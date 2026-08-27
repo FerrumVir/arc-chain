@@ -4,21 +4,152 @@
 //! draining the mempool and feeding committed blocks into `StateDB`.
 
 use crate::SharedValidators;
+use crate::recovery_dag_wal::{ActiveDurability, ActiveLogWriter, RetainedDagRecord};
 use crate::vrf::ProposerSelector;
 use arc_consensus::{ConsensusEngine, StakeTier, Validator, ValidatorSet};
 use arc_crypto::{Hash256, KeyPair};
-use arc_mempool::{EncryptedMempool, Mempool};
+use arc_mempool::Mempool;
 use arc_net::transport::{InboundMessage, OutboundMessage};
 use arc_state::StateDB;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Transaction bodies retained between DAG availability and canonical commit.
+/// Backpressure is safer than deleting an arbitrary body that a later leader
+/// block still commits to.
+const MAX_PENDING_DAG_PREIMAGES: usize = 100_000;
+const RECOVERY_DAG_REBROADCAST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Runtime policy that may replace a bounded recovery-DAG writer with a
+/// compacted successor. The caller hands over exclusive ownership of the
+/// writer so its advisory store lock is released before generation publish.
+/// An error deliberately leaves the writer slot empty and is fatal to the
+/// consensus loop; restart then follows the generation crash-recovery rules.
+pub trait RecoveryDagRollover: Send + Sync {
+    fn prepare_append(
+        &self,
+        state: &StateDB,
+        engine: &ConsensusEngine,
+        writer: ActiveLogWriter,
+        upcoming: &[RetainedDagRecord],
+    ) -> Result<ActiveLogWriter, String>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerDagTransactionError {
     AttachmentMismatch,
     InvalidTransaction(Hash256),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DagPreimageError {
+    Capacity,
+    Missing(Hash256),
+    HashMismatch { expected: Hash256, actual: Hash256 },
+    DuplicateLocalProposal { round: u64 },
+}
+
+fn pending_preimage_capacity_allows(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    hashes: &[Hash256],
+) -> bool {
+    let new_hashes = hashes
+        .iter()
+        .filter(|hash| !pending.contains_key(&hash.0))
+        .count();
+    pending.len().saturating_add(new_hashes) <= MAX_PENDING_DAG_PREIMAGES
+}
+
+fn retain_dag_preimages(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    latest_round: &dashmap::DashMap<[u8; 32], u64>,
+    round: u64,
+    transactions: &[arc_types::Transaction],
+) -> Result<(), DagPreimageError> {
+    let hashes: Vec<_> = transactions
+        .iter()
+        .map(|transaction| transaction.hash)
+        .collect();
+    if !pending_preimage_capacity_allows(pending, &hashes) {
+        return Err(DagPreimageError::Capacity);
+    }
+    for transaction in transactions {
+        pending
+            .entry(transaction.hash.0)
+            .or_insert_with(|| transaction.clone());
+        latest_round
+            .entry(transaction.hash.0)
+            .and_modify(|latest| *latest = (*latest).max(round))
+            .or_insert(round);
+    }
+    Ok(())
+}
+
+fn exact_dag_preimages(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    hashes: &[Hash256],
+) -> Result<Vec<arc_types::Transaction>, DagPreimageError> {
+    hashes
+        .iter()
+        .map(|expected| {
+            let transaction = pending
+                .get(&expected.0)
+                .ok_or(DagPreimageError::Missing(*expected))?
+                .clone();
+            if transaction.hash != *expected {
+                return Err(DagPreimageError::HashMismatch {
+                    expected: *expected,
+                    actual: transaction.hash,
+                });
+            }
+            Ok(transaction)
+        })
+        .collect()
+}
+
+/// Recover the exact local proposal for `round`, including every body needed
+/// for a byte-identical re-broadcast. A protocol-v3 restart can occur after its
+/// proposal crossed the DAG fsync barrier but before every peer received it.
+/// Re-proposing would be a double vote, while failing to re-broadcast would
+/// strand unanimous recovery-mode progress forever.
+fn local_proposal_with_preimages(
+    engine: &ConsensusEngine,
+    local_address: Hash256,
+    round: u64,
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+) -> Result<Option<(arc_consensus::DagBlock, Vec<arc_types::Transaction>)>, DagPreimageError> {
+    let mut local = engine
+        .blocks_in_round(round)
+        .into_iter()
+        .filter_map(|hash| engine.get_block(&hash))
+        .filter(|block| block.author == local_address);
+    let Some(block) = local.next() else {
+        return Ok(None);
+    };
+    if local.next().is_some() {
+        return Err(DagPreimageError::DuplicateLocalProposal { round });
+    }
+    let transactions = exact_dag_preimages(pending, &block.transactions)?;
+    Ok(Some((block, transactions)))
+}
+
+fn prune_irreversible_preimages(
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    latest_round: &dashmap::DashMap<[u8; 32], u64>,
+    committed_round_exclusive: u64,
+) -> usize {
+    let obsolete: Vec<_> = latest_round
+        .iter()
+        .filter(|entry| *entry.value() < committed_round_exclusive)
+        .map(|entry| *entry.key())
+        .collect();
+    for hash in &obsolete {
+        latest_round.remove(hash);
+        pending.remove(hash);
+    }
+    obsolete.len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +319,7 @@ fn verify_peer_dag_transactions_in_domain(
         return Err(PeerDagTransactionError::AttachmentMismatch);
     }
 
-    transactions
+    let mut verified: Vec<_> = transactions
         .iter()
         .map(|tx| {
             let mut verified = tx.clone();
@@ -201,7 +332,13 @@ fn verify_peer_dag_transactions_in_domain(
             verified.sig_verified = true;
             Ok(verified)
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    // The DAG commits only the canonical hash sequence, not the sender's
+    // attachment order. Canonicalize the bodies to that same order before any
+    // state-admission decision so two honest peers cannot accept/reject the
+    // same block differently after receiving permuted JSON/bincode vectors.
+    verified.sort_by_key(|transaction| transaction.hash.0);
+    Ok(verified)
 }
 
 /// The direct benchmark executor mutates canonical `StateDB` without a DAG
@@ -239,9 +376,6 @@ pub struct ConsensusManager {
     pending_diffs: dashmap::DashMap<[u8; 32], (Hash256, arc_types::StateDiff, u64)>,
     /// VRF-based proposer selector (None = VRF disabled, backward compat).
     vrf_selector: Option<ProposerSelector>,
-    /// Encrypted mempool for MEV-protected commit-reveal transactions.
-    /// Runs alongside the regular mempool when `Some`.
-    encrypted_mempool: Option<Arc<EncryptedMempool>>,
     /// Shared operator-approved validator authority list for RPC. Transport
     /// connection events must never add, remove, or reweight entries.
     pub dag_validators: Option<SharedValidators>,
@@ -251,6 +385,13 @@ pub struct ConsensusManager {
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// WAL writer for DAG persistence - enables consensus recovery after restart.
     pub dag_wal: Option<Arc<arc_state::WalWriter>>,
+    /// Content-addressed, bounded recovery-domain DAG delta. Protocol v3 uses
+    /// this instead of the legacy unbounded segmented WAL.
+    pub recovery_dag_writer: Option<Arc<parking_lot::Mutex<Option<ActiveLogWriter>>>>,
+    /// Synchronous rollover policy invoked at safe append boundaries. Protocol
+    /// v3 requires this alongside its bounded writer so capacity cannot turn
+    /// into periodic coordinated validator exits.
+    pub recovery_dag_rollover: Option<Arc<dyn RecoveryDagRollover>>,
     /// Registry for externally certified long-range checkpoints. It remains
     /// empty until canonical state-root signatures are actually collected.
     /// Behind Mutex for interior mutability in the consensus loop (takes &self).
@@ -258,6 +399,9 @@ pub struct ConsensusManager {
     /// Nothing-at-stake mitigation: double-vote tracker with graduated slashing.
     /// Behind Mutex for interior mutability in the consensus loop (takes &self).
     pub stake_tracker: std::sync::Mutex<arc_consensus::security::StakeTracker>,
+    /// Strictly verified transaction bodies restored from the bound recovery
+    /// DAG WAL before the live loop starts.
+    recovered_preimages: Vec<arc_types::Transaction>,
 }
 
 impl ConsensusManager {
@@ -301,15 +445,17 @@ impl ConsensusManager {
             proposer_mode: false,
             pending_diffs: dashmap::DashMap::new(),
             vrf_selector,
-            encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))),
             dag_validators: None,
             dag_round: None,
             dag_committed: None,
             dag_wal: None,
+            recovery_dag_writer: None,
+            recovery_dag_rollover: None,
             checkpoint_registry: std::sync::Mutex::new(
                 arc_consensus::security::CheckpointRegistry::new(),
             ),
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
+            recovered_preimages: Vec::new(),
         }
     }
 
@@ -352,16 +498,125 @@ impl ConsensusManager {
             proposer_mode: false,
             pending_diffs: dashmap::DashMap::new(),
             vrf_selector,
-            encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))),
             dag_validators: None,
             dag_round: None,
             dag_committed: None,
             dag_wal: None,
+            recovery_dag_writer: None,
+            recovery_dag_rollover: None,
             checkpoint_registry: std::sync::Mutex::new(
                 arc_consensus::security::CheckpointRegistry::new(),
             ),
             stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()),
+            recovered_preimages: Vec::new(),
         }
+    }
+
+    /// Install preimages that were signature/domain checked during strict DAG
+    /// WAL replay. They are retained directly; routing them through the live
+    /// mempool could delay a previously certified commit behind a drain cap.
+    pub fn install_recovered_preimages(&mut self, transactions: Vec<arc_types::Transaction>) {
+        self.recovered_preimages = transactions;
+    }
+
+    fn has_durable_dag_writer(&self) -> bool {
+        self.recovery_dag_writer
+            .as_ref()
+            .is_some_and(|slot| slot.lock().is_some())
+            || self.dag_wal.is_some()
+    }
+
+    fn persist_dag_block(
+        &self,
+        state: &StateDB,
+        block: &arc_consensus::DagBlock,
+        transactions: &[arc_types::Transaction],
+    ) -> Result<(), String> {
+        let block_bytes = bincode::serialize(block)
+            .map_err(|error| format!("failed to serialize DAG block {}: {error}", block.hash))?;
+        if let Some(writer_slot) = &self.recovery_dag_writer {
+            let mut records = Vec::with_capacity(transactions.len().saturating_add(1));
+            for transaction in transactions {
+                let bytes = bincode::serialize(transaction).map_err(|error| {
+                    format!(
+                        "failed to serialize DAG transaction {}: {error}",
+                        transaction.hash
+                    )
+                })?;
+                records.push(RetainedDagRecord::transaction(
+                    block.round,
+                    transaction.hash,
+                    bytes,
+                ));
+            }
+            records.push(RetainedDagRecord::dag_block(
+                block.round,
+                block.hash,
+                block_bytes,
+            ));
+            let mut slot = writer_slot.lock();
+            let mut writer = slot
+                .take()
+                .ok_or_else(|| "recovery DAG writer slot is empty".to_string())?;
+            if let Some(rollover) = &self.recovery_dag_rollover {
+                writer = rollover.prepare_append(state, &self.engine, writer, &records)?;
+            }
+            writer
+                .append_batch(&records, ActiveDurability::Fsync)
+                .map_err(|error| error.to_string())?;
+            *slot = Some(writer);
+            return Ok(());
+        }
+        if let Some(wal) = &self.dag_wal {
+            for transaction in transactions {
+                wal.append(
+                    arc_state::WalOp::SetFullTransaction(
+                        transaction.hash,
+                        Box::new(transaction.clone()),
+                    ),
+                    block.round,
+                );
+            }
+            wal.append(
+                arc_state::WalOp::SetDagBlock(block.hash, block_bytes),
+                block.round,
+            );
+            wal.sync().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn persist_dag_commit(
+        &self,
+        state: &StateDB,
+        block: &arc_consensus::DagBlock,
+    ) -> Result<(), String> {
+        if let Some(writer_slot) = &self.recovery_dag_writer {
+            let mut slot = writer_slot.lock();
+            let mut writer = slot
+                .take()
+                .ok_or_else(|| "recovery DAG writer slot is empty".to_string())?;
+            writer
+                .append_batch(
+                    &[RetainedDagRecord::commit(block.round, block.hash)],
+                    ActiveDurability::Fsync,
+                )
+                .map_err(|error| error.to_string())?;
+            // This call is deliberately after both canonical state fsync and
+            // commit-record fsync. It may drop the old writer, compact through
+            // this exact boundary, publish/pin a successor, and return its new
+            // active writer before the loop performs any further work.
+            if let Some(rollover) = &self.recovery_dag_rollover {
+                writer = rollover.prepare_append(state, &self.engine, writer, &[])?;
+            }
+            *slot = Some(writer);
+            return Ok(());
+        }
+        if let Some(wal) = &self.dag_wal {
+            wal.append(arc_state::WalOp::CommitDagBlock(block.hash), block.round);
+            wal.sync().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -461,13 +716,67 @@ impl ConsensusManager {
         if !can_produce {
             info!("Validator is Spark tier - observing only (cannot produce blocks)");
         }
+        if state.active_protocol_version().major == 3 {
+            if !self.is_multi_validator() {
+                tracing::error!(
+                    "Protocol-v3 recovery consensus requires a multi-validator checkpoint set"
+                );
+                return;
+            }
+            if self.recovery_dag_writer.is_none() || self.recovery_dag_rollover.is_none() {
+                tracing::error!(
+                    "Protocol-v3 recovery consensus requires bounded generation persistence with live rollover"
+                );
+                return;
+            }
+        }
 
         // Pending transaction index: tx_hash → Transaction
         // Transactions live here between drain from mempool and execution.
         let pending_txs: DashMap<[u8; 32], Transaction> = DashMap::new();
+        // Highest DAG round that still references each retained preimage.
+        // A body is removable only once this round is behind the contiguous
+        // canonical commit cursor.
+        let pending_tx_latest_round: DashMap<[u8; 32], u64> = DashMap::new();
+        let recovered_round = self.engine.current_round();
+        if let Err(error) = retain_dag_preimages(
+            &pending_txs,
+            &pending_tx_latest_round,
+            recovered_round,
+            &self.recovered_preimages,
+        ) {
+            tracing::error!(
+                ?error,
+                recovered = self.recovered_preimages.len(),
+                cap = MAX_PENDING_DAG_PREIMAGES,
+                "Bounded recovery DAG preimages violate the live retention cap"
+            );
+            return;
+        }
 
-        // Track last proposed round to avoid double-proposing.
-        let mut last_proposed_round: Option<u64> = None;
+        // Track last proposed round to avoid double-proposing. Strict replay
+        // may already have restored our durable proposal for the current
+        // round; in that case it must be re-broadcast, never re-signed.
+        let recovered_local_round = match local_proposal_with_preimages(
+            &self.engine,
+            self.validator_address,
+            recovered_round,
+            &pending_txs,
+        ) {
+            Ok(Some((block, _))) => Some(block.round),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::error!(
+                    round = recovered_round,
+                    ?error,
+                    "Fatal recovered local DAG proposal/preimage invariant failure"
+                );
+                return;
+            }
+        };
+        let mut last_proposed_round = recovered_local_round;
+        let mut recovery_rebroadcast_pending = recovered_local_round.is_some();
+        let mut next_recovery_rebroadcast = Instant::now();
 
         // Genesis membership and live transport connectivity are different
         // facts. The validator set must be known/frozen before networking,
@@ -476,10 +785,6 @@ impl ConsensusManager {
         // connections and wait for live quorum before proposing.
         let mut connected_validators =
             std::collections::HashMap::<Hash256, PeerConnectionGeneration>::new();
-
-        // Pending encrypted transaction batches, keyed by DAG block hash.
-        // Stored at proposal time, revealed after DAG commit.
-        let pending_encrypted: DashMap<[u8; 32], Vec<arc_mempool::EncryptedTx>> = DashMap::new();
 
         loop {
             // Single-validator: 1ms tight loop for max TPS.
@@ -517,6 +822,13 @@ impl ConsensusManager {
                                     "Ignored stale or reordered peer-connected event"
                                 );
                                 continue;
+                            }
+                            if self.engine.requires_full_round_participation() {
+                                // A validator may reconnect after our current
+                                // proposal's original broadcast. Queue a
+                                // byte-identical re-broadcast so unanimity does
+                                // not depend on connection-event timing.
+                                recovery_rebroadcast_pending = true;
                             }
                             // Transport authentication proves the peer identity,
                             // but its advertised stake is still self-asserted.
@@ -618,29 +930,63 @@ impl ConsensusManager {
                                     continue;
                                 }
                             };
-                            for tx in &verified {
-                                pending_txs.insert(tx.hash.0, tx.clone());
+                            if state.active_protocol_version().major == 3 {
+                                let fresh: Vec<_> = verified
+                                    .iter()
+                                    .filter(|transaction| {
+                                        !state.receipts.contains_key(&transaction.hash.0)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                if let Err(error) = state.validate_v3_block_admission(&fresh) {
+                                    warn!(
+                                        author = %block.author,
+                                        round = block.round,
+                                        error = %error,
+                                        "Rejected DAG block that fails protocol-v3 state admission"
+                                    );
+                                    continue;
+                                }
+                            }
+                            if !pending_preimage_capacity_allows(&pending_txs, &block.transactions)
+                            {
+                                warn!(
+                                    author = %block.author,
+                                    round = block.round,
+                                    retained = pending_txs.len(),
+                                    cap = MAX_PENDING_DAG_PREIMAGES,
+                                    "Backpressured DAG block before transaction-preimage capacity exhaustion"
+                                );
+                                continue;
                             }
                             // Feed block into consensus engine
                             match self.engine.receive_block(&block) {
                                 Ok(()) => {
-                                    // Persist DAG block to WAL for crash recovery
-                                    if let Some(ref wal) = self.dag_wal
-                                        && let Ok(bytes) = bincode::serialize(&block)
+                                    // Availability precedes visibility to the
+                                    // commit loop: persist exact bodies + block
+                                    // and fsync before retaining them in memory.
+                                    if let Err(error) =
+                                        self.persist_dag_block(&state, &block, &verified)
                                     {
-                                        for tx in &verified {
-                                            wal.append(
-                                                arc_state::WalOp::SetFullTransaction(
-                                                    tx.hash,
-                                                    Box::new(tx.clone()),
-                                                ),
-                                                block.round,
-                                            );
-                                        }
-                                        wal.append(
-                                            arc_state::WalOp::SetDagBlock(block.hash, bytes),
-                                            block.round,
+                                        tracing::error!(
+                                            block = %block.hash,
+                                            error = %error,
+                                            "Fatal DAG persistence failure before commit eligibility"
                                         );
+                                        return;
+                                    }
+                                    if let Err(error) = retain_dag_preimages(
+                                        &pending_txs,
+                                        &pending_tx_latest_round,
+                                        block.round,
+                                        &verified,
+                                    ) {
+                                        tracing::error!(
+                                            block = %block.hash,
+                                            ?error,
+                                            "Fatal transaction-preimage retention invariant failure"
+                                        );
+                                        return;
                                     }
                                     debug!(
                                         author = %block.author,
@@ -724,12 +1070,18 @@ impl ConsensusManager {
                                         continue;
                                     }
                                     tx.sig_verified = true;
-                                    // Skip if already proposed (prevents gossip loop:
-                                    // drain removes from mempool.seen, so without this
-                                    // check the same tx bounces between peers forever)
-                                    if pending_txs.contains_key(&tx.hash.0) {
+                                    if state.active_protocol_version().major == 3
+                                        && state.validate_v3_transaction_admission(&tx).is_err()
+                                    {
                                         continue;
                                     }
+                                    // A body retained for one non-leader DAG
+                                    // block must remain proposal-eligible until
+                                    // it has a canonical receipt. Inbound
+                                    // transaction gossip is not immediately
+                                    // re-broadcast, and Mempool deduplicates its
+                                    // resident set, so accepting this retry does
+                                    // not create a wire echo loop.
                                     if mempool.insert(tx).is_ok() {
                                         inserted += 1;
                                     }
@@ -753,12 +1105,14 @@ impl ConsensusManager {
                             max_tokens,
                             requester: _,
                         } => {
-                            // Community GPU node received an inference request.
-                            // TODO: Run model locally and send response via outbound_tx.
-                            info!(
+                            // This pre-v0.8 P2P message never had a complete
+                            // execution/settlement protocol. Keep it dark: the
+                            // supported community path is the authenticated,
+                            // job-bound RPC queue and verified result endpoint.
+                            warn!(
                                 request_id = %request_id,
                                 tokens = max_tokens,
-                                "Received inference request from network"
+                                "Ignored dormant legacy P2P inference request"
                             );
                         }
                         InboundMessage::InferenceResponse {
@@ -769,13 +1123,14 @@ impl ConsensusManager {
                             ms_per_token,
                             responder,
                         } => {
-                            // Seed node received inference result from community GPU.
-                            // Store for the waiting RPC handler to pick up.
-                            info!(
+                            // A response on the old P2P surface is not bound to
+                            // an authenticated assignment and must never affect
+                            // work counters or reward settlement.
+                            warn!(
                                 request_id = %request_id,
                                 responder = %responder,
                                 ms_per_token = ms_per_token,
-                                "Received inference response from community node"
+                                "Ignored dormant legacy P2P inference response"
                             );
                         }
                         // ── Partition detection via heartbeat round info ───
@@ -907,6 +1262,69 @@ impl ConsensusManager {
                 }
             }
 
+            // A recovery-domain validator that restarts after fsync has already
+            // signed its one legal block for this round. Re-broadcast that
+            // exact block and its exact durable preimages until the transport
+            // accepts it. A closed transport is fatal; a full channel is
+            // transient and retried on the next tick.
+            if self.engine.requires_full_round_participation()
+                && Instant::now() >= next_recovery_rebroadcast
+            {
+                recovery_rebroadcast_pending = true;
+            }
+            if recovery_rebroadcast_pending && self.engine.requires_full_round_participation() {
+                let round = self.engine.current_round();
+                match local_proposal_with_preimages(
+                    &self.engine,
+                    self.validator_address,
+                    round,
+                    &pending_txs,
+                ) {
+                    Ok(Some((block, transactions))) => {
+                        let Some(tx_chan) = outbound_tx.as_ref() else {
+                            tracing::error!(
+                                round,
+                                "Recovery DAG proposal cannot be re-broadcast without transport"
+                            );
+                            return;
+                        };
+                        match tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
+                            block,
+                            transactions,
+                        }) {
+                            Ok(()) => {
+                                recovery_rebroadcast_pending = false;
+                                next_recovery_rebroadcast =
+                                    Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                debug!(round, "Recovery DAG re-broadcast channel is full; retrying")
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::error!(
+                                    round,
+                                    "Recovery DAG re-broadcast transport channel is closed"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        recovery_rebroadcast_pending = false;
+                        next_recovery_rebroadcast =
+                            Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            round,
+                            ?error,
+                            "Fatal local DAG re-broadcast/preimage invariant failure"
+                        );
+                        return;
+                    }
+                }
+            }
+
             // Check multi-validator EACH iteration (validator set is dynamic).
             let multi_validator = self.is_multi_validator();
             let current_round = self.engine.current_round();
@@ -929,7 +1347,14 @@ impl ConsensusManager {
                             .expect("unique connected stake cannot exceed validator-set total");
                     }
                 }
-                connected_stake >= vs.quorum
+                if self.engine.requires_full_round_participation() {
+                    vs.validators
+                        .iter()
+                        .filter(|validator| validator.stake > 0)
+                        .all(|validator| seen_validators.contains(&validator.address))
+                } else {
+                    connected_stake >= vs.quorum
+                }
             } else {
                 true
             };
@@ -983,7 +1408,14 @@ impl ConsensusManager {
                                 .expect("unique parent stake cannot exceed validator-set total");
                         }
                     }
-                    parent_stake >= vs.quorum
+                    if self.engine.requires_full_round_participation() {
+                        vs.validators
+                            .iter()
+                            .filter(|validator| validator.stake > 0)
+                            .all(|validator| seen_authors.contains(&validator.address))
+                    } else {
+                        parent_stake >= vs.quorum
+                    }
                 };
 
             // ── VRF proposer eligibility check ──────────────────────────
@@ -1083,7 +1515,60 @@ impl ConsensusManager {
                         500
                     };
                     let mempool_len_pre = mempool.len();
-                    let transactions = mempool.drain(drain_limit);
+                    let mut transactions = mempool.drain(drain_limit);
+                    // Recovery protocol v3 never proposes a transaction that
+                    // would become a failed canonical history entry. Validate
+                    // the complete candidate first; on a conflicting batch,
+                    // deterministically retain the first FIFO-valid disjoint
+                    // subset, defer candidate-local conflicts, and discard
+                    // envelopes already stale against canonical state.
+                    if state.active_protocol_version().major == 3 {
+                        transactions.retain(|transaction| {
+                            !state.receipts.contains_key(&transaction.hash.0)
+                                && state.validate_v3_transaction_admission(transaction).is_ok()
+                        });
+                        // DagBlock commits lexicographically sorted hashes.
+                        // Validate exactly that order, never the local FIFO
+                        // attachment order which peers are free to permute.
+                        transactions.sort_by_key(|transaction| transaction.hash.0);
+                        if state.validate_v3_block_admission(&transactions).is_err() {
+                            let mut admitted = Vec::with_capacity(transactions.len());
+                            let mut deferred = Vec::new();
+                            for transaction in transactions {
+                                let mut candidate = admitted.clone();
+                                candidate.push(transaction.clone());
+                                if state.validate_v3_block_admission(&candidate).is_ok() {
+                                    admitted.push(transaction);
+                                } else {
+                                    deferred.push(transaction);
+                                }
+                            }
+                            transactions = admitted;
+                            // Individually valid envelopes can conflict only
+                            // within this candidate (for example two spends of
+                            // one nonce). Keep the loser available until the
+                            // winning canonical state transition decides which
+                            // envelope became stale.
+                            for transaction in deferred {
+                                let _ = mempool.insert(transaction);
+                            }
+                        }
+                    }
+                    let transaction_hashes: Vec<_> = transactions
+                        .iter()
+                        .map(|transaction| transaction.hash)
+                        .collect();
+                    if !pending_preimage_capacity_allows(&pending_txs, &transaction_hashes) {
+                        warn!(
+                            retained = pending_txs.len(),
+                            candidate = transactions.len(),
+                            cap = MAX_PENDING_DAG_PREIMAGES,
+                            "Backpressuring local transaction proposal at preimage capacity"
+                        );
+                        for transaction in transactions.drain(..) {
+                            let _ = mempool.insert(transaction);
+                        }
+                    }
                     if !transactions.is_empty() {
                         info!(
                             "Drained {} txs from mempool for DAG proposal",
@@ -1105,34 +1590,23 @@ impl ConsensusManager {
                         );
                     }
 
-                    // ── Encrypted mempool: drain encrypted txs in FIFO order ──
-                    // Encrypted transactions are included alongside regular ones.
-                    // They remain opaque until after DAG commit (reveal phase).
-                    let encrypted_batch = if let Some(ref emp) = self.encrypted_mempool {
-                        let batch = emp.drain_fifo(10_000);
-                        if !batch.is_empty() {
-                            debug!(
-                                count = batch.len(),
-                                slot = emp.current_slot(),
-                                "Drained encrypted transactions (FIFO)"
-                            );
-                        }
-                        batch
-                    } else {
-                        Vec::new()
-                    };
-
-                    let has_txs = !transactions.is_empty() || !encrypted_batch.is_empty();
+                    // The former encrypted-mempool branch was never a network
+                    // protocol: ciphertext was proposer-local, absent from the
+                    // signed DAG block/WAL, and every process held every test
+                    // committee secret. Keep it completely dark until ARC has
+                    // a replicated ciphertext commitment and validator-specific
+                    // threshold reveal protocol.
+                    let has_txs = !transactions.is_empty();
 
                     if has_txs || multi_validator {
                         let tx_hashes: Vec<Hash256> =
                             transactions.iter().map(|tx| tx.hash).collect();
 
-                        // Index transactions for later lookup on commit
+                        // Gossip admissible envelopes so every leader has an
+                        // opportunity to include them. They become commit
+                        // eligible locally only after the exact proposed block
+                        // and bodies cross the DAG WAL fsync barrier below.
                         if has_txs {
-                            for tx in &transactions {
-                                pending_txs.insert(tx.hash.0, tx.clone());
-                            }
                             // Re-enabled: gossip txs so peers can include them
                             // in THEIR proposals too. The leader-only commit
                             // rule (lib.rs:1452) means a tx in only OUR block
@@ -1161,23 +1635,30 @@ impl ConsensusManager {
 
                         match self.engine.propose_block(tx_hashes, timestamp) {
                             Ok(block) => {
-                                // Persist our own proposed block to WAL
-                                if let Some(ref wal) = self.dag_wal
-                                    && let Ok(bytes) = bincode::serialize(&block)
+                                // Persist our own exact proposal and fsync it
+                                // before advancing/broadcasting/committing.
+                                if let Err(error) =
+                                    self.persist_dag_block(&state, &block, &transactions)
                                 {
-                                    for tx in &transactions {
-                                        wal.append(
-                                            arc_state::WalOp::SetFullTransaction(
-                                                tx.hash,
-                                                Box::new(tx.clone()),
-                                            ),
-                                            block.round,
-                                        );
-                                    }
-                                    wal.append(
-                                        arc_state::WalOp::SetDagBlock(block.hash, bytes),
-                                        block.round,
+                                    tracing::error!(
+                                        block = %block.hash,
+                                        error = %error,
+                                        "Fatal local DAG persistence failure"
                                     );
+                                    return;
+                                }
+                                if let Err(error) = retain_dag_preimages(
+                                    &pending_txs,
+                                    &pending_tx_latest_round,
+                                    block.round,
+                                    &transactions,
+                                ) {
+                                    tracing::error!(
+                                        block = %block.hash,
+                                        ?error,
+                                        "Fatal local transaction-preimage retention failure"
+                                    );
+                                    return;
                                 }
                                 info!(
                                     round = block.round,
@@ -1187,29 +1668,65 @@ impl ConsensusManager {
                                 );
                                 last_proposed_round = Some(block.round);
 
-                                // Store encrypted batch for reveal after commit.
-                                if !encrypted_batch.is_empty() {
-                                    pending_encrypted.insert(block.hash.0, encrypted_batch.clone());
-                                }
-
                                 // Broadcast to peers
                                 if let Some(ref tx_chan) = outbound_tx {
                                     match tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
                                         block: block.clone(),
                                         transactions: transactions.clone(),
                                     }) {
-                                        Ok(()) => {}
-                                        Err(e) => warn!(
+                                        Ok(()) => {
+                                            recovery_rebroadcast_pending = false;
+                                            next_recovery_rebroadcast =
+                                                Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                                            if self.engine.requires_full_round_participation() =>
+                                        {
+                                            recovery_rebroadcast_pending = true;
+                                            warn!(
+                                                round = block.round,
+                                                "Recovery DAG broadcast channel is full; retrying exact proposal"
+                                            );
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                                            if self.engine.requires_full_round_participation() =>
+                                        {
+                                            tracing::error!(
+                                                round = block.round,
+                                                "Recovery DAG broadcast transport channel is closed"
+                                            );
+                                            return;
+                                        }
+                                        Err(error) => warn!(
                                             "Failed to broadcast DAG block: {} (channel full or closed)",
-                                            e
+                                            error
                                         ),
                                     }
                                 } else {
+                                    if self.engine.requires_full_round_participation() {
+                                        tracing::error!(
+                                            round = block.round,
+                                            "Recovery DAG proposal has no outbound transport"
+                                        );
+                                        return;
+                                    }
                                     warn!("No outbound channel - cannot broadcast DAG block");
+                                }
+                                // Only the deterministic leader block for a
+                                // round becomes canonical. Keep every
+                                // unreceipted envelope proposal-eligible across
+                                // rounds; otherwise the first non-leader to
+                                // include it would strand it forever in the DAG
+                                // preimage cache.
+                                for transaction in transactions.iter().cloned() {
+                                    let _ = mempool.insert(transaction);
                                 }
                             }
                             Err(e) => {
                                 warn!("Failed to propose block: {}", e);
+                                for transaction in transactions.iter().cloned() {
+                                    let _ = mempool.insert(transaction);
+                                }
                             }
                         }
 
@@ -1227,12 +1744,6 @@ impl ConsensusManager {
                         }
                         // Multi-validator: round advancement happens below when
                         // has_quorum_parents becomes true on the NEXT iteration.
-
-                        // Advance the encrypted mempool slot each round so that
-                        // new encrypted transactions target the next slot key.
-                        if let Some(ref emp) = self.encrypted_mempool {
-                            emp.advance_slot();
-                        }
 
                         if multi_validator {
                             // ── Multi-validator: DAG commit path ─────────────
@@ -1309,13 +1820,6 @@ impl ConsensusManager {
             committed.sort_by_key(|b| b.round);
             if !committed.is_empty() {
                 for dag_block in &committed {
-                    // Persist commit to WAL
-                    if let Some(ref wal) = self.dag_wal {
-                        wal.append(
-                            arc_state::WalOp::CommitDagBlock(dag_block.hash),
-                            dag_block.round,
-                        );
-                    }
                     info!(
                         round = dag_block.round,
                         hash = %dag_block.hash,
@@ -1323,234 +1827,200 @@ impl ConsensusManager {
                         "DAG block committed"
                     );
 
-                    // ── Encrypted mempool: reveal phase (commit-reveal) ──────
-                    // After DAG commit, decrypt encrypted transactions from
-                    // the batch that was included in this block. Revealed
-                    // transactions are fed back into pending_txs for execution.
-                    if let Some(ref emp) = self.encrypted_mempool
-                        && let Some((_, enc_batch)) = pending_encrypted.remove(&dag_block.hash.0)
-                        && !enc_batch.is_empty()
+                    // A committed hash list without every exact transaction
+                    // body is not executable consensus. Never silently skip a
+                    // missing preimage: stop this loop before state or the
+                    // durable commit cursor can move.
+                    let all_preimages =
+                        match exact_dag_preimages(&pending_txs, &dag_block.transactions) {
+                            Ok(transactions) => transactions,
+                            Err(error) => {
+                                tracing::error!(
+                                    block = %dag_block.hash,
+                                    round = dag_block.round,
+                                    ?error,
+                                    "Fatal committed DAG transaction-preimage failure"
+                                );
+                                return;
+                            }
+                        };
+                    if state.active_protocol_version().major == 3
+                        && self.recovery_dag_writer.is_none()
                     {
-                        let revealed = emp.reveal_batch(&enc_batch, dag_block.round);
-                        let revealed_count = revealed.len();
-                        for rtx in revealed {
-                            pending_txs.insert(rtx.transaction.hash.0, rtx.transaction);
-                        }
-                        if revealed_count > 0 {
-                            info!(
-                                count = revealed_count,
-                                round = dag_block.round,
-                                block = %dag_block.hash,
-                                "Revealed encrypted transactions after DAG commit"
-                            );
-                        }
+                        tracing::error!(
+                            block = %dag_block.hash,
+                            round = dag_block.round,
+                            "Fatal protocol-v3 DAG commit has no bounded recovery-generation writer"
+                        );
+                        return;
                     }
+                    let mut committed_txs: Vec<Transaction> = all_preimages
+                        .into_iter()
+                        .filter(|transaction| !state.receipts.contains_key(&transaction.hash.0))
+                        .collect();
 
-                    // In multi-validator mode, process committed transactions.
-                    // Proposer: full execution + export state diff.
-                    // Verifier: apply received state diff + verify root.
-                    if multi_validator {
-                        let mut committed_txs: Vec<Transaction> = Vec::new();
-                        for tx_hash in &dag_block.transactions {
-                            if let Some((_, tx)) = pending_txs.remove(&tx_hash.0) {
-                                // Skip transactions already applied via direct RPC path
-                                // (faucet claims, /tx/submit). They're already in receipts.
-                                if state.receipts.contains_key(&tx.hash.0) {
-                                    continue;
-                                }
-                                committed_txs.push(tx);
+                    // State can advance between DAG availability and commit.
+                    // Conflicting envelopes that were valid when admitted are
+                    // deterministically omitted instead of becoming free failed
+                    // receipts. The resulting subset is revalidated as one
+                    // exact v3 state block before any mutation.
+                    if state.active_protocol_version().major == 3
+                        && state.validate_v3_block_admission(&committed_txs).is_err()
+                    {
+                        let original = committed_txs.len();
+                        let mut admitted = Vec::with_capacity(original);
+                        for transaction in committed_txs {
+                            let mut candidate = admitted.clone();
+                            candidate.push(transaction.clone());
+                            if state.validate_v3_block_admission(&candidate).is_ok() {
+                                admitted.push(transaction);
                             }
                         }
-                        if !committed_txs.is_empty() {
-                            // ── Pipeline stage overlap: pre-verify signatures ──
-                            // Verify all signatures in a background task before
-                            // execution, so the next block's verification can
-                            // overlap with this block's execution.
-                            let pre_verify_handle = {
-                                let mut txs = committed_txs.clone();
-                                let recovery_domain = state.transaction_domain_hash();
-                                tokio::spawn(async move {
-                                    for tx in txs.iter_mut() {
-                                        if !tx.is_unsigned()
-                                            && !tx.sig_verified
-                                            && match recovery_domain {
-                                                Some(domain) => {
-                                                    tx.verify_signature_in_domain(&domain).is_ok()
-                                                }
-                                                None => tx.verify_signature().is_ok(),
-                                            }
-                                        {
-                                            tx.sig_verified = true;
-                                        }
-                                    }
-                                    txs
-                                })
+                        committed_txs = admitted;
+                        warn!(
+                            block = %dag_block.hash,
+                            omitted = original.saturating_sub(committed_txs.len()),
+                            "Omitted state-stale v3 DAG envelopes without creating failed history"
+                        );
+                    }
+
+                    let cross_shard_hashes: Vec<Hash256> = committed_txs
+                        .iter()
+                        .filter_map(|transaction| {
+                            let arc_types::TxBody::Transfer(body) = &transaction.body else {
+                                return None;
                             };
-                            // Await pre-verification with timeout to prevent deadlock.
-                            // If the spawned task hangs (runtime starvation), fall
-                            // back to unverified txs after 5 seconds.
-                            // All validators must execute the same tx set to agree on
-                            // state root. NEVER truncate - different validators could
-                            // truncate at different points, causing a consensus fork.
-                            committed_txs = match tokio::time::timeout(
-                                tokio::time::Duration::from_secs(5),
-                                pre_verify_handle,
+                            arc_consensus::is_cross_shard(
+                                &transaction.from,
+                                &body.to,
+                                self.num_shards,
                             )
-                            .await
-                            {
-                                Ok(Ok(verified_txs)) => verified_txs,
-                                Ok(Err(e)) => {
-                                    warn!("Pre-verify error: {e} - proceeding with unverified txs");
-                                    committed_txs
-                                }
-                                Err(_) => {
-                                    warn!("Pre-verify timeout - proceeding with unverified txs");
-                                    committed_txs
-                                }
-                            };
-
-                            // Cross-shard: lock cross-shard transactions before execution.
-                            // Single-shard txs execute directly. Cross-shard txs use
-                            // the 2-phase lock protocol for atomicity across shards.
-                            // Cross-shard: identify and lock cross-shard transactions
-                            let cross_shard_hashes: Vec<Hash256> = committed_txs
-                                .iter()
-                                .filter(|tx| {
-                                    if let arc_types::TxBody::Transfer(ref body) = tx.body {
-                                        arc_consensus::is_cross_shard(
-                                            &tx.from,
-                                            &body.to,
-                                            self.num_shards,
-                                        )
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .map(|tx| tx.hash)
-                                .collect();
-                            if !cross_shard_hashes.is_empty() {
-                                for tx in committed_txs.iter() {
-                                    if let arc_types::TxBody::Transfer(ref body) = tx.body {
-                                        let src =
-                                            arc_consensus::assign_shard(&tx.from, self.num_shards);
-                                        let tgt =
-                                            arc_consensus::assign_shard(&body.to, self.num_shards);
-                                        if src != tgt {
-                                            let _ = self.engine.lock_cross_shard(
-                                                tx.hash,
-                                                src,
-                                                tgt,
-                                                dag_block.hash,
-                                                dag_block.round,
-                                            );
-                                        }
-                                    }
-                                }
-                                debug!("{} cross-shard txs locked", cross_shard_hashes.len());
-                            }
-
-                            let start = std::time::Instant::now();
-
-                            // A peer diff is optional corroborating data only.
-                            // Every validator executes the exact committed
-                            // transaction bodies locally; no network payload may
-                            // replace this state transition.
-                            let received_diff = self.pending_diffs.remove(&dag_block.hash.0);
-
-                            {
-                                // ── CANONICAL PATH: local adaptive execution ──
-                                match state.execute_block_adaptive_at(
-                                    &committed_txs,
-                                    dag_block.author,
-                                    dag_block.timestamp,
-                                ) {
-                                    Ok((block, receipts)) => {
-                                        let elapsed = start.elapsed();
-                                        let success = receipts.iter().filter(|r| r.success).count();
-                                        let tps = if elapsed.as_secs_f64() > 0.0 {
-                                            committed_txs.len() as f64 / elapsed.as_secs_f64()
-                                        } else {
-                                            committed_txs.len() as f64
-                                        };
-
-                                        // Commit cross-shard locks after successful execution
-                                        for cs_hash in &cross_shard_hashes {
-                                            let _ = self.engine.commit_cross_shard(*cs_hash);
-                                        }
-
-                                        // Validate an authenticated hint only
-                                        // after local execution produced the
-                                        // canonical height/root. A forged but
-                                        // self-consistent diff cannot affect
-                                        // state because it is never applied.
-                                        if let Some((_, (source, diff, reported_height))) =
-                                            received_diff.as_ref()
-                                        {
-                                            match verify_peer_state_diff(
-                                                *source,
-                                                dag_block.author,
-                                                *reported_height,
-                                                block.header.height,
-                                                diff,
-                                                block.header.state_root,
-                                            ) {
-                                                Ok(()) => debug!(
-                                                    block = %dag_block.hash,
-                                                    source = %source,
-                                                    "State-diff hint corroborated local execution"
-                                                ),
-                                                Err(reason) => warn!(
-                                                    block = %dag_block.hash,
-                                                    source = %source,
-                                                    ?reason,
-                                                    declared_root = %diff.new_root,
-                                                    executed_root = %block.header.state_root,
-                                                    "Rejected state-diff hint after local execution"
-                                                ),
-                                            }
-                                        }
-
-                                        // Only a DAG block's authenticated
-                                        // author may broadcast its optional
-                                        // diff. Other validators already have
-                                        // the locally executed result.
-                                        if self.proposer_mode
-                                            && dag_block.author == self.validator_address
-                                        {
-                                            let dirty = state.drain_dirty_addresses();
-                                            let diff = state.export_state_diff(&dirty);
-                                            if let Some(ref tx_chan) = outbound_tx {
-                                                let _ = tx_chan.try_send(
-                                                    OutboundMessage::BroadcastStateDiff {
-                                                        block_hash: dag_block.hash,
-                                                        diff,
-                                                        block_height: block.header.height,
-                                                    },
-                                                );
-                                            }
-                                        }
-
-                                        info!(
-                                            height = block.header.height,
-                                            txs = committed_txs.len(),
-                                            success = success,
-                                            elapsed_ms = elapsed.as_millis(),
-                                            tps = format!("{:.0}", tps),
-                                            mode = if self.proposer_mode {
-                                                "proposer"
-                                            } else {
-                                                "full"
-                                            },
-                                            "Block produced (DAG commit)"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("DAG commit block execution failed: {}", e);
-                                    }
-                                }
+                            .then_some(transaction.hash)
+                        })
+                        .collect();
+                    for transaction in &committed_txs {
+                        if let arc_types::TxBody::Transfer(body) = &transaction.body {
+                            let source =
+                                arc_consensus::assign_shard(&transaction.from, self.num_shards);
+                            let target = arc_consensus::assign_shard(&body.to, self.num_shards);
+                            if source != target {
+                                let _ = self.engine.lock_cross_shard(
+                                    transaction.hash,
+                                    source,
+                                    target,
+                                    dag_block.hash,
+                                    dag_block.round,
+                                );
                             }
                         }
                     }
+
+                    let started = std::time::Instant::now();
+                    let received_diff = self.pending_diffs.remove(&dag_block.hash.0);
+                    let decision_proof = match self.engine.consensus_domain() {
+                        Some(domain) => dag_block.state_decision_commitment(&domain),
+                        None if state.active_protocol_version().major == 3 => {
+                            tracing::error!(
+                                block = %dag_block.hash,
+                                round = dag_block.round,
+                                "Fatal protocol-v3 DAG decision has no installed consensus domain"
+                            );
+                            return;
+                        }
+                        None => Hash256::ZERO,
+                    };
+                    // Every committed DAG leader maps to exactly one canonical
+                    // state block, including an empty block when all envelopes
+                    // were previously receipted or became state-stale.
+                    let (block, receipts) = match state.execute_block_adaptive_at_with_proof(
+                        &committed_txs,
+                        dag_block.author,
+                        dag_block.timestamp,
+                        decision_proof,
+                    ) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            tracing::error!(
+                                block = %dag_block.hash,
+                                round = dag_block.round,
+                                error = %error,
+                                "Fatal canonical execution failure; DAG commit cursor not persisted"
+                            );
+                            return;
+                        }
+                    };
+                    for hash in &cross_shard_hashes {
+                        let _ = self.engine.commit_cross_shard(*hash);
+                    }
+
+                    if let Some((_, (source, diff, reported_height))) = received_diff.as_ref() {
+                        match verify_peer_state_diff(
+                            *source,
+                            dag_block.author,
+                            *reported_height,
+                            block.header.height,
+                            diff,
+                            block.header.state_root,
+                        ) {
+                            Ok(()) => debug!(
+                                block = %dag_block.hash,
+                                source = %source,
+                                "State-diff hint corroborated local execution"
+                            ),
+                            Err(reason) => warn!(
+                                block = %dag_block.hash,
+                                source = %source,
+                                ?reason,
+                                declared_root = %diff.new_root,
+                                executed_root = %block.header.state_root,
+                                "Rejected state-diff hint after local execution"
+                            ),
+                        }
+                    }
+                    if self.proposer_mode && dag_block.author == self.validator_address {
+                        let dirty = state.drain_dirty_addresses();
+                        let diff = state.export_state_diff(&dirty);
+                        if let Some(ref channel) = outbound_tx {
+                            let _ = channel.try_send(OutboundMessage::BroadcastStateDiff {
+                                block_hash: dag_block.hash,
+                                diff,
+                                block_height: block.header.height,
+                            });
+                        }
+                    }
+
+                    // StateDB's block boundary has already fsynced here. Only
+                    // now may the separate DAG WAL record and fsync the commit
+                    // cursor. A crash before this point replays the certified
+                    // block without ever claiming a durable DAG commit.
+                    if let Err(error) = self.persist_dag_commit(&state, dag_block) {
+                        tracing::error!(
+                            block = %dag_block.hash,
+                            error = %error,
+                            "Fatal DAG commit-cursor persistence failure"
+                        );
+                        return;
+                    } else if !self.has_durable_dag_writer() {
+                        warn!(
+                            block = %dag_block.hash,
+                            "Legacy/dev DAG commit is running without a durability WAL"
+                        );
+                    }
+
+                    let elapsed = started.elapsed();
+                    let success = receipts.iter().filter(|receipt| receipt.success).count();
+                    info!(
+                        height = block.header.height,
+                        txs = committed_txs.len(),
+                        success,
+                        elapsed_ms = elapsed.as_millis(),
+                        mode = if self.proposer_mode {
+                            "proposer"
+                        } else {
+                            "full"
+                        },
+                        "Block produced and durably bound to DAG commit"
+                    );
                 }
             }
 
@@ -1665,26 +2135,20 @@ impl ConsensusManager {
             if count.is_multiple_of(100) {
                 state.evict_transactions(1_000_000); // Keep last ~1M tx bodies
 
-                // Evict stale pending data (txs, diffs, encrypted batches).
-                // These accumulate when blocks are proposed but never committed
-                // (e.g., during network partitions). Cap at 50K entries each.
-                if pending_txs.len() > 50_000 {
-                    let excess = pending_txs.len() - 25_000;
-                    let keys: Vec<[u8; 32]> =
-                        pending_txs.iter().take(excess).map(|e| *e.key()).collect();
-                    for k in keys {
-                        pending_txs.remove(&k);
-                    }
-                }
-                if pending_encrypted.len() > 10_000 {
-                    let keys: Vec<[u8; 32]> = pending_encrypted
-                        .iter()
-                        .take(5_000)
-                        .map(|e| *e.key())
-                        .collect();
-                    for k in keys {
-                        pending_encrypted.remove(&k);
-                    }
+                // Transaction preimages are pruned only after every DAG round
+                // known to reference them is irreversibly behind the contiguous
+                // commit cursor. Never use arbitrary DashMap iteration here.
+                let pruned = prune_irreversible_preimages(
+                    &pending_txs,
+                    &pending_tx_latest_round,
+                    self.engine.last_committed_round(),
+                );
+                if pruned > 0 {
+                    debug!(
+                        pruned,
+                        retained = pending_txs.len(),
+                        "Pruned irreversibly obsolete DAG transaction preimages"
+                    );
                 }
                 if self.pending_diffs.len() > 10_000 {
                     let keys: Vec<[u8; 32]> = self
@@ -1736,6 +2200,14 @@ mod tests {
         let verified = verify_peer_dag_transactions(&committed, &[second, first]).unwrap();
         assert_eq!(verified.len(), 2);
         assert!(verified.iter().all(|tx| tx.sig_verified));
+        assert_eq!(
+            verified
+                .iter()
+                .map(|transaction| transaction.hash)
+                .collect::<Vec<_>>(),
+            committed,
+            "attachment permutations must canonicalize to the DAG hash order"
+        );
     }
 
     #[test]
@@ -1783,6 +2255,135 @@ mod tests {
             verify_peer_dag_transactions(&[mismatch.hash], &[mismatch.clone()]),
             Err(PeerDagTransactionError::InvalidTransaction(hash)) if hash == mismatch.hash
         ));
+    }
+
+    #[test]
+    fn committed_preimages_are_exact_and_never_silently_skipped() {
+        let key = KeyPair::generate_ed25519();
+        let first = signed_transfer(&key, 11, 0);
+        let second = signed_transfer(&key, 12, 1);
+        let pending = dashmap::DashMap::new();
+        let latest = dashmap::DashMap::new();
+        retain_dag_preimages(&pending, &latest, 9, &[first.clone(), second.clone()]).unwrap();
+
+        let exact = exact_dag_preimages(&pending, &[second.hash, first.hash]).unwrap();
+        assert_eq!(
+            exact
+                .iter()
+                .map(|transaction| transaction.hash)
+                .collect::<Vec<_>>(),
+            vec![second.hash, first.hash]
+        );
+
+        pending.remove(&second.hash.0);
+        assert!(matches!(
+            exact_dag_preimages(&pending, &[first.hash, second.hash]),
+            Err(DagPreimageError::Missing(hash)) if hash == second.hash
+        ));
+    }
+
+    #[test]
+    fn preimage_pruning_uses_latest_referencing_round_not_map_order() {
+        let key = KeyPair::generate_ed25519();
+        let obsolete = signed_transfer(&key, 21, 0);
+        let future_commit = signed_transfer(&key, 22, 1);
+        let pending = dashmap::DashMap::new();
+        let latest = dashmap::DashMap::new();
+        retain_dag_preimages(&pending, &latest, 4, std::slice::from_ref(&obsolete)).unwrap();
+        retain_dag_preimages(
+            &pending,
+            &latest,
+            50_001,
+            std::slice::from_ref(&future_commit),
+        )
+        .unwrap();
+
+        assert_eq!(prune_irreversible_preimages(&pending, &latest, 5), 1);
+        assert!(!pending.contains_key(&obsolete.hash.0));
+        assert_eq!(
+            exact_dag_preimages(&pending, &[future_commit.hash])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn rolling_restart_rebroadcasts_exact_proposals_and_all_six_advance() {
+        let validators: Vec<_> = (0..6)
+            .map(|index| hash_bytes(format!("restart-validator-{index}").as_bytes()))
+            .collect();
+        let validator_set = ValidatorSet::new(
+            validators
+                .iter()
+                .enumerate()
+                .map(|(index, address)| {
+                    Validator::new(*address, arc_consensus::STAKE_ARC, index as u16).unwrap()
+                })
+                .collect(),
+            1,
+        );
+        let domain = arc_consensus::ConsensusDomain::new(
+            hash_bytes(b"rolling-restart-rebroadcast-domain"),
+            7,
+            11,
+        );
+        let engines: Vec<_> = validators
+            .iter()
+            .map(|address| {
+                let engine = ConsensusEngine::new(validator_set.clone(), *address);
+                engine.install_consensus_domain(domain.clone()).unwrap();
+                engine.install_recovery_cursor(100).unwrap();
+                engine
+            })
+            .collect();
+        let proposals: Vec<_> = engines
+            .iter()
+            .enumerate()
+            .map(|(index, engine)| {
+                engine
+                    .propose_block(Vec::new(), 1_000 + index as u64)
+                    .unwrap()
+            })
+            .collect();
+
+        // Model lost initial broadcasts: the five continuously-running nodes
+        // know one another's blocks but not the restarted sixth; the restarted
+        // node has only its own fsync-replayed proposal.
+        for (target, engine) in engines.iter().take(5).enumerate() {
+            for (source, proposal) in proposals.iter().take(5).enumerate() {
+                if source != target {
+                    engine.receive_block(proposal).unwrap();
+                }
+            }
+            assert!(!engine.advance_round());
+        }
+        assert!(!engines[5].advance_round());
+
+        let pending = dashmap::DashMap::new();
+        for source in 0..5 {
+            let (block, bodies) =
+                local_proposal_with_preimages(&engines[source], validators[source], 101, &pending)
+                    .unwrap()
+                    .expect("old validator must retain its exact current proposal");
+            assert_eq!(block.hash, proposals[source].hash);
+            assert!(bodies.is_empty());
+            engines[5].receive_block(&block).unwrap();
+        }
+        let (restarted_block, restarted_bodies) =
+            local_proposal_with_preimages(&engines[5], validators[5], 101, &pending)
+                .unwrap()
+                .expect("restart must restore its one legal proposal");
+        assert_eq!(restarted_block.hash, proposals[5].hash);
+        assert!(restarted_bodies.is_empty());
+        for engine in engines.iter().take(5) {
+            engine.receive_block(&restarted_block).unwrap();
+        }
+
+        for engine in &engines {
+            assert!(engine.advance_round());
+            assert_eq!(engine.current_round(), 102);
+        }
     }
 
     #[test]

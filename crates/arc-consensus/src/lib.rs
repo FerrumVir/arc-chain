@@ -1017,6 +1017,14 @@ impl ConsensusEngine {
         self.recovery_bootstrap_round.read().as_ref() == Some(&round)
     }
 
+    /// Recovery-domain v3 deliberately pauses unless every fixed positive-
+    /// stake validator has contributed to the round. Until ARC has a signed
+    /// skip/view-change certificate, advancing on a quorum can permanently
+    /// skip the deterministic leader of an offline validator's round.
+    pub fn requires_full_round_participation(&self) -> bool {
+        self.consensus_domain.read().is_some()
+    }
+
     /// Get the current round number.
     pub fn current_round(&self) -> u64 {
         self.current_round.load(Ordering::SeqCst)
@@ -1402,7 +1410,10 @@ impl ConsensusEngine {
             Vec::new()
         } else {
             let prev_round = round - 1;
-            let prev_hashes = self.blocks_in_round(prev_round);
+            let mut prev_hashes = self.blocks_in_round(prev_round);
+            // Arrival order is transport-dependent. Select one deterministic
+            // block per author and sign parents in canonical hash order.
+            prev_hashes.sort_by_key(|hash| hash.0);
 
             // Collect all available parents from the previous round.
             // The validator should have enough (>= 2f+1) since advance_round
@@ -1423,8 +1434,17 @@ impl ConsensusEngine {
                 }
             }
 
-            // A local timeout or testnet flag is not a quorum certificate.
-            if accumulated_stake < vs.quorum {
+            let full_recovery_participation = !self.requires_full_round_participation()
+                || vs
+                    .validators
+                    .iter()
+                    .filter(|validator| validator.stake > 0)
+                    .all(|validator| seen_parent_authors.contains(&validator.address));
+            // A local timeout or testnet flag is not a quorum certificate. In
+            // the recovery domain there is no certified leader-skip protocol,
+            // so a proposal missing even one fixed validator parent would be
+            // able to recreate a permanent deterministic-leader hole.
+            if accumulated_stake < vs.quorum || !full_recovery_participation {
                 return Err(ConsensusError::InsufficientParents);
             }
 
@@ -1649,8 +1669,17 @@ impl ConsensusEngine {
                 )));
             }
 
+            let full_recovery_participation = !self.requires_full_round_participation()
+                || vs
+                    .validators
+                    .iter()
+                    .filter(|validator| validator.stake > 0)
+                    .all(|validator| seen_parent_authors.contains(&validator.address));
             // A local timeout or testnet flag is not a parent certificate.
-            if parent_stake < vs.quorum {
+            // Recovery blocks must carry one known prior-round parent author
+            // for every fixed positive-stake validator until a separately
+            // certified skip/view-change protocol exists.
+            if parent_stake < vs.quorum || !full_recovery_participation {
                 return Err(ConsensusError::InsufficientParents);
             }
         }
@@ -2137,7 +2166,13 @@ impl ConsensusEngine {
             }
         }
 
-        if round_stake >= vs.quorum {
+        let full_recovery_participation = !self.requires_full_round_participation()
+            || vs
+                .validators
+                .iter()
+                .filter(|validator| validator.stake > 0)
+                .all(|validator| seen_authors.contains(&validator.address));
+        if round_stake >= vs.quorum && full_recovery_participation {
             let Some(new_round) = current.checked_add(1) else {
                 warn!(round = current, "Cannot advance beyond u64::MAX round");
                 return false;
@@ -2160,7 +2195,8 @@ impl ConsensusEngine {
                 round = current,
                 stake = round_stake,
                 quorum = vs.quorum,
-                "Cannot advance round: insufficient stake"
+                full_recovery_participation,
+                "Cannot advance round: insufficient certified participation"
             );
             false
         }
@@ -3337,7 +3373,7 @@ mod tests {
             "restart/retry must never sign a second block in the same round"
         );
 
-        for author in [test_addr(1), test_addr(2)] {
+        for author in [test_addr(1), test_addr(2), test_addr(3)] {
             let mut block = make_block(author, 101, vec![], vec![], 1_000);
             block.hash = block.compute_hash_in_domain(&domain);
             engine.receive_block(&block).unwrap();
@@ -3345,13 +3381,100 @@ mod tests {
         assert!(engine.advance_round());
         assert_eq!(engine.current_round(), 102);
         let next = engine.propose_block(vec![], 2_000).unwrap();
-        assert_eq!(next.parents.len(), 3);
+        assert_eq!(next.parents.len(), 4);
 
         let mut invalid = make_block(test_addr(3), 102, vec![], vec![], 2_001);
         invalid.hash = invalid.compute_hash_in_domain(&domain);
         assert_eq!(
             engine.receive_block(&invalid).unwrap_err(),
             ConsensusError::InsufficientParents
+        );
+    }
+
+    #[test]
+    fn recovery_round_pauses_at_five_of_six_and_resumes_with_sixth() {
+        let engine = ConsensusEngine::new(test_validator_set(6), test_addr(0));
+        let domain = ConsensusDomain::new(hash_bytes(b"unanimous-recovery-round"), 3, 9);
+        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_recovery_cursor(100).unwrap();
+        engine.propose_block(vec![], 1_000).unwrap();
+        for author in (1..5).map(test_addr) {
+            let mut block = make_block(author, 101, vec![], vec![], 1_000);
+            block.hash = block.compute_hash_in_domain(&domain);
+            engine.receive_block(&block).unwrap();
+        }
+        assert_eq!(engine.blocks_in_round(101).len(), 5);
+        assert!(
+            !engine.advance_round(),
+            "five-of-six must pause rather than skip a future deterministic leader"
+        );
+        assert_eq!(engine.current_round(), 101);
+
+        let mut sixth = make_block(test_addr(5), 101, vec![], vec![], 1_000);
+        sixth.hash = sixth.compute_hash_in_domain(&domain);
+        engine.receive_block(&sixth).unwrap();
+        assert!(engine.advance_round());
+        assert_eq!(engine.current_round(), 102);
+        assert_eq!(
+            engine.propose_block(vec![], 2_000).unwrap().parents.len(),
+            6
+        );
+    }
+
+    #[test]
+    fn signed_recovery_proposal_and_receive_require_all_six_canonical_parents() {
+        let keys: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let validators = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| Validator::new(key.address(), STAKE_ARC, index as u16).unwrap())
+            .collect();
+        let engine = ConsensusEngine::new_with_keypair(
+            ValidatorSet::new(validators, 1),
+            keys[0].address(),
+            keys[0].clone(),
+        );
+        let domain = ConsensusDomain::new(hash_bytes(b"signed-six-parent-domain"), 3, 9);
+        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine.install_recovery_cursor(100).unwrap();
+        engine.propose_block(vec![], 1_000).unwrap();
+        for (index, key) in keys.iter().enumerate().skip(1) {
+            let mut block = make_block_in_domain(
+                key.address(),
+                101,
+                Vec::new(),
+                Vec::new(),
+                1_000 + index as u64,
+                &domain,
+            );
+            block.signature = bincode::serialize(&key.sign(&block.hash).unwrap()).unwrap();
+            engine.receive_block(&block).unwrap();
+        }
+        assert!(engine.advance_round());
+
+        let proposal = engine.propose_block(vec![], 2_000).unwrap();
+        assert_eq!(proposal.parents.len(), 6);
+        assert!(
+            proposal
+                .parents
+                .windows(2)
+                .all(|pair| pair[0].0 <= pair[1].0)
+        );
+
+        let mut missing_one = make_block_in_domain(
+            keys[1].address(),
+            102,
+            proposal.parents[..5].to_vec(),
+            Vec::new(),
+            2_001,
+            &domain,
+        );
+        missing_one.signature =
+            bincode::serialize(&keys[1].sign(&missing_one.hash).unwrap()).unwrap();
+        assert_eq!(
+            engine.receive_block(&missing_one).unwrap_err(),
+            ConsensusError::InsufficientParents,
+            "a signed recovery block cannot omit one fixed validator parent"
         );
     }
 
@@ -3379,7 +3502,7 @@ mod tests {
         assert_eq!(engine.last_committed_round(), 110);
 
         let mut boundary = Vec::new();
-        for author in [test_addr(0), test_addr(1), test_addr(2)] {
+        for author in [test_addr(0), test_addr(1), test_addr(2), test_addr(3)] {
             let block = make_block_in_domain(
                 author,
                 109,

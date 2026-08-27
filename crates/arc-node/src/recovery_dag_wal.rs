@@ -38,8 +38,11 @@ const MANIFEST_FILE: &str = "manifest.json";
 const RECORDS_FILE: &str = "records.bin";
 const CURRENT_FILE: &str = "CURRENT";
 const WRITE_LOCK_FILE: &str = ".WRITE.lock";
+const GC_ANCHOR_FILE: &str = "GC-ANCHOR.json";
+const GC_ANCHOR_SCHEMA: &str = "arc.recovery.dag-wal-gc-anchor.v1";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_POINTER_BYTES: u64 = 4 * 1024;
+const MAX_GC_ANCHOR_BYTES: u64 = 2 * 1024 * 1024;
 const FRAME_FIXED_BODY_BYTES: u64 = 1 + 1 + 8 + 32 + 4;
 const FRAME_OVERHEAD_BYTES: u64 = 4 + FRAME_FIXED_BODY_BYTES + 32;
 const ACTIVE_HEADER_BYTES: u64 = 8 + 1 + 32 + 8 + 32 + 32 + 32 + 8 + 8;
@@ -355,6 +358,19 @@ pub struct ActiveAppendReceipt {
     pub durable: bool,
 }
 
+/// Exact non-mutating usage projection for one active-log batch after
+/// idempotent duplicate elimination against both the immutable generation and
+/// the already-written active prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveBatchProjection {
+    pub requested_records: u64,
+    pub appended_records: u64,
+    pub idempotently_omitted_records: u64,
+    pub appended_payload_bytes: u64,
+    pub minimum_round: Option<u64>,
+    pub maximum_round: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentStreamSummary {
     pub generation_pin: GenerationPin,
@@ -395,6 +411,24 @@ pub struct StoreAudit {
     pub status: StoreAuditStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GcAnchor {
+    schema: String,
+    binding: RecoveryDagBinding,
+    authorized_by: GenerationPin,
+    retained_boundary: GenerationPin,
+    missing_parent: GenerationPin,
+    pruned: Vec<GenerationPin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AncestorGcReport {
+    pub current: GenerationPin,
+    pub retained_predecessor: Option<GenerationPin>,
+    pub pruned_generations: Vec<GenerationPin>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishPoint {
     RecordsSynced,
@@ -417,6 +451,29 @@ trait PublishObserver {
 
 struct NoopObserver;
 impl PublishObserver for NoopObserver {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GcPoint {
+    AnchorFileSynced,
+    AnchorRenamed,
+    RootAfterAnchorSynced,
+    GenerationRenamed(GenerationPin),
+    RootAfterGenerationRenameSynced(GenerationPin),
+    ActiveLogRenamed(GenerationPin),
+    RootAfterActiveLogRenameSynced(GenerationPin),
+    GenerationRemoved(GenerationPin),
+    RootAfterGenerationRemoveSynced(GenerationPin),
+    ActiveLogRemoved(GenerationPin),
+    RootAfterActiveLogRemoveSynced(GenerationPin),
+}
+
+trait GcObserver {
+    fn reached(&mut self, _point: GcPoint) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl GcObserver for NoopObserver {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -468,6 +525,60 @@ impl ActiveLogWriter {
 
     pub fn inspection(&self) -> &ActiveLogInspection {
         &self.inspection
+    }
+
+    /// Project the exact records and payload bytes a later [`Self::append_batch`]
+    /// would add, without enforcing this generation's combined capacity. This
+    /// lets a rollover controller distinguish true new bytes from transaction
+    /// bodies repeated byte-identically by several validators in one round.
+    /// Identity conflicts and malformed records still fail closed.
+    pub fn project_batch_usage(
+        &self,
+        records: &[RetainedDagRecord],
+    ) -> Result<ActiveBatchProjection> {
+        if let Some(reason) = &self.poisoned {
+            return Err(GenerationError::ActiveWriterPoisoned(reason.clone()));
+        }
+        let mut batch_seen = HashMap::new();
+        let mut appended_records = 0u64;
+        let mut appended_payload_bytes = 0u64;
+        let mut minimum_round: Option<u64> = None;
+        let mut maximum_round: Option<u64> = None;
+        for record in records {
+            validate_record(record)?;
+            let identity = record_identity(record);
+            let fingerprint = record_payload_fingerprint(record);
+            let existing = batch_seen
+                .get(&identity)
+                .or_else(|| self.seen.get(&identity));
+            if let Some(existing) = existing {
+                if *existing != fingerprint {
+                    return Err(GenerationError::Invalid(format!(
+                        "record key {:?}/round {}/{} was reused with different payload",
+                        record.kind, record.round, record.object_hash
+                    )));
+                }
+                continue;
+            }
+            batch_seen.insert(identity, fingerprint);
+            appended_records = appended_records
+                .checked_add(1)
+                .ok_or_else(|| GenerationError::Invalid("batch record count overflow".into()))?;
+            appended_payload_bytes = appended_payload_bytes
+                .checked_add(record.payload.len() as u64)
+                .ok_or_else(|| GenerationError::Invalid("batch payload size overflow".into()))?;
+            minimum_round = Some(minimum_round.map_or(record.round, |old| old.min(record.round)));
+            maximum_round = Some(maximum_round.map_or(record.round, |old| old.max(record.round)));
+        }
+        let requested_records = records.len() as u64;
+        Ok(ActiveBatchProjection {
+            requested_records,
+            appended_records,
+            idempotently_omitted_records: requested_records - appended_records,
+            appended_payload_bytes,
+            minimum_round,
+            maximum_round,
+        })
     }
 
     /// Append one checksum-atomic batch. Every record and the combined
@@ -1134,27 +1245,37 @@ impl GenerationStore {
     pub fn audit(&self, expected_binding: &RecoveryDagBinding) -> Result<StoreAudit> {
         let current = self.load_current(expected_binding, None)?;
         let manifests = self.read_all_manifests(expected_binding)?;
+        let gc_anchor = self.read_gc_anchor(expected_binding)?;
         let generation_count = manifests.len();
         let mut referenced = HashSet::new();
         for (hash, manifest) in &manifests {
             if let Some(parent) = manifest.previous_generation {
-                let parent_manifest = manifests.get(&parent).ok_or_else(|| {
-                    GenerationError::Invalid(format!(
-                        "generation {hash} references missing parent {parent}"
-                    ))
-                })?;
-                if parent_manifest.sequence.checked_add(1) != Some(manifest.sequence) {
+                if let Some(parent_manifest) = manifests.get(&parent) {
+                    if parent_manifest.sequence.checked_add(1) != Some(manifest.sequence) {
+                        return Err(GenerationError::Invalid(format!(
+                            "generation {hash} sequence does not follow parent {parent}"
+                        )));
+                    }
+                    referenced.insert(parent);
+                } else if !gc_anchor.as_ref().is_some_and(|anchor| {
+                    anchor.retained_boundary.hash == *hash
+                        && anchor.retained_boundary.sequence == manifest.sequence
+                        && anchor.missing_parent.hash == parent
+                        && anchor.missing_parent.sequence.checked_add(1) == Some(manifest.sequence)
+                }) {
                     return Err(GenerationError::Invalid(format!(
-                        "generation {hash} sequence does not follow parent {parent}"
+                        "generation {hash} references missing parent {parent} without an exact GC anchor"
                     )));
                 }
-                referenced.insert(parent);
             } else if manifest.sequence != 0 {
                 return Err(GenerationError::Invalid(format!(
                     "generation {hash} has no parent at nonzero sequence {}",
                     manifest.sequence
                 )));
             }
+        }
+        if let Some(anchor) = gc_anchor.as_ref() {
+            validate_gc_anchor(anchor, &current, &manifests)?;
         }
         let mut heads: Vec<GenerationPin> = manifests
             .iter()
@@ -1176,6 +1297,172 @@ impl GenerationStore {
             current,
             generation_count,
             status,
+        })
+    }
+
+    /// Finish any generation-GC operation whose authorization anchor was
+    /// fsynced before a crash. Only hashes explicitly named by that anchor are
+    /// touched, and the current generation plus its exact predecessor are
+    /// re-derived from `CURRENT` and excluded before every rename/removal.
+    pub fn recover_interrupted_ancestor_gc(
+        &self,
+        expected_binding: &RecoveryDagBinding,
+    ) -> Result<AncestorGcReport> {
+        self.ensure_root()?;
+        let lock = StoreLock::acquire(&self.root)?;
+        let current = self.load_current(expected_binding, None)?;
+        let predecessor = current
+            .manifest
+            .previous_generation
+            .map(|hash| GenerationPin {
+                sequence: current.pin.sequence.saturating_sub(1),
+                hash,
+            });
+        let Some(anchor) = self.read_gc_anchor(expected_binding)? else {
+            lock.release()?;
+            return Ok(AncestorGcReport {
+                current: current.pin,
+                retained_predecessor: predecessor,
+                pruned_generations: Vec::new(),
+            });
+        };
+        // Do not run the ordinary ancestry audit yet: a crash may have moved
+        // an early authorized target while a later target still names it as a
+        // parent. Validate the selected head, anchor path, and every remaining
+        // live/tombstoned target structurally, finish the complete authorized
+        // set, and only then require a clean audit.
+        let manifests = self.read_all_manifests(expected_binding)?;
+        validate_gc_anchor(&anchor, &current, &manifests)?;
+        self.validate_gc_target_namespaces(expected_binding, &anchor.pruned)?;
+        let mut observer = NoopObserver;
+        self.finish_gc_targets(&current, predecessor, &anchor.pruned, &mut observer)?;
+        let clean = self.audit(expected_binding)?;
+        if !matches!(clean.status, StoreAuditStatus::Clean) {
+            return Err(GenerationError::Invalid(
+                "recovery DAG store is not clean after interrupted ancestor GC".into(),
+            ));
+        }
+        lock.release()?;
+        Ok(AncestorGcReport {
+            current: current.pin,
+            retained_predecessor: predecessor,
+            pruned_generations: anchor.pruned,
+        })
+    }
+
+    /// Bound on-disk generation history after the caller has durably advanced
+    /// both `CURRENT` and its independent external pin. The selected generation
+    /// and its exact immediate predecessor are never eligible. Older verified
+    /// generations are first authorized in an fsynced GC anchor, then renamed
+    /// out of the live namespace with a root-directory fsync before removal.
+    pub fn prune_ancestors_keep_current_and_predecessor(
+        &self,
+        expected_binding: &RecoveryDagBinding,
+        expected_current: GenerationPin,
+    ) -> Result<AncestorGcReport> {
+        let mut observer = NoopObserver;
+        self.prune_ancestors_with_observer(expected_binding, expected_current, &mut observer)
+    }
+
+    fn prune_ancestors_with_observer<O: GcObserver>(
+        &self,
+        expected_binding: &RecoveryDagBinding,
+        expected_current: GenerationPin,
+        observer: &mut O,
+    ) -> Result<AncestorGcReport> {
+        self.ensure_root()?;
+        let lock = StoreLock::acquire(&self.root)?;
+        let current = self.load_current(expected_binding, Some(expected_current))?;
+        let audit = self.audit(expected_binding)?;
+        if !matches!(audit.status, StoreAuditStatus::Clean) {
+            return Err(GenerationError::Invalid(
+                "ancestor GC requires one clean generation head".into(),
+            ));
+        }
+        let manifests = self.read_all_manifests(expected_binding)?;
+        let predecessor = match current.manifest.previous_generation {
+            Some(hash) => Some(GenerationPin {
+                sequence: current.pin.sequence.checked_sub(1).ok_or_else(|| {
+                    GenerationError::Invalid("current predecessor sequence underflows".into())
+                })?,
+                hash,
+            }),
+            None => None,
+        };
+        let mut targets: Vec<_> = manifests
+            .iter()
+            .filter_map(|(hash, manifest)| {
+                let pin = GenerationPin {
+                    sequence: manifest.sequence,
+                    hash: *hash,
+                };
+                (pin != current.pin && Some(pin) != predecessor).then_some(pin)
+            })
+            .collect();
+        targets.sort_by_key(|pin| (pin.sequence, pin.hash.0));
+        if targets.is_empty() {
+            lock.release()?;
+            return Ok(AncestorGcReport {
+                current: current.pin,
+                retained_predecessor: predecessor,
+                pruned_generations: Vec::new(),
+            });
+        }
+        let predecessor = predecessor.ok_or_else(|| {
+            GenerationError::Invalid("initial generation cannot have GC ancestors".into())
+        })?;
+        let predecessor_manifest = manifests.get(&predecessor.hash).ok_or_else(|| {
+            GenerationError::Invalid("current generation predecessor is missing".into())
+        })?;
+        let missing_parent = predecessor_manifest
+            .previous_generation
+            .map(|hash| GenerationPin {
+                sequence: predecessor.sequence.saturating_sub(1),
+                hash,
+            })
+            .ok_or_else(|| {
+                GenerationError::Invalid(
+                    "GC targets exist before a sequence-zero predecessor".into(),
+                )
+            })?;
+        if targets.last() != Some(&missing_parent) {
+            return Err(GenerationError::Invalid(
+                "GC targets are not the complete retained ancestry before the predecessor".into(),
+            ));
+        }
+        for target in &targets {
+            let generation = self.verify_generation(target.hash, expected_binding)?;
+            if generation.pin != *target {
+                return Err(GenerationError::Invalid(
+                    "GC target pin differs from its verified manifest".into(),
+                ));
+            }
+            inspect_active_log(&self.active_log_path(*target), &generation)?;
+        }
+        let anchor = GcAnchor {
+            schema: GC_ANCHOR_SCHEMA.to_owned(),
+            binding: expected_binding.clone(),
+            authorized_by: current.pin,
+            retained_boundary: predecessor,
+            missing_parent,
+            pruned: targets.clone(),
+        };
+        self.write_gc_anchor(&anchor, observer)?;
+        self.finish_gc_targets(&current, Some(predecessor), &targets, observer)?;
+        let clean = self.audit(expected_binding)?;
+        if !matches!(clean.status, StoreAuditStatus::Clean)
+            || clean.current.pin != current.pin
+            || clean.generation_count != 2
+        {
+            return Err(GenerationError::Invalid(
+                "ancestor GC did not preserve exactly current plus predecessor".into(),
+            ));
+        }
+        lock.release()?;
+        Ok(AncestorGcReport {
+            current: current.pin,
+            retained_predecessor: Some(predecessor),
+            pruned_generations: targets,
         })
     }
 
@@ -1350,6 +1637,161 @@ impl GenerationStore {
             ));
         }
         Ok(pointer)
+    }
+
+    fn read_gc_anchor(&self, expected_binding: &RecoveryDagBinding) -> Result<Option<GcAnchor>> {
+        let path = self.root.join(GC_ANCHOR_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_small_regular_file(&path, MAX_GC_ANCHOR_BYTES)?;
+        let anchor: GcAnchor = serde_json::from_slice(&bytes).map_err(|error| {
+            GenerationError::Invalid(format!("GC anchor JSON is invalid: {error}"))
+        })?;
+        require_canonical_json(&bytes, &anchor, "GC anchor")?;
+        if anchor.schema != GC_ANCHOR_SCHEMA || &anchor.binding != expected_binding {
+            return Err(GenerationError::Invalid(
+                "GC anchor has a foreign schema or recovery binding".into(),
+            ));
+        }
+        Ok(Some(anchor))
+    }
+
+    fn write_gc_anchor<O: GcObserver>(&self, anchor: &GcAnchor, observer: &mut O) -> Result<()> {
+        let bytes = canonical_json(anchor, "GC anchor")?;
+        if bytes.len() as u64 > MAX_GC_ANCHOR_BYTES {
+            return Err(GenerationError::Invalid(
+                "GC anchor exceeds its hard byte cap".into(),
+            ));
+        }
+        let temporary = self
+            .root
+            .join(format!(".GC-ANCHOR-{}.tmp", uuid::Uuid::new_v4()));
+        write_new_synced_file(&temporary, &bytes)?;
+        observer.reached(GcPoint::AnchorFileSynced)?;
+        let destination = self.root.join(GC_ANCHOR_FILE);
+        fs::rename(&temporary, &destination)
+            .map_err(|error| io_error("atomically replace", &destination, error))?;
+        observer.reached(GcPoint::AnchorRenamed)?;
+        fsync_directory(&self.root)?;
+        observer.reached(GcPoint::RootAfterAnchorSynced)
+    }
+
+    fn finish_gc_targets<O: GcObserver>(
+        &self,
+        current: &VerifiedGeneration,
+        predecessor: Option<GenerationPin>,
+        targets: &[GenerationPin],
+        observer: &mut O,
+    ) -> Result<()> {
+        for target in targets {
+            if *target == current.pin || Some(*target) == predecessor {
+                return Err(GenerationError::Invalid(
+                    "GC anchor attempts to remove current or its predecessor".into(),
+                ));
+            }
+            let generation = self.generation_path(target.hash);
+            let active = self.active_log_path(*target);
+            let generation_tombstone = self.root.join(format!(".gc-gen-{}", target.hash.to_hex()));
+            let active_tombstone = self
+                .root
+                .join(format!(".gc-active-{}.bin", target.hash.to_hex()));
+            if generation.exists() && generation_tombstone.exists()
+                || active.exists() && active_tombstone.exists()
+            {
+                return Err(GenerationError::Invalid(
+                    "GC target exists in both live and tombstone namespaces".into(),
+                ));
+            }
+            if generation.exists() {
+                ensure_real_directory(&generation)?;
+                fs::rename(&generation, &generation_tombstone).map_err(|error| {
+                    io_error(
+                        "rename generation GC tombstone",
+                        &generation_tombstone,
+                        error,
+                    )
+                })?;
+                observer.reached(GcPoint::GenerationRenamed(*target))?;
+                fsync_directory(&self.root)?;
+                observer.reached(GcPoint::RootAfterGenerationRenameSynced(*target))?;
+            }
+            if active.exists() {
+                regular_file_metadata(&active)?;
+                fs::rename(&active, &active_tombstone).map_err(|error| {
+                    io_error("rename active-log GC tombstone", &active_tombstone, error)
+                })?;
+                observer.reached(GcPoint::ActiveLogRenamed(*target))?;
+                fsync_directory(&self.root)?;
+                observer.reached(GcPoint::RootAfterActiveLogRenameSynced(*target))?;
+            }
+            if generation_tombstone.exists() {
+                ensure_real_directory(&generation_tombstone)?;
+                fs::remove_dir_all(&generation_tombstone).map_err(|error| {
+                    io_error(
+                        "remove generation GC tombstone",
+                        &generation_tombstone,
+                        error,
+                    )
+                })?;
+                observer.reached(GcPoint::GenerationRemoved(*target))?;
+                fsync_directory(&self.root)?;
+                observer.reached(GcPoint::RootAfterGenerationRemoveSynced(*target))?;
+            }
+            if active_tombstone.exists() {
+                regular_file_metadata(&active_tombstone)?;
+                fs::remove_file(&active_tombstone).map_err(|error| {
+                    io_error("remove active-log GC tombstone", &active_tombstone, error)
+                })?;
+                observer.reached(GcPoint::ActiveLogRemoved(*target))?;
+                fsync_directory(&self.root)?;
+                observer.reached(GcPoint::RootAfterActiveLogRemoveSynced(*target))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_gc_target_namespaces(
+        &self,
+        expected_binding: &RecoveryDagBinding,
+        targets: &[GenerationPin],
+    ) -> Result<()> {
+        for target in targets {
+            let generation = self.generation_path(target.hash);
+            let active = self.active_log_path(*target);
+            let generation_tombstone = self.root.join(format!(".gc-gen-{}", target.hash.to_hex()));
+            let active_tombstone = self
+                .root
+                .join(format!(".gc-active-{}.bin", target.hash.to_hex()));
+            if generation.exists() && generation_tombstone.exists()
+                || active.exists() && active_tombstone.exists()
+            {
+                return Err(GenerationError::Invalid(
+                    "GC target exists in both live and tombstone namespaces".into(),
+                ));
+            }
+            if generation.exists() {
+                let verified = self.verify_generation(target.hash, expected_binding)?;
+                if verified.pin != *target {
+                    return Err(GenerationError::Invalid(
+                        "live GC target pin differs from its anchor".into(),
+                    ));
+                }
+                if active.exists() {
+                    inspect_active_log(&active, &verified)?;
+                }
+            }
+            if active.exists() {
+                regular_file_metadata(&active)?;
+            }
+            if generation_tombstone.exists() {
+                ensure_real_directory(&generation_tombstone)?;
+            }
+            if active_tombstone.exists() {
+                regular_file_metadata(&active_tombstone)?;
+            }
+        }
+        Ok(())
     }
 
     fn read_manifest(&self, hash: Hash256) -> Result<GenerationManifest> {
@@ -1567,6 +2009,80 @@ impl Drop for StoreLock {
             let _ = self.file.unlock();
         }
     }
+}
+
+fn validate_gc_anchor(
+    anchor: &GcAnchor,
+    current: &VerifiedGeneration,
+    manifests: &HashMap<Hash256, GenerationManifest>,
+) -> Result<()> {
+    if anchor.pruned.is_empty()
+        || anchor.retained_boundary.sequence == 0
+        || anchor.missing_parent.sequence.checked_add(1) != Some(anchor.retained_boundary.sequence)
+        || anchor.pruned.last() != Some(&anchor.missing_parent)
+    {
+        return Err(GenerationError::Invalid(
+            "GC anchor has an invalid retained/pruned boundary".into(),
+        ));
+    }
+    for pair in anchor.pruned.windows(2) {
+        if pair[0].sequence.checked_add(1) != Some(pair[1].sequence) {
+            return Err(GenerationError::Invalid(
+                "GC anchor pruned pins are not sequence-contiguous".into(),
+            ));
+        }
+    }
+    let boundary = manifests
+        .get(&anchor.retained_boundary.hash)
+        .ok_or_else(|| GenerationError::Invalid("GC retained boundary is missing".into()))?;
+    if boundary.sequence != anchor.retained_boundary.sequence
+        || boundary.previous_generation != Some(anchor.missing_parent.hash)
+    {
+        return Err(GenerationError::Invalid(
+            "GC retained boundary does not commit to its named missing parent".into(),
+        ));
+    }
+    for pin in &anchor.pruned {
+        if let Some(manifest) = manifests.get(&pin.hash)
+            && manifest.sequence != pin.sequence
+        {
+            return Err(GenerationError::Invalid(
+                "GC anchor pin differs from its still-present manifest".into(),
+            ));
+        }
+    }
+
+    // The generation that authorized deletion must still be on the exact
+    // present path from externally selected CURRENT down to the retained
+    // boundary. This prevents a stale anchor from authorizing a fork head.
+    let mut cursor = current.pin;
+    let mut saw_authorizer = false;
+    loop {
+        if cursor == anchor.authorized_by {
+            saw_authorizer = true;
+        }
+        if cursor == anchor.retained_boundary {
+            break;
+        }
+        let manifest = manifests.get(&cursor.hash).ok_or_else(|| {
+            GenerationError::Invalid("GC anchor authorization path is incomplete".into())
+        })?;
+        let parent = manifest.previous_generation.ok_or_else(|| {
+            GenerationError::Invalid("GC anchor boundary is not an ancestor of CURRENT".into())
+        })?;
+        cursor = GenerationPin {
+            sequence: cursor.sequence.checked_sub(1).ok_or_else(|| {
+                GenerationError::Invalid("GC authorization sequence underflows".into())
+            })?,
+            hash: parent,
+        };
+    }
+    if !saw_authorizer {
+        return Err(GenerationError::Invalid(
+            "GC authorizing generation is not on the current retained chain".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_input(input: &GenerationInput) -> Result<()> {
@@ -2841,6 +3357,40 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn five_generation_chain(store: &GenerationStore) -> Vec<VerifiedGeneration> {
+        let mut generations = vec![store.create_initial(input(10, 5, 20), records(20)).unwrap()];
+        for offset in 1..5u64 {
+            let previous = generations.last().unwrap().pin;
+            generations.push(
+                store
+                    .append(
+                        previous,
+                        input(10 + offset, 5 + offset, 20 + offset),
+                        records(20 + offset),
+                    )
+                    .unwrap(),
+            );
+        }
+        generations
+    }
+
+    struct FailingGcObserver {
+        fail_at: GcPoint,
+        reached_failure: bool,
+    }
+
+    impl GcObserver for FailingGcObserver {
+        fn reached(&mut self, point: GcPoint) -> Result<()> {
+            if point == self.fail_at {
+                self.reached_failure = true;
+                return Err(GenerationError::Invalid(format!(
+                    "injected ancestor GC crash after {point:?}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn creates_content_addressed_hash_chained_generations() {
         let parent = TestDirectory::new("chain");
@@ -2877,6 +3427,101 @@ mod tests {
             store.audit(&binding()).unwrap().status,
             StoreAuditStatus::Clean
         );
+    }
+
+    #[test]
+    fn ancestor_gc_recovers_every_multi_target_rename_remove_and_fsync_crash() {
+        let probe_parent = TestDirectory::new("gc-crash-probe");
+        let probe_store = GenerationStore::new(probe_parent.0.join("store"));
+        let probe_generations = five_generation_chain(&probe_store);
+        let targets: Vec<_> = probe_generations[..3]
+            .iter()
+            .map(|generation| generation.pin)
+            .collect();
+        let mut crash_points = vec![
+            GcPoint::AnchorFileSynced,
+            GcPoint::AnchorRenamed,
+            GcPoint::RootAfterAnchorSynced,
+        ];
+        for target in &targets {
+            crash_points.extend([
+                GcPoint::GenerationRenamed(*target),
+                GcPoint::RootAfterGenerationRenameSynced(*target),
+                GcPoint::ActiveLogRenamed(*target),
+                GcPoint::RootAfterActiveLogRenameSynced(*target),
+                GcPoint::GenerationRemoved(*target),
+                GcPoint::RootAfterGenerationRemoveSynced(*target),
+                GcPoint::ActiveLogRemoved(*target),
+                GcPoint::RootAfterActiveLogRemoveSynced(*target),
+            ]);
+        }
+        drop(probe_generations);
+        drop(probe_store);
+        drop(probe_parent);
+
+        for crash_point in crash_points {
+            let parent = TestDirectory::new("gc-crash-matrix");
+            let store = GenerationStore::new(parent.0.join("store"));
+            let generations = five_generation_chain(&store);
+            let current = generations[4].pin;
+            let predecessor = generations[3].pin;
+            assert_eq!(
+                generations[..3]
+                    .iter()
+                    .map(|generation| generation.pin)
+                    .collect::<Vec<_>>(),
+                targets,
+                "content-addressed fixture pins must be deterministic"
+            );
+            let mut observer = FailingGcObserver {
+                fail_at: crash_point,
+                reached_failure: false,
+            };
+            let error = store
+                .prune_ancestors_with_observer(&binding(), current, &mut observer)
+                .expect_err("fault observer must interrupt ancestor GC");
+            assert!(observer.reached_failure, "missing point {crash_point:?}");
+            assert!(error.to_string().contains("injected ancestor GC crash"));
+
+            // Startup recovery must never run the ordinary ancestry audit
+            // before finishing an anchored multi-target deletion. Pre-anchor
+            // faults legitimately leave the original clean chain intact.
+            store.recover_interrupted_ancestor_gc(&binding()).unwrap();
+            let recovered = store.audit(&binding()).unwrap();
+            assert_eq!(recovered.current.pin, current);
+            assert!(matches!(recovered.status, StoreAuditStatus::Clean));
+            assert!(matches!(recovered.generation_count, 2 | 5));
+            if recovered.generation_count == 5 {
+                store
+                    .prune_ancestors_keep_current_and_predecessor(&binding(), current)
+                    .unwrap();
+            }
+
+            let final_audit = store.audit(&binding()).unwrap();
+            assert_eq!(final_audit.current.pin, current);
+            assert_eq!(final_audit.generation_count, 2);
+            assert_eq!(final_audit.status, StoreAuditStatus::Clean);
+            assert!(store.generation_path(current.hash).is_dir());
+            assert!(store.active_log_path(current).is_file());
+            assert!(store.generation_path(predecessor.hash).is_dir());
+            assert!(store.active_log_path(predecessor).is_file());
+            for target in &targets {
+                assert!(!store.generation_path(target.hash).exists());
+                assert!(!store.active_log_path(*target).exists());
+                assert!(
+                    !store
+                        .root
+                        .join(format!(".gc-gen-{}", target.hash.to_hex()))
+                        .exists()
+                );
+                assert!(
+                    !store
+                        .root
+                        .join(format!(".gc-active-{}.bin", target.hash.to_hex()))
+                        .exists()
+                );
+            }
+        }
     }
 
     #[test]
