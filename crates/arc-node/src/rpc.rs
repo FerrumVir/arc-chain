@@ -40,10 +40,12 @@ const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute - intentiona
 const REWARD_PER_ATTESTATION_ARC: f64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD as f64
     / arc_types::economics::ARC_BASE_UNITS as f64;
 
-/// No production path currently gathers independent validator signatures over
-/// the common reward commitment. Keep public readiness false until that
-/// peer-authenticated recomputation/aggregation protocol actually exists.
-const COMMUNITY_REWARD_APPROVAL_COLLECTION_READY: bool = false;
+/// The peer-authenticated approval collector is compiled in. Runtime
+/// readiness still fails closed unless the exact six-validator committee,
+/// model, activation, and local validator key prerequisites are present.
+const COMMUNITY_REWARD_APPROVAL_COLLECTION_READY: bool = true;
+const COMMUNITY_REWARD_APPROVE_PATH: &str = "/internal/community/reward/approve";
+const COMMUNITY_REWARD_EXPIRY_BLOCKS: u64 = 3_000;
 
 /// Bond posted only by the local `InferenceAttestation` path, in base units.
 /// Community-worker reward certificates use a protocol-fixed zero bond and
@@ -255,8 +257,15 @@ pub struct NodeState {
     /// connectivity so they work behind any NAT / residential firewall.
     pub community_workers: Arc<dashmap::DashMap<String, (CommunityWorker, std::time::Instant)>>,
     /// Atomically consumed nonces for authenticated community HTTP mutations.
-    /// Bounded and pruned by server time; shared by all four mutation routes.
+    /// Bounded and pruned by server time; shared by every authenticated
+    /// community mutation route, including validator reward approvals.
     community_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
+    /// A validator signs at most one semantic commitment for a job and one
+    /// job for a worker certificate during this process lifetime.
+    community_reward_approval_jobs: Arc<dashmap::DashMap<Hash256, Hash256>>,
+    community_reward_approval_certificates: Arc<dashmap::DashMap<Hash256, Hash256>>,
+    /// Coordinator-side idempotency cache for rewards accepted into mempool.
+    community_reward_submissions: Arc<dashmap::DashMap<Hash256, CommunityRewardSubmission>>,
     /// Community work dispatch: sender side. The coordinator pushes WorkItems
     /// here when it wants community nodes to run forward_shard. This is the
     /// "producer" half of an mpsc channel - wire it up in main.rs when
@@ -919,6 +928,9 @@ pub fn build_node_state(
         community_request_replays: Arc::new(parking_lot::Mutex::new(
             CommunityReplayCache::default(),
         )),
+        community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
+        community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
+        community_reward_submissions: Arc::new(dashmap::DashMap::new()),
         // Community work dispatch — bounded mpsc with 256-slot buffer. New
         // jobs that arrive when 256 are already queued get backpressure
         // (the dispatcher in /inference/run awaits .send().await). Workers
@@ -1571,6 +1583,21 @@ pub async fn serve(
             post(community_submit_work_signed)
                 .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
         )
+        .route(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            post(community_reward_approve_signed)
+                .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/community/reward_receipt/{hash}",
+            get(community_reward_receipt),
+        )
+        .route("/community/reward_job/{job_id}", get(community_reward_job))
+        .route(
+            "/community/reward_approval/{job_id}",
+            get(community_reward_approval_status),
+        )
+        .route("/community/reward_policy", get(community_reward_policy))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -4717,18 +4744,19 @@ async fn channel_state(
 /// inference passes (worker + verifier), one claim-poll window, and network
 /// headroom. The cap prevents an abandoned request from living forever.
 const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 45;
-const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 600;
+const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 3_600;
 const COMMUNITY_VERIFICATION_REPLICAS: usize = 3;
 const COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED: usize = 2;
 
 /// Compute the per-request community dispatch timeout. ~3.3s/token is the
-/// observed worker EWMA. Verification performs a second inference pass, so
-/// budget 2× compute plus 50% headroom and one 30-second claim window.
+/// observed worker EWMA. The worker, coordinator verifier, and parallel peer
+/// approval phase can span three inference passes on the critical path, so
+/// budget 3× compute plus 50% headroom and one 30-second claim window.
 fn community_dispatch_timeout_secs(max_tokens: u32) -> u64 {
     let per_token_ms: u64 = 3300;
     let est_ms = (max_tokens as u64)
         .saturating_mul(per_token_ms)
-        .saturating_mul(2);
+        .saturating_mul(3);
     let est_with_headroom = est_ms.saturating_mul(3) / 2;
     let est_secs = est_with_headroom / 1000 + COMMUNITY_CLAIM_TIMEOUT_SECS;
     est_secs.clamp(
@@ -4771,65 +4799,86 @@ fn community_rewards_v1_protocol_active(node: &NodeState) -> bool {
 /// use this stronger definition so an activated but non-issuing deployment
 /// can never advertise rewards as available.
 fn community_rewards_v1_effective(node: &NodeState) -> bool {
-    community_rewards_v1_protocol_active(node) && COMMUNITY_REWARD_APPROVAL_COLLECTION_READY
+    community_rewards_v1_protocol_active(node) && reward_approval_prerequisites(node).is_ok()
+}
+
+fn reward_approval_prerequisites(node: &NodeState) -> Result<(), &'static str> {
+    if !COMMUNITY_REWARD_APPROVAL_COLLECTION_READY {
+        return Err("approval collector is not compiled in");
+    }
+    let Some(key) = node.validator_keypair.as_ref() else {
+        return Err("local active-validator Ed25519 key is unavailable");
+    };
+    if key.address() != node.validator_address
+        || !node.state.is_validator(&node.validator_address)
+        || !matches!(key.as_ref(), arc_crypto::KeyPair::Ed25519(_))
+    {
+        return Err("local approval key is not an active Ed25519 validator");
+    }
+    if exact_model_identity(node).is_err() {
+        return Err("exact inference model and tokenizer are unavailable");
+    }
+    if node.state.recovery_context().is_none() {
+        return Err("protocol-v3 recovery epoch and transaction domain are unavailable");
+    }
+    if node.state.active_validators().len()
+        != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+    {
+        return Err("active validator committee is not exactly six members");
+    }
+    Ok(())
+}
+
+fn reward_validator_set_id(node: &NodeState) -> String {
+    let mut validators = node.state.active_validators();
+    validators.sort_unstable_by_key(|(address, _)| address.0);
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-community-reward-validator-set-v1");
+    for (address, stake) in validators {
+        hasher.update(address.as_ref());
+        hasher.update(&stake.to_le_bytes());
+    }
+    format!("0x{}", hex::encode(hasher.finalize().as_bytes()))
+}
+
+fn reward_recovery_epoch(node: &NodeState) -> Option<u64> {
+    node.state
+        .recovery_context()
+        .map(|context| context.recovery_epoch)
+}
+
+fn reward_recovery_validator_set_id(node: &NodeState) -> Option<u64> {
+    node.state
+        .recovery_context()
+        .map(|context| context.validator_set_id)
 }
 
 fn community_rewards_v1_readiness_note(node: &NodeState) -> &'static str {
     if !community_rewards_v1_protocol_active(node) {
         "verified work is accepted, but rewards remain dark until genesis activation is reached and the local issuance switch is enabled"
-    } else if !COMMUNITY_REWARD_APPROVAL_COLLECTION_READY {
-        "reward protocol activation is open, but issuance remains fail-closed because peer-authenticated independent validator approval collection is unavailable"
+    } else if reward_approval_prerequisites(node).is_err() {
+        "reward protocol activation is open, but issuance remains fail-closed until the protocol-v3 recovery context, exact six-validator committee, local validator key, and exact model are available"
     } else {
         "verified job completions can be submitted for threshold-authorized on-chain reward inclusion"
     }
 }
 
-fn reward_validator_identity_threshold(active_validator_count: usize) -> usize {
-    u64::try_from(active_validator_count)
-        .ok()
-        .map(arc_types::strict_supermajority_threshold)
-        .and_then(|threshold| usize::try_from(threshold).ok())
-        .unwrap_or(usize::MAX)
-}
-
-/// Explicit fail-closed settlement evidence while no peer-authenticated
-/// validator approval-collection protocol exists. Keeping this as a pure
-/// constructor makes the public contract testable without inventing a local
-/// or HTTP signing oracle.
-fn reward_quorum_approval_unavailable(
-    worker_attestation_hash: &str,
-    active_validator_count: usize,
-) -> Value {
-    let required_validator_approvals = reward_validator_identity_threshold(active_validator_count);
-    json!({
-        "status": "reward_quorum_approval_unavailable",
-        "worker_attestation_hash": worker_attestation_hash,
-        "reward_arc": REWARD_PER_ATTESTATION_ARC,
-        "included": false,
-        "submitted": false,
-        "active_validator_count": active_validator_count,
-        "required_validator_approvals": required_validator_approvals,
-        "approval_policy": "strictly more than two thirds of active validator identities and active stake, with distinct Ed25519 signers",
-        "reason": "result verified locally, but no authenticated validator-to-validator protocol currently collects independent signatures over the common CommunityInferenceReward approval commitment; no reward transaction was constructed or submitted",
-        "operator_action": "keep issuance closed until validators implement peer-authenticated independent recomputation and approval aggregation; do not add a public signing endpoint",
-    })
-}
-
 fn community_job_id(
     validator_address: &Hash256,
     boot_epoch: &Hash256,
-    input: &str,
+    model_id: &Hash256,
+    input_hash: &Hash256,
     max_tokens: u32,
     nonce: u64,
 ) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ARC-community-job-v3");
-    hasher.update(validator_address.as_ref());
-    hasher.update(boot_epoch.as_ref());
-    hasher.update(input.as_bytes());
-    hasher.update(&max_tokens.to_le_bytes());
-    hasher.update(&nonce.to_le_bytes());
-    hex::encode(hasher.finalize().as_bytes())
+    arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+        validator_address,
+        boot_epoch,
+        nonce,
+        model_id,
+        input_hash,
+        max_tokens,
+    )
+    .to_hex()
 }
 
 /// Push a whole-prompt job onto the community work queue and await the
@@ -4851,11 +4900,11 @@ async fn dispatch_to_community_worker(
             "community max_tokens must be in 1..={INFERENCE_RUN_MAX_TOKENS}, got {max_tokens}"
         ));
     }
-    let model_id = model_id_hint
+    let model_id_hash = model_id_hint
         .as_deref()
         .ok_or_else(|| "community dispatch requires an exact model artifact commitment".to_string())
         .and_then(|value| parse_hash256_hex(value, "model_id"))?;
-    let model_id = format!("0x{}", model_id.to_hex());
+    let model_id = format!("0x{}", model_id_hash.to_hex());
     let tx = node
         .community_work_tx
         .as_ref()
@@ -4871,10 +4920,12 @@ async fn dispatch_to_community_worker(
     // nonce so identical concurrent prompts—and two coordinators issuing the
     // same prompt—still receive distinct job commitments.
     let nonce = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
+    let input_hash = arc_crypto::hash_bytes(input.as_bytes());
     let job_id = community_job_id(
         &node.validator_address,
         &node.community_job_epoch,
-        &input,
+        &model_id_hash,
+        &input_hash,
         max_tokens,
         nonce,
     );
@@ -4885,6 +4936,10 @@ async fn dispatch_to_community_worker(
         input,
         max_tokens,
         model_id: Some(model_id),
+        transaction_domain: node
+            .state
+            .transaction_domain_hash()
+            .map(|domain| format!("0x{}", domain.to_hex())),
         submitted_at_unix_ms: submitted_at,
     };
 
@@ -4893,6 +4948,8 @@ async fn dispatch_to_community_worker(
         job_id.clone(),
         PendingCommunityWork {
             item: item.clone(),
+            assignment_epoch: node.community_job_epoch,
+            job_nonce: nonce,
             assigned_worker: None,
             sender: osh_tx,
         },
@@ -5535,6 +5592,7 @@ async fn worker_earnings(
     let mut last_block: Option<u64> = None;
     let mut first_block: Option<u64> = None;
     let mut last_tx_hash: Option<String> = None;
+    let mut confirmed_receipts: Vec<(u64, Value)> = Vec::new();
 
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
@@ -5560,7 +5618,32 @@ async fn worker_earnings(
         if first_block.map(|cur| bh < cur).unwrap_or(true) {
             first_block = Some(bh);
         }
+        confirmed_receipts.push((
+            bh,
+            json!({
+                "tx_type": "0x25",
+                "tx_hash": format!("0x{}", hex::encode(entry.key())),
+                "job_id": format!("0x{}", body.job_id.to_hex()),
+                "model_id": format!("0x{}", body.model_id.to_hex()),
+                "input_hash": format!("0x{}", body.input_hash.to_hex()),
+                "output_hash": format!("0x{}", body.output_hash.to_hex()),
+                "assignment_epoch": format!("0x{}", body.assignment_epoch.to_hex()),
+                "recovery_epoch": body.recovery_epoch,
+                "validator_set_id": body.validator_set_id,
+                "transaction_domain": format!("0x{}", body.transaction_domain.to_hex()),
+                "block_height": receipt.block_height,
+                "block_hash": format!("0x{}", receipt.block_hash.to_hex()),
+                "success": true,
+                "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
+                "reward_arc": REWARD_PER_ATTESTATION_ARC,
+            }),
+        ));
     }
+    confirmed_receipts.sort_unstable_by_key(|(height, _)| *height);
+    let confirmed_receipts: Vec<Value> = confirmed_receipts
+        .into_iter()
+        .map(|(_, receipt)| receipt)
+        .collect();
 
     // Every successful reward receipt transfers the fixed protocol amount.
     // This retained-window total can undercount older history on non-archive
@@ -5599,6 +5682,42 @@ async fn worker_earnings(
         _ => None,
     };
     let rate = attestations_per_day_observed(count, first_ts, last_ts);
+    let reward_base = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+    let confirmed_gross_base = count.checked_mul(reward_base);
+    let treasury_balance = node
+        .state
+        .get_account(&arc_types::transaction::faucet_pool_address())
+        .map(|account| account.balance);
+    let remaining = treasury_balance.and_then(|balance| rewards_remaining(balance, reward_base));
+    let projected_daily_arc =
+        if community_rewards_v1_effective(&node) && remaining.is_some_and(|value| value > 0) {
+            rate.as_ref()
+                .ok()
+                .map(|observed| *observed * REWARD_PER_ATTESTATION_ARC)
+        } else {
+            None
+        };
+    let projected_daily_unavailable_reason = if projected_daily_arc.is_some() {
+        Value::Null
+    } else if !community_rewards_v1_effective(&node) {
+        Value::String(
+            "active reward policy is not issuance-ready on this node; no forward earnings projection is permitted"
+                .to_string(),
+        )
+    } else if !remaining.is_some_and(|value| value > 0) {
+        Value::String(
+            "treasury cannot be proven to fund another full reward; projection is unavailable"
+                .to_string(),
+        )
+    } else {
+        Value::String(
+            rate.as_ref()
+                .err()
+                .copied()
+                .unwrap_or("confirmed receipt rate is unavailable")
+                .to_string(),
+        )
+    };
 
     // "Today" is null, not invented.
     //
@@ -5614,6 +5733,11 @@ async fn worker_earnings(
         "address": format!("0x{}", trimmed),
         "total_rewards": count,
         "total_attestations": count,
+        "confirmed_receipts": confirmed_receipts,
+        "confirmed_receipt_count": count,
+        "confirmed_gross_earnings_base": confirmed_gross_base,
+        "confirmed_gross_earnings_arc": confirmed_gross_base
+            .map(|value| value as f64 / arc_types::economics::ARC_BASE_UNITS as f64),
         // Actual wallet balance, not an earnings total.
         "onchain_balance": onchain_balance,
         "onchain_balance_arc": onchain_balance_arc,
@@ -5632,12 +5756,22 @@ async fn worker_earnings(
             "per-attestation timestamps are not exposed by this endpoint yet \
              (needs a block_height -> block timestamp join)",
         "reward_per_attestation_arc": REWARD_PER_ATTESTATION_ARC,
+        "projected_daily_arc": projected_daily_arc,
+        "projected_daily_unavailable_reason": projected_daily_unavailable_reason,
+        "projection_policy": "observed confirmed-receipt rate × explicit active 0x25 reward amount; unavailable unless issuance is ready and treasury funds at least one full reward",
+        "validator_set_id": reward_recovery_validator_set_id(&node),
+        "validator_set_commitment": reward_validator_set_id(&node),
+        "recovery_epoch": reward_recovery_epoch(&node),
+        "worker_min_stake_base": arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+        "stake_zero_eligible": arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE == 0,
         "community_rewards_v1_enabled": community_rewards_v1_effective(&node),
         "community_rewards_v1_protocol_active": community_rewards_v1_protocol_active(&node),
         "community_rewards_v1_approval_collection_ready": COMMUNITY_REWARD_APPROVAL_COLLECTION_READY,
         "community_rewards_v1_activation_height": node.state.community_rewards_v1_activation_height(),
         "community_rewards_v1_issuance_enabled": node.community_rewards_v1_enabled,
         "community_rewards_v1_note": community_rewards_v1_readiness_note(&node),
+        "validator_set_size_required": arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
+        "validator_approvals_required": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
         // Base units too, so a client can do the whole projection in integers
         // and never round. Same constant arc-state credits on apply.
         "reward_per_attestation_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
@@ -8997,8 +9131,8 @@ pub struct CommunitySignedRequest<T> {
     pub signature: arc_crypto::Signature,
 }
 
-trait CommunityWorkerPayload {
-    fn worker_id(&self) -> &str;
+trait CommunityAuthenticatedPayload {
+    fn signer_id(&self) -> &str;
 }
 
 fn community_unix_ms() -> Result<u64, String> {
@@ -9076,7 +9210,7 @@ fn authenticate_community_request<T>(
     signed: CommunitySignedRequest<T>,
 ) -> Result<T, (StatusCode, String)>
 where
-    T: Serialize + CommunityWorkerPayload,
+    T: Serialize + CommunityAuthenticatedPayload,
 {
     if signed.version != COMMUNITY_AUTH_VERSION {
         return Err((
@@ -9115,10 +9249,10 @@ where
         ));
     }
 
-    let claimed_worker_id = signed.payload.worker_id();
-    let worker_hex = claimed_worker_id
+    let claimed_signer_id = signed.payload.signer_id();
+    let worker_hex = claimed_signer_id
         .strip_prefix("0x")
-        .unwrap_or(claimed_worker_id);
+        .unwrap_or(claimed_signer_id);
     let worker_address = Hash256::from_hex(worker_hex).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -9144,7 +9278,7 @@ where
         .map_err(|_| {
             (
                 StatusCode::UNAUTHORIZED,
-                "community request signature does not prove control of worker_id".to_string(),
+                "community request signature does not prove control of signer_id".to_string(),
             )
         })?;
 
@@ -9181,8 +9315,8 @@ pub struct CommunityRegisterRequest {
     pub platform: String,
 }
 
-impl CommunityWorkerPayload for CommunityRegisterRequest {
-    fn worker_id(&self) -> &str {
+impl CommunityAuthenticatedPayload for CommunityRegisterRequest {
+    fn signer_id(&self) -> &str {
         &self.worker_id
     }
 }
@@ -9288,8 +9422,8 @@ pub struct CommunityHeartbeatRequest {
     pub work_completed: Option<u64>,
 }
 
-impl CommunityWorkerPayload for CommunityHeartbeatRequest {
-    fn worker_id(&self) -> &str {
+impl CommunityAuthenticatedPayload for CommunityHeartbeatRequest {
+    fn signer_id(&self) -> &str {
         &self.worker_id
     }
 }
@@ -9463,6 +9597,10 @@ pub struct WorkItem {
     /// workers serving the same model will accept the job.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Protocol-v3 transaction signing domain advertised by the coordinator.
+    /// Absent on legacy/dev networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_domain: Option<String>,
     /// Unix timestamp (ms) when the dispatcher queued the job. Workers
     /// echo this back so the dispatcher can compute end-to-end latency.
     pub submitted_at_unix_ms: i64,
@@ -9476,8 +9614,37 @@ pub struct WorkItem {
 /// signed attestation that is unrelated to work the coordinator issued.
 pub struct PendingCommunityWork {
     item: WorkItem,
+    assignment_epoch: Hash256,
+    job_nonce: u64,
     assigned_worker: Option<String>,
     sender: tokio::sync::oneshot::Sender<CommunityDispatchOutcome>,
+}
+
+#[derive(Debug, Clone)]
+struct CommunityRewardSubmission {
+    worker: Hash256,
+    output_hash: Hash256,
+    tx_hash: Hash256,
+    approvals: usize,
+}
+
+/// Authenticated coordinator-to-validator approval request. The prompt and
+/// output are required because each validator recomputes independently; the
+/// reward body contains only their commitments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommunityRewardApprovalPayload {
+    coordinator_id: String,
+    reward: arc_types::transaction::CommunityInferenceRewardBody,
+    input: String,
+    output: String,
+    tokens_generated: u64,
+}
+
+impl CommunityAuthenticatedPayload for CommunityRewardApprovalPayload {
+    fn signer_id(&self) -> &str {
+        &self.coordinator_id
+    }
 }
 
 /// Evidence created only after the coordinator independently recomputes a
@@ -9593,8 +9760,8 @@ pub struct WorkResult {
     pub signed_attestation_hex: Option<String>,
 }
 
-impl CommunityWorkerPayload for WorkResult {
-    fn worker_id(&self) -> &str {
+impl CommunityAuthenticatedPayload for WorkResult {
+    fn signer_id(&self) -> &str {
         &self.worker_id
     }
 }
@@ -9871,6 +10038,490 @@ async fn verify_community_result_with_quorum(
     })
 }
 
+fn validate_reward_approval_payload(
+    node: &NodeState,
+    payload: &CommunityRewardApprovalPayload,
+) -> Result<(WorkItem, WorkResult), String> {
+    use arc_types::transaction::{
+        COMMUNITY_REWARD_MIN_WORKER_STAKE, COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
+        CommunityInferenceRewardBody,
+    };
+
+    if !community_rewards_v1_protocol_active(node) {
+        return Err("community reward protocol is not active".to_string());
+    }
+    reward_approval_prerequisites(node).map_err(str::to_string)?;
+    if !payload.reward.validator_approvals.is_empty() {
+        return Err("approval candidate must not contain pre-collected approvals".to_string());
+    }
+    if payload.reward.chain_domain != CommunityInferenceRewardBody::expected_chain_domain() {
+        return Err("reward candidate has the wrong chain domain".to_string());
+    }
+    match node.state.recovery_context() {
+        Some(context)
+            if payload.reward.recovery_epoch == context.recovery_epoch
+                && payload.reward.validator_set_id == context.validator_set_id
+                && payload.reward.transaction_domain == context.domain_hash() => {}
+        Some(_) => {
+            return Err(
+                "reward candidate is not bound to this validator's recovery epoch, validator-set ID, and transaction domain"
+                    .to_string(),
+            );
+        }
+        None if payload.reward.recovery_epoch == 0
+            && payload.reward.validator_set_id == 0
+            && payload.reward.transaction_domain == Hash256::ZERO => {}
+        None => {
+            return Err(
+                "reward candidate carries a recovery binding on legacy/dev state".to_string(),
+            );
+        }
+    }
+    let coordinator = parse_hash256_hex(&payload.coordinator_id, "coordinator_id")?;
+    if coordinator != payload.reward.coordinator || !node.state.is_validator(&coordinator) {
+        return Err("request signer is not the active assignment coordinator".to_string());
+    }
+    if payload.reward.assignment_epoch == Hash256::ZERO {
+        return Err("assignment_epoch cannot be zero".to_string());
+    }
+    let active = node.state.active_validators();
+    if active.len() != COMMUNITY_REWARD_VALIDATOR_SET_SIZE {
+        return Err(format!(
+            "reward approval requires exactly {COMMUNITY_REWARD_VALIDATOR_SET_SIZE} active validators, found {}",
+            active.len()
+        ));
+    }
+    let local_key = node
+        .validator_keypair
+        .as_ref()
+        .ok_or_else(|| "local validator key is unavailable".to_string())?;
+    if local_key.address() != node.validator_address
+        || !node.state.is_validator(&node.validator_address)
+        || !matches!(local_key.as_ref(), arc_crypto::KeyPair::Ed25519(_))
+    {
+        return Err("local approval key is not an active Ed25519 validator".to_string());
+    }
+    let (_, local_model_id) = exact_model_identity(node)?;
+    if payload.reward.model_id != local_model_id {
+        return Err(
+            "reward model_id does not match this validator's exact model artifact".to_string(),
+        );
+    }
+    if arc_crypto::hash_bytes(payload.input.as_bytes()) != payload.reward.input_hash {
+        return Err("reward input_hash does not match the supplied prompt".to_string());
+    }
+    if payload.tokens_generated == 0
+        || payload.tokens_generated > u64::from(payload.reward.max_tokens)
+    {
+        return Err("tokens_generated is outside the assigned token ceiling".to_string());
+    }
+    let expected_job_id = CommunityInferenceRewardBody::derive_job_id(
+        &payload.reward.coordinator,
+        &payload.reward.assignment_epoch,
+        payload.reward.job_nonce,
+        &payload.reward.model_id,
+        &payload.reward.input_hash,
+        payload.reward.max_tokens,
+    );
+    if payload.reward.job_id != expected_job_id {
+        return Err("job_id does not match the exact assignment commitment".to_string());
+    }
+    let height = node.state.height();
+    if payload.reward.expires_at_height < height
+        || payload.reward.expires_at_height > height.saturating_add(COMMUNITY_REWARD_EXPIRY_BLOCKS)
+    {
+        return Err("reward expiry is outside the active bounded approval window".to_string());
+    }
+    let worker_stake = node
+        .state
+        .get_validator_stake(&payload.reward.worker)
+        .unwrap_or(0);
+    if worker_stake < COMMUNITY_REWARD_MIN_WORKER_STAKE {
+        return Err(format!(
+            "worker stake {worker_stake} is below active policy minimum {COMMUNITY_REWARD_MIN_WORKER_STAKE}"
+        ));
+    }
+    let job_marker = CommunityInferenceRewardBody::marker_address(
+        &payload.reward.chain_domain,
+        &payload.reward.job_id,
+    );
+    let certificate_marker = CommunityInferenceRewardBody::certificate_marker_address(
+        &payload.reward.chain_domain,
+        &payload.reward.worker,
+        &payload.reward.worker_certificate.attestation_hash,
+    );
+    if node.state.get_account(&job_marker).is_some()
+        || node.state.get_account(&certificate_marker).is_some()
+    {
+        return Err("job or worker certificate already has a mined reward receipt".to_string());
+    }
+
+    let work_item = WorkItem {
+        job_id: payload.reward.job_id.to_hex(),
+        input: payload.input.clone(),
+        max_tokens: payload.reward.max_tokens,
+        model_id: Some(format!("0x{}", payload.reward.model_id.to_hex())),
+        transaction_domain: node
+            .state
+            .transaction_domain_hash()
+            .map(|domain| format!("0x{}", domain.to_hex())),
+        submitted_at_unix_ms: 0,
+    };
+    let result = WorkResult {
+        job_id: work_item.job_id.clone(),
+        worker_id: format!("0x{}", payload.reward.worker.to_hex()),
+        success: true,
+        declined: false,
+        output: payload.output.clone(),
+        output_hash: format!("0x{}", payload.reward.output_hash.to_hex()),
+        tokens_generated: payload.tokens_generated,
+        total_ms: 0,
+        ms_per_token: 0,
+        engine: "validator-independent-recompute".to_string(),
+        error: None,
+        signed_attestation_hex: None,
+    };
+    let worker_attestation = payload.reward.reconstruct_worker_attestation();
+    node.state
+        .verify_transaction_signature(&worker_attestation)
+        .map_err(|_| "worker certificate signature is invalid".to_string())?;
+    validate_worker_attestation_for_job(
+        &worker_attestation,
+        &work_item,
+        payload.reward.output_hash,
+    )?;
+    Ok((work_item, result))
+}
+
+async fn approve_community_reward_payload(
+    node: &NodeState,
+    payload: &CommunityRewardApprovalPayload,
+) -> Result<arc_types::transaction::CommunityRewardValidatorApproval, String> {
+    let (work_item, result) = validate_reward_approval_payload(node, payload)?;
+    let verified = verify_community_result_with_quorum(node, &work_item, &result).await?;
+    if verified.output_hash != payload.reward.output_hash
+        || verified.tokens_generated != payload.tokens_generated as usize
+    {
+        return Err("independent recomputation did not match the reward commitment".to_string());
+    }
+
+    sign_validated_reward_approval(node, &payload.reward)
+}
+
+fn sign_validated_reward_approval(
+    node: &NodeState,
+    reward: &arc_types::transaction::CommunityInferenceRewardBody,
+) -> Result<arc_types::transaction::CommunityRewardValidatorApproval, String> {
+    use dashmap::mapref::entry::Entry;
+
+    let commitment = reward.validator_approval_commitment();
+    let mut inserted_job = false;
+    match node.community_reward_approval_jobs.entry(reward.job_id) {
+        Entry::Occupied(entry) if *entry.get() != commitment => {
+            return Err(
+                "validator already approved a different commitment for this job".to_string(),
+            );
+        }
+        Entry::Occupied(_) => {}
+        Entry::Vacant(entry) => {
+            entry.insert(commitment);
+            inserted_job = true;
+        }
+    }
+    match node
+        .community_reward_approval_certificates
+        .entry(reward.worker_certificate.attestation_hash)
+    {
+        Entry::Occupied(entry) if *entry.get() != commitment => {
+            if inserted_job {
+                node.community_reward_approval_jobs.remove(&reward.job_id);
+            }
+            return Err(
+                "validator already approved a different job for this worker certificate"
+                    .to_string(),
+            );
+        }
+        Entry::Occupied(_) => {}
+        Entry::Vacant(entry) => {
+            entry.insert(commitment);
+        }
+    }
+
+    let key = node.validator_keypair.as_ref().expect("validated above");
+    let signature = key
+        .sign(&commitment)
+        .map_err(|error| format!("sign reward approval: {error}"))?;
+    arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+        node.validator_address,
+        signature,
+    )
+    .ok_or_else(|| "reward approvals require Ed25519 validators".to_string())
+}
+
+async fn community_reward_approve_signed(
+    AxumState(node): AxumState<NodeState>,
+    Json(signed): Json<CommunitySignedRequest<CommunityRewardApprovalPayload>>,
+) -> Result<Json<arc_types::transaction::CommunityRewardValidatorApproval>, (StatusCode, String)> {
+    let payload = authenticate_community_request(&node, COMMUNITY_REWARD_APPROVE_PATH, signed)?;
+    approve_community_reward_payload(&node, &payload)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))
+}
+
+fn validate_collected_reward_approvals(
+    node: &NodeState,
+    body: &arc_types::transaction::CommunityInferenceRewardBody,
+    approvals: Vec<arc_types::transaction::CommunityRewardValidatorApproval>,
+) -> Result<Vec<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    use arc_types::transaction::{
+        COMMUNITY_REWARD_APPROVALS_REQUIRED, COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
+    };
+    let active = node.state.active_validators();
+    if active.len() != COMMUNITY_REWARD_VALIDATOR_SET_SIZE {
+        return Err(format!(
+            "active reward committee has {} validators; exactly {COMMUNITY_REWARD_VALIDATOR_SET_SIZE} required",
+            active.len()
+        ));
+    }
+    let active_stakes: HashMap<[u8; 32], u64> = active
+        .iter()
+        .map(|(address, stake)| (address.0, *stake))
+        .collect();
+    let total_stake: u128 = active.iter().map(|(_, stake)| u128::from(*stake)).sum();
+    let required_stake = total_stake * 2 / 3 + 1;
+    let commitment = body.validator_approval_commitment();
+    let mut unique = HashMap::new();
+    for approval in approvals {
+        let Some(stake) = active_stakes.get(&approval.validator.0) else {
+            continue;
+        };
+        if approval
+            .as_signature()
+            .verify(&commitment, &approval.validator)
+            .is_ok()
+        {
+            unique
+                .entry(approval.validator.0)
+                .or_insert((approval, *stake));
+        }
+    }
+    if unique.len() < COMMUNITY_REWARD_APPROVALS_REQUIRED {
+        return Err(format!(
+            "collected {} valid independent approvals; {COMMUNITY_REWARD_APPROVALS_REQUIRED} of {COMMUNITY_REWARD_VALIDATOR_SET_SIZE} required",
+            unique.len()
+        ));
+    }
+    let approved_stake: u128 = unique.values().map(|(_, stake)| u128::from(*stake)).sum();
+    if approved_stake < required_stake {
+        return Err(format!(
+            "approval identities reached 5-of-6 but approved stake {approved_stake} is below strict two-thirds threshold {required_stake}"
+        ));
+    }
+    let mut collected: Vec<_> = unique.into_values().map(|(approval, _)| approval).collect();
+    collected.sort_unstable_by_key(|approval| approval.validator.0);
+    Ok(collected)
+}
+
+async fn collect_community_reward_approvals(
+    node: &NodeState,
+    payload: CommunityRewardApprovalPayload,
+) -> Result<Vec<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    let coordinator_key = node
+        .validator_keypair
+        .as_ref()
+        .ok_or_else(|| "coordinator validator key is unavailable".to_string())?;
+    // The coordinator completed `verify_community_result_with_quorum`
+    // immediately before entering this private collector. Revalidate every
+    // signed semantic here, then reuse that independent computation for its
+    // one local vote. Remote validators still execute the full recomputation
+    // endpoint in parallel; rerunning the coordinator a second time would add
+    // latency without adding an independent identity.
+    validate_reward_approval_payload(node, &payload)?;
+    let local = sign_validated_reward_approval(node, &payload.reward)?;
+    let mut approvals = vec![local];
+    let mut requests = tokio::task::JoinSet::new();
+    for seed in node.seed_rpc_addrs.iter() {
+        let signed = sign_community_request(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            payload.clone(),
+            coordinator_key,
+        )?;
+        let client = node.inference_http.clone();
+        let url = format!("http://{seed}{COMMUNITY_REWARD_APPROVE_PATH}");
+        requests.spawn(async move {
+            let response = client
+                .post(url)
+                .timeout(std::time::Duration::from_secs(
+                    MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS,
+                ))
+                .json(&signed)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("validator returned HTTP {}", response.status()));
+            }
+            response
+                .json::<arc_types::transaction::CommunityRewardValidatorApproval>()
+                .await
+                .map_err(|error| error.to_string())
+        });
+    }
+    while let Some(joined) = requests.join_next().await {
+        if let Ok(Ok(approval)) = joined {
+            approvals.push(approval);
+            if let Ok(collected) =
+                validate_collected_reward_approvals(node, &payload.reward, approvals.clone())
+            {
+                // A dead sixth endpoint must not hold an already-authorized
+                // five-of-six reward open until the per-peer timeout.
+                requests.abort_all();
+                return Ok(collected);
+            }
+        }
+    }
+    validate_collected_reward_approvals(node, &payload.reward, approvals)
+}
+
+async fn submit_verified_community_reward(
+    node: &NodeState,
+    work_item: &WorkItem,
+    assignment_epoch: Hash256,
+    job_nonce: u64,
+    result: &WorkResult,
+    worker_attestation: &arc_types::Transaction,
+    dispatcher: &tokio::sync::oneshot::Sender<CommunityDispatchOutcome>,
+) -> Result<Value, String> {
+    use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
+
+    reward_approval_prerequisites(node).map_err(str::to_string)?;
+    let worker = parse_hash256_hex(&result.worker_id, "worker_id")?;
+    let job_id = parse_hash256_hex(&work_item.job_id, "job_id")?;
+    let model_id = work_item
+        .model_id
+        .as_deref()
+        .ok_or_else(|| "reward assignment has no exact model_id".to_string())
+        .and_then(|value| parse_hash256_hex(value, "model_id"))?;
+    let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")?;
+    let input_hash = arc_crypto::hash_bytes(work_item.input.as_bytes());
+    let arc_types::TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+        return Err("worker certificate is not an inference attestation".to_string());
+    };
+    let expires_at_height = node
+        .state
+        .height()
+        .checked_add(COMMUNITY_REWARD_EXPIRY_BLOCKS)
+        .ok_or_else(|| "reward expiry height overflow".to_string())?;
+    let recovery = node.state.recovery_context();
+    let reward = CommunityInferenceRewardBody {
+        chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+        job_id,
+        coordinator: node.validator_address,
+        assignment_epoch,
+        job_nonce,
+        recovery_epoch: recovery
+            .as_ref()
+            .map(|context| context.recovery_epoch)
+            .unwrap_or(0),
+        validator_set_id: recovery
+            .as_ref()
+            .map(|context| context.validator_set_id)
+            .unwrap_or(0),
+        transaction_domain: recovery
+            .as_ref()
+            .map(|context| context.domain_hash())
+            .unwrap_or(Hash256::ZERO),
+        worker,
+        model_id,
+        input_hash,
+        output_hash,
+        max_tokens: work_item.max_tokens,
+        expires_at_height,
+        worker_certificate: WorkerInferenceCertificate {
+            attestation_hash: worker_attestation.hash,
+            nonce: worker_attestation.nonce,
+            challenge_period: attestation.challenge_period,
+            signature: worker_attestation.signature.clone(),
+        },
+        validator_approvals: Vec::new(),
+    };
+    let expected_job_id = CommunityInferenceRewardBody::derive_job_id(
+        &reward.coordinator,
+        &reward.assignment_epoch,
+        reward.job_nonce,
+        &reward.model_id,
+        &reward.input_hash,
+        reward.max_tokens,
+    );
+    if reward.job_id != expected_job_id {
+        return Err(
+            "pending job metadata does not reproduce its assignment commitment".to_string(),
+        );
+    }
+    let payload = CommunityRewardApprovalPayload {
+        coordinator_id: format!("0x{}", node.validator_address.to_hex()),
+        reward,
+        input: work_item.input.clone(),
+        output: result.output.clone(),
+        tokens_generated: result.tokens_generated,
+    };
+    let approvals = collect_community_reward_approvals(node, payload.clone()).await?;
+    if dispatcher.is_closed() {
+        return Err(
+            "dispatcher expired while validator approvals were being collected".to_string(),
+        );
+    }
+    let approval_count = approvals.len();
+    let mut reward = payload.reward;
+    reward.validator_approvals = approvals;
+
+    let key = node
+        .validator_keypair
+        .as_ref()
+        .ok_or_else(|| "coordinator validator key is unavailable".to_string())?;
+    let mut tx = arc_types::Transaction::new_community_inference_reward(
+        node.validator_address,
+        job_nonce,
+        reward,
+    );
+    node.state
+        .sign_transaction(&mut tx, key)
+        .map_err(|error| format!("sign community reward transaction: {error}"))?;
+    let tx_hash = tx.hash;
+    node.mempool
+        .insert(tx)
+        .map_err(|error| format!("submit community reward to mempool: {error}"))?;
+    node.community_reward_submissions.insert(
+        job_id,
+        CommunityRewardSubmission {
+            worker,
+            output_hash,
+            tx_hash,
+            approvals: approval_count,
+        },
+    );
+    Ok(json!({
+        "status": "pending_mined_receipt",
+        "tx_type": "0x25",
+        "tx_hash": format!("0x{}", tx_hash.to_hex()),
+        "job_id": format!("0x{}", job_id.to_hex()),
+        "assignment_epoch": format!("0x{}", assignment_epoch.to_hex()),
+        "recovery_epoch": reward_recovery_epoch(node),
+        "validator_set_id": reward_recovery_validator_set_id(node),
+        "validator_set_commitment": reward_validator_set_id(node),
+        "transaction_domain": node.state.transaction_domain_hash().map(|domain| format!("0x{}", domain.to_hex())),
+        "validator_approvals": approval_count,
+        "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+        "submitted": true,
+        "included": false,
+        "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
+        "reward_arc": REWARD_PER_ATTESTATION_ARC,
+        "receipt_url": format!("/community/reward_receipt/0x{}", tx_hash.to_hex()),
+        "evidence_note": "payment is not earned until this exact 0x25 transaction has a successful mined receipt",
+    }))
+}
+
 fn default_true() -> bool {
     true
 }
@@ -9888,8 +10539,8 @@ pub struct ClaimWorkRequest {
     pub model_id: String,
 }
 
-impl CommunityWorkerPayload for ClaimWorkRequest {
-    fn worker_id(&self) -> &str {
+impl CommunityAuthenticatedPayload for ClaimWorkRequest {
+    fn signer_id(&self) -> &str {
         &self.worker_id
     }
 }
@@ -10141,6 +10792,57 @@ pub async fn community_submit_work(
         "work results map not initialized - coordinator not running".to_string(),
     ))?;
 
+    // Freshly signed retries are idempotent after a reward entered the
+    // mempool. A retry may retrieve status, but cannot change worker/output.
+    if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id")
+        && let Some(submission) = node.community_reward_submissions.get(&job_hash)
+    {
+        let worker = parse_hash256_hex(&result.worker_id, "worker_id")
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        if worker != submission.worker || output_hash != submission.output_hash {
+            return Err((
+                StatusCode::CONFLICT,
+                "job already submitted with different worker or output semantics".to_string(),
+            ));
+        }
+        return Ok(Json(json!({
+            "ok": true,
+            "idempotent_replay": true,
+            "job_id": result.job_id,
+            "settlement": {
+                "status": "pending_mined_receipt",
+                "tx_type": "0x25",
+                "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
+                "validator_approvals": submission.approvals,
+                "included": false,
+                "submitted": true,
+                "receipt_url": format!("/community/reward_receipt/0x{}", submission.tx_hash.to_hex()),
+            }
+        })));
+    }
+    if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id")
+        && let Some((tx_hash, body)) = mined_reward_for_job(&node, job_hash)
+    {
+        let worker = parse_hash256_hex(&result.worker_id, "worker_id")
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        if worker != body.worker || output_hash != body.output_hash {
+            return Err((
+                StatusCode::CONFLICT,
+                "mined job has different worker or output semantics".to_string(),
+            ));
+        }
+        return Ok(Json(json!({
+            "ok": true,
+            "idempotent_replay": true,
+            "job_id": result.job_id,
+            "settlement": community_reward_receipt_value(&node, tx_hash, &body),
+        })));
+    }
+
     let (work_item, assigned_worker) = match results_map.get(&result.job_id) {
         Some(pending) => (pending.item.clone(), pending.assigned_worker.clone()),
         None => {
@@ -10188,8 +10890,12 @@ pub async fn community_submit_work(
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         match result.signed_attestation_hex.as_ref() {
             Some(hex_bytes) => {
-                let tx = decode_and_verify_worker_attestation(hex_bytes, &result.worker_id)
-                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+                let tx = decode_and_verify_worker_attestation_in_domain(
+                    hex_bytes,
+                    &result.worker_id,
+                    node.state.transaction_domain_hash(),
+                )
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
                 validate_worker_attestation_for_job(&tx, &work_item, output_hash)
                     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
                 Some(tx)
@@ -10260,14 +10966,6 @@ pub async fn community_submit_work(
         ));
     }
 
-    // Reward-v1 requires a common approval commitment signed by a strict
-    // supermajority of independent active validators. The shard responses
-    // above sign per-hop transcripts; they are evidence for this coordinator,
-    // but cannot safely be repurposed as reward approvals. Until an
-    // authenticated validator-to-validator approval protocol exists, do not
-    // construct an under-threshold transaction and do not expose an HTTP
-    // signing oracle. Verified work still reaches the caller with an explicit
-    // fail-closed settlement status.
     let settlement_outcome = if let Some(worker_attestation) = verified_attestation {
         let worker_attestation_hash = format!("0x{}", worker_attestation.hash.to_hex());
         if !community_rewards_v1_protocol_active(&node) {
@@ -10278,29 +10976,35 @@ pub async fn community_submit_work(
                 "included": false,
                 "reason": "result verified, but reward issuance requires both the genesis-committed activation height and the local issuance switch",
             }))
-        } else if node.validator_keypair.is_none() {
-            Some(json!({
-                "status": "reward_unavailable",
-                "worker_attestation_hash": worker_attestation_hash,
-                "reward_arc": REWARD_PER_ATTESTATION_ARC,
-                "included": false,
-                "reason": "coordinator validator key is not configured",
-            }))
         } else {
-            let active_validator_count = node.state.active_validators().len();
-            let required_validator_approvals =
-                reward_validator_identity_threshold(active_validator_count);
-            tracing::warn!(
-                worker = %result.worker_id,
-                job_id = %job_id,
-                active_validator_count,
-                required_validator_approvals,
-                "verified community reward withheld: independent approval collection is not implemented"
-            );
-            Some(reward_quorum_approval_unavailable(
-                &worker_attestation_hash,
-                active_validator_count,
-            ))
+            match submit_verified_community_reward(
+                &node,
+                &work_item,
+                pending.assignment_epoch,
+                pending.job_nonce,
+                &result,
+                &worker_attestation,
+                &pending.sender,
+            )
+            .await
+            {
+                Ok(mut settlement) => {
+                    settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
+                    Some(settlement)
+                }
+                Err(reason) => Some(json!({
+                    "status": "reward_approval_quorum_unavailable",
+                    "worker_attestation_hash": worker_attestation_hash,
+                    "reward_arc": REWARD_PER_ATTESTATION_ARC,
+                    "included": false,
+                    "submitted": false,
+                    "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+                    "recovery_epoch": reward_recovery_epoch(&node),
+                    "validator_set_id": reward_recovery_validator_set_id(&node),
+                    "validator_set_commitment": reward_validator_set_id(&node),
+                    "reason": reason,
+                })),
+            }
         }
     } else if result.success {
         Some(json!({
@@ -10348,6 +11052,180 @@ pub async fn community_submit_work(
         "verification": verification_summary,
         "settlement": settlement_outcome,
     })))
+}
+
+fn mined_reward_for_job(
+    node: &NodeState,
+    job_id: Hash256,
+) -> Option<(
+    Hash256,
+    arc_types::transaction::CommunityInferenceRewardBody,
+)> {
+    node.state.full_transactions.iter().find_map(|entry| {
+        let arc_types::TxBody::CommunityInferenceReward(body) = &entry.value().body else {
+            return None;
+        };
+        (body.job_id == job_id).then(|| (Hash256(*entry.key()), body.clone()))
+    })
+}
+
+fn community_reward_receipt_value(
+    node: &NodeState,
+    tx_hash: Hash256,
+    body: &arc_types::transaction::CommunityInferenceRewardBody,
+) -> Value {
+    let receipt = node.state.get_receipt(&tx_hash.0);
+    let (status, included, confirmed) = match receipt.as_ref() {
+        Some(receipt) if receipt.success => ("mined_success", true, true),
+        Some(_) => ("mined_failed", true, false),
+        None => ("pending_mined_receipt", false, false),
+    };
+    json!({
+        "status": status,
+        "tx_type": "0x25",
+        "tx_hash": format!("0x{}", tx_hash.to_hex()),
+        "job_id": format!("0x{}", body.job_id.to_hex()),
+        "worker": format!("0x{}", body.worker.to_hex()),
+        "model_id": format!("0x{}", body.model_id.to_hex()),
+        "input_hash": format!("0x{}", body.input_hash.to_hex()),
+        "output_hash": format!("0x{}", body.output_hash.to_hex()),
+        "assignment_epoch": format!("0x{}", body.assignment_epoch.to_hex()),
+        "recovery_epoch": body.recovery_epoch,
+        "validator_set_id": body.validator_set_id,
+        "validator_set_commitment": reward_validator_set_id(node),
+        "transaction_domain": format!("0x{}", body.transaction_domain.to_hex()),
+        "validator_approvals": body.validator_approvals.len(),
+        "included": included,
+        "confirmed": confirmed,
+        "success": receipt.as_ref().map(|receipt| receipt.success),
+        "block_height": receipt.as_ref().map(|receipt| receipt.block_height),
+        "block_hash": receipt.as_ref().map(|receipt| format!("0x{}", receipt.block_hash.to_hex())),
+        "reward_base": if confirmed { Value::from(arc_types::economics::INFERENCE_ATTESTATION_REWARD) } else { Value::Null },
+        "reward_arc": if confirmed { Value::from(REWARD_PER_ATTESTATION_ARC) } else { Value::Null },
+        "evidence_source": if confirmed { "successful mined CommunityInferenceReward receipt" } else { "no successful mined receipt" },
+    })
+}
+
+async fn community_reward_receipt(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let tx_hash = parse_hash256_hex(&hash, "reward tx hash")
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    if let Some(tx) = node.state.full_transactions.get(&tx_hash.0) {
+        let arc_types::TxBody::CommunityInferenceReward(body) = &tx.body else {
+            return Err((
+                StatusCode::CONFLICT,
+                "transaction is not type 0x25".to_string(),
+            ));
+        };
+        return Ok(Json(community_reward_receipt_value(&node, tx_hash, body)));
+    }
+    let pending = node
+        .community_reward_submissions
+        .iter()
+        .find(|entry| entry.value().tx_hash == tx_hash)
+        .map(|entry| (*entry.key(), entry.value().clone()));
+    if let Some((job_id, submission)) = pending {
+        return Ok(Json(json!({
+            "status": "pending_mined_receipt",
+            "tx_type": "0x25",
+            "tx_hash": format!("0x{}", tx_hash.to_hex()),
+            "job_id": format!("0x{}", job_id.to_hex()),
+            "worker": format!("0x{}", submission.worker.to_hex()),
+            "validator_approvals": submission.approvals,
+            "recovery_epoch": reward_recovery_epoch(&node),
+            "validator_set_id": reward_recovery_validator_set_id(&node),
+            "validator_set_commitment": reward_validator_set_id(&node),
+            "included": false,
+            "confirmed": false,
+            "reward_base": Value::Null,
+            "reward_arc": Value::Null,
+            "evidence_source": "coordinator mempool submission only; no mined receipt",
+        })));
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        "reward transaction is unknown".to_string(),
+    ))
+}
+
+async fn community_reward_job(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let job_id =
+        parse_hash256_hex(&job_id, "job_id").map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    if let Some((tx_hash, body)) = mined_reward_for_job(&node, job_id) {
+        return Ok(Json(community_reward_receipt_value(&node, tx_hash, &body)));
+    }
+    if let Some(submission) = node.community_reward_submissions.get(&job_id) {
+        return Ok(Json(json!({
+            "status": "pending_mined_receipt",
+            "tx_type": "0x25",
+            "job_id": format!("0x{}", job_id.to_hex()),
+            "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
+            "worker": format!("0x{}", submission.worker.to_hex()),
+            "validator_approvals": submission.approvals,
+            "recovery_epoch": reward_recovery_epoch(&node),
+            "validator_set_id": reward_recovery_validator_set_id(&node),
+            "validator_set_commitment": reward_validator_set_id(&node),
+            "included": false,
+            "confirmed": false,
+        })));
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        "community reward job is unknown".to_string(),
+    ))
+}
+
+async fn community_reward_approval_status(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let job_id =
+        parse_hash256_hex(&job_id, "job_id").map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let commitment = node
+        .community_reward_approval_jobs
+        .get(&job_id)
+        .map(|entry| *entry.value());
+    Ok(Json(json!({
+        "job_id": format!("0x{}", job_id.to_hex()),
+        "locally_approved": commitment.is_some(),
+        "approval_commitment": commitment.map(|value| format!("0x{}", value.to_hex())),
+        "submitted": node.community_reward_submissions.contains_key(&job_id),
+        "validator_set_id": reward_recovery_validator_set_id(&node),
+        "validator_set_commitment": reward_validator_set_id(&node),
+        "recovery_epoch": reward_recovery_epoch(&node),
+    })))
+}
+
+async fn community_reward_policy(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let readiness_error = if community_rewards_v1_protocol_active(&node) {
+        reward_approval_prerequisites(&node).err()
+    } else {
+        Some(community_rewards_v1_readiness_note(&node))
+    };
+    Json(json!({
+        "schema": "arc.community.reward-policy.v1",
+        "tx_type": "0x25",
+        "protocol_active": community_rewards_v1_protocol_active(&node),
+        "issuance_ready": community_rewards_v1_effective(&node),
+        "readiness_unavailable_reason": readiness_error,
+        "active_validator_count": node.state.active_validators().len(),
+        "validator_set_size_required": arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
+        "validator_approvals_required": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+        "validator_set_id": reward_recovery_validator_set_id(&node),
+        "validator_set_commitment": reward_validator_set_id(&node),
+        "recovery_epoch": reward_recovery_epoch(&node),
+        "transaction_domain": node.state.transaction_domain_hash().map(|domain| format!("0x{}", domain.to_hex())),
+        "worker_min_stake_base": arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+        "stake_zero_eligible": arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE == 0,
+        "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
+        "reward_arc": REWARD_PER_ATTESTATION_ARC,
+        "earnings_evidence": "successful mined 0x25 receipts only",
+    }))
 }
 
 fn parse_hash256_hex(value: &str, field: &str) -> Result<Hash256, String> {
@@ -10418,6 +11296,14 @@ fn decode_and_verify_worker_attestation(
     hex_bytes: &str,
     expected_worker_id: &str,
 ) -> Result<arc_types::Transaction, String> {
+    decode_and_verify_worker_attestation_in_domain(hex_bytes, expected_worker_id, None)
+}
+
+fn decode_and_verify_worker_attestation_in_domain(
+    hex_bytes: &str,
+    expected_worker_id: &str,
+    recovery_domain: Option<Hash256>,
+) -> Result<arc_types::Transaction, String> {
     // Strip optional "0x" prefix so workers can encode either way.
     let trimmed = hex_bytes.trim_start_matches("0x");
     let raw = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
@@ -10451,8 +11337,11 @@ fn decode_and_verify_worker_attestation(
         ));
     }
 
-    tx.verify_signature()
-        .map_err(|e| format!("signature verify failed: {:?}", e))?;
+    match recovery_domain {
+        Some(domain) => tx.verify_signature_in_domain(&domain),
+        None => tx.verify_signature(),
+    }
+    .map_err(|e| format!("signature verify failed: {:?}", e))?;
 
     Ok(tx)
 }
@@ -11182,6 +12071,14 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
         "community_rewards_v1_activation_height": node.state.community_rewards_v1_activation_height(),
         "community_rewards_v1_issuance_enabled": node.community_rewards_v1_enabled,
         "community_rewards_v1_note": community_rewards_v1_readiness_note(&node),
+        "validator_set_size_required": arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
+        "validator_approvals_required": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+        "validator_set_id": reward_recovery_validator_set_id(&node),
+        "validator_set_commitment": reward_validator_set_id(&node),
+        "recovery_epoch": reward_recovery_epoch(&node),
+        "transaction_domain": node.state.transaction_domain_hash().map(|domain| format!("0x{}", domain.to_hex())),
+        "worker_min_stake_base": arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+        "stake_zero_eligible": arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE == 0,
         "arc_base_units": base_units,
         "reward_source": "arc_types::economics::INFERENCE_ATTESTATION_REWARD — the fixed amount \
                           arc-state credits only when a validator-authorized, job-bound \
@@ -11945,6 +12842,7 @@ mod tests {
             input: "What is 2+2?".to_string(),
             max_tokens: 64,
             model_id: Some("0xdeadbeef".to_string()),
+            transaction_domain: None,
             submitted_at_unix_ms: 1_700_000_000_000,
         };
         let v = serde_json::to_value(&item).unwrap();
@@ -11973,6 +12871,7 @@ mod tests {
             input: "hi".into(),
             max_tokens: 8,
             model_id: None,
+            transaction_domain: None,
             submitted_at_unix_ms: 0,
         };
         let v = serde_json::to_value(&item).unwrap();
@@ -12039,32 +12938,20 @@ mod tests {
     }
 
     #[test]
-    fn reward_quorum_gap_is_actionable_and_never_claims_submission_or_inclusion() {
-        let settlement = reward_quorum_approval_unavailable("0xattestation", 6);
-        assert_eq!(settlement["status"], "reward_quorum_approval_unavailable");
-        assert_eq!(settlement["active_validator_count"], 6);
+    fn reward_quorum_policy_is_exactly_five_of_six() {
         assert_eq!(
-            settlement["required_validator_approvals"], 5,
-            "strict identity supermajority is floor(2N/3)+1"
+            arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
+            6
         );
-        assert_eq!(settlement["submitted"], false);
-        assert_eq!(settlement["included"], false);
-        assert!(
-            settlement["reason"]
-                .as_str()
-                .unwrap()
-                .contains("no reward transaction was constructed or submitted")
+        assert_eq!(
+            arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+            5
         );
-        assert!(
-            settlement["operator_action"]
-                .as_str()
-                .unwrap()
-                .contains("do not add a public signing endpoint")
-        );
+        assert!(COMMUNITY_REWARD_APPROVAL_COLLECTION_READY);
     }
 
     #[tokio::test]
-    async fn public_reward_endpoints_fail_closed_when_approval_collection_is_unavailable() {
+    async fn public_reward_endpoints_fail_closed_when_runtime_prerequisites_are_unavailable() {
         let mut node = fake_node_with_workers(Vec::new());
         node.community_rewards_v1_enabled = true;
         node.state
@@ -12074,6 +12961,13 @@ mod tests {
 
         let Json(economics) = economics_rewards(AxumState(node.clone())).await;
         let Json(community) = community_list(AxumState(node.clone())).await;
+        let Json(policy) = community_reward_policy(AxumState(node.clone())).await;
+        let Json(approval) = community_reward_approval_status(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", Hash256::ZERO.to_hex())),
+        )
+        .await
+        .expect("well-formed job ids always have an approval status");
         let Json(earnings) = worker_earnings(
             AxumState(node),
             axum::extract::Path(format!("0x{}", Hash256::ZERO.to_hex())),
@@ -12085,16 +12979,183 @@ mod tests {
             assert_eq!(response["community_rewards_v1_protocol_active"], true);
             assert_eq!(
                 response["community_rewards_v1_approval_collection_ready"],
-                false
+                true
             );
             assert_eq!(response["community_rewards_v1_enabled"], false);
             assert!(
                 response["community_rewards_v1_note"]
                     .as_str()
                     .unwrap()
-                    .contains("issuance remains fail-closed")
+                    .contains("issuance remains fail-closed until")
             );
         }
+        assert_eq!(policy["schema"], "arc.community.reward-policy.v1");
+        assert_eq!(policy["tx_type"], "0x25");
+        assert_eq!(policy["protocol_active"], true);
+        assert_eq!(policy["issuance_ready"], false);
+        assert!(policy["readiness_unavailable_reason"].is_string());
+        assert!(policy["recovery_epoch"].is_null());
+        assert!(policy["validator_set_id"].is_null());
+        assert!(policy["transaction_domain"].is_null());
+        assert_eq!(approval["locally_approved"], false);
+        assert_eq!(approval["submitted"], false);
+        assert!(approval["recovery_epoch"].is_null());
+        assert!(approval["validator_set_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn mined_reward_receipt_is_the_only_earnings_evidence() {
+        use arc_types::transaction::{
+            CommunityInferenceRewardBody, CommunityRewardValidatorApproval,
+            InferenceAttestationBody, WorkerInferenceCertificate,
+        };
+
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::faucet_pool_address();
+        let reward_amount = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+        let state = arc_state::StateDB::with_genesis(&[
+            (treasury, reward_amount * 2),
+            (worker.address(), 0),
+        ]);
+        state.seed_genesis_validators(
+            &validators
+                .iter()
+                .map(|key| (key.address(), arc_state::StateDB::MIN_VALIDATOR_STAKE))
+                .collect::<Vec<_>>(),
+        );
+        state.set_community_rewards_v1_activation_height(Some(0));
+
+        let model_id = arc_crypto::hash_bytes(b"exact-model-artifact");
+        let input_hash = arc_crypto::hash_bytes(b"prompt");
+        let output_hash = arc_crypto::hash_bytes(b"token-output");
+        let mut worker_attestation = arc_types::Transaction {
+            tx_type: arc_types::TxType::InferenceAttestation,
+            from: worker.address(),
+            nonce: 0,
+            body: arc_types::TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id,
+                input_hash,
+                output_hash,
+                challenge_period: 100,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        worker_attestation.sign(&worker).unwrap();
+        let assignment_epoch = arc_crypto::hash_bytes(b"coordinator-recovery-epoch");
+        let job_nonce = 17;
+        let job_id = CommunityInferenceRewardBody::derive_job_id(
+            &validators[0].address(),
+            &assignment_epoch,
+            job_nonce,
+            &model_id,
+            &input_hash,
+            32,
+        );
+        let mut body = CommunityInferenceRewardBody {
+            chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id,
+            coordinator: validators[0].address(),
+            assignment_epoch,
+            job_nonce,
+            recovery_epoch: 0,
+            validator_set_id: 0,
+            transaction_domain: Hash256::ZERO,
+            worker: worker.address(),
+            model_id,
+            input_hash,
+            output_hash,
+            max_tokens: 32,
+            expires_at_height: 100,
+            worker_certificate: WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: 100,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = validators[..5]
+            .iter()
+            .map(|key| {
+                CommunityRewardValidatorApproval::from_ed25519_signature(
+                    key.address(),
+                    key.sign(&commitment).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let approval_body = body.clone();
+        let mut reward = arc_types::Transaction::new_community_inference_reward(
+            validators[0].address(),
+            job_nonce,
+            body,
+        );
+        reward.sign(&validators[0]).unwrap();
+        let tx_hash = reward.hash;
+        let (_, receipts) = state
+            .execute_block(&[reward], validators[0].address())
+            .unwrap();
+        assert!(receipts[0].success);
+
+        let mut node = fake_node_with_workers(Vec::new());
+        node.state = Arc::new(state);
+        let accepted = validate_collected_reward_approvals(
+            &node,
+            &approval_body,
+            approval_body.validator_approvals.clone(),
+        )
+        .expect("five independently signed approvals satisfy the six-validator policy");
+        assert_eq!(accepted.len(), 5);
+        let four = approval_body.validator_approvals[..4].to_vec();
+        let shortfall = validate_collected_reward_approvals(&node, &approval_body, four)
+            .expect_err("four of six must fail closed");
+        assert!(shortfall.contains("5 of 6 required"), "{shortfall}");
+        let Json(earnings) = worker_earnings(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", worker.address().to_hex())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(earnings["confirmed_receipt_count"], 1);
+        assert_eq!(earnings["confirmed_receipts"][0]["tx_type"], "0x25");
+        assert_eq!(earnings["confirmed_gross_earnings_base"], reward_amount);
+        assert!(earnings["projected_daily_arc"].is_null());
+        assert!(earnings["projected_daily_unavailable_reason"].is_string());
+
+        let Json(receipt) = community_reward_receipt(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", tx_hash.to_hex())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt["status"], "mined_success");
+        assert_eq!(receipt["confirmed"], true);
+        assert_eq!(receipt["reward_base"], reward_amount);
+        assert_eq!(receipt["recovery_epoch"], 0);
+        assert_eq!(receipt["validator_set_id"], 0);
+        assert_eq!(
+            receipt["transaction_domain"],
+            format!("0x{}", Hash256::ZERO.to_hex())
+        );
+
+        let Json(by_job) = community_reward_job(
+            AxumState(node),
+            axum::extract::Path(format!("0x{}", job_id.to_hex())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_job["tx_hash"], format!("0x{}", tx_hash.to_hex()));
+        assert_eq!(by_job["confirmed"], true);
     }
 
     #[tokio::test]
@@ -12112,6 +13173,7 @@ mod tests {
             input: "ping".into(),
             max_tokens: 4,
             model_id: None,
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         })
         .await
@@ -12145,6 +13207,7 @@ mod tests {
                 input: "prompt".to_string(),
                 max_tokens: 1,
                 model_id: None,
+                transaction_domain: None,
                 submitted_at_unix_ms: 0,
             })
             .await
@@ -12238,6 +13301,9 @@ mod tests {
             community_request_replays: Arc::new(parking_lot::Mutex::new(
                 CommunityReplayCache::default(),
             )),
+            community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
+            community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
+            community_reward_submissions: Arc::new(dashmap::DashMap::new()),
             community_work_tx: Some(Arc::new(tx)),
             community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             community_work_results: Some(Arc::new(dashmap::DashMap::new())),
@@ -12608,9 +13674,17 @@ mod tests {
         let validator = arc_crypto::hash_bytes(b"validator");
         let first_boot = arc_crypto::hash_bytes(b"boot-a");
         let second_boot = arc_crypto::hash_bytes(b"boot-b");
-        let before = community_job_id(&validator, &first_boot, "same prompt", 8, 0);
-        let after = community_job_id(&validator, &second_boot, "same prompt", 8, 0);
+        let model = arc_crypto::hash_bytes(b"exact-model");
+        let input = arc_crypto::hash_bytes(b"same prompt");
+        let before = community_job_id(&validator, &first_boot, &model, &input, 8, 0);
+        let after = community_job_id(&validator, &second_boot, &model, &input, 8, 0);
+        let other_model = arc_crypto::hash_bytes(b"other-exact-model");
+        let model_changed = community_job_id(&validator, &first_boot, &other_model, &input, 8, 0);
         assert_ne!(before, after, "boot epoch must namespace the reset counter");
+        assert_ne!(
+            before, model_changed,
+            "exact model identity must be part of deterministic assignment"
+        );
         assert_eq!(before.len(), 64);
         assert_eq!(after.len(), 64);
     }
@@ -13173,6 +14247,8 @@ mod tests {
             item.job_id.clone(),
             PendingCommunityWork {
                 item,
+                assignment_epoch: Hash256([7u8; 32]),
+                job_nonce: 1,
                 assigned_worker,
                 sender,
             },
@@ -13191,6 +14267,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: Some(test_model_id()),
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
 
@@ -13218,6 +14295,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: Some(test_model_id()),
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let _receiver = insert_pending_job(&node, item.clone(), None);
@@ -13267,6 +14345,7 @@ mod tests {
             input: "first".to_string(),
             max_tokens: 8,
             model_id: Some(test_model_id()),
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let second = WorkItem {
@@ -13274,6 +14353,7 @@ mod tests {
             input: "second".to_string(),
             max_tokens: 8,
             model_id: Some(test_model_id()),
+            transaction_domain: None,
             submitted_at_unix_ms: 2,
         };
         let _first_receiver = insert_pending_job(&node, first.clone(), None);
@@ -13330,6 +14410,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: None,
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let _receiver = insert_pending_job(&node, item.clone(), None);
@@ -13374,6 +14455,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: None,
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let _receiver = insert_pending_job(&node, item.clone(), Some(worker_one_id));
@@ -13418,6 +14500,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: Some(test_model_id()),
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let receiver = insert_pending_job(&node, item.clone(), Some(worker_id.clone()));
@@ -13493,6 +14576,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: Some(test_model_id()),
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let receiver = insert_pending_job(&node, item.clone(), Some(worker_id.clone()));
@@ -13549,6 +14633,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: None,
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let receiver = insert_pending_job(&node, item.clone(), Some(worker_id.clone()));
@@ -13617,6 +14702,7 @@ mod tests {
             input: "hello".to_string(),
             max_tokens: 8,
             model_id: None,
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let _receiver = insert_pending_job(&node, item.clone(), Some(worker_id.clone()));
@@ -13932,6 +15018,7 @@ mod tests {
                 "0x{}",
                 arc_crypto::hash_bytes(b"arc-test-model").to_hex()
             )),
+            transaction_domain: None,
             submitted_at_unix_ms: 1,
         };
         let output_hash = arc_crypto::hash_bytes(b"world");

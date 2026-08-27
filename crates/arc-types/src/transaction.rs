@@ -764,6 +764,21 @@ pub struct CommunityInferenceRewardBody {
     pub chain_domain: Hash256,
     /// Coordinator-generated, globally unique job commitment.
     pub job_id: Hash256,
+    /// Active validator that created the assignment. Validators authenticate
+    /// this coordinator before independently recomputing and approving work.
+    pub coordinator: Address,
+    /// Cryptographically random coordinator boot/session epoch. Binding it in
+    /// every approval prevents a restarted coordinator from reusing an old
+    /// assignment namespace.
+    pub assignment_epoch: Hash256,
+    /// Monotonic nonce within `assignment_epoch`.
+    pub job_nonce: u64,
+    /// Protocol-v3 recovery context active when validators approved this job.
+    /// All three fields are zero on legacy/dev state without a recovery
+    /// context and must exactly match state at execution.
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    pub transaction_domain: Hash256,
     /// Stake-zero or staked worker that completed the assigned job.
     pub worker: Address,
     /// Model and I/O commitments copied from the verified worker attestation.
@@ -804,6 +819,16 @@ pub struct WorkerInferenceCertificate {
 /// signature, so a reward cannot recursively embed transactions or unbounded
 /// post-quantum signature payloads.
 pub const MAX_COMMUNITY_REWARD_APPROVALS: usize = 64;
+
+/// Reward-v1 is intentionally fixed to the six-validator ARC approval
+/// committee. Issuance fails closed if the active set has any other size.
+pub const COMMUNITY_REWARD_VALIDATOR_SET_SIZE: usize = 6;
+/// Five independently recomputing validators must approve one receipt.
+pub const COMMUNITY_REWARD_APPROVALS_REQUIRED: usize = 5;
+/// Community compute is stake-zero eligible. This explicit consensus
+/// constant is the single code-level policy switch; raising it requires a
+/// coordinated protocol release rather than an unsafe per-node flag.
+pub const COMMUNITY_REWARD_MIN_WORKER_STAKE: u64 = 0;
 
 /// One validator's approval of a community reward's complete semantic
 /// commitment. The split 64-byte signature keeps the wire representation
@@ -856,6 +881,25 @@ impl CommunityInferenceRewardBody {
         arc_crypto::hash_bytes(b"arc-chain:0x415243:community-inference-reward:v1")
     }
 
+    /// Derive the only valid job identifier for an exact assignment.
+    pub fn derive_job_id(
+        coordinator: &Address,
+        assignment_epoch: &Hash256,
+        job_nonce: u64,
+        model_id: &Hash256,
+        input_hash: &Hash256,
+        max_tokens: u32,
+    ) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-community-job-v4");
+        hasher.update(coordinator.as_ref());
+        hasher.update(assignment_epoch.as_ref());
+        hasher.update(&job_nonce.to_le_bytes());
+        hasher.update(model_id.as_ref());
+        hasher.update(input_hash.as_ref());
+        hasher.update(&max_tokens.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
     /// Zero-balance state marker used for consensus-level replay protection.
     pub fn marker_address(chain_domain: &Hash256, job_id: &Hash256) -> Address {
         let mut bytes = Vec::with_capacity(23 + 64);
@@ -892,6 +936,12 @@ impl CommunityInferenceRewardBody {
             blake3::Hasher::new_derive_key("ARC-community-inference-reward-validator-approval-v1");
         hasher.update(self.chain_domain.as_ref());
         hasher.update(self.job_id.as_ref());
+        hasher.update(self.coordinator.as_ref());
+        hasher.update(self.assignment_epoch.as_ref());
+        hasher.update(&self.job_nonce.to_le_bytes());
+        hasher.update(&self.recovery_epoch.to_be_bytes());
+        hasher.update(&self.validator_set_id.to_be_bytes());
+        hasher.update(self.transaction_domain.as_ref());
         hasher.update(self.worker.as_ref());
         hasher.update(self.model_id.as_ref());
         hasher.update(self.input_hash.as_ref());
@@ -2128,6 +2178,12 @@ mod tests {
         let mut body = CommunityInferenceRewardBody {
             chain_domain,
             job_id,
+            coordinator: validator_key.address(),
+            assignment_epoch: hash_bytes(b"assignment-epoch"),
+            job_nonce: 7,
+            recovery_epoch: 3,
+            validator_set_id: 11,
+            transaction_domain: hash_bytes(b"recovery-domain"),
             worker: worker_key.address(),
             model_id: hash_bytes(b"model"),
             input_hash: hash_bytes(b"input"),
@@ -2217,6 +2273,12 @@ mod tests {
         let body = CommunityInferenceRewardBody {
             chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
             job_id: hash_bytes(b"job"),
+            coordinator: hash_bytes(b"coordinator"),
+            assignment_epoch: hash_bytes(b"assignment-epoch"),
+            job_nonce: 9,
+            recovery_epoch: 3,
+            validator_set_id: 11,
+            transaction_domain: hash_bytes(b"recovery-domain"),
             worker: worker_key.address(),
             model_id: hash_bytes(b"model"),
             input_hash: hash_bytes(b"input"),
@@ -2251,6 +2313,31 @@ mod tests {
         assert_mutation_bound!("job_id", |b: &mut CommunityInferenceRewardBody| {
             b.job_id = hash_bytes(b"other-job")
         });
+        assert_mutation_bound!("coordinator", |b: &mut CommunityInferenceRewardBody| {
+            b.coordinator = hash_bytes(b"other-coordinator")
+        });
+        assert_mutation_bound!(
+            "assignment_epoch",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.assignment_epoch = hash_bytes(b"other-epoch")
+            }
+        );
+        assert_mutation_bound!("job_nonce", |b: &mut CommunityInferenceRewardBody| {
+            b.job_nonce += 1
+        });
+        assert_mutation_bound!("recovery_epoch", |b: &mut CommunityInferenceRewardBody| {
+            b.recovery_epoch += 1
+        });
+        assert_mutation_bound!(
+            "validator_set_id",
+            |b: &mut CommunityInferenceRewardBody| { b.validator_set_id += 1 }
+        );
+        assert_mutation_bound!(
+            "transaction_domain",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.transaction_domain = hash_bytes(b"other-recovery-domain")
+            }
+        );
         assert_mutation_bound!("worker", |b: &mut CommunityInferenceRewardBody| {
             b.worker = hash_bytes(b"other-worker")
         });

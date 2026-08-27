@@ -152,6 +152,19 @@ pub struct NodeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConfirmedRewardReceipt {
+    pub tx_hash: String,
+    pub job_id: String,
+    pub block_height: u64,
+    pub block_hash: String,
+    pub reward_base: u64,
+    pub reward_arc: f64,
+    pub recovery_epoch: Option<u64>,
+    pub validator_set_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Earnings {
     pub total_arc: f64,
     /// Earned since 00:00 UTC. `None` when the chain does not report it —
@@ -168,6 +181,14 @@ pub struct Earnings {
     /// `last_payout_at` because feeding a block height (~123,462) into a
     /// relative-time formatter renders "20770d ago".
     pub last_payout_block: Option<u64>,
+    /// Auditable rows that alone contribute to `total_arc`.
+    pub confirmed_receipts: Vec<ConfirmedRewardReceipt>,
+    /// Server projection is present only when an active explicit reward
+    /// policy, confirmed-receipt rate, and funded treasury all exist.
+    pub projected_daily_arc: Option<f64>,
+    pub projected_daily_unavailable_reason: Option<String>,
+    pub recovery_epoch: Option<u64>,
+    pub validator_set_id: Option<u64>,
     /// True when these numbers came from the chain's `/worker/earnings`
     /// endpoint. False means they were synthesized locally and should be
     /// labelled as an estimate.

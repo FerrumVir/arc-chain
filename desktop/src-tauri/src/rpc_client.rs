@@ -14,9 +14,10 @@
 //                                          receipt index + readiness fields)
 
 use crate::types::{
-    AccountBalance, Attestation, BlockSummary, Earnings, EarningsProjection, FaucetResult,
-    InferenceConsensus, InferenceHop, InferenceResult, NetworkOverview, NetworkStats, NodeContribution,
-    NodeStatus, RecentBlocks, RewardEconomics, TxLookup, ValidatorInfo,
+    AccountBalance, Attestation, BlockSummary, ConfirmedRewardReceipt, Earnings,
+    EarningsProjection, FaucetResult, InferenceConsensus, InferenceHop, InferenceResult,
+    NetworkOverview, NetworkStats, NodeContribution, NodeStatus, RecentBlocks, RewardEconomics,
+    TxLookup, ValidatorInfo,
 };
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -50,11 +51,8 @@ pub async fn probe_coordinator(http: &reqwest::Client) -> Option<String> {
         let origin = origin.to_string();
         set.spawn(async move {
             let url = format!("{}/health", origin);
-            let r = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                http.get(&url).send(),
-            )
-            .await;
+            let r = tokio::time::timeout(std::time::Duration::from_secs(2), http.get(&url).send())
+                .await;
             match r {
                 Ok(Ok(resp)) if resp.status().is_success() => Some(origin),
                 _ => None,
@@ -193,8 +191,18 @@ pub async fn fetch_status(
 /// ambiguous, or internally inconsistent field fails closed.
 fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     let total_rewards = v.get("total_rewards")?.as_u64()?;
-    let total_arc = v.get("estimated_total_arc")?.as_f64()?;
+    let confirmed_count = v.get("confirmed_receipt_count")?.as_u64()?;
+    if confirmed_count != total_rewards {
+        return None;
+    }
+    let total_arc = v.get("confirmed_gross_earnings_arc")?.as_f64()?;
     if total_arc < 0.0 {
+        return None;
+    }
+    // The backend cannot yet join every retained reward receipt to a wall
+    // clock day. Accepting a numeric `today_arc` would reintroduce an
+    // estimate that is not mined-receipt evidence.
+    if !v.get("today_arc")?.is_null() {
         return None;
     }
     let note = v.get("estimated_total_arc_note")?.as_str()?;
@@ -208,6 +216,65 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         .get("community_rewards_v1_approval_collection_ready")?
         .as_bool()?;
     if effective && !(protocol_active && approval_ready) {
+        return None;
+    }
+
+    let receipt_values = v.get("confirmed_receipts")?.as_array()?;
+    if receipt_values.len() != usize::try_from(total_rewards).ok()? {
+        return None;
+    }
+    let mut confirmed_receipts = Vec::with_capacity(receipt_values.len());
+    let mut receipt_base_sum = 0u64;
+    for receipt in receipt_values {
+        if receipt.get("tx_type")?.as_str()? != "0x25" || receipt.get("success")?.as_bool()? != true
+        {
+            return None;
+        }
+        let reward_arc = receipt.get("reward_arc")?.as_f64()?;
+        if !reward_arc.is_finite() || reward_arc < 0.0 {
+            return None;
+        }
+        let reward_base = receipt.get("reward_base")?.as_u64()?;
+        receipt_base_sum = receipt_base_sum.checked_add(reward_base)?;
+        confirmed_receipts.push(ConfirmedRewardReceipt {
+            tx_hash: receipt.get("tx_hash")?.as_str()?.to_string(),
+            job_id: receipt.get("job_id")?.as_str()?.to_string(),
+            block_height: receipt.get("block_height")?.as_u64()?,
+            block_hash: receipt.get("block_hash")?.as_str()?.to_string(),
+            reward_base,
+            reward_arc,
+            recovery_epoch: receipt.get("recovery_epoch").and_then(Value::as_u64),
+            validator_set_id: receipt.get("validator_set_id").and_then(Value::as_u64),
+        });
+    }
+    if receipt_base_sum != v.get("confirmed_gross_earnings_base")?.as_u64()? {
+        return None;
+    }
+    let receipt_sum: f64 = confirmed_receipts
+        .iter()
+        .map(|receipt| receipt.reward_arc)
+        .sum();
+    if (receipt_sum - total_arc).abs() > 1e-9 {
+        return None;
+    }
+
+    let projected_daily_arc = match v.get("projected_daily_arc")? {
+        Value::Null => None,
+        value => {
+            let projected = value.as_f64()?;
+            if !projected.is_finite() || projected < 0.0 {
+                return None;
+            }
+            Some(projected)
+        }
+    };
+    let projected_daily_unavailable_reason = match v.get("projected_daily_unavailable_reason")? {
+        Value::Null => None,
+        value => Some(value.as_str()?.trim().to_string()).filter(|reason| !reason.is_empty()),
+    };
+    // Exactly one side of the projection contract is populated: either a
+    // receipt-derived forecast or a concrete explanation for its absence.
+    if projected_daily_arc.is_some() == projected_daily_unavailable_reason.is_some() {
         return None;
     }
 
@@ -227,12 +294,17 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         total_arc,
         // Null means unavailable, not zero. The candidate intentionally does
         // not invent a daily split from a lifetime receipt count.
-        today_arc: v.get("today_arc").and_then(Value::as_f64),
+        today_arc: None,
         pending_arc: None,
         rank: None,
         attestations: total_rewards,
         last_payout_at: v.get("last_reward_at").and_then(Value::as_i64),
         last_payout_block: last_reward_block,
+        confirmed_receipts,
+        projected_daily_arc,
+        projected_daily_unavailable_reason,
+        recovery_epoch: v.get("recovery_epoch").and_then(Value::as_u64),
+        validator_set_id: v.get("validator_set_id").and_then(Value::as_u64),
         from_chain: true,
     })
 }
@@ -250,7 +322,11 @@ pub async fn fetch_earnings(
     address: Option<&str>,
 ) -> Earnings {
     if let Some(addr) = address {
-        let url = format!("{}/worker/earnings/{}", base_url, addr.trim_start_matches("0x"));
+        let url = format!(
+            "{}/worker/earnings/{}",
+            base_url,
+            addr.trim_start_matches("0x")
+        );
         if let Ok(resp) = http.get(&url).send().await {
             if resp.status().is_success() {
                 if let Ok(v) = resp.json::<Value>().await {
@@ -325,7 +401,10 @@ pub async fn fetch_attestations(
             }
 
             let opt_u32 = |o: &Value, k: &str| {
-                o.get(k).and_then(|x| x.as_u64()).filter(|n| *n > 0).map(|n| n as u32)
+                o.get(k)
+                    .and_then(|x| x.as_u64())
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u32)
             };
             let tokens = opt_u32(&inf, "tokens_generated");
             let ms_per_tok = opt_u32(&inf, "ms_per_token");
@@ -481,6 +560,13 @@ fn empty_earnings() -> Earnings {
         attestations: 0,
         last_payout_at: None,
         last_payout_block: None,
+        confirmed_receipts: Vec::new(),
+        projected_daily_arc: None,
+        projected_daily_unavailable_reason: Some(
+            "confirmed mined reward receipts are unavailable".to_string(),
+        ),
+        recovery_epoch: None,
+        validator_set_id: None,
         from_chain: false,
     }
 }
@@ -636,7 +722,10 @@ pub async fn run_inference(
         return Err(format!("HTTP {}: {}", status, body));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    debug!("[inference/run] ✓ response: {}", serde_json::to_string(&v).unwrap_or_default());
+    debug!(
+        "[inference/run] ✓ response: {}",
+        serde_json::to_string(&v).unwrap_or_default()
+    );
     let inf = v.get("inference").cloned().unwrap_or(Value::Null);
     let att = v.get("attestation").cloned().unwrap_or(Value::Null);
     Ok(InferenceResult {
@@ -708,10 +797,18 @@ pub async fn run_inference_consensus(
     k: u32,
     chat_template: bool,
 ) -> Result<InferenceResult, String> {
-    info!("[inference/consensus] → POST {}/inference/run_consensus  k={}  max_tokens={}  prompt={:?}",
-        coord_base, k, max_tokens, &prompt[..prompt.len().min(80)]);
+    info!(
+        "[inference/consensus] → POST {}/inference/run_consensus  k={}  max_tokens={}  prompt={:?}",
+        coord_base,
+        k,
+        max_tokens,
+        &prompt[..prompt.len().min(80)]
+    );
     let resp = http
-        .post(format!("{}/inference/run_consensus", coord_base.trim_end_matches('/')))
+        .post(format!(
+            "{}/inference/run_consensus",
+            coord_base.trim_end_matches('/')
+        ))
         .json(&serde_json::json!({
             "input": prompt,
             "max_tokens": max_tokens,
@@ -721,18 +818,27 @@ pub async fn run_inference_consensus(
         .send()
         .await
         .map_err(|e| {
-            warn!("[inference/consensus] ✗ coordinator {} unreachable: {}", coord_base, e);
+            warn!(
+                "[inference/consensus] ✗ coordinator {} unreachable: {}",
+                coord_base, e
+            );
             format!("{}: {}", coord_base, e)
         })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        warn!("[inference/consensus] ✗ HTTP {} from {} — body: {}", status, coord_base, body);
+        warn!(
+            "[inference/consensus] ✗ HTTP {} from {} — body: {}",
+            status, coord_base, body
+        );
         return Err(format!("HTTP {} from {}: {}", status, coord_base, body));
     }
     info!("[inference/consensus] ✓ got response from {}", coord_base);
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    debug!("[inference/consensus] full response: {}", serde_json::to_string(&v).unwrap_or_default());
+    debug!(
+        "[inference/consensus] full response: {}",
+        serde_json::to_string(&v).unwrap_or_default()
+    );
 
     let c = v.get("consensus").cloned().unwrap_or(Value::Null);
     let consensus = InferenceConsensus {
@@ -775,10 +881,7 @@ pub async fn run_inference_consensus(
         // run_consensus reports `total_ms` (wall time across the whole
         // pipeline × every token). Use it as `inference_ms` so the UI's
         // "Xms" label still works.
-        inference_ms: v
-            .get("total_ms")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
+        inference_ms: v.get("total_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         tx_hash: String::new(),
         // Consensus path is deterministic by construction: majority hash
         // required at every hop.
@@ -903,28 +1006,66 @@ pub async fn tier1_result(
         .await
         .map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("HTTP {} from /inference/onchain/result", resp.status()));
+        return Err(format!(
+            "HTTP {} from /inference/onchain/result",
+            resp.status()
+        ));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let votes_json = v.get("votes").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let votes_json = v
+        .get("votes")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     let votes: Vec<Tier1Vote> = votes_json
         .into_iter()
         .map(|vj| Tier1Vote {
-            voter: vj.get("voter").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            output_hash: vj.get("output_hash").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            voter: vj
+                .get("voter")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            output_hash: vj
+                .get("output_hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
         .collect();
     Ok(Tier1Result {
-        request_id: v.get("request_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        status: v.get("status").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        request_id: v
+            .get("request_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status: v
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         vote_count: v.get("vote_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-        committee_size: v.get("committee_size").and_then(|x| x.as_u64()).unwrap_or(0) as u8,
+        committee_size: v
+            .get("committee_size")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u8,
         anchor_height: v.get("anchor_height").and_then(|x| x.as_u64()).unwrap_or(0),
-        deadline_blocks: v.get("deadline_blocks").and_then(|x| x.as_u64()).unwrap_or(0),
+        deadline_blocks: v
+            .get("deadline_blocks")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
         votes,
-        output_hash: v.get("output_hash").and_then(|x| x.as_str()).map(String::from),
-        output_blob: v.get("output_blob").and_then(|x| x.as_str()).map(String::from),
-        output_text: v.get("output_text").and_then(|x| x.as_str()).map(String::from),
+        output_hash: v
+            .get("output_hash")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        output_blob: v
+            .get("output_blob")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        output_text: v
+            .get("output_text")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         max_reward: v.get("max_reward").and_then(|x| x.as_u64()).unwrap_or(0),
     })
 }
@@ -1087,7 +1228,10 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
 /// `/inference/attestations` emit it, `/blocks`, `/validators` and `/tx/{hash}`
 /// do not — so everything is normalised on ingest.
 pub fn strip_0x(s: &str) -> String {
-    s.trim().trim_start_matches("0x").trim_start_matches("0X").to_lowercase()
+    s.trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_lowercase()
 }
 
 /// Whether `s` (already `strip_0x`ed) is a 32-byte hash.
@@ -1104,10 +1248,7 @@ pub fn is_tx_hash(s: &str) -> bool {
 ///
 /// Not present on the deployed seeds, so the 404 path is the one that runs
 /// today and is the one that has to read well.
-pub async fn fetch_reward_economics(
-    http: &reqwest::Client,
-    base_url: &str,
-) -> RewardEconomics {
+pub async fn fetch_reward_economics(http: &reqwest::Client, base_url: &str) -> RewardEconomics {
     let path = "/economics/rewards";
     let f = get_detailed(http, &format!("{}{}", base_url, path)).await;
     let v = match &f {
@@ -1146,14 +1287,8 @@ pub async fn fetch_reward_economics(
             "reward_per_attestation_base",
             "reward_per_attestation_arc",
         ),
-        treasury_balance_arc: base_or_arc(
-            "treasury_balance_base",
-            "treasury_balance_arc",
-        ),
-        treasury_balance_unavailable_reason: pick_str(
-            v,
-            &["treasury_balance_unavailable_reason"],
-        ),
+        treasury_balance_arc: base_or_arc("treasury_balance_base", "treasury_balance_arc"),
+        treasury_balance_unavailable_reason: pick_str(v, &["treasury_balance_unavailable_reason"]),
         // `rewards_remaining` is a COUNT of fundable reward receipts — NOT an
         // ARC amount. Renamed on the way in so no call site can mistake it for
         // currency.
@@ -1194,8 +1329,7 @@ pub async fn fetch_earnings_projection(
             return EarningsProjection {
                 source_host: base_url.to_string(),
                 unavailable: Some(
-                    "No identity on this device yet, so there is nothing to project."
-                        .to_string(),
+                    "No identity on this device yet, so there is nothing to project.".to_string(),
                 ),
                 reward_per_attestation: None,
                 reward_rate_source: "unknown".to_string(),
@@ -1268,8 +1402,8 @@ pub async fn fetch_earnings_projection(
     let first_attestation_block = pick_u64(v, &["first_attestation_block"]);
     // `blocks_observed` on the wire — the inclusive span the rate covers.
     let observed_over_blocks = pick_u64(v, &["blocks_observed"]);
-    let attestations_per_day = pick_f64(v, &["attestations_per_day_observed"])
-        .filter(|rate| *rate >= 0.0);
+    let attestations_per_day =
+        pick_f64(v, &["attestations_per_day_observed"]).filter(|rate| *rate >= 0.0);
 
     // A rate the host explicitly declined to give carries its own reason;
     // otherwise say precisely which input is missing.
@@ -1453,10 +1587,7 @@ pub async fn fetch_node_contribution(
 /// be missing without taking the rest down: a host that cannot name its
 /// network can still report a height and a block age, and those are the
 /// numbers a user needs to see that a chain has stopped.
-pub async fn fetch_network_overview(
-    http: &reqwest::Client,
-    base_url: &str,
-) -> NetworkOverview {
+pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> NetworkOverview {
     let (info_url, health_url, latest_url, validators_url) = (
         format!("{}/network/info", base_url),
         format!("{}/health", base_url),
@@ -1567,12 +1698,12 @@ pub async fn fetch_network_overview(
     // Only a total blackout is "unavailable". A missing network name is
     // reported by `network_name: None` and phrased by the UI, which names the
     // host it is reading.
-    let unavailable = if height.is_none() && last_block_age_secs.is_none() && validator_list.is_empty()
-    {
-        Some(unavailable_reason(base_url, "/health", &health))
-    } else {
-        None
-    };
+    let unavailable =
+        if height.is_none() && last_block_age_secs.is_none() && validator_list.is_empty() {
+            Some(unavailable_reason(base_url, "/health", &health))
+        } else {
+            None
+        };
 
     NetworkOverview {
         source_host: base_url.to_string(),
@@ -1667,7 +1798,9 @@ pub async fn fetch_recent_blocks(
                     let height = pick_u64(b, &["height"])?;
                     Some(BlockSummary {
                         height,
-                        hash: pick_str(b, &["hash"]).map(|h| strip_0x(&h)).unwrap_or_default(),
+                        hash: pick_str(b, &["hash"])
+                            .map(|h| strip_0x(&h))
+                            .unwrap_or_default(),
                         // A zero timestamp is not a time. Genesis carries
                         // `timestamp: 0`, and feeding that to the UI's
                         // relative-time formatter renders "20770d ago" — the
@@ -1857,7 +1990,11 @@ mod chain_read_tests {
 
     #[test]
     fn not_found_names_the_host_the_path_and_the_status() {
-        let r = unavailable_reason("http://1.2.3.4:9090", "/economics/rewards", &Fetched::NotFound);
+        let r = unavailable_reason(
+            "http://1.2.3.4:9090",
+            "/economics/rewards",
+            &Fetched::NotFound,
+        );
         assert!(r.contains("http://1.2.3.4:9090"), "{r}");
         assert!(r.contains("/economics/rewards"), "{r}");
         assert!(r.contains("404"), "{r}");
@@ -1867,7 +2004,14 @@ mod chain_read_tests {
     fn degradation_copy_never_speculates_about_the_cause() {
         // A confident wrong explanation ("your node is out of date") is worse
         // than the bare observed fact, because the desktop cannot know.
-        let forbidden = ["old build", "out of date", "outdated", "upgrade", "probably", "likely"];
+        let forbidden = [
+            "old build",
+            "out of date",
+            "outdated",
+            "upgrade",
+            "probably",
+            "likely",
+        ];
         let cases = [
             Fetched::NotFound,
             Fetched::BadRequest,
@@ -1954,9 +2098,42 @@ mod chain_read_tests {
         json!({
             "total_rewards": 2,
             "estimated_total_arc": 5.0,
+            "confirmed_receipt_count": 2,
+            "confirmed_gross_earnings_base": 5_000_000_000u64,
+            "confirmed_gross_earnings_arc": 5.0,
+            "confirmed_receipts": [
+                {
+                    "tx_type": "0x25",
+                    "tx_hash": format!("0x{}", "aa".repeat(32)),
+                    "job_id": format!("0x{}", "01".repeat(32)),
+                    "block_height": 123_461,
+                    "block_hash": format!("0x{}", "10".repeat(32)),
+                    "success": true,
+                    "reward_base": 2_500_000_000u64,
+                    "reward_arc": 2.5,
+                    "recovery_epoch": 1,
+                    "validator_set_id": 7,
+                },
+                {
+                    "tx_type": "0x25",
+                    "tx_hash": format!("0x{}", "ab".repeat(32)),
+                    "job_id": format!("0x{}", "02".repeat(32)),
+                    "block_height": 123_462,
+                    "block_hash": format!("0x{}", "11".repeat(32)),
+                    "success": true,
+                    "reward_base": 2_500_000_000u64,
+                    "reward_arc": 2.5,
+                    "recovery_epoch": 1,
+                    "validator_set_id": 7,
+                }
+            ],
             "estimated_total_arc_note":
                 "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
             "today_arc": Value::Null,
+            "projected_daily_arc": Value::Null,
+            "projected_daily_unavailable_reason": "a single receipt window cannot establish a forecast",
+            "recovery_epoch": 1,
+            "validator_set_id": 7,
             "community_rewards_v1_enabled": true,
             "community_rewards_v1_protocol_active": true,
             "community_rewards_v1_approval_collection_ready": true,
@@ -1974,6 +2151,9 @@ mod chain_read_tests {
         assert_eq!(earnings.total_arc, 5.0);
         assert_eq!(earnings.today_arc, None);
         assert_eq!(earnings.last_payout_block, Some(123_462));
+        assert_eq!(earnings.confirmed_receipts.len(), 2);
+        assert_eq!(earnings.recovery_epoch, Some(1));
+        assert_eq!(earnings.validator_set_id, Some(7));
     }
 
     #[test]
@@ -2000,7 +2180,7 @@ mod chain_read_tests {
     #[test]
     fn candidate_shape_with_negative_reward_total_fails_closed() {
         let mut value = candidate_earnings_value();
-        value["estimated_total_arc"] = json!(-5.0);
+        value["confirmed_gross_earnings_arc"] = json!(-5.0);
         assert!(confirmed_earnings_from_value(&value).is_none());
     }
 
@@ -2019,10 +2199,51 @@ mod chain_read_tests {
     }
 
     #[test]
+    fn failed_or_non_reward_rows_cannot_be_parsed_as_earnings() {
+        let mut failed = candidate_earnings_value();
+        failed["confirmed_receipts"][0]["success"] = json!(false);
+        assert!(confirmed_earnings_from_value(&failed).is_none());
+
+        let mut wrong_type = candidate_earnings_value();
+        wrong_type["confirmed_receipts"][0]["tx_type"] = json!("0x16");
+        assert!(confirmed_earnings_from_value(&wrong_type).is_none());
+    }
+
+    #[test]
+    fn receipt_count_and_exact_base_sum_must_reconcile() {
+        let mut count_mismatch = candidate_earnings_value();
+        count_mismatch["confirmed_receipt_count"] = json!(1);
+        assert!(confirmed_earnings_from_value(&count_mismatch).is_none());
+
+        let mut amount_mismatch = candidate_earnings_value();
+        amount_mismatch["confirmed_gross_earnings_base"] = json!(4_999_999_999u64);
+        assert!(confirmed_earnings_from_value(&amount_mismatch).is_none());
+    }
+
+    #[test]
+    fn unmined_daily_estimates_and_ambiguous_projections_fail_closed() {
+        let mut invented_today = candidate_earnings_value();
+        invented_today["today_arc"] = json!(2.5);
+        assert!(confirmed_earnings_from_value(&invented_today).is_none());
+
+        let mut both_projection_states = candidate_earnings_value();
+        both_projection_states["projected_daily_arc"] = json!(1.0);
+        assert!(confirmed_earnings_from_value(&both_projection_states).is_none());
+
+        let mut malformed_projection = candidate_earnings_value();
+        malformed_projection["projected_daily_arc"] = json!("1.0");
+        assert!(confirmed_earnings_from_value(&malformed_projection).is_none());
+    }
+
+    #[test]
     fn zero_candidate_receipts_allow_null_last_receipt_but_remain_confirmed_zero() {
         let mut value = candidate_earnings_value();
         value["total_rewards"] = json!(0);
         value["estimated_total_arc"] = json!(0.0);
+        value["confirmed_receipt_count"] = json!(0);
+        value["confirmed_gross_earnings_base"] = json!(0);
+        value["confirmed_gross_earnings_arc"] = json!(0.0);
+        value["confirmed_receipts"] = json!([]);
         value["last_reward_block"] = Value::Null;
         value["last_reward_tx_hash"] = Value::Null;
         let earnings = confirmed_earnings_from_value(&value)

@@ -1120,6 +1120,20 @@ impl StateDB {
                 MAX_COMMUNITY_REWARD_APPROVALS
             )));
         }
+        // Protocol-v3 production recovery fixes this authorization committee
+        // at five of six. Legacy/dev states retain the generic strict-BFT
+        // verifier below solely for backward-compatible local fixtures; a
+        // production coordinator cannot advertise issuance-ready without a
+        // recovery context.
+        if self.recovery_context().is_some()
+            && active.len() != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: protocol-v3 committee has {} active validators; exactly {} required",
+                active.len(),
+                arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+            )));
+        }
 
         let active_identity_count = u64::try_from(active.len()).map_err(|_| {
             StateError::ExecutionError(
@@ -1134,6 +1148,11 @@ impl StateDB {
                 "community inference reward: identity threshold exceeds usize::MAX".to_string(),
             )
         })?;
+        let required_identities = if self.recovery_context().is_some() {
+            arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED
+        } else {
+            required_identities
+        };
         if body.validator_approvals.len() < required_identities {
             return Err(StateError::ExecutionError(format!(
                 "community inference reward: insufficient validator approval identities: have {}, need {} of {} active validators",
@@ -4671,6 +4690,53 @@ impl StateDB {
                         "community inference reward: job_id cannot be zero".to_string(),
                     ));
                 }
+                if body.coordinator != tx.from || !self.is_validator(&body.coordinator) {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: assignment coordinator must be the active outer signer"
+                            .to_string(),
+                    ));
+                }
+                if body.assignment_epoch == Hash256::ZERO {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: assignment_epoch cannot be zero".to_string(),
+                    ));
+                }
+                match self.recovery_context() {
+                    Some(context)
+                        if body.recovery_epoch == context.recovery_epoch
+                            && body.validator_set_id == context.validator_set_id
+                            && body.transaction_domain == context.domain_hash() => {}
+                    Some(_) => {
+                        return Err(StateError::ExecutionError(
+                            "community inference reward: recovery epoch, validator-set ID, or transaction domain does not match active state"
+                                .to_string(),
+                        ));
+                    }
+                    None if body.recovery_epoch == 0
+                        && body.validator_set_id == 0
+                        && body.transaction_domain == Hash256::ZERO => {}
+                    None => {
+                        return Err(StateError::ExecutionError(
+                            "community inference reward: recovery binding is non-zero on legacy/dev state"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let expected_job_id =
+                    arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+                        &body.coordinator,
+                        &body.assignment_epoch,
+                        body.job_nonce,
+                        &body.model_id,
+                        &body.input_hash,
+                        body.max_tokens,
+                    );
+                if body.job_id != expected_job_id {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: job_id does not match its exact assignment commitment"
+                            .to_string(),
+                    ));
+                }
                 if body.max_tokens == 0 {
                     return Err(StateError::ExecutionError(
                         "community inference reward: max_tokens must be positive".to_string(),
@@ -4694,6 +4760,14 @@ impl StateDB {
                     })?;
 
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
+                let worker_stake = self.get_validator_stake(&body.worker).unwrap_or(0);
+                if worker_stake < arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: worker stake {} is below active policy minimum {}",
+                        worker_stake,
+                        arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE
+                    )));
+                }
                 if body.worker == treasury_addr {
                     return Err(StateError::ExecutionError(
                         "community inference reward: treasury cannot be the worker".to_string(),
@@ -10336,10 +10410,25 @@ mod tests {
         let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
             unreachable!();
         };
+        let assignment_epoch = hash_bytes(&[b"community-assignment-epoch-v1", tag].concat());
+        let job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &aggregator.address(),
+            &assignment_epoch,
+            reward_nonce,
+            &attestation.model_id,
+            &attestation.input_hash,
+            16,
+        );
         let mut body = arc_types::transaction::CommunityInferenceRewardBody {
             chain_domain:
                 arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
-            job_id: hash_bytes(&[b"community-job-v1", tag].concat()),
+            job_id,
+            coordinator: aggregator.address(),
+            assignment_epoch,
+            job_nonce: reward_nonce,
+            recovery_epoch: 0,
+            validator_set_id: 0,
+            transaction_domain: Hash256::ZERO,
             worker: worker.address(),
             model_id: attestation.model_id,
             input_hash: attestation.input_hash,
@@ -10750,9 +10839,41 @@ mod tests {
             unreachable!();
         };
         body.max_tokens += 1;
+        body.job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &body.coordinator,
+            &body.assignment_epoch,
+            body.job_nonce,
+            &body.model_id,
+            &body.input_hash,
+            body.max_tokens,
+        );
         reward.sign(&validators[0]).unwrap();
 
         assert!(reward_rejection(&state, &reward).contains("invalid Ed25519 approval"));
+    }
+
+    #[test]
+    fn community_reward_rejects_wrong_recovery_binding() {
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = activated_reward_state(
+            worker.address(),
+            2 * REWARD,
+            &[(&validator, StateDB::MIN_VALIDATOR_STAKE)],
+        );
+        let mut reward =
+            make_signed_community_reward(&validator, &worker, 1, b"wrong-recovery", 100);
+        let TxBody::CommunityInferenceReward(body) = &mut reward.body else {
+            unreachable!();
+        };
+        body.recovery_epoch = 1;
+        reward.sign(&validator).unwrap();
+
+        let error = reward_rejection(&state, &reward);
+        assert!(
+            error.contains("recovery binding is non-zero on legacy/dev state"),
+            "{error}"
+        );
     }
 
     #[test]

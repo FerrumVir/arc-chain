@@ -73,6 +73,12 @@ function emptyEarnings(): Earnings {
     attestations: 0,
     lastPayoutAt: null,
     lastPayoutBlock: null,
+    confirmedReceipts: [],
+    projectedDailyArc: null,
+    projectedDailyUnavailableReason:
+      "confirmed mined reward receipts are unavailable",
+    recoveryEpoch: null,
+    validatorSetId: null,
     fromChain: false,
   };
 }
@@ -86,7 +92,10 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
   if (!body || typeof body !== "object") return null;
   const o = body as Record<string, unknown>;
   const totalRewards = o.total_rewards;
-  const totalArc = o.estimated_total_arc;
+  const totalArc = o.confirmed_gross_earnings_arc;
+  const confirmedCount = o.confirmed_receipt_count;
+  const confirmedBase = o.confirmed_gross_earnings_base;
+  const rows = o.confirmed_receipts;
   const note = o.estimated_total_arc_note;
   const effective = o.community_rewards_v1_enabled;
   const protocolActive = o.community_rewards_v1_protocol_active;
@@ -98,6 +107,12 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     typeof totalArc !== "number" ||
     !Number.isFinite(totalArc) ||
     totalArc < 0 ||
+    o.today_arc !== null ||
+    confirmedCount !== totalRewards ||
+    !Number.isSafeInteger(confirmedBase) ||
+    (confirmedBase as number) < 0 ||
+    !Array.isArray(rows) ||
+    rows.length !== totalRewards ||
     typeof note !== "string" ||
     !note.includes("CommunityInferenceReward") ||
     typeof effective !== "boolean" ||
@@ -107,6 +122,66 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     return null;
   }
   if (effective && (!protocolActive || !approvalReady)) return null;
+  let receiptBaseSum = 0;
+  let receiptArcSum = 0;
+  const confirmedReceipts = [] as Earnings["confirmedReceipts"];
+  for (const value of rows as unknown[]) {
+    if (!value || typeof value !== "object") return null;
+    const receipt = value as Record<string, unknown>;
+    if (
+      receipt.tx_type !== "0x25" ||
+      receipt.success !== true ||
+      typeof receipt.tx_hash !== "string" ||
+      typeof receipt.job_id !== "string" ||
+      !Number.isSafeInteger(receipt.block_height) ||
+      typeof receipt.block_hash !== "string" ||
+      !Number.isSafeInteger(receipt.reward_base) ||
+      (receipt.reward_base as number) < 0 ||
+      typeof receipt.reward_arc !== "number" ||
+      !Number.isFinite(receipt.reward_arc) ||
+      receipt.reward_arc < 0
+    ) {
+      return null;
+    }
+    receiptBaseSum += receipt.reward_base as number;
+    receiptArcSum += receipt.reward_arc;
+    if (!Number.isSafeInteger(receiptBaseSum)) return null;
+    confirmedReceipts.push({
+      txHash: receipt.tx_hash,
+      jobId: receipt.job_id,
+      blockHeight: receipt.block_height as number,
+      blockHash: receipt.block_hash,
+      rewardBase: receipt.reward_base as number,
+      rewardArc: receipt.reward_arc,
+      recoveryEpoch:
+        typeof receipt.recovery_epoch === "number"
+          ? receipt.recovery_epoch
+          : null,
+      validatorSetId:
+        typeof receipt.validator_set_id === "number"
+          ? receipt.validator_set_id
+          : null,
+    });
+  }
+  if (receiptBaseSum !== confirmedBase) return null;
+  if (!Number.isFinite(receiptArcSum) || Math.abs(receiptArcSum - totalArc) > 1e-9) {
+    return null;
+  }
+  const projection = o.projected_daily_arc;
+  if (
+    projection !== null &&
+    (typeof projection !== "number" ||
+      !Number.isFinite(projection) ||
+      projection < 0)
+  ) return null;
+  const projectionReason = o.projected_daily_unavailable_reason;
+  if (
+    projectionReason !== null &&
+    (typeof projectionReason !== "string" || projectionReason.trim().length === 0)
+  ) return null;
+  const projectedDailyArc = projection as number | null;
+  const projectedDailyUnavailableReason = projectionReason as string | null;
+  if ((projectedDailyArc === null) === (projectedDailyUnavailableReason === null)) return null;
   if (
     !Object.prototype.hasOwnProperty.call(o, "last_reward_block") ||
     !Object.prototype.hasOwnProperty.call(o, "last_reward_tx_hash")
@@ -128,10 +203,7 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
 
   return {
     totalArc,
-    todayArc:
-      typeof o.today_arc === "number" && Number.isFinite(o.today_arc)
-        ? o.today_arc
-        : null,
+    todayArc: null,
     pendingArc: null,
     rank: null,
     attestations: totalRewards,
@@ -141,6 +213,13 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
         ? o.last_reward_at
         : null,
     lastPayoutBlock: lastBlock,
+    confirmedReceipts,
+    projectedDailyArc,
+    projectedDailyUnavailableReason,
+    recoveryEpoch:
+      typeof o.recovery_epoch === "number" ? o.recovery_epoch : null,
+    validatorSetId:
+      typeof o.validator_set_id === "number" ? o.validator_set_id : null,
     fromChain: true,
   };
 }
@@ -1253,6 +1332,11 @@ const mockEarnings: Earnings = {
   attestations: 1283,
   lastPayoutAt: null,
   lastPayoutBlock: 123_462,
+  confirmedReceipts: [],
+  projectedDailyArc: null,
+  projectedDailyUnavailableReason: "browser preview fixture",
+  recoveryEpoch: 1,
+  validatorSetId: 1,
   fromChain: true,
 };
 

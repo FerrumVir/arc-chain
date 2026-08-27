@@ -56,6 +56,17 @@ export interface NodeStatus {
   cpuCores?: number | null;
 }
 
+export interface ConfirmedRewardReceipt {
+  txHash: string;
+  jobId: string;
+  blockHeight: number;
+  blockHash: string;
+  rewardBase: number;
+  rewardArc: number;
+  recoveryEpoch: number | null;
+  validatorSetId: number | null;
+}
+
 export interface Earnings {
   totalArc: number;
   /** null = the chain does not report it. Not the same as zero. */
@@ -68,6 +79,12 @@ export interface Earnings {
   lastPayoutAt: number | null;
   /** Block height of the last attestation — NOT a timestamp. */
   lastPayoutBlock: number | null;
+  /** Successful mined 0x25 rows that alone reconcile to totalArc. */
+  confirmedReceipts: ConfirmedRewardReceipt[];
+  projectedDailyArc: number | null;
+  projectedDailyUnavailableReason: string | null;
+  recoveryEpoch: number | null;
+  validatorSetId: number | null;
   /** True only for the candidate's mined-0x25 receipt/readiness contract. */
   fromChain: boolean;
 }

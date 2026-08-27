@@ -321,6 +321,12 @@ mod tests {
             CommunityInferenceRewardBody {
                 chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
                 job_id: hash_bytes(&[tag, 3]),
+                coordinator: validator,
+                assignment_epoch: hash_bytes(b"block-stm-assignment-epoch"),
+                job_nonce: u64::from(tag),
+                recovery_epoch: 0,
+                validator_set_id: 0,
+                transaction_domain: arc_crypto::Hash256::ZERO,
                 worker,
                 model_id: hash_bytes(b"model"),
                 input_hash: hash_bytes(&[tag, 1]),
