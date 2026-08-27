@@ -5,9 +5,10 @@ Uses unittest.mock to mock httpx responses so no running node is needed.
 """
 
 import unittest
+from importlib.metadata import version
 from unittest.mock import patch
 
-from arc_sdk import ArcClient, KeyPair, TransactionBuilder
+from arc_sdk import ArcClient, KeyPair, TransactionBuilder, __version__
 from arc_sdk.errors import (
     ArcError,
     ArcTransactionError,
@@ -27,6 +28,11 @@ class MockResponse:
 
     def json(self):
         return self._json_data
+
+
+class TestPackageMetadata(unittest.TestCase):
+    def test_runtime_version_matches_installed_distribution(self):
+        self.assertEqual(__version__, version("arc-sdk"))
 
 
 # ---------------------------------------------------------------------------
