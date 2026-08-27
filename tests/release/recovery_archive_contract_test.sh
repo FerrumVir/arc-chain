@@ -44,7 +44,7 @@ archive_freezes_every_legacy_node_without_forced_kill() {
 archive_is_create_only_and_hash_checked() {
     for required in \
         'existing archive checksum failed; refusing replacement' \
-        'partial archive exists; refusing replacement' \
+        'partial archive or evidence exists; refusing replacement' \
         'sha256sum --check' \
         'rclone copyto' \
         '--checksum --metadata' \
@@ -63,6 +63,24 @@ archive_is_create_only_and_hash_checked() {
     fi
 }
 
+archive_scope_excludes_private_and_noncanonical_material() {
+    for required in \
+        'archive_scope=public-chain-recovery-bundle-v1' \
+        'excluded_private_material=true' \
+        'excluded_build_models_git_and_dag_trace=true' \
+        'root/arc-chain/arc-data/state.wal'
+    do
+        grep -Fq -- "$required" "$NODE_HELPER" || {
+            printf 'archive exclusion contract is missing: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Fq 'paths=(root/arc-chain)' "$NODE_HELPER"; then
+        printf 'archive scope regressed to the broad repository/data directory\n'
+        return 1
+    fi
+}
+
 archive_scripts_are_lintable() {
     bash -n "$NODE_HELPER" "$ORCHESTRATOR" || return 1
     shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"
@@ -71,6 +89,8 @@ archive_scripts_are_lintable() {
 run_test 'fleet archive requires an exact lowercase manifest hash and GO phrase' archive_requires_exact_manifest_authorization
 run_test 'all six validators get a clean TERM-only freeze before archival' archive_freezes_every_legacy_node_without_forced_kill
 run_test 'legacy archives and Drive objects are create-only and hash-checked' archive_is_create_only_and_hash_checked
+run_test 'archive bundle excludes private keys, build/model/Git files, and non-canonical DAG trace' \
+    archive_scope_excludes_private_and_noncanonical_material
 run_test 'fleet archive scripts pass shell syntax and warning lint' archive_scripts_are_lintable
 
 finish_tests

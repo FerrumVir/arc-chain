@@ -15,7 +15,10 @@ validator_set_complete = false
 # community_rewards_v1_activation_height = 12345678
 
 # ── Prefunded Genesis Accounts ──────────────────────────────────────────
-# blake3::hash(&[i]) for i in 0..10, each with 1 trillion ARC
+# blake3::hash(&[i]) for i in 0..5, each with 1_000_000_000_000 base
+# units (= 1000 ARC). Address [0] is the faucet and [1] is the dedicated
+# inference reward treasury; the remaining accounts are reserved testnet
+# system funds.
 
 [[accounts]]
 address = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"

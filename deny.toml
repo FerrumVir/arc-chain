@@ -1,17 +1,8 @@
 # cargo-deny configuration.
 #
-# Run locally with `make audit` (cargo deny check), in CI via the `audit` job
-# in .github/workflows/ci.yml.
-#
-# PRECONDITION: this file is only meaningful once Cargo.lock is tracked.
-# cargo-deny walks the lockfile; with the lock gitignored (as it was until the
-# change that added this file) advisory matching, yanked-crate detection and
-# duplicate analysis all operate on a tree that is re-resolved from scratch on
-# every run and therefore differs between runs. Commit the lock first.
-#
-# The CI job is `continue-on-error: true` on first landing — this repo has
-# never had an advisory, license or yanked-crate check of any kind, so the
-# first run's purpose is to enumerate reality. Triage, then flip it blocking.
+# Run locally with `make audit`; CI and tagged releases use the checksummed
+# `scripts/ci/run-cargo-deny.sh` wrapper against each tracked lockfile. Advisory,
+# license, source, and yanked-crate failures are release-blocking.
 
 [graph]
 all-features = false
@@ -49,15 +40,44 @@ ignore = [
     "RUSTSEC-2026-0162",
     "RUSTSEC-2026-0163",
     "RUSTSEC-2026-0165",
+    # 2026-08-27 ARC release engineering: Tauri 2.11's supported Linux
+    # WebKit/tray runtime still requires the archived gtk-rs GTK3 bindings;
+    # these advisories report maintenance status, not known vulnerabilities,
+    # and cargo-deny reports no safe upgrade. Remove each entry as soon as
+    # Tauri/Wry migrate the Linux runtime off GTK3, no later than the v0.9.0
+    # desktop dependency review.
+    "RUSTSEC-2024-0411", # gdkwayland-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0412", # gdk; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0413", # atk; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0414", # gdkx11-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0415", # gtk; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0416", # atk-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0417", # gdkx11; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0418", # gdk-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0419", # gtk3-macros; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0420", # gtk-sys; remove with Tauri's GTK3 runtime
+    # 2026-08-27 ARC release engineering: proc-macro-error is build-time-only
+    # through the same Tauri GTK3 macro stack; this is an unmaintained notice,
+    # not a vulnerability, and has no safe upgrade. Remove with the GTK3 stack
+    # or earlier if glib-macros migrates, no later than v0.9.0.
+    "RUSTSEC-2024-0370",
+    # 2026-08-27 ARC release engineering: Tauri 2.11's urlpattern dependency
+    # retains these archived rust-unic crates. The notices contain no known
+    # vulnerability and report no safe upgrade. Remove each when Tauri updates
+    # urlpattern to ICU/unicode-ident, no later than the v0.9.0 dependency
+    # review.
+    "RUSTSEC-2025-0075", # unic-char-range; remove with Tauri urlpattern
+    "RUSTSEC-2025-0080", # unic-common; remove with Tauri urlpattern
+    "RUSTSEC-2025-0081", # unic-char-property; remove with Tauri urlpattern
+    "RUSTSEC-2025-0098", # unic-ucd-version; remove with Tauri urlpattern
+    "RUSTSEC-2025-0100", # unic-ucd-ident; remove with Tauri urlpattern
 ]
 
 # ------------------------------------------------------------- licenses ----
 [licenses]
 version = 2
-# DRAFT. This list is a best-effort first pass authored without running
-# cargo (the workspace target lock was held elsewhere). The first CI run of
-# the audit job will report the licences actually present in the graph;
-# reconcile this list against that output rather than trusting it.
+# Shared allowlist for the independently locked workspace, desktop, and updater
+# verifier graphs. The release workflow audits all three.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -109,12 +129,9 @@ skip = []
 # -------------------------------------------------------------- sources ----
 [sources]
 unknown-registry = "deny"
-# This is the check that converts an unpinned git dependency from an invisible
-# reproducibility problem into a visible CI failure. Both git sources below
-# are pinned by `rev`/`tag` in the root Cargo.toml; a new unpinned git
-# dependency, or a new git host, fails here.
+# Shipped graphs must resolve only from the registry or reviewed local paths.
+# Stwo is vendored; the optional ICICLE feature is not release-enabled and must
+# be vendored or registry-published before it can enter a shipped graph. A git
+# dependency therefore fails rather than relying on a mutable tag or host.
 unknown-git = "deny"
-allow-git = [
-    "https://github.com/starkware-libs/stwo.git",
-    "https://github.com/ingonyama-zk/icicle.git",
-]
+allow-git = []

@@ -385,20 +385,29 @@ jobs:
           shellcheck -S warning "${files[@]}"
 
   # ------------------------------------------------------------- forge ----
-  # 8 Solidity files including a bridge, a staking contract, a state-root
-  # anchor and a UUPS proxy. Formatting and compilation are blocking release
-  # gates; OpenZeppelin is resolved at an exact version.
+  # 8 production Solidity files including a bridge, staking contract,
+  # state-root anchor and UUPS proxy, plus standards/proxy regression tests.
+  # Formatting, tests, and compilation are blocking gates; OpenZeppelin is
+  # resolved at an exact version.
   forge:
     name: contracts (forge)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          # Keep formatter/compiler behavior reproducible instead of following
+          # the action's moving `stable` default.
+          version: v1.7.1
       - name: forge fmt --check
         run: forge fmt --check
       - name: Resolve OpenZeppelin
         run: npm install --no-save @openzeppelin/contracts@5.0.2
+      - name: forge tests
+        env:
+          FOUNDRY_REMAPPINGS: '@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/'
+        run: forge test
       - name: forge build --sizes
         env:
           FOUNDRY_REMAPPINGS: '@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/'

@@ -20,7 +20,7 @@ multiline_func_header = "attributes_first"
 quote_style = "double"
 number_underscore = "thousands"
 
-[profile.default.rpc_endpoints]
+[rpc_endpoints]
 arc_local = "http://localhost:9944/eth"
 arc_testnet = "http://testnet.arc.ai:9944/eth"
 
