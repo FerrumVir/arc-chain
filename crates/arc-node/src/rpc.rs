@@ -46,6 +46,9 @@ const REWARD_PER_ATTESTATION_ARC: f64 = arc_types::economics::INFERENCE_ATTESTAT
 /// model, activation, and local validator key prerequisites are present.
 const COMMUNITY_REWARD_APPROVAL_COLLECTION_READY: bool = true;
 const COMMUNITY_REWARD_APPROVE_PATH: &str = "/internal/community/reward/approve";
+pub const SHARD_ANNOUNCE_PATH: &str = "/shards/announce";
+const FORWARD_SHARD_PATH: &str = "/inference/forward_shard";
+const CLEANUP_SHARD_PATH: &str = "/inference/cleanup_shard";
 const COMMUNITY_REWARD_EXPIRY_BLOCKS: u64 = 3_000;
 
 #[inline]
@@ -94,7 +97,28 @@ const INFERENCE_RESULT_CAP: usize = 512;
 const INFERENCE_RESULT_TTL_MS: u64 = 60 * 60 * 1_000;
 const INFERENCE_ACTIVITY_PAGE_MAX: usize = 100;
 const PUBLIC_INFERENCE_CONCURRENCY: usize = 2;
-const VALIDATOR_SHARD_CONCURRENCY: usize = 2;
+// One strict verification hop fans out to all three holders of a range.  A
+// holder must therefore be able to queue overlapping verifier traffic rather
+// than rejecting the third request before it has even reached the compute
+// pool.  The separate approval semaphore below keeps whole recomputations
+// bounded; this reserve is the width of one production replica set.
+const VALIDATOR_SHARD_CONCURRENCY: usize = 3;
+const VALIDATOR_SHARD_QUEUE_CAP: usize = 12;
+const VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS: u64 = 120;
+const VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES: usize = 128;
+const VALIDATOR_SHARD_KV_CACHE_CAP: usize = 32;
+const VALIDATOR_SHARD_KV_CACHE_PER_SIGNER_CAP: usize = 8;
+const VALIDATOR_SHARD_KV_CACHE_TTL_SECS: u64 = 10 * 60;
+const VALIDATOR_RPC_AUDIENCE_TTL_SECS: u64 = 60;
+const COMMUNITY_APPROVAL_RECOMPUTE_CONCURRENCY: usize = 1;
+const COMMUNITY_APPROVAL_QUEUE_CAP: usize = 6;
+const COMMUNITY_APPROVAL_QUEUE_TIMEOUT_SECS: u64 = 120;
+const COMMUNITY_APPROVAL_COLLECTOR_CONCURRENCY: usize = 2;
+const COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS: u64 = 1_500;
+pub const COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS: u64 = 2_700;
+pub const PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS: u64 = 4_000;
+const COMMUNITY_LATE_SUBMIT_GRACE_SECS: u64 = 5 * 60;
+const VERIFIED_SETTLEMENT_CAP: usize = 256;
 
 /// Authenticated community-mutation wire contract. V3 nodes deliberately do
 /// not accept the legacy unsigned bodies.
@@ -109,12 +133,32 @@ const COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS: u64 = 120_000;
 // future-dated request is still accepted while its cache entry is pruned.
 const COMMUNITY_AUTH_REPLAY_RETENTION_MS: u64 = COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS * 2 + 1;
 const COMMUNITY_AUTH_REPLAY_CACHE_MAX: usize = 65_536;
-const COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX: usize = 4_096;
+// A maximum-size verified generation signs one request per range/replica and
+// token position. During the 241-second replay window that legitimately
+// exceeds the worker-mutation cache's small per-identity volume; active
+// validators therefore receive a separate, still-hard-bounded nonce domain.
+const COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX: usize = 98_304;
 const COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX: usize = 64;
-const COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX: usize = 1_024;
+const COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX: usize = 16_384;
 const COMMUNITY_MUTATION_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const COMMUNITY_SUBMIT_BODY_LIMIT_BYTES: usize = 128 * 1024;
+const COMMUNITY_APPROVAL_BODY_LIMIT_BYTES: usize = 256 * 1024;
+// Canonical GGUF proof: 32,000-token vocabulary, maximum UTF-8/JSON token
+// width 48 bytes. At 256 generated tokens the exact maximum is 12,288 bytes;
+// 16 KiB leaves representation headroom while rejecting impossible outputs.
+const COMMUNITY_RESULT_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const COMMUNITY_RPC_BASE_MAX: usize = 64;
 const COMMUNITY_RPC_BASE_MAX_BYTES: usize = 2_048;
+
+fn is_validator_authenticated_path(path: &str) -> bool {
+    matches!(
+        path,
+        COMMUNITY_REWARD_APPROVE_PATH
+            | SHARD_ANNOUNCE_PATH
+            | FORWARD_SHARD_PATH
+            | CLEANUP_SHARD_PATH
+    )
+}
 
 /// Validate and canonicalize operator-configured RPC origins.
 ///
@@ -345,6 +389,16 @@ pub struct NodeState {
     /// consume the compute permits reward verification needs.
     public_inference_permits: Arc<tokio::sync::Semaphore>,
     validator_shard_permits: Arc<tokio::sync::Semaphore>,
+    validator_shard_queue_permits: Arc<tokio::sync::Semaphore>,
+    /// Whole validator-side reward recomputations are intentionally serialized.
+    /// Each one already fans out to three holders per range, so allowing every
+    /// coordinator to start one concurrently creates a multiplicative shard
+    /// storm and makes five-of-six approval impossible under load.
+    community_approval_permits: Arc<tokio::sync::Semaphore>,
+    /// Bounds parsed 256-KiB approval bodies waiting behind the single
+    /// recomputation permit. Without this outer admission gate, a validator
+    /// key could retain an unbounded number of long-lived HTTP tasks.
+    community_approval_queue_permits: Arc<tokio::sync::Semaphore>,
     /// Pipeline-parallel sharding: every layer range this node holds.
     /// Set from repeated --shard-range flags (or the deprecated single
     /// --shard-start/--shard-end pair). Empty = non-shard-holder (validator
@@ -360,6 +414,15 @@ pub struct NodeState {
             Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>,
         >,
     >,
+    /// Admission metadata for the stateful KV caches.  The map is bounded
+    /// globally and per authenticated validator and ages out abandoned
+    /// request IDs; `shard_kv_cache_gate` makes prune/count/insert atomic.
+    shard_kv_cache_metadata: Arc<dashmap::DashMap<String, ShardKvCacheMetadata>>,
+    shard_kv_cache_gate: Arc<parking_lot::Mutex<()>>,
+    /// Recently verified RPC audience for each canonical shard origin.  It is
+    /// learned either from a signed announcement or `/network/info`, and is
+    /// short-lived so topology/key/domain changes fail closed promptly.
+    shard_rpc_audiences: Arc<dashmap::DashMap<String, ValidatorRpcAudience>>,
     /// Network-wide shard registry (gossiped via /shards/announce).
     /// Maps node socket addr → (ShardInfo, last-seen Instant). Entries older
     /// than SHARD_REGISTRY_TTL_SECS (60s) are considered stale and dropped
@@ -418,6 +481,13 @@ pub struct NodeState {
     community_reward_approval_certificates: Arc<dashmap::DashMap<Hash256, Hash256>>,
     /// Coordinator-side idempotency cache for rewards accepted into mempool.
     community_reward_submissions: Arc<dashmap::DashMap<Hash256, CommunityRewardSubmission>>,
+    /// Independently verified completions awaiting approval/mempool settlement.
+    /// This bounded retry journal decouples earned-work liveness from the
+    /// worker's HTTP connection and makes fresh submits idempotent before a
+    /// transaction reaches the mempool.
+    community_verified_settlements: Arc<dashmap::DashMap<Hash256, VerifiedCommunitySettlement>>,
+    community_verified_settlements_gate: Arc<parking_lot::Mutex<()>>,
+    community_settlement_journal_dir: Option<Arc<std::path::PathBuf>>,
     /// Community work dispatch: sender side. The coordinator pushes WorkItems
     /// here when it wants community nodes to run forward_shard. This is the
     /// "producer" half of an mpsc channel - wire it up in main.rs when
@@ -1052,6 +1122,9 @@ pub fn build_node_state(
     model_artifact_id: Option<arc_crypto::Hash256>,
 ) -> NodeState {
     let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
+    let community_settlement_journal_dir = state
+        .persistence_dir()
+        .map(|directory| Arc::new(directory.join("community-settlements")));
     NodeState {
         state,
         mempool,
@@ -1080,8 +1153,20 @@ pub fn build_node_state(
             PUBLIC_INFERENCE_CONCURRENCY,
         )),
         validator_shard_permits: Arc::new(tokio::sync::Semaphore::new(VALIDATOR_SHARD_CONCURRENCY)),
+        validator_shard_queue_permits: Arc::new(tokio::sync::Semaphore::new(
+            VALIDATOR_SHARD_QUEUE_CAP,
+        )),
+        community_approval_permits: Arc::new(tokio::sync::Semaphore::new(
+            COMMUNITY_APPROVAL_RECOMPUTE_CONCURRENCY,
+        )),
+        community_approval_queue_permits: Arc::new(tokio::sync::Semaphore::new(
+            COMMUNITY_APPROVAL_QUEUE_CAP,
+        )),
         shard_infos: Vec::new(),
         shard_kv_caches: Arc::new(dashmap::DashMap::new()),
+        shard_kv_cache_metadata: Arc::new(dashmap::DashMap::new()),
+        shard_kv_cache_gate: Arc::new(parking_lot::Mutex::new(())),
+        shard_rpc_audiences: Arc::new(dashmap::DashMap::new()),
         shard_registry: Arc::new(dashmap::DashMap::new()),
         latency_stats: Arc::new(dashmap::DashMap::new()),
         sharded_runs_total: Arc::new(AtomicU64::new(0)),
@@ -1106,6 +1191,9 @@ pub fn build_node_state(
         community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
         community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
         community_reward_submissions: Arc::new(dashmap::DashMap::new()),
+        community_verified_settlements: Arc::new(dashmap::DashMap::new()),
+        community_verified_settlements_gate: Arc::new(parking_lot::Mutex::new(())),
+        community_settlement_journal_dir,
         // Community work dispatch — bounded mpsc with 256-slot buffer. New
         // jobs that arrive when 256 are already queued get backpressure
         // (the dispatcher in /inference/run awaits .send().await). Workers
@@ -1573,6 +1661,26 @@ pub async fn serve(
         node.shard_registry
             .insert(key, (si.clone(), std::time::Instant::now()));
     }
+    let replayed_settlements = replay_verified_settlement_journal(&node)
+        .map_err(|error| anyhow::anyhow!("verified settlement journal replay failed: {error}"))?;
+    for job_id in &replayed_settlements {
+        schedule_verified_settlement_retry(&node, *job_id);
+    }
+    if !replayed_settlements.is_empty() {
+        tracing::warn!(
+            count = replayed_settlements.len(),
+            "replayed crash-durable verified community settlements"
+        );
+    }
+    let settlement_janitor = node.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if let Err(error) = prune_verified_settlements(&settlement_janitor) {
+                tracing::error!(%error, "failed to prune verified community settlement journal");
+            }
+        }
+    });
 
     // ── Dedicated inference compute pool ────────────────────────────────
     if compute_threads > 0 {
@@ -1762,7 +1870,7 @@ pub async fn serve(
         .route(
             "/inference/forward_shard",
             post(inference_forward_shard)
-                .layer(DefaultBodyLimit::max(MAX_FORWARD_SHARD_RESPONSE_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_FORWARD_SHARD_REQUEST_BYTES)),
         )
         .route("/inference/cleanup_shard", post(inference_cleanup_shard))
         // Tier 1 status remains readable, but public writes fail closed until
@@ -1835,12 +1943,12 @@ pub async fn serve(
         .route(
             COMMUNITY_SUBMIT_WORK_PATH,
             post(community_submit_work_signed)
-                .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
+                .layer(DefaultBodyLimit::max(COMMUNITY_SUBMIT_BODY_LIMIT_BYTES)),
         )
         .route(
             COMMUNITY_REWARD_APPROVE_PATH,
             post(community_reward_approve_signed)
-                .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
+                .layer(DefaultBodyLimit::max(COMMUNITY_APPROVAL_BODY_LIMIT_BYTES)),
         )
         .route(
             "/community/reward_receipt/{hash}",
@@ -4942,7 +5050,10 @@ async fn channel_state(
 /// inference passes (worker + verifier), one claim-poll window, and network
 /// headroom. The cap prevents an abandoned request from living forever.
 const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 45;
-const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 3_600;
+// 256 tokens x 3 observed 3.3s/token passes x 1.5 headroom + a 30s
+// claim window = 3,832s.  Keep the protocol budget below the reviewed 4,000s
+// public/client ceiling while never truncating a valid maximum-size job.
+const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 3_900;
 const COMMUNITY_VERIFICATION_REPLICAS: usize = 3;
 const COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED: usize = 2;
 
@@ -4956,7 +5067,7 @@ fn community_dispatch_timeout_secs(max_tokens: u32) -> u64 {
         .saturating_mul(per_token_ms)
         .saturating_mul(3);
     let est_with_headroom = est_ms.saturating_mul(3) / 2;
-    let est_secs = est_with_headroom / 1000 + COMMUNITY_CLAIM_TIMEOUT_SECS;
+    let est_secs = est_with_headroom.div_ceil(1000) + COMMUNITY_CLAIM_TIMEOUT_SECS;
     est_secs.clamp(
         MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS,
         MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS,
@@ -5092,15 +5203,22 @@ fn reward_approval_prerequisites(node: &NodeState) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn reward_validator_set_id(node: &NodeState) -> String {
-    let mut validators = node.state.active_validators();
+pub(crate) fn active_validator_set_commitment(state: &StateDB) -> Hash256 {
+    let mut validators = state.active_validators();
     validators.sort_unstable_by_key(|(address, _)| address.0);
     let mut hasher = blake3::Hasher::new_derive_key("ARC-community-reward-validator-set-v1");
     for (address, stake) in validators {
         hasher.update(address.as_ref());
         hasher.update(&stake.to_le_bytes());
     }
-    format!("0x{}", hex::encode(hasher.finalize().as_bytes()))
+    Hash256(*hasher.finalize().as_bytes())
+}
+
+fn reward_validator_set_id(node: &NodeState) -> String {
+    format!(
+        "0x{}",
+        active_validator_set_commitment(&node.state).to_hex()
+    )
 }
 
 fn reward_recovery_epoch(node: &NodeState) -> Option<u64> {
@@ -5144,6 +5262,39 @@ fn community_job_id(
     .to_hex()
 }
 
+#[derive(Debug)]
+struct CommunityDispatchError {
+    message: String,
+    local_fallback_safe: bool,
+}
+
+impl CommunityDispatchError {
+    fn before_enqueue(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            local_fallback_safe: true,
+        }
+    }
+
+    fn after_enqueue(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            local_fallback_safe: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+}
+
+impl std::fmt::Display for CommunityDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Push a whole-prompt job onto the community work queue and await the
 /// result via oneshot. Returns Err when there's no queue, no worker
 /// claims the job in time, the worker reports failure, or the result
@@ -5157,31 +5308,43 @@ async fn dispatch_to_community_worker(
     input: String,
     max_tokens: u32,
     model_id_hint: Option<String>,
-) -> Result<CommunityDispatchOutcome, String> {
+) -> Result<CommunityDispatchOutcome, CommunityDispatchError> {
     let _inference_permit = node
         .public_inference_permits
         .clone()
         .try_acquire_owned()
-        .map_err(|_| "public inference capacity is saturated; retry after 2 seconds".to_string())?;
+        .map_err(|_| {
+            CommunityDispatchError::before_enqueue(
+                "public inference capacity is saturated; retry after 2 seconds",
+            )
+        })?;
     if max_tokens == 0 || max_tokens > INFERENCE_RUN_MAX_TOKENS {
-        return Err(format!(
+        return Err(CommunityDispatchError::before_enqueue(format!(
             "community max_tokens must be in 1..={INFERENCE_RUN_MAX_TOKENS}, got {max_tokens}"
-        ));
+        )));
     }
     let model_id_hash = model_id_hint
         .as_deref()
-        .ok_or_else(|| "community dispatch requires an exact model artifact commitment".to_string())
-        .and_then(|value| parse_hash256_hex(value, "model_id"))?;
+        .ok_or_else(|| {
+            CommunityDispatchError::before_enqueue(
+                "community dispatch requires an exact model artifact commitment",
+            )
+        })
+        .and_then(|value| {
+            parse_hash256_hex(value, "model_id").map_err(CommunityDispatchError::before_enqueue)
+        })?;
     let model_id = format!("0x{}", model_id_hash.to_hex());
     let tx = node
         .community_work_tx
         .as_ref()
-        .ok_or_else(|| "community work queue not wired".to_string())?
+        .ok_or_else(|| CommunityDispatchError::before_enqueue("community work queue not wired"))?
         .clone();
     let results = node
         .community_work_results
         .as_ref()
-        .ok_or_else(|| "community work results map not wired".to_string())?
+        .ok_or_else(|| {
+            CommunityDispatchError::before_enqueue("community work results map not wired")
+        })?
         .clone();
 
     // Include the coordinator address as a namespace and a monotonic local
@@ -5219,9 +5382,15 @@ async fn dispatch_to_community_worker(
             assignment_epoch: node.community_job_epoch,
             job_nonce: nonce,
             assigned_worker: None,
+            submitting: false,
             sender: osh_tx,
         },
     );
+    let _pending_reservation = PendingDispatchReservation {
+        results: results.clone(),
+        active_jobs: node.community_active_jobs.clone(),
+        job_id: job_id.clone(),
+    };
 
     if let Err(e) = tx.try_send(item) {
         // Enqueue is part of the bounded admission decision. Waiting for a
@@ -5230,7 +5399,9 @@ async fn dispatch_to_community_worker(
         // queue now fails immediately and the smart router can use its local
         // fallback without growing the pending map.
         results.remove(&job_id);
-        return Err(format!("community queue unavailable: {e}"));
+        return Err(CommunityDispatchError::before_enqueue(format!(
+            "community queue unavailable: {e}"
+        )));
     }
 
     let timeout_secs = community_dispatch_timeout_secs(max_tokens);
@@ -5243,7 +5414,7 @@ async fn dispatch_to_community_worker(
                     .error
                     .clone()
                     .unwrap_or_else(|| "worker reported failure".to_string());
-                return Err(err);
+                return Err(CommunityDispatchError::after_enqueue(err));
             }
             // Record dispatch latency in EWMA so future routing favors
             // workers that consistently beat the deadline. Keyed by
@@ -5259,22 +5430,18 @@ async fn dispatch_to_community_worker(
         Ok(Err(_)) => {
             // oneshot sender dropped without sending — the worker
             // disconnected mid-job or the queue purged us.
-            if let Some((_, pending)) = results.remove(&job_id)
-                && let Some(worker_id) = pending.assigned_worker.as_deref()
-            {
-                release_active_community_job(node, worker_id, &job_id);
-            }
-            Err("worker disconnected before completing job".into())
+            Err(CommunityDispatchError::after_enqueue(
+                "worker disconnected before completing job",
+            ))
         }
         Err(_) => {
-            // Timeout — orphan our entry so submit_work doesn't crash
-            // when the late result arrives.
-            if let Some((_, pending)) = results.remove(&job_id)
-                && let Some(worker_id) = pending.assigned_worker.as_deref()
-            {
-                release_active_community_job(node, worker_id, &job_id);
-            }
-            Err(format!("no worker completed within {}s", timeout_secs))
+            // The drop guard removes an unclaimed job immediately and gives an
+            // already-claimed worker a bounded grace window to submit and
+            // settle without its public caller remaining connected.
+            Err(CommunityDispatchError::after_enqueue(format!(
+                "no worker completed within {}s",
+                timeout_secs
+            )))
         }
     }
 }
@@ -5493,9 +5660,10 @@ async fn inference_run(
     //
     // Routing order:
     //   1. force_local=true  → skip dispatch, run on this seed.
-    //   2. ≥1 live worker    → push WorkItem, wait up to 60s. If any
-    //                          worker completes, return their result.
-    //   3. Community fail    → fall through to local model.
+    //   2. ≥1 live worker    → push WorkItem and wait within the protocol
+    //                          budget for compute + independent verification.
+    //   3. Pre-enqueue fail  → fall through to local model. Once claimed,
+    //                          never start a duplicate late local pass.
     //   4. No local model    → return a 200 with success=false explaining
     //                          why (workers all timed out, no model loaded).
     //
@@ -5573,10 +5741,24 @@ async fn inference_run(
                 })));
             }
             Err(e) => {
+                if !e.local_fallback_safe {
+                    tracing::warn!(
+                        workers = live_workers,
+                        reason = %e.message,
+                        "community assignment did not complete; refusing a second late local inference pass"
+                    );
+                    return Err(api_error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "Community inference did not complete within its verified dispatch budget: {}. The assignment may still settle during its bounded late-submit grace period; query its job status rather than starting duplicate local work.",
+                            e.message
+                        ),
+                    ));
+                }
                 tracing::warn!(
                     workers = live_workers,
-                    "community dispatch failed, falling back to local: {}",
-                    e
+                    "community dispatch could not be enqueued, falling back to local: {}",
+                    e.message
                 );
             }
         }
@@ -6466,8 +6648,22 @@ async fn inference_list_results(AxumState(node): AxumState<NodeState>) -> Json<V
 //                       → shardN-1 (layers kN-1..n_layers + LM head)
 // Each shard holds a per-request KV cache that lives across token generation.
 
+const MAX_FORWARD_SHARD_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORWARD_SHARD_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORWARD_SHARD_HIDDEN_ELEMENTS: usize = 131_072;
+
+#[derive(Clone)]
+struct ValidatorRpcAudience {
+    validator: Hash256,
+    transaction_domain: Option<Hash256>,
+    observed_at: Instant,
+}
+
+#[derive(Clone)]
+struct ShardKvCacheMetadata {
+    signer: Hash256,
+    last_seen: Instant,
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6501,6 +6697,30 @@ struct ForwardShardRequest {
     /// True if this is the last token of the request - used to evict KV cache.
     #[serde(default)]
     last_token: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatorForwardShardRequest {
+    validator_id: String,
+    request: ForwardShardRequest,
+}
+
+impl CommunityAuthenticatedPayload for ValidatorForwardShardRequest {
+    fn signer_id(&self) -> &str {
+        &self.validator_id
+    }
+
+    fn validate_for_auth(&self) -> Result<(), String> {
+        if self.request.request_id.is_empty()
+            || self.request.request_id.len() > VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES
+        {
+            return Err(format!(
+                "request_id required (1-{VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES} bytes)"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -6663,10 +6883,34 @@ fn verify_forward_shard_response_semantics(
     Ok(())
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CleanupShardRequest {
     /// Unique request id whose per-shard KV cache should be evicted.
     request_id: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatorCleanupShardRequest {
+    validator_id: String,
+    request: CleanupShardRequest,
+}
+
+impl CommunityAuthenticatedPayload for ValidatorCleanupShardRequest {
+    fn signer_id(&self) -> &str {
+        &self.validator_id
+    }
+
+    fn validate_for_auth(&self) -> Result<(), String> {
+        if self.request.request_id.is_empty()
+            || self.request.request_id.len() > VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES
+        {
+            return Err(format!(
+                "request_id required (1-{VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES} bytes)"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// GET /inference/cache_stats
@@ -6803,18 +7047,166 @@ async fn inference_cache_check(
 /// Run the local shard's slice of layers on the incoming hidden state (or token).
 async fn inference_forward_shard(
     AxumState(node): AxumState<NodeState>,
-    Json(req): Json<ForwardShardRequest>,
+    Json(signed): Json<CommunitySignedRequest<ValidatorForwardShardRequest>>,
 ) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
-    let _inference_permit = node
-        .validator_shard_permits
+    let payload = authenticate_community_request(&node, FORWARD_SHARD_PATH, signed)?;
+    let signer = parse_hash256_hex(&payload.validator_id, "validator_id")
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    inference_forward_shard_authenticated(node, payload.request, signer).await
+}
+
+struct ShardKvCacheReservation {
+    caches: Arc<
+        dashmap::DashMap<
+            String,
+            Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>,
+        >,
+    >,
+    metadata: Arc<dashmap::DashMap<String, ShardKvCacheMetadata>>,
+    request_id: String,
+    committed: bool,
+}
+
+type ShardKvCacheHandle = Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>;
+type ShardKvCacheAdmission =
+    Result<(ShardKvCacheHandle, ShardKvCacheReservation), (StatusCode, String)>;
+
+impl ShardKvCacheReservation {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ShardKvCacheReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.caches.remove(&self.request_id);
+            self.metadata.remove(&self.request_id);
+        }
+    }
+}
+
+fn reserve_shard_kv_cache(
+    node: &NodeState,
+    request_id: &str,
+    signer: Hash256,
+    n_layers: usize,
+) -> ShardKvCacheAdmission {
+    use arc_inference::cached_integer_model::KVCache;
+
+    let _gate = node.shard_kv_cache_gate.lock();
+    let now = Instant::now();
+    let expired: Vec<String> = node
+        .shard_kv_cache_metadata
+        .iter()
+        .filter_map(|entry| {
+            (entry.value().last_seen.elapsed().as_secs() > VALIDATOR_SHARD_KV_CACHE_TTL_SECS)
+                .then(|| entry.key().clone())
+        })
+        .collect();
+    for id in expired {
+        node.shard_kv_cache_metadata.remove(&id);
+        node.shard_kv_caches.remove(&id);
+    }
+
+    if let Some(mut metadata) = node.shard_kv_cache_metadata.get_mut(request_id) {
+        if metadata.signer != signer {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "request_id is owned by a different authenticated validator".to_string(),
+            ));
+        }
+        metadata.last_seen = now;
+    } else {
+        if node.shard_kv_cache_metadata.len() >= VALIDATOR_SHARD_KV_CACHE_CAP {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "validator shard KV cache reached its reviewed capacity {VALIDATOR_SHARD_KV_CACHE_CAP}"
+                ),
+            ));
+        }
+        let signer_entries = node
+            .shard_kv_cache_metadata
+            .iter()
+            .filter(|entry| entry.value().signer == signer)
+            .count();
+        if signer_entries >= VALIDATOR_SHARD_KV_CACHE_PER_SIGNER_CAP {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "validator exceeded its {VALIDATOR_SHARD_KV_CACHE_PER_SIGNER_CAP}-request shard KV cache allowance"
+                ),
+            ));
+        }
+        node.shard_kv_cache_metadata.insert(
+            request_id.to_string(),
+            ShardKvCacheMetadata {
+                signer,
+                last_seen: now,
+            },
+        );
+    }
+    let cache = node
+        .shard_kv_caches
+        .entry(request_id.to_string())
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(KVCache::new(n_layers))))
+        .value()
+        .clone();
+    Ok((
+        cache,
+        ShardKvCacheReservation {
+            caches: node.shard_kv_caches.clone(),
+            metadata: node.shard_kv_cache_metadata.clone(),
+            request_id: request_id.to_string(),
+            committed: false,
+        },
+    ))
+}
+
+async fn inference_forward_shard_authenticated(
+    node: NodeState,
+    req: ForwardShardRequest,
+    signer: Hash256,
+) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
+    if req.request_id.is_empty() || req.request_id.len() > VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("request_id required (1-{VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES} bytes)"),
+        ));
+    }
+    let _queue_permit = node
+        .validator_shard_queue_permits
         .clone()
         .try_acquire_owned()
         .map_err(|_| {
             (
                 StatusCode::TOO_MANY_REQUESTS,
-                "validator shard compute capacity saturated; retry after 1 second".to_string(),
+                format!(
+                    "validator shard queue reached its reviewed capacity {VALIDATOR_SHARD_QUEUE_CAP}"
+                ),
             )
         })?;
+    let _inference_permit = tokio::time::timeout(
+        std::time::Duration::from_secs(VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS),
+        node.validator_shard_permits.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "validator shard compute queue exceeded its {}s deadline",
+                VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
+            ),
+        )
+    })?
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "validator shard compute admission is closed".to_string(),
+        )
+    })?;
     let signed_request = req.clone();
     let local_model_id = node.model_artifact_id.ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -6918,7 +7310,7 @@ async fn inference_forward_shard(
         })?;
 
     // Decode input
-    use arc_inference::cached_integer_model::{KVCache, ShardInput, ShardOutput};
+    use arc_inference::cached_integer_model::{ShardInput, ShardOutput};
 
     let input = if let Some(token) = req.token {
         // Verify this is the first shard (only first shard accepts a raw token)
@@ -6970,12 +7362,8 @@ async fn inference_forward_shard(
 
     // Get-or-create per-request KV cache
     let n_layers = model.config.n_layers;
-    let cache_arc = node
-        .shard_kv_caches
-        .entry(req.request_id.clone())
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(KVCache::new(n_layers))))
-        .value()
-        .clone();
+    let (cache_arc, mut cache_reservation) =
+        reserve_shard_kv_cache(&node, &req.request_id, signer, n_layers)?;
 
     // Run the shard's forward pass (blocking - uses spawn_blocking to free runtime)
     let model_clone = model.clone();
@@ -7051,6 +7439,7 @@ async fn inference_forward_shard(
     // Optionally evict cache after the last token
     if req.last_token {
         node.shard_kv_caches.remove(&req_id);
+        node.shard_kv_cache_metadata.remove(&req_id);
     }
 
     let layers_processed = end_layer - start_layer;
@@ -7098,6 +7487,7 @@ async fn inference_forward_shard(
             format!("sign shard response: {e}"),
         )
     })?;
+    cache_reservation.commit();
     Ok(Json(response))
 }
 
@@ -7109,7 +7499,18 @@ async fn inference_forward_shard(
 /// anything and every remote shard leaked one cache entry per request.
 async fn inference_cleanup_shard(
     AxumState(node): AxumState<NodeState>,
-    Json(req): Json<CleanupShardRequest>,
+    Json(signed): Json<CommunitySignedRequest<ValidatorCleanupShardRequest>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let payload = authenticate_community_request(&node, CLEANUP_SHARD_PATH, signed)?;
+    let signer = parse_hash256_hex(&payload.validator_id, "validator_id")
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    inference_cleanup_shard_authenticated(node, payload.request, signer).await
+}
+
+async fn inference_cleanup_shard_authenticated(
+    node: NodeState,
+    req: CleanupShardRequest,
+    signer: Hash256,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if req.request_id.is_empty() || req.request_id.len() > 128 {
         return Err((
@@ -7118,7 +7519,17 @@ async fn inference_cleanup_shard(
         ));
     }
 
+    if let Some(metadata) = node.shard_kv_cache_metadata.get(&req.request_id)
+        && metadata.signer != signer
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "request_id is owned by a different authenticated validator".to_string(),
+        ));
+    }
+
     let removed = node.shard_kv_caches.remove(&req.request_id).is_some();
+    node.shard_kv_cache_metadata.remove(&req.request_id);
     Ok(Json(json!({
         "ok": true,
         "request_id": req.request_id,
@@ -7231,7 +7642,7 @@ fn fanout_quorum_plan(
 type FanoutJoinSet = tokio::task::JoinSet<(
     ShardInfo,
     u64,
-    Result<(ForwardShardResponse, usize), (String, bool)>,
+    Result<(ForwardShardResponse, usize, usize), (String, bool)>,
 )>;
 
 /// What one hop produced.
@@ -7354,19 +7765,134 @@ fn shard_rpc_url(socket: &str, path: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-async fn forward_shard_once(
-    client: &reqwest::Client,
+fn shard_rpc_origin(socket: &str) -> Result<String, String> {
+    let url = shard_rpc_url(socket, "/")?;
+    Ok(url.origin().ascii_serialization())
+}
+
+fn shard_origin_is_configured(node: &NodeState, origin: &str) -> bool {
+    let loopback = reqwest::Url::parse(origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    loopback
+        || node
+            .community_rpc_bases
+            .iter()
+            .chain(node.seed_rpc_addrs.iter())
+            .filter_map(|base| shard_rpc_origin(base).ok())
+            .any(|configured| configured == origin)
+}
+
+async fn resolve_shard_rpc_audience(
+    node: &NodeState,
     socket: &str,
-    body: &[u8],
+) -> Result<ValidatorRpcAudience, String> {
+    let origin = shard_rpc_origin(socket)?;
+    if let Some(cached) = node.shard_rpc_audiences.get(&origin)
+        && cached.observed_at.elapsed().as_secs() <= VALIDATOR_RPC_AUDIENCE_TTL_SECS
+        && cached.transaction_domain == node.state.transaction_domain_hash()
+        && node.state.is_validator(&cached.validator)
+    {
+        return Ok(cached.clone());
+    }
+    if !shard_origin_is_configured(node, &origin) {
+        return Err(format!(
+            "refusing shard RPC origin {origin}: it is neither configured nor bound by a signed validator announcement"
+        ));
+    }
+    let info_url = shard_rpc_url(socket, "/network/info")?;
+    let info = node
+        .inference_http
+        .get(info_url)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|error| format!("fetch shard RPC audience: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("shard RPC audience rejected: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("decode shard RPC audience: {error}"))?;
+    let validator = info
+        .get("validator_address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "shard RPC audience omitted validator_address".to_string())
+        .and_then(|value| parse_hash256_hex(value, "validator_address"))?;
+    if !node.state.is_validator(&validator) {
+        return Err(format!(
+            "shard RPC audience {} is not in the active validator set",
+            validator
+        ));
+    }
+    let transaction_domain = match info
+        .get("transaction_domain")
+        .or_else(|| info.get("recovery_domain"))
+    {
+        Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("shard RPC transaction_domain is malformed".to_string()),
+    };
+    if transaction_domain != node.state.transaction_domain_hash() {
+        return Err("shard RPC recovery/network domain does not match this node".to_string());
+    }
+    if let Some(identity) = node.chain_identity.as_ref() {
+        let remote_network = info.get("network").and_then(Value::as_str);
+        let remote_chain_id = info.get("chain_id").and_then(Value::as_str);
+        if remote_network != Some(identity.name.as_str())
+            || remote_chain_id != Some(identity.chain_id.as_str())
+        {
+            return Err("shard RPC declared chain identity does not match this node".to_string());
+        }
+    }
+    let audience = ValidatorRpcAudience {
+        validator,
+        transaction_domain,
+        observed_at: Instant::now(),
+    };
+    node.shard_rpc_audiences.insert(origin, audience.clone());
+    Ok(audience)
+}
+
+async fn forward_shard_once(
+    node: &NodeState,
+    socket: &str,
     request: &ForwardShardRequest,
-    chain_identity: Option<&ChainIdentity>,
-    authorized_validators: &SharedValidators,
-) -> Result<(ForwardShardResponse, usize), (String, bool)> {
-    let url = shard_rpc_url(socket, "/inference/forward_shard").map_err(|error| (error, false))?;
-    let resp = client
+) -> Result<(ForwardShardResponse, usize, usize), (String, bool)> {
+    let audience = resolve_shard_rpc_audience(node, socket)
+        .await
+        .map_err(|error| (error, false))?;
+    let keypair = node.validator_keypair.as_ref().ok_or_else(|| {
+        (
+            "coordinator has no validator signing key for shard request".to_string(),
+            false,
+        )
+    })?;
+    let payload = ValidatorForwardShardRequest {
+        validator_id: format!("0x{}", node.validator_address.to_hex()),
+        request: request.clone(),
+    };
+    let signed = sign_community_request(
+        FORWARD_SHARD_PATH,
+        payload,
+        keypair,
+        audience.validator,
+        audience.transaction_domain,
+    )
+    .map_err(|error| (error, false))?;
+    let body = serde_json::to_vec(&signed).map_err(|error| (error.to_string(), false))?;
+    let request_bytes = body.len();
+    let url = shard_rpc_url(socket, FORWARD_SHARD_PATH).map_err(|error| (error, false))?;
+    let resp = node
+        .inference_http
         .post(url)
         .header("Content-Type", "application/json")
-        .body(body.to_vec())
+        .body(body)
         .send()
         .await
         .map_err(|e| (format!("send: {}", e), false))?;
@@ -7391,13 +7917,19 @@ async fn forward_shard_once(
         serde_json::from_slice(&raw).map_err(|e| (format!("parse: {}", e), false))?;
 
     verify_forward_shard_response_auth(
-        chain_identity,
+        node.chain_identity.as_ref(),
         request,
         &parsed,
-        &authorized_validators.read(),
+        &node.dag_validators.read(),
     )
     .map_err(|e| (e, false))?;
-    Ok((parsed, raw.len()))
+    if parsed.validator_address != audience.validator {
+        return Err((
+            "shard response signer differs from the authenticated RPC audience".to_string(),
+            false,
+        ));
+    }
+    Ok((parsed, raw.len(), request_bytes))
 }
 
 /// Execute one pipeline hop under `strategy`.
@@ -7407,20 +7939,13 @@ async fn forward_shard_once(
 /// across positions so the choice is sticky (which matters: forward_shard is
 /// stateful per request_id, so bouncing between replicas is what makes a KV
 /// cache go cold in the first place).
-#[allow(clippy::too_many_arguments)]
 async fn pipeline_hop(
-    client: &reqwest::Client,
+    node: &NodeState,
     replicas: &mut Vec<ShardInfo>,
     strategy: HopStrategy,
     req: &ForwardShardRequest,
-    lat_stats: &Arc<dashmap::DashMap<String, LatencyEWMA>>,
-    chain_identity: Option<&ChainIdentity>,
-    authorized_validators: &SharedValidators,
     want_vote: bool,
 ) -> Result<HopOutcome, String> {
-    let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-    let req_bytes = body.len();
-
     match strategy {
         HopStrategy::Failover => {
             let mut last_err = String::new();
@@ -7429,19 +7954,10 @@ async fn pipeline_hop(
             while attempts < replicas.len() {
                 let shard = replicas[0].clone();
                 let t_hop = std::time::Instant::now();
-                match forward_shard_once(
-                    client,
-                    &shard.socket_addr,
-                    &body,
-                    req,
-                    chain_identity,
-                    authorized_validators,
-                )
-                .await
-                {
-                    Ok((resp, resp_bytes)) => {
+                match forward_shard_once(node, &shard.socket_addr, req).await {
+                    Ok((resp, resp_bytes, req_bytes)) => {
                         let wall_ms = t_hop.elapsed().as_millis() as u64;
-                        record_latency(lat_stats, &shard.socket_addr, wall_ms);
+                        record_latency(&node.latency_stats, &shard.socket_addr, wall_ms);
                         return Ok(HopOutcome {
                             hidden: resp.hidden,
                             hidden_hash: resp.hidden_hash,
@@ -7510,23 +8026,12 @@ async fn pipeline_hop(
 
             let mut set: FanoutJoinSet = tokio::task::JoinSet::new();
             for r in &selected {
-                let c = client.clone();
-                let b = body.clone();
+                let node = node.clone();
                 let shard = r.clone();
                 let request = req.clone();
-                let chain_identity = chain_identity.cloned();
-                let authorized_validators = authorized_validators.clone();
                 set.spawn(async move {
                     let t = std::time::Instant::now();
-                    let out = forward_shard_once(
-                        &c,
-                        &shard.socket_addr,
-                        &b,
-                        &request,
-                        chain_identity.as_ref(),
-                        &authorized_validators,
-                    )
-                    .await;
+                    let out = forward_shard_once(&node, &shard.socket_addr, &request).await;
                     let wall = t.elapsed().as_millis() as u64;
                     (shard, wall, out)
                 });
@@ -7539,7 +8044,8 @@ async fn pipeline_hop(
             // desktop sends) that made the latency-aware sort a complete no-op
             // and every hop paid the worst replica. Cost per hop goes from
             // max(k) to the k/2+1-th order statistic.
-            let mut returned: Vec<(ShardInfo, u64, ForwardShardResponse, usize)> = Vec::new();
+            let mut returned: Vec<(ShardInfo, u64, ForwardShardResponse, usize, usize)> =
+                Vec::new();
             let mut tally: HashMap<String, Vec<usize>> = HashMap::new();
             let mut signer_votes: std::collections::HashSet<(String, Hash256)> =
                 std::collections::HashSet::new();
@@ -7556,8 +8062,8 @@ async fn pipeline_hop(
                     }
                 };
                 match out {
-                    Ok((resp, resp_bytes)) => {
-                        record_latency(lat_stats, &shard.socket_addr, wall_ms);
+                    Ok((resp, resp_bytes, request_bytes)) => {
+                        record_latency(&node.latency_stats, &shard.socket_addr, wall_ms);
                         let hash = if resp.is_terminal {
                             resp.logits_hash.clone()
                         } else {
@@ -7565,7 +8071,7 @@ async fn pipeline_hop(
                         };
                         let idx = returned.len();
                         let signer = resp.validator_address;
-                        returned.push((shard, wall_ms, resp, resp_bytes));
+                        returned.push((shard, wall_ms, resp, resp_bytes, request_bytes));
                         if let Some(h) = hash {
                             // Multiple HTTP aliases controlled by one validator
                             // are still one vote. Count a signer at most once
@@ -7603,7 +8109,7 @@ async fn pipeline_hop(
             // hedged replica's KV cache aligned (and refreshes its EWMA, which
             // is how a recovered replica gets rediscovered).
             if !set.is_empty() {
-                let stats = lat_stats.clone();
+                let stats = node.latency_stats.clone();
                 tokio::spawn(async move {
                     let mut set = set;
                     while let Some(Ok((shard, wall_ms, out))) = set.join_next().await {
@@ -7643,7 +8149,7 @@ async fn pipeline_hop(
             let vote = if want_vote {
                 let divergent: Vec<(String, String)> = returned
                     .iter()
-                    .filter_map(|(s, _, r, _)| {
+                    .filter_map(|(s, _, r, _, _)| {
                         let h = if r.is_terminal {
                             r.logits_hash.clone()
                         } else {
@@ -7662,7 +8168,7 @@ async fn pipeline_hop(
                     replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
                     replicas_returned: returned
                         .iter()
-                        .map(|(s, _, _, _)| s.node_name.clone())
+                        .map(|(s, _, _, _, _)| s.node_name.clone())
                         .collect(),
                     majority_hash: majority_hash.clone(),
                     majority_signers,
@@ -7702,7 +8208,8 @@ async fn pipeline_hop(
                 ));
             }
 
-            let (shard, wall_ms, resp, resp_bytes) = &returned[members[0]];
+            let request_bytes = returned.iter().map(|entry| entry.4).sum();
+            let (shard, wall_ms, resp, resp_bytes, _) = &returned[members[0]];
             Ok(HopOutcome {
                 hidden: resp.hidden.clone(),
                 hidden_hash: resp.hidden_hash.clone(),
@@ -7712,7 +8219,7 @@ async fn pipeline_hop(
                 compute_ms: resp.compute_ms,
                 wall_ms: *wall_ms,
                 layers_processed: resp.layers_processed as u64,
-                req_bytes,
+                req_bytes: request_bytes,
                 resp_bytes: *resp_bytes,
                 vote,
             })
@@ -7766,7 +8273,6 @@ async fn run_pipeline(
     let model_id_hex = format!("0x{}", model_id.to_hex());
     let num_hops = pipeline.len();
     let prompt_len = all_tokens.len();
-    let client = node.inference_http.clone();
     let mut total_bytes: usize = 0;
     let mut votes: Vec<RangeVote> = Vec::new();
     let mut generated: Vec<u32> = Vec::new();
@@ -7794,17 +8300,13 @@ async fn run_pipeline(
         for i in 0..num_hops {
             let (start_layer, end_layer) = pipeline[i].0;
             let mut replicas = live_replicas[i].clone();
-            let client_c = client.clone();
+            let hop_node = node.clone();
             let req_id = request_id.to_string();
             let model_id = model_id_hex.clone();
             let mut rx = rxs[i].take().expect("rx slot populated");
             let tx_out = txs[i + 1].clone();
             let is_last = i == num_hops - 1;
             let expected_hidden_len = model.config.d_model;
-            let lat_stats = node.latency_stats.clone();
-            let chain_identity = node.chain_identity.clone();
-            let authorized_validators = node.dag_validators.clone();
-
             handles.push(tokio::spawn(async move {
                 let mut bytes: usize = 0;
                 let mut stats = HopStats::default();
@@ -7824,17 +8326,8 @@ async fn run_pipeline(
                         generated_tokens: Vec::new(),
                         last_token: false,
                     };
-                    let out = pipeline_hop(
-                        &client_c,
-                        &mut replicas,
-                        strategy,
-                        &req,
-                        &lat_stats,
-                        chain_identity.as_ref(),
-                        &authorized_validators,
-                        collect_votes,
-                    )
-                    .await?;
+                    let out = pipeline_hop(&hop_node, &mut replicas, strategy, &req, collect_votes)
+                        .await?;
                     bytes += out.req_bytes + out.resp_bytes;
                     stats.fold(&out);
                     if let Some(v) = out.vote.clone() {
@@ -7967,17 +8460,8 @@ async fn run_pipeline(
                 },
                 last_token: false,
             };
-            let out = pipeline_hop(
-                &client,
-                &mut live_replicas[i],
-                strategy,
-                &req,
-                &node.latency_stats,
-                node.chain_identity.as_ref(),
-                &node.dag_validators,
-                collect_votes,
-            )
-            .await?;
+            let out =
+                pipeline_hop(node, &mut live_replicas[i], strategy, &req, collect_votes).await?;
             total_bytes += out.req_bytes + out.resp_bytes;
             hop_stats[i].fold(&out);
             if let Some(v) = out.vote.clone() {
@@ -8061,8 +8545,42 @@ fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value
 /// (6 ranges x 3 replicas), 4-10 s of dead tail latency appended to every
 /// request, three of them aimed at the replica with the worst EWMA. The
 /// response never depended on any of it.
+async fn send_authenticated_shard_cleanup(
+    node: &NodeState,
+    socket: &str,
+    request_id: String,
+) -> Result<(), String> {
+    let audience = resolve_shard_rpc_audience(node, socket).await?;
+    let keypair = node
+        .validator_keypair
+        .as_ref()
+        .ok_or_else(|| "coordinator has no validator signing key for shard cleanup".to_string())?;
+    let payload = ValidatorCleanupShardRequest {
+        validator_id: format!("0x{}", node.validator_address.to_hex()),
+        request: CleanupShardRequest { request_id },
+    };
+    let signed = sign_community_request(
+        CLEANUP_SHARD_PATH,
+        payload,
+        keypair,
+        audience.validator,
+        audience.transaction_domain,
+    )?;
+    let url = shard_rpc_url(socket, CLEANUP_SHARD_PATH)?;
+    node.inference_http
+        .post(url)
+        .json(&signed)
+        .timeout(std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|error| format!("send authenticated shard cleanup: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("authenticated shard cleanup rejected: {error}"))?;
+    Ok(())
+}
+
 fn spawn_cleanup(node: &NodeState, pipeline: &[PipelineHop], request_id: &str) {
-    let client = node.inference_http.clone();
+    let cleanup_node = node.clone();
     let request_id = request_id.to_string();
     let sockets: Vec<String> = {
         let mut s: Vec<String> = pipeline
@@ -8074,22 +8592,14 @@ fn spawn_cleanup(node: &NodeState, pipeline: &[PipelineHop], request_id: &str) {
         s
     };
     let _ = node.shard_kv_caches.remove(&request_id);
+    let _ = node.shard_kv_cache_metadata.remove(&request_id);
     tokio::spawn(async move {
-        let payload = json!({ "request_id": request_id });
         let mut set = tokio::task::JoinSet::new();
         for socket in sockets {
-            let c = client.clone();
-            let p = payload.clone();
+            let node = cleanup_node.clone();
+            let request_id = request_id.clone();
             set.spawn(async move {
-                let Ok(url) = shard_rpc_url(&socket, "/inference/cleanup_shard") else {
-                    return;
-                };
-                let _ = c
-                    .post(url)
-                    .json(&p)
-                    .timeout(std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS))
-                    .send()
-                    .await;
+                let _ = send_authenticated_shard_cleanup(&node, &socket, request_id).await;
             });
         }
         while set.join_next().await.is_some() {}
@@ -9381,9 +9891,20 @@ async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-#[derive(serde::Deserialize)]
-struct AnnounceShardRequest {
-    shard: ShardInfo,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatorShardAnnouncement {
+    /// Canonical address of the validator whose key authenticated this
+    /// topology claim.  A registry destination is never accepted from an
+    /// anonymous HTTP caller.
+    pub validator_id: String,
+    pub shard: ShardInfo,
+}
+
+impl CommunityAuthenticatedPayload for ValidatorShardAnnouncement {
+    fn signer_id(&self) -> &str {
+        &self.validator_id
+    }
 }
 
 /// Returns true iff `addr` is a stub (unroutable placeholder) that the
@@ -9409,9 +9930,10 @@ fn is_stub_socket_addr(addr: &str) -> bool {
 /// caller can advertise `169.254.169.254:80` (or any private control-plane
 /// service) and turn later inference routing into blind SSRF.
 ///
-/// Loopback is deliberately trusted: the local puller fetches a remote seed's
-/// self-shards and re-announces them to this process over 127.0.0.1. Rewriting
-/// those trusted local messages would destroy the remote destination.
+/// Loopback is deliberately retained for this process's own signed refresh:
+/// a holder often advertises its public service origin to its localhost RPC.
+/// Remote topology is never relayed and re-signed locally; every holder must
+/// authenticate its own direct announcement.
 fn bind_announced_shard_addr(announced_addr: &str, peer_addr: SocketAddr) -> String {
     if peer_addr.ip().is_loopback() {
         return announced_addr.to_string();
@@ -9435,8 +9957,11 @@ fn bind_announced_shard_addr(announced_addr: &str, peer_addr: SocketAddr) -> Str
 async fn announce_shard(
     AxumState(node): AxumState<NodeState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Json(mut req): Json<AnnounceShardRequest>,
+    Json(signed): Json<CommunitySignedRequest<ValidatorShardAnnouncement>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut req = authenticate_community_request(&node, SHARD_ANNOUNCE_PATH, signed)?;
+    let announcing_validator = parse_hash256_hex(&req.validator_id, "validator_id")
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let model_id = parse_hash256_hex(&req.shard.model_id, "model_id")
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     if req.shard.start_layer >= req.shard.end_layer
@@ -9449,7 +9974,40 @@ async fn announce_shard(
         ));
     }
     req.shard.model_id = format!("0x{}", model_id.to_hex());
-    req.shard.socket_addr = bind_announced_shard_addr(&req.shard.socket_addr, peer_addr);
+    let declared_origin = shard_rpc_origin(&req.shard.socket_addr)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    req.shard.socket_addr = if peer_addr.ip().is_loopback()
+        && is_stub_socket_addr(&req.shard.socket_addr)
+    {
+        let port = shard_rpc_url(&req.shard.socket_addr, "/")
+            .ok()
+            .and_then(|url| url.port_or_known_default())
+            .unwrap_or(peer_addr.port());
+        SocketAddr::new(peer_addr.ip(), port).to_string()
+    } else if peer_addr.ip().is_loopback() || shard_origin_is_configured(&node, &declared_origin) {
+        declared_origin
+    } else {
+        bind_announced_shard_addr(&req.shard.socket_addr, peer_addr)
+    };
+    let announced_origin = shard_rpc_origin(&req.shard.socket_addr)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    if !shard_origin_is_configured(&node, &announced_origin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "announced shard RPC origin is not an explicitly configured TLS/loopback origin"
+                .to_string(),
+        ));
+    }
+    let audience = resolve_shard_rpc_audience(&node, &announced_origin)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    if audience.validator != announcing_validator {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "signed shard announcement does not match the destination's validator identity"
+                .to_string(),
+        ));
+    }
 
     // Dedupe: if an existing entry already covers the same (layer_range,
     // node_name) with a routable socket_addr, drop this announcement when
@@ -9616,6 +10174,31 @@ pub fn sign_community_request<T: Serialize>(
     })
 }
 
+/// Build the only wire form accepted by `POST /shards/announce`.
+///
+/// Main's broadcaster first reads the destination's `/network/info`, then
+/// supplies that validator address and transaction domain here.  Binding the
+/// signer, exact destination, recovery domain, route, and complete shard
+/// record prevents registry poisoning and cross-seed replay.
+pub fn sign_validator_shard_announcement(
+    shard: ShardInfo,
+    keypair: &arc_crypto::KeyPair,
+    target_validator: Hash256,
+    transaction_domain: Option<Hash256>,
+) -> Result<CommunitySignedRequest<ValidatorShardAnnouncement>, String> {
+    let payload = ValidatorShardAnnouncement {
+        validator_id: format!("0x{}", keypair.address().to_hex()),
+        shard,
+    };
+    sign_community_request(
+        SHARD_ANNOUNCE_PATH,
+        payload,
+        keypair,
+        target_validator,
+        transaction_domain,
+    )
+}
+
 fn authenticate_community_request<T>(
     node: &NodeState,
     path: &str,
@@ -9720,7 +10303,7 @@ where
         .validate_for_auth()
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
-    let validator_domain = path == COMMUNITY_REWARD_APPROVE_PATH;
+    let validator_domain = is_validator_authenticated_path(path);
     if validator_domain {
         if !node.state.is_validator(&worker_address) {
             return Err((
@@ -10156,6 +10739,10 @@ pub struct PendingCommunityWork {
     assignment_epoch: Hash256,
     job_nonce: u64,
     assigned_worker: Option<String>,
+    /// Set while one authenticated submit is independently recomputed.  The
+    /// record stays in the map until verification succeeds, so cancellation or
+    /// transient shard failure cannot irreversibly consume the assignment.
+    submitting: bool,
     sender: tokio::sync::oneshot::Sender<CommunityDispatchOutcome>,
 }
 
@@ -10165,6 +10752,15 @@ struct CommunityRewardSubmission {
     output_hash: Hash256,
     tx_hash: Hash256,
     approvals: usize,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedCommunitySettlement {
+    payload: CommunityRewardApprovalPayload,
+    verified_at_unix_ms: u64,
+    attempts: u32,
+    retry_running: bool,
+    last_error: Option<String>,
 }
 
 /// Authenticated coordinator-to-validator approval request. The prompt and
@@ -10237,16 +10833,105 @@ impl Drop for CommunityClaimReservation {
     }
 }
 
-/// Release a worker's capacity only when it still belongs to this job. The
-/// DashMap entry API makes the compare-and-remove atomic, so a late timeout
-/// can never erase a newer assignment.
-fn release_active_community_job(node: &NodeState, worker_id: &str, job_id: &str) {
+fn release_active_community_job_from_map(
+    active_jobs: &dashmap::DashMap<String, String>,
+    worker_id: &str,
+    job_id: &str,
+) {
     use dashmap::mapref::entry::Entry;
 
-    if let Entry::Occupied(entry) = node.community_active_jobs.entry(worker_id.to_string())
+    if let Entry::Occupied(entry) = active_jobs.entry(worker_id.to_string())
         && entry.get() == job_id
     {
         entry.remove();
+    }
+}
+
+/// Cancellation guard for the public dispatcher.  An unclaimed queue entry is
+/// removed immediately.  Once a worker owns the job, preserve it for a bounded
+/// late-submit grace period so a proxy/client disconnect cannot erase valid
+/// work or its reward settlement while the worker is still computing.
+struct PendingDispatchReservation {
+    results: Arc<dashmap::DashMap<String, PendingCommunityWork>>,
+    active_jobs: Arc<dashmap::DashMap<String, String>>,
+    job_id: String,
+}
+
+impl Drop for PendingDispatchReservation {
+    fn drop(&mut self) {
+        use dashmap::mapref::entry::Entry;
+        let worker_id = match self.results.entry(self.job_id.clone()) {
+            Entry::Occupied(entry) => match entry.get().assigned_worker.clone() {
+                Some(worker_id) => worker_id,
+                None => {
+                    entry.remove();
+                    return;
+                }
+            },
+            Entry::Vacant(_) => return,
+        };
+
+        let results = self.results.clone();
+        let active_jobs = self.active_jobs.clone();
+        let job_id = self.job_id.clone();
+        let cleanup_worker_id = worker_id.clone();
+        let cleanup = async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                COMMUNITY_LATE_SUBMIT_GRACE_SECS,
+            ))
+            .await;
+            if results.remove(&job_id).is_some() {
+                release_active_community_job_from_map(&active_jobs, &cleanup_worker_id, &job_id);
+            }
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(cleanup);
+        } else if self.results.remove(&self.job_id).is_some() {
+            release_active_community_job_from_map(&self.active_jobs, &worker_id, &self.job_id);
+        }
+    }
+}
+
+/// Marks a pending assignment as being verified without removing it.  Dropping
+/// the future resets the marker, so an interrupted submit remains retryable.
+struct PendingSubmissionReservation {
+    results: Arc<dashmap::DashMap<String, PendingCommunityWork>>,
+    job_id: String,
+    armed: bool,
+}
+
+impl PendingSubmissionReservation {
+    fn take(mut self) -> Option<PendingCommunityWork> {
+        self.armed = false;
+        self.results
+            .remove(&self.job_id)
+            .map(|(_, pending)| pending)
+    }
+}
+
+impl Drop for PendingSubmissionReservation {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(mut pending) = self.results.get_mut(&self.job_id)
+        {
+            pending.submitting = false;
+        }
+    }
+}
+
+/// Once the pending record is consumed, this guard guarantees that every
+/// return path and task cancellation releases the worker's single-job slot.
+struct ActiveCommunityJobReservation {
+    active_jobs: Arc<dashmap::DashMap<String, String>>,
+    worker_id: Option<String>,
+    job_id: String,
+}
+
+impl Drop for ActiveCommunityJobReservation {
+    fn drop(&mut self) {
+        if let Some(worker_id) = self.worker_id.as_deref() {
+            release_active_community_job_from_map(&self.active_jobs, worker_id, &self.job_id);
+        }
     }
 }
 
@@ -10311,6 +10996,26 @@ struct CommunityResultVerification {
     tokens_generated: usize,
     range_count: usize,
     range_position_quorum_count: usize,
+}
+
+#[derive(Debug)]
+enum CommunityResultVerificationError {
+    /// A completed authenticated quorum proved that the worker's semantic
+    /// claim is wrong. This is worker-attributable and permanently rejects
+    /// the assignment.
+    Invalid(String),
+    /// The coordinator could not obtain proof (missing topology/model,
+    /// timeout, capacity, or shard disagreement). Absence of proof is not
+    /// proof of worker fault; the same assignment remains retryable.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for CommunityResultVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => formatter.write_str(message),
+        }
+    }
 }
 
 impl From<&CommunityResultVerification> for CommunityVerificationSummary {
@@ -10514,23 +11219,30 @@ async fn verify_community_result_with_quorum(
     node: &NodeState,
     work_item: &WorkItem,
     result: &WorkResult,
-) -> Result<CommunityResultVerification, String> {
-    validate_community_reward_profile(result)?;
+) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
+    validate_community_reward_profile(result).map_err(CommunityResultVerificationError::Invalid)?;
     let model = node
         .inference_model
         .as_ref()
-        .ok_or_else(|| "coordinator has no tokenizer/model for result verification".to_string())?
+        .ok_or_else(|| {
+            CommunityResultVerificationError::Unavailable(
+                "coordinator has no tokenizer/model for result verification".to_string(),
+            )
+        })?
         .clone();
-    let (expected_model_name, expected_model_id) = exact_model_identity(node)?;
-    let assigned_model_id = work_item
-        .model_id
-        .as_deref()
-        .ok_or_else(|| "job was not pinned to a model identity".to_string())?;
-    let assigned_model_id = parse_hash256_hex(assigned_model_id, "assigned model_id")?;
+    let (expected_model_name, expected_model_id) =
+        exact_model_identity(node).map_err(CommunityResultVerificationError::Unavailable)?;
+    let assigned_model_id = work_item.model_id.as_deref().ok_or_else(|| {
+        CommunityResultVerificationError::Unavailable(
+            "job was not pinned to a model identity".to_string(),
+        )
+    })?;
+    let assigned_model_id = parse_hash256_hex(assigned_model_id, "assigned model_id")
+        .map_err(CommunityResultVerificationError::Unavailable)?;
     if assigned_model_id != expected_model_id {
-        return Err(format!(
+        return Err(CommunityResultVerificationError::Unavailable(format!(
             "assigned model does not match coordinator model {expected_model_name}"
-        ));
+        )));
     }
 
     let pipeline = {
@@ -10539,16 +11251,20 @@ async fn verify_community_result_with_quorum(
             if let Some(pipeline) = node.community_verification_pipeline_override.clone() {
                 pipeline
             } else {
-                assemble_pipeline_with_bootstrap(node)
-                    .await
-                    .map_err(|e| format!("assemble verification pipeline: {e}"))?
+                assemble_pipeline_with_bootstrap(node).await.map_err(|e| {
+                    CommunityResultVerificationError::Unavailable(format!(
+                        "assemble verification pipeline: {e}"
+                    ))
+                })?
             }
         }
         #[cfg(not(test))]
         {
-            assemble_pipeline_with_bootstrap(node)
-                .await
-                .map_err(|e| format!("assemble verification pipeline: {e}"))?
+            assemble_pipeline_with_bootstrap(node).await.map_err(|e| {
+                CommunityResultVerificationError::Unavailable(format!(
+                    "assemble verification pipeline: {e}"
+                ))
+            })?
         }
     };
     for (range, replicas) in &pipeline {
@@ -10557,17 +11273,33 @@ async fn verify_community_result_with_quorum(
             .map(|replica| replica.socket_addr.as_str())
             .collect();
         if distinct_sockets.len() < COMMUNITY_VERIFICATION_REPLICAS {
-            return Err(format!(
+            return Err(CommunityResultVerificationError::Unavailable(format!(
                 "range [{}, {}) has {} distinct replicas; secure reward verification requires 3",
                 range.0,
                 range.1,
                 distinct_sockets.len()
-            ));
+            )));
         }
     }
 
-    let all_tokens = community_worker_verification_tokens(&model, &work_item.input)?;
-    let request_id = format!("community-verify-v3-{}", work_item.job_id);
+    let all_tokens = community_worker_verification_tokens(&model, &work_item.input)
+        .map_err(CommunityResultVerificationError::Unavailable)?;
+    // Every approver recomputes independently but contacts the same shard
+    // holders.  Namespace the stateful KV-cache key by approver identity;
+    // using only job_id made parallel approvers corrupt one another's cache
+    // position and rendered production five-of-six fanout impossible.
+    let request_id = format!(
+        "0x{}",
+        arc_crypto::hash_bytes(
+            format!(
+                "community-verify-v3-{}-{}",
+                work_item.job_id,
+                node.validator_address.to_hex()
+            )
+            .as_bytes()
+        )
+        .to_hex()
+    );
     let run_result = run_pipeline(
         node,
         &model,
@@ -10585,16 +11317,18 @@ async fn verify_community_result_with_quorum(
     )
     .await;
     spawn_cleanup(node, &pipeline, &request_id);
-    let run = run_result?;
+    let run = run_result.map_err(CommunityResultVerificationError::Unavailable)?;
     let active_validators = node.dag_validators.read().clone();
     let range_position_quorum_count = validate_community_range_position_quorums(
         &pipeline,
         &run.hop_stats,
         &run.votes,
         &active_validators,
-    )?;
+    )
+    .map_err(CommunityResultVerificationError::Unavailable)?;
     let actual_output = model.decode(&run.generated);
-    let output_hash = compare_community_result_with_tokens(result, &run.generated, &actual_output)?;
+    let output_hash = compare_community_result_with_tokens(result, &run.generated, &actual_output)
+        .map_err(CommunityResultVerificationError::Invalid)?;
 
     Ok(CommunityResultVerification {
         output_hash,
@@ -10615,6 +11349,15 @@ fn validate_reward_approval_payload(
 
     if !community_rewards_v1_protocol_active(node) {
         return Err("community reward protocol is not active".to_string());
+    }
+    if payload.input.len() > 32_768 {
+        return Err("reward approval input exceeds the 32 KiB inference limit".to_string());
+    }
+    if payload.output.len() > COMMUNITY_RESULT_OUTPUT_MAX_BYTES {
+        return Err(format!(
+            "reward approval output exceeds the {}-byte settlement limit",
+            COMMUNITY_RESULT_OUTPUT_MAX_BYTES
+        ));
     }
     reward_approval_prerequisites(node).map_err(str::to_string)?;
     if !payload.reward.validator_approvals.is_empty() {
@@ -10774,7 +11517,9 @@ async fn approve_community_reward_payload(
     payload: &CommunityRewardApprovalPayload,
 ) -> Result<arc_types::transaction::CommunityRewardValidatorApproval, String> {
     let (work_item, result) = validate_reward_approval_payload(node, payload)?;
-    let verified = verify_community_result_with_quorum(node, &work_item, &result).await?;
+    let verified = verify_community_result_with_quorum(node, &work_item, &result)
+        .await
+        .map_err(|error| error.to_string())?;
     if verified.output_hash != payload.reward.output_hash
         || verified.tokens_generated != payload.tokens_generated as usize
     {
@@ -10839,6 +11584,38 @@ async fn community_reward_approve_signed(
     Json(signed): Json<CommunitySignedRequest<CommunityRewardApprovalPayload>>,
 ) -> Result<Json<arc_types::transaction::CommunityRewardValidatorApproval>, (StatusCode, String)> {
     let payload = authenticate_community_request(&node, COMMUNITY_REWARD_APPROVE_PATH, signed)?;
+    let _queue_permit = node
+        .community_approval_queue_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "validator approval queue reached its reviewed capacity {COMMUNITY_APPROVAL_QUEUE_CAP}"
+                ),
+            )
+        })?;
+    let _approval_permit = tokio::time::timeout(
+        std::time::Duration::from_secs(COMMUNITY_APPROVAL_QUEUE_TIMEOUT_SECS),
+        node.community_approval_permits.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "validator approval recomputation queue exceeded its {}s deadline",
+                COMMUNITY_APPROVAL_QUEUE_TIMEOUT_SECS
+            ),
+        )
+    })?
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "validator approval recomputation admission is closed".to_string(),
+        )
+    })?;
     approve_community_reward_payload(&node, &payload)
         .await
         .map(Json)
@@ -10899,6 +11676,67 @@ fn validate_collected_reward_approvals(
     Ok(collected)
 }
 
+async fn request_remote_reward_approval(
+    client: reqwest::Client,
+    seed: String,
+    payload: CommunityRewardApprovalPayload,
+    coordinator_key: Arc<arc_crypto::KeyPair>,
+    coordinator: Hash256,
+) -> Result<Option<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    let info = client
+        .get(format!("{seed}/network/info"))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|error| format!("fetch validator approval audience: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("validator approval audience rejected: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("decode validator approval audience: {error}"))?;
+    let target = info
+        .get("validator_address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "validator approval audience omitted address".to_string())
+        .and_then(|value| parse_hash256_hex(value, "validator_address"))?;
+    // The configured production list contains all six origins, including the
+    // local coordinator.  Its vote was already produced from the coordinator's
+    // independent verification, so a second HTTP recomputation adds load but
+    // can never add a distinct approval identity.
+    if target == coordinator {
+        return Ok(None);
+    }
+    let transaction_domain = match info.get("transaction_domain") {
+        Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("validator transaction_domain is malformed".to_string()),
+    };
+    let signed = sign_community_request(
+        COMMUNITY_REWARD_APPROVE_PATH,
+        payload,
+        &coordinator_key,
+        target,
+        transaction_domain,
+    )?;
+    let response = client
+        .post(format!("{seed}{COMMUNITY_REWARD_APPROVE_PATH}"))
+        .timeout(std::time::Duration::from_secs(
+            COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS,
+        ))
+        .json(&signed)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("validator returned HTTP {}", response.status()));
+    }
+    response
+        .json::<arc_types::transaction::CommunityRewardValidatorApproval>()
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 async fn collect_community_reward_approvals(
     node: &NodeState,
     payload: CommunityRewardApprovalPayload,
@@ -10916,74 +11754,534 @@ async fn collect_community_reward_approvals(
     validate_reward_approval_payload(node, &payload)?;
     let local = sign_validated_reward_approval(node, &payload.reward)?;
     let mut approvals = vec![local];
+    let mut seeds = node.community_rpc_bases.iter().cloned();
     let mut requests = tokio::task::JoinSet::new();
-    for seed in node.community_rpc_bases.iter() {
-        let client = node.inference_http.clone();
-        let seed = seed.clone();
-        let payload = payload.clone();
-        let coordinator_key = coordinator_key.clone();
-        requests.spawn(async move {
-            let info = client
-                .get(format!("{seed}/network/info"))
-                .timeout(std::time::Duration::from_secs(8))
-                .send()
-                .await
-                .map_err(|error| format!("fetch validator approval audience: {error}"))?
-                .error_for_status()
-                .map_err(|error| format!("validator approval audience rejected: {error}"))?
-                .json::<Value>()
-                .await
-                .map_err(|error| format!("decode validator approval audience: {error}"))?;
-            let target = info
-                .get("validator_address")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "validator approval audience omitted address".to_string())
-                .and_then(|value| parse_hash256_hex(value, "validator_address"))?;
-            let transaction_domain = match info.get("transaction_domain") {
-                Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
-                Some(Value::Null) | None => None,
-                Some(_) => return Err("validator transaction_domain is malformed".to_string()),
+    loop {
+        while requests.len() < COMMUNITY_APPROVAL_COLLECTOR_CONCURRENCY {
+            let Some(seed) = seeds.next() else {
+                break;
             };
-            let signed = sign_community_request(
-                COMMUNITY_REWARD_APPROVE_PATH,
-                payload,
-                &coordinator_key,
-                target,
-                transaction_domain,
-            )?;
-            let url = format!("{seed}{COMMUNITY_REWARD_APPROVE_PATH}");
-            let response = client
-                .post(url)
-                .timeout(std::time::Duration::from_secs(
-                    MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS,
-                ))
-                .json(&signed)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            if !response.status().is_success() {
-                return Err(format!("validator returned HTTP {}", response.status()));
-            }
-            response
-                .json::<arc_types::transaction::CommunityRewardValidatorApproval>()
-                .await
-                .map_err(|error| error.to_string())
-        });
-    }
-    while let Some(joined) = requests.join_next().await {
-        if let Ok(Ok(approval)) = joined {
+            let client = node.inference_http.clone();
+            let payload = payload.clone();
+            let coordinator_key = coordinator_key.clone();
+            let coordinator = node.validator_address;
+            requests.spawn(async move {
+                request_remote_reward_approval(client, seed, payload, coordinator_key, coordinator)
+                    .await
+            });
+        }
+        let Some(joined) = requests.join_next().await else {
+            break;
+        };
+        if let Ok(Ok(Some(approval))) = joined {
             approvals.push(approval);
             if let Ok(collected) =
                 validate_collected_reward_approvals(node, &payload.reward, approvals.clone())
             {
-                // A dead sixth endpoint must not hold an already-authorized
-                // five-of-six reward open until the per-peer timeout.
+                // Four remote votes plus the local vote authorize the reward.
+                // Never hold that result open for the fifth remote endpoint.
                 requests.abort_all();
                 return Ok(collected);
             }
         }
     }
     validate_collected_reward_approvals(node, &payload.reward, approvals)
+}
+
+const VERIFIED_SETTLEMENT_JOURNAL_SCHEMA: &str = "arc.community.verified-settlement.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedSettlementJournalRecord {
+    schema: String,
+    verified_at_unix_ms: u64,
+    payload_hash: Hash256,
+    payload: CommunityRewardApprovalPayload,
+}
+
+fn settlement_journal_file(node: &NodeState, job_id: Hash256) -> Option<std::path::PathBuf> {
+    node.community_settlement_journal_dir
+        .as_ref()
+        .map(|directory| directory.join(format!("{}.json", job_id.to_hex())))
+}
+
+fn sync_directory(directory: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("fsync settlement journal directory: {error}"))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Windows requires FILE_FLAG_BACKUP_SEMANTICS to open a directory
+        // handle. FlushFileBuffers via `sync_all` is then the closest native
+        // equivalent to fsyncing the rename's parent directory.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("flush settlement journal directory: {error}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+fn ensure_settlement_journal_directory(directory: &std::path::Path) -> Result<(), String> {
+    if directory.exists() {
+        let metadata = std::fs::symlink_metadata(directory)
+            .map_err(|error| format!("inspect settlement journal directory: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("settlement journal path is not a real directory".to_string());
+        }
+        return Ok(());
+    }
+    std::fs::create_dir(directory)
+        .map_err(|error| format!("create settlement journal directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure settlement journal directory: {error}"))?;
+    }
+    let parent = directory
+        .parent()
+        .ok_or_else(|| "settlement journal directory has no parent".to_string())?;
+    sync_directory(parent)
+}
+
+fn read_settlement_journal_file(
+    path: &std::path::Path,
+) -> Result<VerifiedSettlementJournalRecord, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "inspect settlement journal entry {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "settlement journal entry {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > COMMUNITY_APPROVAL_BODY_LIMIT_BYTES as u64 + 32 * 1024 {
+        return Err(format!(
+            "settlement journal entry {} exceeds its bounded wire size",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read settlement journal entry {}: {error}", path.display()))?;
+    let record: VerifiedSettlementJournalRecord =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "decode settlement journal entry {}: {error}",
+                path.display()
+            )
+        })?;
+    if record.schema != VERIFIED_SETTLEMENT_JOURNAL_SCHEMA {
+        return Err(format!(
+            "settlement journal entry {} has unsupported schema {:?}",
+            path.display(),
+            record.schema
+        ));
+    }
+    let actual_hash = community_payload_hash(&record.payload)?;
+    if actual_hash != record.payload_hash {
+        return Err(format!(
+            "settlement journal entry {} payload hash mismatch",
+            path.display()
+        ));
+    }
+    Ok(record)
+}
+
+fn persist_verified_settlement_journal(
+    node: &NodeState,
+    payload: &CommunityRewardApprovalPayload,
+    verified_at_unix_ms: u64,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let directory = node
+        .community_settlement_journal_dir
+        .as_deref()
+        .ok_or_else(|| {
+            "community rewards require a persistent state directory for the verified-settlement journal"
+                .to_string()
+        })?;
+    ensure_settlement_journal_directory(directory)?;
+    let final_path = settlement_journal_file(node, payload.reward.job_id)
+        .ok_or_else(|| "settlement journal path is unavailable".to_string())?;
+    let record = VerifiedSettlementJournalRecord {
+        schema: VERIFIED_SETTLEMENT_JOURNAL_SCHEMA.to_string(),
+        verified_at_unix_ms,
+        payload_hash: community_payload_hash(payload)?,
+        payload: payload.clone(),
+    };
+    if final_path.exists() {
+        let existing = read_settlement_journal_file(&final_path)?;
+        if existing.payload_hash != record.payload_hash {
+            return Err(
+                "settlement journal job already exists with different semantics".to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    let temporary = directory.join(format!(
+        ".tmp-{}-{}",
+        payload.reward.job_id.to_hex(),
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|error| format!("encode settlement journal entry: {error}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create settlement journal temporary file: {error}"))?;
+    let write_result = (|| -> Result<(), String> {
+        file.write_all(&bytes)
+            .map_err(|error| format!("write settlement journal entry: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("fsync settlement journal entry: {error}"))?;
+        std::fs::rename(&temporary, &final_path)
+            .map_err(|error| format!("publish settlement journal entry: {error}"))?;
+        sync_directory(directory)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn remove_verified_settlement_journal(node: &NodeState, job_id: Hash256) -> Result<(), String> {
+    let Some(path) = settlement_journal_file(node, job_id) else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(&path)
+        .map_err(|error| format!("remove settled journal entry {}: {error}", path.display()))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "settlement journal entry has no parent".to_string())?;
+    sync_directory(directory)
+}
+
+fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, String> {
+    let Some(directory) = node.community_settlement_journal_dir.as_deref() else {
+        return Ok(Vec::new());
+    };
+    ensure_settlement_journal_directory(directory)?;
+    let now = now_unix_ms();
+    let mut replayed = Vec::new();
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("read settlement journal directory: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read settlement journal entry: {error}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| "settlement journal contains a non-UTF8 filename".to_string())?;
+        if name.starts_with(".tmp-") {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!("remove incomplete settlement journal temporary file: {error}")
+            })?;
+            continue;
+        }
+        let expected_job = name
+            .strip_suffix(".json")
+            .ok_or_else(|| format!("unexpected settlement journal file {name:?}"))
+            .and_then(|value| parse_hash256_hex(value, "settlement journal job filename"))?;
+        let record = read_settlement_journal_file(&path)?;
+        if record.payload.reward.job_id != expected_job {
+            return Err(format!(
+                "settlement journal filename {name:?} does not match payload job_id"
+            ));
+        }
+        if record.verified_at_unix_ms > now.saturating_add(COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS) {
+            return Err(format!("settlement journal entry {name:?} is future-dated"));
+        }
+        let expired = record.payload.reward.expires_at_height < node.state.height();
+        if expired || mined_reward_for_job(node, expected_job).is_some() {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!("remove expired/mined settlement journal entry {name:?}: {error}")
+            })?;
+            continue;
+        }
+        if replayed.len() >= VERIFIED_SETTLEMENT_CAP {
+            return Err(format!(
+                "settlement journal exceeds reviewed capacity {VERIFIED_SETTLEMENT_CAP}"
+            ));
+        }
+        node.community_verified_settlements.insert(
+            expected_job,
+            VerifiedCommunitySettlement {
+                payload: record.payload,
+                verified_at_unix_ms: record.verified_at_unix_ms,
+                attempts: 0,
+                retry_running: false,
+                last_error: Some("replayed after node restart".to_string()),
+            },
+        );
+        replayed.push(expected_job);
+    }
+    sync_directory(directory)?;
+    Ok(replayed)
+}
+
+fn retain_verified_settlement(
+    node: &NodeState,
+    payload: CommunityRewardApprovalPayload,
+) -> Result<(), String> {
+    let _gate = node.community_verified_settlements_gate.lock();
+    let now = now_unix_ms();
+    prune_verified_settlements_locked(node)?;
+    if let Some(existing) = node
+        .community_verified_settlements
+        .get(&payload.reward.job_id)
+    {
+        if community_payload_hash(&existing.payload)? != community_payload_hash(&payload)? {
+            return Err(
+                "verified settlement job already exists with different semantics".to_string(),
+            );
+        }
+        persist_verified_settlement_journal(node, &payload, existing.verified_at_unix_ms)?;
+        return Ok(());
+    }
+    if node.community_verified_settlements.len() >= VERIFIED_SETTLEMENT_CAP {
+        return Err(format!(
+            "verified settlement journal is at reviewed capacity {VERIFIED_SETTLEMENT_CAP}; retry after older entries expire"
+        ));
+    }
+    // Durability precedes visibility: after this returns, a crash at any later
+    // await can replay the exact independently verified payload.
+    persist_verified_settlement_journal(node, &payload, now)?;
+    node.community_verified_settlements.insert(
+        payload.reward.job_id,
+        VerifiedCommunitySettlement {
+            payload,
+            verified_at_unix_ms: now,
+            attempts: 0,
+            retry_running: false,
+            last_error: None,
+        },
+    );
+    Ok(())
+}
+
+fn prune_verified_settlements_locked(node: &NodeState) -> Result<usize, String> {
+    let height = node.state.height();
+    let removable: Vec<Hash256> = node
+        .community_verified_settlements
+        .iter()
+        .filter_map(|entry| {
+            let job_id = *entry.key();
+            (entry.value().payload.reward.expires_at_height < height
+                || mined_reward_for_job(node, job_id).is_some())
+            .then_some(job_id)
+        })
+        .collect();
+    for job_id in &removable {
+        node.community_verified_settlements.remove(job_id);
+        node.community_reward_submissions.remove(job_id);
+        remove_verified_settlement_journal(node, *job_id)?;
+    }
+    Ok(removable.len())
+}
+
+fn prune_verified_settlements(node: &NodeState) -> Result<usize, String> {
+    let _gate = node.community_verified_settlements_gate.lock();
+    prune_verified_settlements_locked(node)
+}
+
+fn pending_settlement_value(node: &NodeState, record: &VerifiedCommunitySettlement) -> Value {
+    json!({
+        "status": "verified_pending_approval",
+        "tx_type": "0x25",
+        "job_id": format!("0x{}", record.payload.reward.job_id.to_hex()),
+        "worker": format!("0x{}", record.payload.reward.worker.to_hex()),
+        "output_hash": format!("0x{}", record.payload.reward.output_hash.to_hex()),
+        "assignment_epoch": format!("0x{}", record.payload.reward.assignment_epoch.to_hex()),
+        "recovery_epoch": reward_recovery_epoch(node),
+        "validator_set_id": reward_recovery_validator_set_id(node),
+        "validator_set_commitment": reward_validator_set_id(node),
+        "attempts": record.attempts,
+        "retry_running": record.retry_running,
+        "last_error": record.last_error,
+        "submitted": false,
+        "included": false,
+        "confirmed": false,
+        "reward_base": Value::Null,
+        "reward_arc": Value::Null,
+        "evidence_source": "independently verified completion awaiting threshold approval; no mined receipt",
+    })
+}
+
+async fn attempt_verified_community_reward(
+    node: &NodeState,
+    job_id: Hash256,
+) -> Result<Value, String> {
+    if let Some(submission) = node.community_reward_submissions.get(&job_id) {
+        if node.mempool.contains(&submission.tx_hash) {
+            return Ok(json!({
+                "status": "pending_mined_receipt",
+                "tx_type": "0x25",
+                "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
+                "job_id": format!("0x{}", job_id.to_hex()),
+                "validator_approvals": submission.approvals,
+                "submitted": true,
+                "included": false,
+            }));
+        }
+        drop(submission);
+        // The transaction left the mempool without a mined receipt (for
+        // example, a proposer drained then rejected it). Rebuild approvals
+        // and resubmit from the durable verified payload.
+        node.community_reward_submissions.remove(&job_id);
+    }
+    let payload = node
+        .community_verified_settlements
+        .get(&job_id)
+        .map(|record| record.payload.clone())
+        .ok_or_else(|| "verified settlement retry state is unavailable".to_string())?;
+    if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
+        record.attempts = record.attempts.saturating_add(1);
+    }
+
+    let approvals = collect_community_reward_approvals(node, payload.clone()).await?;
+    let approval_count = approvals.len();
+    let mut reward = payload.reward;
+    reward.validator_approvals = approvals;
+    let worker = reward.worker;
+    let output_hash = reward.output_hash;
+    let assignment_epoch = reward.assignment_epoch;
+    let job_nonce = reward.job_nonce;
+
+    let key = node
+        .validator_keypair
+        .as_ref()
+        .ok_or_else(|| "coordinator validator key is unavailable".to_string())?;
+    let mut tx = arc_types::Transaction::new_community_inference_reward(
+        node.validator_address,
+        job_nonce,
+        reward,
+    );
+    node.state
+        .sign_transaction(&mut tx, key)
+        .map_err(|error| format!("sign community reward transaction: {error}"))?;
+    if node.state.active_protocol_version().major == 3 {
+        node.state
+            .validate_v3_transaction_admission(&tx)
+            .map_err(|error| format!("community reward failed v3 admission: {error}"))?;
+    }
+    let tx_hash = tx.hash;
+    node.mempool
+        .insert(tx)
+        .map_err(|error| format!("submit community reward to mempool: {error}"))?;
+    node.community_reward_submissions.insert(
+        job_id,
+        CommunityRewardSubmission {
+            worker,
+            output_hash,
+            tx_hash,
+            approvals: approval_count,
+        },
+    );
+    Ok(json!({
+        "status": "pending_mined_receipt",
+        "tx_type": "0x25",
+        "tx_hash": format!("0x{}", tx_hash.to_hex()),
+        "job_id": format!("0x{}", job_id.to_hex()),
+        "assignment_epoch": format!("0x{}", assignment_epoch.to_hex()),
+        "recovery_epoch": reward_recovery_epoch(node),
+        "validator_set_id": reward_recovery_validator_set_id(node),
+        "validator_set_commitment": reward_validator_set_id(node),
+        "transaction_domain": node.state.transaction_domain_hash().map(|domain| format!("0x{}", domain.to_hex())),
+        "validator_approvals": approval_count,
+        "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+        "submitted": true,
+        "included": false,
+        "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
+        "reward_arc": REWARD_PER_ATTESTATION_ARC,
+        "receipt_url": format!("/community/reward_receipt/0x{}", tx_hash.to_hex()),
+        "evidence_note": "payment is not earned until this exact 0x25 transaction has a successful mined receipt",
+    }))
+}
+
+fn schedule_verified_settlement_retry(node: &NodeState, job_id: Hash256) {
+    let should_spawn = node
+        .community_verified_settlements
+        .get_mut(&job_id)
+        .is_some_and(|mut record| {
+            if record.retry_running {
+                false
+            } else {
+                record.retry_running = true;
+                true
+            }
+        });
+    if !should_spawn {
+        return;
+    }
+    let node = node.clone();
+    tokio::spawn(async move {
+        loop {
+            let Some(record) = node
+                .community_verified_settlements
+                .get(&job_id)
+                .map(|record| record.clone())
+            else {
+                return;
+            };
+            if mined_reward_for_job(&node, job_id).is_some()
+                || record.payload.reward.expires_at_height < node.state.height()
+            {
+                if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
+                    record.retry_running = false;
+                }
+                if let Err(error) = prune_verified_settlements(&node) {
+                    tracing::error!(job_id = %job_id, %error, "failed to prune settled reward journal");
+                }
+                return;
+            }
+            let delay = if node.community_reward_submissions.contains_key(&job_id) {
+                60
+            } else {
+                2u64.saturating_pow(record.attempts.min(5)).min(60)
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            match attempt_verified_community_reward(&node, job_id).await {
+                Ok(_) => {
+                    // A mempool insertion is not a mined receipt. Keep one
+                    // bounded monitor alive so a drained/rejected transaction
+                    // is retried and the durable journal is removed only once
+                    // the chain confirms or expires the exact job.
+                }
+                Err(error) => {
+                    if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
+                        record.last_error = Some(error);
+                    }
+                }
+            }
+        }
+    });
 }
 
 async fn submit_verified_community_reward(
@@ -10993,7 +12291,6 @@ async fn submit_verified_community_reward(
     job_nonce: u64,
     result: &WorkResult,
     worker_attestation: &arc_types::Transaction,
-    dispatcher: &tokio::sync::oneshot::Sender<CommunityDispatchOutcome>,
 ) -> Result<Value, String> {
     use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
 
@@ -11069,65 +12366,23 @@ async fn submit_verified_community_reward(
         output: result.output.clone(),
         tokens_generated: result.tokens_generated,
     };
-    let approvals = collect_community_reward_approvals(node, payload.clone()).await?;
-    if dispatcher.is_closed() {
-        return Err(
-            "dispatcher expired while validator approvals were being collected".to_string(),
-        );
+    retain_verified_settlement(node, payload)?;
+    match attempt_verified_community_reward(node, job_id).await {
+        Ok(settlement) => {
+            schedule_verified_settlement_retry(node, job_id);
+            Ok(settlement)
+        }
+        Err(error) => {
+            if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
+                record.last_error = Some(error);
+            }
+            schedule_verified_settlement_retry(node, job_id);
+            node.community_verified_settlements
+                .get(&job_id)
+                .map(|record| pending_settlement_value(node, &record))
+                .ok_or_else(|| "verified settlement retry state disappeared".to_string())
+        }
     }
-    let approval_count = approvals.len();
-    let mut reward = payload.reward;
-    reward.validator_approvals = approvals;
-
-    let key = node
-        .validator_keypair
-        .as_ref()
-        .ok_or_else(|| "coordinator validator key is unavailable".to_string())?;
-    let mut tx = arc_types::Transaction::new_community_inference_reward(
-        node.validator_address,
-        job_nonce,
-        reward,
-    );
-    node.state
-        .sign_transaction(&mut tx, key)
-        .map_err(|error| format!("sign community reward transaction: {error}"))?;
-    if node.state.active_protocol_version().major == 3 {
-        node.state
-            .validate_v3_transaction_admission(&tx)
-            .map_err(|error| format!("community reward failed v3 admission: {error}"))?;
-    }
-    let tx_hash = tx.hash;
-    node.mempool
-        .insert(tx)
-        .map_err(|error| format!("submit community reward to mempool: {error}"))?;
-    node.community_reward_submissions.insert(
-        job_id,
-        CommunityRewardSubmission {
-            worker,
-            output_hash,
-            tx_hash,
-            approvals: approval_count,
-        },
-    );
-    Ok(json!({
-        "status": "pending_mined_receipt",
-        "tx_type": "0x25",
-        "tx_hash": format!("0x{}", tx_hash.to_hex()),
-        "job_id": format!("0x{}", job_id.to_hex()),
-        "assignment_epoch": format!("0x{}", assignment_epoch.to_hex()),
-        "recovery_epoch": reward_recovery_epoch(node),
-        "validator_set_id": reward_recovery_validator_set_id(node),
-        "validator_set_commitment": reward_validator_set_id(node),
-        "transaction_domain": node.state.transaction_domain_hash().map(|domain| format!("0x{}", domain.to_hex())),
-        "validator_approvals": approval_count,
-        "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
-        "submitted": true,
-        "included": false,
-        "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
-        "reward_arc": REWARD_PER_ATTESTATION_ARC,
-        "receipt_url": format!("/community/reward_receipt/0x{}", tx_hash.to_hex()),
-        "evidence_note": "payment is not earned until this exact 0x25 transaction has a successful mined receipt",
-    }))
 }
 
 fn default_true() -> bool {
@@ -11401,6 +12656,15 @@ pub async fn community_submit_work(
                 "tokens_generated must be > 0 on success=true".to_string(),
             ));
         }
+        if result.output.len() > COMMUNITY_RESULT_OUTPUT_MAX_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "output exceeds the {}-byte community settlement limit",
+                    COMMUNITY_RESULT_OUTPUT_MAX_BYTES
+                ),
+            ));
+        }
     }
 
     // ── Worker must be registered ───────────────────────────────────────
@@ -11412,10 +12676,14 @@ pub async fn community_submit_work(
     }
 
     // ── Match and validate the coordinator-issued job ───────────────────
-    let results_map = node.community_work_results.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "work results map not initialized - coordinator not running".to_string(),
-    ))?;
+    let results_map = node
+        .community_work_results
+        .as_ref()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "work results map not initialized - coordinator not running".to_string(),
+        ))?
+        .clone();
 
     // Freshly signed retries are idempotent after a reward entered the
     // mempool. A retry may retrieve status, but cannot change worker/output.
@@ -11468,8 +12736,62 @@ pub async fn community_submit_work(
         })));
     }
 
-    let (work_item, assigned_worker) = match results_map.get(&result.job_id) {
-        Some(pending) => (pending.item.clone(), pending.assigned_worker.clone()),
+    if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id")
+        && let Some(record) = node.community_verified_settlements.get(&job_hash)
+    {
+        let worker = parse_hash256_hex(&result.worker_id, "worker_id")
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        if worker != record.payload.reward.worker
+            || output_hash != record.payload.reward.output_hash
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "verified job has different worker or output semantics".to_string(),
+            ));
+        }
+        let settlement = pending_settlement_value(&node, &record);
+        drop(record);
+        schedule_verified_settlement_retry(&node, job_hash);
+        return Ok(Json(json!({
+            "ok": true,
+            "idempotent_replay": true,
+            "job_id": result.job_id,
+            "settlement": settlement,
+        })));
+    }
+
+    let (work_item, assigned_worker) = match results_map.get_mut(&result.job_id) {
+        Some(mut pending) => {
+            if pending.submitting {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "an authenticated submit for this job is already being verified".to_string(),
+                ));
+            }
+            let assigned_worker = pending.assigned_worker.clone();
+            match assigned_worker.as_deref() {
+                Some(worker_id) if worker_id == result.worker_id => {}
+                Some(worker_id) => {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        format!(
+                            "job_id {} is assigned to worker {}, not {}",
+                            result.job_id, worker_id, result.worker_id
+                        ),
+                    ));
+                }
+                None => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("job_id {} has not been claimed", result.job_id),
+                    ));
+                }
+            }
+            pending.submitting = true;
+            (pending.item.clone(), assigned_worker)
+        }
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -11480,25 +12802,11 @@ pub async fn community_submit_work(
             ));
         }
     };
-
-    match assigned_worker.as_deref() {
-        Some(worker_id) if worker_id == result.worker_id => {}
-        Some(worker_id) => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "job_id {} is assigned to worker {}, not {}",
-                    result.job_id, worker_id, result.worker_id
-                ),
-            ));
-        }
-        None => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("job_id {} has not been claimed", result.job_id),
-            ));
-        }
-    }
+    let submission_reservation = PendingSubmissionReservation {
+        results: results_map.clone(),
+        job_id: result.job_id.clone(),
+        armed: true,
+    };
 
     if result.tokens_generated > u64::from(work_item.max_tokens) {
         return Err((
@@ -11531,49 +12839,61 @@ pub async fn community_submit_work(
         None
     };
 
-    // Atomically consume the job before delivering it. A replay racing this
-    // request can pass the read-only checks above, but only one submit can
-    // remove the pending record and reach counters or the mempool.
-    let Some((_, pending)) = results_map.remove(&result.job_id) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!(
-                "no pending work for job_id {} - already completed or expired",
-                result.job_id
-            ),
-        ));
-    };
-
     let job_id = result.job_id.clone();
     let verification = if result.success {
         match verify_community_result_with_quorum(&node, &work_item, &result).await {
             Ok(verification) => Some(verification),
-            Err(error) => {
-                if let Some(worker_id) = pending.assigned_worker.as_deref() {
-                    release_active_community_job(&node, worker_id, &job_id);
-                }
+            Err(CommunityResultVerificationError::Invalid(error)) => {
+                let Some(pending) = submission_reservation.take() else {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "pending job {} changed while invalid proof completed",
+                            job_id
+                        ),
+                    ));
+                };
+                let _active_job_reservation = ActiveCommunityJobReservation {
+                    active_jobs: node.community_active_jobs.clone(),
+                    worker_id: assigned_worker.clone(),
+                    job_id: job_id.clone(),
+                };
                 if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
                     let (worker, ts) = entry.value_mut();
                     *ts = std::time::Instant::now();
                     worker.failure_count = worker.failure_count.saturating_add(1);
                 }
-                let mut rejected = result.clone();
-                rejected.success = false;
-                rejected.error = Some(format!("coordinator verification failed: {error}"));
-                let _ = pending.sender.send(CommunityDispatchOutcome {
-                    result: rejected,
-                    verification: None,
-                    settlement: None,
-                });
                 tracing::warn!(
                     worker = %result.worker_id,
                     job_id = %job_id,
                     reason = %error,
                     "community result rejected by authenticated shard quorum"
                 );
+                let mut rejected = result.clone();
+                rejected.success = false;
+                rejected.error = Some(format!("verification failed: {error}"));
+                let _ = pending.sender.send(CommunityDispatchOutcome {
+                    result: rejected,
+                    verification: None,
+                    settlement: None,
+                });
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("community result failed independent verification: {error}"),
+                ));
+            }
+            Err(CommunityResultVerificationError::Unavailable(error)) => {
+                tracing::warn!(
+                    worker = %result.worker_id,
+                    job_id = %job_id,
+                    reason = %error,
+                    "community result verification unavailable; preserving assignment without penalty"
+                );
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "community result could not complete independent verification and remains retryable: {error}"
+                    ),
                 ));
             }
         }
@@ -11581,15 +12901,24 @@ pub async fn community_submit_work(
         None
     };
 
-    if let Some(worker_id) = pending.assigned_worker.as_deref() {
-        release_active_community_job(&node, worker_id, &job_id);
-    }
-    if pending.sender.is_closed() {
+    // Verification succeeded (or this is an explicit worker failure). Only
+    // now atomically consume the pending assignment. Until this point the drop
+    // guard resets `submitting`, preserving retryability on every error and
+    // task cancellation.
+    let Some(pending) = submission_reservation.take() else {
         return Err((
-            StatusCode::GONE,
-            format!("dispatcher already timed out for job_id {}", job_id),
+            StatusCode::CONFLICT,
+            format!(
+                "pending job {} changed while verification completed",
+                job_id
+            ),
         ));
-    }
+    };
+    let _active_job_reservation = ActiveCommunityJobReservation {
+        active_jobs: node.community_active_jobs.clone(),
+        worker_id: assigned_worker,
+        job_id: job_id.clone(),
+    };
 
     let settlement_outcome = if let Some(worker_attestation) = verified_attestation {
         let worker_attestation_hash = format!("0x{}", worker_attestation.hash.to_hex());
@@ -11609,7 +12938,6 @@ pub async fn community_submit_work(
                 pending.job_nonce,
                 &result,
                 &worker_attestation,
-                &pending.sender,
             )
             .await
             {
@@ -11648,15 +12976,11 @@ pub async fn community_submit_work(
         verification: verification_summary.clone(),
         settlement: settlement_outcome.clone(),
     };
-    if pending.sender.send(dispatch_outcome).is_err() {
-        return Err((
-            StatusCode::GONE,
-            format!("dispatcher already timed out for job_id {}", job_id),
-        ));
-    }
+    let dispatcher_connected = pending.sender.send(dispatch_outcome).is_ok();
 
-    // Only a result that reached its waiting dispatcher affects worker
-    // health and performance counters.
+    // Independently verified work affects worker health even when the original
+    // public client disconnected. Settlement and accounting are properties of
+    // the authenticated job, not of an hour-long frontend socket.
     if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
         let (worker, ts) = entry.value_mut();
         *ts = std::time::Instant::now();
@@ -11674,6 +12998,7 @@ pub async fn community_submit_work(
     Ok(Json(json!({
         "ok": true,
         "job_id": job_id,
+        "dispatcher_connected": dispatcher_connected,
         "verification": verification_summary,
         "settlement": settlement_outcome,
     })))
@@ -11798,6 +13123,12 @@ async fn community_reward_job(
             "included": false,
             "confirmed": false,
         })));
+    }
+    if let Some(record) = node.community_verified_settlements.get(&job_id) {
+        let pending = pending_settlement_value(&node, &record);
+        drop(record);
+        schedule_verified_settlement_retry(&node, job_id);
+        return Ok(Json(pending));
     }
     Err((
         StatusCode::NOT_FOUND,
@@ -12973,6 +14304,11 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "recovery_active": recovery_context.is_some(),
         "recovery_epoch": recovery_context.as_ref().map(|context| context.recovery_epoch),
         "validator_set_id": recovery_context.as_ref().map(|context| context.validator_set_id),
+        // Canonical audience field consumed by every signed validator HTTP
+        // client. `recovery_domain` remains as a descriptive alias for older
+        // dashboards, but callers must not have to guess that relationship.
+        "transaction_domain": node.state.transaction_domain_hash()
+            .map(|domain| format!("0x{}", domain.to_hex())),
         "recovery_domain": recovery_context
             .as_ref()
             .map(|context| format!("0x{}", context.domain_hash().to_hex())),
@@ -13303,6 +14639,42 @@ mod tests {
         super::sign_community_request(path, payload, keypair, Hash256::ZERO, None)
     }
 
+    fn test_verified_settlement_payload(
+        job_id: Hash256,
+        expires_at_height: u64,
+    ) -> CommunityRewardApprovalPayload {
+        use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
+        CommunityRewardApprovalPayload {
+            coordinator_id: format!("0x{}", Hash256([8; 32]).to_hex()),
+            reward: CommunityInferenceRewardBody {
+                chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+                job_id,
+                coordinator: Hash256([8; 32]),
+                assignment_epoch: Hash256([9; 32]),
+                job_nonce: 1,
+                recovery_epoch: 0,
+                validator_set_id: 0,
+                transaction_domain: Hash256::ZERO,
+                worker: Hash256([10; 32]),
+                model_id: Hash256([11; 32]),
+                input_hash: Hash256([12; 32]),
+                output_hash: Hash256([13; 32]),
+                max_tokens: 1,
+                expires_at_height,
+                worker_certificate: WorkerInferenceCertificate {
+                    attestation_hash: Hash256([14; 32]),
+                    nonce: 0,
+                    challenge_period: DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS,
+                    signature: arc_crypto::Signature::null(),
+                },
+                validator_approvals: Vec::new(),
+            },
+            input: "private prompt".to_string(),
+            output: "private output".to_string(),
+            tokens_generated: 1,
+        }
+    }
+
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
     }
@@ -13353,6 +14725,74 @@ mod tests {
             assert!(shard_rpc_url(invalid, "/health").is_err(), "{invalid}");
         }
         assert!(shard_rpc_url("https://149.28.32.76", "//metadata").is_err());
+    }
+
+    #[test]
+    fn shard_kv_admission_is_bounded_per_signer_and_cleans_up_on_error() {
+        let node = fake_node_with_workers(Vec::new());
+        let signer = Hash256([41; 32]);
+        for index in 0..VALIDATOR_SHARD_KV_CACHE_PER_SIGNER_CAP {
+            let (_cache, mut reservation) =
+                reserve_shard_kv_cache(&node, &format!("request-{index}"), signer, 1).unwrap();
+            reservation.commit();
+        }
+        let error = reserve_shard_kv_cache(&node, "one-too-many", signer, 1)
+            .err()
+            .expect("per-signer cap must reject");
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+
+        let transient = "transient-error";
+        let (_cache, reservation) =
+            reserve_shard_kv_cache(&node, transient, Hash256([42; 32]), 1).unwrap();
+        drop(reservation);
+        assert!(!node.shard_kv_caches.contains_key(transient));
+        assert!(!node.shard_kv_cache_metadata.contains_key(transient));
+
+        node.shard_kv_cache_metadata.insert(
+            "expired".to_string(),
+            ShardKvCacheMetadata {
+                signer: Hash256([43; 32]),
+                last_seen: Instant::now()
+                    - std::time::Duration::from_secs(VALIDATOR_SHARD_KV_CACHE_TTL_SECS + 1),
+            },
+        );
+        node.shard_kv_caches.insert(
+            "expired".to_string(),
+            Arc::new(std::sync::Mutex::new(
+                arc_inference::cached_integer_model::KVCache::new(1),
+            )),
+        );
+        let (_cache, _reservation) =
+            reserve_shard_kv_cache(&node, "fresh", Hash256([44; 32]), 1).unwrap();
+        assert!(!node.shard_kv_caches.contains_key("expired"));
+    }
+
+    #[test]
+    fn signed_shard_payload_rejects_oversized_request_id() {
+        let request = ForwardShardRequest {
+            request_id: "x".repeat(VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES + 1),
+            model_id: format!("0x{}", Hash256([45; 32]).to_hex()),
+            token: Some(1),
+            hidden: None,
+            hidden_hash: None,
+            position: 0,
+            start_layer: 0,
+            end_layer: 1,
+            expected_hidden_len: 1,
+            expect_terminal: true,
+            generated_tokens: Vec::new(),
+            last_token: false,
+        };
+        let payload = ValidatorForwardShardRequest {
+            validator_id: format!("0x{}", Hash256([46; 32]).to_hex()),
+            request,
+        };
+        assert!(
+            payload
+                .validate_for_auth()
+                .unwrap_err()
+                .contains("request_id")
+        );
     }
 
     #[test]
@@ -13674,6 +15114,256 @@ mod tests {
             arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
             5
         );
+    }
+
+    #[test]
+    fn inference_timeout_budget_is_nested_for_maximum_generation() {
+        let protocol = community_dispatch_timeout_secs(INFERENCE_RUN_MAX_TOKENS);
+        let one_pass = (u64::from(INFERENCE_RUN_MAX_TOKENS) * 3_300).div_ceil(1_000);
+        assert_eq!(protocol, 3_832);
+        assert!(
+            COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
+                >= one_pass + VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
+        );
+        assert!(
+            COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS
+                >= one_pass + COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
+        );
+        assert!(
+            protocol
+                >= COMMUNITY_CLAIM_TIMEOUT_SECS + one_pass + COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS
+        );
+        assert!(protocol <= MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS);
+        const {
+            assert!(
+                COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS < COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS
+            );
+        }
+        assert!(COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS < protocol);
+        const {
+            assert!(MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS < PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS);
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_route_accepts_max_escaped_prompt_and_canonical_max_output_body() {
+        use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
+        use tower::ServiceExt;
+
+        let coordinator = arc_crypto::KeyPair::generate_ed25519();
+        let payload = CommunityRewardApprovalPayload {
+            coordinator_id: format!("0x{}", coordinator.address().to_hex()),
+            reward: CommunityInferenceRewardBody {
+                chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+                job_id: Hash256([1; 32]),
+                coordinator: coordinator.address(),
+                assignment_epoch: Hash256([2; 32]),
+                job_nonce: 1,
+                recovery_epoch: 0,
+                validator_set_id: 0,
+                transaction_domain: Hash256::ZERO,
+                worker: Hash256([3; 32]),
+                model_id: Hash256([4; 32]),
+                input_hash: Hash256([5; 32]),
+                output_hash: Hash256([6; 32]),
+                max_tokens: INFERENCE_RUN_MAX_TOKENS,
+                expires_at_height: 1,
+                worker_certificate: WorkerInferenceCertificate {
+                    attestation_hash: Hash256([7; 32]),
+                    nonce: 0,
+                    challenge_period: DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS,
+                    signature: arc_crypto::Signature::null(),
+                },
+                validator_approvals: Vec::new(),
+            },
+            // NUL is the maximum six-byte JSON escape for one input byte:
+            // 32 KiB therefore occupies 192 KiB on the wire.
+            input: "\0".repeat(32_768),
+            // Exact canonical tokenizer bound measured from the reviewed
+            // GGUF: 48 bytes/token * 256 tokens = 12,288 decoded bytes.
+            output: "x".repeat(12_288),
+            tokens_generated: INFERENCE_RUN_MAX_TOKENS.into(),
+        };
+        let signed = super::sign_community_request(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            payload,
+            &coordinator,
+            Hash256::ZERO,
+            None,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&signed).unwrap();
+        assert!(
+            body.len() > COMMUNITY_SUBMIT_BODY_LIMIT_BYTES,
+            "test must prove the approval route is distinct from submit_work"
+        );
+        assert!(
+            body.len() <= COMMUNITY_APPROVAL_BODY_LIMIT_BYTES,
+            "reviewed worst-case valid approval is {} bytes",
+            body.len()
+        );
+        let app = Router::new()
+            .route(
+                COMMUNITY_REWARD_APPROVE_PATH,
+                post(community_reward_approve_signed)
+                    .layer(DefaultBodyLimit::max(COMMUNITY_APPROVAL_BODY_LIMIT_BYTES)),
+            )
+            .with_state(fake_node_with_workers(Vec::new()));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(COMMUNITY_REWARD_APPROVE_PATH)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn community_submit_enforces_reviewed_sixteen_kib_output_cap() {
+        let result_with = |output: String| WorkResult {
+            job_id: "job".to_string(),
+            worker_id: format!("0x{}", Hash256([47; 32]).to_hex()),
+            success: true,
+            declined: false,
+            output,
+            output_hash: format!("0x{}", Hash256([48; 32]).to_hex()),
+            tokens_generated: INFERENCE_RUN_MAX_TOKENS.into(),
+            total_ms: 1,
+            ms_per_token: 1,
+            engine: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+                .to_string(),
+            error: None,
+            signed_attestation_hex: None,
+        };
+        let exact = community_submit_work(
+            AxumState(fake_node_with_workers(Vec::new())),
+            Json(result_with("x".repeat(COMMUNITY_RESULT_OUTPUT_MAX_BYTES))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            exact.0,
+            StatusCode::NOT_FOUND,
+            "exact cap passes size admission"
+        );
+        let oversized = community_submit_work(
+            AxumState(fake_node_with_workers(Vec::new())),
+            Json(result_with(
+                "x".repeat(COMMUNITY_RESULT_OUTPUT_MAX_BYTES + 1),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn verified_settlement_journal_replays_idempotently_and_fails_closed_on_corruption() {
+        let temporary = std::env::temp_dir().join(format!(
+            "arc-rpc-settlement-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = temporary.join("state");
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(
+                &[],
+                &data_dir,
+                arc_crypto::hash_bytes(b"settlement-journal-genesis"),
+            )
+            .unwrap(),
+        );
+        let make_node = || {
+            build_node_state(
+                state.clone(),
+                Arc::new(Mempool::new(16)),
+                Hash256([21; 32]),
+                None,
+                0,
+                Instant::now(),
+                Arc::new(AtomicU32::new(0)),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let job_id = Hash256([22; 32]);
+        let payload = test_verified_settlement_payload(job_id, 100);
+        let first = make_node();
+        retain_verified_settlement(&first, payload.clone()).unwrap();
+        let journal_path = settlement_journal_file(&first, job_id).unwrap();
+        assert!(journal_path.is_file());
+
+        let replayed = make_node();
+        assert_eq!(
+            replay_verified_settlement_journal(&replayed).unwrap(),
+            vec![job_id]
+        );
+        assert_eq!(replayed.community_verified_settlements.len(), 1);
+        retain_verified_settlement(&replayed, payload.clone()).unwrap();
+        assert_eq!(replayed.community_verified_settlements.len(), 1);
+
+        let mut conflicting = payload;
+        conflicting.output = "different private output".to_string();
+        assert!(
+            retain_verified_settlement(&replayed, conflicting)
+                .unwrap_err()
+                .contains("different semantics")
+        );
+
+        std::fs::write(&journal_path, b"{not-json").unwrap();
+        let corrupt_replay = make_node();
+        assert!(
+            replay_verified_settlement_journal(&corrupt_replay)
+                .unwrap_err()
+                .contains("decode settlement journal entry"),
+            "persistent RPC boot must fail closed rather than discard earned work"
+        );
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn verified_settlement_journal_prunes_only_after_protocol_expiry() {
+        let temporary = std::env::temp_dir().join(format!(
+            "arc-rpc-settlement-expiry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = temporary.join("state");
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(
+                &[],
+                &data_dir,
+                arc_crypto::hash_bytes(b"settlement-expiry-genesis"),
+            )
+            .unwrap(),
+        );
+        let node = build_node_state(
+            state.clone(),
+            Arc::new(Mempool::new(16)),
+            Hash256([31; 32]),
+            None,
+            0,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let job_id = Hash256([32; 32]);
+        retain_verified_settlement(&node, test_verified_settlement_payload(job_id, 0)).unwrap();
+        assert_eq!(prune_verified_settlements(&node).unwrap(), 0);
+        assert!(settlement_journal_file(&node, job_id).unwrap().is_file());
+        state.execute_block(&[], Hash256([33; 32])).unwrap();
+        assert_eq!(prune_verified_settlements(&node).unwrap(), 1);
+        assert!(!settlement_journal_file(&node, job_id).unwrap().exists());
+        let _ = std::fs::remove_dir_all(temporary);
     }
 
     #[test]
@@ -14158,6 +15848,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let app = Router::new()
+                .route("/network/info", get(network_info))
                 .route("/inference/forward_shard", post(inference_forward_shard))
                 .route("/inference/cleanup_shard", post(inference_cleanup_shard))
                 .with_state(node.clone());
@@ -14245,11 +15936,17 @@ mod tests {
             tokens_generated: output_tokens.len() as u64,
         };
 
-        let mut approvals = Vec::new();
+        for shard_node in &shard_nodes {
+            shard_node.shard_kv_caches.clear();
+            shard_node.shard_kv_cache_metadata.clear();
+        }
+        // Production approval collection starts all five remote validators
+        // while the same three shard holders are busy. This is the regression
+        // that used to fail immediately at the third try_acquire and made
+        // five-of-six mathematically unreachable under real fan-out.
+        let mut approval_tasks = tokio::task::JoinSet::new();
         for key in validator_keys.iter().skip(1) {
-            for shard_node in &shard_nodes {
-                shard_node.shard_kv_caches.clear();
-            }
+            let key = key.clone();
             let mut approver = fake_node_with_workers(Vec::new());
             approver.state = recovered.clone();
             approver.validator_address = key.address();
@@ -14272,10 +15969,17 @@ mod tests {
                 approver.state.transaction_domain_hash(),
             )
             .unwrap();
-            let Json(approval) = community_reward_approve_signed(AxumState(approver), Json(signed))
-                .await
-                .expect("remote endpoint authenticates, recomputes, and signs canonical payload");
-            approvals.push(approval);
+            approval_tasks.spawn(async move {
+                let Json(approval) =
+                    community_reward_approve_signed(AxumState(approver), Json(signed))
+                        .await
+                        .expect("parallel endpoint authenticates, queues, recomputes, and signs");
+                approval
+            });
+        }
+        let mut approvals = Vec::new();
+        while let Some(approval) = approval_tasks.join_next().await {
+            approvals.push(approval.expect("parallel approval task joins"));
         }
         assert_eq!(approvals.len(), 5);
         let mut coordinator = fake_node_with_workers(Vec::new());
@@ -14520,6 +16224,9 @@ mod tests {
             community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
             community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
             community_reward_submissions: Arc::new(dashmap::DashMap::new()),
+            community_verified_settlements: Arc::new(dashmap::DashMap::new()),
+            community_verified_settlements_gate: Arc::new(parking_lot::Mutex::new(())),
+            community_settlement_journal_dir: None,
             community_work_tx: Some(Arc::new(tx)),
             community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             community_work_results: Some(Arc::new(dashmap::DashMap::new())),
@@ -14557,8 +16264,20 @@ mod tests {
             validator_shard_permits: Arc::new(tokio::sync::Semaphore::new(
                 VALIDATOR_SHARD_CONCURRENCY,
             )),
+            validator_shard_queue_permits: Arc::new(tokio::sync::Semaphore::new(
+                VALIDATOR_SHARD_QUEUE_CAP,
+            )),
+            community_approval_permits: Arc::new(tokio::sync::Semaphore::new(
+                COMMUNITY_APPROVAL_RECOMPUTE_CONCURRENCY,
+            )),
+            community_approval_queue_permits: Arc::new(tokio::sync::Semaphore::new(
+                COMMUNITY_APPROVAL_QUEUE_CAP,
+            )),
             shard_infos: Vec::new(),
             shard_kv_caches: Arc::new(dashmap::DashMap::new()),
+            shard_kv_cache_metadata: Arc::new(dashmap::DashMap::new()),
+            shard_kv_cache_gate: Arc::new(parking_lot::Mutex::new(())),
+            shard_rpc_audiences: Arc::new(dashmap::DashMap::new()),
             shard_registry: Arc::new(dashmap::DashMap::new()),
             sharded_runs_total: Arc::new(AtomicU64::new(0)),
             sharded_bytes_total: Arc::new(AtomicU64::new(0)),
@@ -15655,6 +17374,7 @@ mod tests {
                 assignment_epoch: Hash256([7u8; 32]),
                 job_nonce: 1,
                 assigned_worker,
+                submitting: false,
                 sender,
             },
         );
@@ -16046,6 +17766,47 @@ mod tests {
             .expect_err("activation state must not turn a self-commitment into proof");
         assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!receiver.await.unwrap().result.success);
+        assert_eq!(node.mempool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_verifier_preserves_assignment_without_worker_penalty() {
+        let worker_key = KeyPair::generate_ed25519();
+        let worker_id = worker_key.address().to_hex();
+        let node =
+            fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
+        let item = WorkItem {
+            job_id: arc_crypto::hash_bytes(b"retryable-verifier-outage").to_hex(),
+            input: "hello".to_string(),
+            max_tokens: 8,
+            model_id: Some(test_model_id()),
+            transaction_domain: None,
+            submitted_at_unix_ms: 1,
+        };
+        let _receiver = insert_pending_job(&node, item.clone(), Some(worker_id.clone()));
+        node.community_active_jobs
+            .insert(worker_id.clone(), item.job_id.clone());
+        let mut result = signed_result_for(&worker_key, &item, 0);
+        result.engine =
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string();
+
+        let error = community_submit_work(AxumState(node.clone()), Json(result))
+            .await
+            .expect_err("missing authenticated shard topology is retryable unavailability");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("remains retryable"));
+        let pending = node
+            .community_work_results
+            .as_ref()
+            .unwrap()
+            .get(&item.job_id)
+            .expect("assignment remains durable in memory");
+        assert!(!pending.submitting);
+        drop(pending);
+        assert!(node.community_active_jobs.contains_key(&worker_id));
+        let stats = node.community_workers.get(&worker_id).unwrap();
+        assert_eq!(stats.value().0.failure_count, 0);
+        assert_eq!(stats.value().0.success_count, 0);
         assert_eq!(node.mempool.len(), 0);
     }
 
@@ -16574,11 +18335,12 @@ mod tests {
             )),
         );
 
-        let Json(first) = inference_cleanup_shard(
-            AxumState(node.clone()),
-            Json(CleanupShardRequest {
+        let Json(first) = inference_cleanup_shard_authenticated(
+            node.clone(),
+            CleanupShardRequest {
                 request_id: target.clone(),
-            }),
+            },
+            Hash256::ZERO,
         )
         .await
         .unwrap();
@@ -16586,9 +18348,10 @@ mod tests {
         assert!(!node.shard_kv_caches.contains_key(&target));
         assert!(node.shard_kv_caches.contains_key(&unrelated));
 
-        let Json(second) = inference_cleanup_shard(
-            AxumState(node.clone()),
-            Json(CleanupShardRequest { request_id: target }),
+        let Json(second) = inference_cleanup_shard_authenticated(
+            node.clone(),
+            CleanupShardRequest { request_id: target },
+            Hash256::ZERO,
         )
         .await
         .unwrap();
