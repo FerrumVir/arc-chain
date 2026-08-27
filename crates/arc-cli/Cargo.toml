@@ -21,6 +21,8 @@ hex.workspace = true
 anyhow.workspace = true
 ed25519-dalek.workspace = true
 k256.workspace = true
+zeroize.workspace = true
+libc = "0.2"
 
 [lints]
 workspace = true
