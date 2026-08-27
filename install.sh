@@ -714,16 +714,16 @@ snapshot_transaction_path() {
     if transaction_as_owner test -L "$path"; then
         die "Refusing symlinked managed install path: $path"
     fi
-    TRANSACTION_PATHS[$index]="$path"
-    TRANSACTION_BACKUPS[$index]="$backup"
+    TRANSACTION_PATHS[index]="$path"
+    TRANSACTION_BACKUPS[index]="$backup"
     if transaction_as_owner test -e "$path"; then
         transaction_as_owner test -f "$path" \
             || die "Managed install path is not a regular file: $path"
         transaction_as_owner cp -p -- "$path" "$backup" \
             || die "Could not snapshot managed install path: $path"
-        TRANSACTION_EXISTED[$index]=true
+        TRANSACTION_EXISTED[index]=true
     else
-        TRANSACTION_EXISTED[$index]=false
+        TRANSACTION_EXISTED[index]=false
     fi
 }
 
