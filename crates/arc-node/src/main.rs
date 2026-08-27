@@ -4,8 +4,18 @@ mod validator_identity;
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, hash_bytes};
 use arc_mempool::Mempool;
-use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
-use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
+use arc_net::transport::{InboundMessage, OutboundMessage, run_transport_with_readiness};
+use arc_node::{
+    benchmark::BenchmarkPool,
+    consensus::{ConsensusManager, RecoveryDagRollover},
+    recovery_dag_wal::{
+        BaselineState as DagBaselineState, CurrentStreamSummary, DagCursor, GenerationInput,
+        GenerationPin, GenerationStore, HARD_MAX_RETENTION_ROUND_SPAN,
+        RecoveryDagBinding as GenerationDagBinding, RetainedDagRecord, RetainedRecordKind,
+        RetentionLimits, StoreAuditStatus, TornSuffix, VerifiedGeneration,
+    },
+    rpc,
+};
 use arc_state::StateDB;
 use arc_types::Block;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -633,8 +643,9 @@ fn print_recovery_summary(
     Ok(())
 }
 
-const RECOVERY_DAG_BINDING_VERSION: u16 = 1;
+const RECOVERY_DAG_BINDING_VERSION: u16 = 2;
 const RECOVERY_DAG_BINDING_FILE: &str = "recovery-dag.binding.json";
+const RECOVERY_DAG_PIN_SCHEMA: &str = "arc.recovery.dag-generation-pin.v1";
 
 /// Local DAG persistence is useful only after it is bound to the signed
 /// checkpoint which created its consensus domain. This small readable file is
@@ -646,17 +657,278 @@ struct RecoveryDagBinding {
     format_version: u16,
     manifest_hash: Hash256,
     consensus_domain: arc_consensus::ConsensusDomain,
+    /// Domain-separated commitment to the fixed validator identities, public
+    /// keys, and stakes in the signed ARCCHKPT manifest. This deliberately
+    /// never follows mutable post-transition validator state.
+    validator_set_commitment: Hash256,
     source_height: u64,
     transition_height: u64,
     source_consensus_round: u64,
     initial_consensus_round: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RecoveryDagStartup {
+    data_dir: PathBuf,
     wal_dir: PathBuf,
     binding: RecoveryDagBinding,
     archived_legacy_wal: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct RecoveryDagReplay {
+    current_round: u64,
+    next_commit_round: u64,
+    transactions: Vec<arc_types::Transaction>,
+    repaired_commit: Option<(Hash256, u64)>,
+}
+
+const LIVE_DAG_ROLLOVER_PERCENT: u64 = 90;
+const LIVE_DAG_ROLLOVER_ROUND_HEADROOM: u64 = 64;
+
+struct LiveRecoveryDagRollover {
+    store: GenerationStore,
+    startup: RecoveryDagStartup,
+    current: parking_lot::Mutex<VerifiedGeneration>,
+}
+
+impl LiveRecoveryDagRollover {
+    fn projected_usage(
+        generation: &VerifiedGeneration,
+        writer: &arc_node::recovery_dag_wal::ActiveLogWriter,
+        upcoming: &[RetainedDagRecord],
+    ) -> Result<(u64, u64, u64)> {
+        let inspection = writer.inspection();
+        ensure!(
+            writer.generation_pin() == generation.pin
+                && inspection.generation_pin == generation.pin,
+            "live recovery DAG writer differs from its selected generation"
+        );
+        let upcoming = writer
+            .project_batch_usage(upcoming)
+            .map_err(|error| anyhow::anyhow!("project live recovery DAG batch: {error}"))?;
+        let record_count = generation
+            .manifest
+            .retained_records
+            .record_count
+            .checked_add(inspection.record_count)
+            .and_then(|count| count.checked_add(upcoming.appended_records))
+            .ok_or_else(|| anyhow::anyhow!("live recovery DAG record count overflows"))?;
+        let payload_bytes = generation
+            .manifest
+            .retained_records
+            .payload_bytes
+            .checked_add(inspection.payload_bytes)
+            .and_then(|bytes| bytes.checked_add(upcoming.appended_payload_bytes))
+            .ok_or_else(|| anyhow::anyhow!("live recovery DAG payload size overflows"))?;
+        let maximum_round = upcoming
+            .maximum_round
+            .into_iter()
+            .chain(inspection.last_round)
+            .max()
+            .unwrap_or(generation.manifest.dag_cursor.current_round);
+        Ok((record_count, payload_bytes, maximum_round))
+    }
+
+    fn projection_fits_hard_limits(
+        generation: &VerifiedGeneration,
+        projection: (u64, u64, u64),
+    ) -> bool {
+        let limits = generation.manifest.retained_records.limits;
+        projection.0 <= limits.max_records
+            && projection.1 <= limits.max_payload_bytes
+            && projection.2 >= generation.manifest.dag_cursor.retention_floor_round
+            && projection.2 <= generation.manifest.dag_cursor.retention_ceiling_round
+    }
+
+    fn projection_needs_rollover(
+        generation: &VerifiedGeneration,
+        projection: (u64, u64, u64),
+    ) -> bool {
+        let limits = generation.manifest.retained_records.limits;
+        let record_target = limits.max_records.saturating_mul(LIVE_DAG_ROLLOVER_PERCENT) / 100;
+        let payload_target = limits
+            .max_payload_bytes
+            .saturating_mul(LIVE_DAG_ROLLOVER_PERCENT)
+            / 100;
+        let round_target = generation
+            .manifest
+            .dag_cursor
+            .retention_ceiling_round
+            .saturating_sub(LIVE_DAG_ROLLOVER_ROUND_HEADROOM);
+        projection.0 >= record_target
+            || projection.1 >= payload_target
+            || projection.2 >= round_target
+    }
+}
+
+impl RecoveryDagRollover for LiveRecoveryDagRollover {
+    fn prepare_append(
+        &self,
+        state: &StateDB,
+        engine: &arc_consensus::ConsensusEngine,
+        writer: arc_node::recovery_dag_wal::ActiveLogWriter,
+        upcoming: &[RetainedDagRecord],
+    ) -> std::result::Result<arc_node::recovery_dag_wal::ActiveLogWriter, String> {
+        let mut current = self.current.lock();
+        let before = Self::projected_usage(&current, &writer, upcoming)
+            .map_err(|error| format!("{error:#}"))?;
+        let fits_before = Self::projection_fits_hard_limits(&current, before);
+        let needs_rollover = Self::projection_needs_rollover(&current, before) || !fits_before;
+        let canonical_advanced = state.height() > current.manifest.baseline_state.height;
+        if !needs_rollover || !canonical_advanced {
+            if !fits_before {
+                return Err(
+                    "recovery DAG capacity exhausted before a newer canonical compaction boundary"
+                        .to_string(),
+                );
+            }
+            return Ok(writer);
+        }
+
+        let selected_pin = current.pin;
+        let expected_active_pin = writer.inspection().pin();
+        // Dropping the writer releases the store's advisory lock. No other
+        // consensus task can append because the outer writer slot remains
+        // exclusively locked until this method returns.
+        drop(writer);
+        let (records, summary) = stream_recovery_generation_records(
+            &self.store,
+            &current.manifest.binding,
+            selected_pin,
+        )
+        .map_err(|error| format!("stage live recovery DAG rollover: {error:#}"))?;
+        if summary.active_pin != expected_active_pin || summary.active_suffix != TornSuffix::Clean {
+            return Err(
+                "live recovery DAG changed or tore after its rollover pin was selected".to_string(),
+            );
+        }
+        let successor = compact_replayed_recovery_generation(
+            &self.store,
+            state,
+            &self.startup,
+            &current,
+            &summary,
+            engine,
+            &records,
+        )
+        .map_err(|error| format!("publish live recovery DAG rollover: {error:#}"))?;
+        if successor.pin == selected_pin {
+            return Err(
+                "live recovery DAG threshold requested rollover but produced no successor"
+                    .to_string(),
+            );
+        }
+        let successor_writer = self
+            .store
+            .open_current_active_writer(&successor.manifest.binding, successor.pin)
+            .map_err(|error| format!("open live recovery DAG successor writer: {error}"))?;
+        let after = Self::projected_usage(&successor, &successor_writer, upcoming)
+            .map_err(|error| format!("{error:#}"))?;
+        if !Self::projection_fits_hard_limits(&successor, after) {
+            return Err(
+                "compacted recovery DAG still lacks capacity for the next durable batch"
+                    .to_string(),
+            );
+        }
+        *current = successor;
+        Ok(successor_writer)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryDagExternalPin {
+    schema: String,
+    recovery_manifest_hash: Hash256,
+    generation: GenerationPin,
+}
+
+fn recovery_dag_pin_path(data_dir: &Path, manifest_hash: Hash256) -> PathBuf {
+    data_dir.join(format!("recovery-dag.{}.pin.json", manifest_hash.to_hex()))
+}
+
+fn read_recovery_dag_pin(
+    data_dir: &Path,
+    manifest_hash: Hash256,
+) -> Result<Option<RecoveryDagExternalPin>> {
+    let path = recovery_dag_pin_path(data_dir, manifest_hash);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect recovery DAG pin {}", path.display()));
+        }
+    };
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "recovery DAG pin {} must be a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= 64 * 1024,
+        "recovery DAG pin {} exceeds 64 KiB",
+        path.display()
+    );
+    let pin: RecoveryDagExternalPin = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("failed to read recovery DAG pin {}", path.display()))?,
+    )
+    .with_context(|| format!("invalid recovery DAG pin {}", path.display()))?;
+    ensure!(
+        pin.schema == RECOVERY_DAG_PIN_SCHEMA && pin.recovery_manifest_hash == manifest_hash,
+        "recovery DAG pin {} has a foreign schema or checkpoint binding",
+        path.display()
+    );
+    Ok(Some(pin))
+}
+
+fn write_recovery_dag_pin_atomically(
+    data_dir: &Path,
+    manifest_hash: Hash256,
+    generation: GenerationPin,
+) -> Result<()> {
+    let path = recovery_dag_pin_path(data_dir, manifest_hash);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "recovery DAG pin {} must be a regular file",
+            path.display()
+        );
+    }
+    let pin = RecoveryDagExternalPin {
+        schema: RECOVERY_DAG_PIN_SCHEMA.to_owned(),
+        recovery_manifest_hash: manifest_hash,
+        generation,
+    };
+    let bytes = serde_json::to_vec(&pin)?;
+    let temporary = data_dir.join(format!(
+        ".recovery-dag.{}.pin-{}.tmp",
+        manifest_hash.to_hex(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("failed to create recovery DAG pin {}", temporary.display()))?;
+    if let Err(error) = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    })() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).context("failed to durably write recovery DAG pin");
+    }
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to activate recovery DAG pin {}", path.display()))?;
+    sync_directory(data_dir)
 }
 
 /// Preserve recovered validator state exactly. Re-seeding the genesis set
@@ -722,6 +994,74 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Process-lifetime advisory lock for one node data directory. The lock file
+/// may remain after a crash, but the kernel lock is released automatically;
+/// this prevents two self-heal/systemd processes from opening the same state
+/// and consensus WALs concurrently without creating a stale-PID blocker.
+struct NodeDataDirLock {
+    _file: File,
+}
+
+fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
+    match std::fs::symlink_metadata(data_dir) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "node data directory {} must be a real directory",
+            data_dir.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(data_dir).with_context(|| {
+                format!(
+                    "failed to create node data directory {}",
+                    data_dir.display()
+                )
+            })?;
+            let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+            sync_directory(parent)?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect data directory {}", data_dir.display())
+            });
+        }
+    }
+
+    let path = data_dir.join(".arc-node.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "node data lock {} must be a regular file",
+            path.display()
+        );
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("failed to open node data lock {}", path.display()))?;
+    file.try_lock().with_context(|| {
+        format!(
+            "node data directory {} is already locked by another ARC process",
+            data_dir.display()
+        )
+    })?;
+    file.set_len(0)
+        .with_context(|| format!("failed to reset node data lock {}", path.display()))?;
+    file.write_all(
+        format!("schema=arc.node.data-lock.v1\npid={}\n", std::process::id()).as_bytes(),
+    )
+    .with_context(|| format!("failed to write node data lock {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync node data lock {}", path.display()))?;
+    sync_directory(data_dir)?;
+    Ok(NodeDataDirLock { _file: file })
+}
+
 fn write_recovery_dag_binding_atomically(path: &Path, binding: &RecoveryDagBinding) -> Result<()> {
     let parent = path
         .parent()
@@ -765,6 +1105,48 @@ fn read_recovery_dag_binding(path: &Path) -> Result<RecoveryDagBinding> {
         .with_context(|| format!("invalid recovery DAG binding {}", path.display()))
 }
 
+fn activate_recovery_dag_binding(wal_dir: &Path, binding: &RecoveryDagBinding) -> Result<()> {
+    let binding_path = wal_dir.join(RECOVERY_DAG_BINDING_FILE);
+    let binding_tmp_path = wal_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+    if binding_path.exists() {
+        ensure!(
+            !binding_tmp_path.exists(),
+            "recovery DAG WAL contains both active and staged binding files"
+        );
+        let stored = read_recovery_dag_binding(&binding_path)?;
+        ensure!(
+            stored == *binding,
+            "recovery DAG WAL binding differs from the signed active checkpoint"
+        );
+        return Ok(());
+    }
+
+    let entries: Vec<_> = std::fs::read_dir(wal_dir)
+        .with_context(|| format!("failed to inspect {}", wal_dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        return write_recovery_dag_binding_atomically(&binding_path, binding);
+    }
+    if entries.len() == 1 && entries[0].path() == binding_tmp_path {
+        // The binding bytes are fully fsynced before their atomic rename. If
+        // power failed in that one window, accept only the exact deterministic
+        // bytes re-derived from the active ARCCHKPT, then finish the rename and
+        // directory fsync before creating any generation files.
+        let staged = read_recovery_dag_binding(&binding_tmp_path)?;
+        ensure!(
+            staged == *binding,
+            "staged recovery DAG binding differs from the signed active checkpoint"
+        );
+        std::fs::rename(&binding_tmp_path, &binding_path)
+            .context("failed to activate the fsynced recovery DAG binding")?;
+        return sync_directory(wal_dir);
+    }
+    bail!(
+        "recovery DAG WAL {} contains data without an active binding; refusing replay",
+        wal_dir.display()
+    )
+}
+
 fn archive_legacy_dag_wal(data_dir: &Path, manifest_hash: Hash256) -> Result<Option<PathBuf>> {
     let legacy = data_dir.join("dag-wal");
     let metadata = match std::fs::symlink_metadata(&legacy) {
@@ -798,6 +1180,21 @@ fn archive_legacy_dag_wal(data_dir: &Path, manifest_hash: Hash256) -> Result<Opt
     Ok(Some(archive))
 }
 
+fn checkpoint_validator_set_commitment(
+    manifest: &arc_state::recovery::RecoveryManifest,
+) -> Result<Hash256> {
+    ensure!(
+        !manifest.validators.is_empty(),
+        "recovery checkpoint validator set is empty"
+    );
+    let encoded = bincode::serialize(&(manifest.validator_set_id, manifest.validators.as_slice()))
+        .context("failed to encode the fixed recovery validator set")?;
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-recovery-DAG-validator-set-commitment-v1");
+    hasher.update(&(encoded.len() as u64).to_be_bytes());
+    hasher.update(&encoded);
+    Ok(Hash256(*hasher.finalize().as_bytes()))
+}
+
 fn prepare_recovery_dag_startup(
     data_dir: &Path,
     state: &StateDB,
@@ -824,6 +1221,9 @@ fn prepare_recovery_dag_startup(
         checkpoint.manifest.recovery_context() == context,
         "active recovery checkpoint context differs from replayed state"
     );
+    checkpoint
+        .verify_content()
+        .context("active recovery checkpoint content failed DAG startup validation")?;
     let transition_height = checkpoint
         .manifest
         .source_height
@@ -848,6 +1248,7 @@ fn prepare_recovery_dag_startup(
             context.recovery_epoch,
             context.validator_set_id,
         ),
+        validator_set_commitment: checkpoint_validator_set_commitment(&checkpoint.manifest)?,
         source_height: checkpoint.manifest.source_height,
         transition_height,
         source_consensus_round: checkpoint.manifest.source_consensus_round,
@@ -875,39 +1276,319 @@ fn prepare_recovery_dag_startup(
         }
     }
 
-    let binding_path = wal_dir.join(RECOVERY_DAG_BINDING_FILE);
-    if binding_path.exists() {
-        let stored = read_recovery_dag_binding(&binding_path)?;
-        ensure!(
-            stored == binding,
-            "recovery DAG WAL binding differs from the signed active checkpoint"
-        );
-    } else {
-        let mut entries = std::fs::read_dir(&wal_dir)
-            .with_context(|| format!("failed to inspect {}", wal_dir.display()))?;
-        ensure!(
-            entries.next().is_none(),
-            "recovery DAG WAL {} contains data without a binding; refusing replay",
-            wal_dir.display()
-        );
-        write_recovery_dag_binding_atomically(&binding_path, &binding)?;
-    }
+    activate_recovery_dag_binding(&wal_dir, &binding)?;
 
     Ok(Some(RecoveryDagStartup {
+        data_dir: data_dir.to_path_buf(),
         wal_dir,
         binding,
         archived_legacy_wal,
     }))
 }
 
+fn generation_dag_binding(startup: &RecoveryDagStartup) -> Result<GenerationDagBinding> {
+    ensure!(
+        startup.binding.manifest_hash != Hash256::ZERO,
+        "recovery generation is missing its ARCCHKPT hash"
+    );
+    ensure!(
+        startup.binding.validator_set_commitment != Hash256::ZERO,
+        "recovery generation has an empty validator-set commitment"
+    );
+    Ok(GenerationDagBinding {
+        recovery_manifest_hash: startup.binding.manifest_hash,
+        recovery_domain: startup.binding.consensus_domain.domain_hash,
+        validator_set_commitment: startup.binding.validator_set_commitment,
+    })
+}
+
+fn canonical_dag_baseline(state: &StateDB) -> Result<DagBaselineState> {
+    let height = state.height();
+    let block = state
+        .get_block(height)
+        .ok_or_else(|| anyhow::anyhow!("canonical DAG baseline block {height} is missing"))?;
+    let state_root = state.get_state_root();
+    ensure!(
+        block.header.state_root == state_root,
+        "canonical DAG baseline block {} commits {}, live state computes {}",
+        block.hash,
+        block.header.state_root,
+        state_root
+    );
+    Ok(DagBaselineState {
+        height,
+        block_hash: block.hash,
+        state_root,
+    })
+}
+
+fn validate_recovery_generation_anchor(
+    state: &StateDB,
+    startup: &RecoveryDagStartup,
+    generation: &VerifiedGeneration,
+) -> Result<()> {
+    let baseline = &generation.manifest.baseline_state;
+    ensure!(
+        baseline.height >= startup.binding.transition_height && baseline.height <= state.height(),
+        "recovery DAG generation baseline height {} is outside canonical state {}..={} ",
+        baseline.height,
+        startup.binding.transition_height,
+        state.height()
+    );
+    let block = state.get_block(baseline.height).ok_or_else(|| {
+        anyhow::anyhow!(
+            "recovery DAG generation baseline block {} is missing",
+            baseline.height
+        )
+    })?;
+    ensure!(
+        block.hash == baseline.block_hash && block.header.state_root == baseline.state_root,
+        "recovery DAG generation baseline differs from canonical block {}",
+        baseline.height
+    );
+    let committed_block_count = baseline
+        .height
+        .checked_sub(startup.binding.transition_height)
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG committed-block count underflows"))?;
+    ensure!(
+        generation.manifest.dag_cursor.committed_block_count == committed_block_count,
+        "recovery DAG generation committed count does not match its canonical baseline"
+    );
+    let expected_next_round = startup
+        .binding
+        .initial_consensus_round
+        .checked_add(committed_block_count)
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG next-commit round overflows"))?;
+    ensure!(
+        generation.manifest.dag_cursor.next_dag_round == expected_next_round,
+        "recovery DAG generation next-commit round is not contiguous with canonical state"
+    );
+    Ok(())
+}
+
+fn recovery_retention_ceiling(floor_round: u64) -> Result<u64> {
+    floor_round
+        .checked_add(HARD_MAX_RETENTION_ROUND_SPAN)
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG retention ceiling overflows u64"))
+}
+
+fn initialize_recovery_generation_store(
+    state: &StateDB,
+    startup: &RecoveryDagStartup,
+) -> Result<(GenerationStore, VerifiedGeneration)> {
+    let binding = generation_dag_binding(startup)?;
+    let store = GenerationStore::new(&startup.wal_dir);
+    if startup.wal_dir.join("CURRENT").exists() {
+        store
+            .recover_interrupted_ancestor_gc(&binding)
+            .context("failed to finish interrupted recovery DAG ancestor GC")?;
+    }
+    let external = read_recovery_dag_pin(&startup.data_dir, startup.binding.manifest_hash)?;
+
+    let mut current = if let Some(external) = external.as_ref() {
+        match store.load_current(&binding, Some(external.generation)) {
+            Ok(generation) => generation,
+            Err(arc_node::recovery_dag_wal::GenerationError::PinMismatch { .. }) => {
+                let audit = store
+                    .audit(&binding)
+                    .context("failed to audit recovery DAG after an external pin mismatch")?;
+                match &audit.status {
+                    StoreAuditStatus::Clean
+                        if audit.current.pin.sequence
+                            == external.generation.sequence.saturating_add(1)
+                            && audit.current.manifest.previous_generation
+                                == Some(external.generation.hash) =>
+                    {
+                        validate_recovery_generation_anchor(state, startup, &audit.current)?;
+                        write_recovery_dag_pin_atomically(
+                            &startup.data_dir,
+                            startup.binding.manifest_hash,
+                            audit.current.pin,
+                        )?;
+                        audit.current
+                    }
+                    StoreAuditStatus::PointerBehind { heads }
+                        if heads.as_slice() == [external.generation] =>
+                    {
+                        let successor = store
+                            .verify_generation(external.generation.hash, &binding)
+                            .context("externally pinned recovery DAG successor is invalid")?;
+                        validate_recovery_generation_anchor(state, startup, &successor)?;
+                        store
+                            .activate_existing_successor(
+                                audit.current.pin,
+                                external.generation.hash,
+                            )
+                            .context("failed to activate externally pinned DAG successor")?
+                    }
+                    _ => bail!(
+                        "recovery DAG CURRENT/external pin mismatch is not one exact crash successor"
+                    ),
+                }
+            }
+            Err(error) => return Err(error).context("failed to load pinned recovery DAG"),
+        }
+    } else {
+        let generation = if startup.wal_dir.join("CURRENT").exists() {
+            // Initial generation publication deliberately precedes the
+            // independent pin. Recover that one crash window only when the
+            // selected generation is the exact empty transition boundary; no
+            // live consensus writer can have opened before the pin existed.
+            let generation = store
+                .load_current(&binding, None)
+                .context("failed to inspect unpinned initial recovery DAG generation")?;
+            validate_recovery_generation_anchor(state, startup, &generation)?;
+            ensure!(
+                generation.pin.sequence == 0
+                    && generation.manifest.previous_generation.is_none()
+                    && generation.manifest.baseline_state.height
+                        == startup.binding.transition_height
+                    && generation.manifest.retained_records.record_count == 0,
+                "recovery DAG CURRENT exists without a pin and is not the exact empty initial generation"
+            );
+            let mut observed_records = 0u64;
+            let summary = store
+                .stream_current_generation_and_active(&binding, generation.pin, |_| {
+                    observed_records += 1;
+                    Ok(())
+                })
+                .context("failed to verify unpinned initial recovery DAG active log")?;
+            ensure!(
+                observed_records == 0
+                    && summary.active_record_count == 0
+                    && summary.active_suffix == TornSuffix::Clean,
+                "unpinned initial recovery DAG generation contains active history"
+            );
+            generation
+        } else {
+            let baseline = canonical_dag_baseline(state)?;
+            ensure!(
+                baseline.height == startup.binding.transition_height,
+                "cannot initialize a new recovery DAG generation after canonical state advanced"
+            );
+            let initial_round = startup.binding.initial_consensus_round;
+            store
+                .create_initial(
+                    GenerationInput {
+                        binding: binding.clone(),
+                        baseline_state: baseline,
+                        dag_cursor: DagCursor {
+                            committed_block_count: 0,
+                            next_dag_round: initial_round,
+                            current_round: initial_round,
+                            retention_floor_round: initial_round,
+                            retention_ceiling_round: recovery_retention_ceiling(initial_round)?,
+                        },
+                        retention_limits: RetentionLimits::default(),
+                    },
+                    std::iter::empty(),
+                )
+                .context("failed to create initial recovery DAG generation")?
+        };
+        write_recovery_dag_pin_atomically(
+            &startup.data_dir,
+            startup.binding.manifest_hash,
+            generation.pin,
+        )?;
+        generation
+    };
+
+    validate_recovery_generation_anchor(state, startup, &current)?;
+    let audit = store
+        .audit(&binding)
+        .context("failed to audit immutable recovery DAG generations")?;
+    match audit.status {
+        StoreAuditStatus::Clean => ensure!(
+            audit.current.pin == current.pin,
+            "recovery DAG audit CURRENT changed during startup"
+        ),
+        StoreAuditStatus::PointerBehind { ref heads }
+            if heads.len() == 1 && heads[0].sequence == current.pin.sequence.saturating_add(1) =>
+        {
+            let successor = store
+                .verify_generation(heads[0].hash, &binding)
+                .context("orphan recovery DAG successor is invalid")?;
+            ensure!(
+                successor.manifest.previous_generation == Some(current.pin.hash),
+                "orphan recovery DAG generation is not the direct crash successor"
+            );
+            validate_recovery_generation_anchor(state, startup, &successor)?;
+            current = store
+                .activate_existing_successor(current.pin, successor.pin.hash)
+                .context("failed to finish crash-interrupted DAG generation activation")?;
+            write_recovery_dag_pin_atomically(
+                &startup.data_dir,
+                startup.binding.manifest_hash,
+                current.pin,
+            )?;
+        }
+        _ => bail!("recovery DAG generation audit found a fork or ambiguous rollback"),
+    }
+    Ok((store, current))
+}
+
+fn stream_recovery_generation_records(
+    store: &GenerationStore,
+    binding: &GenerationDagBinding,
+    generation: GenerationPin,
+) -> Result<(Vec<RetainedDagRecord>, CurrentStreamSummary)> {
+    let mut records = Vec::new();
+    let summary = store
+        .stream_current_generation_and_active(binding, generation, |record| {
+            records.push(record);
+            Ok(())
+        })
+        .context("failed to stage the bounded recovery DAG generation")?;
+    Ok((records, summary))
+}
+
+fn stage_recovery_generation_records(
+    store: &GenerationStore,
+    generation: &VerifiedGeneration,
+) -> Result<(Vec<RetainedDagRecord>, CurrentStreamSummary)> {
+    let (records, summary) =
+        stream_recovery_generation_records(store, &generation.manifest.binding, generation.pin)?;
+    if summary.active_suffix == TornSuffix::Clean {
+        return Ok((records, summary));
+    }
+
+    let evidence = store
+        .quarantine_current_active_suffix(
+            &generation.manifest.binding,
+            generation.pin,
+            summary.active_valid_prefix_bytes,
+        )
+        .context("failed to quarantine the classified torn recovery DAG suffix")?;
+    tracing::warn!(
+        generation = %generation.pin.hash,
+        valid_prefix_bytes = evidence.valid_prefix_bytes,
+        quarantined_suffix_bytes = evidence.quarantined_suffix_bytes,
+        quarantined_suffix_hash = %evidence.quarantined_suffix_hash,
+        quarantine = %evidence.quarantine_path.display(),
+        classification = ?evidence.classification,
+        "Preserved and removed a torn final recovery DAG active batch"
+    );
+
+    let (clean_records, clean_summary) =
+        stream_recovery_generation_records(store, &generation.manifest.binding, generation.pin)?;
+    ensure!(
+        clean_summary.active_suffix == TornSuffix::Clean
+            && clean_records == records
+            && clean_summary.active_valid_prefix_bytes == summary.active_valid_prefix_bytes,
+        "recovery DAG valid prefix changed while its torn suffix was quarantined"
+    );
+    Ok((clean_records, clean_summary))
+}
+
 fn verify_canonical_state_block_for_dag_commit(
     state: &StateDB,
-    transition_height: u64,
+    baseline_height: u64,
     commit_index: u64,
+    consensus_domain: &arc_consensus::ConsensusDomain,
     dag_block: &arc_consensus::DagBlock,
     transactions: &std::collections::HashMap<[u8; 32], arc_types::Transaction>,
 ) -> Result<()> {
-    let height = transition_height
+    let height = baseline_height
         .checked_add(commit_index)
         .and_then(|height| height.checked_add(1))
         .ok_or_else(|| anyhow::anyhow!("canonical DAG/state binding height overflows u64"))?;
@@ -921,8 +1602,9 @@ fn verify_canonical_state_block_for_dag_commit(
     ensure!(
         block.header.producer == dag_block.author
             && block.header.timestamp == dag_block.timestamp
-            && block.header.height == height,
-        "canonical state block {} does not bind DAG leader {} author/timestamp/height",
+            && block.header.height == height
+            && block.header.proof_hash == dag_block.state_decision_commitment(consensus_domain),
+        "canonical state block {} does not bind DAG leader {} domain/hash/round/author/timestamp/height",
         block.hash,
         dag_block.hash
     );
@@ -950,17 +1632,13 @@ fn verify_canonical_state_block_for_dag_commit(
     Ok(())
 }
 
-fn replay_recovery_dag_wal(
+fn replay_recovery_dag_generation(
     engine: &arc_consensus::ConsensusEngine,
     state: &StateDB,
     startup: &RecoveryDagStartup,
-    expected_commits: u64,
-) -> Result<(
-    u64,
-    u64,
-    Vec<arc_types::Transaction>,
-    Option<(Hash256, u64)>,
-)> {
+    generation: &VerifiedGeneration,
+    records: &[RetainedDagRecord],
+) -> Result<RecoveryDagReplay> {
     let installed = engine
         .install_recovery_cursor(startup.binding.source_consensus_round)
         .map_err(|error| anyhow::anyhow!("failed to install signed recovery cursor: {error}"))?;
@@ -968,21 +1646,35 @@ fn replay_recovery_dag_wal(
         installed == startup.binding.initial_consensus_round,
         "installed recovery cursor differs from signed DAG binding"
     );
-    let entries = arc_state::wal::read_wal_dir_strict(&startup.wal_dir).with_context(|| {
-        format!(
-            "recovery DAG WAL {} is corrupt or incomplete",
-            startup.wal_dir.display()
+    let cursor = &generation.manifest.dag_cursor;
+    engine
+        .install_recovery_generation_cursor(
+            cursor.retention_floor_round,
+            cursor.current_round,
+            cursor.next_dag_round,
         )
-    })?;
+        .map_err(|error| {
+            anyhow::anyhow!("failed to install the pinned recovery DAG generation: {error}")
+        })?;
+
+    let expected_commits = state
+        .height()
+        .checked_sub(generation.manifest.baseline_state.height)
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG generation baseline exceeds state height"))?;
     let mut commits = 0u64;
     let mut committed_hashes = Vec::new();
     let mut transactions = std::collections::HashMap::<[u8; 32], arc_types::Transaction>::new();
-    for entry in entries {
-        match entry.op {
-            arc_state::WalOp::SetFullTransaction(expected_hash, transaction) => {
+    let mut transaction_payloads = std::collections::HashMap::<[u8; 32], Vec<u8>>::new();
+    for record in records {
+        match record.kind {
+            RetainedRecordKind::TransactionBody => {
+                let expected_hash = record.object_hash;
+                let transaction: arc_types::Transaction = bincode::deserialize(&record.payload)
+                    .with_context(|| format!("invalid retained DAG transaction {expected_hash}"))?;
                 ensure!(
-                    transaction.hash == expected_hash && entry.block_height >= installed,
-                    "persisted DAG transaction key/round differs from its WAL envelope"
+                    transaction.hash == expected_hash
+                        && record.round >= cursor.retention_floor_round,
+                    "retained DAG transaction key/round differs from its generation envelope"
                 );
                 transaction
                     .verify_signature_in_domain(&startup.binding.consensus_domain.domain_hash)
@@ -993,19 +1685,24 @@ fn replay_recovery_dag_wal(
                             error
                         )
                     })?;
-                transactions.entry(expected_hash.0).or_insert(*transaction);
+                if let Some(existing) = transaction_payloads.get(&expected_hash.0) {
+                    ensure!(
+                        existing == &record.payload,
+                        "retained DAG transaction {} has conflicting bodies across rounds",
+                        expected_hash
+                    );
+                } else {
+                    transaction_payloads.insert(expected_hash.0, record.payload.clone());
+                    transactions.insert(expected_hash.0, transaction);
+                }
             }
-            arc_state::WalOp::SetDagBlock(expected_hash, bytes) => {
-                ensure!(
-                    bytes.len() <= 64 * 1024 * 1024,
-                    "recovery DAG block {} exceeds 64 MiB",
-                    expected_hash
-                );
-                let block: arc_consensus::DagBlock = bincode::deserialize(&bytes)
+            RetainedRecordKind::DagBlock => {
+                let expected_hash = record.object_hash;
+                let block: arc_consensus::DagBlock = bincode::deserialize(&record.payload)
                     .with_context(|| format!("invalid persisted DAG block {expected_hash}"))?;
                 ensure!(
-                    block.hash == expected_hash && block.round == entry.block_height,
-                    "persisted DAG block key/round differs from its WAL envelope"
+                    block.hash == expected_hash && block.round == record.round,
+                    "retained DAG block key/round differs from its generation envelope"
                 );
                 ensure!(
                     block
@@ -1022,18 +1719,22 @@ fn replay_recovery_dag_wal(
                         error
                     )
                 })?;
+                // Active generations keep their immutable startup cursor;
+                // reconstruct every later live round only from the same
+                // quorum of validated blocks that advanced it originally.
                 let _ = engine.advance_round();
             }
-            arc_state::WalOp::SetDagRound(round) => {
+            RetainedRecordKind::RoundCursor => {
                 ensure!(
-                    round >= startup.binding.initial_consensus_round
-                        && round <= engine.current_round(),
-                    "persisted DAG cursor {} is not justified by replayed quorum blocks (current {})",
-                    round,
+                    record.round >= startup.binding.initial_consensus_round
+                        && record.round <= engine.current_round(),
+                    "retained DAG cursor {} is not justified by replayed quorum blocks (current {})",
+                    record.round,
                     engine.current_round()
                 );
             }
-            arc_state::WalOp::CommitDagBlock(hash) => {
+            RetainedRecordKind::Commit => {
+                let hash = record.object_hash;
                 engine
                     .restore_recovery_commit_from_local_wal(hash)
                     .map_err(|error| {
@@ -1044,10 +1745,6 @@ fn replay_recovery_dag_wal(
                     .ok_or_else(|| anyhow::anyhow!("recovery DAG commit count overflows u64"))?;
                 committed_hashes.push(hash);
             }
-            _ => bail!(
-                "recovery DAG WAL contains a non-DAG state operation at sequence {}",
-                entry.sequence
-            ),
         }
     }
     for (index, hash) in committed_hashes.iter().enumerate() {
@@ -1056,8 +1753,9 @@ fn replay_recovery_dag_wal(
         })?;
         verify_canonical_state_block_for_dag_commit(
             state,
-            startup.binding.transition_height,
+            generation.manifest.baseline_state.height,
             index as u64,
+            &startup.binding.consensus_domain,
             &block,
             &transactions,
         )?;
@@ -1095,8 +1793,9 @@ fn replay_recovery_dag_wal(
         let candidate = &candidates[0];
         verify_canonical_state_block_for_dag_commit(
             state,
-            startup.binding.transition_height,
+            generation.manifest.baseline_state.height,
             commits,
+            &startup.binding.consensus_domain,
             candidate,
             &transactions,
         )?;
@@ -1115,18 +1814,132 @@ fn replay_recovery_dag_wal(
     };
     ensure!(
         commits == expected_commits,
-        "recovery DAG/state WAL commit mismatch: DAG has {}, canonical state has {} post-transition blocks",
+        "recovery DAG/state commit mismatch: generation delta has {}, canonical state has {} post-baseline blocks",
         commits,
         expected_commits
     );
+    engine
+        .finish_recovery_generation_replay()
+        .map_err(|error| anyhow::anyhow!("failed to seal recovery DAG replay: {error}"))?;
     let mut transactions: Vec<_> = transactions.into_values().collect();
     transactions.sort_by_key(|transaction| transaction.hash.0);
-    Ok((
-        engine.current_round(),
-        engine.last_committed_round(),
+    Ok(RecoveryDagReplay {
+        current_round: engine.current_round(),
+        next_commit_round: engine.last_committed_round(),
         transactions,
         repaired_commit,
-    ))
+    })
+}
+
+fn compact_replayed_recovery_generation(
+    store: &GenerationStore,
+    state: &StateDB,
+    startup: &RecoveryDagStartup,
+    current: &VerifiedGeneration,
+    stream: &CurrentStreamSummary,
+    engine: &arc_consensus::ConsensusEngine,
+    records: &[RetainedDagRecord],
+) -> Result<VerifiedGeneration> {
+    ensure!(
+        stream.generation_pin == current.pin && stream.active_pin.generation_pin == current.pin,
+        "recovery DAG stream pin differs from the generation selected for compaction"
+    );
+    ensure!(
+        stream.active_suffix == TornSuffix::Clean,
+        "recovery DAG compaction requires a clean active prefix"
+    );
+
+    let baseline = canonical_dag_baseline(state)?;
+    let committed_block_count = baseline
+        .height
+        .checked_sub(startup.binding.transition_height)
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG committed-block count underflows"))?;
+    let next_dag_round = startup
+        .binding
+        .initial_consensus_round
+        .checked_add(committed_block_count)
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG next-commit round overflows"))?;
+    ensure!(
+        engine.last_committed_round() == next_dag_round,
+        "replayed DAG commit cursor {} differs from canonical baseline cursor {}",
+        engine.last_committed_round(),
+        next_dag_round
+    );
+    let current_round = engine.current_round();
+    ensure!(
+        current_round >= next_dag_round,
+        "replayed DAG current round precedes its commit cursor"
+    );
+    let retention_ceiling_round = recovery_retention_ceiling(next_dag_round)?;
+    ensure!(
+        current_round <= retention_ceiling_round,
+        "replayed DAG window exceeds its hard round-span bound"
+    );
+
+    // Every commit in the staged delta is now bound into `baseline`. Preserve
+    // only bodies/blocks/cursors that can still participate in a future commit,
+    // in their original physical order. The exact floor round is the sole
+    // parent-compaction boundary accepted by the consensus replay API.
+    let retained: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.kind != RetainedRecordKind::Commit && record.round >= next_dag_round
+        })
+        .cloned()
+        .collect();
+    ensure!(
+        retained
+            .iter()
+            .all(|record| record.round <= retention_ceiling_round),
+        "retained recovery DAG record escapes the successor round window"
+    );
+    let cursor = DagCursor {
+        committed_block_count,
+        next_dag_round,
+        current_round,
+        retention_floor_round: next_dag_round,
+        retention_ceiling_round,
+    };
+    let needs_compaction = stream.active_batch_count != 0
+        || current.manifest.baseline_state != baseline
+        || current.manifest.dag_cursor != cursor
+        || current.manifest.retained_records.record_count != retained.len() as u64;
+    if !needs_compaction {
+        return Ok(current.clone());
+    }
+
+    let successor = store
+        .append_compacted(
+            current.pin,
+            stream.active_pin,
+            GenerationInput {
+                binding: current.manifest.binding.clone(),
+                baseline_state: baseline,
+                dag_cursor: cursor,
+                retention_limits: current.manifest.retained_records.limits,
+            },
+            retained,
+        )
+        .context("failed to publish compacted recovery DAG generation")?;
+    validate_recovery_generation_anchor(state, startup, &successor)?;
+    write_recovery_dag_pin_atomically(
+        &startup.data_dir,
+        startup.binding.manifest_hash,
+        successor.pin,
+    )?;
+    let gc = store
+        .prune_ancestors_keep_current_and_predecessor(&successor.manifest.binding, successor.pin)
+        .context("failed to bound recovery DAG generation ancestry")?;
+    tracing::info!(
+        previous_generation = %current.pin.hash,
+        generation = %successor.pin.hash,
+        sequence = successor.pin.sequence,
+        baseline_height = successor.manifest.baseline_state.height,
+        retained_records = successor.manifest.retained_records.record_count,
+        pruned_generations = gc.pruned_generations.len(),
+        "Published and independently pinned a compacted recovery DAG generation"
+    );
+    Ok(successor)
 }
 
 fn run_operator_command(command: OperatorCommand) -> Result<()> {
@@ -1271,48 +2084,6 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
             );
             Ok(())
         }
-    }
-}
-
-/// Bind a pulled peer's `self_shard.socket_addr` to the exact explicit RPC
-/// origin that served it.
-///
-/// The registry body is remote-controlled, so even a syntactically routable
-/// address in it cannot choose where this process later sends shard traffic.
-/// Production uses the reviewed HTTPS origin; local rehearsals use an explicit
-/// loopback HTTP origin. This also preserves the scheme required by TLS rather
-/// than incorrectly turning an HTTPS gateway into raw HTTP on the node's
-/// loopback-only port.
-///
-/// Pure JSON mutation - no I/O, no async. Unit-testable against static fixtures.
-/// Companion to the receiver-side `rewrite_stub_shard_addr` in `rpc.rs`.
-fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_addr: &str) {
-    if !self_shard
-        .get("socket_addr")
-        .is_some_and(serde_json::Value::is_string)
-    {
-        return;
-    }
-    let Ok(origin) = reqwest::Url::parse(pulled_from_addr)
-        .or_else(|_| reqwest::Url::parse(&format!("http://{pulled_from_addr}")))
-    else {
-        return;
-    };
-    if !matches!(origin.scheme(), "http" | "https")
-        || origin.host_str().is_none()
-        || !origin.username().is_empty()
-        || origin.password().is_some()
-        || origin.query().is_some()
-        || origin.fragment().is_some()
-        || origin.path() != "/"
-    {
-        return;
-    }
-    if let Some(obj) = self_shard.as_object_mut() {
-        obj.insert(
-            "socket_addr".to_string(),
-            serde_json::Value::String(origin.as_str().trim_end_matches('/').to_string()),
-        );
     }
 }
 
@@ -1612,6 +2383,95 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ValidatorHttpAudience {
+    target_validator: Hash256,
+    transaction_domain: Option<Hash256>,
+}
+
+/// Resolve the exact validator and recovery domain that an authenticated HTTP
+/// mutation targets. Callers may cache this result, but must evict it after a
+/// failed request so a recovery transition can never keep using stale domain
+/// metadata.
+async fn fetch_validator_http_audience(
+    client: &reqwest::Client,
+    rpc_base: &str,
+) -> Result<ValidatorHttpAudience> {
+    let info = client
+        .get(format!("{rpc_base}/network/info"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("GET validator HTTP audience from {rpc_base}"))?
+        .error_for_status()
+        .with_context(|| format!("validator {rpc_base} has no audience metadata"))?
+        .json::<serde_json::Value>()
+        .await
+        .context("decode validator HTTP audience")?;
+    let target_validator = info
+        .get("validator_address")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("validator omitted validator_address"))
+        .and_then(|value| {
+            Hash256::from_hex(value)
+                .map_err(|error| anyhow::anyhow!("invalid validator_address: {error}"))
+        })?;
+    ensure!(
+        target_validator != Hash256::ZERO,
+        "validator HTTP audience cannot be the zero address"
+    );
+    let transaction_domain = match info.get("transaction_domain") {
+        Some(serde_json::Value::String(value)) => {
+            Some(Hash256::from_hex(value).map_err(|error| {
+                anyhow::anyhow!("invalid validator transaction_domain: {error}")
+            })?)
+        }
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => {
+            return Err(anyhow::anyhow!("validator transaction_domain is malformed"));
+        }
+    };
+    if info
+        .get("recovery_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && transaction_domain.is_none()
+    {
+        bail!("recovery validator omitted its required transaction_domain");
+    }
+    Ok(ValidatorHttpAudience {
+        target_validator,
+        transaction_domain,
+    })
+}
+
+async fn post_signed_shard_announcement(
+    client: &reqwest::Client,
+    rpc_base: &str,
+    shard: &rpc::ShardInfo,
+    keypair: &arc_crypto::KeyPair,
+    audience: ValidatorHttpAudience,
+) -> Result<()> {
+    let signed = rpc::sign_validator_shard_announcement(
+        shard.clone(),
+        keypair,
+        audience.target_validator,
+        audience.transaction_domain,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("sign validator shard announcement")?;
+    client
+        .post(format!("{rpc_base}{}", rpc::SHARD_ANNOUNCE_PATH))
+        .json(&signed)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("POST authenticated shard announcement to {rpc_base}"))?
+        .error_for_status()
+        .with_context(|| format!("validator {rpc_base} rejected shard announcement"))?;
+    Ok(())
+}
+
 /// POST one authenticated community mutation. A new timestamp and CSPRNG
 /// nonce are signed for every attempt; callers must invoke this again for a
 /// retry or a different coordinator rather than reusing the wire envelope.
@@ -1908,6 +2768,7 @@ async fn main() -> Result<()> {
         } else {
             node_cfg.storage.data_dir.clone()
         };
+    let _data_dir_lock = acquire_node_data_dir_lock(Path::new(&data_dir))?;
 
     let min_stake =
         if matches.value_source("min_stake") == Some(clap::parser::ValueSource::CommandLine) {
@@ -2268,7 +3129,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("╔═══════════════════════════════════════╗");
     tracing::info!("║   ARC Chain - Agent Runtime Chain     ║");
-    tracing::info!("║   Testnet Node v0.3.0                 ║");
+    tracing::info!("║   ARC Node v{:<26}║", env!("CARGO_PKG_VERSION"));
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
     tracing::info!(
@@ -2731,38 +3592,6 @@ async fn main() -> Result<()> {
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(4000);
     let peer_count = Arc::new(AtomicU32::new(0));
 
-    if chain_participation_enabled {
-        // Parse bootstrap peers only for a node allowed to join this chain.
-        let bootstrap_peers: Vec<SocketAddr> =
-            peers.iter().filter_map(|p| p.parse().ok()).collect();
-        let listen_addr: SocketAddr = format!("0.0.0.0:{}", p2p_port).parse()?;
-
-        // The authenticated handshake commits to the canonical parsed genesis
-        // hash, separating chains with different identities/state/validators.
-        let mut allowed_validator_addresses = std::collections::HashSet::new();
-        allowed_validator_addresses.insert(validator_address.0);
-        allowed_validator_addresses.extend(genesis_validators.iter().map(|(address, _)| address.0));
-        let allowed_validator_addresses = Arc::new(allowed_validator_addresses);
-        let peer_count_transport = peer_count.clone();
-        let transport_keypair = validator_keypair.clone();
-        tokio::spawn(run_transport(
-            listen_addr,
-            bootstrap_peers,
-            validator_address,
-            stake,
-            genesis_hash,
-            allowed_validator_addresses,
-            outbound_rx,
-            inbound_tx,
-            peer_count_transport,
-            transport_keypair,
-            data_dir.clone(),
-        ));
-    } else {
-        drop(outbound_rx);
-        drop(inbound_tx);
-    }
-
     // ── Start benchmark signing pool + indexer (if benchmark mode) ─────
     let benchmark_pool = if cli.benchmark {
         state.start_benchmark_indexer();
@@ -2834,54 +3663,28 @@ async fn main() -> Result<()> {
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
         consensus.dag_committed = Some(dag_committed.clone());
-        // DAG persistence WAL - survives restarts. Recovery domains use a
-        // content-addressed directory with an exact signed binding; legacy
-        // pre-recovery WAL is archived and never inspected as a cursor.
-        let dag_wal_path = recovery_dag_startup
-            .as_ref()
-            .map(|startup| startup.wal_dir.clone())
-            .unwrap_or_else(|| Path::new(&data_dir).join("dag-wal"));
-        std::fs::create_dir_all(&dag_wal_path).with_context(|| {
-            format!(
-                "failed to create DAG WAL directory {}",
-                dag_wal_path.display()
-            )
-        })?;
-
-        // ── v0.7.0: DAG WAL recovery on boot ────────────────────────────────
-        //
-        // Pre-v0.7 the dag-wal was write-only: every block.proposed and every
-        // block.received called wal.append, but nothing ever read those
-        // segments back at startup. The seed boots, sees `current_round = 0`,
-        // and any block from a peer at round=N gets rejected as "too far
-        // ahead" once N > 1M. NYC hit this on the v0.7.0 upgrade attempt:
-        // 76 segments of accumulated DAG history sat on disk, ignored.
-        //
-        // The fix: scan dag-wal/ for the highest block_height we've ever
-        // persisted. That's the round we WERE at the moment we crashed/
-        // shutdown. Hand it to the local-WAL restore path so the engine
-        // resumes from there instead of fighting peers about it.
-        //
-        // We don't replay block contents — peers will re-deliver any DAG
-        // blocks we still need on the normal consensus path. Only locally
-        // persisted cursors may restore consensus position; peer hints cannot.
-        // Bounded read: scans only the latest segment (≤64 MB), not every
-        // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
-        // history at boot would balloon memory and slow startup minutes.
-        let mut recovery_commit_repair = None;
         if let Some(startup) = recovery_dag_startup.as_ref() {
-            let expected_commits = state
-                .height()
-                .checked_sub(startup.binding.transition_height)
-                .ok_or_else(|| anyhow::anyhow!("recovery state precedes transition height"))?;
-            let (recovered_round, recovered_committed, recovered_transactions, repaired_commit) =
-                replay_recovery_dag_wal(
-                    consensus.engine.as_ref(),
-                    state.as_ref(),
-                    startup,
-                    expected_commits,
-                )?;
-            recovery_commit_repair = repaired_commit;
+            // Protocol v3 never opens the legacy segmented WAL. Select an
+            // independently pinned content-addressed generation, stage its
+            // bounded immutable+active stream, quarantine only a classified
+            // torn final active batch, and replay every block/commit before
+            // networking starts.
+            let (store, selected_generation) =
+                initialize_recovery_generation_store(state.as_ref(), startup)?;
+            let (staged_records, staged_summary) =
+                stage_recovery_generation_records(&store, &selected_generation)?;
+            let RecoveryDagReplay {
+                current_round: recovered_round,
+                next_commit_round: recovered_committed,
+                transactions: recovered_transactions,
+                repaired_commit,
+            } = replay_recovery_dag_generation(
+                consensus.engine.as_ref(),
+                state.as_ref(),
+                startup,
+                &selected_generation,
+                &staged_records,
+            )?;
             // Certified-but-not-yet-committed replay blocks may become
             // executable on the first consensus tick. Their exact bodies must
             // be installed directly as availability preimages; the live
@@ -2904,15 +3707,61 @@ async fn main() -> Result<()> {
             }
             dag_round.store(recovered_round, std::sync::atomic::Ordering::SeqCst);
             dag_committed.store(recovered_committed, std::sync::atomic::Ordering::SeqCst);
+
+            // Advance the immutable baseline to the exact canonical state
+            // boundary and remove commit records now transitively bound by its
+            // block hash/root. Publication selects generation+empty active log
+            // atomically; the independent pin is advanced only afterwards.
+            let active_generation = compact_replayed_recovery_generation(
+                &store,
+                state.as_ref(),
+                startup,
+                &selected_generation,
+                &staged_summary,
+                consensus.engine.as_ref(),
+                &staged_records,
+            )?;
+            let active_writer = store
+                .open_current_active_writer(
+                    &active_generation.manifest.binding,
+                    active_generation.pin,
+                )
+                .context("failed to open the pinned recovery DAG active writer")?;
+            consensus.recovery_dag_writer =
+                Some(Arc::new(parking_lot::Mutex::new(Some(active_writer))));
+            consensus.recovery_dag_rollover = Some(Arc::new(LiveRecoveryDagRollover {
+                store,
+                startup: startup.clone(),
+                current: parking_lot::Mutex::new(active_generation.clone()),
+            }));
+            if let Some((hash, round)) = repaired_commit {
+                tracing::warn!(
+                    %hash,
+                    round,
+                    generation = %active_generation.pin.hash,
+                    "Bound the repaired state/DAG commit crash window into a new generation baseline"
+                );
+            }
             tracing::info!(
                 recovered_round,
                 recovered_committed,
                 manifest_hash = %startup.binding.manifest_hash,
+                validator_set_commitment = %startup.binding.validator_set_commitment,
+                generation = %active_generation.pin.hash,
                 archived_legacy_wal = ?startup.archived_legacy_wal,
                 restored_transactions,
-                "Recovery DAG cursor and WAL are bound to the signed ARCCHKPT domain"
+                "Recovery DAG cursor and bounded writer are pinned to the signed ARCCHKPT domain"
             );
         } else {
+            // Preserve the segmented WAL compatibility path only for legacy
+            // pre-recovery networks. Protocol-v3 startup above cannot reach it.
+            let dag_wal_path = Path::new(&data_dir).join("dag-wal");
+            std::fs::create_dir_all(&dag_wal_path).with_context(|| {
+                format!(
+                    "failed to create legacy DAG WAL directory {}",
+                    dag_wal_path.display()
+                )
+            })?;
             let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
             if recovered_round > 0 {
                 // The highest WAL round does not prove that any earlier leader was
@@ -2930,39 +3779,81 @@ async fn main() -> Result<()> {
             } else {
                 tracing::info!("DAG WAL is empty - starting fresh from round 0");
             }
-        }
 
-        match arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
-            Ok(dag_wal) => {
-                if let Some((hash, round)) = recovery_commit_repair {
-                    dag_wal.append(arc_state::WalOp::CommitDagBlock(hash), round);
-                    dag_wal.sync().map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to durably repair DAG commit {} at round {}: {}",
-                            hash,
-                            round,
-                            error
-                        )
-                    })?;
-                    tracing::warn!(
-                        %hash,
-                        round,
-                        "Repaired crash window between canonical state fsync and DAG commit fsync"
+            match arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
+                Ok(dag_wal) => {
+                    consensus.dag_wal = Some(Arc::new(dag_wal));
+                    tracing::info!(
+                        "Legacy DAG persistence WAL enabled: {}",
+                        dag_wal_path.display()
                     );
                 }
-                consensus.dag_wal = Some(Arc::new(dag_wal));
-                tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path.display());
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    path = %dag_wal_path.display(),
+                    "Legacy DAG persistence WAL is unavailable"
+                ),
             }
-            Err(error) if recovery_dag_startup.is_some() => {
-                return Err(error)
-                    .context("recovery consensus requires a durable, domain-bound DAG WAL");
-            }
-            Err(error) => tracing::warn!(
-                error = %error,
-                path = %dag_wal_path.display(),
-                "DAG persistence WAL is unavailable"
-            ),
         }
+
+        // Recovery replay and durable-writer setup are complete before any
+        // network input can arrive. Bind the authenticated QUIC endpoint and
+        // require an explicit readiness result before the consensus thread is
+        // allowed to start.
+        let bootstrap_peers: Vec<SocketAddr> =
+            peers.iter().filter_map(|peer| peer.parse().ok()).collect();
+        let listen_addr: SocketAddr = format!("0.0.0.0:{p2p_port}").parse()?;
+        let mut allowed_validator_addresses = std::collections::HashSet::new();
+        allowed_validator_addresses.insert(validator_address.0);
+        allowed_validator_addresses.extend(genesis_validators.iter().map(|(address, _)| address.0));
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let transport_task = tokio::spawn(run_transport_with_readiness(
+            listen_addr,
+            bootstrap_peers,
+            validator_address,
+            stake,
+            genesis_hash,
+            Arc::new(allowed_validator_addresses),
+            outbound_rx,
+            inbound_tx,
+            peer_count.clone(),
+            validator_keypair.clone(),
+            data_dir.clone(),
+            startup_tx,
+        ));
+        let bound_addr =
+            match tokio::time::timeout(std::time::Duration::from_secs(15), startup_rx).await {
+                Ok(Ok(Ok(bound_addr))) => bound_addr,
+                Ok(Ok(Err(error))) => {
+                    transport_task.abort();
+                    bail!("authenticated validator transport failed startup: {error}");
+                }
+                Ok(Err(_)) => {
+                    transport_task.abort();
+                    bail!("authenticated validator transport exited before reporting readiness");
+                }
+                Err(_) => {
+                    transport_task.abort();
+                    bail!("authenticated validator transport readiness timed out after 15 seconds");
+                }
+            };
+        tracing::info!(
+            bound = %bound_addr,
+            "Authenticated validator transport is ready before consensus startup"
+        );
+        tokio::spawn(async move {
+            match transport_task.await {
+                Ok(()) => tracing::error!(
+                    "Authenticated validator transport exited after readiness; terminating node"
+                ),
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Authenticated validator transport task failed after readiness; terminating node"
+                ),
+            }
+            std::process::exit(1);
+        });
+
         consensus.set_proposer_mode(cli.proposer_mode);
         let state_clone = state.clone();
         let mempool_clone = mempool.clone();
@@ -3007,6 +3898,8 @@ async fn main() -> Result<()> {
     } else {
         drop(inbound_rx);
         drop(outbound_tx);
+        drop(inbound_tx);
+        drop(outbound_rx);
         tracing::warn!(
             "Chain P2P/consensus is OFF while genesis validator migration is pending; community HTTP inference remains active"
         );
@@ -3200,25 +4093,33 @@ async fn main() -> Result<()> {
         };
     let shard_infos = shard_infos_for_broadcast.clone();
 
-    // Spawn a background task that announces each held range to every seed
-    // AND pulls their shards back. Runs immediately at startup + every 15s
-    // so the registry converges fast.
+    // Announce each held range directly to every explicit validator HTTP
+    // origin. Every mutation is signed for the exact destination validator
+    // and recovery domain; no raw or re-signed third-party announcement is
+    // emitted. Direct holder announcements are the only topology authority.
     if !shard_infos_for_broadcast.is_empty() {
         let sis = shard_infos_for_broadcast.clone();
         // RPC origins are explicit TLS/gateway configuration. Never infer an
         // HTTP port from a P2P bootstrap address.
         let seed_rpc_bases = coordinator_rpc_bases.clone();
-        let seed_rpc_bases_pull = seed_rpc_bases.clone();
+        let local_rpc_base = format!(
+            "http://127.0.0.1:{}",
+            rpc_addr.split(':').nth(1).unwrap_or("9090")
+        );
 
         // Background broadcaster: post our shard to every seed AND to our
         // own localhost so the self-entry in the local registry gets its
         // timestamp refreshed every tick. Without the localhost post, the
         // 60s TTL on the registry would prune the self entry even while
         // the node is still live.
-        let local_announce_broadcast = format!(
-            "http://127.0.0.1:{}/shards/announce",
-            rpc_addr.split(':').nth(1).unwrap_or("9090")
-        );
+        let mut announcement_targets = Vec::with_capacity(seed_rpc_bases.len() + 1);
+        announcement_targets.push(local_rpc_base.clone());
+        for rpc_base in seed_rpc_bases {
+            if !announcement_targets.contains(&rpc_base) {
+                announcement_targets.push(rpc_base);
+            }
+        }
+        let shard_announcement_keypair = validator_keypair.clone();
         tokio::spawn(async move {
             // Brief settle so the local /shards endpoint is up before we ask
             // peers to fetch from us
@@ -3231,97 +4132,56 @@ async fn main() -> Result<()> {
                 Ok(c) => c,
                 Err(_) => return,
             };
+            let mut audiences = std::collections::HashMap::<String, ValidatorHttpAudience>::new();
             loop {
-                for si in &sis {
-                    let payload = serde_json::json!({"shard": si});
-                    // Refresh our own entry first
-                    let _ = client
-                        .post(&local_announce_broadcast)
-                        .json(&payload)
-                        .send()
-                        .await;
-                    // Then announce to remote seeds
-                    for rpc_base in &seed_rpc_bases {
-                        let url = format!("{rpc_base}/shards/announce");
-                        let _ = client.post(&url).json(&payload).send().await;
+                for rpc_base in &announcement_targets {
+                    let audience = if let Some(audience) = audiences.get(rpc_base).copied() {
+                        audience
+                    } else {
+                        match fetch_validator_http_audience(&client, rpc_base).await {
+                            Ok(audience) => {
+                                audiences.insert(rpc_base.clone(), audience);
+                                audience
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %rpc_base,
+                                    %error,
+                                    "Cannot resolve authenticated shard-announcement audience"
+                                );
+                                continue;
+                            }
+                        }
+                    };
+                    let mut target_succeeded = true;
+                    for shard in &sis {
+                        if let Err(error) = post_signed_shard_announcement(
+                            &client,
+                            rpc_base,
+                            shard,
+                            &shard_announcement_keypair,
+                            audience,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %rpc_base,
+                                %error,
+                                "Authenticated shard announcement failed; evicting cached audience"
+                            );
+                            target_succeeded = false;
+                            break;
+                        }
+                    }
+                    if !target_succeeded {
+                        audiences.remove(rpc_base);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             }
         });
 
-        // Background puller: fetch each seed's /shards and re-announce them locally.
-        // This converges the registry even when a peer was offline when we first
-        // announced. Anyone we reach contributes their full registry to ours.
-        let local_announce = format!(
-            "http://127.0.0.1:{}/shards/announce",
-            rpc_addr.split(':').nth(1).unwrap_or("9090")
-        );
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            loop {
-                // Pull ONLY each seed's own self_shard, not its whole registry.
-                // Re-announcing every remote entry we see would resurrect stale
-                // entries: a seed's registry can still contain a shard for a
-                // node that restarted without --shard-start flags, and pulling
-                // + re-announcing it would defeat the 60s TTL and keep the
-                // phantom shard alive forever. Each real shard holder already
-                // broadcasts its own shard every 15s via the outbound
-                // broadcaster above, so trusting only self_shard is both
-                // sufficient and safe.
-                //
-                // IMPORTANT: A peer's self_shard.socket_addr is almost always
-                // "0.0.0.0:<port>" because the peer binds to all interfaces and
-                // doesn't know its own public IP. Re-announcing that stub
-                // locally would make /inference/run_sharded unable to route to
-                // the peer (dialing 0.0.0.0 fails). Rewrite the stub to the
-                // *seed's actual address* (the URL we just pulled from) before
-                // re-announcing - that IS the routable address for that shard
-                // holder, and it's what the receiver-side fix for direct
-                // /shards/announce broadcasts produces too.
-                for rpc_base in &seed_rpc_bases_pull {
-                    if let Ok(resp) = client.get(format!("{rpc_base}/shards")).send().await
-                        && let Ok(mut json) = resp.json::<serde_json::Value>().await
-                    {
-                        // New peers emit `self_shards: [ShardInfo, ...]`; legacy
-                        // peers still emit `self_shard: ShardInfo` - accept both
-                        // so a rolling upgrade never loses shard visibility.
-                        let mut to_announce: Vec<serde_json::Value> = Vec::new();
-                        if let Some(arr) =
-                            json.get_mut("self_shards").and_then(|v| v.as_array_mut())
-                        {
-                            for entry in arr.iter_mut() {
-                                if !entry.is_null() {
-                                    rewrite_pulled_self_shard(entry, rpc_base);
-                                    to_announce.push(entry.clone());
-                                }
-                            }
-                        }
-                        if let Some(self_shard) = json.get_mut("self_shard")
-                            && !self_shard.is_null()
-                        {
-                            rewrite_pulled_self_shard(self_shard, rpc_base);
-                            to_announce.push(self_shard.clone());
-                        }
-                        for shard_val in to_announce {
-                            let payload = serde_json::json!({"shard": shard_val});
-                            let _ = client.post(&local_announce).json(&payload).send().await;
-                        }
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-            }
-        });
-
-        tracing::info!("Shard announcement broadcaster + puller started (15s/20s tick)");
+        tracing::info!("Signed direct-holder shard broadcaster started (15s tick)");
     }
 
     // ── Community-mode HTTP registration + heartbeat ──────────────────
@@ -3972,9 +4832,11 @@ async fn main() -> Result<()> {
                             &worker_keypair,
                             // The coordinator independently repeats inference through
                             // a 2-of-3 validator quorum before acknowledging success.
-                            // Its verified-dispatch budget is capped at 600 seconds;
-                            // allow network/serialization headroom beyond that cap.
-                            std::time::Duration::from_secs(660),
+                            // Use the RPC protocol's audited end-to-end budget;
+                            // the public gateway has a wider 4,000-second ceiling.
+                            std::time::Duration::from_secs(
+                                rpc::COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS,
+                            ),
                         )
                         .await;
 
@@ -4089,7 +4951,6 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
-    use arc_state::{WalOp, WalWriter};
     use serde_json::json;
 
     fn recovery_test_binding(domain: arc_consensus::ConsensusDomain) -> RecoveryDagBinding {
@@ -4097,10 +4958,19 @@ mod tests {
             format_version: RECOVERY_DAG_BINDING_VERSION,
             manifest_hash: hash_bytes(b"manifest"),
             consensus_domain: domain,
+            validator_set_commitment: hash_bytes(b"fixed-checkpoint-validator-set"),
             source_height: 900,
             transition_height: 901,
             source_consensus_round: 100,
             initial_consensus_round: 101,
+        }
+    }
+
+    fn recovery_test_generation_binding(binding: &RecoveryDagBinding) -> GenerationDagBinding {
+        GenerationDagBinding {
+            recovery_manifest_hash: binding.manifest_hash,
+            recovery_domain: binding.consensus_domain.domain_hash,
+            validator_set_commitment: binding.validator_set_commitment,
         }
     }
 
@@ -4400,6 +5270,23 @@ mod tests {
     }
 
     #[test]
+    fn node_data_directory_lock_rejects_concurrent_owner_and_survives_stale_file() {
+        let data_dir =
+            std::env::temp_dir().join(format!("arc-node-data-lock-test-{}", uuid::Uuid::new_v4()));
+        let first = acquire_node_data_dir_lock(&data_dir).unwrap();
+        let error = acquire_node_data_dir_lock(&data_dir)
+            .err()
+            .expect("a second process handle must not share one data directory");
+        assert!(error.to_string().contains("already locked"), "{error}");
+
+        drop(first);
+        let second = acquire_node_data_dir_lock(&data_dir)
+            .expect("the persistent lock file must be reusable after owner exit");
+        drop(second);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
     fn recovery_dag_binding_round_trip_is_exact_and_tamper_visible() {
         let data_dir = std::env::temp_dir().join(format!(
             "arc-recovery-dag-file-test-{}",
@@ -4416,14 +5303,260 @@ mod tests {
         assert_eq!(read_recovery_dag_binding(&path).unwrap(), binding);
 
         let mut tampered = binding.clone();
-        tampered.source_consensus_round += 1;
+        tampered.validator_set_commitment = hash_bytes(b"mutable-live-validator-set");
         std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
         assert_ne!(read_recovery_dag_binding(&path).unwrap(), binding);
+
+        let staged_dir = data_dir.join("staged-crash");
+        std::fs::create_dir(&staged_dir).unwrap();
+        let staged_path = staged_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+        std::fs::write(&staged_path, serde_json::to_vec_pretty(&binding).unwrap()).unwrap();
+        activate_recovery_dag_binding(&staged_dir, &binding).unwrap();
+        assert!(!staged_path.exists());
+        assert_eq!(
+            read_recovery_dag_binding(&staged_dir.join(RECOVERY_DAG_BINDING_FILE)).unwrap(),
+            binding
+        );
+
+        let mismatched_dir = data_dir.join("mismatched-staged-crash");
+        std::fs::create_dir(&mismatched_dir).unwrap();
+        std::fs::write(
+            mismatched_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new")),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(activate_recovery_dag_binding(&mismatched_dir, &binding).is_err());
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
     #[test]
-    fn recovery_dag_restart_replays_domain_blocks_and_certified_commit() {
+    fn recovery_dag_startup_quarantines_only_a_torn_final_active_batch() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-torn-startup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let store = GenerationStore::new(data_dir.join("store"));
+        let local_binding = recovery_test_binding(arc_consensus::ConsensusDomain::new(
+            hash_bytes(b"domain"),
+            7,
+            11,
+        ));
+        let generation = store
+            .create_initial(
+                GenerationInput {
+                    binding: recovery_test_generation_binding(&local_binding),
+                    baseline_state: DagBaselineState {
+                        height: 901,
+                        block_hash: hash_bytes(b"block"),
+                        state_root: hash_bytes(b"root"),
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: 101,
+                        current_round: 101,
+                        retention_floor_round: 101,
+                        retention_ceiling_round: recovery_retention_ceiling(101).unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                std::iter::empty(),
+            )
+            .unwrap();
+        let active_path = store.active_log_path(generation.pin);
+        let valid_prefix_bytes = std::fs::metadata(&active_path).unwrap().len();
+        let mut active = OpenOptions::new().append(true).open(&active_path).unwrap();
+        active.write_all(&[0, 1]).unwrap();
+        active.sync_all().unwrap();
+        drop(active);
+
+        let (records, summary) = stage_recovery_generation_records(&store, &generation).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(summary.active_suffix, TornSuffix::Clean);
+        assert_eq!(
+            std::fs::metadata(&active_path).unwrap().len(),
+            valid_prefix_bytes
+        );
+        assert!(
+            std::fs::read_dir(store.root())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_name().to_string_lossy().contains(".torn-")),
+            "the exact torn suffix must remain quarantined beside the generation store"
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_dag_startup_repairs_exact_initial_and_successor_pin_crash_windows() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-pin-crash-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"funded"), 100)]);
+        state
+            .execute_block_adaptive_at(&[], hash_bytes(b"producer"), 1)
+            .unwrap();
+        let mut local_binding = recovery_test_binding(arc_consensus::ConsensusDomain::new(
+            hash_bytes(b"domain"),
+            7,
+            11,
+        ));
+        local_binding.source_height = 0;
+        local_binding.transition_height = 1;
+        let startup = RecoveryDagStartup {
+            data_dir: data_dir.clone(),
+            wal_dir: data_dir.join("generation-store"),
+            binding: local_binding,
+            archived_legacy_wal: None,
+        };
+        let store = GenerationStore::new(&startup.wal_dir);
+        let baseline = canonical_dag_baseline(&state).unwrap();
+        let input = GenerationInput {
+            binding: recovery_test_generation_binding(&startup.binding),
+            baseline_state: baseline,
+            dag_cursor: DagCursor {
+                committed_block_count: 0,
+                next_dag_round: startup.binding.initial_consensus_round,
+                current_round: startup.binding.initial_consensus_round,
+                retention_floor_round: startup.binding.initial_consensus_round,
+                retention_ceiling_round: recovery_retention_ceiling(
+                    startup.binding.initial_consensus_round,
+                )
+                .unwrap(),
+            },
+            retention_limits: RetentionLimits::default(),
+        };
+
+        // Simulate process death after initial CURRENT publication but before
+        // the independent pin rename.
+        let initial = store
+            .create_initial(input.clone(), std::iter::empty())
+            .unwrap();
+        assert!(
+            read_recovery_dag_pin(&data_dir, startup.binding.manifest_hash)
+                .unwrap()
+                .is_none()
+        );
+        let (store, resumed_initial) =
+            initialize_recovery_generation_store(&state, &startup).unwrap();
+        assert_eq!(resumed_initial.pin, initial.pin);
+        assert_eq!(
+            read_recovery_dag_pin(&data_dir, startup.binding.manifest_hash)
+                .unwrap()
+                .unwrap()
+                .generation,
+            initial.pin
+        );
+
+        // Simulate death after successor CURRENT rename but before advancing
+        // the independent pin. Only that exact direct successor is accepted.
+        let successor = store
+            .append(initial.pin, input, std::iter::empty())
+            .unwrap();
+        assert_eq!(
+            read_recovery_dag_pin(&data_dir, startup.binding.manifest_hash)
+                .unwrap()
+                .unwrap()
+                .generation,
+            initial.pin
+        );
+        let (_, resumed_successor) =
+            initialize_recovery_generation_store(&state, &startup).unwrap();
+        assert_eq!(resumed_successor.pin, successor.pin);
+        assert_eq!(
+            read_recovery_dag_pin(&data_dir, startup.binding.manifest_hash)
+                .unwrap()
+                .unwrap()
+                .generation,
+            successor.pin
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn live_rollover_projection_counts_shared_500_transaction_bodies_once_per_round() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-shared-body-projection-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let local_binding = recovery_test_binding(arc_consensus::ConsensusDomain::new(
+            hash_bytes(b"shared-body-projection-domain"),
+            7,
+            11,
+        ));
+        let store = GenerationStore::new(data_dir.join("generation-store"));
+        let generation = store
+            .create_initial(
+                GenerationInput {
+                    binding: recovery_test_generation_binding(&local_binding),
+                    baseline_state: DagBaselineState {
+                        height: 1,
+                        block_hash: hash_bytes(b"shared-body-baseline-block"),
+                        state_root: hash_bytes(b"shared-body-baseline-root"),
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: 100,
+                        current_round: 100,
+                        retention_floor_round: 100,
+                        retention_ceiling_round: 4_196,
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                std::iter::empty(),
+            )
+            .unwrap();
+        let bodies: Vec<_> = (0..500u64)
+            .map(|index| {
+                RetainedDagRecord::transaction(
+                    100,
+                    hash_bytes(format!("shared-transaction-{index}").as_bytes()),
+                    index.to_be_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let mut writer = store
+            .open_current_active_writer(&generation.manifest.binding, generation.pin)
+            .unwrap();
+
+        for validator in 0..6u64 {
+            let mut batch = bodies.clone();
+            batch.push(RetainedDagRecord::dag_block(
+                100,
+                hash_bytes(format!("validator-block-{validator}").as_bytes()),
+                validator.to_be_bytes().to_vec(),
+            ));
+            let exact = writer.project_batch_usage(&batch).unwrap();
+            assert_eq!(exact.appended_records, if validator == 0 { 501 } else { 1 });
+            assert_eq!(
+                exact.idempotently_omitted_records,
+                if validator == 0 { 0 } else { 500 }
+            );
+            let projected =
+                LiveRecoveryDagRollover::projected_usage(&generation, &writer, &batch).unwrap();
+            assert_eq!(projected.0, 501 + validator);
+            writer
+                .append_batch(&batch, arc_node::recovery_dag_wal::ActiveDurability::Fsync)
+                .unwrap();
+        }
+        assert_eq!(writer.inspection().record_count, 506);
+        assert!(
+            !LiveRecoveryDagRollover::projection_needs_rollover(
+                &generation,
+                LiveRecoveryDagRollover::projected_usage(&generation, &writer, &[]).unwrap(),
+            ),
+            "six 500-tx validator blocks must consume 506 records, not 3,006"
+        );
+        drop(writer);
+        drop(store);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_dag_restart_replays_compacts_and_repairs_certified_commit() {
         let data_dir = std::env::temp_dir().join(format!(
             "arc-recovery-dag-replay-test-{}",
             uuid::Uuid::new_v4()
@@ -4466,17 +5599,6 @@ mod tests {
             .map(|author| recovery_test_block(*author, bootstrap + 2, parents_1.clone(), &domain))
             .collect();
 
-        let writer = WalWriter::with_segments(&data_dir, 64 * 1024 * 1024).unwrap();
-        writer.append(
-            WalOp::SetFullTransaction(transaction.hash, Box::new(transaction.clone())),
-            bootstrap,
-        );
-        for block in round_0.iter().chain(&round_1).chain(&round_2) {
-            writer.append(
-                WalOp::SetDagBlock(block.hash, bincode::serialize(block).unwrap()),
-                block.round,
-            );
-        }
         let mut sorted_validators = validators.clone();
         sorted_validators.sort_by_key(|address| address.0);
         let leader = sorted_validators[bootstrap as usize % sorted_validators.len()];
@@ -4496,158 +5618,182 @@ mod tests {
             vec![transaction.clone()]
         };
         state
-            .execute_block_adaptive_at(&canonical_transactions, leader, bootstrap)
+            .execute_block_adaptive_at_with_proof(
+                &canonical_transactions,
+                leader,
+                bootstrap,
+                leader_block.state_decision_commitment(&domain),
+            )
             .unwrap();
-        writer.append(WalOp::CommitDagBlock(leader_hash), bootstrap);
-        writer.sync().unwrap();
-        drop(writer);
-
+        let generation_records: Vec<_> = std::iter::once(RetainedDagRecord::transaction(
+            bootstrap,
+            transaction.hash,
+            bincode::serialize(&transaction).unwrap(),
+        ))
+        .chain(round_0.iter().chain(&round_1).chain(&round_2).map(|block| {
+            RetainedDagRecord::dag_block(
+                block.round,
+                block.hash,
+                bincode::serialize(block).unwrap(),
+            )
+        }))
+        .chain(std::iter::once(RetainedDagRecord::commit(
+            bootstrap,
+            leader_hash,
+        )))
+        .collect();
         let startup = RecoveryDagStartup {
-            wal_dir: data_dir.clone(),
+            data_dir: data_dir.clone(),
+            wal_dir: data_dir.join("generation-store"),
             binding,
             archived_legacy_wal: None,
         };
+        let store = GenerationStore::new(&startup.wal_dir);
+        let genesis = state.get_block(0).unwrap();
+        let generation = store
+            .create_initial(
+                GenerationInput {
+                    binding: recovery_test_generation_binding(&startup.binding),
+                    baseline_state: DagBaselineState {
+                        height: 0,
+                        block_hash: genesis.hash,
+                        state_root: hash_bytes(b"test-transition-root"),
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: bootstrap,
+                        // The immutable cursor predates the later staged
+                        // blocks; replay must re-derive +3 from their quorum.
+                        current_round: bootstrap,
+                        retention_floor_round: bootstrap,
+                        retention_ceiling_round: recovery_retention_ceiling(bootstrap).unwrap(),
+                    },
+                    // Four validators across three rounds plus one body and
+                    // one commit produce fourteen records. A sixteen-record
+                    // test limit crosses the 90% live-rollover watermark and
+                    // exercises rollover without a production-sized fixture.
+                    retention_limits: RetentionLimits {
+                        max_records: 16,
+                        max_payload_bytes: 16 * 1024 * 1024,
+                    },
+                },
+                generation_records.clone(),
+            )
+            .unwrap();
+        let (staged, _) = stage_recovery_generation_records(&store, &generation).unwrap();
+        assert_eq!(staged, generation_records);
+
         for _ in 0..2 {
             let engine = recovery_test_engine(&validators, &domain);
-            let (round, committed, transactions, repaired) =
-                replay_recovery_dag_wal(&engine, &state, &startup, 1).unwrap();
-            assert_eq!(round, bootstrap + 3);
-            assert_eq!(committed, bootstrap + 1);
+            let replay =
+                replay_recovery_dag_generation(&engine, &state, &startup, &generation, &staged)
+                    .unwrap();
+            assert_eq!(replay.current_round, bootstrap + 3);
+            assert_eq!(replay.next_commit_round, bootstrap + 1);
             assert_eq!(
-                transactions
+                replay
+                    .transactions
                     .iter()
                     .map(|transaction| transaction.hash)
                     .collect::<Vec<_>>(),
                 vec![transaction.hash]
             );
-            assert!(repaired.is_none());
+            assert!(replay.repaired_commit.is_none());
             assert_eq!(engine.committed_blocks(), vec![leader_hash]);
         }
+
+        let compact_engine = recovery_test_engine(&validators, &domain);
+        replay_recovery_dag_generation(&compact_engine, &state, &startup, &generation, &staged)
+            .unwrap();
+        let active_writer = store
+            .open_current_active_writer(&generation.manifest.binding, generation.pin)
+            .unwrap();
+        let live_rollover = LiveRecoveryDagRollover {
+            store: GenerationStore::new(&startup.wal_dir),
+            startup: startup.clone(),
+            current: parking_lot::Mutex::new(generation.clone()),
+        };
+        let successor_writer = live_rollover
+            .prepare_append(&state, &compact_engine, active_writer, &[])
+            .unwrap();
+        drop(successor_writer);
+        let compacted = live_rollover.current.lock().clone();
+        assert_eq!(compacted.pin.sequence, 1);
+        assert_eq!(compacted.manifest.baseline_state.height, 1);
+        assert_eq!(
+            read_recovery_dag_pin(&data_dir, startup.binding.manifest_hash)
+                .unwrap()
+                .unwrap()
+                .generation,
+            compacted.pin
+        );
+        let (compacted_records, compacted_summary) =
+            stage_recovery_generation_records(&store, &compacted).unwrap();
+        assert_eq!(compacted_summary.active_record_count, 0);
+        assert!(compacted_records.iter().all(
+            |record| record.kind != RetainedRecordKind::Commit && record.round > bootstrap
+        ));
+        let restart_engine = recovery_test_engine(&validators, &domain);
+        let replay = replay_recovery_dag_generation(
+            &restart_engine,
+            &state,
+            &startup,
+            &compacted,
+            &compacted_records,
+        )
+        .unwrap();
+        assert_eq!(replay.next_commit_round, bootstrap + 1);
+        assert!(replay.repaired_commit.is_none());
 
         let repair_dir = std::env::temp_dir().join(format!(
             "arc-recovery-dag-repair-test-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&repair_dir).unwrap();
-        let repair_writer = WalWriter::with_segments(&repair_dir, 64 * 1024 * 1024).unwrap();
-        repair_writer.append(
-            WalOp::SetFullTransaction(transaction.hash, Box::new(transaction.clone())),
-            bootstrap,
-        );
-        for block in round_0.iter().chain(&round_1).chain(&round_2) {
-            repair_writer.append(
-                WalOp::SetDagBlock(block.hash, bincode::serialize(block).unwrap()),
-                block.round,
-            );
-        }
-        repair_writer.sync().unwrap();
-        drop(repair_writer);
         let repair_startup = RecoveryDagStartup {
-            wal_dir: repair_dir.clone(),
+            data_dir: repair_dir.clone(),
+            wal_dir: repair_dir.join("generation-store"),
             binding: startup.binding.clone(),
             archived_legacy_wal: None,
         };
+        let repair_store = GenerationStore::new(&repair_startup.wal_dir);
+        let repair_records: Vec<_> = generation_records
+            .iter()
+            .filter(|record| record.kind != RetainedRecordKind::Commit)
+            .cloned()
+            .collect();
+        let repair_generation = repair_store
+            .create_initial(
+                GenerationInput {
+                    binding: recovery_test_generation_binding(&repair_startup.binding),
+                    baseline_state: generation.manifest.baseline_state.clone(),
+                    dag_cursor: generation.manifest.dag_cursor.clone(),
+                    retention_limits: RetentionLimits::default(),
+                },
+                repair_records.clone(),
+            )
+            .unwrap();
         let repair_engine = recovery_test_engine(&validators, &domain);
-        let (_, repaired_cursor, _, repaired) =
-            replay_recovery_dag_wal(&repair_engine, &state, &repair_startup, 1).unwrap();
-        assert_eq!(repaired_cursor, bootstrap + 1);
-        assert_eq!(repaired, Some((leader_hash, bootstrap)));
+        let replay = replay_recovery_dag_generation(
+            &repair_engine,
+            &state,
+            &repair_startup,
+            &repair_generation,
+            &repair_records,
+        )
+        .unwrap();
+        assert_eq!(replay.next_commit_round, bootstrap + 1);
+        assert_eq!(replay.repaired_commit, Some((leader_hash, bootstrap)));
         assert_eq!(repair_engine.committed_blocks(), vec![leader_hash]);
 
         let wrong_domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"wrong"), 7, 11);
         let engine = recovery_test_engine(&validators, &wrong_domain);
-        assert!(replay_recovery_dag_wal(&engine, &state, &startup, 1).is_err());
+        assert!(
+            replay_recovery_dag_generation(&engine, &state, &startup, &generation, &staged,)
+                .is_err()
+        );
         std::fs::remove_dir_all(&repair_dir).unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();
-    }
-
-    #[test]
-    fn pulled_shard_is_bound_to_exact_https_seed_origin() {
-        let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
-            "node_name": "AMS"
-        });
-        rewrite_pulled_self_shard(&mut v, "https://seed-ams.example");
-        assert_eq!(v["socket_addr"], "https://seed-ams.example");
-    }
-
-    #[test]
-    fn pulled_routable_or_metadata_addr_cannot_override_seed_origin() {
-        let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "169.254.169.254:80",
-            "node_name": "AMS"
-        });
-        rewrite_pulled_self_shard(&mut v, "https://136-244-109-1.nip.io");
-        assert_eq!(v["socket_addr"], "https://136-244-109-1.nip.io");
-    }
-
-    #[test]
-    fn pulled_origin_port_and_scheme_are_authoritative() {
-        let mut v = json!({
-            "socket_addr": "0.0.0.0:9090", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "https://1.2.3.4:9443");
-        assert_eq!(v["socket_addr"], "https://1.2.3.4:9443");
-    }
-
-    #[test]
-    fn pulled_plain_host_is_normalized_to_explicit_http_origin() {
-        let mut v = json!({
-            "socket_addr": "0.0.0.0:junk", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_loopback_stub_also_rewritten() {
-        // Seed set up with --rpc 127.0.0.1 on a misconfigured run would announce
-        // 127.0.0.1:9090. The pulled URL is the routable address, use it.
-        let mut v = json!({
-            "socket_addr": "127.0.0.1:9090", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_ipv6_stub_rewritten() {
-        let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
-
-        let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_empty_addr_rewritten() {
-        let mut v = json!({"socket_addr": "", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
-    }
-
-    #[test]
-    fn missing_socket_addr_field_is_noop() {
-        // Malformed / partial self_shard JSON should not panic.
-        let mut v = json!({"node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert!(v.get("socket_addr").is_none());
-    }
-
-    #[test]
-    fn pulled_url_with_no_port_uses_the_origins_scheme_default() {
-        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1");
-        assert_eq!(v["socket_addr"], "http://136.244.109.1");
-    }
-
-    #[test]
-    fn invalid_pulled_origin_cannot_replace_existing_destination() {
-        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "https://user@seed.example/path");
-        assert_eq!(v["socket_addr"], "0.0.0.0:9090");
     }
 
     #[test]
