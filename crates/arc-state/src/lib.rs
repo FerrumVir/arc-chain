@@ -4808,7 +4808,13 @@ impl StateDB {
                 // State transitions are not automatically rolled back when an
                 // executor arm returns an error, so every fallible check must
                 // happen before the first write.
-                let mut worker = self.get_or_create_account(&body.worker);
+                // Build a detached candidate account. `get_or_create_account`
+                // inserts immediately, which would mutate state even when the
+                // treasury check below fails. Failed reward execution must be
+                // atomic and must not leave an un-WALed zero-balance worker.
+                let mut worker = self
+                    .get_account(&body.worker)
+                    .unwrap_or_else(|| Account::new(body.worker, 0));
                 worker.balance = worker.balance.checked_add(reward).ok_or_else(|| {
                     StateError::ExecutionError(
                         "community inference reward: worker balance overflow".to_string(),
@@ -11017,6 +11023,28 @@ mod tests {
         assert!(!receipt[0].success);
         assert_eq!(state.get_account(&pool).unwrap().balance, partial);
         assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn failed_community_reward_does_not_create_an_absent_worker_account() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, REWARD - 1)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+        assert!(state.get_account(&worker.address()).is_none());
+
+        let reward =
+            make_signed_community_reward(&validator, &worker, 1, b"absent-worker", 100);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, REWARD - 1);
+        assert!(
+            state.get_account(&worker.address()).is_none(),
+            "a failed reward must not create state that was never WAL-persisted"
+        );
     }
 
     #[test]
