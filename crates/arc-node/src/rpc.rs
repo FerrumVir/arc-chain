@@ -48,6 +48,11 @@ const COMMUNITY_REWARD_APPROVAL_COLLECTION_READY: bool = true;
 const COMMUNITY_REWARD_APPROVE_PATH: &str = "/internal/community/reward/approve";
 const COMMUNITY_REWARD_EXPIRY_BLOCKS: u64 = 3_000;
 
+#[inline]
+fn below_policy_minimum(value: u64, minimum: u64) -> bool {
+    value < minimum
+}
+
 /// Bond posted only by the local `InferenceAttestation` path, in base units.
 /// Community-worker reward certificates use a protocol-fixed zero bond and
 /// are paid exclusively by a separate `CommunityInferenceReward` transaction.
@@ -5682,7 +5687,7 @@ async fn worker_earnings(
             "active reward policy is not issuance-ready on this node; no forward earnings projection is permitted"
                 .to_string(),
         )
-    } else if !remaining.is_some_and(|value| value > 0) {
+    } else if remaining.is_none_or(|value| value == 0) {
         Value::String(
             "treasury cannot be proven to fund another full reward; projection is unavailable"
                 .to_string(),
@@ -7005,7 +7010,7 @@ async fn forward_shard_once(
 ) -> Result<(ForwardShardResponse, usize), (String, bool)> {
     let url = format!("http://{}/inference/forward_shard", socket);
     let resp = client
-        .post(&url)
+        .post(url)
         .header("Content-Type", "application/json")
         .body(body.to_vec())
         .send()
@@ -10121,7 +10126,7 @@ fn validate_reward_approval_payload(
         .state
         .get_validator_stake(&payload.reward.worker)
         .unwrap_or(0);
-    if worker_stake < COMMUNITY_REWARD_MIN_WORKER_STAKE {
+    if below_policy_minimum(worker_stake, COMMUNITY_REWARD_MIN_WORKER_STAKE) {
         return Err(format!(
             "worker stake {worker_stake} is below active policy minimum {COMMUNITY_REWARD_MIN_WORKER_STAKE}"
         ));
@@ -12934,7 +12939,6 @@ mod tests {
             arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
             5
         );
-        assert!(COMMUNITY_REWARD_APPROVAL_COLLECTION_READY);
     }
 
     #[test]

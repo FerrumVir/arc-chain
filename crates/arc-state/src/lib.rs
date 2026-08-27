@@ -147,6 +147,11 @@ pub struct StateSummary {
 /// WASM module magic bytes: `\0asm`.
 const WASM_MAGIC: &[u8; 4] = b"\0asm";
 
+#[inline]
+fn below_policy_minimum(value: u64, minimum: u64) -> bool {
+    value < minimum
+}
+
 // ── Tier 1 on-chain inference status bytes ────────────────────────────────
 // Stored in the first byte of the request escrow's `code_hash` field. See
 // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md` for the lifecycle.
@@ -681,7 +686,8 @@ impl StateDB {
                 self.contracts.insert(addr.0, bytecode.clone());
             }
             WalOp::SetFullTransaction(hash, transaction) => {
-                self.full_transactions.insert(hash.0, transaction.clone());
+                self.full_transactions
+                    .insert(hash.0, transaction.as_ref().clone());
             }
             WalOp::SetEventLogs(height, logs) => {
                 self.event_logs.insert(*height, logs.clone());
@@ -4783,7 +4789,10 @@ impl StateDB {
 
                 let treasury_addr = arc_types::transaction::inference_reward_treasury_address();
                 let worker_stake = self.get_validator_stake(&body.worker).unwrap_or(0);
-                if worker_stake < arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE {
+                if below_policy_minimum(
+                    worker_stake,
+                    arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+                ) {
                     return Err(StateError::ExecutionError(format!(
                         "community inference reward: worker stake {} is below active policy minimum {}",
                         worker_stake,
@@ -6494,7 +6503,7 @@ impl StateDB {
             self.wal
                 .append(WalOp::SetReceipt(transaction.hash, receipt.clone()), height);
             self.wal.append(
-                WalOp::SetFullTransaction(transaction.hash, transaction.clone()),
+                WalOp::SetFullTransaction(transaction.hash, Box::new(transaction.clone())),
                 height,
             );
         }

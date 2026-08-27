@@ -157,7 +157,7 @@ impl RecoveryContext {
 pub struct RecoveryPayload {
     pub blocks: Vec<(u64, Block)>,
     pub accounts: Vec<(Address, Account)>,
-    pub storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)>,
+    pub storage: ContractStorage,
     pub contracts: Vec<(Address, Vec<u8>)>,
     pub receipts: Vec<(Hash256, TxReceipt)>,
     pub full_transactions: Vec<(Hash256, Transaction)>,
@@ -894,7 +894,7 @@ fn verify_network_policy(
 }
 
 fn canonicalize_recovery_validators(
-    validators: &mut Vec<RecoveryValidator>,
+    validators: &mut [RecoveryValidator],
 ) -> Result<(), RecoveryError> {
     validators.sort_by_key(|validator| validator.address.0);
     validate_recovery_validators(validators)
@@ -974,7 +974,7 @@ fn consensus_state_root_from_sections(
     context: &RecoveryContext,
     reward_activation_height: Option<u64>,
     accounts: &[(Address, Account)],
-    storage: &[(Address, Vec<(Hash256, Vec<u8>)>)],
+    storage: &ContractStorage,
     contracts: &[(Address, Vec<u8>)],
     identities: &[(Address, Identity)],
     validators: &[(Address, u64)],
@@ -1101,12 +1101,11 @@ fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundar
     let mut latest = None;
     for (index, entry) in entries.iter().enumerate() {
         match &entry.op {
-            WalOp::SetBlock(height, block) => {
+            WalOp::SetBlock(height, block)
                 if *height == block.header.height
-                    && block.hash == Block::compute_hash(&block.header)
-                {
-                    blocks.insert(*height, index);
-                }
+                    && block.hash == Block::compute_hash(&block.header) =>
+            {
+                blocks.insert(*height, index);
             }
             WalOp::Checkpoint(root) => {
                 let height = entry.block_height;
@@ -1168,17 +1167,17 @@ fn validate_legacy_boundary(
                     )));
                 }
             }
-            WalOp::Checkpoint(root) => {
-                if checkpoints
-                    .insert(entry.block_height, (index, *root))
-                    .is_some()
-                {
+            WalOp::Checkpoint(root) => match checkpoints.entry(entry.block_height) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((index, *root));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
                     return Err(StateError::PersistenceError(format!(
                         "legacy WAL has duplicate checkpoints at height {}",
                         entry.block_height
                     )));
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -2646,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_signed_post_recovery_block_and_history_survive_restart() {
+    fn adaptive_h_plus_two_block_has_correct_wal_height_and_survives_restart() {
         let sender = KeyPair::generate_ed25519();
         let recipient = hash_bytes(b"post-recovery-recipient");
         let source = StateDB::with_genesis(&[(sender.address(), 10_000), (recipient, 0)]);
@@ -2700,13 +2699,18 @@ mod tests {
         state.sign_transaction(&mut transaction, &sender).unwrap();
         let transaction_hash = transaction.hash;
         let (block, receipts) = state
-            .execute_block_verified_at(
+            .execute_block_adaptive_at(
                 &[transaction],
                 validator_keys[0].address(),
                 1_787_777_001_000,
             )
             .unwrap();
         assert!(receipts[0].success);
+        assert_eq!(
+            block.header.height,
+            checkpoint.manifest.source_height + 2,
+            "the first ordinary transaction block must be H+2 after the dedicated H+1 transition"
+        );
         assert_eq!(block.header.protocol_version, RECOVERY_PROTOCOL_VERSION);
         let root = block.header.state_root;
         let height = block.header.height;
@@ -2717,7 +2721,10 @@ mod tests {
         assert_eq!(restarted.height(), height);
         assert_eq!(restarted.get_state_root(), root);
         assert!(restarted.get_transaction(&transaction_hash.0).is_some());
-        assert!(restarted.get_receipt(&transaction_hash.0).is_some());
+        let receipt = restarted.get_receipt(&transaction_hash.0).unwrap();
+        assert!(receipt.success);
+        assert_eq!(receipt.block_height, height);
+        assert_eq!(restarted.get_account(&sender.address()).unwrap().nonce, 1);
         assert_eq!(restarted.get_account(&recipient).unwrap().balance, 250);
 
         fs::remove_dir_all(source_dir).unwrap();

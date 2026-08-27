@@ -4,7 +4,6 @@
 //! draining the mempool and feeding committed blocks into `StateDB`.
 
 use crate::SharedValidators;
-use crate::pipeline::{Pipeline, PipelineBatch};
 use crate::vrf::ProposerSelector;
 use arc_consensus::{ConsensusEngine, StakeTier, Validator, ValidatorSet};
 use arc_crypto::{Hash256, KeyPair};
@@ -482,9 +481,6 @@ impl ConsensusManager {
         // Stored at proposal time, revealed after DAG commit.
         let pending_encrypted: DashMap<[u8; 32], Vec<arc_mempool::EncryptedTx>> = DashMap::new();
 
-        // ── Pipeline for single-validator pipelined execution ────────────
-        let pipeline = Pipeline::new(Arc::clone(&state));
-
         loop {
             // Single-validator: 1ms tight loop for max TPS.
             // Multi-validator: 50ms to give peer blocks time to arrive
@@ -500,17 +496,6 @@ impl ConsensusManager {
             // (~100-200ms cross-continent = 5-10 rounds/sec actual).
             let tick = if self.is_multi_validator() { 50 } else { 1 };
             tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
-
-            // ── Drain pipeline results ──────────────────────────────────
-            while let Some(result) = pipeline.try_recv() {
-                info!(
-                    height = result.height,
-                    txs = result.tx_count,
-                    success = result.success_count,
-                    elapsed_ms = result.elapsed_ms,
-                    "Block produced (pipeline)"
-                );
-            }
 
             // ── 0. Process inbound network messages ─────────────────────
             if let Some(ref mut rx) = inbound_rx {
@@ -647,7 +632,7 @@ impl ConsensusManager {
                                             wal.append(
                                                 arc_state::WalOp::SetFullTransaction(
                                                     tx.hash,
-                                                    tx.clone(),
+                                                    Box::new(tx.clone()),
                                                 ),
                                                 block.round,
                                             );
@@ -1184,7 +1169,7 @@ impl ConsensusManager {
                                         wal.append(
                                             arc_state::WalOp::SetFullTransaction(
                                                 tx.hash,
-                                                tx.clone(),
+                                                Box::new(tx.clone()),
                                             ),
                                             block.round,
                                         );
@@ -1258,10 +1243,10 @@ impl ConsensusManager {
                                 );
                             }
                         } else if has_txs {
-                            // ── Pipeline path: single-validator mode ─────────
+                            // ── Canonical synchronous path: single-validator mode ──
                             // Filter out transactions already applied via RPC
                             // (faucet/submit direct-apply). Without this filter,
-                            // the pipeline re-executes them → double nonce
+                            // consensus re-executes them → double nonce
                             // increment and double balance deduction.
                             let fresh_txs: Vec<Transaction> = transactions
                                 .iter()
@@ -1270,17 +1255,35 @@ impl ConsensusManager {
                                 .collect();
 
                             if !fresh_txs.is_empty() {
-                                pipeline
-                                    .submit(PipelineBatch {
-                                        transactions: fresh_txs,
-                                        producer: self.validator_address,
-                                    })
-                                    .unwrap_or_else(|e| {
-                                        warn!("Pipeline submit failed: {:?}", e);
-                                    });
+                                let started = std::time::Instant::now();
+                                match state.execute_block_adaptive_at(
+                                    &fresh_txs,
+                                    self.validator_address,
+                                    timestamp,
+                                ) {
+                                    Ok((block, receipts)) => {
+                                        info!(
+                                            height = block.header.height,
+                                            txs = fresh_txs.len(),
+                                            success = receipts
+                                                .iter()
+                                                .filter(|receipt| receipt.success)
+                                                .count(),
+                                            elapsed_ms = started.elapsed().as_millis(),
+                                            "Block produced (canonical synchronous executor)"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            error = %error,
+                                            "Canonical single-validator block execution failed"
+                                        );
+                                    }
+                                }
                             }
 
-                            // Clean up pending index - pipeline owns them now
+                            // Clean up pending index after the synchronous
+                            // executor has either durably committed or failed.
                             for tx in &transactions {
                                 pending_txs.remove(&tx.hash.0);
                             }

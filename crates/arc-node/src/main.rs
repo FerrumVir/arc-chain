@@ -859,7 +859,7 @@ fn replay_recovery_dag_wal(
                             error
                         )
                     })?;
-                transactions.entry(expected_hash.0).or_insert(transaction);
+                transactions.entry(expected_hash.0).or_insert(*transaction);
             }
             arc_state::WalOp::SetDagBlock(expected_hash, bytes) => {
                 ensure!(
@@ -3983,7 +3983,7 @@ mod tests {
 
         let writer = WalWriter::with_segments(&data_dir, 64 * 1024 * 1024).unwrap();
         writer.append(
-            WalOp::SetFullTransaction(transaction.hash, transaction.clone()),
+            WalOp::SetFullTransaction(transaction.hash, Box::new(transaction.clone())),
             bootstrap,
         );
         for block in round_0.iter().chain(&round_1).chain(&round_2) {

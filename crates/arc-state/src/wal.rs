@@ -64,7 +64,7 @@ pub enum WalOp {
     /// Record a DAG block commit (hash of committed block).
     CommitDagBlock(Hash256),
     /// Persist a full transaction body for restart-safe receipt/explorer state.
-    SetFullTransaction(Hash256, Transaction),
+    SetFullTransaction(Hash256, Box<Transaction>),
     /// Persist EVM event logs associated with one canonical block.
     SetEventLogs(u64, Vec<EventLog>),
     /// Persist one identity-registry update.
