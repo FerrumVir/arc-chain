@@ -38,6 +38,10 @@ jobs:
         env:
           ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # The retained v0.7-compatible key is intentionally unencrypted.
+          # Tauri still requires the password variable to be present in a
+          # headless runner; an absent variable attempts an interactive prompt.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           set -Eeuo pipefail
           if [ -z "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]; then

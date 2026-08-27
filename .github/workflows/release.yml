@@ -555,6 +555,9 @@ jobs:
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # The retained updater key has an empty passphrase. Presence of this
+          # empty variable keeps Tauri from attempting an interactive prompt.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           set -Eeuo pipefail
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then

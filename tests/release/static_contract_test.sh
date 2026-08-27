@@ -288,6 +288,7 @@ release_manifest_has_owner_signature_and_preflight() {
         'environment: release' \
         'ref: main' \
         'TAURI_SIGNING_PRIVATE_KEY' \
+        'TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""' \
         'tauri signer sign' \
         'tauri-updater-verifier'
     do
@@ -296,6 +297,11 @@ release_manifest_has_owner_signature_and_preflight() {
             return 1
         }
     done
+    [ "$(grep -Fch 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""' \
+        "$RELEASE_WORKFLOW" "$RELEASE_PREFLIGHT_WORKFLOW" | awk '{ total += $1 } END { print total + 0 }')" -eq 2 ] || {
+        printf 'both Tauri signing jobs must explicitly provide the empty retained-key password\n'
+        return 1
+    }
 }
 
 raw_node_downloads_are_version_pinned() {

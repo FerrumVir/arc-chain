@@ -195,9 +195,11 @@ in GitHub's settings:
   required reviewers, move `TAURI_SIGNING_PRIVATE_KEY` and the separate
   `ARC_RELEASE_MANIFEST_PRIVATE_KEY` into that environment, and remove all
   repository-level copies. The retained v0.7-compatible Tauri key encoding has
-  no passphrase, so the workflow deliberately does not inject a misleading
-  password variable. Run the protected-main signing preflight and require both
-  key canaries to verify before creating the non-movable `v0.8.0` tag;
+  no passphrase, so both signing jobs explicitly set
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to the empty string. Tauri otherwise
+  attempts an interactive prompt and fails closed on a headless runner. Run the
+  protected-main signing preflight and require both key canaries to verify
+  before creating the non-movable `v0.8.0` tag;
 - after the independent PR approval and merge are complete, temporarily reduce
   every non-owner collaborator below `write` until the workflow-created release
   is complete, immutable, signature-verified, and smoke-tested. The detached
