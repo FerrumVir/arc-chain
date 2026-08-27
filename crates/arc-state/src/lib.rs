@@ -4783,7 +4783,7 @@ impl StateDB {
                         )
                     })?;
 
-                let treasury_addr = arc_types::transaction::faucet_pool_address();
+                let treasury_addr = arc_types::transaction::inference_reward_treasury_address();
                 let worker_stake = self.get_validator_stake(&body.worker).unwrap_or(0);
                 if worker_stake < arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE {
                     return Err(StateError::ExecutionError(format!(
@@ -6001,9 +6001,10 @@ impl StateDB {
                 // No signer-nonce check or bump. A validator-signed
                 // FaucetClaim is authorized by the Ed25519 signature plus
                 // is_validator(tx.from) — both deterministic across peers.
-                // Replay protection comes from the tx_hash receipt dedup
-                // in consensus.rs:966-973 plus the per-address rate limit
-                // in the /faucet/claim handler.
+                // The canonical recipient marker below provides chain-wide
+                // exactly-once protection even when different validators sign
+                // distinct transaction hashes for the same recipient. RPC
+                // rate limits are only an additional abuse control.
                 //
                 // We INTENTIONALLY do NOT enforce signer.nonce == tx.nonce
                 // here. Peers' committed-state nonce for a validator
@@ -6015,54 +6016,66 @@ impl StateDB {
                 // the bug v0.7.1 was meant to fix. Signer balance is also
                 // not touched: the pool is the shared source.
 
-                // Debit the system faucet pool. Account exists on every
-                // seed because it's prefunded in genesis.toml as the first
-                // [[accounts]] entry (blake3(&[0u8])).
                 let pool_addr = arc_types::transaction::faucet_pool_address();
-                {
-                    let mut pool = self.accounts.get_mut(&pool_addr.0).ok_or_else(|| {
-                        StateError::ExecutionError(
-                            "faucet claim: system faucet pool account is not prefunded".into(),
-                        )
-                    })?;
-                    if pool.balance < body.amount {
-                        return Err(StateError::InsufficientBalance {
-                            have: pool.balance,
-                            need: body.amount,
-                        });
-                    }
-                    pool.balance -= body.amount;
-                    if self.use_jmt {
-                        let h = hash_bytes(&bincode::serialize(pool.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(pool_addr.0, h);
-                    }
-                    if self.wal.is_active() {
-                        let snap = pool.clone();
-                        drop(pool);
-                        self.wal
-                            .append(WalOp::SetAccount(pool_addr, snap), self.height());
-                    }
+                let marker_addr =
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+                if self.accounts.contains_key(&marker_addr.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "faucet claim: recipient {} has already claimed",
+                        body.recipient
+                    )));
                 }
 
-                // Credit recipient.
-                {
-                    let mut recipient = self
-                        .accounts
-                        .entry(body.recipient.0)
-                        .or_insert_with(|| Account::new(body.recipient, 0));
-                    recipient.balance = recipient.balance.saturating_add(body.amount);
-                    if self.use_jmt {
-                        let h =
-                            hash_bytes(&bincode::serialize(recipient.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(body.recipient.0, h);
-                    }
-                    if self.wal.is_active() {
-                        let snap = recipient.clone();
-                        drop(recipient);
-                        self.wal
-                            .append(WalOp::SetAccount(body.recipient, snap), self.height());
+                // Validate every fallible condition against detached account
+                // copies before the first write. A failed faucet transaction
+                // must be atomic and must never leave a debited pool or a
+                // fabricated recipient account.
+                let mut pool = self.get_account(&pool_addr).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "faucet claim: system faucet pool account is not prefunded".into(),
+                    )
+                })?;
+                if pool.balance < body.amount {
+                    return Err(StateError::InsufficientBalance {
+                        have: pool.balance,
+                        need: body.amount,
+                    });
+                }
+                let mut recipient = self
+                    .get_account(&body.recipient)
+                    .unwrap_or_else(|| Account::new(body.recipient, 0));
+                recipient.balance =
+                    recipient.balance.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError(
+                            "faucet claim: recipient balance overflow".into(),
+                        )
+                    })?;
+                pool.balance -= body.amount;
+                let mut marker = Account::new(marker_addr, 0);
+                marker.nonce = 1;
+                marker.code_hash = body.recipient;
+                marker.storage_root = hash_bytes(&body.amount.to_be_bytes());
+
+                self.accounts.insert(pool_addr.0, pool.clone());
+                self.accounts.insert(body.recipient.0, recipient.clone());
+                self.accounts.insert(marker_addr.0, marker.clone());
+                if self.use_jmt {
+                    let mut jmt = self.jmt.lock();
+                    for (address, account) in [
+                        (pool_addr, &pool),
+                        (body.recipient, &recipient),
+                        (marker_addr, &marker),
+                    ] {
+                        let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
                     }
                 }
+                self.wal
+                    .append(WalOp::SetAccount(pool_addr, pool), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.recipient, recipient), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(marker_addr, marker), self.height());
 
                 Ok(gas.consumed)
             }
@@ -6614,7 +6627,7 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
                 self.account_txs
-                    .entry(arc_types::transaction::faucet_pool_address().0)
+                    .entry(arc_types::transaction::inference_reward_treasury_address().0)
                     .or_default()
                     .push(tx.hash);
             }
@@ -6697,6 +6710,12 @@ impl StateDB {
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 self.account_txs
                     .entry(pool_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+                let marker_addr =
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+                self.account_txs
+                    .entry(marker_addr.0)
                     .or_default()
                     .push(tx.hash);
             }
@@ -6807,7 +6826,7 @@ impl StateDB {
             TxBody::CommunityInferenceReward(body) => {
                 self.dirty_accounts.insert(body.worker.0);
                 self.dirty_accounts
-                    .insert(arc_types::transaction::faucet_pool_address().0);
+                    .insert(arc_types::transaction::inference_reward_treasury_address().0);
                 self.dirty_accounts.insert(
                     arc_types::transaction::CommunityInferenceRewardBody::marker_address(
                         &body.chain_domain,
@@ -6880,6 +6899,9 @@ impl StateDB {
                 self.dirty_accounts.insert(body.recipient.0);
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(pool_addr.0);
+                self.dirty_accounts.insert(
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient).0,
+                );
             }
             TxBody::InferenceRequest(body) => {
                 // Request: signer balance debited + escrow created.
@@ -10089,6 +10111,101 @@ mod tests {
         assert!(!r[0].success, "underfunded pool must reject the claim");
         // Pool balance unchanged.
         assert_eq!(state.get_account(&pool_addr).unwrap().balance, 500);
+        assert!(
+            state
+                .get_account(&FaucetClaimBody::marker_address(&addr(46)))
+                .is_none(),
+            "a failed claim must not consume the recipient's exactly-once marker"
+        );
+        assert!(
+            state.get_account(&addr(46)).is_none(),
+            "a failed claim must not fabricate a recipient account"
+        );
+    }
+
+    #[test]
+    fn test_faucet_claim_is_exactly_once_across_validators() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator_a = addr(111);
+        let validator_b = addr(112);
+        let recipient = addr(113);
+        let state = StateDB::with_genesis(&[(pool_addr, 3 * FAUCET_CLAIM_MAX)]);
+        seed_validator(&state, validator_a);
+        seed_validator(&state, validator_b);
+
+        // These are distinct, independently authorized transactions, exactly
+        // as a recipient could obtain by calling two public validators.
+        let claim_a = make_channel_tx(
+            validator_a,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: FAUCET_CLAIM_MAX,
+            }),
+            TxType::FaucetClaim,
+        );
+        let claim_b = make_channel_tx(
+            validator_b,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: FAUCET_CLAIM_MAX,
+            }),
+            TxType::FaucetClaim,
+        );
+
+        let (_, receipts) = state
+            .execute_block(&[claim_a, claim_b], addr(99))
+            .expect("the block itself remains valid");
+        assert!(receipts[0].success);
+        assert!(!receipts[1].success, "a second validator cannot pay twice");
+        assert_eq!(
+            state.get_account(&recipient).unwrap().balance,
+            FAUCET_CLAIM_MAX
+        );
+        assert_eq!(
+            state.get_account(&pool_addr).unwrap().balance,
+            2 * FAUCET_CLAIM_MAX
+        );
+        let marker = state
+            .get_account(&FaucetClaimBody::marker_address(&recipient))
+            .expect("successful claim writes a durable marker");
+        assert_eq!(marker.nonce, 1);
+        assert_eq!(marker.code_hash, recipient);
+    }
+
+    #[test]
+    fn test_faucet_claim_overflow_is_atomic() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator = addr(114);
+        let recipient = addr(115);
+        let state =
+            StateDB::with_genesis(&[(pool_addr, 2 * FAUCET_CLAIM_MAX), (recipient, u64::MAX)]);
+        seed_validator(&state, validator);
+        let claim = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: FAUCET_CLAIM_MAX,
+            }),
+            TxType::FaucetClaim,
+        );
+
+        let (_, receipts) = state.execute_block(&[claim], addr(99)).unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&pool_addr).unwrap().balance,
+            2 * FAUCET_CLAIM_MAX,
+            "overflow must not debit the faucet"
+        );
+        assert_eq!(state.get_account(&recipient).unwrap().balance, u64::MAX);
+        assert!(
+            state
+                .get_account(&FaucetClaimBody::marker_address(&recipient))
+                .is_none(),
+            "overflow must not consume the recipient marker"
+        );
     }
 
     #[test]
@@ -10537,7 +10654,7 @@ mod tests {
         treasury_balance: u64,
         validators: &[(&arc_crypto::KeyPair, u64)],
     ) -> StateDB {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let state = StateDB::with_genesis(&[(pool, treasury_balance), (worker, 0)]);
         let validator_stakes: Vec<(Address, u64)> = validators
             .iter()
@@ -10557,7 +10674,7 @@ mod tests {
 
     #[test]
     fn raw_attestation_locks_bond_without_treasury_reward() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let worker = addr(60);
         let treasury_start = 10 * REWARD;
         let worker_start = 5 * REWARD;
@@ -10590,7 +10707,7 @@ mod tests {
 
     #[test]
     fn raw_bond_zero_attestation_creates_no_escrow_or_reward() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let worker = addr(61);
         let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 0)]);
         let before = sum_all_balances(&state);
@@ -10620,10 +10737,12 @@ mod tests {
 
     #[test]
     fn authorized_stake_zero_community_reward_pays_exactly_once() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let faucet = arc_types::transaction::faucet_pool_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
-        let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
+        let state =
+            StateDB::with_genesis(&[(pool, 3 * REWARD), (faucet, 99), (worker.address(), 0)]);
         seed_validator(&state, validator.address());
         activate_community_rewards(&state);
         let before = sum_all_balances(&state);
@@ -10645,6 +10764,7 @@ mod tests {
             REWARD
         );
         assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(state.get_account(&faucet).unwrap().balance, 99);
         let paid = state.get_account(&marker).expect("replay marker");
         assert_eq!(paid.nonce, 1);
         assert_eq!(paid.code_hash, worker.address());
@@ -10653,7 +10773,7 @@ mod tests {
 
     #[test]
     fn community_reward_is_rejected_before_genesis_activation() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), 0)]);
@@ -10973,7 +11093,7 @@ mod tests {
 
     #[test]
     fn community_reward_replay_with_fresh_nonce_cannot_pay_twice() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
@@ -11001,7 +11121,7 @@ mod tests {
 
     #[test]
     fn community_reward_cannot_rewrap_one_certificate_under_a_fresh_job_id() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
@@ -11041,7 +11161,7 @@ mod tests {
 
     #[test]
     fn community_reward_rejects_unauthorized_or_mismatched_certificates() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let outsider = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
@@ -11075,7 +11195,7 @@ mod tests {
 
     #[test]
     fn community_reward_is_all_or_nothing_when_treasury_is_low() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let partial = REWARD - 1;
@@ -11092,7 +11212,7 @@ mod tests {
 
     #[test]
     fn failed_community_reward_does_not_create_an_absent_worker_account() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let state = StateDB::with_genesis(&[(pool, REWARD - 1)]);
@@ -11100,8 +11220,7 @@ mod tests {
         activate_community_rewards(&state);
         assert!(state.get_account(&worker.address()).is_none());
 
-        let reward =
-            make_signed_community_reward(&validator, &worker, 1, b"absent-worker", 100);
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"absent-worker", 100);
         let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
 
         assert!(!receipt[0].success);
@@ -11114,7 +11233,7 @@ mod tests {
 
     #[test]
     fn community_reward_overflow_failure_does_not_debit_treasury() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), u64::MAX)]);
@@ -11133,7 +11252,7 @@ mod tests {
 
     #[test]
     fn community_reward_rejects_expired_job() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), 0)]);
@@ -11150,7 +11269,7 @@ mod tests {
 
     #[test]
     fn community_reward_sequential_and_blockstm_state_match_at_treasury_tail() {
-        let pool = arc_types::transaction::faucet_pool_address();
+        let pool = arc_types::transaction::inference_reward_treasury_address();
         let validator = arc_crypto::KeyPair::generate_ed25519();
         let worker_a = arc_crypto::KeyPair::generate_ed25519();
         let worker_b = arc_crypto::KeyPair::generate_ed25519();

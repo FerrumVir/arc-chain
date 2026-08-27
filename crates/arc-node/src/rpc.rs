@@ -22,9 +22,10 @@ use std::time::Instant;
 use tower_http::cors::CorsLayer;
 
 /// Faucet configuration.
-const FAUCET_CLAIM_AMOUNT: u64 = 10_000;
-const FAUCET_RATE_LIMIT_SECS: u64 = 60; // 1 minute per address (testnet - was 1 hour)
-const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute - intentionally high for testnet TPS demos; lower before mainnet
+const FAUCET_CLAIM_AMOUNT: u64 = arc_types::economics::ARC_BASE_UNITS;
+const FAUCET_RATE_LIMIT_SECS: u64 = 60 * 60;
+const FAUCET_GLOBAL_RATE_LIMIT: usize = 100;
+const FAUCET_PENDING_TTL_SECS: u64 = 5 * 60;
 
 /// Fixed amount transferred by one successfully mined, threshold-authorized
 /// `CommunityInferenceReward` (0x25). A raw `InferenceAttestation` (0x16)
@@ -263,6 +264,10 @@ pub struct NodeState {
     pub faucet_claims: Arc<dashmap::DashMap<[u8; 32], Instant>>,
     /// Total faucet claims since boot.
     pub faucet_claims_total: Arc<AtomicU32>,
+    /// At most one validator-signed faucet transaction may be pending per
+    /// node. This prevents concurrent claims from signing the same validator
+    /// nonce; it is cleared after a real receipt or a bounded stale timeout.
+    pub faucet_pending: Arc<tokio::sync::Mutex<Option<(Hash256, Instant)>>>,
     /// Cached INT8 inference model (if --model was provided).
     pub inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
     /// Candle GGUF float inference engine (coherent output).
@@ -990,6 +995,7 @@ pub fn build_node_state(
         peer_count,
         faucet_claims: Arc::new(dashmap::DashMap::new()),
         faucet_claims_total: Arc::new(AtomicU32::new(0)),
+        faucet_pending: Arc::new(tokio::sync::Mutex::new(None)),
         inference_model,
         candle_engine,
         candle_model_id,
@@ -2140,10 +2146,6 @@ async fn submit_batch(
     })
 }
 
-fn signed_transfer_from_request(req: &SubmitTxRequest) -> Result<Transaction, String> {
-    signed_transfer_from_request_in_domain(req, None)
-}
-
 fn signed_transfer_from_request_in_domain(
     req: &SubmitTxRequest,
     recovery_domain: Option<Hash256>,
@@ -2391,10 +2393,11 @@ struct FaucetClaimRequest {
 struct FaucetClaimResponse {
     tx_hash: String,
     amount: u64,
+    status: &'static str,
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct FaucetErrorResponse {
     error: String,
 }
@@ -2423,18 +2426,28 @@ async fn faucet_claim(
         )
     })?;
 
-    // Rate limiting: check if this address claimed recently
-    // Global rate limit: 5000 faucet claims/minute (testnet only - production should be 100)
+    let marker = arc_types::transaction::FaucetClaimBody::marker_address(&to);
+    if node.state.get_account(&marker).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FaucetErrorResponse {
+                error: "This address already received its one-time faucet claim.".to_string(),
+            }),
+        ));
+    }
+
+    // Rate limiting: check if this address claimed recently.
+    // Global rate limit: 100 accepted submissions per minute.
     // DashMap iter is lock-free per shard so this never blocks the runtime.
     {
         let total = node.faucet_claims_total.load(Ordering::Relaxed);
-        if total > FAUCET_GLOBAL_RATE_LIMIT as u32 {
+        if total >= FAUCET_GLOBAL_RATE_LIMIT as u32 {
             let recent = node
                 .faucet_claims
                 .iter()
                 .filter(|e| e.value().elapsed().as_secs() < 60)
                 .count();
-            if recent > FAUCET_GLOBAL_RATE_LIMIT {
+            if recent >= FAUCET_GLOBAL_RATE_LIMIT {
                 return Err((
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(FaucetErrorResponse {
@@ -2463,207 +2476,88 @@ async fn faucet_claim(
         }
     }
 
-    // FaucetClaim path (default). Legacy null-sig Transfer path is
-    // retained for emergency rollback via FAUCET_V2_ENABLED=false, but
-    // every active v0.7.1 seed should use the new path so the funded
-    // balance actually propagates cross-seed. v0.7.2 will drop the gate
-    // and the legacy branch entirely.
-    let v2_enabled = std::env::var("FAUCET_V2_ENABLED")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true);
-
-    let hash = if v2_enabled {
-        // v0.7.1+ validator-signed FaucetClaim path. Validator signs a
-        // FaucetClaim tx that arc-state's executor accepts as
-        // authorization to debit the shared system pool
-        // (`arc-types::transaction::faucet_pool_address()`). Replaces
-        // the legacy null-sig Transfer, which peers rejected at
-        // `pipeline.rs`'s verify stage (signature bytes, not the
-        // `sig_verified` flag) so the funded balance only existed on
-        // the seed that received the /faucet/claim call.
-        let keypair = node.validator_keypair.as_ref().ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(FaucetErrorResponse {
-                    error: "Validator keypair not configured on this node.".to_string(),
-                }),
-            )
-        })?;
-        let validator_addr = node.validator_address;
-
-        let pool_addr = arc_types::transaction::faucet_pool_address();
-        let pool_account = node.state.get_account(&pool_addr).ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FaucetErrorResponse {
-                    error: "Faucet pool account not funded. Node misconfiguration.".to_string(),
-                }),
-            )
-        })?;
-        if pool_account.balance < FAUCET_CLAIM_AMOUNT {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(FaucetErrorResponse {
-                    error: "Faucet balance too low. Please try another node.".to_string(),
-                }),
-            ));
-        }
-
-        // Read validator's current state nonce per-call. An in-memory
-        // atomic counter would drift past state when txs fail to land,
-        // leaving a permanent nonce gap. Concurrent calls in the same
-        // block window race; the loser gets a 409 on commit and retries.
-        let validator_account = node.state.get_or_create_account(&validator_addr);
-        let nonce = validator_account.nonce;
-
-        let mut tx = Transaction::new_faucet_claim(validator_addr, to, FAUCET_CLAIM_AMOUNT, nonce);
-        node.state.sign_transaction(&mut tx, keypair).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FaucetErrorResponse {
-                    error: format!("Faucet sign failed: {:?}", e),
-                }),
-            )
-        })?;
-        tx.sig_verified = true;
-        let hash = tx.hash.to_hex();
-
-        // Receipt first — the consensus thread dedups via
-        // `receipts.contains_key()`. Peers don't have the receipt and
-        // run the FaucetClaim arm through `execute_block` normally.
-        let receipt = TxReceipt {
-            tx_hash: tx.hash,
-            block_height: node.state.height(),
-            block_hash: node
-                .state
-                .get_block(node.state.height())
-                .map(|b| b.hash)
-                .unwrap_or(Hash256::ZERO),
-            index: 0,
-            success: true,
-            gas_used: arc_types::gas_costs::FAUCET_CLAIM,
-            value_commitment: None,
-            inclusion_proof: None,
-            logs: vec![],
-        };
-        node.state.receipts.insert(tx.hash.0, receipt);
-
-        // Pre-apply locally so /account/X reflects funded balance
-        // immediately. Mirrors the executor arm exactly.
+    // Serialize faucet writes per validator. Two concurrent requests signed
+    // with the same account nonce would both be accepted by the old handler,
+    // while at most one could ever execute canonically.
+    let mut pending = node.faucet_pending.lock().await;
+    if let Some((pending_hash, submitted_at)) = *pending {
+        if node.state.get_receipt(&pending_hash.0).is_some() {
+            *pending = None;
+        } else if node.mempool.contains(&pending_hash)
+            || submitted_at.elapsed().as_secs() < FAUCET_PENDING_TTL_SECS
         {
-            let mut signer = validator_account.clone();
-            signer.nonce += 1;
-            node.state.update_account(&validator_addr, signer);
-
-            let mut pool = pool_account.clone();
-            pool.balance -= FAUCET_CLAIM_AMOUNT;
-            node.state.update_account(&pool_addr, pool);
-
-            let mut recipient = node.state.get_or_create_account(&to);
-            recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
-            node.state.update_account(&to, recipient);
-        }
-        node.state.full_transactions.insert(tx.hash.0, tx.clone());
-        node.state
-            .account_txs
-            .entry(validator_addr.0)
-            .or_default()
-            .push(tx.hash);
-        node.state
-            .account_txs
-            .entry(pool_addr.0)
-            .or_default()
-            .push(tx.hash);
-        node.state
-            .account_txs
-            .entry(to.0)
-            .or_default()
-            .push(tx.hash);
-
-        let _ = node.mempool.insert(tx);
-        hash
-    } else {
-        // Legacy v0.7.0 null-sig Transfer path. Funded balance is
-        // observable only on the seed that handled the call (the
-        // known propagation bug). Acceptable during the rollout window
-        // because no FaucetClaim variant is emitted that v0.7.0 peers
-        // can't deserialize.
-        let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
-        let faucet_account = node.state.get_account(&faucet_addr).ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(FaucetErrorResponse {
-                    error: "Faucet account not funded. Node misconfiguration.".to_string(),
-                }),
-            )
-        })?;
-
-        if faucet_account.balance < FAUCET_CLAIM_AMOUNT {
             return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::CONFLICT,
                 Json(FaucetErrorResponse {
-                    error: "Faucet balance too low. Please try another node.".to_string(),
+                    error: format!(
+                        "A faucet transaction is still pending confirmation (0x{}). Try again after it is mined.",
+                        pending_hash.to_hex()
+                    ),
                 }),
             ));
-        }
-
-        static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = FAUCET_NONCE.fetch_add(1, Ordering::SeqCst);
-        if nonce == 0 {
-            FAUCET_NONCE.store(faucet_account.nonce + 1, Ordering::SeqCst);
-        }
-        let actual_nonce = if nonce == 0 {
-            faucet_account.nonce
         } else {
-            nonce
-        };
-
-        let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, actual_nonce);
-        tx.sig_verified = true;
-        let hash = tx.hash.to_hex();
-
-        let receipt = TxReceipt {
-            tx_hash: tx.hash,
-            block_height: node.state.height(),
-            block_hash: node
-                .state
-                .get_block(node.state.height())
-                .map(|b| b.hash)
-                .unwrap_or(Hash256::ZERO),
-            index: 0,
-            success: true,
-            gas_used: 21_000,
-            value_commitment: None,
-            inclusion_proof: None,
-            logs: vec![],
-        };
-        node.state.receipts.insert(tx.hash.0, receipt);
-
-        {
-            let mut sender = faucet_account.clone();
-            sender.balance -= FAUCET_CLAIM_AMOUNT;
-            sender.nonce += 1;
-            node.state.update_account(&faucet_addr, sender);
-
-            let mut recipient = node.state.get_or_create_account(&to);
-            recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
-            node.state.update_account(&to, recipient);
+            // It was neither mined nor retained by the mempool for a bounded
+            // interval. Re-read canonical nonce and allow a clean retry.
+            *pending = None;
         }
-        node.state.full_transactions.insert(tx.hash.0, tx.clone());
-        node.state
-            .account_txs
-            .entry(faucet_addr.0)
-            .or_default()
-            .push(tx.hash);
-        node.state
-            .account_txs
-            .entry(to.0)
-            .or_default()
-            .push(tx.hash);
+    }
 
-        let _ = node.mempool.insert(tx);
-        hash
-    };
+    let keypair = node.validator_keypair.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: "Validator keypair not configured on this node.".to_string(),
+            }),
+        )
+    })?;
+    let validator_addr = node.validator_address;
+    let pool_addr = arc_types::transaction::faucet_pool_address();
+    let pool_account = node.state.get_account(&pool_addr).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(FaucetErrorResponse {
+                error: "Faucet pool account not funded. Node misconfiguration.".to_string(),
+            }),
+        )
+    })?;
+    if pool_account.balance < FAUCET_CLAIM_AMOUNT {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: "Faucet balance too low. Please try another node.".to_string(),
+            }),
+        ));
+    }
+
+    // Construct and sign only. Consensus execution is the sole code path
+    // allowed to debit the pool, credit the recipient, advance the nonce,
+    // create history, or emit a receipt.
+    let nonce = node
+        .state
+        .get_account(&validator_addr)
+        .map(|account| account.nonce)
+        .unwrap_or(0);
+    let mut tx = Transaction::new_faucet_claim(validator_addr, to, FAUCET_CLAIM_AMOUNT, nonce);
+    node.state.sign_transaction(&mut tx, keypair).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(FaucetErrorResponse {
+                error: format!("Faucet signing failed: {e}"),
+            }),
+        )
+    })?;
+    let tx_hash = tx.hash;
+    node.mempool.insert(tx).map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(FaucetErrorResponse {
+                error: format!("Faucet transaction was not accepted by the mempool: {error}"),
+            }),
+        )
+    })?;
+    *pending = Some((tx_hash, Instant::now()));
+    drop(pending);
+    let hash = tx_hash.to_hex();
 
     // Record claim time + evict stale entries to prevent unbounded growth
     node.faucet_claims.insert(to.0, Instant::now());
@@ -2676,7 +2570,11 @@ async fn faucet_claim(
     Ok(Json(FaucetClaimResponse {
         tx_hash: hash,
         amount: FAUCET_CLAIM_AMOUNT,
-        message: format!("Sent {} ARC to {}", FAUCET_CLAIM_AMOUNT, req.address),
+        status: "pending",
+        message: format!(
+            "Submitted a 1 ARC faucet claim for {}; credit appears only after a successful mined receipt",
+            req.address
+        ),
     }))
 }
 
@@ -4654,37 +4552,16 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
     let secp_sig = arc_crypto::Signature::Secp256k1 { signature: sig_65 };
 
     let arc_tx = if is_contract_creation {
-        // Contract deployment - run EVM deploy immediately and persist
-        let result = arc_vm::evm::evm_deploy(
-            &node.state,
-            sender_address,
-            data_bytes.to_vec(),
-            value,
-            gas_limit,
+        // The historical gateway executed EVM deployment directly against
+        // this node, then submitted an unrelated Transfer as its supposed
+        // on-chain record. That can never be replayed by peers and forks
+        // state. Fail closed until the protocol has a canonical EVM-deploy
+        // transaction that every validator executes inside block commit.
+        return eth_rpc_error(
+            id,
+            -32004,
+            "EVM contract creation is unavailable until canonical block-executed deployment is activated; no state was changed",
         );
-        if !result.success {
-            return eth_rpc_error(
-                id,
-                -32000,
-                &format!(
-                    "Contract deployment failed: {}",
-                    result.revert_reason.unwrap_or_default()
-                ),
-            );
-        }
-
-        // Store event logs from deployment
-        if !result.logs.is_empty() {
-            let height = node.state.height();
-            node.state.store_event_logs(height + 1, result.logs);
-        }
-
-        // Build an ARC Transfer tx as the on-chain record
-        let mut tx = Transaction::new_transfer(sender_address, to_address, value, nonce);
-        tx.gas_limit = gas_limit;
-        tx.signature = secp_sig;
-        tx.hash = tx.compute_hash();
-        tx
     } else if data_bytes.is_empty() {
         // Simple value transfer
         let mut tx = Transaction::new_transfer(sender_address, to_address, value, nonce);
@@ -5787,7 +5664,7 @@ async fn worker_earnings(
     let confirmed_gross_base = count.checked_mul(reward_base);
     let treasury_balance = node
         .state
-        .get_account(&arc_types::transaction::faucet_pool_address())
+        .get_account(&arc_types::transaction::inference_reward_treasury_address())
         .map(|account| account.balance);
     let remaining = treasury_balance.and_then(|balance| rewards_remaining(balance, reward_base));
     let projected_daily_arc =
@@ -11401,6 +11278,7 @@ fn validate_worker_attestation_for_job(
 ///
 /// Errors as a string so submit_work can surface the diagnostic to the
 /// worker without picking a single error type.
+#[cfg(test)]
 fn decode_and_verify_worker_attestation(
     hex_bytes: &str,
     expected_worker_id: &str,
@@ -12146,7 +12024,7 @@ async fn inference_auto(
 /// applies, so the projected rate and the paid rate cannot drift.
 ///
 /// `rewards_remaining` is the field that makes a projection honest. The reward
-/// is a pure TRANSFER from the treasury (`faucet_pool_address()`), never
+/// is a pure TRANSFER from the dedicated inference reward treasury, never
 /// minted, so the pool is finite and exhaustible: at 2.5 ARC a job, a treasury
 /// holding 1000 ARC funds exactly 400 full rewards; later claims reject rather
 /// than paying a nondeterministic partial tail. Any "ARC per day" figure that
@@ -12160,7 +12038,7 @@ async fn inference_auto(
 async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let reward_base = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
     let base_units = arc_types::economics::ARC_BASE_UNITS;
-    let treasury_addr = arc_types::transaction::faucet_pool_address();
+    let treasury_addr = arc_types::transaction::inference_reward_treasury_address();
 
     // The treasury account may be absent from this node's state entirely (a
     // fresh data dir, or a snapshot that never included it). Absent is not
@@ -12199,7 +12077,7 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
         "treasury_balance_arc": treasury_balance.map(|b| b as f64 / base_units as f64),
         "treasury_balance_unavailable_reason": if treasury_balance.is_none() {
             Value::String(
-                "the treasury account (faucet_pool_address) is not present in this node's \
+                "the dedicated inference reward treasury account is not present in this node's \
                  state; absent is not the same as empty"
                     .to_string(),
             )
@@ -13165,7 +13043,7 @@ mod tests {
             .map(|_| arc_crypto::KeyPair::generate_ed25519())
             .collect();
         let worker = arc_crypto::KeyPair::generate_ed25519();
-        let treasury = arc_types::transaction::faucet_pool_address();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
         let reward_amount = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
         let state = arc_state::StateDB::with_genesis(&[
             (treasury, reward_amount * 2),
@@ -13474,6 +13352,7 @@ mod tests {
             peer_count: Arc::new(AtomicU32::new(0)),
             faucet_claims: Arc::new(dashmap::DashMap::new()),
             faucet_claims_total: Arc::new(AtomicU32::new(0)),
+            faucet_pending: Arc::new(tokio::sync::Mutex::new(None)),
             inference_model: Some(test_inference_model()),
             candle_engine: None,
             candle_model_id: None,
@@ -14914,6 +14793,70 @@ mod tests {
         assert_eq!(node.mempool.len(), 1);
     }
 
+    #[tokio::test]
+    async fn faucet_submission_is_pending_until_canonical_execution() {
+        let validator = KeyPair::generate_ed25519();
+        let validator_address = validator.address();
+        let recipient = KeyPair::generate_ed25519().address();
+        let pool = arc_types::transaction::faucet_pool_address();
+        let state = Arc::new(arc_state::StateDB::with_genesis(&[
+            (pool, 2 * FAUCET_CLAIM_AMOUNT),
+            (validator_address, 0),
+        ]));
+        state.seed_genesis_validators(&[(
+            validator_address,
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+        )]);
+        let mempool = Arc::new(arc_mempool::Mempool::new(16));
+        let node = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            validator_address,
+            Some(Arc::new(validator)),
+            arc_state::StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let Json(submitted) = faucet_claim(
+            AxumState(node),
+            Json(FaucetClaimRequest {
+                address: recipient.to_hex(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(submitted.status, "pending");
+        assert_eq!(submitted.amount, FAUCET_CLAIM_AMOUNT);
+        assert_eq!(mempool.len(), 1);
+        assert_eq!(
+            state.get_account(&pool).unwrap().balance,
+            2 * FAUCET_CLAIM_AMOUNT
+        );
+        assert!(state.get_account(&recipient).is_none());
+        let submitted_hash = Hash256::from_hex(&submitted.tx_hash).unwrap();
+        assert!(state.get_receipt(&submitted_hash.0).is_none());
+
+        let transaction = mempool.drain(1).pop().unwrap();
+        let (_, receipts) = state
+            .execute_block(&[transaction], validator_address)
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(
+            state.get_account(&pool).unwrap().balance,
+            FAUCET_CLAIM_AMOUNT
+        );
+        assert_eq!(
+            state.get_account(&recipient).unwrap().balance,
+            FAUCET_CLAIM_AMOUNT
+        );
+        assert!(state.get_receipt(&submitted_hash.0).is_some());
+    }
+
     fn tier1_request_transaction(key: &KeyPair) -> Transaction {
         let input_blob = b"paid request must stay dark".to_vec();
         let mut tx = Transaction {
@@ -16044,7 +15987,7 @@ mod projection_tests {
 
     #[test]
     fn rewards_remaining_divides_the_finite_treasury() {
-        // The genesis faucet pool holds 1000 ARC → exactly 400 more rewards.
+        // The dedicated genesis reward treasury holds 1000 ARC → exactly 400 rewards.
         let treasury = 1_000 * ARC_BASE_UNITS;
         assert_eq!(
             rewards_remaining(treasury, INFERENCE_ATTESTATION_REWARD),

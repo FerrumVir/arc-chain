@@ -1369,15 +1369,34 @@ pub struct FaucetClaimBody {
     pub amount: u64,
 }
 
-/// Per-claim cap enforced by the executor (anti-drain). Matches the
-/// RPC-layer `FAUCET_CLAIM_AMOUNT` default so a routine /faucet/claim
-/// hits the cap exactly; raising one without the other will reject txs.
-pub const FAUCET_CLAIM_MAX: u64 = 10_000;
+impl FaucetClaimBody {
+    /// Exactly-once marker shared by every validator for one recipient. This
+    /// closes the cross-node replay path where six validators could each sign
+    /// a different transaction hash for the same faucet address.
+    pub fn marker_address(recipient: &Address) -> Address {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-faucet-recipient-marker-v1");
+        hasher.update(recipient.as_ref());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+}
+
+/// Per-claim cap enforced by the executor (anti-drain): exactly 1 ARC in
+/// nine-decimal base units. Matches the RPC-layer default; raising one without
+/// the other will reject transactions.
+pub const FAUCET_CLAIM_MAX: u64 = crate::economics::ARC_BASE_UNITS;
 
 /// System faucet pool address. Same on every seed because it's derived
 /// from `blake3::hash(&[0u8])` and prefunded in genesis.toml.
 pub fn faucet_pool_address() -> Address {
     arc_crypto::hash_bytes(&[0u8])
+}
+
+/// Dedicated finite treasury for validator-approved community inference
+/// rewards. It is the second prefunded system account (`blake3(&[1u8])`) and
+/// is deliberately distinct from the public faucet, so onboarding claims can
+/// neither consume worker rewards nor inflate their projected runway.
+pub fn inference_reward_treasury_address() -> Address {
+    arc_crypto::hash_bytes(&[1u8])
 }
 
 /// Milestone B helpers - shared between arc-state and arc-node so both

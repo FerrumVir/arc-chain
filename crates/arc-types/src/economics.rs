@@ -12,9 +12,9 @@ pub const DECIMALS: u8 = 9;
 
 /// Base units (smallest indivisible unit, "nanoARC") per whole ARC = 10^DECIMALS.
 /// Every balance, bond, and reward in the state DB is denominated in these
-/// units. The genesis faucet pool is prefunded with `1_000_000_000_000`
-/// base units (= 1000 ARC) and the testnet faucet grants `FAUCET_CLAIM_MAX`
-/// base units per claim — both are counts of *this* unit.
+/// units. The dedicated genesis inference treasury is prefunded with
+/// `1_000_000_000_000` base units (= 1000 ARC), independently of the public
+/// faucet. All are counts of *this* unit.
 pub const ARC_BASE_UNITS: u64 = 10u64.pow(DECIMALS as u32); // 1_000_000_000
 
 /// Reward paid to the worker for each accepted, validator-authorized
@@ -29,7 +29,8 @@ pub const ARC_BASE_UNITS: u64 = 10u64.pow(DECIMALS as u32); // 1_000_000_000
 /// earnings UI and the value actually credited on-chain can never drift.
 ///
 /// Testnet monetary policy: this reward is a **pure transfer** FROM the
-/// treasury (`arc_types::transaction::faucet_pool_address()`) TO the
+/// dedicated finite treasury
+/// (`arc_types::transaction::inference_reward_treasury_address()`) TO the
 /// explicitly certified worker, and is paid only in full when funds exist.
 /// It is NEVER minted — total supply is conserved. Tune this single constant;
 /// production will replace the flat rate with a halving-curve emission.

@@ -83,9 +83,9 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(escrow_addr.0);
         }
         TxBody::CommunityInferenceReward(body) => {
-            // Rewards share the treasury and each touches a worker plus
+            // Rewards share their dedicated treasury and each touches a worker plus
             // independent exactly-once job and worker-certificate markers.
-            accounts.insert(arc_types::transaction::faucet_pool_address().0);
+            accounts.insert(arc_types::transaction::inference_reward_treasury_address().0);
             accounts.insert(validator_set_access_key());
             accounts.insert(body.worker.0);
             accounts.insert(
@@ -172,6 +172,8 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             // doesn't race on the pool's balance.
             accounts.insert(body.recipient.0);
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
+            accounts
+                .insert(arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient).0);
             accounts.insert(validator_set_access_key());
         }
         TxBody::InferenceRequest(body) => {
@@ -408,7 +410,7 @@ mod tests {
     fn community_rewards_conflict_on_shared_treasury() {
         let first = make_community_reward(addr(9), addr(10), 1);
         let second = make_community_reward(addr(9), addr(11), 2);
-        let treasury = arc_types::transaction::faucet_pool_address().0;
+        let treasury = arc_types::transaction::inference_reward_treasury_address().0;
 
         assert!(tx_access_set(&first).accounts.contains(&treasury));
         assert!(tx_access_set(&second).accounts.contains(&treasury));
@@ -453,7 +455,7 @@ mod tests {
     fn raw_attestations_do_not_claim_treasury_access() {
         let first = make_attestation(addr(10), 0, 1);
         let second = make_attestation(addr(11), 0, 2);
-        let treasury = arc_types::transaction::faucet_pool_address().0;
+        let treasury = arc_types::transaction::inference_reward_treasury_address().0;
 
         assert!(!tx_access_set(&first).accounts.contains(&treasury));
         assert!(!tx_access_set(&second).accounts.contains(&treasury));
