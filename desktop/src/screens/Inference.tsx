@@ -16,6 +16,7 @@ import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
 import { formatHash } from "../lib/format";
+import { hostLabel } from "../lib/hosts";
 import { useAppStore } from "../lib/store";
 import type { InferenceResult } from "../lib/types";
 
@@ -86,19 +87,6 @@ async function runInferenceSmart(
     }
     throw err;
   }
-}
-
-function coordinatorLabel(url: string): string {
-  const host = url.replace(/^https?:\/\//, "").split(":")[0];
-  const byIp: Record<string, string> = {
-    "149.28.32.76": "NYC",
-    "140.82.16.112": "LAX",
-    "136.244.109.1": "AMS",
-    "104.238.171.11": "LHR",
-    "202.182.107.41": "NRT",
-    "149.28.153.31": "SGP",
-  };
-  return byIp[host] ?? host;
 }
 
 export function Inference() {
@@ -370,7 +358,7 @@ export function Inference() {
                 {run.data.servedLocally
                   ? "your node"
                   : run.data.coordinator
-                    ? coordinatorLabel(run.data.coordinator)
+                    ? hostLabel(run.data.coordinator)
                     : "the network"}
               </strong>
               {run.data.consensus ? (

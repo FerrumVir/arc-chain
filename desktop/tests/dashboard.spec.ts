@@ -37,6 +37,56 @@ async function useLiveEarningsBody(
   });
 }
 
+function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
+  return {
+    total_rewards: 2,
+    estimated_total_arc: 5,
+    confirmed_receipt_count: 2,
+    confirmed_gross_earnings_base: 5_000_000_000,
+    confirmed_gross_earnings_arc: 5,
+    confirmed_receipts: [
+      {
+        tx_type: "0x25",
+        tx_hash: `0x${"aa".repeat(32)}`,
+        job_id: `0x${"01".repeat(32)}`,
+        block_height: 123_461,
+        block_hash: `0x${"10".repeat(32)}`,
+        success: true,
+        reward_base: 2_500_000_000,
+        reward_arc: 2.5,
+        recovery_epoch: 1,
+        validator_set_id: 7,
+      },
+      {
+        tx_type: "0x25",
+        tx_hash: `0x${"ab".repeat(32)}`,
+        job_id: `0x${"02".repeat(32)}`,
+        block_height: 123_462,
+        block_hash: `0x${"11".repeat(32)}`,
+        success: true,
+        reward_base: 2_500_000_000,
+        reward_arc: 2.5,
+        recovery_epoch: 1,
+        validator_set_id: 7,
+      },
+    ],
+    estimated_total_arc_note:
+      "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
+    today_arc: null,
+    projected_daily_arc: null,
+    projected_daily_unavailable_reason:
+      "a single receipt window cannot establish a forecast",
+    recovery_epoch: 1,
+    validator_set_id: 7,
+    community_rewards_v1_enabled: true,
+    community_rewards_v1_protocol_active: true,
+    community_rewards_v1_approval_collection_ready: true,
+    last_reward_block: 123_462,
+    last_reward_tx_hash: `0x${"ab".repeat(32)}`,
+    ...overrides,
+  };
+}
+
 test.describe("Dashboard", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
@@ -93,18 +143,7 @@ test.describe("Dashboard", () => {
   test("candidate receipt/readiness shape can render confirmed mined rewards", async ({
     page,
   }) => {
-    await useLiveEarningsBody(page, {
-      total_rewards: 2,
-      estimated_total_arc: 5,
-      estimated_total_arc_note:
-        "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
-      today_arc: null,
-      community_rewards_v1_enabled: true,
-      community_rewards_v1_protocol_active: true,
-      community_rewards_v1_approval_collection_ready: true,
-      last_reward_block: 9,
-      last_reward_tx_hash: `0x${"ab".repeat(32)}`,
-    });
+    await useLiveEarningsBody(page, candidateEarningsBody());
     await page.goto("/");
     await expect(page.getByTestId("earnings-total")).toHaveText(
       /5\.00\s*ARC confirmed/,
@@ -112,18 +151,13 @@ test.describe("Dashboard", () => {
   });
 
   test("candidate-shaped negative reward totals fail closed", async ({ page }) => {
-    await useLiveEarningsBody(page, {
-      total_rewards: 2,
-      estimated_total_arc: -5,
-      estimated_total_arc_note:
-        "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
-      today_arc: null,
-      community_rewards_v1_enabled: true,
-      community_rewards_v1_protocol_active: true,
-      community_rewards_v1_approval_collection_ready: true,
-      last_reward_block: 9,
-      last_reward_tx_hash: `0x${"ab".repeat(32)}`,
-    });
+    await useLiveEarningsBody(
+      page,
+      candidateEarningsBody({
+        estimated_total_arc: -5,
+        confirmed_gross_earnings_arc: -5,
+      }),
+    );
     await page.goto("/");
     await expect(page.getByTestId("earnings-total")).toContainText(
       "not confirmed",

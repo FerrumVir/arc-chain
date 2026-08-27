@@ -16,14 +16,38 @@ export const SEED_LABELS: Record<string, string> = {
 };
 
 /**
+ * HTTPS seed origins use nip.io names because the desktop talks to them over
+ * TLS. Keep those aliases tied to the exact configured IPs: a custom nip.io
+ * host must not inherit a city merely because its text happens to resemble a
+ * seed address.
+ */
+const SEED_ORIGIN_LABELS: Record<string, string> = Object.fromEntries(
+  Object.entries(SEED_LABELS).flatMap(([ip, label]) => [
+    [ip, label],
+    [`${ip.replaceAll(".", "-")}.nip.io`, label],
+  ]),
+);
+
+function hostnameOf(origin: string): string | null {
+  try {
+    return new URL(
+      origin.includes("://") ? origin : `http://${origin}`,
+    ).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * A short label for a host URL: the seed's city when we recognise it, else the
  * bare host:port. Never a guess — an unrecognised host is shown verbatim so a
  * local devnet or a custom `ARC_WALLET_HOST` is still identifiable.
  */
 export function hostLabel(url: string | null | undefined): string {
   if (!url) return "unknown host";
-  for (const [ip, label] of Object.entries(SEED_LABELS)) {
-    if (url.includes(ip)) return label;
+  const hostname = hostnameOf(url);
+  if (hostname && SEED_ORIGIN_LABELS[hostname]) {
+    return SEED_ORIGIN_LABELS[hostname];
   }
   return url.replace(/^https?:\/\//, "");
 }
