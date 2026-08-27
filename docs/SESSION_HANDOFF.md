@@ -1,4 +1,13 @@
-# Session Handoff — Tier 1 On-Chain Inference
+# Session Handoff — Tier 1 On-Chain Inference (archived 2026-05-16)
+
+> **Historical implementation handoff, not current rollout state or operator
+> instructions.** The versions, endpoint plan, fleet membership, test counts,
+> and “done” labels below describe a May development branch. The public fleet
+> was later confirmed forked/version-skewed, and v0.8.0 remains an unreleased,
+> undeployed recovery candidate. Use
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
+> and [`VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) for the current
+> evidence and cutover contract.
 
 **Last session:** 2026-05-16 (Windows machine, branch `fix/inference-timeout-and-connect-ux`)
 **Next session:** continue on MacBook — clone fork, read this doc, resume.

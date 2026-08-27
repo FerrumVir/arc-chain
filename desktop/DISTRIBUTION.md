@@ -1,4 +1,12 @@
-# ARC - pre-distribution checklist
+# ARC - pre-distribution checklist (archived Android planning snapshot)
+
+> **Historical planning document, not a v0.8.0 ship checklist.** Its APK scope,
+> test counts, remaining-work claims, timelines, and “current” labels were
+> written during an earlier mobile experiment. The v0.8.0 release contract is
+> desktop plus headless/server, remains unpublished and undeployed, and is
+> documented in [`../README.md`](../README.md),
+> [`README.md`](README.md), and
+> [`../docs/VALIDATOR-FLEET-ROLLOUT.md`](../docs/VALIDATOR-FLEET-ROLLOUT.md).
 
 **Target: 10,000 users. Zero silent failures.**
 

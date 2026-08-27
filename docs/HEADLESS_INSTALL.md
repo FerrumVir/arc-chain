@@ -34,16 +34,36 @@ asset and pin the same version when running it. Keeping download and execution
 separate makes network errors visible and lets you inspect the script first.
 
 ```bash
-curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
 bash install.sh --version 0.8.0
 ```
 
+That first script download is the bootstrap trust boundary: the URL is HTTPS
+and the installer refuses to continue unless GitHub reports the release as
+immutable. If you want to verify the bootstrap file before executing it,
+download `SHA256SUMS` from the same exact release and check only the
+`install.sh` row. On Linux:
+
+```bash
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/SHA256SUMS
+awk '$2 == "install.sh" { print; found=1 } END { exit !found }' SHA256SUMS | sha256sum -c -
+```
+
+On macOS, use the same two commands with `shasum -a 256 -c -` in place of
+`sha256sum -c -` on the second line.
+
+Every later program/config download is verified automatically before any
+managed file is replaced.
+
 The installer does not resolve `releases/latest/download` for the programs. It
-first reads one release's metadata, validates a strict `vMAJOR.MINOR.PATCH`
-tag, checks that every required platform asset exists, and then downloads from
-that exact tag. It verifies the node, CLI, seeds, genesis, and updater installer
-against `SHA256SUMS`. A desktop-only or otherwise incomplete release is an
-error; it never silently walks backward to an old version.
+first reads one release's metadata, requires GitHub to report that release as
+immutable, non-draft, and non-prerelease, validates a strict
+`vMAJOR.MINOR.PATCH` tag, and downloads from that exact tag. It verifies the
+current platform's node and CLI plus seeds and genesis against `SHA256SUMS`; if
+auto-update is enabled, it also verifies the installer copy it retains. A
+desktop-only or otherwise incomplete platform bundle is an error; it never
+silently walks backward to an old version. The release publisher separately
+requires every supported platform before it can publish anything.
 
 ### Common server setups
 
@@ -212,10 +232,11 @@ state healthy.
 ## Updates and rollback behavior
 
 The optional daily systemd timer/LaunchAgent runs the checksummed installer
-copy from the installed release. It resolves a complete latest release, refuses
-a version lower than the installed binary, verifies downloads, replaces files
-atomically, restarts the same service scope, and checks the saved custom RPC
-port. Before the first replacement it snapshots every managed binary, network
+copy from the installed release. It resolves the latest immutable, non-draft,
+non-prerelease release, requires its complete bundle for the installed platform,
+refuses a version lower than the installed binary, verifies downloads, replaces
+files atomically, restarts the same service scope, and checks the saved custom
+RPC port. Before the first replacement it snapshots every managed binary, network
 file, runner, install config, identity file, service definition, and the active
 and enabled service/timer state. A copy, service-manager, or health failure
 restores that complete snapshot (or removes a newly introduced managed file)

@@ -1,4 +1,11 @@
-# ARC Node - Canonical Desktop App
+# ARC Node - Canonical Desktop App (archived 2026-04-19 snapshot)
+
+> **Historical recovery note, not the current desktop contract.** The version,
+> stack versions, build output, and “working” label below describe the original
+> v0.1-era app. The current tree is the unreleased v0.8.0 recovery candidate.
+> Use [`README.md`](README.md), [`../README.md`](../README.md), and
+> [`../docs/GETTING_STARTED.md`](../docs/GETTING_STARTED.md) for current source,
+> release, and user-facing status.
 
 **Version:** 0.1.0 · **Stack:** Tauri 2 + React 18 + Vite 5 · **Status:** Working
 

@@ -211,6 +211,18 @@ installer_and_updater_verify_checksums() {
         printf 'installed updater has no explicit noninteractive --update-only mode\n'
         return 1
     }
+    for required in \
+        'require_release_boolean immutable true' \
+        'require_release_boolean draft false' \
+        'require_release_boolean prerelease false' \
+        "--proto '=https'" \
+        "--proto-redir '=https'"
+    do
+        grep -Fq -- "$required" "$INSTALLER" || {
+            printf 'installer/update path lacks immutable HTTPS release binding: %s\n' "$required"
+            return 1
+        }
+    done
 }
 
 raw_node_downloads_are_version_pinned() {

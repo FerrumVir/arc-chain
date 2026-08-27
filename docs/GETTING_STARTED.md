@@ -37,7 +37,9 @@ earned token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
 >
 > Permanent fix is on the roadmap — once the project is signed + notarized with an Apple Developer ID, this dialog goes away for everyone.
 
-> **Apple Silicon vs Intel?** Apple menu → *About This Mac*. If you see "Apple M1/M2/M3/M4" → use the Apple Silicon `.dmg`. If "Intel" → use the Intel `.dmg`.
+> **Apple Silicon vs Intel?** Apple menu → *About This Mac*. If the chip name
+> starts with “Apple,” use the Apple Silicon `.dmg`; if it says “Intel,” use the
+> Intel `.dmg`.
 
 ### Windows 10 / 11
 
@@ -84,13 +86,18 @@ Brief overview. Click **Continue**.
 
 ### Screen 2: Identity
 
-ARC Node generates a fresh **BIP39 seed phrase** (12 words) and an **ARC address** (`arc1q...`).
+ARC Node generates a fresh **BIP-39 seed phrase** (12 words) and the current
+64-hex-character ARC address derived from its Ed25519 public key.
 
 > **Save the seed phrase offline or in a trusted password manager.** Do not take
 > a screenshot, paste it into chat, or store it in an unencrypted note. You'll
 > need it if you ever reinstall or move to a new machine.
 
-The seed phrase is stored locally on your machine. It is never sent to any server. ARC Node has no "forgot password" recovery — the seed phrase IS the recovery.
+The seed phrase is stored in the native app's private local `store.json` so the
+node can sign after restart; it is excluded from frontend `localStorage` and is
+never sent to a server by the identity flow. On Unix the directory/file modes
+are `0700`/`0600`, but v0.8.0 does not yet use an OS keychain. Save a separate
+offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.
 
@@ -204,8 +211,10 @@ authenticated recomputation, a signed worker certificate, active genesis
 protocol activation, validator approval collection, strict
 greater-than-two-thirds identity and active-stake approval, a funded treasury,
 and successful block inclusion. With six equally staked validators, five must
-approve. Approval collection is currently unavailable, so the candidate fails
-closed and shows no forward reward projection.
+approve. The source candidate implements approval collection, but it is not
+available on the current v2 public fleet and the checked-in observer genesis
+keeps issuance disabled. Until the coordinated cutover proves that path, the
+candidate fails closed and shows no forward reward projection.
 
 The deployed v2 seeds expose legacy count × constant display arithmetic. That
 does not reconcile to payment and must not be described as earnings. The Aug 26
@@ -242,9 +251,9 @@ to measure an address-specific rate. Hardware size is not a reward multiplier.
 
 Measure this on your own machine; the app does not promise a universal CPU or
 RAM figure. An observer needs no model. The current full-model worker target is
-about 4 GB on disk; use at least 8 GB RAM, with 12 GB or more providing safer
-OS and chain headroom. **Settings → Compute contribution** controls the worker
-thread ceiling, not a reward multiplier.
+about 4 GB on disk; use at least 16 GB system RAM for expanded integer weights
+plus OS and chain headroom. **Settings → Compute contribution** controls the
+worker thread ceiling, not a reward multiplier.
 
 **How do I update?**
 
@@ -265,9 +274,10 @@ package-managed files. Headless/server updates are separate and documented in
 - **Windows**: Settings → Apps → ARC Node → Uninstall.
 - **Linux**: `sudo apt remove arc-node-desktop` (or rpm equivalent), then `~/.config/network.arc.desktop/`.
 
-Keep the recovery phrase you saved during setup. The desktop does not retain the
-displayed phrase for later recovery, so do not reset or uninstall until you have
-verified your backup.
+Keep the recovery phrase you saved during setup. The native app retains it in
+its private local store so the node can restart, but that local copy is not a
+substitute for an offline backup and is removed if you delete the app-data
+directory. Do not reset or uninstall until you have verified your backup.
 
 **Where do I report bugs?**
 

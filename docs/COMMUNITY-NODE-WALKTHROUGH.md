@@ -57,7 +57,7 @@ closed; the CLI flag alone cannot turn issuance on.
 Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
-curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
 bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 

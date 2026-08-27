@@ -1,4 +1,12 @@
-# ARC Chain - Session Guide
+# ARC Chain - Session Guide (archived pre-recovery snapshot)
+
+> **Do not use this file as current operator guidance.** Its live-network
+> assumptions, versions, counts, and commands predate the 2026-08-26 recovery
+> audit. The current tree is the unreleased v0.8.0/protocol-v3 candidate; use
+> [`README.md`](README.md),
+> [`docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md),
+> and [`docs/VALIDATOR-FLEET-ROLLOUT.md`](docs/VALIDATOR-FLEET-ROLLOUT.md).
+> Nothing in the archived body authorizes a public-seed mutation.
 
 ## What This Is
 
@@ -7,10 +15,9 @@ innovation: a pure integer inference engine that produces bitwise identical
 output across ARM, x86, and GPU. That enables hash-based verification of AI
 computation at O(1) cost.
 
-**Version:** 0.7.11 (`Cargo.toml`)
+**Version at snapshot:** 0.7.11 (not the current `Cargo.toml` version)
 **Repo:** `FerrumVir/arc-chain` (private)
-**Language:** Rust — ~121,900 lines across 16 workspace members (14 under
-`crates/`, plus `agents/` and `relayer/`), 1,363 test functions defined
+**Counts:** historical; remeasure the current checkout instead of quoting them
 
 ---
 

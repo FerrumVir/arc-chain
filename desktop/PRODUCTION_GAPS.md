@@ -1,4 +1,13 @@
-# Production readiness - honest gaps
+# Production readiness - honest gaps (archived alpha snapshot)
+
+> **Historical gap list, not current release status.** Several items below were
+> subsequently implemented or replaced, including real BIP-39 derivation,
+> native tests, CI, the updater key, and the updater lifecycle. Other claims
+> describe superseded inference/reward designs. The v0.8.0 candidate remains
+> unpublished and undeployed; use [`README.md`](README.md),
+> [`../README.md`](../README.md), and
+> [`../docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](../docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
+> for current status.
 
 Status: **closed-alpha ready** (v0.2 pass addressed #4, #6, #7, #8, #13).
 Public beta still gated on code-signing + key derivation.

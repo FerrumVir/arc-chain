@@ -543,6 +543,7 @@ version_compare() {
 github_curl() {
     local url="$1"
     local args=(--fail --silent --show-error --location --retry 3 \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
         --connect-timeout 15 --header 'Accept: application/vnd.github+json' \
         --header 'User-Agent: arc-chain-installer')
     if [ -n "${GITHUB_TOKEN:-}" ]; then
@@ -564,6 +565,29 @@ info "Resolving a complete release for $PLATFORM"
 if ! github_curl "$RELEASE_METADATA_URL" > "$TMP_DIR/release.json"; then
     die "Could not read GitHub release metadata: $RELEASE_METADATA_URL"
 fi
+
+# SHA256SUMS and the payloads it authenticates live in the same GitHub
+# release. A mutable release could replace both together, so a checksum alone
+# is not an authenticity boundary. The sole publisher enables GitHub immutable
+# releases before creation; require that server-side property here as well and
+# reject drafts/prereleases from both pinned installs and unattended updates.
+require_release_boolean() {
+    local key="$1"
+    local expected="$2"
+    local rejected=true
+    if [ "$expected" = true ]; then rejected=false; fi
+    grep -Eq "\"$key\"[[:space:]]*:[[:space:]]*$expected([[:space:]]*[,}])" \
+        "$TMP_DIR/release.json" \
+        || die "Release metadata must declare $key=$expected"
+    if grep -Eq "\"$key\"[[:space:]]*:[[:space:]]*$rejected([[:space:]]*[,}])" \
+        "$TMP_DIR/release.json"; then
+        die "Release metadata contains conflicting $key values"
+    fi
+}
+require_release_boolean immutable true
+require_release_boolean draft false
+require_release_boolean prerelease false
+
 RESOLVED_TAG="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP_DIR/release.json" | head -n 1)"
 case "$RESOLVED_TAG" in v*) VERSION="${RESOLVED_TAG#v}" ;; *) die "Release metadata has no valid vX.Y.Z tag" ;; esac
 strict_version "$VERSION" || die "Release tag is not strict vX.Y.Z: $RESOLVED_TAG"

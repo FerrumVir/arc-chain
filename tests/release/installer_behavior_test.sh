@@ -213,6 +213,42 @@ minified_github_api_json_without_newline_installs_exact_assets() {
     done
 }
 
+mutable_draft_and_prerelease_metadata_fail_before_asset_download() {
+    local sandbox fixture output status field replacement
+    for field in immutable draft prerelease; do
+        new_sandbox
+        sandbox="$NEW_SANDBOX"
+        fixture="$sandbox/rejected-$field.json"
+        case "$field" in
+            immutable) replacement='s/"immutable": true/"immutable": false/' ;;
+            draft) replacement='s/"draft": false/"draft": true/' ;;
+            prerelease) replacement='s/"prerelease": false/"prerelease": true/' ;;
+        esac
+        sed "$replacement" "$TEST_DIR/fixtures/release-v0.8.0.json" > "$fixture"
+        output="$sandbox/rejected-$field.out"
+        ARC_NODE_VERSION_UNDER_TEST='0.8.0'
+        invoke_installer "$sandbox" Linux amd64 "$fixture" 0.8.0 \
+            --no-service --no-auto-update >"$output" 2>&1
+        status=$?
+        ARC_NODE_VERSION_UNDER_TEST=''
+
+        if [ "$status" -eq 0 ]; then
+            printf 'installer accepted release metadata with rejected %s state\n' "$field"
+            return 1
+        fi
+        if grep -Fq '/releases/download/' "$sandbox/curl.log"; then
+            printf 'installer downloaded assets before rejecting %s metadata:\n' "$field"
+            cat "$sandbox/curl.log"
+            return 1
+        fi
+        if find "$sandbox/arc/bin" -type f | grep -q .; then
+            printf 'installer introduced executables before rejecting %s metadata\n' "$field"
+            find "$sandbox/arc/bin" -type f -print
+            return 1
+        fi
+    done
+}
+
 tampered_binary_is_rejected() {
     local sandbox output status
     new_sandbox
@@ -781,6 +817,7 @@ transaction_contract_covers_every_service_scope() {
 
 run_test 'offline platform aliases install exact-tag node + CLI assets without starting' install_only_platform_matrix
 run_test 'minified GitHub API JSON with no trailing newline installs exact-tag assets' minified_github_api_json_without_newline_installs_exact_assets
+run_test 'mutable, draft, and prerelease metadata fail before any asset download' mutable_draft_and_prerelease_metadata_fail_before_asset_download
 run_test 'checksum mismatch rejects and removes staged executables' tampered_binary_is_rejected
 run_test 'ARC_NODE_VERSION requires strict X.Y.Z before network-shaped requests' invalid_version_pin_fails_before_asset_download
 run_test '--no-service --no-auto-update has no start, health, service, or updater side effects' no_service_no_updater_really_is_install_only

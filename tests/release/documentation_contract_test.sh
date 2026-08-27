@@ -15,6 +15,13 @@ GETTING_STARTED="$REPO_ROOT/docs/GETTING_STARTED.md"
 STATUS_DOC="$REPO_ROOT/docs/STATUS.md"
 ANNOUNCEMENT="$REPO_ROOT/docs/ANNOUNCEMENT.md"
 DEMO_RUNBOOK="$REPO_ROOT/docs/DEMO-RUNBOOK.md"
+SESSION_HANDOFF="$REPO_ROOT/docs/SESSION_HANDOFF.md"
+DESKTOP_README="$REPO_ROOT/desktop/README.md"
+DESKTOP_FIRST_RUN="$REPO_ROOT/desktop/FIRST-RUN.md"
+DESKTOP_CANONICAL="$REPO_ROOT/desktop/DESKTOP_CANONICAL.md"
+DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
+DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
+CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CANDIDATE_VERSION=0.8.0
 
@@ -90,9 +97,15 @@ candidate_install_commands_are_exact_and_honest() {
             'candidate install guide does not download the exact installer tag' || return 1
         require_literal "$file" "--version $CANDIDATE_VERSION" \
             'candidate install guide does not pin the matching installer version' || return 1
+        require_literal "$file" "--proto '=https' --proto-redir '=https' --tlsv1.2" \
+            'candidate install guide permits a non-HTTPS bootstrap or redirect' || return 1
         require_literal "$file" 'not published' \
             'candidate install guide could be mistaken for an already-published release' || return 1
     done
+    require_literal "$HEADLESS" '$2 == "install.sh"' \
+        'headless guide does not isolate the installer checksum row' || return 1
+    require_literal "$HEADLESS" 'END { exit !found }' \
+        'headless guide does not isolate and require the installer checksum row' || return 1
     if grep -Fq '0.7.12' "$README" "$HEADLESS" "$WALKTHROUGH" "$ROLLOUT"; then
         printf 'the superseded v0.7.12 candidate remains in active v0.8.0 operator docs\n'
         return 1
@@ -185,6 +198,7 @@ desktop_and_release_notes_match_the_artifact_and_reward_contract() {
         arc-desktop-macos-arm64.dmg \
         arc-desktop-macos-x86_64.dmg \
         arc-desktop-windows-x86_64-setup.exe \
+        arc-desktop-windows-x86_64.msi \
         arc-desktop-linux-x86_64.AppImage \
         arc-desktop-linux-x86_64.deb \
         arc-desktop-linux-x86_64.rpm
@@ -199,6 +213,7 @@ desktop_and_release_notes_match_the_artifact_and_reward_contract() {
         arc-desktop-macos-arm64.dmg \
         arc-desktop-macos-x86_64.dmg \
         arc-desktop-windows-x86_64-setup.exe \
+        arc-desktop-windows-x86_64.msi \
         arc-desktop-linux-x86_64.AppImage \
         arc-desktop-linux-x86_64.deb \
         arc-desktop-linux-x86_64.rpm
@@ -244,10 +259,56 @@ activation_and_archived_guides_fail_closed_in_copy() {
         'archived announcement can still be mistaken for current marketing copy' || return 1
     require_literal "$DEMO_RUNBOOK" 'Do not use the legacy v0.7.7 installer' \
         'old demo runbook still presents v0.7.7 as the current CLI path' || return 1
+    require_literal "$SESSION_HANDOFF" 'Historical implementation handoff, not current rollout state' \
+        'old inference session handoff can be mistaken for current rollout state' || return 1
+    require_literal "$DESKTOP_CANONICAL" 'Historical recovery note, not the current desktop contract' \
+        'old canonical-desktop snapshot lacks an archive boundary' || return 1
+    require_literal "$DESKTOP_DISTRIBUTION" 'Historical planning document, not a v0.8.0 ship checklist' \
+        'old Android distribution plan can be mistaken for the v0.8 ship gate' || return 1
+    require_literal "$DESKTOP_GAPS" 'Historical gap list, not current release status' \
+        'old desktop gap list can be mistaken for current release status' || return 1
+    require_literal "$CLAUDE_GUIDE" 'Do not use this file as current operator guidance' \
+        'old session guide can be mistaken for live-network instructions' || return 1
     if grep -Eq 'ARC[.]Node[_-]0[.]7[.]11|ARC[.]Node-0[.]7[.]11' "$GETTING_STARTED"; then
         printf 'Getting Started still contains stale v0.7.11 Linux package commands\n'
         return 1
     fi
+}
+
+readme_counts_and_desktop_secret_copy_match_the_tree() {
+    local rust_lines rust_tests
+    rust_lines="$(find "$REPO_ROOT/crates" "$REPO_ROOT/agents" "$REPO_ROOT/relayer" \
+        -type f -name '*.rs' -print0 | xargs -0 wc -l | awk 'END { print $1 }')"
+    rust_tests="$(find "$REPO_ROOT/crates" "$REPO_ROOT/agents" "$REPO_ROOT/relayer" \
+        -type f -name '*.rs' -print0 | xargs -0 grep -Eh \
+        '^[[:space:]]*#\[(tokio::)?test' | wc -l | tr -d ' ')"
+    [ "$rust_lines" -ge 167000 ] || {
+        printf 'README 167K+ Rust badge exceeds current measured source lines: %s\n' "$rust_lines"
+        return 1
+    }
+    [ "$rust_tests" -ge 1700 ] || {
+        printf 'README 1,700+ Rust-test badge exceeds current defined tests: %s\n' "$rust_tests"
+        return 1
+    }
+    for literal in \
+        'more than 167,000 physical lines of Rust' \
+        'More than 1,700 Rust test functions' \
+        'plus one narrowly' \
+        'vendored `wasmer-derive` workspace member'
+    do
+        require_literal "$README" "$literal" \
+            'README source inventory is stale or not reproducible' || return 1
+    done
+    if grep -Eq '121,900|1,363|34-endpoint|Every line is original' "$README"; then
+        printf 'README retains a disproven source-count, endpoint-count, or authorship claim\n'
+        return 1
+    fi
+    require_literal "$DESKTOP_README" 'recovery phrase is present' \
+        'desktop README falsely implies the native store excludes its signing secret' || return 1
+    require_literal "$GETTING_STARTED" 'v0.8.0 does not yet use an OS keychain' \
+        'user guide omits the desktop recovery-secret storage boundary' || return 1
+    require_literal "$DESKTOP_FIRST_RUN" 'only a successful mined receipt' \
+        'first-run guide still upgrades faucet submission into confirmed credit' || return 1
 }
 
 persistence_rpc_and_transaction_copy_match_the_installer() {
@@ -280,5 +341,6 @@ run_test 'desktop docs and generated release notes match artifacts, updater, and
 run_test 'production origins and receipt-backed status copy are exact' production_origins_and_evidence_are_exact
 run_test 'activation copy fails closed and archived guides carry recovery warnings' activation_and_archived_guides_fail_closed_in_copy
 run_test 'operator docs require fresh v3 state, loopback RPC, and full transaction rollback' persistence_rpc_and_transaction_copy_match_the_installer
+run_test 'README counts and desktop secret/payment copy match the current tree' readme_counts_and_desktop_secret_copy_match_the_tree
 
 finish_tests

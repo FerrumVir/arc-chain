@@ -1,5 +1,8 @@
 {
   "tag_name": "v0.8.0",
+  "draft": false,
+  "prerelease": false,
+  "immutable": true,
   "assets": [
     {"name": "arc-node-linux-x86_64"},
     {"name": "arc-cli-linux-x86_64"},
