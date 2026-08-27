@@ -9,6 +9,19 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 WORKFLOW="$REPO_ROOT/.github/workflows/deploy-explorer.yml"
 BUILDER="$REPO_ROOT/scripts/build-public-site.sh"
 
+every_action_is_commit_sha_pinned() {
+    local workflow ref
+    while IFS= read -r workflow; do
+        while IFS= read -r ref; do
+            printf '%s\n' "$ref" | grep -Eq '^[^@[:space:]]+@[0-9a-f]{40}$' || {
+                printf 'workflow action is not pinned to a full Git object SHA: %s (%s)\n' \
+                    "$ref" "$workflow"
+                return 1
+            }
+        done < <(sed -n 's/^[[:space:]]*-\{0,1\}[[:space:]]*uses:[[:space:]]*\([^#[:space:]]*\).*/\1/p' "$workflow")
+    done < <(find "$REPO_ROOT/.github/workflows" -type f -name '*.yml' | LC_ALL=C sort)
+}
+
 pages_workflow_is_pinned_and_self_contained() {
     for pin in \
         'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
@@ -91,6 +104,7 @@ site_builder_rejects_broad_targets() {
 }
 
 run_test 'Pages workflow uses pinned, secret-free deployment actions' pages_workflow_is_pinned_and_self_contained
+run_test 'every GitHub Action is pinned to a full immutable SHA' every_action_is_commit_sha_pinned
 run_test 'public console assembles reproducibly with every product surface' site_builder_is_reproducible_and_complete
 run_test 'public-console builder refuses destructive broad targets' site_builder_rejects_broad_targets
 
