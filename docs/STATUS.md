@@ -5,7 +5,7 @@
 > The body below is a **2026-04-22 snapshot** and much of it describes a v0.4.6
 > world: the release table stops at v0.4.6, it refers to a Mac joining as a
 > "9th node", and it says the community installer pulls v0.4.6. The workspace
-> is now the **unreleased v0.7.12 recovery candidate**; public v0.7.11 is
+> is now the **unreleased v0.8.0 recovery candidate**; public v0.7.11 is
 > desktop-only, while the seeds still run v0.7.2/v0.7.9.
 >
 > Two sections have been corrected in place because they were actively
@@ -17,7 +17,7 @@
 >
 > **For current state, use these instead:**
 > - [`README.md`](../README.md) — honest release/public-network status
-> - [`docs/HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) — post-publication v0.7.12 server install
+> - [`docs/HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) — post-publication v0.8.0 server install
 > - [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) — gated recording script
 > - [`docs/VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) — blocking cutover checklist
 > - [`ALERTS.md`](../ALERTS.md) — what is broken on the live network right now
@@ -46,7 +46,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc
 
 **Historical one-command join:** retired; do not run it. The replacement is
 documented in [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) and is not usable
-until the complete v0.7.12 release is published.
+until the complete v0.8.0 release is published.
 
 ---
 

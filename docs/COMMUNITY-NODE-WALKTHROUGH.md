@@ -1,15 +1,15 @@
 # ARC community node: 2–3 minute walkthrough
 
 This is the short recording script for the repaired headless/community flow.
-The v0.7.12 recovery candidate is not published or deployed. Use this script
-only after the complete v0.7.12 CLI release is visible on GitHub and the seed
+The v0.8.0 recovery candidate is not published or deployed. Use this script
+only after the complete v0.8.0 CLI release is visible on GitHub and the seed
 rollout checklist below has been completed. Do not record against the current
 mixed v0.7.2/v0.7.9 fleet as though these branch fixes are already live.
 
 ## Before recording
 
 - Use a clean SSH-only Ubuntu 24.04 or 26.04 machine.
-- Use a fresh data directory. v0.7.12 writes `genesis.network-hash` and fails
+- Use a fresh data directory. v0.8.0 writes `genesis.network-hash` and fails
   closed when an existing WAL has no marker or a different genesis hash. Back
   up old v2 identity/data for forensics, but do not reuse or copy the v2 WAL.
   Validators need the approved canonical checkpoint migration instead.
@@ -17,44 +17,45 @@ mixed v0.7.2/v0.7.9 fleet as though these branch fixes are already live.
   every layer and that its streamed BLAKE3 artifact ID exactly matches the
   request/coordinator model ID. A multi-gigabyte download does not fit a
   three-minute recording.
-- Pick one seed that is sealing blocks and use that same seed for the worker,
-  inference request, earnings query, and explorer. Mixing seeds can mix chain
-  histories.
+- Pick one approved HTTPS seed origin that is sealing blocks and use that same
+  origin for the worker, inference request, earnings query, receipt, and
+  explorer. Mixing origins can mix chain histories during recovery.
 - Confirm the seed is on the approved v3 genesis/checkpoint and the operator
   has completed [VALIDATOR-FLEET-ROLLOUT.md](VALIDATOR-FLEET-ROLLOUT.md).
 - Confirm the canonical activation height has been reached, the local
   issuance switch is open, and independent validator approval collection is
-  ready. The combined `community_rewards_v1_enabled` field is true only when
-  all three conditions hold. In the current recovery candidate, approval
-  collection intentionally remains unavailable and issuance fails closed:
+  ready. The stable reward-policy endpoint binds readiness to the recovery
+  epoch, validator set, exact transaction domain, and all six configured RPC
+  origins:
 
   ```bash
-  # Public seed RPC is normally 9090. Port 9944 is the separate local-node
-  # default and should be used only when you intentionally target that node.
-  export ARC_RPC=http://SEED_HOST:9090
-  curl -fsS "$ARC_RPC/economics/rewards" \
-    | jq '{community_rewards_v1_enabled,
-           community_rewards_v1_protocol_active,
-           community_rewards_v1_approval_collection_ready,
-           community_rewards_v1_activation_height,
-           community_rewards_v1_issuance_enabled,
-           community_rewards_v1_note,
-           reward_per_attestation_arc,treasury_balance_arc}'
+  # Choose exactly one of the six reviewed HTTPS origins. Raw remote HTTP and
+  # :9090 are not production v3 configuration.
+  export ARC_RPC=https://149-28-32-76.nip.io
+  curl -fsS "$ARC_RPC/community/reward_policy" \
+    | jq '{schema,tx_type,protocol_active,issuance_ready,
+           readiness_unavailable_reason,active_validator_count,
+           configured_community_rpc_origins,validator_set_size_required,
+           validator_approvals_required,recovery_epoch,validator_set_id,
+           validator_set_commitment,transaction_domain,stake_zero_eligible,
+           worker_min_stake_base,reward_base,reward_arc,earnings_evidence}'
   ```
 
-If the activation height is null, the issuance switch is false, approval
-collection is false, or the effective enabled field is false, demonstrate
+For the six-validator recovery network, `configured_community_rpc_origins` is
+the integer `6`, `validator_approvals_required` is `5`, and
+`stake_zero_eligible` is true. If `issuance_ready` is false, any epoch/domain
+field is absent, or the returned set does not match the locked rollout, show
 verified inference only. Do not say the worker earned a reward.
-An absent genesis activation fails closed. Missing validator approval quorum
-also fails closed; the CLI flag alone cannot turn issuance on.
+An absent genesis activation fails closed. Missing validator approval quorum also fails
+closed; the CLI flag alone cannot turn issuance on.
 
 ## 0:00–0:35 — install without a screen
 
 Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
-curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/install.sh
-bash install.sh --version 0.7.12 --model /absolute/path/to/model.gguf
+curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 
 The installer resolves one exact semantic-versioned release, verifies every
@@ -114,9 +115,15 @@ curl -fsS -X POST "$ARC_RPC/inference/run" \
         range_position_quorums:.verification.range_position_quorums,
         signatures_required_per_quorum:.verification.signatures_required_per_quorum,
         replicas_contacted_per_quorum:.verification.replicas_contacted_per_quorum},
-        settlement:{status:.settlement.status,included:.settlement.included,
-        reward_tx_hash:.settlement.reward_tx_hash,reason:.settlement.reason,
-        error:.settlement.error}}'
+        settlement:{status:.settlement.status,submitted:.settlement.submitted,
+        included:.settlement.included,tx_hash:.settlement.tx_hash,
+        job_id:.settlement.job_id,receipt_url:.settlement.receipt_url,
+        recovery_epoch:.settlement.recovery_epoch,
+        validator_set_id:.settlement.validator_set_id,
+        transaction_domain:.settlement.transaction_domain,
+        validator_approvals:.settlement.validator_approvals,
+        required_validator_approvals:.settlement.required_validator_approvals,
+        reason:.settlement.reason}}'
 ```
 
 `routed_via` must begin with `community:`. If it says `local`, the seed fell
@@ -135,30 +142,41 @@ stake; with six equally staked validators, five approvals are required.
 ## 2:05–2:40 — prove payment, not just submission
 
 ```bash
+export ARC_REWARD_TX=$(jq -r '.settlement.tx_hash // empty' /tmp/arc-inference.json)
+test -n "$ARC_REWARD_TX"
+curl -fsS "$ARC_RPC/community/reward_receipt/$ARC_REWARD_TX" \
+  | jq '{status,tx_type,tx_hash,job_id,worker,model_id,input_hash,output_hash,
+         recovery_epoch,validator_set_id,transaction_domain,
+         validator_approvals,included,confirmed,success,block_height,block_hash,
+         reward_base,reward_arc,evidence_source}'
+
 curl -fsS "$ARC_RPC/worker/earnings/$ARC_WORKER" \
-  | jq '{onchain_balance_arc,total_rewards,estimated_total_arc,
-         reward_per_attestation_arc,last_reward_block,last_reward_tx_hash,
-         attestations_per_day_observed,attestations_per_day_unavailable_reason,
-         community_rewards_v1_enabled,
-         community_rewards_v1_approval_collection_ready,
-         community_rewards_v1_note}'
+  | jq '{onchain_balance_arc,confirmed_receipt_count,
+         confirmed_gross_earnings_base,confirmed_gross_earnings_arc,
+         confirmed_receipts,projected_daily_arc,
+         projected_daily_unavailable_reason,projection_policy,
+         reward_per_attestation_base,reward_per_attestation_arc,
+         recovery_epoch,validator_set_id,stake_zero_eligible,
+         last_reward_block,last_reward_tx_hash}'
 ```
 
 Narration:
 
 - `onchain_balance_arc` is the address’s actual current chain balance.
-- `total_rewards` counts only successful, mined
+- `confirmed_receipt_count` counts only successful, mined
   `CommunityInferenceReward` receipts visible in this node’s retained index.
-- `estimated_total_arc` is gross retained-window reward history, not the
-  wallet balance and not a promise of future work.
-- An observed rate appears only when real timestamps provide a measurement. An
-  unavailable value stays null rather than being invented.
+- `confirmed_receipts` provides the rows, including block and recovery-domain
+  bindings, that sum to `confirmed_gross_earnings_base`.
+- `projected_daily_arc` appears only when an explicit active policy, confirmed
+  receipt rate, and funded treasury support it. Otherwise it stays null and
+  `projected_daily_unavailable_reason` says why.
 
-Open `last_reward_tx_hash` in the static explorer, select the same seed as the
-data source, prove the transaction type is `CommunityInferenceReward` (`0x25`),
-and show the successful receipt. A mined raw `InferenceAttestation` (`0x16`)
-pays nothing. If the hash is null, pruned, a different type, or unsuccessful,
-the reward is not proven—wait or say so plainly.
+The receipt must say `status: mined_success`, `confirmed: true`, `success:
+true`, and `tx_type: 0x25` before the amount is earned. Then open the same hash
+in the static explorer, select the same origin as the data source, and show the
+matching block. A mined raw `InferenceAttestation` (`0x16`) pays nothing. If the
+hash is null, pending, pruned, a different type, or unsuccessful, the reward is
+not proven—wait or say so plainly.
 
 ## Recording stop conditions
 

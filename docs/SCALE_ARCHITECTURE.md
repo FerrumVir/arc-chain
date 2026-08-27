@@ -3,7 +3,7 @@
 > **Historical design record.** The session observations below are not current
 > production claims. As of the 2026-08-26 read-only audit, the six public seeds
 > were version-skewed and returned six different hashes and state roots at a
-> common height; v0.7.12 remains unpublished and undeployed. See
+> common height; v0.8.0 remains unpublished and undeployed. See
 > [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
 
 **Status:** Design doc, 2026-04-20. Supersedes ad-hoc assumptions baked into the v0.5.2 seed deployment.

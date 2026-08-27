@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "arc-agents"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bench"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-bincode",
  "arc-consensus",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bincode"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "cu-bincode",
  "hex",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "arc-channel"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "arc-cli"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-crypto",
@@ -280,15 +280,17 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "k256",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
 name = "arc-consensus"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -307,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "arc-crypto"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "blst",
@@ -338,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "arc-gpu"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -363,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "arc-inference"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-crypto",
  "arc-gpu",
@@ -385,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "arc-mempool"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -402,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "arc-net"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-bincode",
@@ -427,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "arc-node"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-bincode",
@@ -483,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "arc-relayer"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-types",
@@ -504,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "arc-state"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -527,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "arc-types"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -542,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "arc-vm"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-crypto",
  "arc-state",

@@ -597,7 +597,7 @@ export interface Tier1Result {
 }
 
 /** Legacy paid-inference response shape, retained only for IPC compatibility.
- *  The v0.7.12 recovery candidate rejects new escrow writes before signing. */
+ *  The v0.8.0 recovery candidate rejects new escrow writes before signing. */
 export interface PaidInferenceResult {
   input: string;
   output: string;

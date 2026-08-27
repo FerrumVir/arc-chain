@@ -147,13 +147,13 @@ test.describe("UpdateController", () => {
     expect(controller.getSnapshot().phase).toBe("checking");
 
     pending.resolve({
-      version: "0.7.12",
+      version: "0.8.0",
       downloadAndInstall: async () => {},
     });
     await first;
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      version: "0.7.12",
+      version: "0.8.0",
       canInstall: true,
     });
     controller.dispose();
@@ -173,7 +173,7 @@ test.describe("UpdateController", () => {
     };
     const controller = createUpdateController({
       supported: true,
-      check: async () => ({ version: "0.7.12", downloadAndInstall }),
+      check: async () => ({ version: "0.8.0", downloadAndInstall }),
       relaunch: () => {
         relaunchCalls += 1;
         return relaunchDone.promise;
@@ -194,7 +194,7 @@ test.describe("UpdateController", () => {
     while (relaunchCalls === 0) await Promise.resolve();
     expect(controller.getSnapshot()).toMatchObject({
       phase: "ready",
-      version: "0.7.12",
+      version: "0.8.0",
       restartRequired: true,
       error: null,
     });
@@ -209,7 +209,7 @@ test.describe("UpdateController", () => {
     const controller = createUpdateController({
       supported: true,
       check: async () => ({
-        version: "0.7.12",
+        version: "0.8.0",
         downloadAndInstall: async () => {
           throw new Error("signature verification failed");
         },
@@ -240,7 +240,7 @@ test.describe("UpdateController", () => {
       check: async () => {
         checkCalls += 1;
         return {
-          version: "0.7.12",
+          version: "0.8.0",
           downloadAndInstall: async () => {},
         };
       },
@@ -277,7 +277,7 @@ test.describe("UpdateController", () => {
         checkCalls += 1;
         if (checkCalls === 1) {
           return {
-            version: "0.7.12",
+            version: "0.8.0",
             downloadAndInstall: async () => {
               oldInstalls += 1;
             },

@@ -6,7 +6,7 @@
 > **Historical proposal, not current rollout state.** Do not use the endpoints,
 > committee sizes, rewards, or deployment expectations below as evidence that
 > Tier 1 is live. The 2026-08-26 public fleet is forked/version-skewed and the
-> v0.7.12 recovery candidate is not published or deployed. See
+> v0.8.0 recovery candidate is not published or deployed. See
 > [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
 > The candidate desktop disables both Tier 1 request submission and paid
 > escrow before signing or network I/O. VRF selection is not validator

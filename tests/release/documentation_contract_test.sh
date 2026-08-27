@@ -15,7 +15,8 @@ GETTING_STARTED="$REPO_ROOT/docs/GETTING_STARTED.md"
 STATUS_DOC="$REPO_ROOT/docs/STATUS.md"
 ANNOUNCEMENT="$REPO_ROOT/docs/ANNOUNCEMENT.md"
 DEMO_RUNBOOK="$REPO_ROOT/docs/DEMO-RUNBOOK.md"
-CANDIDATE_VERSION=0.7.12
+RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
+CANDIDATE_VERSION=0.8.0
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -27,6 +28,7 @@ require_literal() {
 
 candidate_version_is_consistent() {
     local workspace_version desktop_cargo_version desktop_tauri_version
+    local desktop_npm_version desktop_npm_lock_version desktop_npm_lock_root_version
     workspace_version="$(awk '
         /^\[workspace\.package\]$/ { in_package=1; next }
         /^\[/ { in_package=0 }
@@ -50,6 +52,15 @@ candidate_version_is_consistent() {
     desktop_tauri_version="$(python3 -c \
         'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
         "$REPO_ROOT/desktop/src-tauri/tauri.conf.json")"
+    desktop_npm_version="$(python3 -c \
+        'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+        "$REPO_ROOT/desktop/package.json")"
+    desktop_npm_lock_version="$(python3 -c \
+        'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' \
+        "$REPO_ROOT/desktop/package-lock.json")"
+    desktop_npm_lock_root_version="$(python3 -c \
+        'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["packages"][""]["version"])' \
+        "$REPO_ROOT/desktop/package-lock.json")"
 
     assert_equals "$CANDIDATE_VERSION" "$workspace_version" \
         'workspace version does not match the documented recovery candidate' || return 1
@@ -57,9 +68,17 @@ candidate_version_is_consistent() {
         'desktop Cargo version does not match the recovery candidate' || return 1
     assert_equals "$CANDIDATE_VERSION" "$desktop_tauri_version" \
         'Tauri version does not match the recovery candidate' || return 1
+    assert_equals "$CANDIDATE_VERSION" "$desktop_npm_version" \
+        'desktop npm package version does not match the recovery candidate' || return 1
+    assert_equals "$CANDIDATE_VERSION" "$desktop_npm_lock_version" \
+        'desktop npm lock document version does not match the recovery candidate' || return 1
+    assert_equals "$CANDIDATE_VERSION" "$desktop_npm_lock_root_version" \
+        'desktop npm lock package root does not match the recovery candidate' || return 1
+    require_literal "$RELEASE_WORKFLOW" '"desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION"' \
+        'release tag gate does not validate the npm lock package root' || return 1
     require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Unreleased recovery candidate" \
         'changelog is missing the unreleased candidate heading' || return 1
-    require_literal "$README" "v$CANDIDATE_VERSION/v3" \
+    require_literal "$README" "v$CANDIDATE_VERSION / protocol v3" \
         'README does not identify the candidate version' || return 1
 }
 
@@ -74,10 +93,42 @@ candidate_install_commands_are_exact_and_honest() {
         require_literal "$file" 'not published' \
             'candidate install guide could be mistaken for an already-published release' || return 1
     done
-    if grep -Fq '0.8.0' "$README" "$HEADLESS" "$WALKTHROUGH" "$ROLLOUT"; then
-        printf 'a future v0.8.0 example remains in the v0.7.12 operator docs\n'
+    if grep -Fq '0.7.12' "$README" "$HEADLESS" "$WALKTHROUGH" "$ROLLOUT"; then
+        printf 'the superseded v0.7.12 candidate remains in active v0.8.0 operator docs\n'
         return 1
     fi
+}
+
+production_origins_and_evidence_are_exact() {
+    local origin
+    for origin in \
+        https://149-28-32-76.nip.io \
+        https://140-82-16-112.nip.io \
+        https://136-244-109-1.nip.io \
+        https://104-238-171-11.nip.io \
+        https://202-182-107-41.nip.io \
+        https://149-28-153-31.nip.io
+    do
+        require_literal "$README" "$origin" \
+            'README is missing an exact production HTTPS origin' || return 1
+        require_literal "$REPO_ROOT/desktop/src-tauri/src/rpc_client.rs" "$origin" \
+            'Rust desktop defaults are missing an exact production HTTPS origin' || return 1
+        require_literal "$REPO_ROOT/desktop/src/lib/tauri.ts" "$origin" \
+            'browser fallback defaults are missing an exact production HTTPS origin' || return 1
+    done
+
+    if grep -Eq 'releases/latest/download/arc-(node|cli|desktop)' "$README"; then
+        printf 'README still sends a release asset through the stale moving latest alias\n'
+        return 1
+    fi
+    require_literal "$README" 'only a successful mined receipt confirms the 1 ARC credit' \
+        'README presents faucet submission as confirmed credit' || return 1
+    require_literal "$README" 'confirmed mined `0x25` receipt rows' \
+        'README does not define the worker earnings evidence boundary' || return 1
+    require_literal "$README" 'otherwise the value is null and the API returns the reason' \
+        'README does not define fail-closed projected earnings' || return 1
+    require_literal "$WALKTHROUGH" '/community/reward_receipt/$ARC_REWARD_TX' \
+        'walkthrough does not poll the exact reward receipt endpoint' || return 1
 }
 
 manual_updater_commands_are_identical() {
@@ -90,7 +141,7 @@ manual_updater_commands_are_identical() {
         require_literal "$file" "$system_command" \
             'system updater command drifted between operator docs' || return 1
     done
-    require_literal "$HEADLESS" 'do not pin v0.7.12' \
+    require_literal "$HEADLESS" 'do not pin v0.8.0' \
         'updater docs do not distinguish discovery from the pinned initial install' || return 1
 }
 
@@ -142,7 +193,7 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
     done
     require_literal "$README" 'Do not reuse a v0.7.11-or-earlier data directory.' \
         'README does not fail closed on v2 WAL reuse' || return 1
-    require_literal "$HEADLESS" 'Do not point v0.7.12 at a v0.7.11-or-earlier data directory.' \
+    require_literal "$HEADLESS" 'Do not point v0.8.0 at a v0.7.11-or-earlier data directory.' \
         'headless guide does not require a fresh observer data directory' || return 1
     require_literal "$WALKTHROUGH" 'Validators need the approved canonical checkpoint migration instead.' \
         'walkthrough omits the validator checkpoint-only migration rule' || return 1
@@ -156,10 +207,11 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
         'README could present install rollback as persisted-state migration' || return 1
 }
 
-run_test 'workspace, desktop, changelog, and README agree on unreleased v0.7.12' candidate_version_is_consistent
-run_test 'candidate install commands pin exact v0.7.12 without claiming publication' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
+run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
+run_test 'production origins and receipt-backed status copy are exact' production_origins_and_evidence_are_exact
 run_test 'activation copy fails closed and archived guides carry recovery warnings' activation_and_archived_guides_fail_closed_in_copy
 run_test 'operator docs require fresh v3 state, loopback RPC, and full transaction rollback' persistence_rpc_and_transaction_copy_match_the_installer
 

@@ -808,7 +808,7 @@ function InferenceModeToggle() {
           <div style={{ fontWeight: 500 }}>Coordinator</div>
           <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
             Tries your local node, then the selected coordinator path. The
-            v0.7.12 candidate accepts community work only after authenticated
+            v0.8.0 candidate accepts community work only after authenticated
             2-of-3 recomputation for every layer range and token. Older public
             seeds may return less evidence, which the result screen labels.
           </div>

@@ -184,7 +184,7 @@ pub async fn fetch_status(
     }
 }
 
-/// Parse only the v0.7.12 mined-community-reward receipt contract.
+/// Parse only the v0.8.0 mined-community-reward receipt contract.
 ///
 /// Public v2 also answers `/worker/earnings/:address` with HTTP 200, but that
 /// older body is raw-0x16 count × constant display arithmetic. HTTP success is
@@ -314,7 +314,7 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
 
 /// Fetch this worker's confirmed community rewards.
 ///
-/// Only the v0.7.12 receipt/readiness response above can produce numeric
+/// Only the v0.8.0 receipt/readiness response above can produce numeric
 /// earnings. Older endpoints and inference caches are deliberately unavailable
 /// rather than converted into ARC.
 ///
@@ -1315,7 +1315,7 @@ pub struct Tier1Result {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Chain visibility + projection reads (v0.7.12)
+// Chain visibility + projection reads (v0.8.0)
 // ═════════════════════════════════════════════════════════════════════════
 
 /// ARC base units per whole ARC. Balances and stakes cross the wire as

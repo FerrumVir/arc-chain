@@ -3,7 +3,7 @@
 > **Historical evidence catalog — not current production status.** Several URLs,
 > topology claims, and verification labels below predate the 2026-08-26 audit.
 > The public fleet is forked and version-skewed, community completed work was
-> zero in that read-only snapshot, and v0.7.12 is not published or deployed.
+> zero in that read-only snapshot, and v0.8.0 is not published or deployed.
 > A matching public-v2 hash does not prove exact model bytes or payment. Use
 > [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
 > for the current evidence boundary and re-run every receipt before quoting it.

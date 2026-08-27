@@ -18,12 +18,13 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.7.12 - Unreleased recovery candidate
+## v0.8.0 - Unreleased recovery candidate
 
 - Restores one checksummed release graph for headless Linux amd64/arm64,
   Intel/Apple-Silicon macOS, Windows CLI, and signed desktop bundles. The
   installer resolves one exact version, works without a display, and refuses
-  downgrade or unverified replacement.
+  downgrade or unverified replacement. Workspace, Tauri, desktop npm, and lock
+  metadata are all pinned to v0.8.0 before a matching tag can publish.
 - Adds the typed `arc health` command and makes the installer use it for
   readiness, accepting only explicit JSON `ok` or `degraded` states. Install
   and upgrade now share a complete rollback transaction across binaries,
@@ -50,9 +51,22 @@ All notable changes to ARC Chain are tracked here. This project follows
   gate; none are ignored.
 - Introduces authenticated v3 community registration/heartbeat/claim/submit,
   exact model-ID routing, one-job worker capacity, bounded payloads/timeouts,
-  independent 2-of-3 range verification, and validator-authorized,
-  replay-protected 2.5 ARC reward transactions. Pending or rejected rewards
-  are never reported as earned.
+  independent 2-of-3 range verification, and five-of-six active-validator,
+  replay-protected 2.5 ARC reward transactions. Stable policy, approval, job,
+  receipt, and earnings endpoints bind evidence to the recovery epoch,
+  validator set, transaction domain, exact model/input/output, and mined
+  `0x25` receipt. Pending or rejected rewards are never reported as earned;
+  projections fail closed unless policy, receipt history, and treasury support
+  them. Stake-zero worker eligibility is explicit policy, not an installer
+  promise.
+- Separates RPC from P2P discovery and configures all six reviewed dashed
+  `https://*.nip.io` origins explicitly. Remote plaintext, credentials, URL
+  paths, query strings, fragments, wildcard listeners, and port zero are
+  rejected outside the deliberate local/dev escape hatch.
+- Moves wallet transfer signing into Rust so the seed never crosses IPC,
+  parses and formats ARC with exactly nine decimal base-unit precision, and
+  treats sends and 1 ARC faucet claims as pending until the chain returns a
+  successful mined receipt.
 - Authenticates P2P session transcripts with TLS-exporter-bound Ed25519
   identities, enforces pinned certificates in strict mode, caps frames and
   decoders, and binds claimed identities to signed payloads.

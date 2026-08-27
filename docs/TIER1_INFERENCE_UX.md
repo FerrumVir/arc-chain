@@ -5,7 +5,7 @@
 **Audience:** Anyone evaluating what users will actually see when Tier 1 ships.
 
 > **Not shipped.** This is a proposed experience, not the public v0.7.11 UI or
-> the unreleased v0.7.12 recovery contract. Reward amounts and validator-vote
+> the unreleased v0.8.0 recovery contract. Reward amounts and validator-vote
 > examples below are design assumptions, not evidence of current work or
 > payment. The recovery candidate treats only a successful mined `0x25`
 > community-reward receipt as payment and currently fails closed while approval

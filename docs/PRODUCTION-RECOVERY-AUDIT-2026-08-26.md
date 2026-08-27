@@ -1,7 +1,7 @@
 # ARC production-recovery audit — 2026-08-26
 
 This is a read-only evidence snapshot plus the contract of the unreleased
-v0.7.12/v3 recovery candidate. It is not a deployment announcement. No seed was
+v0.8.0/v3 recovery candidate. It is not a deployment announcement. No seed was
 restarted, upgraded, rekeyed, or otherwise mutated during this audit.
 
 ## What community reports correctly identified
@@ -47,7 +47,7 @@ This is a confirmed fork, not one replicated testnet. An advancing DAG round or
 The snapshot will age. Re-run the same-height hash/root and latest-block-age
 checks before making a current claim; never silently blend seeds.
 
-## What v0.7.12 changes — and what remains blocked
+## What v0.8.0 changes — and what remains blocked
 
 The candidate unifies one release publisher for checksummed headless and
 desktop artifacts: Linux amd64/arm64, Intel and Apple Silicon macOS, Windows
@@ -103,7 +103,7 @@ Free/community inference remains available without opening escrow.
 
 ## Answers operators can give today
 
-- **Is v0.7.12 available?** No. It is not published or deployed. Its pinned
+- **Is v0.8.0 available?** No. It is not published or deployed. Its pinned
   install URL becomes valid only after the complete GitHub release exists.
 - **Are the seeds upgraded?** No. The audited public fleet was one v0.7.2 and
   five v0.7.9 nodes. A coordinated v3 cutover has not occurred.

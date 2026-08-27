@@ -1,6 +1,6 @@
 # Getting Started with ARC Node
 
-> **Recovery notice (2026-08-26):** v0.7.12 is an unreleased recovery
+> **Recovery notice (2026-08-26):** v0.8.0 is an unreleased recovery
 > candidate; the public v0.7.11 release is desktop-only, and the public seeds
 > still run older split/stalled chain state. This guide predates that recovery
 > and is not proof that community work or rewards are live. For an SSH/VPS
@@ -50,7 +50,7 @@ earned token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
 
 ### Linux (Ubuntu / Debian)
 
-After the complete v0.7.12 release is published, use its normalized desktop
+After the complete v0.8.0 release is published, use its normalized desktop
 asset name:
 
 ```bash
@@ -198,7 +198,7 @@ This is testnet ARC — no real-world value.
 2. Treat only a successful mined `CommunityInferenceReward` (`0x25`) receipt as
    payment. Raw `0x16` rows are shown separately as unpaid inference claims.
 
-The unreleased v0.7.12 candidate configures 2.5 testnet ARC per successful
+The unreleased v0.8.0 candidate configures 2.5 testnet ARC per successful
 `0x25` receipt, but issuance also requires exact-artifact work assignment,
 authenticated recomputation, a signed worker certificate, active genesis
 protocol activation, validator approval collection, strict

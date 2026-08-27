@@ -638,7 +638,7 @@ export function Dashboard() {
                 Recent inference claims
                 <InfoPopover title="What this evidence proves">
                   <p>
-                    In the v0.7.12 candidate, a worker is eligible only after
+                    In the v0.8.0 candidate, a worker is eligible only after
                     it fully loads the exact model artifact requested. The
                     coordinator independently recomputes every token through
                     authenticated 2-of-3 agreement for each layer range.

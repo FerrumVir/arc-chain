@@ -7,7 +7,7 @@ production procedure.
 ## Production recovery boundary (2026-08-26)
 
 The public v2 validator fleet has mixed versions and divergent chain state.
-The v0.7.12 recovery candidate is not published or deployed. An HTTP response
+The v0.8.0 recovery candidate is not published or deployed. An HTTP response
 from one seed therefore proves only that one process answered; it does not
 prove shared-chain progress, finality, inference assignment, or payment.
 
@@ -76,16 +76,16 @@ resolves either the latest release or one exact pin, requires every platform
 asset, and verifies all downloads with that release's `SHA256SUMS`. It does not
 walk backward through old tags: an incomplete release fails closed.
 
-Public v0.7.10 and v0.7.11 were desktop-only releases. The v0.7.12 recovery
+Public v0.7.10 and v0.7.11 were desktop-only releases. The v0.8.0 recovery
 candidate and its restored headless asset matrix are not published yet, so the
 commands below are release-shape examples, not a claim that GitHub's current
 `latest` release can install every platform today.
 
 ```bash
-# Example only after the v0.7.12 release is explicitly approved and published:
+# Example only after the v0.8.0 release is explicitly approved and published:
 curl --fail --silent --show-error --location --output install.sh \
-  https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/install.sh
-bash install.sh --version 0.7.12
+  https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+bash install.sh --version 0.8.0
 ```
 
 The candidate service launches with `--stake 0 --min-stake 0 --community-mode`.
@@ -171,10 +171,10 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 
 **I want to join the network as a community node:**
 ```bash
-# Only after v0.7.12 is explicitly approved and published:
+# Only after v0.8.0 is explicitly approved and published:
 curl --fail --silent --show-error --location --output install.sh \
-  https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/install.sh
-bash install.sh --version 0.7.12
+  https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+bash install.sh --version 0.8.0
 ```
 
 **I want to reproduce the factual benchmark:**

@@ -1,7 +1,7 @@
 # ARC Chain — Demo Runbook
 
 > **Recovery notice (2026-08-26):** this live-network runbook records the old
-> v0.7.2/v0.7.9 fleet and is not the v0.7.12 launch walkthrough. v0.7.12 is
+> v0.7.2/v0.7.9 fleet and is not the v0.8.0 launch walkthrough. v0.8.0 is
 > still unpublished and undeployed. Do not use the legacy v0.7.7 installer
 > path below; the gated replacement is
 > [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) after
@@ -106,7 +106,7 @@ bash tests/release/run.sh
 
 At the 2026-08-17 audit, v0.7.7 was the last public release with CLI binaries;
 it is historical, not the repaired “latest CLI.” v0.7.10 and v0.7.11 are
-desktop-only. The unreleased v0.7.12 candidate adds checksummed Linux
+desktop-only. The unreleased v0.8.0 candidate adds checksummed Linux
 x86_64/arm64 and macOS arm64/x86_64 headless assets, but no install command may
 be presented as live until that complete release is published.
 
@@ -491,7 +491,7 @@ has the most ways to go wrong, so the framing matters more than the clicks.
 
 The former “strong version” credited 2.5 ARC from the raw
 `InferenceAttestation` (`0x16`) path on an isolated local chain. That is not the
-v0.7.12 reward contract and must not be presented as evidence that community
+v0.8.0 reward contract and must not be presented as evidence that community
 workers are paid. In the recovery candidate:
 
 - `0x16` is a computation claim and **never pays a reward**;
@@ -558,7 +558,7 @@ curl -s $ARC_WALLET_SEED/worker/earnings/$ADDR
 ```
 
 On the public v2 seeds, the number is legacy **display arithmetic** based on raw
-attestation count. It is not income. In the unreleased v0.7.12/v3 candidate,
+attestation count. It is not income. In the unreleased v0.8.0/v3 candidate,
 the endpoint instead counts retained successful mined `0x25` reward receipts.
 Be precise about the public response:
 

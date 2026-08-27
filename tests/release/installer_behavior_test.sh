@@ -241,7 +241,7 @@ invalid_version_pin_fails_before_asset_download() {
 }
 
 no_service_no_updater_really_is_install_only() {
-    local sandbox output seed_value
+    local sandbox output seed_value origin origin_count
     new_sandbox
     sandbox="$NEW_SANDBOX"
     output="$sandbox/install.out"
@@ -285,6 +285,21 @@ no_service_no_updater_really_is_install_only() {
         'generated observer runner does not force stake to zero' || return 1
     assert_file_contains "$sandbox/arc/bin/run-arc-node" '--min-stake 0' \
         'generated observer runner does not disable validator minimum stake' || return 1
+    origin_count="$(grep -o -- '--community-rpc-url' "$sandbox/arc/bin/run-arc-node" | wc -l | tr -d ' ')"
+    assert_equals 6 "$origin_count" \
+        'generated runner must pass exactly six explicit community RPC origins' || return 1
+    for origin in \
+        https://149-28-32-76.nip.io \
+        https://140-82-16-112.nip.io \
+        https://136-244-109-1.nip.io \
+        https://104-238-171-11.nip.io \
+        https://202-182-107-41.nip.io \
+        https://149-28-153-31.nip.io
+    do
+        assert_log_contains_literal "$sandbox/arc/bin/run-arc-node" \
+            "--community-rpc-url $origin" \
+            "generated runner is missing reviewed origin: $origin" || return 1
+    done
     assert_file_contains "$sandbox/arc/genesis.toml" \
         '^validator_set_complete[[:space:]]*=[[:space:]]*false$' \
         'installed release genesis is not an explicit observer placeholder' || return 1

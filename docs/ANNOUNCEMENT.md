@@ -3,7 +3,7 @@
 > **DO NOT PUBLISH OR USE AS CURRENT INSTALL INSTRUCTIONS.** This is an April
 > 2026 promotional snapshot. Its “live,” one-command join, daily auto-update,
 > universal model-ID, quality, and availability claims do not describe the
-> public network audited on 2026-08-26. v0.7.12 is an unreleased recovery
+> public network audited on 2026-08-26. v0.8.0 is an unreleased recovery
 > candidate; public v0.7.11 is desktop-only and the seeds remain on older,
 > divergent/stalled binaries. Use [`../README.md`](../README.md) for current
 > status, [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) for the gated server

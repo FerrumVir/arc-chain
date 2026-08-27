@@ -415,7 +415,7 @@ pub struct ResetPeerStateResult {
 }
 
 /// Legacy paid-inference response shape, retained for IPC compatibility.
-/// The v0.7.12 recovery candidate rejects new escrow writes before signing.
+/// The v0.8.0 recovery candidate rejects new escrow writes before signing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaidInferenceResult {
@@ -432,7 +432,7 @@ pub struct PaidInferenceResult {
     pub release_tx_hash: String,
 }
 
-// ── Chain-visibility + projection types (v0.7.12) ─────────────────────────
+// ── Chain-visibility + projection types (v0.8.0) ─────────────────────────
 //
 // Every struct below carries `unavailable: Option<String>` and
 // `source_host: String`.

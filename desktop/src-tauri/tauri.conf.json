@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ARC Node",
-  "version": "0.7.12",
+  "version": "0.8.0",
   "identifier": "network.arc.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -45,7 +45,7 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Run an ARC verifiable AI inference node",
-    "longDescription": "ARC Node lets anyone run a verifiable AI inference node on their machine. Earn ARC tokens for every request your node serves. Cryptographic attestations prove your compute is honest.",
+    "longDescription": "ARC Node runs verifiable AI inference on your machine. Community work is independently verified; ARC is shown as earned only after a successful mined reward receipt.",
     "createUpdaterArtifacts": true,
     "macOS": {
       "minimumSystemVersion": "11.0",

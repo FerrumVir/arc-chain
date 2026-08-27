@@ -4,12 +4,12 @@ This guide is for EC2, VPS, SSH-only, and other machines with no graphical
 session. The desktop `.dmg`, `.exe`, AppImage, `.deb`, and `.rpm` packages are
 GUI applications; they are not substitutes for the headless `arc-node` binary.
 
-> **Release status — do not skip:** v0.7.12 is an unreleased recovery
+> **Release status — do not skip:** v0.8.0 is an unreleased recovery
 > candidate. The current public v0.7.11 release is desktop-only and cannot
-> install an SSH/headless node. The v0.7.12 commands below become valid only
+> install an SSH/headless node. The v0.8.0 commands below become valid only
 > after GitHub shows that exact release with `arc-node`, `arc-cli`, `install.sh`,
 > `genesis.toml`, `testnet-seeds.txt`, and `SHA256SUMS` assets. Nothing here
-> claims that v0.7.12 is already deployed to the public seeds. v0.7.12 is not published or deployed.
+> claims that v0.8.0 is already deployed to the public seeds. v0.8.0 is not published or deployed.
 
 ## Supported release targets
 
@@ -29,13 +29,13 @@ Linux ARM64 desktop bundle and no Windows ARM64 release.
 
 ## Linux and macOS
 
-After the complete v0.7.12 release is published, download that exact installer
+After the complete v0.8.0 release is published, download that exact installer
 asset and pin the same version when running it. Keeping download and execution
 separate makes network errors visible and lets you inspect the script first.
 
 ```bash
-curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/install.sh
-bash install.sh --version 0.7.12
+curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+bash install.sh --version 0.8.0
 ```
 
 The installer does not resolve `releases/latest/download` for the programs. It
@@ -49,16 +49,16 @@ error; it never silently walks backward to an old version.
 
 ```bash
 # Non-root Linux: ~/.arc plus a systemd user service
-bash install.sh --version 0.7.12
+bash install.sh --version 0.8.0
 
 # Root/sudo Linux: root-owned programs in /var/lib/arc-chain and a system
 # service whose node process/data/identity belong to the invoking sudo user.
 # A direct root login intentionally runs the node as root.
-sudo bash install.sh --version 0.7.12 --system-service
+sudo bash install.sh --version 0.8.0 --system-service
 
 # Custom install root, chain data volume, RPC, and P2P ports
 bash install.sh \
-  --version 0.7.12 \
+  --version 0.8.0 \
   --install-dir "$HOME/.arc-custom" \
   --data-dir "$HOME/arc-chain-data" \
   --port 19090 \
@@ -66,10 +66,10 @@ bash install.sh \
 
 # Install and verify only. No service, background process, health request, or
 # update schedule is created.
-bash install.sh --version 0.7.12 --no-service --no-auto-update
+bash install.sh --version 0.8.0 --no-service --no-auto-update
 
 # Load a local model and become eligible to execute compatible inference work.
-bash install.sh --version 0.7.12 --model /absolute/path/to/model.gguf
+bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 
 The default node is deliberately `--stake 0 --community-mode`, with the EVM RPC
@@ -120,12 +120,12 @@ support channel.
 
 ### v2 data directories are not upgrade inputs
 
-v0.7.12 binds persisted state to the exact network identity. On first use of a
+v0.8.0 binds persisted state to the exact network identity. On first use of a
 fresh data directory it writes `genesis.network-hash`. Startup fails closed if
 an existing WAL has no marker or if the stored hash differs from the selected
 genesis. A reachable HTTP process is not permission to bypass that check.
 
-Do not point v0.7.12 at a v0.7.11-or-earlier data directory. For a stake-zero
+Do not point v0.8.0 at a v0.7.11-or-earlier data directory. For a stake-zero
 observer, stop the old service, back up its identity and data for forensics, and
 install with a fresh data directory (for example a new `--data-dir` path). Do
 not copy the old WAL into it. A validator may move state only through the
@@ -227,7 +227,7 @@ Run the same updater manually:
 sudo /var/lib/arc-chain/bin/arc-installer --update-only --install-dir /var/lib/arc-chain --system-service
 ```
 
-Those commands intentionally do not pin v0.7.12: update mode resolves the
+Those commands intentionally do not pin v0.8.0: update mode resolves the
 newest complete release and then refuses equality or downgrade. They are
 available only when the original install kept auto-update enabled; an install
 made with `--no-auto-update` does not install `arc-installer`.
@@ -235,10 +235,10 @@ made with `--no-auto-update` does not install `arc-installer`.
 Pinning is deterministic and never means “nearest available version”:
 
 ```bash
-bash install.sh --version 0.7.12
+bash install.sh --version 0.8.0
 ```
 
-If `v0.7.12` lacks any required asset or checksum, installation fails with the
+If `v0.8.0` lacks any required asset or checksum, installation fails with the
 missing filename. If a newer version is already installed, the command refuses
 to downgrade it.
 

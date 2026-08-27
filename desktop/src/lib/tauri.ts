@@ -59,7 +59,7 @@ function liveBase(): string | null {
 const MOCK_REWARD_PER_RECEIPT = 2.5;
 
 const SETTLEMENT_WRITE_UNAVAILABLE =
-  "is unavailable in the v0.7.12 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+  "is unavailable in the v0.8.0 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
 
 function settlementWriteUnavailable(flow: string): Error {
   return new Error(`${flow} ${SETTLEMENT_WRITE_UNAVAILABLE}`);
@@ -1630,7 +1630,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.7.12",
+        version: "0.8.0",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,

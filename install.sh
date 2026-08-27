@@ -15,6 +15,18 @@ REPOSITORY="${ARC_REPOSITORY:-FerrumVir/arc-chain}"
 API_ROOT="${ARC_GITHUB_API_ROOT:-https://api.github.com/repos/${REPOSITORY}}"
 DOWNLOAD_ROOT="${ARC_GITHUB_DOWNLOAD_ROOT:-https://github.com/${REPOSITORY}/releases/download}"
 
+# Community/reward RPC is explicit HTTPS configuration, separate from QUIC
+# P2P discovery. Every managed node receives the same reviewed six origins;
+# raw remote HTTP is deliberately not configurable through the installer.
+COMMUNITY_RPC_ORIGINS=(
+    https://149-28-32-76.nip.io
+    https://140-82-16-112.nip.io
+    https://136-244-109-1.nip.io
+    https://104-238-171-11.nip.io
+    https://202-182-107-41.nip.io
+    https://149-28-153-31.nip.io
+)
+
 REQUESTED_VERSION="${ARC_NODE_VERSION:-}"
 ARG_INSTALL_DIR=""
 ARG_DATA_DIR=""
@@ -978,6 +990,9 @@ NODE_ARGS=(
     --data-dir "$NODE_DATA_DIR"
     --community-mode
 )
+for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
+    NODE_ARGS+=(--community-rpc-url "$origin")
+done
 if [ -n "$MODEL_PATH" ]; then
     NODE_ARGS+=(--model "$MODEL_PATH")
 fi

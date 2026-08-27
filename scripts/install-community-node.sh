@@ -12,5 +12,5 @@ fi
 printf '%s\n' \
     'install-community-node.sh: canonical ../install.sh was not found.' \
     'Refusing to download or execute an installer from a mutable branch.' \
-    'After v0.7.12 is approved and published, use its exact-tag installer and release checksum.' >&2
+    'After v0.8.0 is approved and published, use its exact-tag installer and release checksum.' >&2
 exit 78

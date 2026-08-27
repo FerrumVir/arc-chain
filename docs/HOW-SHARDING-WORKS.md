@@ -3,7 +3,7 @@
 > **Architecture history, not a current production guarantee.** The public-v2
 > model ID binds a shape label rather than exact weight bytes, and a per-hop
 > BLAKE3 digest detects changed bytes but does not prove an honest forward pass.
-> The unreleased v0.7.12 candidate adds exact-artifact binding and authenticated
+> The unreleased v0.8.0 candidate adds exact-artifact binding and authenticated
 > independent recomputation; its blocking determinism evidence is currently a
 > synthetic CPU ARM/x86 known-answer test, not every model or backend. The Aug
 > 26 public fleet is forked/version-skewed. See

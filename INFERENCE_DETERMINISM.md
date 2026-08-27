@@ -1,6 +1,6 @@
 # Integer inference determinism
 
-**Version:** v0.7.12 release candidate (unreleased)
+**Version:** v0.8.0 release candidate (unreleased)
 
 **Last verified locally:** 2026-08-26
 

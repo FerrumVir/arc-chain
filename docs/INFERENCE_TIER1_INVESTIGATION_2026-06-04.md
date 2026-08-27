@@ -3,7 +3,7 @@
 > **Dated incident record.** Statements below about worker count, working
 > community routing, versions, balances, and latency are observations from June
 > 4, not current status. The 2026-08-26 read-only snapshot found a mixed
-> v0.7.2/v0.7.9 fork and community `total_work_completed: 0`; v0.7.12 remains
+> v0.7.2/v0.7.9 fork and community `total_work_completed: 0`; v0.8.0 remains
 > unpublished and undeployed. See
 > [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
 

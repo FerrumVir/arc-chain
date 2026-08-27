@@ -10,9 +10,9 @@ reject one another because the meaning of consensus and reward messages
 changed. This is a coordinated quorum cutover, not a compatible rolling
 upgrade.
 
-The repository version is the **unreleased v0.7.12 recovery candidate**. Do
+The repository version is the **unreleased v0.8.0 recovery candidate**. Do
 not treat this checklist, a green local build, or a draft tag as evidence that
-v0.7.12 is published or running on any public seed.
+v0.8.0 is published or running on any public seed.
 
 Until every security gate below is complete:
 
@@ -162,7 +162,7 @@ in GitHub's settings:
   signature is not Apple or Windows platform signing.
 
 After its one tag-resolution checkout, the release workflow pins every
-downstream job to the commit SHA validated from `v0.7.12`, re-checks the remote
+downstream job to the commit SHA validated from `v0.8.0`, re-checks the remote
 tag immediately before creation, and refuses to replace an existing release.
 Its publisher is blocked on the full quality harness, Cargo
 and npm dependency policy, and the five-platform inference known-answer matrix.
@@ -223,9 +223,22 @@ maintenance halt as permission to mix protocols or lower quorum.
 7. Require all six to converge on the same advancing height/hash/root for a
    full observation window before reopening ordinary traffic.
 
-Each production validator RPC must bind loopback. Configure all six explicit
-`--community-rpc-url https://...` origins on every validator; P2P peers are not
-RPC discovery. The locked rollout installs a SHA-pinned Caddy TLS gateway for
+Each production validator RPC must bind loopback. Configure these six explicit
+origins on every validator, each as its own repeated `--community-rpc-url`
+argument; P2P peers are not RPC discovery:
+
+```text
+https://149-28-32-76.nip.io
+https://140-82-16-112.nip.io
+https://136-244-109-1.nip.io
+https://104-238-171-11.nip.io
+https://202-182-107-41.nip.io
+https://149-28-153-31.nip.io
+```
+
+`/community/reward_policy.configured_community_rpc_origins` reports the
+configured origin **count**, so the sealed production value is `6`; it does
+not return the URL array. The locked rollout installs a SHA-pinned Caddy TLS gateway for
 an exact IP-derived `nip.io` hostname (`sslip.io` is the resealed-manifest
 fallback), a loopback request/rate-limit filter, strict body limits, security
 headers, and a reviewed path allowlist. Unknown paths fail closed. Raw public

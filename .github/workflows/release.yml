@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing strict tag to release (for example v0.7.12); repository rules must separately protect it from moves
+        description: Existing strict tag to release (for example v0.8.0); repository rules must separately protect it from moves
         required: true
         type: string
 
@@ -78,6 +78,9 @@ jobs:
             }
           ' Cargo.toml)"
           DESKTOP_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')"
+          DESKTOP_NPM_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/package.json"))["version"])')"
+          DESKTOP_NPM_LOCK_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/package-lock.json"))["version"])')"
+          DESKTOP_NPM_LOCK_ROOT_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/package-lock.json"))["packages"][""]["version"])')"
           DESKTOP_CARGO_VERSION="$(awk '
             /^\[package\]$/ { in_package=1; next }
             /^\[/ { in_package=0 }
@@ -91,6 +94,9 @@ jobs:
           for pair in \
             "workspace:$WORKSPACE_VERSION" \
             "desktop-tauri:$DESKTOP_VERSION" \
+            "desktop-npm:$DESKTOP_NPM_VERSION" \
+            "desktop-npm-lock:$DESKTOP_NPM_LOCK_VERSION" \
+            "desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION" \
             "desktop-cargo:$DESKTOP_CARGO_VERSION"; do
             component="${pair%%:*}"
             actual="${pair#*:}"

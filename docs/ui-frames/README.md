@@ -3,7 +3,7 @@
 > **Historical visual snapshot only.** These populated frames and URLs do not
 > prove current inference, shared chain state, community assignment, or payment.
 > The 2026-08-26 read-only audit found the public fleet forked and
-> version-skewed with community completed work at zero; v0.7.12 is not deployed.
+> version-skewed with community completed work at zero; v0.8.0 is not deployed.
 > Do not use these images as a current product walkthrough. See
 > [`../PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](../PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
 

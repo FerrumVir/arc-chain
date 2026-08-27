@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bincode"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "cu-bincode",
  "serde",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "arc-crypto"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "blake3",
  "blst",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "arc-desktop"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-crypto",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "arc-types"
-version = "0.7.12"
+version = "0.8.0"
 dependencies = [
  "arc-bincode",
  "arc-crypto",

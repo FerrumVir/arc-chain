@@ -2,12 +2,12 @@
 
 There is currently no supported “quick join” or validator-deployment command.
 The public v2 fleet has mixed versions and divergent chain state, and the
-v0.7.12 recovery candidate is not published or deployed. Do not pipe a script
+v0.8.0 recovery candidate is not published or deployed. Do not pipe a script
 from the mutable `main` branch into a shell, derive a validator identity from a
 label, assign yourself stake, or treat one host's `/health` response as proof
 that the network is live.
 
-Community nodes are stake-zero observers. After an approved v0.7.12 release is
+Community nodes are stake-zero observers. After an approved v0.8.0 release is
 published with the complete checksummed headless asset matrix, follow the exact
 tag-pinned process in [`../docs/HEADLESS_INSTALL.md`](../docs/HEADLESS_INSTALL.md).
 That does not enroll the node as a validator or guarantee inference work,

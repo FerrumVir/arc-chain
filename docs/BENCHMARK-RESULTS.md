@@ -3,7 +3,7 @@
 > **Historical benchmark:** this run was captured against the April 7-shard,
 > 1×-replica topology. At the later 2026-04-22 snapshot, the cluster reported 6
 > layer ranges with 3× replication each. Neither topology is current production
-> evidence: the 2026-08-26 fleet is forked/version-skewed, and v0.7.12 is not
+> evidence: the 2026-08-26 fleet is forked/version-skewed, and v0.8.0 is not
 > deployed. Per-hop numbers and receipt links below are point-in-time evidence,
 > not a spec; re-run them before quoting them.
 

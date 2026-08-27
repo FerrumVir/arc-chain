@@ -3,7 +3,7 @@
 > **Historical comparison — do not quote as current capability or performance.**
 > The tables below mix an April-era seven-node topology, external estimates,
 > and design claims. They do not describe the forked/version-skewed public fleet
-> observed on 2026-08-26 or the unreleased v0.7.12 candidate. Public-v2 hashes do
+> observed on 2026-08-26 or the unreleased v0.8.0 candidate. Public-v2 hashes do
 > not bind exact model bytes; transit hashes alone are not recomputation proof;
 > and current evidence does not establish RISC-V, GPU, full-GGUF, permissionless
 > work assignment, or one-command production participation. Re-benchmark the
