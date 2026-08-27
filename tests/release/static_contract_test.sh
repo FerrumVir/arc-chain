@@ -21,6 +21,10 @@ INFERENCE_INSTALL="$REPO_ROOT/scripts/install-inference-node.sh"
 UPDATER_SIGNATURE_GATE="$TEST_DIR/verify_tauri_updater_signatures.sh"
 UPDATER_VERIFIER_MANIFEST="$TEST_DIR/tauri-updater-verifier/Cargo.toml"
 UPDATER_FIXTURE_DIR="$TEST_DIR/fixtures/tauri-updater"
+DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
+DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
+CANONICAL_SEEDS="$REPO_ROOT/testnet-seeds.txt"
+DESKTOP_SEEDS="$REPO_ROOT/desktop/src-tauri/resources/testnet-seeds.txt"
 
 REQUIRED_ASSETS='
 arc-node-linux-x86_64
@@ -67,6 +71,77 @@ required_assets_are_built_and_gated() {
             return 1
         }
     done
+}
+
+desktop_tauri_packages_are_release_compatible() {
+    python3 - "$DESKTOP_CARGO_LOCK" "$DESKTOP_NPM_LOCK" <<'PY'
+import json
+import sys
+import tomllib
+
+cargo_lock_path, npm_lock_path = sys.argv[1:]
+with open(cargo_lock_path, "rb") as handle:
+    cargo_lock = tomllib.load(handle)
+with open(npm_lock_path, encoding="utf-8") as handle:
+    npm_lock = json.load(handle)
+
+
+def cargo_version(name):
+    versions = sorted(
+        {package["version"] for package in cargo_lock["package"] if package["name"] == name}
+    )
+    if len(versions) != 1:
+        raise SystemExit(
+            f"desktop Cargo.lock must contain exactly one {name!r} version; found {versions}"
+        )
+    return versions[0]
+
+
+def npm_version(name):
+    package = npm_lock.get("packages", {}).get(f"node_modules/{name}")
+    if not package or not package.get("version"):
+        raise SystemExit(f"desktop package-lock.json is missing locked {name!r}")
+    return package["version"]
+
+
+def major_minor(version):
+    fields = version.split(".")
+    if len(fields) < 2 or not all(field.isdigit() for field in fields[:2]):
+        raise SystemExit(f"cannot compare non-semver package version {version!r}")
+    return tuple(map(int, fields[:2]))
+
+
+rust_tauri = cargo_version("tauri")
+for js_package in ("@tauri-apps/api", "@tauri-apps/cli"):
+    js_version = npm_version(js_package)
+    if major_minor(js_version) != major_minor(rust_tauri):
+        raise SystemExit(
+            "Tauri release packages are incompatible: "
+            f"Rust tauri={rust_tauri}, {js_package}={js_version}; "
+            "the exact `npx tauri build --ci ... -- --locked` release command will refuse this graph"
+        )
+
+for rust_package, js_package in (
+    ("tauri-plugin-updater", "@tauri-apps/plugin-updater"),
+    ("tauri-plugin-process", "@tauri-apps/plugin-process"),
+    ("tauri-plugin-shell", "@tauri-apps/plugin-shell"),
+):
+    rust_version = cargo_version(rust_package)
+    js_version = npm_version(js_package)
+    if js_version != rust_version:
+        raise SystemExit(
+            "paired Tauri plugin versions drifted: "
+            f"{rust_package}={rust_version}, {js_package}={js_version}"
+        )
+PY
+}
+
+packaged_desktop_network_resources_match_release() {
+    cmp -s "$CANONICAL_SEEDS" "$DESKTOP_SEEDS" || {
+        printf 'desktop packaged seed list differs from the canonical release seed list\n'
+        diff -u "$CANONICAL_SEEDS" "$DESKTOP_SEEDS" | sed -n '1,80p'
+        return 1
+    }
 }
 
 linux_arm_asset_name_is_consistent_and_required() {
@@ -726,6 +801,8 @@ relevant_shell_is_syntax_valid() {
 }
 
 run_test 'required headless assets are built and gate the sole publisher' required_assets_are_built_and_gated
+run_test 'locked Rust and JavaScript Tauri packages are release-compatible' desktop_tauri_packages_are_release_compatible
+run_test 'desktop packages the exact canonical release seed list' packaged_desktop_network_resources_match_release
 run_test 'Linux ARM uses canonical arm64 names and is release-blocking' linux_arm_asset_name_is_consistent_and_required
 run_test 'release publishes and gates a SHA256SUMS manifest' checksum_manifest_is_published_and_gated
 run_test 'installer and update-only path verify SHA-256 before replacement' installer_and_updater_verify_checksums

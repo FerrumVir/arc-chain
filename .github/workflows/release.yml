@@ -191,8 +191,8 @@ jobs:
         run: ./scripts/ci_check.sh --full
 
   # Release publication fails closed on the reviewed Cargo.lock and deny.toml.
-  # The branch CI audit is intentionally only a canary; this exact-commit gate
-  # is the release authorization for advisories, bans, sources, and licenses.
+  # Branch CI audits these same three Rust graphs; this gate repeats the policy
+  # on the validated tag commit so publication never relies on an earlier run.
   release-supply-chain:
     name: Cargo dependency policy (${{ matrix.graph }})
     needs: validate
@@ -591,24 +591,47 @@ jobs:
           RELEASE_NOTES: |
             ## Headless / server node
 
-            Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), and
-            Windows x86_64 command-line binaries are attached. Linux and macOS:
+            Every supported GUI-free target has a node and CLI binary:
+
+            - Linux x86_64/amd64: `arc-node-linux-x86_64`, `arc-cli-linux-x86_64`
+            - Linux ARM64/aarch64: `arc-node-linux-arm64`, `arc-cli-linux-arm64`
+            - macOS Apple Silicon: `arc-node-macos-arm64`, `arc-cli-macos-arm64`
+            - macOS Intel: `arc-node-macos-x86_64`, `arc-cli-macos-x86_64`
+            - Windows x86_64: `arc-node-windows-x86_64.exe`, `arc-cli-windows-x86_64.exe`
+
+            Linux and macOS install without a display using the exact release:
 
             ```bash
             curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ needs.validate.outputs.tag }}/install.sh
             bash install.sh --version ${{ needs.validate.outputs.version }}
             ```
 
-            Windows Server users can download the `arc-node-windows-x86_64.exe`
-            and `arc-cli-windows-x86_64.exe` assets and verify SHA256SUMS.
+            Windows Server users download the two `.exe` files above manually.
 
             ## Desktop GUI
 
-            Tauri updater payloads carry application-update signatures. The
-            macOS and Windows installer packages in this recovery candidate are
-            not Apple Developer ID/notarized or Windows Authenticode signed, so
-            operating-system trust approval may be required. Linux x86_64
-            packages are attached; Linux ARM64 is headless-only in this release.
+            - macOS Apple Silicon: `arc-desktop-macos-arm64.dmg`
+            - macOS Intel: `arc-desktop-macos-x86_64.dmg`
+            - Windows x86_64: `arc-desktop-windows-x86_64-setup.exe`
+            - Linux x86_64: `arc-desktop-linux-x86_64.AppImage`,
+              `arc-desktop-linux-x86_64.deb`, `arc-desktop-linux-x86_64.rpm`
+
+            Linux ARM64 is headless-only in this release. Tauri updater payloads
+            carry application-update signatures. Enabled background checks read
+            the signed manifest after startup and every 24 hours, but never
+            download or install without confirmation. In-place updates cover
+            macOS, Windows, and AppImage; `.deb` and `.rpm` remain manual package
+            upgrades. The macOS and Windows installers are not Apple Developer
+            ID/notarized or Windows Authenticode signed, so operating-system
+            trust approval may be required.
+
+            The checked-in genesis is a stake-zero migration-observer placeholder:
+            it does not activate reward issuance, and work is not guaranteed.
+            Once an approved validator genesis activates the policy, stake-zero
+            workers are eligible, but only a successful mined `0x25`
+            `CommunityInferenceReward` receipt is earned. Projected earnings are
+            null with an explicit reason unless policy, receipt-rate, and funded
+            treasury evidence are all available.
 
             Verify any asset with the attached `SHA256SUMS` file.
         run: |

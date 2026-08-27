@@ -163,6 +163,71 @@ headless_platform_claims_match_release_assets() {
         'headless guide incorrectly leaves Windows ARM64 support ambiguous' || return 1
 }
 
+desktop_and_release_notes_match_the_artifact_and_reward_contract() {
+    local asset release_notes
+    release_notes="$(awk '
+        /^[[:space:]]+RELEASE_NOTES:[[:space:]]+[|]$/ { capture=1; next }
+        capture && /^[[:space:]]+run:[[:space:]]+[|]$/ { exit }
+        capture { print }
+    ' "$RELEASE_WORKFLOW")"
+
+    for asset in \
+        arc-node-linux-x86_64 \
+        arc-cli-linux-x86_64 \
+        arc-node-linux-arm64 \
+        arc-cli-linux-arm64 \
+        arc-node-macos-arm64 \
+        arc-cli-macos-arm64 \
+        arc-node-macos-x86_64 \
+        arc-cli-macos-x86_64 \
+        arc-node-windows-x86_64.exe \
+        arc-cli-windows-x86_64.exe \
+        arc-desktop-macos-arm64.dmg \
+        arc-desktop-macos-x86_64.dmg \
+        arc-desktop-windows-x86_64-setup.exe \
+        arc-desktop-linux-x86_64.AppImage \
+        arc-desktop-linux-x86_64.deb \
+        arc-desktop-linux-x86_64.rpm
+    do
+        printf '%s\n' "$release_notes" | grep -Fq -- "$asset" || {
+            printf 'generated v0.8.0 release notes omit exact artifact name: %s\n' "$asset"
+            return 1
+        }
+    done
+
+    for asset in \
+        arc-desktop-macos-arm64.dmg \
+        arc-desktop-macos-x86_64.dmg \
+        arc-desktop-windows-x86_64-setup.exe \
+        arc-desktop-linux-x86_64.AppImage \
+        arc-desktop-linux-x86_64.deb \
+        arc-desktop-linux-x86_64.rpm
+    do
+        require_literal "$README" "$asset" \
+            'README desktop table drifted from a normalized release asset' || return 1
+    done
+
+    for literal in \
+        'Linux ARM64 is headless-only' \
+        'download or install without confirmation' \
+        'stake-zero' \
+        'only a successful mined `0x25`' \
+        'Projected earnings are' \
+        'null with an explicit reason'
+    do
+        printf '%s\n' "$release_notes" | grep -Fq -- "$literal" || {
+            printf 'generated v0.8.0 release notes omit required support/evidence copy: %s\n' "$literal"
+            return 1
+        }
+    done
+
+    if grep -Eq 'releases/(download|tag)/v0[.]7[.](10|11)|releases/latest/download/arc-(node|cli|desktop)' \
+        "$README" "$HEADLESS" "$WALKTHROUGH"; then
+        printf 'an active v0.8.0 guide still links a stale desktop-only or moving binary asset\n'
+        return 1
+    fi
+}
+
 activation_and_archived_guides_fail_closed_in_copy() {
     require_literal "$HEADLESS" 'Absence means consensus' \
         'headless guide does not explain absent activation fail-closed behavior' || return 1
@@ -211,6 +276,7 @@ run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' 
 run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
+run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract
 run_test 'production origins and receipt-backed status copy are exact' production_origins_and_evidence_are_exact
 run_test 'activation copy fails closed and archived guides carry recovery warnings' activation_and_archived_guides_fail_closed_in_copy
 run_test 'operator docs require fresh v3 state, loopback RPC, and full transaction rollback' persistence_rpc_and_transaction_copy_match_the_installer

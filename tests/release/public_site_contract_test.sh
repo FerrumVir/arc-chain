@@ -46,6 +46,9 @@ pages_workflow_is_pinned_and_self_contained() {
     fi
     grep -Fq 'pages: write' "$WORKFLOW" \
         && grep -Fq 'id-token: write' "$WORKFLOW" \
+        && grep -Fq 'name: github-pages' "$WORKFLOW" \
+        && grep -Fq 'url: ${{ steps.deployment.outputs.page_url }}' "$WORKFLOW" \
+        && grep -Fq 'needs: build' "$WORKFLOW" \
         && grep -Fq -- "- 'shared/frontend/**'" "$WORKFLOW" \
         && grep -Fq 'node shared/frontend/test-arc-network.mjs' "$WORKFLOW" \
         && grep -Fq './scripts/build-public-site.sh public-site' "$WORKFLOW"
