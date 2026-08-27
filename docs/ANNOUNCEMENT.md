@@ -95,7 +95,8 @@ Each layer range is held by 3 replicas (e.g. range [0,6) lives on AMS · LAX · 
 
 For the deep dive: [`docs/HOW-SHARDING-WORKS.md`](HOW-SHARDING-WORKS.md)
 
-For the 5-minute walkthrough: [`docs/SERO-DEMO.md`](SERO-DEMO.md)
+For the current 2–3 minute, receipt-gated walkthrough after the recovered
+validator cutover: [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md)
 
 For the source: https://github.com/FerrumVir/arc-chain
 

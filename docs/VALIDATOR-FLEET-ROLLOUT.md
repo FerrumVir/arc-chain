@@ -23,10 +23,11 @@ Until every security gate below is complete:
 - do not send private keys, keyfiles, or seed phrases through chat, GitHub,
   CI, shell history, logs, or this repository.
 
-Stake-zero community nodes may run the release in migration-observer mode.
-That mode intentionally disables chain P2P, consensus, and voting when the
-bundled genesis says `validator_set_complete = false`; HTTP community
-inference remains available for controlled testing.
+Stake-zero community nodes use the same checkpoint-bound recovered network
+identity as the validators while keeping local consensus and voting disabled.
+The checked-in genesis now contains the complete six-validator public set and
+the block 137146 reward-activation boundary. It is still an unreleased
+definition, not evidence that the public cutover or reward path is live.
 
 ## 1. Freeze and inventory the current fleet
 
@@ -38,7 +39,9 @@ Record the following for all six validators before touching any process:
 - authenticated peers and connected stake;
 - data, WAL, snapshot, model, and environment locations;
 - worker, inference, shard, reward, and receipt evidence;
-- a byte-for-byte backup and a restore test on an isolated host.
+- enough free bytes and inodes to retain the exact fenced legacy source,
+  stream its complete archive, and create the fresh v3 data tree with explicit
+  headroom.
 
 Do not infer a service manager from a generic guide. Use the launch mechanism
 actually installed on each host. At the August 26, 2026 audit, NYC reported
@@ -52,20 +55,40 @@ governance decision before building a replacement genesis or checkpoint.
 
 The freeze authorization must not depend on the final checkpoint hash, because
 that hash cannot be known until the forked fleet is stopped and its exact
-source is verified. Use `archive-fleet-to-drive.sh seal-freeze-plan` to create
-a reviewed, immutable six-host plan, then run `capture` in plan mode. Execution
-requires its own exact `ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256>"`.
-The helper persistently fences and cleanly stops enough writers to halt quorum
-before it copies any chain byte. It then fences all remaining writers and
-copies each complete `arc-data` directory offline. Complete capture indexes
-are create-only and fail on any changed, missing, unexpected, symlink, or
-special-file content; the legacy `/sync/snapshot` endpoint is not trusted as a
-state barrier.
+source is verified. First use `archive-fleet-to-drive.sh audit-writers` to bind
+each controlled systemd `MainPID`, process start time, boot ID, argv,
+executable, data directory, validator identity, and stake to the sealed
+eight-validator 40M legacy source set. Then use `seal-freeze-plan` to create a
+reviewed, create-only six-host plan and run `capture` in plan mode. Execution
+requires exactly
+`ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256> CAPTURE <capture-id>"`;
+the capture ID is deterministically derived from the freeze-plan digest.
 
-## 2. Rotate every validator identity offline
+The helper installs a persistent restart fence and cleanly stops the six exact
+controlled writers without SIGKILL. Their 30M stake is more than one third of
+the sealed 40M source set, so after all six stops the sealed set has at most
+10M unstopped stake and cannot reach its quorum. Legacy RPC membership was
+dynamic and divergent, however: unknown positive-stake identities are recorded
+as untrusted external legacy forks, and this proof must never be presented as
+a claim that every possible external legacy network is globally halted.
 
-Generate six new Ed25519 keyfiles on trusted offline operator systems. One
-keyfile per validator; never reuse a legacy seed or key.
+After the fence is stable, `capture-offline` records source path/device/inode,
+a complete regular-file content index, final WAL identity, external snapshot
+identity, and stop evidence. The original legacy data directory stays in place;
+it is content-sealed by repeated hashing, not mounted read-only and not copied
+into a second full local tree. Changed, missing, unexpected, cross-device,
+symlink, or special-file content fails closed. The legacy `/sync/snapshot`
+endpoint is not trusted as a state barrier.
+
+## 2. Verify every rotated validator identity offline
+
+The recovered genesis already binds six rotated public Ed25519 identities.
+Each operator must verify, on a trusted offline system, that the separately
+delivered mode-`0600` keyfile derives the exact public address assigned to that
+host. Never reuse a legacy seed or key. If any approved private key is missing
+or suspect, generate a replacement offline and reseal the genesis, checkpoint,
+archive premanifest, and rollout; do not silently substitute a new identity for
+one in the checked-in recovery definition.
 
 ```bash
 umask 077
@@ -97,12 +120,13 @@ match both its public key and intended stake.
 ## 3. Approve a new trust root
 
 Because the old validator keys are compromised, a rotation transaction signed
-only by the old validator set is not a sufficient trust anchor. Operators must
-make an explicit out-of-band decision and record it in a reviewable manifest:
-
-1. start a clean chain from a new genesis; or
-2. adopt a specifically identified canonical state checkpoint under the new
-   validator set.
+only by the old validator set is not a sufficient trust anchor. The current
+candidate records the out-of-band recovery decision as a specifically
+identified canonical state checkpoint under the rotated set and carries the
+matching complete genesis in all release locations. Operators must approve the
+exact signed artifacts and hashes out of band. Rejecting any part of that
+decision requires a newly reviewed recovery manifest; it is not permission to
+fall back to the old trust root or improvise a fresh chain on one host.
 
 The manifest must bind chain ID, protocol version, canonical height/hash/root
 (if preserving state), all six new public addresses and stakes, binary/tag
@@ -121,14 +145,16 @@ fast-forwarding from a peer.
 
 Absence is the fail-closed disabled state; do not encode “disabled” as height
 zero. The release contract permits an explicit bounded activation only in a
-complete validator genesis and rejects any schedule on the incomplete
-stake-zero observer placeholder. The node also requires the independent
-`--enable-community-rewards-v1` switch, so neither the schedule nor the switch
-can enable issuance by itself.
+complete validator genesis. The checked-in checkpoint-bound recovery genesis
+is complete and explicitly schedules activation at block 137146. The node also
+requires the independent `--enable-community-rewards-v1` switch, so neither
+the schedule nor the switch can enable issuance by itself.
 
-Populate all release/deployment genesis copies from that approved public
-manifest, set `validator_set_complete = true`, copy the identical reward
-activation schedule into each, and verify that the files are byte-identical.
+The canonical, deployment, and desktop genesis copies are now byte-identical
+copies of that recovered definition with `validator_set_complete = true`.
+Before release, verify their pinned checksum and every signed recovery artifact
+against the reviewed recovery commit; do not reconstruct or edit the definition
+on a validator host.
 Every validator public address must also appear exactly once in the shared
 `[[accounts]]` list with an explicit `balance` (zero is allowed). Runtime
 startup and release validation both reject a complete validator genesis when
@@ -136,9 +162,9 @@ an address is missing from accounts or duplicated. A node's local keyfile must
 only prove that it matches this shared definition; local identity must never
 insert an account or otherwise mutate genesis state at startup.
 The schedule is included in the authenticated semantic genesis hash; nodes
-with different activation rules are different networks. The incomplete
-genesis currently in source control is a safe placeholder, not a production
-network definition.
+with different activation rules are different networks. The checked-in
+definition remains an unreleased recovery artifact until the coordinated
+cutover proves the sealed checkpoint and the six new validator keyfiles.
 
 ## 4. Build and prove the release candidate
 
@@ -165,9 +191,10 @@ in GitHub's settings:
 - restrict Actions to an owner-reviewed allowlist and require full commit-SHA
   pinning;
 - create a protected `release` environment, restrict its deployment tags, add
-  required reviewers, move `TAURI_SIGNING_PRIVATE_KEY` and its password from
-  repository secrets into that environment, and remove the repository-level
-  copies;
+  required reviewers, move `TAURI_SIGNING_PRIVATE_KEY` from repository secrets
+  into that environment, and remove the repository-level copies. The retained
+  v0.7-compatible key encoding has no passphrase, so the workflow deliberately
+  does not inject a misleading password variable;
 - configure Apple Developer ID signing/notarization and Windows Authenticode
   signing before claiming OS-signed installers. Until then, release notes must
   plainly label macOS and Windows packages unsigned; the Tauri updater payload
@@ -205,60 +232,92 @@ Keep reward issuance disabled throughout this rehearsal.
 
 Use `scripts/recovery/recovery_rollout.py` for both the isolated rehearsal and
 the production cutover. Its manifest is canonical JSON, create-only, mode
-`0444`, and protected by a SHA-256 sidecar. `run` is plan/preflight-only unless
-both `--execute --go-hash <locked-manifest-sha256>` and the exact
-`ARC_RECOVERY_GO="GO <locked-manifest-sha256>"` value are present. The harness
-imports the quorum-verified checkpoint into six fresh data directories, proves
-the selected legacy block H and v3 transition H+1, requires advancing
-same-height hash/root convergence, restarts one validator at a time, and checks
-the configured reward policy. Receipt mode additionally requires the exact
-successful mined `0x25` receipt and receipt-backed worker earnings on all six.
+`0444`, and protected by a SHA-256 sidecar. A local rehearsal is
+plan/preflight-only unless both `--execute --go-hash
+<locked-manifest-sha256>` and the exact
+`ARC_RECOVERY_GO="GO <locked-manifest-sha256>"` value are present. Production
+has the longer archive-bound authorization in section 5. The harness imports
+the quorum-verified checkpoint into six fresh—or exact same-manifest resumable—
+data directories, proves the selected legacy block H and v3 transition H+1,
+requires advancing same-height hash/root convergence, restarts one validator
+at a time, and checks the configured reward policy. Receipt mode additionally
+requires the exact successful mined `0x25` receipt and receipt-backed worker
+earnings on all six.
 
 ## 5. Execute the coordinated v3 cutover
 
-With six equal-stake validators, the strict greater-than-two-thirds quorum is
-five; four validators are exactly two thirds and cannot finalize. Since v2 and
-v3 are mutually incompatible, the network is expected to stop while fewer
-than five approved v3 validators are online. Do not interpret that deliberate
-maintenance halt as permission to mix protocols or lower quorum.
+The sealed legacy source set contains eight 5M-stake identities (40M total),
+including the six controlled 30M writers. Stopping all six leaves at most 10M
+of that sealed set, below its strict greater-than-two-thirds quorum. This is a
+closed proof about the sealed source identities, not host count and not a
+global halt claim about dynamically admitted legacy forks. The recovered v3
+set contains six rotated validators totalling 40M; the orchestrator starts five
+in a tight batch before the sixth. Since v2 and v3 are mutually incompatible,
+do not interpret the maintenance boundary as permission to mix protocols or
+lower quorum.
 
 1. Announce a maintenance window and stop ordinary submissions.
-2. Execute the separately sealed freeze plan. It persistently fences and stops
-   NYC, then LAX. Four of six equal-stake validators cannot
-   reach the required five-validator quorum, so finality is now deliberately
-   halted.
-3. While quorum remains halted, persistently fence and stop AMS, LHR, NRT, and
-   SGP. Verify all six are PID-free, then copy/fsync all six complete data
-   directories offline. Do not deploy a new endpoint to the legacy binaries.
-4. Verify all six immutable capture indexes and that no legacy process is
-   listening or sealing. Preserve all six captures; do not discard a fork
-   because it is not ultimately selected.
-5. Use `arc-node recovery export --data-dir <paired-source> --snapshot
-   <sealed-source.snapshot.lz4> --legacy-validator-set
-   <legacy-validator-set-40m.json> ...` to reproduce the candidate. Successful
-   export—not endpoint metadata—must prove that the decoded snapshot H/root
-   equals the complete WAL block/checkpoint boundary.
+2. Execute the separately sealed freeze plan with the exact `FREEZE
+   <freeze-plan-sha256> CAPTURE <capture-id>` authorization. It persistently
+   fences and stops NYC, then LAX, but does not claim those first two stops
+   halted any global legacy network.
+3. Persistently fence and stop AMS, LHR, NRT, and SGP. Verify all six exact
+   writer PIDs are gone and their restart fences are stable. The controlled
+   30M has now been removed from the sealed 40M source set, leaving at most 10M
+   of that set available; record external dynamic identities as untrusted
+   forks rather than claiming a global legacy halt.
+4. Build and verify all six capture evidence trees and complete content indexes
+   against the original fenced data directories. Preserve every source in
+   place; do not discard a fork because it is not ultimately selected and do
+   not create a second full local data-tree copy.
+5. Use `arc-node recovery export --data-dir <reference-pair> --snapshot
+   <reference-pair/state.snapshot.lz4> --legacy-validator-set
+   <legacy-validator-set-40m.json> ...` to reproduce the candidate from the
+   independently preserved shared reference pair. Successful export—not
+   endpoint metadata or a later validator capture—must prove that the decoded
+   snapshot H/root equals its complete WAL block/checkpoint boundary.
    The audited legacy WAL needs the explicit `--allow-unbound-legacy-wal`
    exception because it predates the genesis network hash; record that fact.
-6. Sign the accepted candidate offline with the required 5-of-6 quorum and
-   seal the final production rollout manifest.
+6. Sign the accepted candidate offline with the required 5-of-6 recovery
+   quorum and seal the **prearchive** production manifest. Its
+   `complete_sha256`, `archive_manifest_sha256`, `sha256sums_sha256`, and
+   `prearchive_rollout_sha256` fields must all be 64 zeroes.
 7. Run `archive-fleet-to-drive.sh seal` in plan mode, then execute it only with
-   the exact `ARC_RECOVERY_GO="GO <rollout-manifest-sha256>"`. It re-exports
-   each stopped WAL only against that capture's own on-disk snapshot. A
-   derivable pair is classified as `valid_canonical` or
+   the exact `ARC_RECOVERY_GO="GO <prearchive-rollout-sha256> FREEZE
+   <freeze-plan-sha256> CAPTURE <capture-id> DEST
+   <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>"`. It
+   re-exports each stopped WAL only against that capture's own on-disk
+   snapshot. A derivable pair is classified as `valid_canonical` or
    `valid_noncanonical_fork`; a missing, ambiguous, torn, or otherwise
-   non-derivable pair is `preserved_unclassified`. The sealed source snapshot
-   is independent canonical reference evidence and is never substituted into
-   a validator capture. At least one canonical match is required, and all six
-   labelled bundles are uploaded immutably.
-8. Install the exact checksummed candidate and approved genesis/checkpoint on
-   every host; install the host's new keyfile separately.
-9. Start enough prepared v3 validators in a tight window to reach quorum,
-   then start the remainder.
-10. Confirm public address, keyfile source, protocol v3, genesis/checkpoint,
+   non-derivable pair is `preserved_unclassified`. The independently verified
+   shared reference snapshot/WAL pair is the canonical recovery source and is
+   never substituted into a validator capture. All six captures may be forks
+   or unclassified; no live capture is required to match the canonical
+   checkpoint.
+8. Stream each complete content-indexed stopped source directly into its
+   bundle at the exact capture-scoped destination
+   `arc-drive:ARC Chain Recovery/captures/<capture-id>`. Google Drive is not
+   WORM. `COMPLETE.json` is merely the last create-only write in this execution;
+   partial uploads are resumable but unusable, and every object named by
+   `SHA256SUMS` and `ARCHIVE-MANIFEST.json` must be re-downloaded and hashed.
+9. Create the final rollout manifest by changing only the four archive roots
+   from step 6 to the verified `COMPLETE.json`, archive manifest, checksum, and
+   prearchive-manifest digests. Its canonical projection with those four fields
+   reset to zero must hash exactly to the archived prearchive digest.
+10. Install the exact checksummed candidate and approved genesis/checkpoint on
+   every host; install the host's new keyfile separately. The new release and
+   data paths must be disjoint and non-nested with the preserved legacy source.
+11. Run the finalized production plan, then execute only with
+   `--go-hash <final-rollout-sha256> --archive-manifest-sha256
+   <verified-archive-manifest-sha256>` and the exact
+   `ARC_RECOVERY_GO="GO <final-rollout-sha256> FREEZE
+   <freeze-plan-sha256> CAPTURE <capture-id> ARCHIVE
+   <verified-archive-manifest-sha256> DEST
+   <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>"`.
+12. Confirm public address, keyfile source, protocol v3, genesis/checkpoint,
    binary checksum, connected authenticated stake, and advancing chain on
    every host.
-11. Require all six to converge on the same advancing height/hash/root for a
+13. Require all six to converge on the same advancing height/hash/root for a
    full observation window before reopening ordinary traffic.
 
 Each production validator RPC must bind loopback. Configure these six explicit

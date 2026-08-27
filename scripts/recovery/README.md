@@ -9,8 +9,9 @@ mutable, clear-text, or same-data-directory rollout.
 The default `run` behavior is read-only. A local mutation requires the same
 SHA-256 three times: the sealed manifest sidecar, `--go-hash`, and the exact
 `ARC_RECOVERY_GO="GO <hash>"` phrase. Production additionally binds the sealed
-freeze-plan digest and its deterministically derived capture ID in both the
-rollout manifest and the exact GO phrase.
+freeze-plan digest, deterministically derived capture ID, exact Drive
+destination, verified archive-manifest hash, and explicit legacy-WAL policy in
+the finalized manifest, CLI, and extended GO phrase.
 
 ## Inputs
 
@@ -23,13 +24,17 @@ than JSON Schema and rejects unknown fields. A draft binds:
 - local absolute paths and SHA-256 values for `arc-node`, genesis, ARCCHKPT,
   and, in production, the exact Caddy executable;
 - exactly six unique public validator addresses, stakes, keyfile paths, RPC
-  origins, P2P addresses, and initially absent data directories;
+  origins, P2P addresses, and fresh data directories (or exact
+  same-manifest-owned prepared state during a retry);
 - timeouts, minimum observed height advance, and either a policy-only or real
   mined-receipt reward gate;
 - production-only IP-derived `nip.io` (or resealed `sslip.io` fallback)
   hostnames, SSH/service identity, and create-only release/unit paths;
-- production-only `archive.freeze_plan_sha256` and `archive.capture_id`, which
-  must match the independently sealed six-node freeze exactly;
+- production-only archive destination, freeze/capture identities, executing
+  helper/orchestrator/rollout/schema hashes, explicit legacy-WAL policy, and
+  four finalization roots. A prearchive manifest has four all-zero roots; a
+  final manifest may change only those roots and must project exactly to the
+  archived prearchive digest;
 - the pre-positioned canonical GGUF path and SHA-256 on every validator, plus
   exact per-node ranges that give every one of the 32 layers three replicas
   while loading exactly 16 layers on each validator.
@@ -75,7 +80,8 @@ python3 scripts/recovery/recovery_rollout.py run \
 `seal` verifies every artifact hash, writes canonical JSON with mode `0444`,
 and creates a mode-`0444` `.sha256` sidecar. It never replaces either file.
 `run` rechecks the seal and all artifact hashes, executes offline ARCCHKPT
-`inspect` plus quorum `verify`, checks six fresh data/key/host prerequisites,
+`inspect` plus quorum `verify`, checks six fresh-or-exact-resume
+data/key/host prerequisites,
 and prints `PLAN ONLY`. It changes no local/remote directory, process, service,
 package, proxy, certificate, or data.
 
@@ -105,23 +111,27 @@ deleted.
 
 ## Execute the production cutover
 
-Use a sealed `mode: "production"` manifest only after the legacy fleet archive
-has a valid `COMPLETE.json` and all legacy `arc-node` processes are stopped.
-Production execution uses the extended phrase printed by `seal`:
+Use a roots-only finalized, sealed `mode: "production"` manifest only after the
+exact capture-scoped archive has a fully verified `COMPLETE.json` and all six
+controlled legacy writers remain persistently fenced. This is not a claim that
+all dynamically observed external legacy forks are globally halted. Run the
+read-only plan to obtain the verified archive-manifest hash and exact extended
+phrase:
 
 ```bash
-ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id" \
+ARC_RECOVERY_GO="GO $final_rollout_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id ARCHIVE $archive_manifest_sha256 DEST $destination_sha256 LEGACY_WAL $legacy_wal_policy" \
   python3 scripts/recovery/recovery_rollout.py run \
-    --manifest /secure/operator/arc-recovery.lock.json \
+    --manifest /secure/operator/arc-recovery-final.lock.json \
     --execute \
-    --go-hash "$locked_sha256"
+    --go-hash "$final_rollout_sha256" \
+    --archive-manifest-sha256 "$archive_manifest_sha256"
 ```
 
 The orchestrator:
 
 1. stages and re-hashes the exact binary/genesis/checkpoint/Caddy artifacts;
 2. validates the checkpoint and Caddy configuration remotely;
-3. imports into six fresh data directories;
+3. imports into six fresh or exact same-manifest resumable data directories;
 4. installs create-only filter, gateway, and validator systemd units;
 5. obtains publicly trusted TLS or fails closed;
 6. starts five validators in a tight quorum batch, then the sixth;
@@ -133,19 +143,30 @@ The orchestrator:
 
 On failure, the orchestrator stops/disables only the newly installed v3
 services. It does not delete imported data, artifacts, configs, journals, or
-the old archived fleet and never falls back to compromised identities.
+the old archived fleet and never falls back to compromised identities. Each
+prepared stage is marked with the exact rollout digest: the same manifest can
+verify and resume it, while a different manifest is rejected. New release and
+data paths must be disjoint and non-nested with every frozen legacy source.
 
 ### Efficient legacy archive
 
 The legacy freeze and the final checkpoint seal are deliberately separate.
 The final checkpoint hash cannot exist until the forked fleet has stopped, so
 requiring that hash before capture would create a circular authorization. Seal
-a small, create-only freeze plan v2 first. It binds the exact remote helper
-bytes, orchestrator bytes, source commit, sentinel order, and six hosts:
+a small, create-only freeze plan v2 first. It binds the exact remote helper,
+orchestrator, rollout verifier, and schema bytes plus the source commit,
+sentinel order, six controlled writer contracts, and the sealed eight-member
+40M legacy validator set:
 
 ```bash
+scripts/recovery/archive-fleet-to-drive.sh audit-writers \
+  --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
+  --output /secure/operator/arc-writers.lock.json
+
 scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
   --window arc-v3-cutover-2026-08 \
+  --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
+  --writer-contracts /secure/operator/arc-writers.lock.json \
   --output /secure/operator/arc-freeze.lock.json
 
 scripts/recovery/archive-fleet-to-drive.sh capture \
@@ -163,17 +184,25 @@ The capture ID is `SHA256("ARC recovery capture v2\0" || freeze_plan_digest)`;
 it is not an operator-selected label. The default `capture` is read-only.
 Immediately before every remote helper invocation, the orchestrator re-hashes
 the installed helper and refuses any byte mismatch. Execution installs a
-persistent systemd restart fence and cleanly stops NYC and then LAX, leaving only four of six
-equal-stake validators running when five are required. Only after that quorum
-halt does it fence and stop the remaining four. After all six writers are
-proven PID-free, it copies and fsyncs each complete `arc-data` directory
-offline, including the final state and DAG WALs. It never uses SIGKILL and
-never relies on the racy legacy live-snapshot RPC. Every capture has a complete
-file index, refuses overwrite, and detects changed, missing, unexpected,
-symlink, or special-file content.
+persistent systemd restart fence and cleanly stops NYC and then LAX, but those
+sentinel stops do not authorize a global halt claim. It then stops AMS, LHR,
+NRT, and SGP. The six exact controlled identities represent 30M of the sealed
+40M source set; only after all six are stopped does the sealed proof leave at
+most 10M unstopped stake, below quorum. Divergent dynamic RPC identities are
+recorded as untrusted external forks, never folded into a false claim that the
+vulnerable old network is globally halted.
 
-The sealed production manifest carries the independently preserved exact-height
-source snapshot and its paired reference WAL as SHA-256-bound artifacts. Build
+After all six writers are proven PID-free, each capture binds the original
+legacy data directory's path, device, inode, complete regular-file index, final
+state/DAG WAL bytes, external snapshot identity, and persistent fence evidence.
+The exact source remains in place and is repeatedly re-hashed; it is content-
+sealed, not OS-read-only, and no second full local data tree is created. The
+helper never uses SIGKILL or the racy legacy live-snapshot RPC. It rejects
+changed, missing, unexpected, cross-device, symlink, or special-file content.
+
+The sealed prearchive production manifest carries the independently preserved
+exact-height source snapshot and its paired reference WAL as SHA-256-bound
+artifacts. Build
 the unsigned candidate from that pair using the exact recovery exporter;
 successful export decodes the snapshot, recomputes its account/storage/code
 root, and requires it to equal the complete WAL block/checkpoint boundary:
@@ -197,7 +226,10 @@ The last flag is necessary for the audited legacy WAL, which predates the
 authenticated genesis network hash. It is never implicit: both checkpoint
 creation and final archive sealing require the operator to state it, and the
 binding evidence records that exception. Sign the accepted candidate offline,
-seal the production rollout manifest, then plan and execute the second phase:
+then seal the prearchive production manifest with `complete_sha256`,
+`archive_manifest_sha256`, `sha256sums_sha256`, and
+`prearchive_rollout_sha256` all set to 64 zeroes. Plan and execute the archive
+phase:
 
 ```bash
 scripts/recovery/archive-fleet-to-drive.sh seal \
@@ -206,9 +238,9 @@ scripts/recovery/archive-fleet-to-drive.sh seal \
   --validator-public-keys /secure/operator/validator-public-keys.json \
   --allow-unbound-legacy-wal
 
-locked_sha256='<sealed rollout-manifest sha256>'
+locked_sha256='<sealed prearchive rollout-manifest sha256>'
 destination='arc-drive:ARC Chain Recovery/captures/'"$capture_id"
-destination_sha256="$(printf %s "$destination" | sha256sum | cut -d' ' -f1)"
+destination_sha256="$(printf %s "$destination" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
 ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id DEST $destination_sha256 LEGACY_WAL UNBOUND" \
   scripts/recovery/archive-fleet-to-drive.sh seal \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
@@ -218,13 +250,14 @@ ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id DES
     --execute
 ```
 
-The production rollout manifest must contain the same `freeze_plan_sha256` and
-`capture_id`; neither the archive seal nor `recovery_rollout.py run --execute`
-accepts a production GO phrase without both. `seal` rechecks the read-only
-rollout sidecar, every artifact hash, the paired reference export, and the
-5-of-6 signed checkpoint. On each host it runs the read-only exporter directly
-against the content-indexed, persistently fenced source without creating a
-second full data tree. Each final capture is classified as `valid_canonical`,
+The prearchive rollout manifest must contain the same `freeze_plan_sha256`,
+`capture_id`, exact destination, helper/tool hashes, and legacy-WAL policy.
+Archive sealing refuses a manifest unless all four finalization roots are
+zero. `seal` rechecks the read-only rollout sidecar, every artifact hash, the
+paired reference export, and the 5-of-6 signed checkpoint. On each host it runs
+the read-only exporter directly against the content-indexed, persistently
+fenced source without creating a second full data tree. Each final capture is
+classified as `valid_canonical`,
 `valid_noncanonical_fork`, or `preserved_unclassified`. It never substitutes
 the sealed canonical reference snapshot for a validator's missing or divergent
 snapshot. The independently reproduced shared reference snapshot/WAL pair—not
@@ -238,9 +271,9 @@ unclassified evidence and cannot masquerade as either a fork or a canonical
 source. If strict offline recovery trims an uncheckpointed WAL tail, hashes of
 the accepted prefix and quarantined tail bind the exact retained source bytes.
 
-Each streamed bundle contains the complete stopped legacy data directory, persistent
-fence evidence, optional public legacy binary/genesis inputs, and semantic
-export result. Shared uploads include the sealed source snapshot/reference
+Each streamed bundle contains the complete stopped legacy data directory,
+persistent fence evidence, optional public legacy binary/genesis inputs, and
+semantic export result. Shared uploads include the sealed source snapshot/reference
 WAL, final binary, genesis, source/public validator sets, signed checkpoint,
 rollout manifest, capture ID, and `SHA256SUMS`. Private identities, service
 environments, build caches, model weights, and Git objects outside `arc-data`
@@ -252,8 +285,7 @@ checked, the operator builds canonical `SHA256SUMS` and
 classifications, bundle/inventory sizes and SHA-256 values, both archive helper
 hashes, rollout tool/schema hashes, the independently verified canonical
 reference, source commit, freeze digest, capture ID, and prearchive rollout
-digest. Those
-metadata files are uploaded and checked only after the bundles. Content-addressed
+digest. Those metadata files are uploaded and checked only after the bundles. Content-addressed
 `COMPLETE.json`, which binds the archive-manifest hash, is the final create-only
 mutation in this execution. Google Drive is not WORM or intrinsically
 immutable: partial destinations without COMPLETE are resumable but must never
@@ -267,6 +299,17 @@ scripts/recovery/archive-fleet-to-drive.sh verify-complete \
 
 An absent, non-canonical, mismatched, or tampered `COMPLETE.json`, manifest, or
 sidecar fails closed.
+
+Use the emitted `FINAL-ROLLOUT-ROOTS` values to create a new final draft by
+replacing **only** the prearchive manifest's four zero roots. Seal that draft to
+a new file. Validation resets those four fields to zero and requires the
+resulting canonical bytes to hash to `prearchive_rollout_sha256`; a changed
+host, artifact, check, model, shard assignment, destination, or policy is not a
+finalization. The final `recovery_rollout.py run` first verifies the exact
+destination, `COMPLETE.json`, archive manifest, `SHA256SUMS`, every listed
+object, and all live capture indexes. It then prints the production GO phrase
+shown above. The verifier repeats those source and archive checks immediately
+before mutation and again after cutover.
 
 ## Sealed production API
 
@@ -362,7 +405,9 @@ python3 scripts/recovery/test_community_reward_probe.py
 ```
 
 The tests cover manifest strictness, six-validator and restart-quorum rules,
-content-addressed sealing/no-clobber behavior, dual GO authorization, exact
-checkpoint commitments, explicit HTTPS origins, loopback gateway policy,
-same-height fork rejection, clean restart command construction, hash-pinned
-reward probes, and successful-receipt-only earnings.
+roots-only prearchive finalization, partial-capture and rollout resume,
+content-verified create-only archive behavior, both extended GO authorizations,
+sealed-source stake proof, exact checkpoint/model/shard commitments, full
+remote-object verification, source-path separation, explicit HTTPS origins,
+loopback gateway policy, same-height fork rejection, clean restart command
+construction, hash-pinned reward probes, and successful-receipt-only earnings.

@@ -10,9 +10,9 @@ restarted, upgraded, rekeyed, or otherwise mutated during this audit.
   publishers had split, so those tags did not contain the headless
   `arc-node-linux-x86_64` asset that existed in v0.7.7. A GUI package is not a
   substitute for an EC2/VPS/SSH binary.
-- Public v0.7.11 carried updater configuration, but the desktop application did
-  not invoke the update lifecycle. It therefore did not perform automatic
-  checks or present an install flow.
+- Public v0.7.11 could manually check, verify, and install a signed update from
+  Settings, but its persisted automatic-update preference was never consumed,
+  so startup and periodic checks did not run.
 - Community workers had no demonstrated work or payment. The Aug 26 snapshot of
   `/community/list` reported `total_work_completed: 0` across the worker list.
 - The public dashboard could not prove a shared chain or successful community
@@ -113,46 +113,82 @@ Free/community inference remains available without opening escrow.
   verification, strict validator authorization, activation, treasury, and mined
   `0x25` gates above must pass. The public fleet cannot currently do so because
   this candidate and its coordinated v3 trust root are not deployed.
-- **What hardware is required?** An observer/router needs no model or GPU. The
-  current full-model worker target is Llama-2-7B Q4_K_M, about 4 GB on disk.
-  Use at least 8 GB RAM; 12 GB or more gives safer OS/chain headroom. More CPU
-  cores can reduce latency. A GPU is optional. Hardware size is not a reward
-  multiplier and cannot guarantee jobs.
+- **What hardware is required?** A stake-zero router that does not execute
+  inference needs no model or GPU. The current full-model worker target is
+  Llama-2-7B Q4_K_M, about 4 GB on disk. Use at least 16 GB system RAM for the
+  expanded integer weights plus OS/chain headroom. More CPU cores can reduce
+  latency. A GPU is optional. Hardware size is not a reward multiplier and
+  cannot guarantee jobs.
 
 ## Human-controlled cutover gates
 
-Before publishing a “working network” walkthrough, operators must choose an
-approved canonical genesis or checkpoint, rotate the six validator identities
-whose legacy seed material appeared in repository history, configure the full
-trusted validator set and six explicit HTTPS community RPC origins, choose and
-record the activation height, execute one coordinated strict-quorum cutover,
-and verify common-height block hash plus state root agreement. The content-
-addressed `scripts/recovery/recovery_rollout.py` plan defaults to read-only,
-requires an exact GO hash before mutation, imports only into fresh data
-directories, checks H/H+1 continuity and restart convergence, and can require a
-successful reward receipt plus receipt-only earnings on every validator.
+Before publishing a “working network” walkthrough, operators must verify the
+signed canonical checkpoint and the byte-identical, checkpoint-bound recovered
+genesis already checked into the candidate. That genesis contains the complete
+six-identity rotated validator set and the block 137146 activation boundary;
+it is not an incomplete observer placeholder. Operators must prove each
+separately delivered keyfile matches its assigned public address, configure the
+six explicit HTTPS community RPC origins, execute one coordinated cutover, and
+verify common-height block hash plus state root agreement. The content-addressed
+`scripts/recovery/recovery_rollout.py` plan defaults to read-only, requires an
+exact archive-bound GO phrase before mutation, imports only into fresh or exact
+same-manifest resumable data directories, checks H/H+1 continuity and restart
+convergence, and can require a successful reward receipt plus receipt-only
+earnings on every validator.
 
-The legacy archive now has a separate, earlier freeze authorization because a
-final checkpoint hash cannot truthfully exist before the forked fleet stops.
-`archive-fleet-to-drive.sh capture` requires an immutable freeze-plan sidecar
-and exact `FREEZE <hash>` phrase. It snapshots and cleanly stops NYC and LAX to
-drop the six-equal-stake fleet below its five-validator quorum, captures the
-remaining four live RPCs while finality is halted, then stops them and records
-all six final WALs. Every capture contains the exact LZ4 `/sync/snapshot`,
-bracketing metadata, public endpoint evidence, and a complete tamper-evident
-file index; no private identity, service environment, model/build cache, Git
-object, or bulky DAG trace is uploaded.
+The legacy archive has a separate, earlier freeze authorization because the
+final checkpoint and archive roots cannot truthfully exist before the forked
+fleet is stopped and indexed. `audit-writers` binds the exact controlled
+systemd `MainPID`, process identity, argv, executable, data directory,
+validator identity, and stake to a sealed eight-identity 40M source set.
+`archive-fleet-to-drive.sh capture` executes only with
+`ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256> CAPTURE <capture-id>"`.
+It persistently fences and cleanly stops the six exact controlled writers,
+representing 30M of that set, without SIGKILL. Stopping them leaves at most 10M
+of the sealed set—below quorum—but dynamic legacy RPC membership was poisoned
+and divergent. Unknown positive-stake identities remain recorded as untrusted
+external forks; the recovery evidence does **not** claim every possible
+external legacy network globally halted.
 
-After operators choose a source, the recovery exporter—not an endpoint label—
-must decode that snapshot and prove its H/full-root equals the latest complete
-WAL block/checkpoint boundary. The audited old WAL predates the authenticated
+After all six controlled writers are fenced, capture records the original data
+directory's path/device/inode, final WAL, external snapshot identities, stop
+evidence, and a complete content index. It retains the original legacy source
+in place and repeatedly re-hashes it; it does not create a second full local
+data-tree copy or pretend the source is OS-read-only. Changed, missing,
+unexpected, cross-device, symlink, or special-file content fails closed. The
+racy legacy `/sync/snapshot` RPC is not the capture boundary.
+
+The independently preserved shared reference snapshot/WAL pair is the
+canonical source. The recovery exporter—not an endpoint label or a later live
+capture—must decode that pair and prove its H/full-root equals its complete WAL
+block/checkpoint boundary. The audited old WAL predates the authenticated
 genesis network hash, so its narrowly scoped `--allow-unbound-legacy-wal`
-exception must be explicit in both export and archive-seal evidence. Only after
-the 5-of-6 checkpoint and production rollout are sealed can the independent
-exact `GO <rollout-manifest-sha256>` phase bind all unchanged captures. It
-requires at least one H/hash/root match to the selected checkpoint but uploads
-all six bundles with honest `canonical_match` labels, preserving fork history
-instead of rewriting it to imply the testnet never diverged.
+exception must be explicit in checkpoint export, archive sealing, and both GO
+policies.
+
+After the 5-of-6 checkpoint is signed, operators seal a prearchive rollout
+whose four archive-finalization roots are all zero. Archive execution requires
+exactly `GO <prearchive-rollout-sha256> FREEZE <freeze-plan-sha256> CAPTURE
+<capture-id> DEST <sha256-of-exact-drive-destination> LEGACY_WAL
+<BOUND|UNBOUND>`. Each stopped capture is independently classified
+`valid_canonical`, `valid_noncanonical_fork`, or `preserved_unclassified`; all
+six may be forks or unclassified because canonical authority comes from the
+shared reference pair. Every stopped source is streamed directly to
+`arc-drive:ARC Chain Recovery/captures/<capture-id>` without a full second
+local copy.
+
+Google Drive is not WORM or intrinsically immutable. Partial uploads are
+resumable but not consumable; `COMPLETE.json` is only the last create-only
+write in this execution, and the verifier re-downloads and hashes every object
+named by `SHA256SUMS` and `ARCHIVE-MANIFEST.json`. The final production manifest
+may replace only its four zero archive roots and must project byte-for-byte to
+the archived premanifest. Production execution then requires both
+`--archive-manifest-sha256 <verified-archive-manifest-sha256>` and exactly `GO
+<final-rollout-sha256> FREEZE <freeze-plan-sha256> CAPTURE <capture-id> ARCHIVE
+<verified-archive-manifest-sha256> DEST
+<sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>`. New v3 release
+and data paths must be disjoint from every preserved legacy source, which is
+reverified after cutover.
 
 Only after that should the team use
 [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) to record the
