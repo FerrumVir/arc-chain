@@ -412,7 +412,12 @@ github_owned_actions_are_node24_exact_sha_allowlisted() {
 }
 
 release_supply_chain_and_npm_audits_are_blocking() {
-    local manifest_count quality_block supply_block
+    local ci_audit_block manifest_count quality_block supply_block
+    ci_audit_block="$(awk '
+        /^  audit:/ { capture=1 }
+        capture { print }
+        capture && /^  shell-syntax:/ { exit }
+    ' "$CI_WORKFLOW")"
     quality_block="$(awk '
         /^  release-quality:/ { capture=1 }
         capture { print }
@@ -455,6 +460,23 @@ release_supply_chain_and_npm_audits_are_blocking() {
             return 1
         }
     done
+
+    for required in \
+        'set -euo pipefail' \
+        'Cargo.toml' \
+        'desktop/src-tauri/Cargo.toml' \
+        'tests/release/tauri-updater-verifier/Cargo.toml' \
+        'bash scripts/ci/run-cargo-deny.sh "$manifest"'
+    do
+        printf '%s\n' "$ci_audit_block" | grep -Fq -- "$required" || {
+            printf 'pull-request dependency-policy gate is missing: %s\n' "$required"
+            return 1
+        }
+    done
+    if printf '%s\n' "$ci_audit_block" | grep -Eq 'continue-on-error:[[:space:]]*true'; then
+        printf 'pull-request cargo-deny gate is advisory\n'
+        return 1
+    fi
 
     printf '%s\n' "$quality_block" \
         | grep -Fq 'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
@@ -717,7 +739,7 @@ run_test 'secret scans are pinned to the CI commit and local releasable worktree
 run_test 'Ubuntu 24/26 smoke boots a real GUI-free node and checks health' linux_compat_smoke_executes_real_headless_node
 run_test 'release actions are exact-SHA pinned to the reviewed allowlist' release_actions_are_exact_sha_allowlisted
 run_test 'GitHub-owned actions are exact-SHA pinned to the reviewed Node 24 releases' github_owned_actions_are_node24_exact_sha_allowlisted
-run_test 'release cargo and npm supply-chain audits are exact-ref and blocking' release_supply_chain_and_npm_audits_are_blocking
+run_test 'CI/release cargo and npm supply-chain audits are exact-ref and blocking' release_supply_chain_and_npm_audits_are_blocking
 run_test 'release golden vectors cover Linux x86/ARM, both Macs, and Windows' cross_arch_golden_vectors_gate_publication
 run_test 'updater signatures verify against the embedded key and reject rotation' updater_signatures_are_verified_against_the_embedded_key
 run_test 'signing and publishing require the owner-protected release environment' release_secret_jobs_require_the_owner_environment

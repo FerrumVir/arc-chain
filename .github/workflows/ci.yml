@@ -338,7 +338,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Enforce advisory, license, source, and dependency policy
-        run: bash scripts/ci/run-cargo-deny.sh Cargo.toml
+        run: |
+          set -euo pipefail
+          for manifest in \
+            Cargo.toml \
+            desktop/src-tauri/Cargo.toml \
+            tests/release/tauri-updater-verifier/Cargo.toml; do
+            bash scripts/ci/run-cargo-deny.sh "$manifest"
+          done
 
   # ------------------------------------------------------- shell syntax ----
   # Zero-debt gate, blocking from day one: `bash -n` parses without executing,
