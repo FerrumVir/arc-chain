@@ -1,24 +1,8 @@
-# ARC Chain Genesis Configuration
-# Defines the initial chain state: prefunded accounts and validators.
-# All nodes MUST use the same genesis config for consensus to work.
-# Usage: arc-node --genesis genesis.toml
-
 [chain]
 name = "arc-testnet"
-chain_id = "0x415243"  # "ARC" in ASCII hex
-# Fail closed until each operator generates a fresh Ed25519 keyfile off-repo
-# and the team commits only the corresponding public addresses below.
-validator_set_complete = false
-# Consensus reward settlement is disabled while this is absent. Before a
-# coordinated fleet cutover, choose one future block height and uncomment it
-# in the canonical genesis/checkpoint used by every validator:
-# community_rewards_v1_activation_height = 12345678
-
-# ── Prefunded Genesis Accounts ──────────────────────────────────────────
-# blake3::hash(&[i]) for i in 0..5, each with 1_000_000_000_000 base
-# units (= 1000 ARC). Address [0] is the faucet and [1] is the dedicated
-# inference reward treasury; the remaining accounts are reserved testnet
-# system funds.
+chain_id = "0x415243"
+validator_set_complete = true
+community_rewards_v1_activation_height = 137146
 
 [[accounts]]
 address = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
@@ -40,14 +24,50 @@ balance = 1_000_000_000_000
 address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
 balance = 1_000_000_000_000
 
-# ── Genesis Validators (migration required) ────────────────────────────
-# Do not put keyfile contents or deterministic seeds in this repository.
-# After collecting fresh public addresses from the approved validator
-# operators, add each address both here and as an explicit [[accounts]] entry
-# above (with its approved starting balance), then set the flag above to true.
-# Startup and release validation reject a production validator that is absent
-# from the shared account state; nodes never add their local identity.
-#
-# [[validators]]
-# address = "<64-character public ARC address from arc keygen>"
-# stake = 5_000_000
+[[accounts]]
+address = "05f6429c8b7fe87434e96c486c325e1f71de0ca53b26a41e1a0326bf7bc9f6f1"
+balance = 0
+
+[[accounts]]
+address = "063776aedd80cde15341ec377ea27c52893bd8364da03b31a860e96c80b5c2cc"
+balance = 0
+
+[[accounts]]
+address = "6d68698c8dfe024efc840833a298cdcf213062384a10fedad165fd2f091125fc"
+balance = 0
+
+[[accounts]]
+address = "9a3c8ae2318b864f9f3aac297ff958893a766ee76550fcb1199655d08e72ee70"
+balance = 0
+
+[[accounts]]
+address = "a54fa166ea1bc187402d5688d1b31b3e8b86000911aab501e26671b79864f960"
+balance = 0
+
+[[accounts]]
+address = "c0fa495b158a975c3fb74beea1fa069df34ac702ff299dd721795d9b68de622e"
+balance = 0
+
+[[validators]]
+address = "05f6429c8b7fe87434e96c486c325e1f71de0ca53b26a41e1a0326bf7bc9f6f1"
+stake = 6_666_667
+
+[[validators]]
+address = "063776aedd80cde15341ec377ea27c52893bd8364da03b31a860e96c80b5c2cc"
+stake = 6_666_667
+
+[[validators]]
+address = "6d68698c8dfe024efc840833a298cdcf213062384a10fedad165fd2f091125fc"
+stake = 6_666_667
+
+[[validators]]
+address = "9a3c8ae2318b864f9f3aac297ff958893a766ee76550fcb1199655d08e72ee70"
+stake = 6_666_667
+
+[[validators]]
+address = "a54fa166ea1bc187402d5688d1b31b3e8b86000911aab501e26671b79864f960"
+stake = 6_666_666
+
+[[validators]]
+address = "c0fa495b158a975c3fb74beea1fa069df34ac702ff299dd721795d9b68de622e"
+stake = 6_666_666

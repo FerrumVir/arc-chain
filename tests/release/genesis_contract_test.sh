@@ -128,8 +128,22 @@ reward_activation_must_be_a_representable_integer() {
     done
 }
 
-shipped_genesis_templates_are_identical_disabled_observers() {
-    local canonical="$REPO_ROOT/genesis.toml" template output
+shipped_genesis_templates_are_identical_recovered_network() {
+    local canonical="$REPO_ROOT/genesis.toml" template output actual_sha
+    local expected_sha=833636c0c4d87430fb891f9a843d2adcef28853659734e3179996da1dd39caaf
+
+    actual_sha="$(python3 - "$canonical" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" || return 1
+    [ "$actual_sha" = "$expected_sha" ] || {
+        printf 'canonical genesis does not match the approved recovery genesis: %s\n' "$actual_sha"
+        return 1
+    }
     for template in \
         "$canonical" \
         "$REPO_ROOT/deploy/config/genesis.toml" \
@@ -137,7 +151,10 @@ shipped_genesis_templates_are_identical_disabled_observers() {
     do
         output="$(validate "$template")" || return 1
         printf '%s\n' "$output" \
-            | grep -Fq 'community rewards v1 disabled (activation absent)' \
+            | grep -Fq 'complete production validator set contains 6 public address(es)' \
+            || return 1
+        printf '%s\n' "$output" \
+            | grep -Fq 'community rewards v1 activation height 137146 is explicit' \
             || return 1
         cmp -s "$canonical" "$template" || {
             printf 'shipped genesis template differs from canonical genesis.toml: %s\n' "$template"
@@ -275,6 +292,6 @@ run_test 'embedded private-key material fails closed without being echoed' embed
 run_test 'incomplete genesis cannot publish a partial validator set' incomplete_genesis_cannot_ship_a_partial_validator_set
 run_test 'release genesis must explicitly select complete or observer mode' validator_mode_must_be_explicit
 run_test 'validator identities must be declared in shared genesis accounts' validator_accounts_must_be_shared_genesis_state
-run_test 'all shipped genesis templates are identical activation-free observers' shipped_genesis_templates_are_identical_disabled_observers
+run_test 'all shipped genesis templates equal the approved recovered network' shipped_genesis_templates_are_identical_recovered_network
 
 finish_tests
