@@ -1,27 +1,69 @@
-name: Deploy Explorer
+name: Deploy ARC public console
+
 on:
   push:
     branches: [main]
     paths:
+      - 'dashboard/**'
       - 'explorer/**'
+      - 'wallet/**'
+      - 'docs/STATUS.md'
+      - 'scripts/build-public-site.sh'
+      - '.github/workflows/deploy-explorer.yml'
+  workflow_dispatch:
 
 concurrency:
-  group: deploy-explorer-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  deploy:
+  build:
+    name: Verify and assemble public console
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
-      - name: Install Vercel CLI
-        run: npm i -g vercel
-      - name: Deploy
-        run: vercel --prod --yes --token ${{ secrets.VERCEL_TOKEN }}
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Verify dashboard and explorer contracts
+        run: |
+          set -Eeuo pipefail
+          npm --prefix dashboard ci
+          npm --prefix dashboard test
+          node explorer/test-contract.mjs
+
+      - name: Assemble one immutable site artifact
         env:
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          ARC_PUBLIC_SITE_SHA: ${{ github.sha }}
+        run: ./scripts/build-public-site.sh public-site
+
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: public-site
+          retention-days: 7
+
+  deploy:
+    name: Publish GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
