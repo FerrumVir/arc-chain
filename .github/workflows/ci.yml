@@ -335,15 +335,10 @@ jobs:
     name: supply chain (cargo-deny)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # TODO(OPTIONAL-AUDIT): make blocking after the current advisory, license,
-    # and yanked-crate findings are triaged. Every entry added to [advisories]
-    # ignore must carry a dated comment; see deny.toml.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check advisories bans sources licenses
+      - name: Enforce advisory, license, source, and dependency policy
+        run: bash scripts/ci/run-cargo-deny.sh Cargo.toml
 
   # ------------------------------------------------------- shell syntax ----
   # Zero-debt gate, blocking from day one: `bash -n` parses without executing,
@@ -391,29 +386,15 @@ jobs:
 
   # ------------------------------------------------------------- forge ----
   # 8 Solidity files including a bridge, a staking contract, a state-root
-  # anchor and a UUPS proxy. foundry.toml has been configured this whole
-  # time; nothing has ever compiled them.
+  # anchor and a UUPS proxy. Formatting and compilation are blocking release
+  # gates; OpenZeppelin is resolved at an exact version.
   forge:
     name: contracts (forge)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # TODO(OPTIONAL-FORGE): make blocking after dependency resolution is
-    # reproducible. contracts/ imports
-    # @openzeppelin/contracts/**, foundry.toml sets libs = ["lib"], and there
-    # is no lib/ directory and no git submodule in the repo — so the
-    # dependency has never been resolvable from a clean checkout. The npm
-    # install + FOUNDRY_REMAPPINGS below is the minimal fix that adds no new
-    # tracked files; the durable fix is committing a remappings.txt or a
-    # foundry submodule, and pinning the OpenZeppelin major version to
-    # whichever one these contracts were written against (v5 changed
-    # Ownable's constructor signature, so a v4-era contract fails to compile
-    # against the v5 pinned below — that is the first thing to check).
-    continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
-      # Runs without dependencies resolved, so it reports honestly even while
-      # `forge build` is still red.
       - name: forge fmt --check
         run: forge fmt --check
       - name: Resolve OpenZeppelin

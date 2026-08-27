@@ -20,18 +20,38 @@ esac
 [ ! -L "${OUTPUT_DIR%/}" ] || die "refusing symlinked output directory: $OUTPUT_DIR"
 
 for required in \
-    dashboard/index.html dashboard/tailwind.css \
+    dashboard/index.html dashboard/tailwind.css dashboard/app.css dashboard/app.js \
     explorer/index.html explorer/app.js explorer/styles.css \
+    shared/frontend/arc-network.js shared/frontend/arc-network.json \
     wallet/index.html docs/STATUS.md; do
     [ -s "$required" ] || die "required source is missing or empty: $required"
 done
 
 rm -rf -- "$OUTPUT_DIR"
-mkdir -p -- "$OUTPUT_DIR/explorer" "$OUTPUT_DIR/wallet" "$OUTPUT_DIR/docs"
+mkdir -p -- \
+    "$OUTPUT_DIR/explorer" "$OUTPUT_DIR/wallet" "$OUTPUT_DIR/docs" \
+    "$OUTPUT_DIR/shared/frontend"
 
-cp -- dashboard/index.html "$OUTPUT_DIR/index.html"
-cp -- dashboard/tailwind.css "$OUTPUT_DIR/tailwind.css"
+# The source dashboard lives one directory below the shared resolver. At the
+# public-site root it is a sibling instead, so rewrite only these two audited
+# relative URLs. This keeps the same source usable in repository-local tests
+# and on GitHub project Pages (which may itself have a path prefix).
+sed \
+    -e 's#content="../shared/frontend/arc-network.json"#content="./shared/frontend/arc-network.json"#' \
+    -e 's#src="../shared/frontend/arc-network.js#src="./shared/frontend/arc-network.js#' \
+    dashboard/index.html > "$OUTPUT_DIR/index.html"
+grep -Fq 'content="./shared/frontend/arc-network.json"' "$OUTPUT_DIR/index.html" \
+    || die "dashboard network-config URL rewrite failed"
+grep -Fq 'src="./shared/frontend/arc-network.js' "$OUTPUT_DIR/index.html" \
+    || die "dashboard resolver URL rewrite failed"
+if grep -Fq '../shared/frontend' "$OUTPUT_DIR/index.html"; then
+    die "dashboard retained a source-tree-only shared URL"
+fi
+
+cp -- dashboard/tailwind.css dashboard/app.css dashboard/app.js "$OUTPUT_DIR/"
 cp -- explorer/index.html explorer/app.js explorer/styles.css "$OUTPUT_DIR/explorer/"
+cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
+    "$OUTPUT_DIR/shared/frontend/"
 cp -- wallet/index.html "$OUTPUT_DIR/wallet/index.html"
 cp -- docs/STATUS.md "$OUTPUT_DIR/docs/STATUS.md"
 

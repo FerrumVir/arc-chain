@@ -6,6 +6,7 @@ on:
     paths:
       - 'dashboard/**'
       - 'explorer/**'
+      - 'shared/frontend/**'
       - 'wallet/**'
       - 'docs/STATUS.md'
       - 'scripts/build-public-site.sh'
@@ -42,6 +43,7 @@ jobs:
           set -Eeuo pipefail
           npm --prefix dashboard ci
           npm --prefix dashboard test
+          node shared/frontend/test-arc-network.mjs
           node explorer/test-contract.mjs
 
       - name: Assemble one immutable site artifact

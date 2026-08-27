@@ -65,10 +65,9 @@ contract ARC721 {
      * @return             True if the interface is supported
      */
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return
-            interfaceId == 0x80ac58cd || // ERC-721
-            interfaceId == 0x5b5e139f || // ERC-721 Metadata
-            interfaceId == 0x01ffc9a7;   // ERC-165
+        return interfaceId == 0x80ac58cd // ERC-721
+            || interfaceId == 0x5b5e139f // ERC-721 Metadata
+            || interfaceId == 0x01ffc9a7; // ERC-165
     }
 
     // ── ERC-721 Interface ──────────────────────────────────────────────────
@@ -279,9 +278,7 @@ contract ARC721 {
 
     function _isApprovedOrOwner(address spender, uint256 tokenId) internal view returns (bool) {
         address tokenOwner = ownerOf(tokenId);
-        return (spender == tokenOwner ||
-                getApproved(tokenId) == spender ||
-                isApprovedForAll(tokenOwner, spender));
+        return (spender == tokenOwner || getApproved(tokenId) == spender || isApprovedForAll(tokenOwner, spender));
     }
 
     function _toString(uint256 value) internal pure returns (string memory) {
@@ -306,10 +303,7 @@ contract ARC721 {
  * @dev Interface for contracts that want to support safeTransfers from ERC-721 contracts.
  */
 interface IERC721Receiver {
-    function onERC721Received(
-        address operator,
-        address from,
-        uint256 tokenId,
-        bytes calldata data
-    ) external returns (bytes4);
+    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)
+        external
+        returns (bytes4);
 }

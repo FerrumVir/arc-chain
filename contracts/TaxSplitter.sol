@@ -18,8 +18,7 @@ contract TaxSplitter is Ownable {
     // -------------------------------------------------------------------------
 
     /// @notice The ARC ERC-20 token contract.
-    IERC20 public constant ARC_TOKEN =
-        IERC20(0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499);
+    IERC20 public constant ARC_TOKEN = IERC20(0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499);
 
     /// @notice Percentage denominator (100%).
     uint256 public constant PERCENT_BASE = 100;
@@ -50,17 +49,9 @@ contract TaxSplitter is Ownable {
     // Events
     // -------------------------------------------------------------------------
 
-    event Distributed(
-        uint256 stakingAmount,
-        uint256 treasuryAmount,
-        uint256 liquidityAmount
-    );
+    event Distributed(uint256 stakingAmount, uint256 treasuryAmount, uint256 liquidityAmount);
 
-    event AddressesUpdated(
-        address staking,
-        address treasury,
-        address liquidity
-    );
+    event AddressesUpdated(address staking, address treasury, address liquidity);
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -70,18 +61,13 @@ contract TaxSplitter is Ownable {
     /// @param _staking     Initial staking rewards recipient.
     /// @param _treasury    Initial treasury recipient.
     /// @param _liquidity   Initial liquidity recipient.
-    constructor(
-        address initialOwner,
-        address _staking,
-        address _treasury,
-        address _liquidity
-    ) Ownable(initialOwner) {
-        require(_staking   != address(0), "TaxSplitter: zero staking address");
-        require(_treasury  != address(0), "TaxSplitter: zero treasury address");
+    constructor(address initialOwner, address _staking, address _treasury, address _liquidity) Ownable(initialOwner) {
+        require(_staking != address(0), "TaxSplitter: zero staking address");
+        require(_treasury != address(0), "TaxSplitter: zero treasury address");
         require(_liquidity != address(0), "TaxSplitter: zero liquidity address");
 
-        stakingAddress   = _staking;
-        treasuryAddress  = _treasury;
+        stakingAddress = _staking;
+        treasuryAddress = _treasury;
         liquidityAddress = _liquidity;
     }
 
@@ -97,13 +83,13 @@ contract TaxSplitter is Ownable {
         uint256 balance = ARC_TOKEN.balanceOf(address(this));
         require(balance > 0, "TaxSplitter: nothing to distribute");
 
-        uint256 stakingAmount   = (balance * STAKING_SHARE)   / PERCENT_BASE;
-        uint256 treasuryAmount  = (balance * TREASURY_SHARE)  / PERCENT_BASE;
+        uint256 stakingAmount = (balance * STAKING_SHARE) / PERCENT_BASE;
+        uint256 treasuryAmount = (balance * TREASURY_SHARE) / PERCENT_BASE;
         // Liquidity gets the remainder to avoid rounding dust.
         uint256 liquidityAmount = balance - stakingAmount - treasuryAmount;
 
-        ARC_TOKEN.safeTransfer(stakingAddress,   stakingAmount);
-        ARC_TOKEN.safeTransfer(treasuryAddress,  treasuryAmount);
+        ARC_TOKEN.safeTransfer(stakingAddress, stakingAmount);
+        ARC_TOKEN.safeTransfer(treasuryAddress, treasuryAmount);
         ARC_TOKEN.safeTransfer(liquidityAddress, liquidityAmount);
 
         emit Distributed(stakingAmount, treasuryAmount, liquidityAmount);
@@ -113,17 +99,13 @@ contract TaxSplitter is Ownable {
     /// @param _staking   New staking rewards recipient.
     /// @param _treasury  New treasury recipient.
     /// @param _liquidity New liquidity recipient.
-    function setAddresses(
-        address _staking,
-        address _treasury,
-        address _liquidity
-    ) external onlyOwner {
-        require(_staking   != address(0), "TaxSplitter: zero staking address");
-        require(_treasury  != address(0), "TaxSplitter: zero treasury address");
+    function setAddresses(address _staking, address _treasury, address _liquidity) external onlyOwner {
+        require(_staking != address(0), "TaxSplitter: zero staking address");
+        require(_treasury != address(0), "TaxSplitter: zero treasury address");
         require(_liquidity != address(0), "TaxSplitter: zero liquidity address");
 
-        stakingAddress   = _staking;
-        treasuryAddress  = _treasury;
+        stakingAddress = _staking;
+        treasuryAddress = _treasury;
         liquidityAddress = _liquidity;
 
         emit AddressesUpdated(_staking, _treasury, _liquidity);

@@ -360,7 +360,6 @@ linux_compat_smoke_executes_real_headless_node() {
 release_actions_are_exact_sha_allowlisted() {
     local actual expected ref
     expected="$(printf '%s\n' \
-        'EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25' \
         'Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c' \
         'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
         'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' \
@@ -406,10 +405,7 @@ release_supply_chain_and_npm_audits_are_blocking() {
     for required in \
         'needs: validate' \
         'ref: ${{ needs.validate.outputs.sha }}' \
-        'EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25' \
-        'manifest-path: ${{ matrix.manifest }}' \
-        'arguments: --locked' \
-        'command: check advisories bans sources licenses'
+        'bash scripts/ci/run-cargo-deny.sh "${{ matrix.manifest }}"'
     do
         printf '%s\n' "$supply_block" | grep -Fq -- "$required" || {
             printf 'blocking release dependency-policy gate is missing: %s\n' "$required"

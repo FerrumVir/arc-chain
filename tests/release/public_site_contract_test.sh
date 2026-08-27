@@ -46,6 +46,8 @@ pages_workflow_is_pinned_and_self_contained() {
     fi
     grep -Fq 'pages: write' "$WORKFLOW" \
         && grep -Fq 'id-token: write' "$WORKFLOW" \
+        && grep -Fq -- "- 'shared/frontend/**'" "$WORKFLOW" \
+        && grep -Fq 'node shared/frontend/test-arc-network.mjs' "$WORKFLOW" \
         && grep -Fq './scripts/build-public-site.sh public-site' "$WORKFLOW"
 }
 
@@ -61,8 +63,9 @@ site_builder_is_reproducible_and_complete() (
     ) || return 1
 
     for path in \
-        index.html tailwind.css .nojekyll deployed-commit.txt SHA256SUMS \
+        index.html tailwind.css app.css app.js .nojekyll deployed-commit.txt SHA256SUMS \
         explorer/index.html explorer/app.js explorer/styles.css \
+        shared/frontend/arc-network.js shared/frontend/arc-network.json \
         wallet/index.html docs/STATUS.md
     do
         [ -e "$output/$path" ] || {
@@ -70,6 +73,9 @@ site_builder_is_reproducible_and_complete() (
             return 1
         }
     done
+    grep -Fq 'content="./shared/frontend/arc-network.json"' "$output/index.html" || return 1
+    grep -Fq 'src="./shared/frontend/arc-network.js' "$output/index.html" || return 1
+    ! grep -Fq '../shared/frontend' "$output/index.html" || return 1
     [ "$(cat "$output/deployed-commit.txt")" = contract-test ] || return 1
     (cd / && shasum -a 256 -c "$output/SHA256SUMS") >/dev/null || return 1
     first_hash="$(shasum -a 256 "$output/SHA256SUMS")"
