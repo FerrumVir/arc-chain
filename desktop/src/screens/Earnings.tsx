@@ -93,9 +93,10 @@ export function Earnings() {
               </li>
             </ol>
             <p style={{ marginBottom: 0, color: "var(--text-muted)" }}>
-              The current recovery candidate fails closed while approval
-              collection is unavailable. Running a prompt from the Inference
-              tab tests the selected inference path; it does not guarantee that
+              Reward issuance fails closed whenever activation, validator
+              approval collection, treasury capacity, or mined-receipt
+              evidence is unavailable. Running a prompt from the Inference tab
+              tests the selected inference path; it does not guarantee that
               your worker receives the job or a reward.
             </p>
           </div>
