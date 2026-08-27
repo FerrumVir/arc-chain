@@ -145,6 +145,34 @@ sdk_package() {
     )
 }
 
+compatibility_typescript_sdk() {
+    (
+        cd sdks/typescript &&
+            npm ci &&
+            npm audit --audit-level=low &&
+            npm test -- --runInBand &&
+            npm run build &&
+            node -e "const sdk=require('./dist'); if (!sdk || typeof sdk !== 'object') throw new Error('CommonJS SDK failed to load')"
+    )
+}
+
+python_sdk() {
+    (
+        local arc_python_venv
+        arc_python_venv="$(mktemp -d "${TMPDIR:-/tmp}/arc-python-sdk.XXXXXX")" || exit 1
+        trap 'rm -rf -- "$arc_python_venv"' EXIT
+        python3 -m venv "$arc_python_venv" &&
+            cd sdks/python &&
+            "$arc_python_venv/bin/python" -m pip install -e '.[dev]' &&
+            "$arc_python_venv/bin/python" -m pip freeze --exclude-editable > "$arc_python_venv/requirements.txt" &&
+            "$arc_python_venv/bin/python" -m pip_audit -r "$arc_python_venv/requirements.txt" &&
+            "$arc_python_venv/bin/python" -m ruff check arc_sdk tests &&
+            "$arc_python_venv/bin/python" -m ruff format --check arc_sdk tests &&
+            "$arc_python_venv/bin/python" -m unittest discover -s tests -v &&
+            "$arc_python_venv/bin/python" -m compileall -q arc_sdk tests
+    )
+}
+
 printf '================================================================\n'
 printf ' ARC Chain quality gate (%s)\n' "$PROFILE"
 printf ' Logs: %s\n' "$LOG_DIR"
@@ -171,6 +199,8 @@ if [ "$PROFILE" = full ]; then
     run_check "Desktop Playwright E2E" desktop_e2e
     run_check "Desktop Tauri Rust tests" desktop_tauri_tests
     run_check "TypeScript SDK package" sdk_package
+    run_check "Compatibility TypeScript SDK" compatibility_typescript_sdk
+    run_check "Python SDK" python_sdk
 fi
 
 printf '\n================================================================\n'

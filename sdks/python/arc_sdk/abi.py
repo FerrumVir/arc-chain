@@ -21,9 +21,8 @@ Usage::
 
 from __future__ import annotations
 
-import struct
 import re
-from typing import Any, List, Sequence, Tuple, Union
+from typing import Any, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -34,14 +33,30 @@ from typing import Any, List, Sequence, Tuple, Union
 
 
 _KECCAK_RC = [
-    0x0000000000000001, 0x0000000000008082, 0x800000000000808A,
-    0x8000000080008000, 0x000000000000808B, 0x0000000080000001,
-    0x8000000080008081, 0x8000000000008009, 0x000000000000008A,
-    0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
-    0x000000008000808B, 0x800000000000008B, 0x8000000000008089,
-    0x8000000000008003, 0x8000000000008002, 0x8000000000000080,
-    0x000000000000800A, 0x800000008000000A, 0x8000000080008081,
-    0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808A,
+    0x8000000080008000,
+    0x000000000000808B,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008A,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000A,
+    0x000000008000808B,
+    0x800000000000008B,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800A,
+    0x800000008000000A,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
 ]
 
 _KECCAK_ROT = [
@@ -116,8 +131,6 @@ def keccak256(data: bytes) -> bytes:
         32-byte digest.
     """
     rate = 136  # (1600 - 2*256) / 8 = 136 bytes
-    capacity_bytes = 64  # 512 bits / 8
-
     # Pad: Keccak uses multi-rate padding  10*1
     padding_len = rate - (len(data) % rate)
     if padding_len == 0:
@@ -214,6 +227,7 @@ def _parse_canonical_signature(sig: str) -> Tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 # Encoding
 # ---------------------------------------------------------------------------
+
 
 def _encode_uint(value: int, bits: int) -> bytes:
     """Encode an unsigned integer, left-padded to 32 bytes."""
@@ -391,6 +405,7 @@ def encode_abi(types: list[str], values: list) -> bytes:
 # Decoding
 # ---------------------------------------------------------------------------
 
+
 def _decode_uint(data: bytes, offset: int, bits: int) -> Tuple[int, int]:
     """Decode a uint from 32 bytes at the given offset."""
     word = data[offset : offset + 32]
@@ -543,9 +558,7 @@ def _decode_array_contents(
     return results
 
 
-def _decode_tuple(
-    types: list[str], data: bytes, offset: int, base_offset: int
-) -> list:
+def _decode_tuple(types: list[str], data: bytes, offset: int, base_offset: int) -> list:
     """Decode a tuple of types starting at *offset*."""
     results: list = []
     cursor = offset
@@ -575,6 +588,7 @@ def decode_abi(types: list[str], data: bytes) -> list:
 # ---------------------------------------------------------------------------
 # Function selectors and call encoding
 # ---------------------------------------------------------------------------
+
 
 def function_selector(signature: str) -> bytes:
     """
@@ -645,9 +659,7 @@ def decode_function_result(types: list[str], data: bytes) -> list:
     return decode_abi(types, data)
 
 
-def decode_function_input(
-    function_signature: str, data: bytes
-) -> Tuple[str, list]:
+def decode_function_input(function_signature: str, data: bytes) -> Tuple[str, list]:
     """
     Decode calldata (selector + arguments) given the expected signature.
 
@@ -665,8 +677,7 @@ def decode_function_input(
     actual_selector = data[:4]
     if expected_selector != actual_selector:
         raise ValueError(
-            f"Selector mismatch: expected {expected_selector.hex()}, "
-            f"got {actual_selector.hex()}"
+            f"Selector mismatch: expected {expected_selector.hex()}, got {actual_selector.hex()}"
         )
     name, param_types = _parse_canonical_signature(function_signature)
     decoded = decode_abi(param_types, data[4:])

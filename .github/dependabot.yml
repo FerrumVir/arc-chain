@@ -40,12 +40,16 @@ updates:
     schedule:
       interval: weekly
 
+  - package-ecosystem: pip
+    directory: /sdks/python
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
 # REMOVED: `npm` at /explorer. explorer/ contains two static HTML files and
 # no package.json, so that entry watched nothing.
 #
 # NOT ADDED: /sdk (has package.json but no package-lock.json, so Dependabot
-# cannot resolve it) and /sdks/python (pip ecosystem; add once
-# sdks/python/pyproject.toml declares dev extras and a python job exists to
-# validate the bumps). Also note three separate package.json files all
+# cannot resolve it). Also note three separate package.json files all
 # declare the name "@arc-chain/sdk" - resolve that collision before adding
 # more automation on top of them.

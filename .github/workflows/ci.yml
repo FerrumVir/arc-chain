@@ -452,15 +452,69 @@ jobs:
       # never rewrites the checkout's tracked dist directory.
       - run: npm test
 
+  compatibility-typescript-sdk:
+    name: compatibility TypeScript SDK (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=low
+      - run: npm test -- --runInBand
+      - run: npm run build
+      - name: Load the published CommonJS entrypoint
+        shell: bash
+        run: >-
+          node -e "const sdk=require('./dist');
+          if (!sdk || typeof sdk !== 'object') throw new Error('CommonJS SDK failed to load')"
+
+  python-sdk:
+    name: Python SDK (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.13']
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: sdks/python/pyproject.toml
+      - run: python -m pip install -e '.[dev]'
+      - name: Audit the resolved SDK dependency graph
+        run: |
+          python -m pip freeze --exclude-editable > "$RUNNER_TEMP/arc-python-sdk-requirements.txt"
+          python -m pip_audit -r "$RUNNER_TEMP/arc-python-sdk-requirements.txt"
+      - run: python -m ruff check arc_sdk tests
+      - run: python -m ruff format --check arc_sdk tests
+      - run: python -m unittest discover -s tests -v
+      - run: python -m compileall -q arc_sdk tests
+
 # REMOVED: the old `explorer-build` job. It probed for explorer/package.json,
 # emitted a ::notice:: and exited. Explorer is intentionally dependency-free
 # static HTML/CSS/JavaScript now, and its executable contract is enforced by
 # the blocking `explorer-contract` job above. Add a build job only if a real
 # package/build pipeline lands in explorer/.
 #
-# NOT ADDED (deliberate, tracked as follow-up): jobs for the two duplicate
-# legacy SDK trees at sdk/ and sdks/typescript, or sdks/python. The legacy Jest
-# suite cannot currently load its ESM-only noble dependency and its test-only
-# dependency tree has known advisories; Python has no tracked pytest/ruff/mypy
-# tooling. Resolve which of the three packages named "@arc-chain/sdk" is
-# canonical before publishing or making those trees release gates.
+# Both compatibility SDK trees are deliberately blocking even though only
+# sdk/typescript is publishable. Keeping them executable prevents stale client
+# code from becoming a security or integration blind spot while consumers
+# migrate to the canonical package.

@@ -72,8 +72,7 @@ class Block:
     def from_dict(cls, data: Dict[str, Any]) -> Block:
         header = BlockHeader.from_dict(data)
         tx_hashes = [
-            h if isinstance(h, str) else h.get("hash", "")
-            for h in data.get("tx_hashes", [])
+            h if isinstance(h, str) else h.get("hash", "") for h in data.get("tx_hashes", [])
         ]
         return cls(
             header=header,

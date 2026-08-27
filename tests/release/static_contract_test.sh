@@ -472,6 +472,7 @@ github_owned_actions_are_node24_exact_sha_allowlisted() {
         'actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128' \
         'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' \
         'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020' \
+        'actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1' \
         'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
         'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9' \
         | LC_ALL=C sort)"
@@ -560,8 +561,8 @@ release_supply_chain_and_npm_audits_are_blocking() {
             return 1
         }
     printf '%s\n' "$quality_block" \
-        | grep -Fq 'for package in dashboard desktop sdk/typescript; do' || {
-            printf 'release-quality npm audit loop does not enumerate all three lockfiles\n'
+        | grep -Fq 'for package in dashboard desktop sdk/typescript sdks/typescript; do' || {
+            printf 'release-quality npm audit loop does not enumerate all four lockfiles\n'
             return 1
         }
 }

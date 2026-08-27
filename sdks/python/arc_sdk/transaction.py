@@ -8,7 +8,7 @@ format, then signs them with Ed25519 and computes the BLAKE3 transaction hash.
 from __future__ import annotations
 
 import struct
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import blake3
 
@@ -90,14 +90,19 @@ def _encode_body(body: Dict[str, Any]) -> bytes:
     else:
         # Fallback: serialize as-is for unknown types
         import json
+
         parts.append(json.dumps(body, sort_keys=True).encode("utf-8"))
 
     return b"".join(parts)
 
 
 def _compute_hash(
-    tx_type_byte: int, from_addr: str, nonce: int,
-    body: Dict[str, Any], fee: int, gas_limit: int,
+    tx_type_byte: int,
+    from_addr: str,
+    nonce: int,
+    body: Dict[str, Any],
+    fee: int,
+    gas_limit: int,
 ) -> str:
     """
     Compute the BLAKE3 signing hash for a transaction.

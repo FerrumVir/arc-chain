@@ -21,7 +21,6 @@ from .types import (
     HealthInfo,
     NodeInfo,
     Receipt,
-    SubmitResult,
 )
 
 
@@ -311,12 +310,14 @@ class ArcClient:
         for tx in txs:
             if "body" in tx and "tx_type" in tx:
                 body = tx["body"]
-                normalized.append({
-                    "from": tx["from"],
-                    "to": body.get("to", "0" * 64),
-                    "amount": body.get("amount", 0),
-                    "nonce": tx.get("nonce", 0),
-                })
+                normalized.append(
+                    {
+                        "from": tx["from"],
+                        "to": body.get("to", "0" * 64),
+                        "amount": body.get("amount", 0),
+                        "nonce": tx.get("nonce", 0),
+                    }
+                )
             else:
                 normalized.append(tx)
 

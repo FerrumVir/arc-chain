@@ -138,6 +138,7 @@ jobs:
             dashboard/package-lock.json
             desktop/package-lock.json
             sdk/typescript/package-lock.json
+            sdks/typescript/package-lock.json
 
       # The workspace is pinned to nightly; the out-of-workspace Tauri crate
       # is deliberately tested on stable by scripts/ci_check.sh.
@@ -158,7 +159,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          for package in dashboard desktop sdk/typescript; do
+          for package in dashboard desktop sdk/typescript sdks/typescript; do
             npm --prefix "$package" audit --package-lock-only --audit-level=low
           done
 
