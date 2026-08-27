@@ -161,6 +161,8 @@ python_sdk() {
         local arc_python_venv
         arc_python_venv="$(mktemp -d "${TMPDIR:-/tmp}/arc-python-sdk.XXXXXX")" || exit 1
         trap 'rm -rf -- "$arc_python_venv"' EXIT
+        export PYTHONPYCACHEPREFIX="$arc_python_venv/pycache"
+        export RUFF_CACHE_DIR="$arc_python_venv/ruff-cache"
         python3 -m venv "$arc_python_venv" &&
             cd sdks/python &&
             "$arc_python_venv/bin/python" -m pip install -e '.[dev]' &&

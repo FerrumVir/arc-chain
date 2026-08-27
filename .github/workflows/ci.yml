@@ -484,6 +484,9 @@ jobs:
     name: Python SDK (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/arc-python-sdk-pycache-${{ matrix.python-version }}
+      RUFF_CACHE_DIR: /tmp/arc-python-sdk-ruff-cache-${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
