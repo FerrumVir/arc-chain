@@ -268,12 +268,21 @@ in GitHub's settings:
   tag. Existing unreleased historical tags mean a write collaborator could
   otherwise publish junk as GitHub's `Latest` release and deny service to the
   updater even though payload signatures still prevent code execution;
-- before tagging, run `scripts/release/backup-signing-keys.sh` with a random
-  passphrase held outside the ciphertext provider. Keep a mode-0600 local
-  ciphertext copy and an independently downloaded, hash-matched remote copy;
-  then restore from the remote ciphertext and verify canary signatures against
-  both checked-in public keys. GitHub environment secrets are write-only and do
-  not replace this recovery copy. Never upload either private key in plaintext;
+- before tagging, retain the existing v0.7-compatible updater key and create a
+  recovery copy of both current signing keys. If the only private copies are
+  the write-only GitHub environment secrets, store a random 32+-character
+  backup passphrase in macOS Keychain and the protected `release` environment,
+  then manually dispatch `release-signing-backup.yml` with the exact protected
+  `main` SHA. That workflow runs `scripts/release/backup-signing-keys.sh`,
+  immediately restores and byte-compares both keys, uploads ciphertext only,
+  and retains the temporary Actions artifact for one day. Download it, set it
+  mode 0600, run `scripts/release/verify-signing-key-backup.sh` against the
+  checked-in manifest and updater public keys, copy only the ciphertext to ARC
+  Drive and a second independent recovery medium, re-download and hash-match
+  both copies, then delete the Actions artifact. Keep the passphrase outside
+  every ciphertext provider. Never upload either private key in plaintext and
+  never rotate the updater key before v0.8.0: every v0.7 client must still be
+  able to verify the v0.8.0 bridge release;
 - configure Apple Developer ID signing/notarization and Windows Authenticode
   signing before claiming OS-signed installers. Until then, release notes must
   plainly label macOS and Windows packages unsigned; the Tauri updater payload
