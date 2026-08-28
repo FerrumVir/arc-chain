@@ -410,4 +410,6 @@ content-verified create-only archive behavior, both extended GO authorizations,
 sealed-source stake proof, exact checkpoint/model/shard commitments, full
 remote-object verification, source-path separation, explicit HTTPS origins,
 loopback gateway policy, same-height fork rejection, clean restart command
-construction, hash-pinned reward probes, and successful-receipt-only earnings.
+construction, TERM-only local cleanup that refuses SIGKILL, the complete
+six-validator restart/height-advance sequence, hash-pinned reward probes, and
+successful-receipt-only earnings.

@@ -427,6 +427,108 @@ class RecoveryRolloutTests(unittest.TestCase):
         self.assertIn("--approved-manifest-hash", imported)
         self.assertIn("--data-dir", imported)
 
+    def test_local_stop_is_term_only_and_fails_closed_on_timeout(self) -> None:
+        value = self.fixture()
+        output = io.StringIO()
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=output)
+        node = value["validators"][0]
+        name = node["name"]
+
+        process = mock.Mock()
+        process.pid = 4242
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        handle = mock.Mock()
+        harness.processes[name] = process
+        harness.logs[name] = handle
+
+        with mock.patch.object(rollout.os, "killpg") as killpg:
+            harness.stop_local(node)
+        killpg.assert_called_once_with(4242, rollout.signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=30)
+        handle.close.assert_called_once_with()
+        self.assertNotIn(name, harness.logs)
+
+        timed_out = mock.Mock()
+        timed_out.pid = 4343
+        timed_out.poll.return_value = None
+        timed_out.wait.side_effect = rollout.subprocess.TimeoutExpired("arc-node", 30)
+        timed_out_handle = mock.Mock()
+        harness.processes[name] = timed_out
+        harness.logs[name] = timed_out_handle
+        with mock.patch.object(rollout.os, "killpg") as killpg:
+            with self.assertRaisesRegex(rollout.RolloutError, "refusing SIGKILL"):
+                harness.stop_local(node)
+        killpg.assert_called_once_with(4343, rollout.signal.SIGTERM)
+        timed_out_handle.close.assert_not_called()
+        self.assertIs(harness.logs[name], timed_out_handle)
+
+    def test_local_rehearsal_restarts_all_six_and_requires_post_restart_advance(self) -> None:
+        value = self.fixture()
+        output = io.StringIO()
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=output)
+        validators = value["validators"]
+
+        harness.import_local = mock.Mock()
+        harness.start_local = mock.Mock()
+        harness.stop_local = mock.Mock()
+        harness.wait_nodes_ready = mock.Mock()
+        harness.prove_boundary = mock.Mock()
+        harness.prove_advancing_convergence = mock.Mock()
+        harness.prove_reward_policy = mock.Mock()
+        harness.obtain_receipt_evidence = mock.Mock(return_value=None)
+        convergence = []
+        expected_waits = []
+        for index in range(6):
+            before = 200 + index * 2
+            convergence.extend(
+                [
+                    (before, "a" * 64, "b" * 64),
+                    (before + 1, "c" * 64, "b" * 64),
+                ]
+            )
+            expected_waits.extend(
+                [
+                    mock.call(),
+                    mock.call(
+                        minimum_height=before + value["checks"]["min_height_advance"],
+                        timeout=value["checks"]["restart_timeout_seconds"],
+                    ),
+                ]
+            )
+        harness.wait_convergence = mock.Mock(side_effect=convergence)
+
+        harness.execute_local()
+
+        self.assertEqual(
+            harness.import_local.call_args_list,
+            [mock.call(node) for node in validators],
+        )
+        for node in validators:
+            self.assertEqual(
+                [call.args[0] for call in harness.start_local.call_args_list].count(node),
+                2,
+            )
+        self.assertEqual(
+            harness.wait_nodes_ready.call_args_list,
+            [mock.call()]
+            + [
+                mock.call(timeout=value["checks"]["restart_timeout_seconds"])
+                for _ in validators
+            ],
+        )
+        self.assertEqual(harness.wait_convergence.call_args_list, expected_waits)
+        self.assertEqual(
+            harness.stop_local.call_args_list[:6],
+            [mock.call(node) for node in validators],
+        )
+        self.assertEqual(
+            harness.stop_local.call_args_list[6:],
+            [mock.call(node, strict=False) for node in reversed(validators)],
+        )
+        harness.prove_reward_policy.assert_called_once_with()
+        self.assertIn("COMPLETE local rehearsal", output.getvalue())
+
     def test_dynamic_reward_probe_is_hash_pinned(self) -> None:
         value = self.fixture(reward_receipt=True)
         probe = self.root / "reward-probe"
