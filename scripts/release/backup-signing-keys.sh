@@ -3,8 +3,11 @@
 # long-lived ARC release signing keys. The passphrase is supplied only through
 # ARC_SIGNING_BACKUP_PASSPHRASE and is removed from the child-process
 # environment before GnuPG is invoked.
+set +x
 set -Eeuo pipefail
+ulimit -c 0
 umask 077
+unset BASH_ENV ENV CDPATH
 
 die() {
     printf 'signing-key backup: %s\n' "$*" >&2
@@ -74,6 +77,7 @@ chmod 600 "$PAYLOAD/release-manifest-ed25519.pub"
 printf '%s' "$PASSPHRASE" | gpg \
     --batch \
     --yes \
+    --no-symkey-cache \
     --pinentry-mode loopback \
     --passphrase-fd 0 \
     --symmetric \
@@ -91,6 +95,7 @@ install -m 600 -- "$WORK_DIR/signing-keys.tar.gpg" "$OUTPUT"
 printf '%s' "$PASSPHRASE" | gpg \
     --batch \
     --yes \
+    --no-symkey-cache \
     --pinentry-mode loopback \
     --passphrase-fd 0 \
     --decrypt \

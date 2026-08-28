@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -48,6 +48,7 @@ jobs:
           [ "$GITHUB_REF" = "refs/heads/main" ]
           [ "$CONFIRMATION" = "BACKUP_EXISTING_RELEASE_KEYS" ]
           [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$GITHUB_SHA" = "$EXPECTED_MAIN_SHA" ]
 
           checked_out_sha="$(git rev-parse HEAD)"
           git fetch --no-tags --force origin main:refs/remotes/origin/main
@@ -65,7 +66,7 @@ jobs:
           set +x
           set -Eeuo pipefail
           printf '%s  %s\n' \
-            'beed045b538af7f8daf5729171d2bbbca11af3d5143e67096f091aa8e87c6306' \
+            'f515c8937dfe8bc764f72d12580793647b445cac8bb6ed78b31e260f6f5bb14b' \
             'scripts/release/backup-signing-keys.sh' |
             sha256sum -c -
 
@@ -76,6 +77,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
           ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
         run: |
           set +x
           set -Eeuo pipefail
@@ -122,7 +124,7 @@ jobs:
           chmod 600 "$ciphertext"
 
           cipher_sha256="$(sha256sum "$ciphertext" | awk '{print $1}')"
-          artifact_name="arc-signing-backup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$cipher_sha256"
+          artifact_name="arc-signing-backup-$EXPECTED_MAIN_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$cipher_sha256"
 
           {
             printf 'cipher_path=%s\n' "$ciphertext"

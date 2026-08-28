@@ -1009,11 +1009,12 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
     for required in \
         'environment: release' \
         'runs-on: ubuntu-24.04' \
-        'ref: main' \
+        'ref: ${{ github.sha }}' \
         'BACKUP_EXISTING_RELEASE_KEYS' \
         '[ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]' \
         '[ "$GITHUB_REF" = "refs/heads/main" ]' \
-        'beed045b538af7f8daf5729171d2bbbca11af3d5143e67096f091aa8e87c6306' \
+        '[ "$GITHUB_SHA" = "$EXPECTED_MAIN_SHA" ]' \
+        'f515c8937dfe8bc764f72d12580793647b445cac8bb6ed78b31e260f6f5bb14b' \
         'ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}' \
         'TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}' \
         'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}' \
@@ -1023,6 +1024,7 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         'overwrite: false' \
         'include-hidden-files: false' \
         'cleanup_keys' \
+        'arc-signing-backup-$EXPECTED_MAIN_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$cipher_sha256' \
         'Remove runner ciphertext'
     do
         grep -Fq -- "$required" "$SIGNING_BACKUP_WORKFLOW" || {
@@ -1038,9 +1040,12 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         'decrypted archive membership differs from the four-file contract' \
         'shasum -a 256 -c KEY-SHA256SUMS' \
         'release/arc-release-allowed-signers' \
+        'EXPECTED_CIPHERTEXT_SHA256' \
+        'git -C "$REPO_ROOT" diff --quiet "$EXPECTED_MAIN_SHA"' \
         'ssh-keygen -Y sign' \
         'ssh-keygen -Y verify' \
-        'tauri signer sign' \
+        'node_modules/@tauri-apps/cli/tauri.js' \
+        '--private-key-path' \
         'tauri-updater-verifier'
     do
         grep -Fq -- "$required" "$SIGNING_BACKUP_VERIFY" || {

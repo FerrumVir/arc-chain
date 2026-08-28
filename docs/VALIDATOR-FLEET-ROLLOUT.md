@@ -276,9 +276,33 @@ in GitHub's settings:
   `main` SHA and confirmation `BACKUP_EXISTING_RELEASE_KEYS`. That one-shot
   workflow runs `scripts/release/backup-signing-keys.sh`,
   immediately restores and byte-compares both keys, uploads ciphertext only,
-  and retains the temporary Actions artifact for one day. Download it, set it
-  mode 0600, run `scripts/release/verify-signing-key-backup.sh` against the
-  checked-in manifest and updater public keys, copy only the ciphertext to ARC
+  and retains the temporary Actions artifact for one day. Before dispatch,
+  disable administrator bypass and self-review on the `release` environment
+  and require a distinct trusted reviewer. The artifact name binds protected
+  `main`, run/attempt, and its ciphertext SHA-256. Download it into a
+  FileVault-protected directory, set it mode 0600, and restore-test it from a
+  clean checkout of that exact commit. Disable inherited shell tracing before
+  reading Keychain so the passphrase cannot enter a trace:
+
+  ```bash
+  (
+    set +x
+    chmod 600 -- "$CIPHERTEXT"
+    export ARC_SIGNING_BACKUP_PASSPHRASE
+    ARC_SIGNING_BACKUP_PASSPHRASE="$(security find-generic-password \
+      -a 'FerrumVir ARC release' \
+      -s 'com.arc-chain.release-signing-backup.current' -w)"
+    trap 'unset ARC_SIGNING_BACKUP_PASSPHRASE' EXIT HUP INT TERM
+    scripts/release/verify-signing-key-backup.sh \
+      "$CIPHERTEXT" "$EXPECTED_MAIN_SHA" "$EXPECTED_CIPHERTEXT_SHA256"
+  )
+  ```
+
+  The verifier binds its checkout and trust inputs to the expected protected
+  `main` commit, verifies the ciphertext hash before decryption, prepares all
+  locked build tools before plaintext exists, and signs both manifest and
+  updater canaries without exporting either private key. Copy only the
+  ciphertext to ARC
   Drive and a second independent recovery medium, re-download and hash-match
   both copies, then delete the Actions artifact, delete only the temporary
   passphrase environment secret, and remove the one-shot workflow through a

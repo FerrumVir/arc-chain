@@ -16,6 +16,7 @@ for test_file in \
     "$TEST_DIR/genesis_contract_test.sh" \
     "$TEST_DIR/release_assembly_test.sh" \
     "$TEST_DIR/release_manifest_signature_test.sh" \
+    "$TEST_DIR/signing_key_backup_behavior_test.sh" \
     "$TEST_DIR/installer_behavior_test.sh"
 do
     printf '# %s\n' "${test_file##*/}"
