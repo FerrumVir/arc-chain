@@ -1072,6 +1072,9 @@ fn matmul_i8xi8_simd(
 /// x86 SIMD matmul - llama.cpp sign trick for AVX2, AVX-512.
 /// sign trick: abs(w) × sign_corrected(input) → safe maddubs (no i16 saturation)
 /// Processes 32 bytes at once (AVX2) or 64 (AVX-512), no sign extension needed.
+// The production dispatcher deliberately uses the full-precision scalar path;
+// this double-quantized implementation remains as a tested SIMD reference.
+#[cfg_attr(not(test), allow(dead_code))]
 #[cfg(target_arch = "x86_64")]
 fn matmul_i8xi8_simd(
     weights: &I8Weights,
@@ -1115,7 +1118,7 @@ fn matmul_i8xi8_simd(
                 let i = start + local_i;
                 let row = unsafe { data.as_ptr().add(i * in_size) };
                 let inp_ptr = inp_slice.as_ptr();
-                let mut acc: i64 = 0;
+                let mut acc: i64;
 
                 if use_avx512 {
                     // AVX-512: 4 independent 512-bit accumulators for ILP
@@ -1130,8 +1133,8 @@ fn matmul_i8xi8_simd(
                         let mut j = 0usize;
                         while j < simd_len {
                             // Prefetch next iteration's data into L1
-                            _mm_prefetch(row.add(j + 256) as *const i8, _MM_HINT_T0);
-                            _mm_prefetch(inp_ptr.add(j + 256) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(row.add(j + 256), _MM_HINT_T0);
+                            _mm_prefetch(inp_ptr.add(j + 256), _MM_HINT_T0);
 
                             // First 64 elements
                             let vw0 = _mm512_loadu_si512(row.add(j) as *const __m512i);
@@ -1226,8 +1229,8 @@ fn matmul_i8xi8_simd(
 
                         let mut j = 0usize;
                         while j < simd_len {
-                            _mm_prefetch(row.add(j + 256) as *const i8, _MM_HINT_T0);
-                            _mm_prefetch(inp_ptr.add(j + 256) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(row.add(j + 256), _MM_HINT_T0);
+                            _mm_prefetch(inp_ptr.add(j + 256), _MM_HINT_T0);
 
                             // 4 independent 32-element blocks per iteration
                             let vw0 = _mm256_loadu_si256(row.add(j) as *const __m256i);
@@ -1399,6 +1402,9 @@ fn matmul_simd_preq_neon(
         });
 }
 
+// See matmul_simd_preq_neon: retained as the x86 reference datapath while
+// production favors the full-precision scalar implementation.
+#[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 fn matmul_simd_preq_x86(
     weights: &I8Weights,
@@ -1427,7 +1433,7 @@ fn matmul_simd_preq_x86(
                 let i = base + li;
                 let row = unsafe { data.as_ptr().add(i * in_size) };
                 let ip = inp.as_ptr();
-                let mut acc: i64 = 0;
+                let mut acc: i64;
                 unsafe {
                     if use512 {
                         let sl = in_size / 64 * 64;
@@ -1606,7 +1612,7 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                 let i = base + li;
                 let row = unsafe { data.as_ptr().add(i * byte_cols) };
                 let ip = inp.as_ptr();
-                let mut acc: i64 = 0;
+                let mut acc: i64;
 
                 unsafe {
                     // AVX2: process 16 Q4 bytes (32 values) per iteration
@@ -1623,7 +1629,7 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                     let mut j = 0usize;
                     while j < simd_len {
                         _mm_prefetch(row.add(j + 128) as *const i8, _MM_HINT_T0);
-                        _mm_prefetch(ip.add(j * 2 + 256) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(ip.add(j * 2 + 256), _MM_HINT_T0);
 
                         // Block 0: 16 Q4 bytes → 32 i8 weights × 32 i8 input
                         let packed0 = _mm_loadu_si128(row.add(j) as *const __m128i);
@@ -3048,6 +3054,7 @@ impl CachedIntegerModel {
             // smaller models like Llama-7B). Q4 layer ref used on aarch64
             // where matmul_q4_preq_neon delivers ~2× extra bandwidth.
             let i16l = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
+            #[cfg(target_arch = "aarch64")]
             let q4l = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
             // Dispatch order (highest quality first, then highest speed):
