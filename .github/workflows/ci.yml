@@ -47,7 +47,7 @@ jobs:
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "::notice::explorer/ has no package.json - skipping npm build"
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.has_npm_project.outputs.found == 'true'
         with:
           node-version: 20
@@ -62,7 +62,7 @@ jobs:
         working-directory: sdk/typescript
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - run: npm install
