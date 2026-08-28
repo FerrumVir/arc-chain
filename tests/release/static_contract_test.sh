@@ -10,6 +10,7 @@ RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 GOLDEN_WORKFLOW="$REPO_ROOT/.github/workflows/golden-vectors.yml"
 ASSEMBLER="$REPO_ROOT/scripts/release/assemble-release.sh"
+SIGNING_KEY_BACKUP="$REPO_ROOT/scripts/release/backup-signing-keys.sh"
 INSTALLER="$REPO_ROOT/install.sh"
 LEGACY_INSTALLER="$REPO_ROOT/scripts/install-node.sh"
 GENESIS_VALIDATOR="$REPO_ROOT/scripts/release/validate-genesis.py"
@@ -805,6 +806,9 @@ release_secret_jobs_require_the_owner_environment() {
         'protected `release` environment' \
         'required reviewers' \
         'move `TAURI_SIGNING_PRIVATE_KEY`' \
+        'two `~ALL` tag rulesets' \
+        'keep release creation' \
+        'backup-signing-keys.sh' \
         'immutable' \
         'Apple Developer ID' \
         'Windows Authenticode' \
@@ -956,6 +960,29 @@ relevant_shell_is_syntax_valid() {
     done
 }
 
+signing_key_backup_is_encrypted_create_only_and_restore_tested() {
+    for required in \
+        'ARC_SIGNING_BACKUP_PASSPHRASE' \
+        'refusing to replace existing backup' \
+        '--symmetric' \
+        '--cipher-algo AES256' \
+        '--s2k-digest-algo SHA512' \
+        '--decrypt' \
+        'shasum -a 256 -c KEY-SHA256SUMS' \
+        'cmp -s -- "$TAURI_KEY"' \
+        'cmp -s -- "$MANIFEST_KEY"'
+    do
+        grep -Fq -- "$required" "$SIGNING_KEY_BACKUP" || {
+            printf 'signing-key backup omits required encrypted restore contract: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Eq 'rclone|arc-drive|Google Drive' "$SIGNING_KEY_BACKUP"; then
+        printf 'signing-key backup script must not implicitly transmit private material\n'
+        return 1
+    fi
+}
+
 run_test 'required headless assets are built and gate the sole publisher' required_assets_are_built_and_gated
 run_test 'locked Rust and JavaScript Tauri packages are release-compatible' desktop_tauri_packages_are_release_compatible
 run_test 'desktop packages the exact canonical release seed list' packaged_desktop_network_resources_match_release
@@ -980,6 +1007,7 @@ run_test 'updater signatures verify against the embedded key and reject rotation
 run_test 'signing and publishing require the owner-protected release environment' release_secret_jobs_require_the_owner_environment
 run_test 'publisher pins one validated commit, rechecks the tag, and refuses release replacement' publish_is_pinned_to_one_validated_commit_and_create_only
 run_test 'validator QUIC forbids anonymous/test-only TLS and retains exact allowlisting' validator_transport_cannot_regress_to_anonymous_or_test_only_tls
+run_test 'signing-key backups are encrypted, create-only, and restore-tested' signing_key_backup_is_encrypted_create_only_and_restore_tested
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 
 finish_tests

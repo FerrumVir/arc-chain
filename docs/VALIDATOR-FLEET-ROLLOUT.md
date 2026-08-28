@@ -186,9 +186,9 @@ Workflow text does not prove that repository settings are enabled. Before a
 release owner runs the tag workflow, the owner must verify all of these controls
 in GitHub's settings:
 
-- protect `main` with a no-bypass PR/check/review ruleset. Protect semver tags
-  with two rulesets: owner-only creation, plus no-bypass update, deletion, and
-  non-fast-forward prevention. Enable immutable releases;
+- protect `main` with a no-bypass PR/check/review ruleset. Protect **all** tag
+  names with two `~ALL` tag rulesets: owner-only creation, plus no-bypass
+  update, deletion, and non-fast-forward prevention. Enable immutable releases;
 - restrict Actions to an owner-reviewed allowlist and require full commit-SHA
   pinning;
 - create a protected `release` environment, restrict its deployment tags, add
@@ -203,12 +203,19 @@ in GitHub's settings:
   preflight through immutable publication: the tag validator requires a
   successful preflight on the exact current `main` SHA, and the publisher
   rejects any `main` movement while the build matrix is running;
-- after the independent PR approval and merge are complete, temporarily reduce
-  every non-owner collaborator below `write` until the workflow-created release
-  is complete, immutable, signature-verified, and smoke-tested. The detached
-  signature prevents unauthorized code from installing, but this short release
-  lock also prevents a write collaborator from first-publishing junk and
-  permanently burning the version as a denial of service;
+- after the independent PR approval and merge are complete, reduce every
+  non-owner collaborator below `write` before tagging and keep release creation
+  owner-only. Contributions continue through forked pull requests; grant `write`
+  only for a bounded independent-review window, then remove it again before any
+  tag. Existing unreleased historical tags mean a write collaborator could
+  otherwise publish junk as GitHub's `Latest` release and deny service to the
+  updater even though payload signatures still prevent code execution;
+- before tagging, run `scripts/release/backup-signing-keys.sh` with a random
+  passphrase held outside the ciphertext provider. Keep a mode-0600 local
+  ciphertext copy and an independently downloaded, hash-matched remote copy;
+  then restore from the remote ciphertext and verify canary signatures against
+  both checked-in public keys. GitHub environment secrets are write-only and do
+  not replace this recovery copy. Never upload either private key in plaintext;
 - configure Apple Developer ID signing/notarization and Windows Authenticode
   signing before claiming OS-signed installers. Until then, release notes must
   plainly label macOS and Windows packages unsigned; the Tauri updater payload
