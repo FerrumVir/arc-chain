@@ -110,12 +110,11 @@ fn rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         // /proc/self/statm: columns are in pages
-        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(rss_pages) = statm.split_whitespace().nth(1) {
-                if let Ok(pages) = rss_pages.parse::<u64>() {
-                    return pages * 4096;
-                }
-            }
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
+            && let Some(rss_pages) = statm.split_whitespace().nth(1)
+            && let Ok(pages) = rss_pages.parse::<u64>()
+        {
+            return pages * 4096;
         }
         0
     }

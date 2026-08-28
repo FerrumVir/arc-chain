@@ -193,7 +193,9 @@ printf '%s' "$worker_pid" >"$leaf/cgroup.procs"
 wait_event "$leaf/cgroup.events" frozen 1 || die "owned leaf did not become effectively frozen"
 [[ "$(event_value "$leaf/cgroup.events" populated)" == "1" ]] || die "owned leaf is not populated"
 mapfile -t leaf_members <"$leaf/cgroup.procs"
-(( ${#leaf_members[@]} == 1 )) && [[ "${leaf_members[0]}" == "$worker_pid" ]] || die "owned leaf membership differs"
+if (( ${#leaf_members[@]} != 1 )) || [[ "${leaf_members[0]}" != "$worker_pid" ]]; then
+    die "owned leaf membership differs"
+fi
 
 printf '0' >"$base/cgroup.freeze"
 wait_event "$base/cgroup.events" frozen 0 || die "parent cgroup did not release"
@@ -219,7 +221,9 @@ wait_event "$leaf/cgroup.events" frozen 1 || die "owned leaf thawed after depend
 read -r current_device current_inode < <(stat -Lc '%d %i' "$leaf")
 [[ "$current_device" == "$leaf_device" && "$current_inode" == "$leaf_inode" ]] || die "owned leaf inode changed"
 mapfile -t leaf_members <"$leaf/cgroup.procs"
-(( ${#leaf_members[@]} == 1 )) && [[ "${leaf_members[0]}" == "$worker_pid" ]] || die "owned leaf sole membership changed"
+if (( ${#leaf_members[@]} != 1 )) || [[ "${leaf_members[0]}" != "$worker_pid" ]]; then
+    die "owned leaf sole membership changed"
+fi
 
 read -r stopped_start stopped_ticks < <(proc_values "$worker_pid") || die "worker exited after dependency stop"
 sleep 0.2
