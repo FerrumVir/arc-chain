@@ -1,10 +1,16 @@
-name: Release signing-key backup
+name: One-shot encrypted signing-key backup
+
+run-name: Signing-key backup at ${{ inputs.expected_main_sha }}
 
 on:
   workflow_dispatch:
     inputs:
       expected_main_sha:
-        description: Exact protected-main commit authorized for this encrypted backup
+        description: Exact 40-character protected-main SHA
+        required: true
+        type: string
+      confirmation:
+        description: Type BACKUP_EXISTING_RELEASE_KEYS
         required: true
         type: string
 
@@ -12,105 +18,164 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-signing-key-backup
+  group: arc-one-shot-signing-key-backup
   cancel-in-progress: false
 
 jobs:
-  encrypted-backup:
+  backup:
     name: encrypted signing-key backup
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.expected_main_sha }}
+          ref: main
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Bind backup to exact protected main
+      - name: Bind to exact protected main and explicit authorization
         shell: bash
         env:
+          CONFIRMATION: ${{ inputs.confirmation }}
           EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
         run: |
+          set +x
           set -Eeuo pipefail
-          if [[ ! "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo '::error::expected_main_sha must be one full lowercase commit SHA.'
-            exit 1
-          fi
-          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
-          git fetch --no-tags --force origin main:refs/remotes/origin/main
-          REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
-          if [ "$CHECKED_OUT_SHA" != "$EXPECTED_MAIN_SHA" ] || [ "$REMOTE_MAIN_SHA" != "$EXPECTED_MAIN_SHA" ]; then
-            echo "::error::Backup authorization, checkout, and protected main are not the same commit."
-            exit 1
-          fi
 
-      - name: Encrypt and immediately restore-test both current signing keys
+          [ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]
+          [ "$GITHUB_REF" = "refs/heads/main" ]
+          [ "$CONFIRMATION" = "BACKUP_EXISTING_RELEASE_KEYS" ]
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          checked_out_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          remote_main_sha="$(git rev-parse refs/remotes/origin/main)"
+
+          [ "$checked_out_sha" = "$EXPECTED_MAIN_SHA" ]
+          [ "$checked_out_sha" = "$remote_main_sha" ]
+
+          printf 'Exact protected-main SHA: %s\n' "$checked_out_sha" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify audited backup implementation
+        shell: bash
+        run: |
+          set +x
+          set -Eeuo pipefail
+          printf '%s  %s\n' \
+            'beed045b538af7f8daf5729171d2bbbca11af3d5143e67096f091aa8e87c6306' \
+            'scripts/release/backup-signing-keys.sh' |
+            sha256sum -c -
+
+      - name: Create restore-tested ciphertext
         id: backup
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
           ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}
-          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
         run: |
+          set +x
           set -Eeuo pipefail
+          ulimit -c 0
           umask 077
-          for secret_name in \
-            TAURI_SIGNING_PRIVATE_KEY \
-            ARC_RELEASE_MANIFEST_PRIVATE_KEY \
-            ARC_SIGNING_BACKUP_PASSPHRASE; do
-            if [ -z "${!secret_name:-}" ]; then
-              echo "::error::$secret_name is unavailable in the protected release environment."
-              exit 1
-            fi
-          done
-          if [ "${#ARC_SIGNING_BACKUP_PASSPHRASE}" -lt 32 ]; then
-            echo '::error::ARC_SIGNING_BACKUP_PASSPHRASE must contain at least 32 characters.'
-            exit 1
-          fi
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          unset BASH_ENV ENV CDPATH
 
-          key_dir="$RUNNER_TEMP/arc-signing-backup-source"
-          output="$RUNNER_TEMP/arc-signing-keys-$EXPECTED_MAIN_SHA.tar.gpg"
-          mkdir -m 700 -- "$key_dir"
-          printf '%s\n' "$TAURI_SIGNING_PRIVATE_KEY" > "$key_dir/tauri-updater.key"
-          printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$key_dir/release-manifest-ed25519"
-          chmod 600 "$key_dir/tauri-updater.key" "$key_dir/release-manifest-ed25519"
+          [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]
+          [ -n "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]
+          [ "${#ARC_SIGNING_BACKUP_PASSPHRASE}" -ge 32 ]
+
+          work_dir="$RUNNER_TEMP/arc-signing-backup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          tauri_key="$work_dir/tauri-updater.key"
+          manifest_key="$work_dir/release-manifest-ed25519"
+          ciphertext="$work_dir/arc-signing-keys.tar.gpg"
+
+          install -d -m 700 -- "$work_dir"
+
+          cleanup_keys() {
+            chmod u+rw -- "$tauri_key" "$manifest_key" 2>/dev/null || true
+            rm -f -- "$tauri_key" "$manifest_key"
+          }
+          trap cleanup_keys EXIT HUP INT TERM
+
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$tauri_key"
+          printf '%s' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"
+          chmod 600 "$tauri_key" "$manifest_key"
+
+          unset TAURI_SIGNING_PRIVATE_KEY ARC_RELEASE_MANIFEST_PRIVATE_KEY
 
           scripts/release/backup-signing-keys.sh \
-            "$key_dir/tauri-updater.key" \
-            "$key_dir/release-manifest-ed25519" \
-            "$output"
+            "$tauri_key" \
+            "$manifest_key" \
+            "$ciphertext"
 
-          test -f "$output" && test ! -L "$output" && test -s "$output"
-          test "$(stat -c '%a' "$output")" = 600
-          output_sha="$(sha256sum "$output" | awk '{print $1}')"
-          printf 'path=%s\n' "$output" >> "$GITHUB_OUTPUT"
-          printf 'sha256=%s\n' "$output_sha" >> "$GITHUB_OUTPUT"
+          unset ARC_SIGNING_BACKUP_PASSPHRASE
+          cleanup_keys
+          trap - EXIT HUP INT TERM
+
+          [ -f "$ciphertext" ]
+          [ ! -L "$ciphertext" ]
+          [ -s "$ciphertext" ]
+          chmod 600 "$ciphertext"
+
+          cipher_sha256="$(sha256sum "$ciphertext" | awk '{print $1}')"
+          artifact_name="arc-signing-backup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$cipher_sha256"
+
           {
-            echo '## Encrypted ARC signing-key backup'
-            echo
-            echo "Protected-main commit: \`$EXPECTED_MAIN_SHA\`"
-            echo
-            echo "Ciphertext SHA-256: \`$output_sha\`"
-            echo
-            echo 'The workflow uploaded ciphertext only. Download, independently restore-test, copy to ARC Drive and a second recovery medium, then delete this Actions artifact.'
-          } >> "$GITHUB_STEP_SUMMARY"
+            printf 'cipher_path=%s\n' "$ciphertext"
+            printf 'cipher_sha256=%s\n' "$cipher_sha256"
+            printf 'artifact_name=%s\n' "$artifact_name"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Upload ciphertext only for operator retrieval
+      - name: Upload ciphertext only
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: arc-signing-keys-${{ inputs.expected_main_sha }}
-          path: ${{ steps.backup.outputs.path }}
+          name: ${{ steps.backup.outputs.artifact_name }}
+          path: ${{ steps.backup.outputs.cipher_path }}
           if-no-files-found: error
-          compression-level: 0
           retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
 
-      - name: Remove runner plaintext and ciphertext
+      - name: Record non-secret receipt
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          CIPHER_SHA256: ${{ steps.backup.outputs.cipher_sha256 }}
+        run: |
+          {
+            echo "Artifact ID: \`$ARTIFACT_ID\`"
+            echo "Ciphertext SHA-256: \`$CIPHER_SHA256\`"
+            echo "GitHub artifact digest: \`$ARTIFACT_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove runner ciphertext
         if: ${{ always() }}
         shell: bash
+        env:
+          CIPHER_PATH: ${{ steps.backup.outputs.cipher_path }}
         run: |
+          set +x
           set -Eeuo pipefail
-          rm -f -- "$RUNNER_TEMP"/arc-signing-keys-*.tar.gpg
-          rm -rf -- "$RUNNER_TEMP/arc-signing-backup-source"
+          expected_dir="$RUNNER_TEMP/arc-signing-backup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          expected_ciphertext="$expected_dir/arc-signing-keys.tar.gpg"
+          if [ -n "${CIPHER_PATH:-}" ] && [ "$CIPHER_PATH" != "$expected_ciphertext" ]; then
+            echo "::error::Refusing unexpected cleanup path"
+            exit 1
+          fi
+          case "$expected_dir" in
+            "$RUNNER_TEMP"/arc-signing-backup-"$GITHUB_RUN_ID"-"$GITHUB_RUN_ATTEMPT")
+              chmod -R u+rwX -- "$expected_dir" 2>/dev/null || true
+              rm -rf -- "$expected_dir"
+              ;;
+            *)
+              echo "::error::Refusing unexpected cleanup directory"
+              exit 1
+              ;;
+          esac

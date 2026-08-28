@@ -1008,14 +1008,22 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
     fi
     for required in \
         'environment: release' \
-        'ref: ${{ inputs.expected_main_sha }}' \
+        'runs-on: ubuntu-24.04' \
+        'ref: main' \
+        'BACKUP_EXISTING_RELEASE_KEYS' \
+        '[ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]' \
+        '[ "$GITHUB_REF" = "refs/heads/main" ]' \
+        'beed045b538af7f8daf5729171d2bbbca11af3d5143e67096f091aa8e87c6306' \
         'ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}' \
         'TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}' \
         'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}' \
         'scripts/release/backup-signing-keys.sh' \
         'compression-level: 0' \
         'retention-days: 1' \
-        'Remove runner plaintext and ciphertext'
+        'overwrite: false' \
+        'include-hidden-files: false' \
+        'cleanup_keys' \
+        'Remove runner ciphertext'
     do
         grep -Fq -- "$required" "$SIGNING_BACKUP_WORKFLOW" || {
             printf 'protected signing-key backup workflow omits: %s\n' "$required"
@@ -1030,6 +1038,8 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         'decrypted archive membership differs from the four-file contract' \
         'shasum -a 256 -c KEY-SHA256SUMS' \
         'release/arc-release-allowed-signers' \
+        'ssh-keygen -Y sign' \
+        'ssh-keygen -Y verify' \
         'tauri signer sign' \
         'tauri-updater-verifier'
     do

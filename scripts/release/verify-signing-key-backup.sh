@@ -86,6 +86,19 @@ cut -d ' ' -f 3- "$REPO_ROOT/release/arc-release-allowed-signers" \
 cmp -s "$WORK_DIR/derived-manifest.pub" "$WORK_DIR/allowed-manifest.pub" \
     || die 'restored manifest key does not match the committed release trust root'
 
+printf '%s\n' 'ARC downloaded-backup manifest canary v1' > "$WORK_DIR/manifest-canary"
+ssh-keygen -Y sign \
+    -f "$WORK_DIR/restored/release-manifest-ed25519" \
+    -n arc-release-manifest-v1 \
+    "$WORK_DIR/manifest-canary"
+ssh-keygen -Y verify \
+    -f "$REPO_ROOT/release/arc-release-allowed-signers" \
+    -I arc-release \
+    -n arc-release-manifest-v1 \
+    -s "$WORK_DIR/manifest-canary.sig" \
+    < "$WORK_DIR/manifest-canary" \
+    || die 'restored manifest key failed the committed signing canary'
+
 printf '%s\n' 'ARC downloaded-backup updater canary v1' > "$WORK_DIR/tauri-canary"
 TAURI_SIGNING_PRIVATE_KEY="$(cat "$WORK_DIR/restored/tauri-updater.key")"
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""

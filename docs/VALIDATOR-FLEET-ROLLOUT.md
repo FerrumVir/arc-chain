@@ -273,16 +273,19 @@ in GitHub's settings:
   the write-only GitHub environment secrets, store a random 32+-character
   backup passphrase in macOS Keychain and the protected `release` environment,
   then manually dispatch `release-signing-backup.yml` with the exact protected
-  `main` SHA. That workflow runs `scripts/release/backup-signing-keys.sh`,
+  `main` SHA and confirmation `BACKUP_EXISTING_RELEASE_KEYS`. That one-shot
+  workflow runs `scripts/release/backup-signing-keys.sh`,
   immediately restores and byte-compares both keys, uploads ciphertext only,
   and retains the temporary Actions artifact for one day. Download it, set it
   mode 0600, run `scripts/release/verify-signing-key-backup.sh` against the
   checked-in manifest and updater public keys, copy only the ciphertext to ARC
   Drive and a second independent recovery medium, re-download and hash-match
-  both copies, then delete the Actions artifact. Keep the passphrase outside
-  every ciphertext provider. Never upload either private key in plaintext and
-  never rotate the updater key before v0.8.0: every v0.7 client must still be
-  able to verify the v0.8.0 bridge release;
+  both copies, then delete the Actions artifact, delete only the temporary
+  passphrase environment secret, and remove the one-shot workflow through a
+  protected PR. Keep the passphrase outside every ciphertext provider. Never
+  upload either private key in plaintext and never rotate the updater key
+  before v0.8.0: every v0.7 client must still be able to verify the v0.8.0
+  bridge release;
 - configure Apple Developer ID signing/notarization and Windows Authenticode
   signing before claiming OS-signed installers. Until then, release notes must
   plainly label macOS and Windows packages unsigned; the Tauri updater payload
