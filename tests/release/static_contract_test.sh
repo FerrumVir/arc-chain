@@ -25,6 +25,8 @@ UPDATER_VERIFIER_MANIFEST="$TEST_DIR/tauri-updater-verifier/Cargo.toml"
 UPDATER_FIXTURE_DIR="$TEST_DIR/fixtures/tauri-updater"
 RELEASE_ALLOWED_SIGNERS="$REPO_ROOT/release/arc-release-allowed-signers"
 RELEASE_PREFLIGHT_WORKFLOW="$REPO_ROOT/.github/workflows/release-signing-preflight.yml"
+SIGNING_BACKUP_WORKFLOW="$REPO_ROOT/.github/workflows/release-signing-backup.yml"
+SIGNING_BACKUP_VERIFY="$REPO_ROOT/scripts/release/verify-signing-key-backup.sh"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
 CANONICAL_SEEDS="$REPO_ROOT/testnet-seeds.txt"
@@ -1004,6 +1006,38 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         printf 'signing-key backup script must not implicitly transmit private material\n'
         return 1
     fi
+    for required in \
+        'environment: release' \
+        'ref: ${{ inputs.expected_main_sha }}' \
+        'ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}' \
+        'TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}' \
+        'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}' \
+        'scripts/release/backup-signing-keys.sh' \
+        'compression-level: 0' \
+        'retention-days: 1' \
+        'Remove runner plaintext and ciphertext'
+    do
+        grep -Fq -- "$required" "$SIGNING_BACKUP_WORKFLOW" || {
+            printf 'protected signing-key backup workflow omits: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Eq 'pull_request|push:' "$SIGNING_BACKUP_WORKFLOW"; then
+        printf 'signing-key backup workflow must remain manual-only\n'
+        return 1
+    fi
+    for required in \
+        'decrypted archive membership differs from the four-file contract' \
+        'shasum -a 256 -c KEY-SHA256SUMS' \
+        'release/arc-release-allowed-signers' \
+        'tauri signer sign' \
+        'tauri-updater-verifier'
+    do
+        grep -Fq -- "$required" "$SIGNING_BACKUP_VERIFY" || {
+            printf 'downloaded signing-key verifier omits: %s\n' "$required"
+            return 1
+        }
+    done
 }
 
 run_test 'required headless assets are built and gate the sole publisher' required_assets_are_built_and_gated

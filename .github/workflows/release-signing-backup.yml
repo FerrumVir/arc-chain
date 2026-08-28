@@ -1,0 +1,116 @@
+name: Release signing-key backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: Exact protected-main commit authorized for this encrypted backup
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-signing-key-backup
+  cancel-in-progress: false
+
+jobs:
+  encrypted-backup:
+    name: encrypted signing-key backup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_main_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind backup to exact protected main
+        shell: bash
+        env:
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::expected_main_sha must be one full lowercase commit SHA.'
+            exit 1
+          fi
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$CHECKED_OUT_SHA" != "$EXPECTED_MAIN_SHA" ] || [ "$REMOTE_MAIN_SHA" != "$EXPECTED_MAIN_SHA" ]; then
+            echo "::error::Backup authorization, checkout, and protected main are not the same commit."
+            exit 1
+          fi
+
+      - name: Encrypt and immediately restore-test both current signing keys
+        id: backup
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
+          ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          for secret_name in \
+            TAURI_SIGNING_PRIVATE_KEY \
+            ARC_RELEASE_MANIFEST_PRIVATE_KEY \
+            ARC_SIGNING_BACKUP_PASSPHRASE; do
+            if [ -z "${!secret_name:-}" ]; then
+              echo "::error::$secret_name is unavailable in the protected release environment."
+              exit 1
+            fi
+          done
+          if [ "${#ARC_SIGNING_BACKUP_PASSPHRASE}" -lt 32 ]; then
+            echo '::error::ARC_SIGNING_BACKUP_PASSPHRASE must contain at least 32 characters.'
+            exit 1
+          fi
+
+          key_dir="$RUNNER_TEMP/arc-signing-backup-source"
+          output="$RUNNER_TEMP/arc-signing-keys-$EXPECTED_MAIN_SHA.tar.gpg"
+          mkdir -m 700 -- "$key_dir"
+          printf '%s\n' "$TAURI_SIGNING_PRIVATE_KEY" > "$key_dir/tauri-updater.key"
+          printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$key_dir/release-manifest-ed25519"
+          chmod 600 "$key_dir/tauri-updater.key" "$key_dir/release-manifest-ed25519"
+
+          scripts/release/backup-signing-keys.sh \
+            "$key_dir/tauri-updater.key" \
+            "$key_dir/release-manifest-ed25519" \
+            "$output"
+
+          test -f "$output" && test ! -L "$output" && test -s "$output"
+          test "$(stat -c '%a' "$output")" = 600
+          output_sha="$(sha256sum "$output" | awk '{print $1}')"
+          printf 'path=%s\n' "$output" >> "$GITHUB_OUTPUT"
+          printf 'sha256=%s\n' "$output_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Encrypted ARC signing-key backup'
+            echo
+            echo "Protected-main commit: \`$EXPECTED_MAIN_SHA\`"
+            echo
+            echo "Ciphertext SHA-256: \`$output_sha\`"
+            echo
+            echo 'The workflow uploaded ciphertext only. Download, independently restore-test, copy to ARC Drive and a second recovery medium, then delete this Actions artifact.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ciphertext only for operator retrieval
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-signing-keys-${{ inputs.expected_main_sha }}
+          path: ${{ steps.backup.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Remove runner plaintext and ciphertext
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -f -- "$RUNNER_TEMP"/arc-signing-keys-*.tar.gpg
+          rm -rf -- "$RUNNER_TEMP/arc-signing-backup-source"
