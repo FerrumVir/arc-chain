@@ -189,17 +189,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            optional: false
-          # TODO(OPTIONAL-PLATFORMS): make these required after their
-          # platform-specific dependencies and timing behavior are proven
-          # stable enough for branch protection. Linux remains the merge gate.
-          - os: macos-14
-            optional: true
-          - os: windows-latest
-            optional: true
-    continue-on-error: ${{ matrix.optional }}
+        # v0.8 treats every shipped server OS as a blocking workspace target.
+        # Platform-specific compile or unit failures must be repaired before
+        # merge; a green Linux leg cannot mask a broken Mac or Windows binary.
+        os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master

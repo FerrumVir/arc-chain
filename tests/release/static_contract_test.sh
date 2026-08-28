@@ -717,6 +717,29 @@ branch_golden_vectors_prove_manifest_verification_on_every_os() {
     done
 }
 
+cross_os_workspace_tests_are_blocking() {
+    local test_block
+    test_block="$(awk '
+        /^  test:/ { capture=1 }
+        capture { print }
+        capture && /^  integration:/ { exit }
+    ' "$CI_WORKFLOW")"
+    for required in \
+        'os: [ubuntu-latest, macos-14, windows-latest]' \
+        'cargo check --workspace --all-targets --locked' \
+        'cargo test --workspace --lib --locked'
+    do
+        printf '%s\n' "$test_block" | grep -Fq -- "$required" || {
+            printf 'cross-OS workspace test gate omits: %s\n' "$required"
+            return 1
+        }
+    done
+    if printf '%s\n' "$test_block" | grep -Fq 'continue-on-error'; then
+        printf 'Mac/Windows workspace tests are still optional\n'
+        return 1
+    fi
+}
+
 updater_signatures_are_verified_against_the_embedded_key() {
     local fixture_bin target_dir valid_key wrong_key
     for required in \
@@ -1003,6 +1026,7 @@ run_test 'GitHub-owned actions are exact-SHA pinned to the reviewed Node 24 rele
 run_test 'CI/release cargo and npm supply-chain audits are exact-ref and blocking' release_supply_chain_and_npm_audits_are_blocking
 run_test 'release golden vectors cover Linux x86/ARM, both Macs, and Windows' cross_arch_golden_vectors_gate_publication
 run_test 'branch golden vectors prove manifest verification on every installer OS' branch_golden_vectors_prove_manifest_verification_on_every_os
+run_test 'workspace compile and library tests block on Linux, Mac, and Windows' cross_os_workspace_tests_are_blocking
 run_test 'updater signatures verify against the embedded key and reject rotation' updater_signatures_are_verified_against_the_embedded_key
 run_test 'signing and publishing require the owner-protected release environment' release_secret_jobs_require_the_owner_environment
 run_test 'publisher pins one validated commit, rechecks the tag, and refuses release replacement' publish_is_pinned_to_one_validated_commit_and_create_only
