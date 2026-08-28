@@ -110,7 +110,7 @@ setup_fixture() {
     FIXTURE="$(mktemp -d)"
     mkdir -p "$FIXTURE/bin"
     FREEZE_PLAN="$FIXTURE/freeze.json"
-    write_freeze_fixture "$FREEZE_PLAN" "${1:-1048576}"
+    write_freeze_fixture "$FREEZE_PLAN" 1048576
     FREEZE_SHA="$(hash_file "$FREEZE_PLAN")"
     CAPTURE="$(capture_id "$FREEZE_SHA")"
     REMOTE_ROOT='arc-recovery-drive:ARC Chain Recovery'
