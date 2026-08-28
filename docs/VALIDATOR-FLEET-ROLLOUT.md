@@ -287,6 +287,7 @@ in GitHub's settings:
   ```bash
   (
     set +x
+    unset BASH_ENV ENV CDPATH
     chmod 600 -- "$CIPHERTEXT"
     export ARC_SIGNING_BACKUP_PASSPHRASE
     ARC_SIGNING_BACKUP_PASSPHRASE="$(security find-generic-password \
