@@ -30,6 +30,9 @@ jobs:
     name: Validate release tag and pin commit
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
@@ -46,6 +49,7 @@ jobs:
         name: Match tag, source, and application versions
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -Eeuo pipefail
@@ -67,10 +71,26 @@ jobs:
             exit 1
           fi
           git fetch --no-tags --force origin main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
-            echo "::error::Tag $TAG targets $TAG_COMMIT, which has not been merged to main."
+          MAIN_COMMIT="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then
+            echo "::error::Tag $TAG targets $TAG_COMMIT, but current main is $MAIN_COMMIT. Release only the exact protected-main head verified by preflight."
             exit 1
           fi
+
+          PREFLIGHT_RUN_ID="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow release-signing-preflight.yml \
+            --commit "$TAG_COMMIT" \
+            --event workflow_dispatch \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')"
+          if [ -z "$PREFLIGHT_RUN_ID" ]; then
+            echo "::error::No successful protected signing preflight exists for exact main commit $TAG_COMMIT."
+            exit 1
+          fi
+          echo "::notice::Release commit $TAG_COMMIT is bound to signing preflight run $PREFLIGHT_RUN_ID."
 
           WORKSPACE_VERSION="$(awk '
             /^\[workspace\.package\]$/ { in_package=1; next }
@@ -726,6 +746,13 @@ jobs:
           fi
           if [ "$REMOTE_SHA" != "$EXPECTED_SHA" ]; then
             echo "::error::Remote tag $RELEASE_TAG moved to ${REMOTE_SHA:-missing}; validated commit was $EXPECTED_SHA."
+            exit 1
+          fi
+
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          PUBLISH_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$PUBLISH_MAIN_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Protected main advanced to $PUBLISH_MAIN_SHA after validation; refusing to publish tagged commit $EXPECTED_SHA."
             exit 1
           fi
 

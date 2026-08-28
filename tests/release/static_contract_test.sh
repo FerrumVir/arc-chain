@@ -8,6 +8,7 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
+GOLDEN_WORKFLOW="$REPO_ROOT/.github/workflows/golden-vectors.yml"
 ASSEMBLER="$REPO_ROOT/scripts/release/assemble-release.sh"
 INSTALLER="$REPO_ROOT/install.sh"
 LEGACY_INSTALLER="$REPO_ROOT/scripts/install-node.sh"
@@ -698,6 +699,23 @@ cross_arch_golden_vectors_gate_publication() {
     done
 }
 
+branch_golden_vectors_prove_manifest_verification_on_every_os() {
+    for required in \
+        'os: [ubuntu-latest, macos-14, macos-15-intel, windows-latest]' \
+        'Prove namespaced manifest verification on every installer OS' \
+        'ssh-keygen -Y sign' \
+        'ssh-keygen -Y verify' \
+        '-n arc-release-manifest-v1' \
+        'if [ "$RUNNER_OS" = Windows ]; then' \
+        'cmd.exe /d /c "ssh-keygen -Y verify'
+    do
+        grep -Fq -- "$required" "$GOLDEN_WORKFLOW" || {
+            printf 'branch golden-vector workflow omits installer signature portability proof: %s\n' "$required"
+            return 1
+        }
+    done
+}
+
 updater_signatures_are_verified_against_the_embedded_key() {
     local fixture_bin target_dir valid_key wrong_key
     for required in \
@@ -820,7 +838,10 @@ publish_is_pinned_to_one_validated_commit_and_create_only() {
         'sha: ${{ steps.release.outputs.sha }}' \
         'echo "sha=$TAG_COMMIT"' \
         'git fetch --no-tags --force origin main:refs/remotes/origin/main' \
-        'git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main'
+        'if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then' \
+        '--workflow release-signing-preflight.yml' \
+        '--commit "$TAG_COMMIT"' \
+        '--status success'
     do
         printf '%s\n' "$validate_block" | grep -Fq -- "$required" || {
             printf 'release validation does not export the validated tag commit: missing %s\n' "$required"
@@ -880,6 +901,8 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
         'EXPECTED_SHA: ${{ needs.validate.outputs.sha }}' \
         'git ls-remote --exit-code --tags origin' \
         'if [ "$REMOTE_SHA" != "$EXPECTED_SHA" ]; then' \
+        'PUBLISH_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"' \
+        'if [ "$PUBLISH_MAIN_SHA" != "$EXPECTED_SHA" ]; then' \
         '"repos/$GITHUB_REPOSITORY/immutable-releases" --jq '\''.enabled'\''' \
         'if [ "$IMMUTABLE_RELEASES_ENABLED" != true ]; then' \
         'gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100"' \
@@ -952,6 +975,7 @@ run_test 'release actions are exact-SHA pinned to the reviewed allowlist' releas
 run_test 'GitHub-owned actions are exact-SHA pinned to the reviewed Node 24 releases' github_owned_actions_are_node24_exact_sha_allowlisted
 run_test 'CI/release cargo and npm supply-chain audits are exact-ref and blocking' release_supply_chain_and_npm_audits_are_blocking
 run_test 'release golden vectors cover Linux x86/ARM, both Macs, and Windows' cross_arch_golden_vectors_gate_publication
+run_test 'branch golden vectors prove manifest verification on every installer OS' branch_golden_vectors_prove_manifest_verification_on_every_os
 run_test 'updater signatures verify against the embedded key and reject rotation' updater_signatures_are_verified_against_the_embedded_key
 run_test 'signing and publishing require the owner-protected release environment' release_secret_jobs_require_the_owner_environment
 run_test 'publisher pins one validated commit, rechecks the tag, and refuses release replacement' publish_is_pinned_to_one_validated_commit_and_create_only

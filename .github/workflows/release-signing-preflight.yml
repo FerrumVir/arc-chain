@@ -12,9 +12,9 @@ concurrency:
 
 jobs:
   manifest-key:
-    name: protected manifest-key canary
+    name: protected manifest-key canary (ubuntu)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -22,44 +22,39 @@ jobs:
           ref: main
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
+      - name: Bind preflight to the exact protected-main head
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$CHECKED_OUT_SHA" != "$REMOTE_MAIN_SHA" ]; then
+            echo "::error::Preflight checkout $CHECKED_OUT_SHA is not current protected main $REMOTE_MAIN_SHA."
+            exit 1
+          fi
+          {
+            echo '## ARC release signing preflight'
+            echo
+            echo "Exact protected-main commit: \`$CHECKED_OUT_SHA\`"
+            echo
+            echo 'The release tag and final publisher must remain bound to this SHA.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-
-      - name: Install the locked Tauri signer
-        run: npm ci --prefix desktop
-
-      - name: Sign and verify a fixed non-release canary
+      - name: Sign and verify the manifest-key canary
         shell: bash
         env:
           ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # The retained v0.7-compatible key is intentionally unencrypted.
-          # Tauri still requires the password variable to be present in a
-          # headless runner; an absent variable attempts an interactive prompt.
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           set -Eeuo pipefail
           if [ -z "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]; then
             echo "::error::ARC_RELEASE_MANIFEST_PRIVATE_KEY is unavailable."
             exit 1
           fi
-          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY is unavailable."
-            exit 1
-          fi
           key_file="$RUNNER_TEMP/arc-release-manifest-key"
           canary="$RUNNER_TEMP/arc-release-signing-canary"
-          tauri_canary="$RUNNER_TEMP/arc-tauri-signing-canary"
-          verifier_target="$RUNNER_TEMP/arc-tauri-verifier"
           cleanup() {
-            rm -f -- \
-              "$key_file" "$canary" "$canary.sig" \
-              "$tauri_canary" "$tauri_canary.sig"
+            rm -f -- "$key_file" "$canary" "$canary.sig"
           }
           trap cleanup EXIT HUP INT TERM
           umask 077
@@ -76,9 +71,93 @@ jobs:
             -n arc-release-manifest-v1 \
             -s "$canary.sig" \
             < "$canary"
+          cleanup
+          trap - EXIT HUP INT TERM
 
+
+  updater-key:
+    name: protected updater-key canary (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    environment: release
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            exe-suffix: ''
+          - platform: macos-arm64
+            runner: macos-14
+            exe-suffix: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            exe-suffix: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            exe-suffix: .exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind preflight to the exact protected-main head
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$CHECKED_OUT_SHA" != "$REMOTE_MAIN_SHA" ]; then
+            echo "::error::Preflight checkout $CHECKED_OUT_SHA is not current protected main $REMOTE_MAIN_SHA."
+            exit 1
+          fi
+          echo "Exact protected-main commit: \`$CHECKED_OUT_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Install the locked Tauri signer
+        run: npm ci --prefix desktop
+
+      - name: Sign the updater-key canary
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # The retained v0.7-compatible key is intentionally unencrypted.
+          # Tauri still requires the password variable to be present in a
+          # headless runner; an absent variable attempts an interactive prompt.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is unavailable."
+            exit 1
+          fi
+          tauri_canary="$RUNNER_TEMP/arc-tauri-signing-canary"
           printf '%s\n' 'ARC protected Tauri signing canary v1' > "$tauri_canary"
           npm --prefix desktop exec -- tauri signer sign "$tauri_canary"
+          test -s "$tauri_canary.sig"
+
+      - name: Verify the updater-key canary without private keys
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tauri_canary="$RUNNER_TEMP/arc-tauri-signing-canary"
+          verifier_target="$RUNNER_TEMP/arc-tauri-verifier"
+          cleanup() {
+            rm -f -- "$tauri_canary" "$tauri_canary.sig"
+          }
+          trap cleanup EXIT HUP INT TERM
           tauri_public_key="$(python3 - <<'PY'
           import json
           from pathlib import Path
@@ -88,7 +167,7 @@ jobs:
           )"
           CARGO_TARGET_DIR="$verifier_target" cargo build --quiet --locked \
             --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
-          "$verifier_target/debug/tauri-updater-verifier" \
+          "$verifier_target/debug/tauri-updater-verifier${{ matrix.exe-suffix }}" \
             "$tauri_public_key" "$tauri_canary" "$tauri_canary.sig"
           cleanup
           trap - EXIT HUP INT TERM

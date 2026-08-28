@@ -199,7 +199,10 @@ in GitHub's settings:
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to the empty string. Tauri otherwise
   attempts an interactive prompt and fails closed on a headless runner. Run the
   protected-main signing preflight and require both key canaries to verify
-  before creating the non-movable `v0.8.0` tag;
+  before creating the non-movable `v0.8.0` tag. Freeze merges from that
+  preflight through immutable publication: the tag validator requires a
+  successful preflight on the exact current `main` SHA, and the publisher
+  rejects any `main` movement while the build matrix is running;
 - after the independent PR approval and merge are complete, temporarily reduce
   every non-owner collaborator below `write` until the workflow-created release
   is complete, immutable, signature-verified, and smoke-tested. The detached

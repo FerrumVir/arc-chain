@@ -286,8 +286,11 @@ the same release and the allowed-signers file from the protected source tag:
 - `SHA256SUMS.sig`
 - `release/arc-release-allowed-signers` from tag `v0.8.0`
 
-First use the Windows OpenSSH client to authenticate the exact manifest, then
-compare PowerShell's digest with the corresponding signed manifest line:
+Windows OpenSSH 8.1 or newer is required; `ssh -V` prints the installed
+version. First use that client to authenticate the exact manifest, then compare
+PowerShell's digest with the corresponding signed manifest line. The blocking
+cross-OS preflight exercises this exact `cmd.exe` verification path on Windows
+before the release tag is created:
 
 ```powershell
 cmd.exe /d /c "ssh-keygen -Y verify -f arc-release-allowed-signers -I arc-release -n arc-release-manifest-v1 -s SHA256SUMS.sig < SHA256SUMS"
