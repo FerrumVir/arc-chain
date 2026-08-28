@@ -136,6 +136,19 @@
     return { state, samples, reachable, current, commonHeight, drift, commonAudit, commitments, replicaCount: replicas.length };
   }
 
+  function activeFleetPublicationError(config, fleet) {
+    if (!config || !["recovered", "degraded"].includes(config.state)) return "configuration is not an active recovery state";
+    if (fleet?.replicaCount !== 6 || fleet?.samples?.length !== 6) return "active recovery must declare exactly six validator replicas";
+    if (fleet.reachable?.length !== fleet.replicaCount) return "all six validator health snapshots must be reachable";
+    if (fleet.commitments?.length !== fleet.replicaCount || fleet.commitments.some((entry) => !entry?.ok)) return "all six validators must return a common-height commitment";
+    if (fleet.commonAudit?.state !== "consistent" || !Number.isSafeInteger(fleet.commonHeight)) return "all six current commitments must agree at one comparable height";
+    if (!fleet.current?.reachable) return "checkpoint-selected validator must be reachable";
+    if (fleet.current?.liveness?.state !== "advancing") return "checkpoint-selected validator must prove advancing liveness";
+    if (config.state === "recovered" && fleet.state !== "healthy") return "recovered publication requires a healthy fleet";
+    if (config.state === "degraded" && !["healthy", "degraded"].includes(fleet.state)) return "degraded publication still requires a consistent live fleet";
+    return null;
+  }
+
   async function verifyRecoveryBoundary(options) {
     const { resolver, fetchImpl, signal } = options;
     const checkpoint = resolver.config.checkpoint;
@@ -483,6 +496,7 @@
     requestJson,
     collectSourceSnapshot,
     collectFleetHealth,
+    activeFleetPublicationError,
     verifyRecoveryBoundary,
     loadInferenceEvidence,
     normalizeWorkerEarnings,

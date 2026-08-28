@@ -134,6 +134,33 @@ await test("stale canonical source is reported as degraded", async () => {
   assert.equal(result.current.liveness.state, "stalled");
 });
 
+await test("active publication requires six reachable agreeing commitments and advancing liveness", () => {
+  const samples = Array.from({ length: 6 }, (_, index) => ({ source: { id: `v3-${index + 1}` }, reachable: true }));
+  const fleet = {
+    state: "healthy",
+    samples,
+    reachable: samples,
+    current: { reachable: true, liveness: { state: "advancing" } },
+    commonHeight: 700,
+    commonAudit: { state: "consistent" },
+    commitments: samples.map((sample) => ({ sourceId: sample.source.id, ok: true, height: 700, blockHash: hex("7"), stateRoot: hex("8") })),
+    replicaCount: 6,
+  };
+  assert.equal(app.activeFleetPublicationError({ state: "recovered" }, fleet), null);
+
+  const unknownCommitment = { ...fleet, commonAudit: { state: "unknown" } };
+  assert.match(app.activeFleetPublicationError({ state: "recovered" }, unknownCommitment), /commitments must agree/);
+
+  const unknownLiveness = { ...fleet, current: { reachable: true, liveness: { state: "unknown" } } };
+  assert.match(app.activeFleetPublicationError({ state: "recovered" }, unknownLiveness), /advancing liveness/);
+
+  const missingReplica = { ...fleet, reachable: fleet.reachable.slice(1) };
+  assert.match(app.activeFleetPublicationError({ state: "recovered" }, missingReplica), /all six validator health snapshots/);
+
+  assert.equal(app.activeFleetPublicationError({ state: "degraded" }, { ...fleet, state: "degraded" }), null);
+  assert.match(app.activeFleetPublicationError({ state: "recovered" }, { ...fleet, state: "degraded" }), /healthy fleet/);
+});
+
 await test("recovery audit verifies exact H, H+1, and every replica identity", async () => {
   const resolver = makeResolver();
   const fetchImpl = mockFetch(recoveryAuditRoutes());

@@ -35,10 +35,8 @@ const [boundary, fleet] = await Promise.all([
 
 assert.equal(boundary.state, "verified", `exact recovery checkpoint proof is ${boundary.state}: ${boundary.reason ?? "no reason"}`);
 const inference = await dashboard.loadInferenceEvidence({ resolver, fetchImpl: fetch, checkpointAudit: boundary });
-assert.notEqual(fleet.state, "fork", `v3 replicas disagree at common height ${fleet.commonHeight}`);
-assert.notEqual(fleet.state, "offline", "all configured v3 replicas are offline");
-assert.ok(fleet.current?.reachable, "checkpoint-selected v3 source must be reachable");
-assert.notEqual(fleet.current.liveness.state, "stalled", "checkpoint-selected v3 source is stale");
+const fleetError = dashboard.activeFleetPublicationError(config, fleet);
+assert.equal(fleetError, null, `active fleet publication gate failed: ${fleetError}`);
 assert.equal(inference.error, null, `inference evidence endpoint failed: ${inference.error}`);
 
 console.log(`PASS ARC dashboard live gate: fleet=${fleet.state}, replicas=${fleet.reachable.length}/${fleet.replicaCount}, common_height=${fleet.commonHeight}, confirmed_inference=${inference.confirmed.length}, excluded=${inference.excluded}`);
