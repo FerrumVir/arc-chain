@@ -254,7 +254,7 @@ impl PreallocBackend {
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(target_os = "linux"))]
