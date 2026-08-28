@@ -13,7 +13,9 @@ printf '%s\n' \
     'install-node.sh: legacy validator installation is retired.' \
     'Routing to the stake-zero community installer; release artifacts are checksum-verified.' >&2
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+if ! SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
+    SCRIPT_DIR=""
+fi
 if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../install.sh" ]; then
     exec bash "$SCRIPT_DIR/../install.sh" "$@"
 fi

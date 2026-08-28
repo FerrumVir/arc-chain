@@ -3,7 +3,9 @@
 # headless installs; this wrapper no longer has an independent download path.
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+if ! SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then
+    SCRIPT_DIR=""
+fi
 INSTALLER="$SCRIPT_DIR/../install.sh"
 if [ ! -f "$INSTALLER" ]; then
     printf '%s\n' \

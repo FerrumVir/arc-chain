@@ -97,7 +97,9 @@ EOF
 }
 
 need_value() {
-    [ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 requires a value"
+    if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        die "$1 requires a value"
+    fi
 }
 
 while [ "$#" -gt 0 ]; do
@@ -189,8 +191,9 @@ elif command -v getent >/dev/null 2>&1; then
 else
     TARGET_HOME=""
 fi
-[ -n "$TARGET_HOME" ] && [ -d "$TARGET_HOME" ] \
-    || die "Could not determine a home directory for $TARGET_USER"
+if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
+    die "Could not determine a home directory for $TARGET_USER"
+fi
 
 DEFAULT_ARC_DIR="$TARGET_HOME/.arc"
 SCOPE_HINT="${ARG_SERVICE_SCOPE:-${ARC_INSTALL_SCOPE:-}}"
@@ -457,9 +460,10 @@ if [ "$SERVICE_SCOPE" = system ]; then
     PARENT_MODE_DECIMAL=$((10#$PARENT_MODE))
     [ "$PARENT_UID" -eq 0 ] \
         || die "System install parent must be owned by root: $INSTALL_PARENT"
-    [ $(((PARENT_MODE_DECIMAL / 10) % 10 & 2)) -eq 0 ] \
-        && [ $((PARENT_MODE_DECIMAL % 10 & 2)) -eq 0 ] \
-        || die "System install parent must not be group/world writable: $INSTALL_PARENT"
+    if [ $(((PARENT_MODE_DECIMAL / 10) % 10 & 2)) -ne 0 ] \
+        || [ $((PARENT_MODE_DECIMAL % 10 & 2)) -ne 0 ]; then
+        die "System install parent must not be group/world writable: $INSTALL_PARENT"
+    fi
     as_root mkdir -p -- "$ARC_DIR" "$ARC_DIR/bin" "$ARC_DIR/identity" "$NODE_DATA_DIR"
     as_root chown root:root "$ARC_DIR" "$ARC_DIR/bin"
     as_root chmod 755 "$ARC_DIR" "$ARC_DIR/bin"
@@ -1025,8 +1029,9 @@ if [ "$INSTALL_UPDATER" = true ]; then
 fi
 
 if [ -e "$SEED_FILE" ]; then
-    [ -f "$SEED_FILE" ] && [ ! -L "$SEED_FILE" ] && [ -s "$SEED_FILE" ] \
-        || die "Identity seed is not a non-empty regular file: $SEED_FILE"
+    if [ ! -f "$SEED_FILE" ] || [ -L "$SEED_FILE" ] || [ ! -s "$SEED_FILE" ]; then
+        die "Identity seed is not a non-empty regular file: $SEED_FILE"
+    fi
     chmod 600 "$SEED_FILE"
 else
     if command -v openssl >/dev/null 2>&1; then

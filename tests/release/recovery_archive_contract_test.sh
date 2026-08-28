@@ -165,7 +165,11 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
     local f; f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    # Fixture override invoked indirectly by sourced remote_readiness.
+    # shellcheck disable=SC2329
     host_for() { printf '%s\n' "$1"; }
+    # Fixture override invoked indirectly by sourced remote_readiness.
+    # shellcheck disable=SC2329
     freeze_node_field() {
         case "$3" in
             writer_pid|writer_start_ticks|supervisor_main_pid|stake) printf '1\n' ;;
@@ -177,6 +181,8 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
             *) return 1 ;;
         esac
     }
+    # Fixture override invoked indirectly by sourced remote_readiness.
+    # shellcheck disable=SC2329
     ssh() {
         local joined="$*" node
         for node in nyc lax ams lhr nrt sgp; do case "$joined" in *"root@$node"*) break;; esac; done
@@ -186,6 +192,8 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
         fi
         return 0
     }
+    # Fixture override invoked indirectly by sourced remote_readiness.
+    # shellcheck disable=SC2329
     run_remote() {
         printf '%s %s\n' "$1" "$2" >> "$f/actions"
         case "$2:$1" in
