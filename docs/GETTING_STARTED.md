@@ -222,13 +222,29 @@ does not reconcile to payment and must not be described as earnings. The Aug 26
 read-only snapshot showed community `total_work_completed: 0` across all
 workers and no successful community reward receipt.
 
-### Check the dashboard
+### Check the legacy diagnostic dashboard
 
-The public dashboard at <http://140.82.16.112:3200> is a diagnostic view, not a
-proof that the fleet is one healthy chain. On Aug 26, all six reachable seeds
-returned different block hashes and state roots at the same audited height.
-Pin one source, show its version and block age, and stop any reward demo if the
-common-height fork warning appears.
+The old v2 dashboard at <http://140.82.16.112:3200> is a legacy diagnostic
+view, not the corrected product surface and not proof that the fleet is one
+healthy chain. On Aug 26, all six reachable seeds returned different block
+hashes and state roots at the same audited height. Pin one source, show its
+version and block age, and stop any reward demo if the common-height fork
+warning appears.
+
+### Verify a block, transaction, or reward in the explorer
+
+The corrected static explorer is built but is not a supported public service
+until the coordinated v3 cutover passes its live gates. It will remain in
+maintenance mode rather than inventing a canonical chain from the current six
+forks.
+
+After a proven cutover, **Canonical timeline** retains blocks `0..H` from the
+signed checkpoint and continues with the exact parent-linked v3 block at
+`H+1`. Search a reward transaction from the same selected host and require a
+successful mined `0x25` receipt. Explicit alternate-source views remain
+labelled non-canonical and are never added into balances, earnings, or the
+canonical history. Until that recovered configuration is published, there is
+no supported explorer URL to use in a walkthrough.
 
 ---
 
@@ -288,7 +304,9 @@ GitHub Issues: <https://github.com/FerrumVir/arc-chain/issues>
 
 ## 6. Want to go deeper?
 
-- **Run from CLI instead of the desktop app?** See [README.md](../README.md) "Or run from the command line".
+- **Run from CLI instead of the desktop app?** Use the current
+  [headless/server guide](HEADLESS_INSTALL.md); archived command-line demos are
+  not installation instructions.
 - **Inspect a past attestation from a reviewed checkout?** Run `ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest` from the repository root against a controlled candidate. Its hash comparison is not payment proof or exact-artifact recomputation unless that coordinator supplies those fields.
 - **Read the paper:** *On the Foundations of Trustworthy Artificial Intelligence* (in the repo root).
 - **Architecture deep-dive:** [ARCHITECTURE.md](../ARCHITECTURE.md).

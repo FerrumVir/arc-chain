@@ -340,6 +340,52 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
         'README could present install rollback as persisted-state migration' || return 1
 }
 
+community_support_and_history_copy_is_actionable() {
+    for literal in \
+        '### Community support answer sheet' \
+        'Publishing v0.8.0 alone does not update them.' \
+        '[2–3 minute community-node walkthrough]' \
+        '## Block-level history and explorer continuity' \
+        'The recovery boundary is exactly `H+1`' \
+        'no public explorer URL is supported yet.'
+    do
+        require_literal "$README" "$literal" \
+            'README omits a current community support or history-continuity answer' || return 1
+    done
+
+    for literal in \
+        '### Troubleshooting and permissions' \
+        'Do not use' \
+        '`chmod -R 777`' \
+        '`chown -R`' \
+        'Do not mix the two scopes.' \
+        'scripts/arc-diagnose.sh'
+    do
+        require_literal "$HEADLESS" "$literal" \
+            'headless guide omits a safe permission or diagnostic instruction' || return 1
+    done
+
+    for literal in \
+        '#### Download and verify the exact worker model' \
+        'exactly 4,081,004,224 bytes' \
+        '08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa' \
+        "--proto '=https' --proto-redir '=https' --tlsv1.2" \
+        'sha256sum -c -' \
+        'shasum -a 256 -c -'
+    do
+        require_literal "$HEADLESS" "$literal" \
+            'headless guide omits the exact worker-model acquisition contract' || return 1
+    done
+
+    require_literal "$WALKTHROUGH" 'download-and-verify-the-exact-worker-model' \
+        'recording walkthrough does not point to the exact pre-staged model procedure' || return 1
+
+    require_literal "$GETTING_STARTED" '### Verify a block, transaction, or reward in the explorer' \
+        'desktop guide omits block-level recovery and explorer status' || return 1
+    require_literal "$GETTING_STARTED" 'Explicit alternate-source views remain' \
+        'desktop guide could silently blend non-canonical history' || return 1
+}
+
 run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
 run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
@@ -349,5 +395,6 @@ run_test 'production origins and receipt-backed status copy are exact' productio
 run_test 'activation copy fails closed and archived guides carry recovery warnings' activation_and_archived_guides_fail_closed_in_copy
 run_test 'operator docs require fresh v3 state, loopback RPC, and full transaction rollback' persistence_rpc_and_transaction_copy_match_the_installer
 run_test 'README counts and desktop secret/payment copy match the current tree' readme_counts_and_desktop_secret_copy_match_the_tree
+run_test 'community support, permissions, and block-history answers stay actionable' community_support_and_history_copy_is_actionable
 
 finish_tests

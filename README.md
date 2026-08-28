@@ -29,7 +29,7 @@ bash install.sh --version 0.8.0
 ```
 
 Expected `install.sh` SHA-256 for this candidate:
-`5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293`.
+`fb1cb4b097ffa71a68859f63e785fcbeffbfc147f186b4db61d28a7c939fadb4`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
@@ -37,6 +37,26 @@ normalized desktop installers, and one checksummed installer. Until the exact
 release exists, build and test only from a reviewed checkout; do not treat the
 commands above as a production download. The public fleet still requires the
 [coordinated recovery/cutover gate](docs/VALIDATOR-FLEET-ROLLOUT.md).
+
+### Community support answer sheet
+
+| Community question | Evidence-backed answer today |
+|---|---|
+| Can an SSH-only EC2/VPS install ARC? | Not from public v0.7.11. The complete v0.8.0 release restores real headless `arc-node` assets for Linux amd64 and arm64; the GUI packages are not server binaries. |
+| Are Intel and Apple Silicon Macs supported? | The v0.8.0 contract builds separate Intel and Apple Silicon CLI and desktop assets. Those candidate links become installable only after the complete release is published. |
+| Does automatic update work? | Public v0.7.11 saved the desktop preference but never scheduled checks. The candidate adds signed desktop checks after startup and every 24 hours, plus a transactional daily headless updater. Desktop updates still require confirmation; `.deb` and `.rpm` remain package-manager owned. |
+| When are the seeds upgraded? | They are not upgraded yet, and there is no honest calendar promise in this repository. Publishing v0.8.0 alone does not update them. Operators must complete one coordinated, archive-bound checkpoint cutover and prove all six agree before reopening traffic. |
+| Can a stake-zero worker earn the configured 2.5 testnet ARC? | Stake zero is eligible, but registration and raw inference tx `0x16` pay nothing. Exact-model assignment, independent verification, five-of-six reward authorization, activation, treasury limits, and a successful mined `0x25` receipt are all required. That payment path is not live on the public v2 fleet. |
+| What should a worker run? | A router needs no model or GPU. The current full-worker target is Llama-2-7B Q4_K_M (about 4 GB on disk) with at least 16 GB system RAM recommended; GPU is optional and hardware never guarantees work. |
+| Where are earnings and the block explorer? | The corrected dashboard and source-pinned explorer are release candidates, not supported public services yet. They remain in maintenance mode until live checkpoint, replica, inference, and receipt gates pass; projections fail closed to null when evidence is insufficient. |
+
+Use the [headless/server guide](docs/HEADLESS_INSTALL.md) for the complete
+platform, update, permissions, and troubleshooting contract. After the seed
+cutover is proven, the
+[2–3 minute community-node walkthrough](docs/COMMUNITY-NODE-WALKTHROUGH.md)
+demonstrates install, assignment, inference verification, a mined reward
+receipt, earnings, and the matching explorer block without overstating any
+missing evidence.
 
 📄 Paper: *On the Foundations of Trustworthy Artificial Intelligence*
 
@@ -206,7 +226,7 @@ bash install.sh --version 0.8.0
 ```
 
 Expected `install.sh` SHA-256:
-`5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293`.
+`fb1cb4b097ffa71a68859f63e785fcbeffbfc147f186b4db61d28a7c939fadb4`.
 
 The bootstrap installer comes from the owner-created protected source tag.
 It resolves an exact immutable, non-draft release, requires GitHub to identify
@@ -597,6 +617,33 @@ endpoints return 404 on the current binary.
 | Peer-to-peer weight distribution | planned |
 | Replicated chain across the seeds (one shared state) | v3 repair candidate built; public cutover blocked on validator key rotation and an approved genesis/checkpoint |
 | Block explorer | source-pinned static candidate built; not yet publicly deployed, so no explorer URL is currently supported |
+
+---
+
+## Block-level history and explorer continuity
+
+Recovery does not call the six divergent v2 databases one chain, discard their
+evidence, or restart height at zero. Before production mutation, the rollout
+contract fences the six controlled writers and content-indexes every retained
+source. An independently preserved reference snapshot/WAL pair must reproduce
+the approved block and state root at height H. Each divergent source is kept
+and labelled canonical, non-canonical, or unclassified; it is never silently
+merged into balances or transaction history.
+
+The selected checkpoint imports the canonical blocks `0..H` into every v3
+validator. The recovery boundary is exactly `H+1`, whose parent hash must equal
+the signed block H hash; the rollout then proves the same advancing
+height/hash/state-root commitment on all six validators, including after
+one-at-a-time restarts. That is a block-level continuation, not a reset or a
+claim that every old fork became canonical.
+
+The dashboard and explorer consume configuration generated from that sealed
+rollout. They do not label anything canonical until the exact H/H+1 boundary,
+network identity, and all six replica identities verify live. The explorer's
+automatic timeline serves retained history through H and the v3 continuation
+from H+1; explicit alternate-source views keep their provenance and are never
+promoted into canonical search results. The checked-in public configuration is
+still maintenance-only, so no public explorer URL is supported yet.
 
 ---
 

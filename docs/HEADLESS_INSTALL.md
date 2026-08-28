@@ -43,7 +43,7 @@ bash install.sh --version 0.8.0
 Verify the candidate's pinned installer hash before execution:
 
 ```bash
-printf '%s  %s\n' 5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293 install.sh | sha256sum -c -
+printf '%s  %s\n' fb1cb4b097ffa71a68859f63e785fcbeffbfc147f186b4db61d28a7c939fadb4 install.sh | sha256sum -c -
 ```
 
 On macOS, replace `sha256sum -c -` with `shasum -a 256 -c -`.
@@ -144,6 +144,43 @@ missing validator approval quorum. Absence means consensus rejects reward tx
   authorization, treasury funding, remaining block/epoch/worker/coordinator
   promotional budget, and a successful mined `0x25` receipt.
 
+#### Download and verify the exact worker model
+
+The desktop app downloads and verifies this artifact automatically. A headless
+operator must stage the same bytes explicitly. The supported artifact is
+`llama-2-7b-chat.Q4_K_M.gguf`, exactly 4,081,004,224 bytes, with SHA-256
+`08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa`.
+The hash, not the filename or download host, is the trust boundary.
+
+```bash
+mkdir -p "$HOME/.arc-models"
+curl --fail --location --retry 3 --continue-at - \
+  --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --output "$HOME/.arc-models/llama2-7b.gguf" \
+  https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf
+
+test "$(wc -c < "$HOME/.arc-models/llama2-7b.gguf" | tr -d ' ')" = 4081004224
+printf '%s  %s\n' \
+  08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa \
+  "$HOME/.arc-models/llama2-7b.gguf" | sha256sum -c -
+
+bash install.sh --version 0.8.0 \
+  --model "$HOME/.arc-models/llama2-7b.gguf"
+```
+
+On macOS, replace the `sha256sum -c -` pipeline with:
+
+```bash
+printf '%s  %s\n' \
+  08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa \
+  "$HOME/.arc-models/llama2-7b.gguf" | shasum -a 256 -c -
+```
+
+If either the byte count or digest differs, delete only the incomplete model
+file and retry the download. Do not start a worker with unverified bytes. Model
+verification proves artifact identity; it does not prove that the fleet is
+ready, that a job will be assigned, or that a reward will be mined.
+
 The installer never emits `--model ""`. It also stores the validator seed in a
 mode-`0600` environment file instead of process arguments, so `ps` does not
 expose it. The seed at `INSTALL_DIR/identity/validator-seed` is created once and
@@ -230,6 +267,45 @@ pass; `degraded` means the process and RPC are reachable but one or more chain
 readiness checks do not. The installer accepts both as proof that the new
 binary booted, but it prints a warning for `degraded` and never calls that
 state healthy.
+
+### Troubleshooting and permissions
+
+First identify which installation scope owns the node. Do not alternate
+between a user install and a sudo/system install while trying random fixes:
+
+```bash
+# User scope
+test -f "$HOME/.arc/install.conf" && sed -n '1,20p' "$HOME/.arc/install.conf"
+systemctl --user --no-pager status arc-node
+
+# System scope
+sudo test -f /var/lib/arc-chain/install.conf \
+  && sudo sed -n '1,20p' /var/lib/arc-chain/install.conf
+sudo systemctl --no-pager status arc-node
+```
+
+`install.conf` contains paths, ports, and service scope, not the private
+validator seed. Do not paste `identity/validator-seed`, process arguments, an
+environment file, or a recovery phrase into a support channel. Do not use
+`chmod -R 777`, `chown -R`, or delete the data directory to make an error go
+away; those actions can weaken the identity boundary or destroy the evidence
+needed to diagnose a failed recovery.
+
+| Symptom | Safe check and action |
+|---|---|
+| `sudo authorization failed` | Install as the login user with `bash install.sh --version 0.8.0 --user-service`, or deliberately use `sudo bash install.sh --version 0.8.0 --system-service`. Do not mix the two scopes. |
+| `No systemd user manager is reachable` over SSH | Use the explicit system service command above, or install with `--no-service` and run the printed command under your own supervisor. `sudo loginctl enable-linger "$USER"` is an optional administrator decision for a user service that must start before login. |
+| Model file is unreadable | As the account that will run the node, use `test -r /absolute/path/to/model.gguf`. Move the model to a directory that account can traverse or correct only the specific file/directory ownership; do not make the model or identity world-writable. |
+| Port is already in use | On Linux inspect `ss -ltnp` for RPC and `ss -lunp` for P2P, then choose unused explicit values with `--port` and `--p2p-port`. Do not kill an unidentified process. |
+| Service starts but health is `degraded` | Read the matching user/system journal above, confirm peers and the selected genesis/checkpoint, and run `bash scripts/arc-diagnose.sh` from a reviewed checkout. `degraded` is not fixed by exposing RPC publicly or reusing an old WAL. |
+| Update says no existing installation | Run the updater from the same install scope and exact install directory recorded in `install.conf`. A `--no-auto-update` install intentionally has no retained updater. |
+| Installer reports an incomplete release or checksum/signature failure | Stop. Confirm the exact v0.8.0 release contains every required platform asset and signed manifest. Never fall back to a desktop package, a moving URL, or an unsigned older binary. |
+
+For a support report, share the operating system/architecture, release version,
+service scope, redacted journal error, local `/health` response, and the output
+of `scripts/arc-diagnose.sh`. That diagnostic intentionally excludes process
+arguments and validator material and compares same-height hashes/state roots;
+an advancing DAG round alone is not a healthy-chain result.
 
 ## Updates and rollback behavior
 

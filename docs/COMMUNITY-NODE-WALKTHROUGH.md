@@ -13,10 +13,12 @@ mixed v0.7.2/v0.7.9 fleet as though these branch fixes are already live.
   closed when an existing WAL has no marker or a different genesis hash. Back
   up old v2 identity/data for forensics, but do not reuse or copy the v2 WAL.
   Validators need the approved canonical checkpoint migration instead.
-- Pre-stage the supported GGUF model at an absolute path. Confirm that it loads
-  every layer and that its streamed BLAKE3 artifact ID exactly matches the
-  request/coordinator model ID. A multi-gigabyte download does not fit a
-  three-minute recording.
+- Pre-stage the supported GGUF model at an absolute path using the exact
+  byte-count and SHA-256 procedure in
+  [HEADLESS_INSTALL.md](HEADLESS_INSTALL.md#download-and-verify-the-exact-worker-model).
+  Confirm that it loads every layer and that its streamed BLAKE3 artifact ID
+  exactly matches the request/coordinator model ID. A multi-gigabyte download
+  does not fit a three-minute recording.
 - Pick one approved HTTPS seed origin that is sealing blocks and use that same
   origin for the worker, inference request, earnings query, receipt, and
   explorer. Mixing origins can mix chain histories during recovery.
@@ -62,7 +64,7 @@ bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 
 The pinned installer SHA-256 is
-`5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293`.
+`fb1cb4b097ffa71a68859f63e785fcbeffbfc147f186b4db61d28a7c939fadb4`.
 
 The protected source-tag installer resolves one exact semantic-versioned
 release and verifies the owner signature on `SHA256SUMS` before trusting any
