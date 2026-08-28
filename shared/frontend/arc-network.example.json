@@ -9,6 +9,7 @@
   "checkpoint": {
     "height": 999,
     "recoveryHeight": 1000,
+    "legacyPublicMaxHeight": 1120,
     "blockHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "stateRoot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "manifestHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",

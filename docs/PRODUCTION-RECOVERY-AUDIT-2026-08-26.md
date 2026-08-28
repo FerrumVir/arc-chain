@@ -138,17 +138,84 @@ earnings on every validator.
 
 The legacy archive has a separate, earlier freeze authorization because the
 final checkpoint and archive roots cannot truthfully exist before the forked
-fleet is stopped and indexed. `audit-writers` binds the exact controlled
-systemd `MainPID`, process identity, argv, executable, data directory,
-validator identity, and stake to a sealed eight-identity 40M source set.
+fleet is stopped and indexed. `audit-writers` separately binds the exact
+controlled validator process and systemd supervisor `MainPID`, including both
+start times, cgroups, argv, executables, the data directory, validator identity,
+and stake, to a sealed eight-identity 40M source set. A validator in the exact
+root-session cgroup shape is recorded explicitly instead of being falsely
+treated as the service `MainPID`. Preparation does not stop, reparent, or
+normalize a writer. It requires the exact
+`ARC_RECOVERY_PREPARE_GO="STAGE-BARRIERS <orchestrator-sha256> HELPER
+<helper-sha256>"` phrase, stages four condition-only persistent barriers
+behind a present allow marker, and seals the marker, writer cgroup
+path/device/inode, unit source/alias/activation closure, and selected versus
+process-free alternative states. Removed alternative boot links are globally
+synced and their terminal enablement/PID/job state is independently rechecked
+before that prepare receipt is sealed. `seal-freeze-plan` emits the canonical
+`arc.recovery.freeze-plan.v5`.
 `archive-fleet-to-drive.sh capture` executes only with
 `ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256> CAPTURE <capture-id>"`.
-It persistently fences and cleanly stops the six exact controlled writers,
-representing 30M of that set, without SIGKILL. Stopping them leaves at most 10M
-of the sealed set—below quorum—but dynamic legacy RPC membership was poisoned
-and divergent. Unknown positive-stake identities remain recorded as untrusted
-external forks; the recovery evidence does **not** claim every possible
-external legacy network globally halted.
+Before that authorization may consume a stop intent, the v5 plan binds the ARC
+custom-OAuth Drive remote/root
+`arc-drive-arc:ARC Chain Recovery v0.8`, hashes of the inspectable OAuth client
+ID and account, the exact prefreeze gate, remaining dedicated-uploader budget,
+and an archive-capacity reservation. The legacy shared-client `arc-drive`
+remote is forbidden. Plan mode verifies those identities and capacity
+read-only. Execute mode repeats the gate immediately before the first writer
+signal, then immutable-creates, downloads and SHA-256 verifies, permanently
+deletes, and proves absence of one unique 8 MiB canary. A durable
+`arc.recovery.drive-prefreeze.v1` receipt must report both verification and
+deletion.
+
+After the Drive gate, the helper applies exact volatile lifecycle safety and
+freezes the inode-checked cgroup-v2 supervisor subtree. For a detached
+root-session writer it transiently freezes the audited parent scope, creates
+and locally freezes an inode-bound `arc-recovery-writer` child cgroup, moves the
+sole sealed writer into that child, durably seals the child identity and
+membership, then thaws and releases the parent scope. The owned child—not the
+root-session scope—is the writer's continuing freeze target; a systemd-owned
+writer instead shares the supervisor cgroup. Before the transient parent
+freeze, the high-priority scope overlay sets `DefaultDependencies=no`; the
+effective `Conflicts` and `Before` sets must be empty so PID1 has no generated
+shutdown stop edge. Exact source, property, reverse-edge, recursive-member, and
+signal-baseline checks are repeated through barrier arm. The
+transaction requires exclusive trusted-root control; a concurrent privileged
+root/PID1 D-Bus adversary could directly thaw or kill any process and is not a
+defensible in-host threat boundary.
+
+Still before marker unlink, all four canonical ARC units must resolve through
+their exact `Names`/`Id` and empty `Following` closure to `/dev/null` masks in
+the higher-priority volatile `/run/systemd/system.control` directory. Only
+after the frozen state, effective masks, and barrier arm are fsynced does the
+transaction unlink `/etc/arc-recovery/legacy-start-allowed` through its parent
+dirfd and fsync that parent. That unlink commits the four persistent
+condition-only start barriers. A precommit reboot loses the volatile masks but
+keeps the allow marker; a postcommit reboot is zero-signal reconciliation.
+
+The same-boot controller sends only pidfd `SIGTERM` while targets remain
+frozen. It never sends job-control signals or `SIGKILL`. Its two-stage v2
+journal persists writer TERM progress and writer thaw intent first, opens the
+exact owned-leaf cgroup inode, and writes `0` directly to `cgroup.freeze` while
+the supervisor remains frozen and unsignaled. Two stable checks and a durable
+writer-terminal receipt must prove the sealed identity, exact matches, and
+owned-leaf membership gone before supervisor TERM or thaw intent may exist.
+Only then may the controller thaw/reconcile the supervisor through its exact
+inode. A retry after either thaw intent cannot refreeze that target; a shared
+systemd cgroup uses a linked one-stage event chain and is thawed once. These
+facts do not establish which permitted event ultimately caused process exit.
+
+The durable result is `arc.recovery.offline-stop.v4`. Independently signaled
+targets record pidfd-TERM state `none`, `indeterminate`, or `confirmed`; a
+shared supervisor points to the writer event chain. `confirmed` proves the
+pidfd send returned, not that SIGTERM caused exit, so `exit_cause` remains
+`unknown`. A post-audit reboot sends no signal to stale numeric PIDs: it
+re-verifies the persistent fence and enablement, proves both services and all
+writers absent twice, and records reboot reconciliation. Only after all six
+exact writers are absent does the closed sealed-set proof leave at most 10M of
+40M available—below quorum. Dynamic legacy RPC membership was poisoned and
+divergent; unknown positive-stake identities remain untrusted external forks,
+and the evidence does **not** claim every possible external legacy network
+globally halted.
 
 After all six controlled writers are fenced, capture records the original data
 directory's path/device/inode, final WAL, external snapshot identities, stop
@@ -174,8 +241,8 @@ exactly `GO <prearchive-rollout-sha256> FREEZE <freeze-plan-sha256> CAPTURE
 `valid_canonical`, `valid_noncanonical_fork`, or `preserved_unclassified`; all
 six may be forks or unclassified because canonical authority comes from the
 shared reference pair. Every stopped source is streamed directly to
-`arc-drive:ARC Chain Recovery/captures/<capture-id>` without a full second
-local copy.
+`arc-drive-arc:ARC Chain Recovery v0.8/captures/<capture-id>` without a full
+second local copy.
 
 Google Drive is not WORM or intrinsically immutable. Partial uploads are
 resumable but not consumable; `COMPLETE.json` is only the last create-only
@@ -189,6 +256,16 @@ the archived premanifest. Production execution then requires both
 <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>`. New v3 release
 and data paths must be disjoint from every preserved legacy source, which is
 reverified after cutover.
+
+The prearchive and finalized rollout manifests also seal
+`chain.legacy_public_max_height`, sampled as the greatest block number exposed
+by any legacy public source immediately before maintenance (or set to a higher
+conservative ceiling). Roots-only archive finalization cannot change it. The
+rollout must put all six v3 validators on one commitment strictly above that
+floor, continue advancing, survive every one-at-a-time restart, and recheck the
+floor before completion. Recovered frontend configuration is create-only and
+is not emitted until the same H/H+1, reward, liveness, and all-replica height
+gates pass; any replica at or below the floor keeps canonical labels paused.
 
 Only after that should the team use
 [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) to record the

@@ -151,6 +151,7 @@ class ManifestFixture:
                 "recovery_epoch": 7,
                 "validator_set_id": 9,
                 "source_height": 100,
+                "legacy_public_max_height": 110,
                 "source_consensus_round": 9876,
                 "created_at_unix_ms": 1_787_857_623_000,
                 "source_block_hash": "0x" + "1" * 64,
@@ -198,6 +199,20 @@ class RecoveryRolloutTests(unittest.TestCase):
         wrong_boundary["chain"]["transition_height"] = 102
         with self.assertRaisesRegex(rollout.RolloutError, r"exactly source_height \+ 1"):
             rollout.validate_manifest(wrong_boundary)
+
+    def test_manifest_seals_a_legacy_public_height_not_below_source(self) -> None:
+        valid = self.fixture()
+        self.assertEqual(valid["chain"]["legacy_public_max_height"], 110)
+
+        missing = copy.deepcopy(valid)
+        missing["chain"].pop("legacy_public_max_height")
+        with self.assertRaisesRegex(rollout.RolloutError, "legacy_public_max_height"):
+            rollout.validate_manifest(missing)
+
+        below_source = copy.deepcopy(valid)
+        below_source["chain"]["legacy_public_max_height"] = 99
+        with self.assertRaisesRegex(rollout.RolloutError, "at least source_height"):
+            rollout.validate_manifest(below_source)
 
     def test_manifest_rejects_public_listener_and_protected_override(self) -> None:
         value = self.fixture()
@@ -293,6 +308,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             lambda value: value["validators"][0].__setitem__("host", "192.0.2.99"),
             lambda value: value["artifacts"]["binary"].__setitem__("sha256", "9" * 64),
             lambda value: value["checks"].__setitem__("observation_seconds", 2),
+            lambda value: value["chain"].__setitem__("legacy_public_max_height", 111),
             lambda value: value["validators"][0].__setitem__("shard_ranges", [[0, 6], [12, 17], [22, 27]]),
         )
         for mutate in mutations:
@@ -607,6 +623,27 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, "same-height fork"):
             harness.common_commitment()
 
+    def test_advancing_convergence_starts_strictly_above_legacy_public_maximum(self) -> None:
+        value = self.fixture()
+        output = io.StringIO()
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=output)
+        harness.wait_convergence = mock.Mock(
+            side_effect=[
+                (111, "a" * 64, "b" * 64),
+                (112, "c" * 64, "d" * 64),
+            ]
+        )
+
+        with mock.patch.object(rollout.time, "monotonic", side_effect=[0, 0, 0, 0, 2]):
+            harness.prove_advancing_convergence()
+
+        self.assertEqual(
+            harness.wait_convergence.call_args_list,
+            [mock.call(minimum_height=111), mock.call(timeout=10)],
+        )
+        self.assertIn("#111 > #110", output.getvalue())
+        self.assertIn("#111 -> #112", output.getvalue())
+
     def test_frontend_config_binds_source_boundary_domain_and_all_six_v3_replicas(self) -> None:
         value = self.fixture(production=True)
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
@@ -614,6 +651,10 @@ class RecoveryRolloutTests(unittest.TestCase):
         checkpoint = config["checkpoint"]
         self.assertEqual(checkpoint["height"], value["chain"]["source_height"])
         self.assertEqual(checkpoint["recoveryHeight"], value["chain"]["transition_height"])
+        self.assertEqual(
+            checkpoint["legacyPublicMaxHeight"],
+            value["chain"]["legacy_public_max_height"],
+        )
         self.assertEqual(
             checkpoint["boundaryBlockHash"], value["chain"]["transition_block_hash"].removeprefix("0x")
         )
@@ -634,13 +675,23 @@ class RecoveryRolloutTests(unittest.TestCase):
             {node["rpc_url"] for node in value["validators"]},
         )
 
+        blocked = self.root / "frontend.blocked.json"
+        harness.verify_live = mock.Mock(side_effect=rollout.RolloutError("height gate pending"))
+        with self.assertRaisesRegex(rollout.RolloutError, "height gate pending"):
+            rollout.write_frontend_config(harness, blocked)
+        self.assertFalse(blocked.exists())
+        self.assertFalse(Path(str(blocked) + ".sha256").exists())
+
         output = self.root / "frontend.lock.json"
+        harness.verify_live = mock.Mock()
         digest_value = rollout.write_frontend_config(harness, output)
+        harness.verify_live.assert_called_once_with()
         self.assertEqual(digest_value, digest(output))
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
         self.assertEqual(stat.S_IMODE(Path(str(output) + ".sha256").stat().st_mode), 0o444)
         with self.assertRaisesRegex(rollout.RolloutError, "refusing replacement"):
             rollout.write_frontend_config(harness, output)
+        harness.verify_live.assert_called_once_with()
 
     def test_gateway_is_https_only_loopback_limited_and_fail_closed(self) -> None:
         value = self.fixture(production=True)

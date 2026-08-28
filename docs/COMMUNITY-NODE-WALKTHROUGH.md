@@ -24,6 +24,10 @@ mixed v0.7.2/v0.7.9 fleet as though these branch fixes are already live.
   explorer. Mixing origins can mix chain histories during recovery.
 - Confirm the seed is on the approved v3 genesis/checkpoint and the operator
   has completed [VALIDATOR-FLEET-ROLLOUT.md](VALIDATOR-FLEET-ROLLOUT.md).
+- Confirm the recovered frontend checkpoint names the sealed
+  `legacyPublicMaxHeight` and every one of its six v3 replicas reports a
+  `last_block_height` strictly above it. If the app or explorer still shows
+  maintenance, do not bypass that gate for the recording.
 - Confirm the canonical activation height has been reached, the local
   issuance switch is open, and independent validator approval collection is
   ready. The stable reward-policy endpoint binds readiness to the recovery

@@ -9,9 +9,12 @@ ORCHESTRATOR="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
 NODE_HELPER="$REPO_ROOT/scripts/recovery/archive-node.sh"
 ROLLOUT="$REPO_ROOT/scripts/recovery/recovery_rollout.py"
 SCHEMA="$REPO_ROOT/scripts/recovery/recovery-manifest.schema.json"
+FREEZE_MODULE="$REPO_ROOT/scripts/recovery/recovery_freeze.py"
+FREEZE_MODULE_TEST="$REPO_ROOT/scripts/recovery/test_recovery_freeze.py"
 
 exact_authorizations_bind_every_domain() {
-    for required in 'expected_go="FREEZE $freeze_sha CAPTURE $capture_id"' \
+    for required in 'expected_go="STAGE-BARRIERS $orchestrator_sha HELPER $helper_sha"' \
+      'expected_go="FREEZE $freeze_sha CAPTURE $capture_id"' \
       'expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"' \
       'ARCHIVE {archive_manifest_sha256}' 'DEST {destination_sha} LEGACY_WAL {policy}' \
       remote_helper_sha256 rollout_tool_sha256 rollout_schema_sha256; do
@@ -146,14 +149,168 @@ stream_has_no_full_copy_or_model_member() {
     ! grep -Fq 'source_tree_immutable_in_place' "$NODE_HELPER"
 }
 
-helper_and_writer_identity_are_toctou_safe() {
-    for r in 'mktemp "$root/upload.XXXXXX"' 'exec 9<"$helper"' 'sha256sum /proc/self/fd/9' 'exec /proc/self/fd/9 "$@"' 'writer PID was reused or restarted after audit' 'writer argv differs from sealed audit' 'supervisor MainPID differs from sealed audit'; do grep -Fq -- "$r" "$ORCHESTRATOR" "$NODE_HELPER" || return 1; done
-    ! grep -Eq 'pkill[[:space:]]|exec[[:space:]]+"\$helper"' "$ORCHESTRATOR" "$NODE_HELPER" || return 1
-    grep -Fq 'legacy-start authorization marker exists' "$NODE_HELPER" || return 1
-    grep -Fq 'Never ask systemd to stop the audited writer' "$NODE_HELPER" || return 1
-    ! grep -Eq 'disable[[:space:]]+--now[[:space:]].*(arc-node|arc-self-heal)' "$NODE_HELPER"
-}
+v5_freeze_transaction_is_fault_closed() {
+    local old_stop old_continue old_quiesce
+    old_stop='SIG''STOP'; old_continue='SIG''CONT'; old_quiesce='pidfd-quiesce-''intent'
+    for required in \
+      'arc.recovery.freeze-plan.v5' \
+      'writer_cgroup_path' 'writer_cgroup_device' 'writer_cgroup_inode' \
+      'prepare_barrier' 'arc.recovery.prepare-barrier.v1' \
+      'ConditionPathExists=/etc/arc-recovery/legacy-start-allowed' \
+      '/run/systemd/system.control' \
+      'arc.recovery.restart-barrier-arm.v1' \
+      'arc.recovery.restart-barrier-committed.v2' \
+      'arc.recovery.fast-cgroups-frozen.v1' \
+      'arc.recovery.cgroup-thaw-intent.v2' \
+      'arc.recovery.detached-writer-terminal.v2' \
+      'DefaultDependencies=no'; do
+        grep -Fq -- "$required" "$ORCHESTRATOR" "$NODE_HELPER" || return 1
+    done
+    grep -Fq 'writer_supervision_mode = "detached-root-session"' "$ORCHESTRATOR" || return 1
+    grep -Fq 'signal.pidfd_send_signal(descriptor, signal.SIGTERM' "$NODE_HELPER" || return 1
+    grep -Fq 'SIGKILL is forbidden' "$NODE_HELPER" || return 1
+    ! grep -Eq "signal\\.$old_stop|signal\\.$old_continue|$old_quiesce|$old_stop-sent|$old_continue-sent" "$NODE_HELPER" || return 1
+    ! grep -Eq 'normalize_writer|reparent_writer|normalized into its reviewed systemd supervisor' "$NODE_HELPER" "$ORCHESTRATOR" || return 1
+    ! grep -Eq 'pkill[[:space:]]|killall[[:space:]]|kill[[:space:]]+-9|disable[[:space:]]+--now[[:space:]].*(arc-node|arc-self-heal)' "$NODE_HELPER" "$ORCHESTRATOR" || return 1
+    python3 - "$NODE_HELPER" "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib
+import sys
 
+node, orchestrator = (pathlib.Path(path).read_text() for path in sys.argv[1:])
+fast = node[node.index("fast_cgroup_freeze()"):node.index("pre_fence_quiesce_phase()")]
+assert fast.index('freeze_targets = [cgroup_entry("supervisor", supervisor_cgroup)]') < fast.index(
+    'freeze_targets.append(prepared_parent)'
+)
+parent_frozen = fast.index('02-writer-parent-cgroup-frozen.json')
+move_intent = fast.index('publish(leaf_move_path, move_intent)')
+leaf_create = fast.index('os.mkdir(leaf_name, 0o755, dir_fd=parent_directory)')
+leaf_local_freeze = fast.index('os.write(freezer, b"1")', leaf_create)
+writer_move = fast.index('os.write(procs, str(writer_pid).encode("ascii"))', leaf_local_freeze)
+leaf_receipt = fast.index('publish(leaf_receipt_path', writer_move)
+parent_release = fast.index('write_local_freeze(prepared_parent, 0)', leaf_receipt)
+release_receipt = fast.index('publish(parent_release_path', parent_release)
+assert parent_frozen < move_intent < leaf_create < leaf_local_freeze < writer_move
+assert writer_move < leaf_receipt < parent_release < release_receipt
+assert 'arc.recovery.detached-writer-leaf-move-intent.v1' in fast
+assert 'arc.recovery.detached-writer-parent-release.v1' in fast
+assert 'leaf.joinpath("cgroup.freeze").read_text' in node
+release_retry = fast.index('parent_already_released = False')
+release_skip = fast.index('entry["role"] == "writer-parent" and parent_already_released', release_retry)
+parent_refreeze = fast.index('write_local_freeze(entry, 1)', release_skip)
+assert release_retry < release_skip < parent_refreeze
+assert 'A durable parent-release receipt is a one-way phase transition' in fast
+assert 'cgroup_subtree_pids(prepared_parent["path"]) != [writer_pid]' in fast
+assert 'DefaultDependencies=no' in fast
+assert 'exact_scope["DefaultDependencies"] != "no"' in fast
+assert 'exact_scope["Conflicts"] or exact_scope["Before"]' in fast
+assert fast.index('entry["role"] == "supervisor"') < fast.index(
+    'entry["role"] == "writer-parent" and writer_mode == "detached-root-session"'
+)
+
+barrier = node[node.index("# Current v5 barrier transaction."):]
+mask_create = barrier.index('os.symlink("/dev/null", unit, dir_fd=control)')
+arm_publish = barrier.index('"schema": "arc.recovery.restart-barrier-arm.v1"')
+marker_unlink = barrier.index('os.unlink("legacy-start-allowed", dir_fd=parent)')
+assert mask_create < arm_publish < marker_unlink
+mask_loop = barrier[barrier.rindex("control = os.open", 0, mask_create):barrier.index(
+    "systemctl daemon-reload", mask_create
+)]
+assert "if value != selected" not in mask_loop
+arm_loop = barrier[barrier.index("barriers = {}; runtime = {}; masks = {}"):arm_publish]
+assert 'if unit == selected' not in arm_loop
+assert 'masks[unit] = "/dev/null"' in arm_loop
+assert 'run_mounts != ["tmpfs"]' in barrier
+assert '/etc/systemd/system.control/' in barrier
+
+controller = node[node.index("def thaw(entry, intent_path):"):node.index("def term_progress(prefix):")]
+assert '["systemctl", "thaw"' not in controller
+opened = controller.index("directory = os.open(")
+inode_check = controller.index('details.st_dev != entry["device"]', opened)
+direct_thaw = controller.index('os.write(freezer, b"0")', inode_check)
+assert opened < inode_check < direct_thaw
+detached = node[node.index('# Detached mode is deliberately two-stage.'):node.index(
+    'event("50-cgroups-thawed.json"'
+)]
+writer_term = detached.index('ensure_term(writer_target)')
+writer_intent = detached.index('"detached-writer-first"', writer_term)
+writer_thaw = detached.index('thaw(role_entries["writer"], thaw_intent_path)', writer_intent)
+terminal = detached.index('event(writer_terminal_path.name', writer_thaw)
+supervisor_term = detached.index('ensure_term(supervisor_targets[0])', terminal)
+supervisor_intent = detached.index('"detached-supervisor-after-writer-terminal"', supervisor_term)
+supervisor_thaw = detached.index('thaw(role_entries["supervisor"], supervisor_intent_path)', supervisor_intent)
+assert writer_term < writer_intent < writer_thaw < terminal
+assert terminal < supervisor_term < supervisor_intent < supervisor_thaw
+assert 'term_progress("20-supervisor") != "missing"' in detached
+assert '"supervisor_containment"' in detached
+assert "stable_absence_checks" in detached
+assert 'An unsignaled supervisor disappearance has no durable causal/ordering' in detached
+assert 'sealed-supervisor-terminal-cgroup-disappeared' not in node
+assert '"parent_state": scope_parent_state' in barrier
+assert 'terminal-after-leaf-seal' in barrier
+
+assert 'expected_go="STAGE-BARRIERS $orchestrator_sha HELPER $helper_sha"' in orchestrator
+assert 'expected_go="FREEZE $freeze_sha CAPTURE $capture_id"' in orchestrator
+assert 'expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"' in orchestrator
+assert orchestrator.index("run_drive_prefreeze_gate execute") < orchestrator.index(
+    'ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" nyc'
+)
+PY
+}
+v5_stop_journal_semantics_are_fault_closed() {
+    local old_stop_schema
+    old_stop_schema='arc.recovery.offline-stop.v''3'
+    for required in \
+      'arc.recovery.offline-stop.v4' \
+      'same-boot-frozen-cgroup-controller' \
+      'cgroup-v2-freeze' \
+      'SIGTERM-sent-via-pidfd-while-cgroup-frozen' \
+      'arc.recovery.cgroup-thaw-intent.v2' \
+      'no_signal_replayed_after_own_stage_thaw_intent' \
+      'sealed-boot-ended; no stale PID signaled' \
+      'exit_cause": "unknown"'; do
+        grep -Fq -- "$required" "$NODE_HELPER" || return 1
+    done
+    ! grep -Fq "$old_stop_schema" "$NODE_HELPER" || return 1
+    PYTHONDONTWRITEBYTECODE=1 python3 "$FREEZE_MODULE_TEST" >/dev/null || return 1
+    python3 - "$NODE_HELPER" "$FREEZE_MODULE" <<'PY' || return 1
+import importlib.util
+import pathlib
+import sys
+
+node_path, module_path = map(pathlib.Path, sys.argv[1:])
+node = node_path.read_text()
+stop = node[node.index("stop_node_cleanly()"):node.index("reconcile_known_stop_partials()")]
+reboot_branch = stop.index("if current_boot_id != boot_id:")
+detached_start = stop.index("# Detached mode is deliberately two-stage.", reboot_branch)
+writer_term = stop.index("ensure_term(writer_target)", detached_start)
+writer_intent = stop.index('"detached-writer-first"', writer_term)
+writer_thaw = stop.index('thaw(role_entries["writer"], thaw_intent_path)', writer_intent)
+writer_terminal = stop.index('event(writer_terminal_path.name', writer_thaw)
+supervisor_term = stop.index('ensure_term(supervisor_targets[0])', writer_terminal)
+supervisor_intent = stop.index('"detached-supervisor-after-writer-terminal"', supervisor_term)
+supervisor_thaw = stop.index('thaw(role_entries["supervisor"], supervisor_intent_path)', supervisor_intent)
+assert reboot_branch < writer_term < writer_intent < writer_thaw < writer_terminal
+assert writer_terminal < supervisor_term < supervisor_intent < supervisor_thaw
+assert 'signal.pidfd_send_signal(descriptor, signal.SIGTERM, None, 0)' in stop
+assert "signal.SIGKILL" not in stop
+assert '"recovery_sigkill_allowed": False' in stop
+assert 'role_matches = (' in stop
+assert 'if role == "supervisor" and "writer" not in role_entries' in stop
+assert 'selected supervisor disappeared without durable TERM/thaw progress' in stop
+assert 'selected supervisor thaw is not journal-authorized' in stop
+assert 'detached parent scope reactivated after durable terminal state' in stop
+assert '"exit_cause": "unknown"' in node
+
+spec = importlib.util.spec_from_file_location("recovery_freeze_contract", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert module.FREEZE_PLAN_SCHEMA == "arc.recovery.freeze-plan.v5"
+assert module.DEFAULT_ALLOW_MARKER_PATH == "/etc/arc-recovery/legacy-start-allowed"
+assert module.FailClosedHostMutationAdapter
+assert module.OFFLINE_RECONCILIATION_SCHEMA.endswith(".v1")
+PY
+}
 classification_requires_each_node_once() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
@@ -172,11 +329,12 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
     # shellcheck disable=SC2329
     freeze_node_field() {
         case "$3" in
-            writer_pid|writer_start_ticks|supervisor_main_pid|stake) printf '1\n' ;;
+            writer_pid|writer_start_ticks|supervisor_main_pid|supervisor_start_ticks|stake) printf '1\n' ;;
             boot_id) printf '00000000-0000-0000-0000-000000000000\n' ;;
+            writer_supervision_mode) printf 'systemd-unit\n' ;;
             supervisor_unit) printf 'arc-node.service\n' ;;
-            executable_path|data_dir|model_path) printf '/safe/%s/%s\n' "$2" "$3" ;;
-            executable_sha256|argv_sha256|model_sha256|validator_address) printf 'a%.0s' {1..64}; printf '\n' ;;
+            executable_path|supervisor_executable_path|data_dir|model_path) printf '/safe/%s/%s\n' "$2" "$3" ;;
+            executable_sha256|argv_sha256|writer_cgroup_sha256|supervisor_executable_sha256|supervisor_argv_sha256|model_sha256|validator_address) printf 'a%.0s' {1..64}; printf '\n' ;;
             model_size_bytes) printf '4081004224\n' ;;
             *) return 1 ;;
         esac
@@ -298,7 +456,7 @@ new_v3_paths_and_post_cutover_source_are_verified() {
     ! grep -Fq 'source_tree_immutable_in_place' "$NODE_HELPER" "$ORCHESTRATOR"
 }
 
-archive_scripts_are_lintable() { bash -n "$NODE_HELPER" "$ORCHESTRATOR" && PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$ROLLOUT" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "$REPO_ROOT/scripts/recovery/test_recovery_rollout.py" >/dev/null && python3 -m json.tool "$SCHEMA" >/dev/null && shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"; }
+archive_scripts_are_lintable() { bash -n "$NODE_HELPER" "$ORCHESTRATOR" && PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$ROLLOUT" "$FREEZE_MODULE" "$FREEZE_MODULE_TEST" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "$REPO_ROOT/scripts/recovery/test_recovery_rollout.py" >/dev/null && PYTHONDONTWRITEBYTECODE=1 python3 "$FREEZE_MODULE_TEST" >/dev/null && python3 -m json.tool "$SCHEMA" >/dev/null && shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"; }
 
 run_test 'exact authorizations bind every domain' exact_authorizations_bind_every_domain
 run_test 'capture id and destination fail closed' capture_id_and_destination_fail_closed
@@ -310,7 +468,8 @@ run_test 'disk peak allows growth and reserves v3' disk_peak_allows_growth_and_r
 run_test 'WAL boundary hashes without duplicates' wal_boundary_hashes_without_duplicate_files
 run_test 'model bytes and shards are bound' model_size_hash_and_shards_are_bound
 run_test 'archive stream makes no full copy' stream_has_no_full_copy_or_model_member
-run_test 'helper and writer identity are TOCTOU-safe' helper_and_writer_identity_are_toctou_safe
+run_test 'v5 freeze transaction is fault-closed' v5_freeze_transaction_is_fault_closed
+run_test 'v5 stop journal semantics are fault-closed' v5_stop_journal_semantics_are_fault_closed
 run_test 'classification requires each node once' classification_requires_each_node_once
 run_test 'capture readiness resumes exact stopped state' capture_readiness_resumes_stopped_and_indexed_nodes
 run_test 'canonical reference is independently required' reference_pair_is_independent_of_final_capture_classes

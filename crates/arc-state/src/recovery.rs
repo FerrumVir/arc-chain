@@ -41,12 +41,12 @@ pub const LEGACY_SNAPSHOT_MAX_BYTES: usize = ARCCHKPT_MAX_PAYLOAD_BYTES;
 pub const RECOVERY_VALIDATOR_SET_SIZE: usize = 6;
 /// Five identities are required in addition to strict >2/3 signed stake.
 pub const RECOVERY_SIGNATURES_REQUIRED: usize = 5;
-/// The selected canonical legacy fork was created by the original eight
-/// deterministic genesis validators. Later peer registries contain zero-stake
-/// community identities and divergent dynamically admitted validators; none
-/// of those are a recovery trust source.
+/// The selected canonical legacy fork retained one exact eight-validator set.
+/// Other fork-local peer registries contain zero-stake community identities
+/// and divergent dynamically admitted validators; none of those registries is
+/// a recovery trust source.
 pub const LEGACY_RECOVERY_VALIDATOR_SET_SIZE: usize = 8;
-/// Every validator in the selected legacy genesis carried exactly 5M stake.
+/// Every validator in the selected source set carried exactly 5M stake.
 pub const LEGACY_RECOVERY_VALIDATOR_STAKE: u64 = 5_000_000;
 /// The canonical legacy validator-set total committed by the recovery input.
 pub const LEGACY_RECOVERY_TOTAL_STAKE: u64 = 40_000_000;
@@ -1048,8 +1048,8 @@ fn validate_recovery_validators(validators: &[RecoveryValidator]) -> Result<(), 
 }
 
 /// Validate and canonicalize the independently archived validator metadata
-/// for the selected legacy fork. This deliberately accepts only the original
-/// eight-validator, 40M-stake genesis shape. Runtime peer registries and
+/// for the selected legacy fork. This deliberately accepts only the separately
+/// sealed eight-validator, 40M-stake source shape. Runtime peer registries and
 /// divergent validator maps on other legacy forks are not authoritative.
 pub fn canonicalize_legacy_recovery_validator_set(
     mut validators: Vec<(Address, u64)>,
@@ -2882,6 +2882,40 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn selected_nyc_legacy_validator_set_matches_recovery_commitment() {
+        let addresses = [
+            "030eab8217c91526ee96c263fa40541fdee2be5b3bb808fb6bd5775175a9df2d",
+            "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+            "16e1afc6f6323be62e37a823f36568c9427baca08a7ed12ab289e08dffddb97d",
+            "4f6f87d3fc2aac2b76778fa5d95cc72ff7b1f33c6c47abd3f277aeccc6833545",
+            "868dddb80041cdaa7aaa0b2992f4dfc49628a26f2c7424c985310ed0bead7aba",
+            "8bed4ea91365a9c92c67f2bb660ab8d39cb130d973eb6fb93cdb1dfdc4a9f3d3",
+            "bc27a1a9a0a8f7fcadb8d60641170e58083b990fe92614041a044b5de724bd62",
+            "c7a6141ddfe8ce668c3683b0097969cbab2d686494e1bae15bc464baa42264fd",
+        ];
+        let validators = canonicalize_legacy_recovery_validator_set(
+            addresses
+                .into_iter()
+                .map(|address| {
+                    (
+                        Hash256::from_hex(address).unwrap(),
+                        LEGACY_RECOVERY_VALIDATOR_STAKE,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let bytes =
+            bincode::serialize(&(validators.as_slice(), LEGACY_RECOVERY_TOTAL_STAKE)).unwrap();
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-source-validator-set-content-v1");
+        hasher.update(&bytes);
+        assert_eq!(
+            Hash256(*hasher.finalize().as_bytes()).to_hex(),
+            "80d7c2d229fea4171732fd04451372d849fab7baefed143a2a445ae72f472ecd"
+        );
     }
 
     fn target_validators_40m() -> (Vec<KeyPair>, Vec<RecoveryValidator>) {

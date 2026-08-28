@@ -13,14 +13,19 @@ freeze-plan digest, deterministically derived capture ID, exact Drive
 destination, verified archive-manifest hash, and explicit legacy-WAL policy in
 the finalized manifest, CLI, and extended GO phrase.
 
+The production archive remote is the separately reviewed ARC Google Drive
+OAuth remote/root, currently `arc-drive-arc:ARC Chain Recovery v0.8`. The
+legacy shared-client `arc-drive` remote cannot authorize a fleet freeze.
+
 ## Inputs
 
 Start from `recovery-manifest.schema.json`. The built-in validator is stricter
 than JSON Schema and rejects unknown fields. A draft binds:
 
 - protocol v3 chain ID, recovery epoch, validator-set ID, selected legacy H,
-  exact H block hash, exact H+1 transition hash/root, and the approved
-  checkpoint manifest hash;
+  exact H block hash, exact H+1 transition hash/root, the approved checkpoint
+  manifest hash, and `legacy_public_max_height`: the greatest legacy block
+  number exposed before maintenance (or a higher conservative ceiling);
 - local absolute paths and SHA-256 values for `arc-node`, genesis, ARCCHKPT,
   and, in production, the exact Caddy executable;
 - exactly six unique public validator addresses, stakes, keyfile paths, RPC
@@ -135,11 +140,22 @@ The orchestrator:
 4. installs create-only filter, gateway, and validator systemd units;
 5. obtains publicly trusted TLS or fails closed;
 6. starts five validators in a tight quorum batch, then the sixth;
-7. proves loopback-only node RPC, HTTPS health, H/H+1 continuity, advancing
-   convergence, the sealed 32-layer/3x HTTPS shard topology, and every
-   one-at-a-time restart;
+7. proves loopback-only node RPC, HTTPS health, H/H+1 continuity, all-six
+   convergence strictly above the sealed `legacy_public_max_height`, continued
+   advancing convergence, the sealed 32-layer/3x HTTPS shard topology, and
+   every one-at-a-time restart;
 8. proves reward-policy agreement and, when selected, one successful mined
    `0x25` receipt plus receipt-only worker earnings on every validator.
+
+Do not reuse the 2026-08-27 README observation as the final public ceiling.
+Immediately before the maintenance boundary, sample every public legacy source
+again and seal at least their maximum into `legacy_public_max_height`; choosing
+a higher conservative value is safe but lengthens the closed catch-up period.
+The orchestrator rechecks that all six v3 replicas are at `max + 1` or later
+after restarts and again before completion. `frontend-config` repeats the full
+live H/H+1, liveness, reward-policy, and height-floor verification before it
+creates a recovered config; the shared frontend keeps canonical labels paused
+if even one replica is missing or at/below the floor.
 
 On failure, the orchestrator stops/disables only the newly installed v3
 services. It does not delete imported data, artifacts, configs, journals, or
@@ -153,20 +169,42 @@ data paths must be disjoint and non-nested with every frozen legacy source.
 The legacy freeze and the final checkpoint seal are deliberately separate.
 The final checkpoint hash cannot exist until the forked fleet has stopped, so
 requiring that hash before capture would create a circular authorization. Seal
-a small, create-only freeze plan v2 first. It binds the exact remote helper,
-orchestrator, rollout verifier, and schema bytes plus the source commit,
-sentinel order, six controlled writer contracts, and the sealed eight-member
-40M legacy validator set:
+a small, create-only `arc.recovery.freeze-plan.v5` first. It binds the exact
+remote helper, orchestrator, rollout verifier, and schema bytes plus the source
+commit,
+sentinel order, six exact writer/supervisor identities, and the sealed
+eight-member 40M legacy validator set. Each node seals both process start
+times, argv, executables, and the writer cgroup path/device/inode. It also
+seals the prepare marker and all four condition-only barriers, merged unit
+sources, canonical `Names`/`Id`/empty-`Following` alias closure, selected and
+alternative unit states, and activation edges. A validator in the exact
+`/user.slice/user-0.slice/session-N.scope` root-session shape is recorded as a
+detached writer instead of being falsely treated as the systemd `MainPID`.
+The v5 plan also binds the ARC Drive gate bytes, exact remote root,
+hashed custom OAuth client ID, hashed account, reviewed remaining daily upload
+budget, and the operator's dedicated-uploader attestation:
 
 ```bash
-scripts/recovery/archive-fleet-to-drive.sh audit-writers \
+scripts/recovery/archive-fleet-to-drive.sh prepare-writers \
   --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
-  --output /secure/operator/arc-writers.lock.json
+  --output /secure/operator/arc-writers.lock.json \
+  --plan
+
+ARC_RECOVERY_PREPARE_GO="STAGE-BARRIERS <orchestrator-sha256> HELPER <helper-sha256>" \
+  scripts/recovery/archive-fleet-to-drive.sh prepare-writers \
+    --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
+    --output /secure/operator/arc-writers.lock.json \
+    --execute
 
 scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
   --window arc-v3-cutover-2026-08 \
   --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
   --writer-contracts /secure/operator/arc-writers.lock.json \
+  --drive-remote-root 'arc-drive-arc:ARC Chain Recovery v0.8' \
+  --drive-client-id-sha256 "$drive_client_id_sha256" \
+  --drive-account-sha256 "$drive_account_sha256" \
+  --drive-daily-upload-budget-bytes "$drive_daily_upload_budget_bytes" \
+  --attest-dedicated-drive-uploader \
   --output /secure/operator/arc-freeze.lock.json
 
 scripts/recovery/archive-fleet-to-drive.sh capture \
@@ -180,13 +218,93 @@ ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
     --execute
 ```
 
+The preparation authorization is exact and independently hash-binds the local
+orchestrator and installed remote helper. Preparation never stops, reparents,
+or normalizes a writer. It stages four persistent condition-only drop-ins
+behind the still-present allow marker, disables only already process-free
+alternatives, globally syncs the removed boot-enablement links, independently
+rechecks their inactive/PID/job state, and seals that durability receipt in the
+prepare contract. It then seals either the existing systemd cgroup relationship or the
+exact detached root-session relationship. The shared marker keeps this stage
+fail-open and safely resumable.
+
 The capture ID is `SHA256("ARC recovery capture v2\0" || freeze_plan_digest)`;
 it is not an operator-selected label. The default `capture` is read-only.
 Immediately before every remote helper invocation, the orchestrator re-hashes
-the installed helper and refuses any byte mismatch. Execution installs a
-persistent systemd restart fence and cleanly stops NYC and then LAX, but those
-sentinel stops do not authorize a global halt claim. It then stops AMS, LHR,
-NRT, and SGP. The six exact controlled identities represent 30M of the sealed
+the installed helper and refuses any byte mismatch. Plan mode also runs the
+Drive gate read-only: it rejects the legacy remote, ambient rclone backend or
+credential overrides, a missing inspectable custom OAuth client, a different
+account/root, rclone warnings, insufficient finite capacity, an over-budget
+archive reservation, and a largest-object reservation above Drive's limit.
+
+After the exact `FREEZE` authorization and immediately before the first writer
+signal, execute mode repeats those checks at the sealed ARC remote root. It
+uploads one unique 8 MiB canary with immutable-create semantics, downloads and
+SHA-256 verifies it, permanently deletes it, verifies absence, rechecks
+capacity/client/account, and durably records the
+`arc.recovery.drive-prefreeze.v1` receipt. The freeze does not begin unless the
+canary is both verified and deleted.
+
+Execution installs exact volatile lifecycle-safety overlays, then uses cgroup
+v2 freezing as the only quiescence mechanism. It inode-checks and freezes the
+selected supervisor cgroup first. For a detached writer, it transiently freezes
+the audited root-session parent, creates and locally freezes an inode-bound
+`arc-recovery-writer` child, moves the sole writer into that child, durably
+seals the child's exact identity and membership, then thaws and releases the
+parent. The owned child—not the root-session scope—remains frozen alongside the
+supervisor; a systemd-owned writer is already inside the supervisor cgroup.
+The parent-scope overlay sets `DefaultDependencies=no` and proves the effective
+`Conflicts` and `Before` sets are empty before the transient freeze. It also
+seals and repeatedly rechecks reverse dependency edges and exact scope
+source/property bytes. The helper and ancestors must be outside the final
+targets, all recursive members must match the sealed allowlist, and the frozen
+task/signal baseline is durably recorded.
+
+This transaction protects against ordinary service lifecycle, dependency,
+retry, and reboot paths on the reviewed host. It does not claim protection
+from a concurrent privileged root/PID1 D-Bus adversary: such an actor can
+create a new stop edge, write `cgroup.freeze`, or kill the process directly.
+Production execution therefore requires exclusive trusted-root control for
+the short freeze transaction.
+
+While the marker is still present, the transaction installs `/dev/null` masks
+for all four canonical units in the higher-priority volatile
+`/run/systemd/system.control` directory and proves PID1 resolves each exact
+canonical `Names`/`Id` with empty `Following` to that mask. It writes and
+fsyncs the barrier arm only after every cgroup is frozen and every mask is
+effective. The sole commit mutation is then unlinking
+`/etc/arc-recovery/legacy-start-allowed` through its sealed parent dirfd and
+fsyncing the parent. The persistent condition-only barriers become fail-closed
+at that point. Before commit, a reboot removes the volatile masks while the
+present marker permits normal recovery; after commit, marker absence is the
+durable restart fence and a reboot permits only zero-signal reconciliation.
+
+The same-boot controller sends only pidfd `SIGTERM`, and only while the exact
+cgroup remains frozen. It never sends job-control signals and never issues
+`SIGKILL`. Its two-stage v2 journal is writer-first: persist writer TERM
+progress and the writer thaw intent, directly thaw the inode-checked owned leaf
+while the supervisor remains frozen and unsignaled, then require two stable
+terminal checks and a durable writer-terminal receipt before any supervisor
+TERM or thaw intent may exist. Only then may it persist supervisor progress and
+directly thaw/reconcile the supervisor cgroup. Each stage binds `none`,
+`indeterminate`, `confirmed`, or terminal TERM evidence, and retry after a thaw
+intent never refreezes that target. A shared systemd cgroup uses the linked
+single-cgroup path and is thawed once. No path asks systemd to stop or thaw the
+audited unit.
+
+Every stop writes `arc.recovery.offline-stop.v4`. Each independently signaled
+target has a durable pidfd-TERM state: `none` means no intent was consumed,
+`indeterminate` means intent was fsynced but no sent record exists, and
+`confirmed` means the pidfd send returned and its sent record was persisted.
+A shared supervisor is explicitly linked to the writer's event chain. The
+record always leaves `exit_cause=unknown` and states that recovery sent no
+SIGKILL. If the boot ID changed after audit, reconciliation sends nothing to a
+stale numeric PID; it instead verifies the persistent fence, both reviewed
+services and all writers absent twice, and records the reboot-fenced outcome.
+
+The sentinel order remains NYC, then LAX, followed by AMS, LHR, NRT, and SGP;
+those first stops do not authorize a global halt claim. The six exact
+controlled identities represent 30M of the sealed
 40M source set; only after all six are stopped does the sealed proof leave at
 most 10M unstopped stake, below quorum. Divergent dynamic RPC identities are
 recorded as untrusted external forks, never folded into a false claim that the
@@ -239,7 +357,7 @@ scripts/recovery/archive-fleet-to-drive.sh seal \
   --allow-unbound-legacy-wal
 
 locked_sha256='<sealed prearchive rollout-manifest sha256>'
-destination='arc-drive:ARC Chain Recovery/captures/'"$capture_id"
+destination='arc-drive-arc:ARC Chain Recovery v0.8/captures/'"$capture_id"
 destination_sha256="$(printf %s "$destination" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
 ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id DEST $destination_sha256 LEGACY_WAL UNBOUND" \
   scripts/recovery/archive-fleet-to-drive.sh seal \
@@ -264,7 +382,8 @@ snapshot. The independently reproduced shared reference snapshot/WAL pair—not
 one of the later live captures—is the canonical recovery source. All six final
 captures may therefore be forks or unclassified and are still retained and
 uploaded under the exact capture-scoped destination
-`arc-drive:ARC Chain Recovery/captures/<capture-id>`. A changed or missing
+`arc-drive-arc:ARC Chain Recovery v0.8/captures/<capture-id>`. A changed or
+missing
 capture or a Drive object bound to a different freeze hash stops before upload
 or replacement. A per-node semantic export failure is preserved as
 unclassified evidence and cannot masquerade as either a fork or a canonical
@@ -294,7 +413,7 @@ Verify a destination before use:
 
 ```bash
 scripts/recovery/archive-fleet-to-drive.sh verify-complete \
-  --destination 'arc-drive:ARC Chain Recovery/captures/<capture-id>'
+  --destination 'arc-drive-arc:ARC Chain Recovery v0.8/captures/<capture-id>'
 ```
 
 An absent, non-canonical, mismatched, or tampered `COMPLETE.json`, manifest, or
@@ -409,7 +528,9 @@ roots-only prearchive finalization, partial-capture and rollout resume,
 content-verified create-only archive behavior, both extended GO authorizations,
 sealed-source stake proof, exact checkpoint/model/shard commitments, full
 remote-object verification, source-path separation, explicit HTTPS origins,
-loopback gateway policy, same-height fork rejection, clean restart command
-construction, TERM-only local cleanup that refuses SIGKILL, the complete
+loopback gateway policy, same-height fork rejection, restart command
+construction, cgroup-v2 freeze/TERM/thaw ordering, durable signal ambiguity
+without SIGKILL, the four-unit condition barrier and volatile control-mask
+commit, detached-writer terminal proof, the complete
 six-validator restart/height-advance sequence, hash-pinned reward probes, and
 successful-receipt-only earnings.

@@ -65,7 +65,8 @@ jobs:
           # two inapplicable diagnostics in the test harness.
           shellcheck --exclude=SC1090,SC2016 \
             tests/release/*.sh \
-            tests/release/helpers/*.sh
+            tests/release/helpers/*.sh \
+            tests/integration/*.sh
 
   # ------------------------------------------------ current-tree secrets ----
   # Full history intentionally contains the retired deterministic validator
@@ -363,7 +364,7 @@ jobs:
               echo "::error file=$f::bash syntax error"
               fail=1
             fi
-          done < <(find scripts deploy -type f -name '*.sh' | sort)
+          done < <(find scripts deploy tests/release tests/integration -type f -name '*.sh' | sort)
           exit "$fail"
 
   # --------------------------------------------------------- shellcheck ----
@@ -386,7 +387,7 @@ jobs:
           files=(install.sh)
           while IFS= read -r -d '' file; do
             files+=("$file")
-          done < <(find scripts deploy tests/release -type f -name '*.sh' -print0)
+          done < <(find scripts deploy tests/release tests/integration -type f -name '*.sh' -print0)
           shellcheck -S warning "${files[@]}"
 
   # ------------------------------------------------------------- forge ----

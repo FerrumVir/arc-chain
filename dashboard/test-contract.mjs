@@ -25,6 +25,7 @@ function makeResolver() {
     checkpoint: {
       height: H,
       recoveryHeight: H + 1,
+      legacyPublicMaxHeight: H + 10,
       blockHash: hex("a"),
       stateRoot: hex("b"),
       manifestHash: hex("c"),
@@ -80,6 +81,7 @@ function exactNetworkInfo(overrides = {}) {
     validator_set_id: 9,
     recovery_domain: hex("f"),
     checkpoint_manifest_hash: hex("c"),
+    last_block_height: H + 11,
     ...overrides,
   };
 }

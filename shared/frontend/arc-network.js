@@ -92,8 +92,12 @@
     if (!isObject(raw)) throw new ConfigurationError("checkpoint must be an object or null");
     const height = integer(raw.height);
     const recoveryHeight = integer(raw.recoveryHeight);
+    const legacyPublicMaxHeight = integer(raw.legacyPublicMaxHeight);
     if (height === null || height < 0) throw new ConfigurationError("checkpoint.height must be a non-negative integer");
     if (recoveryHeight !== height + 1) throw new ConfigurationError("checkpoint.recoveryHeight must equal checkpoint.height + 1");
+    if (legacyPublicMaxHeight === null || legacyPublicMaxHeight < height) {
+      throw new ConfigurationError("checkpoint.legacyPublicMaxHeight must be an integer at least checkpoint.height");
+    }
     const blockHash = normalizeHex(raw.blockHash, 32);
     const stateRoot = normalizeHex(raw.stateRoot, 32);
     const manifestHash = normalizeHex(raw.manifestHash, 32);
@@ -125,6 +129,7 @@
     return Object.freeze({
       height,
       recoveryHeight,
+      legacyPublicMaxHeight,
       blockHash,
       stateRoot,
       manifestHash,
@@ -464,9 +469,20 @@
       .map(([key]) => key);
     if (normalizeHex(info.recovery_domain, 32) !== checkpoint.recoveryDomain) mismatches.push("recovery_domain");
     if (normalizeHex(info.checkpoint_manifest_hash, 32) !== checkpoint.manifestHash) mismatches.push("checkpoint_manifest_hash");
-    return mismatches.length
-      ? { state: "mismatch", reason: "network-identity-mismatch", mismatches }
-      : { state: "verified" };
+    if (mismatches.length) return { state: "mismatch", reason: "network-identity-mismatch", mismatches };
+    const lastBlockHeight = integer(info.last_block_height);
+    if (lastBlockHeight === null) {
+      return { state: "unknown", reason: "last-block-height-unavailable" };
+    }
+    if (lastBlockHeight <= checkpoint.legacyPublicMaxHeight) {
+      return {
+        state: "unknown",
+        reason: "visible-height-regression-gate-pending",
+        lastBlockHeight,
+        requiredMinimumHeight: checkpoint.legacyPublicMaxHeight + 1,
+      };
+    }
+    return { state: "verified", lastBlockHeight };
   }
 
   function auditRecoveryCheckpoint(input) {

@@ -20,6 +20,7 @@ const recovered = {
   checkpoint: {
     height: H,
     recoveryHeight: H + 1,
+    legacyPublicMaxHeight: H + 100,
     blockHash: hex("a"),
     stateRoot: hex("b"),
     manifestHash: hex("c"),
@@ -67,6 +68,16 @@ test("fails closed when recovered mode has no checkpoint", () => {
 test("requires H+1 as the recovery height", () => {
   const invalid = { ...recovered, checkpoint: { ...recovered.checkpoint, recoveryHeight: H + 2 } };
   assert.throws(() => network.normalizeConfig(invalid), /must equal checkpoint.height \+ 1/);
+});
+
+test("requires the sealed legacy public maximum at or above H", () => {
+  const missing = structuredClone(recovered);
+  delete missing.checkpoint.legacyPublicMaxHeight;
+  assert.throws(() => network.normalizeConfig(missing), /legacyPublicMaxHeight/);
+
+  const belowSource = structuredClone(recovered);
+  belowSource.checkpoint.legacyPublicMaxHeight = H - 1;
+  assert.throws(() => network.normalizeConfig(belowSource), /at least checkpoint.height/);
 });
 
 test("recovered configuration requires exact boundary and recovery identity commitments", () => {
@@ -239,6 +250,7 @@ function exactNetworkInfo(overrides = {}) {
     validator_set_id: recovered.checkpoint.validatorSetId,
     recovery_domain: recovered.checkpoint.recoveryDomain,
     checkpoint_manifest_hash: recovered.checkpoint.manifestHash,
+    last_block_height: recovered.checkpoint.legacyPublicMaxHeight + 1,
     ...overrides,
   };
 }
@@ -249,6 +261,40 @@ test("network identity requires exact chain, v3, epoch, set, domain, and manifes
     const result = network.networkInfoVerification(exactNetworkInfo({ [field]: value }), config);
     assert.equal(result.state, "mismatch", field);
   }
+});
+
+test("network identity stays unverified until the reported height is strictly above the legacy public maximum", () => {
+  const missing = network.networkInfoVerification(exactNetworkInfo({ last_block_height: undefined }), config);
+  assert.equal(missing.state, "unknown");
+  assert.equal(missing.reason, "last-block-height-unavailable");
+
+  const equal = network.networkInfoVerification(
+    exactNetworkInfo({ last_block_height: recovered.checkpoint.legacyPublicMaxHeight }),
+    config,
+  );
+  assert.equal(equal.state, "unknown");
+  assert.equal(equal.reason, "visible-height-regression-gate-pending");
+  assert.equal(equal.requiredMinimumHeight, recovered.checkpoint.legacyPublicMaxHeight + 1);
+
+  const above = network.networkInfoVerification(
+    exactNetworkInfo({ last_block_height: recovered.checkpoint.legacyPublicMaxHeight + 1 }),
+    config,
+  );
+  assert.equal(above.state, "verified");
+});
+
+test("one lagging replica keeps the full recovery audit fail closed", () => {
+  const boundaryBlock = { header: { height: H + 1, parent_hash: recovered.checkpoint.blockHash, hash: recovered.checkpoint.boundaryBlockHash, state_root: recovered.checkpoint.boundaryStateRoot } };
+  const result = network.auditRecoveryCheckpoint({
+    config,
+    legacyBlock: { header: { height: H, hash: recovered.checkpoint.blockHash, state_root: recovered.checkpoint.stateRoot } },
+    replicas: [
+      { sourceId: "v3-a", boundaryBlock, networkInfo: exactNetworkInfo() },
+      { sourceId: "v3-b", boundaryBlock, networkInfo: exactNetworkInfo({ last_block_height: recovered.checkpoint.legacyPublicMaxHeight }) },
+    ],
+  });
+  assert.equal(result.state, "unknown");
+  assert.equal(result.replicas.find((entry) => entry.sourceId === "v3-b").networkInfo.reason, "visible-height-regression-gate-pending");
 });
 
 test("full checkpoint audit verifies signed H plus every configured v3 replica", () => {

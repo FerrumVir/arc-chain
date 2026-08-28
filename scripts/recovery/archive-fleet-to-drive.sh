@@ -10,7 +10,8 @@ ORCHESTRATOR="$SCRIPT_DIR/archive-fleet-to-drive.sh"
 REMOTE_HELPER="$SCRIPT_DIR/archive-node.sh"
 ROLLOUT_TOOL="$SCRIPT_DIR/recovery_rollout.py"
 ROLLOUT_SCHEMA="$SCRIPT_DIR/recovery-manifest.schema.json"
-DRIVE_REMOTE="${ARC_RECOVERY_DRIVE_REMOTE:-arc-drive:ARC Chain Recovery}"
+DRIVE_PREFREEZE_GATE="$SCRIPT_DIR/verify-drive-prefreeze.sh"
+DRIVE_REMOTE="${ARC_RECOVERY_DRIVE_REMOTE:-arc-drive-arc:ARC Chain Recovery v0.8}"
 SSH_USER="${ARC_RECOVERY_SSH_USER:-root}"
 
 NODES=(
@@ -25,10 +26,15 @@ SENTINELS=(nyc lax)
 REMAINING=(ams lhr nrt sgp)
 SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes)
 ARCHIVE_FLEET_TEMP_ROOT=""
+ARCHIVE_FLEET_PINNED_ROOT=""
+OPERATOR_FREEZE_PLAN=""
 
 cleanup_temporary_root() {
     if [ -n "$ARCHIVE_FLEET_TEMP_ROOT" ]; then
         rm -rf -- "$ARCHIVE_FLEET_TEMP_ROOT"
+    fi
+    if [ -n "$ARCHIVE_FLEET_PINNED_ROOT" ]; then
+        rm -rf -- "$ARCHIVE_FLEET_PINNED_ROOT"
     fi
 }
 
@@ -40,12 +46,23 @@ die() {
 usage() {
     cat <<'EOF'
 Usage:
+  archive-fleet-to-drive.sh prepare-writers \
+    --legacy-validator-set /absolute/legacy-validators.json \
+    --output /absolute/writers.lock.json [--plan]
+  ARC_RECOVERY_PREPARE_GO='STAGE-BARRIERS ORCHESTRATOR_SHA256 HELPER HELPER_SHA256' \
+    archive-fleet-to-drive.sh prepare-writers \
+    --legacy-validator-set /absolute/legacy-validators.json \
+    --output /absolute/writers.lock.json --execute
+
   archive-fleet-to-drive.sh audit-writers --legacy-validator-set /absolute/legacy-validators.json \
     --output /absolute/writers.lock.json
 
   archive-fleet-to-drive.sh seal-freeze-plan --window ID \
     --legacy-validator-set /absolute/legacy-validators.json \
     --writer-contracts /absolute/writers.lock.json \
+    --drive-remote-root 'arc-drive-arc:ARC Chain Recovery v0.8' \
+    --drive-client-id-sha256 HASH --drive-account-sha256 HASH \
+    --drive-daily-upload-budget-bytes BYTES --attest-dedicated-drive-uploader \
     --output /absolute/freeze.lock.json
 
   archive-fleet-to-drive.sh capture --freeze-plan /absolute/freeze.lock.json [--plan]
@@ -147,6 +164,66 @@ print(digest.hexdigest())
 PY
 }
 
+pin_freeze_plan() {
+    local source="$1" destination_root="$2"
+    python3 - "$source" "$destination_root" <<'PY'
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+source_sidecar = source.with_name(source.name + ".sha256")
+root = pathlib.Path(sys.argv[2])
+if not source.is_absolute() or not root.is_absolute() or not root.is_dir() or root.is_symlink():
+    raise SystemExit("freeze-plan pin paths are unsafe")
+
+def read_locked(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_mode & 0o222:
+            raise SystemExit(f"sealed freeze input is mutable or non-regular: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+payload = read_locked(source)
+sidecar = read_locked(source_sidecar)
+digest = hashlib.sha256(payload).hexdigest()
+if sidecar != f"{digest}  {source.name}\n".encode("ascii"):
+    raise SystemExit("freeze-plan sidecar does not bind the exact source bytes")
+destination = root / source.name
+destination_sidecar = root / source_sidecar.name
+for path, value in ((destination, payload), (destination_sidecar, sidecar)):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(value); handle.flush(); os.fsync(handle.fileno())
+directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(destination)
+PY
+}
+
+assert_pinned_freeze_bytes() {
+    local plan="$1" expected_sha="$2"
+    case "$plan" in "$ARCHIVE_FLEET_PINNED_ROOT"/*) ;; *) die "destructive freeze input is not the private pinned snapshot" ;; esac
+    [ "$(hash_file "$plan")" = "$expected_sha" ] || \
+        die "private pinned freeze-plan bytes changed before destructive call"
+    [ "$(cat "${plan}.sha256")" = "$expected_sha  ${plan##*/}" ] || \
+        die "private pinned freeze-plan sidecar changed before destructive call"
+}
+
 host_for() {
     local wanted="$1"
     local entry
@@ -220,6 +297,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import urllib.request
@@ -348,20 +427,373 @@ exe_path = os.readlink(proc / "exe")
 if not os.path.isabs(exe_path):
     fail("writer executable is not absolute")
 cgroup = (proc / "cgroup").read_text(encoding="utf-8")
-units = [unit for unit in ("arc-node.service", "arc-self-heal.service") if unit in cgroup]
-if len(units) != 1:
-    fail(f"writer does not belong to exactly one reviewed systemd unit: {units}")
-unit = units[0]
+unified_rows = []
+for line in cgroup.splitlines():
+    hierarchy, controllers, path = line.split(":", 2)
+    if hierarchy == "0" and controllers == "": unified_rows.append(path)
+if (len(unified_rows) != 1 or not re.fullmatch(r"/[A-Za-z0-9._@/-]+", unified_rows[0])
+        or ".." in unified_rows[0] or unified_rows[0] == "/"):
+    fail("writer unified cgroup is missing or unsafe")
+writer_cgroup_path = unified_rows[0]
+writer_cgroup_root = pathlib.Path("/sys/fs/cgroup") / writer_cgroup_path.lstrip("/")
+if writer_cgroup_root.is_symlink() or not writer_cgroup_root.is_dir():
+    fail("writer cgroup directory is missing or unsafe")
+writer_cgroup_details = writer_cgroup_root.stat()
+active_units = []
+for candidate_unit in ("arc-node.service", "arc-self-heal.service"):
+    candidate_main = uint(
+        subprocess.check_output(
+            ["systemctl", "show", candidate_unit, "--property=MainPID", "--value"],
+            text=True,
+        ).strip(),
+        f"{candidate_unit} MainPID",
+    )
+    if candidate_main > 0 and pathlib.Path(f"/proc/{candidate_main}").exists():
+        active_units.append((candidate_unit, candidate_main))
+if len(active_units) != 1:
+    fail(f"expected one reviewed active supervisor unit, found {active_units}")
+unit, observed_unit_main_pid = active_units[0]
+if unit in cgroup:
+    writer_supervision_mode = "systemd-unit"
+else:
+    if (not re.fullmatch(r"/user\.slice/user-0\.slice/session-[1-9][0-9]*\.scope", writer_cgroup_path)
+            or int(stat_fields[3]) != 1):
+        fail("detached writer is outside the reviewed root-session relationship")
+    observed_members = set()
+    for current, directories, _files in os.walk(writer_cgroup_root, followlinks=False):
+        directories.sort()
+        current_path = pathlib.Path(current)
+        if current_path.is_symlink(): fail("detached writer cgroup subtree contains a symlink")
+        procs = current_path / "cgroup.procs"
+        if procs.is_symlink() or not procs.is_file(): fail("detached writer cgroup inventory is unsafe")
+        observed_members.update(int(value) for value in procs.read_text(encoding="ascii").splitlines())
+    if observed_members != {pid}:
+        fail(f"detached writer is not the sole recursive cgroup member: {sorted(observed_members)}")
+    writer_supervision_mode = "detached-root-session"
+writer_cgroup_sha256 = hashlib.sha256(cgroup.encode("utf-8")).hexdigest()
 unit_main_pid = uint(
     subprocess.check_output(
         ["systemctl", "show", unit, "--property=MainPID", "--value"], text=True
     ).strip(),
     "unit MainPID",
 )
+if unit_main_pid != observed_unit_main_pid:
+    fail("reviewed supervisor MainPID changed during audit")
 if unit_main_pid <= 0 or not pathlib.Path(f"/proc/{unit_main_pid}").exists():
     fail(f"reviewed supervisor unit is not active: {unit}")
-if unit_main_pid != pid:
-    fail("reviewed supervisor MainPID is not the exact writer PID")
+supervisor_proc = pathlib.Path("/proc") / str(unit_main_pid)
+supervisor_stat = supervisor_proc.joinpath("stat").read_text(encoding="ascii").split()
+if len(supervisor_stat) < 22:
+    fail("supervisor /proc stat is truncated")
+supervisor_start_ticks = uint(supervisor_stat[21], "supervisor start ticks")
+supervisor_argv_raw = supervisor_proc.joinpath("cmdline").read_bytes()
+if not supervisor_argv_raw:
+    fail("supervisor argv is empty")
+supervisor_executable_path = os.readlink(supervisor_proc / "exe")
+if not os.path.isabs(supervisor_executable_path):
+    fail("supervisor executable is not absolute")
+if unit not in supervisor_proc.joinpath("cgroup").read_text(encoding="utf-8"):
+    fail("supervisor MainPID is outside the reviewed systemd unit")
+
+def signal_ignored(process, signal_number):
+    for line in process.joinpath("status").read_text(encoding="ascii").splitlines():
+        if line.startswith("SigIgn:"):
+            return bool(int(line.split(":", 1)[1].strip(), 16) & (1 << (signal_number - 1)))
+    fail("process status has no SigIgn mask")
+
+if signal_ignored(proc, 15) or signal_ignored(supervisor_proc, 15):
+    fail("writer or supervisor ignores SIGTERM; deterministic recovery shutdown is unsupported")
+
+try:
+    supervisor_argv = [item.decode("utf-8") for item in supervisor_argv_raw.rstrip(b"\0").split(b"\0")]
+except UnicodeDecodeError:
+    fail("supervisor argv is not UTF-8")
+payloads = []
+if pathlib.Path(supervisor_executable_path).name in {"bash", "sh", "dash"}:
+    if len(supervisor_argv) < 2:
+        fail("interpreted supervisor has no script payload")
+    payload_path = pathlib.Path(os.path.realpath(supervisor_argv[1]))
+    if not payload_path.is_absolute() or not payload_path.is_file() or payload_path.is_symlink():
+        fail("interpreted supervisor payload is missing, non-regular, or a symlink")
+    payload_text = payload_path.read_text(encoding="utf-8")
+    if re.search(r"(?:^|[;\s])trap(?:\s|$)", payload_text):
+        fail("interpreted supervisor has a signal/exit trap; TERM quiescence is unreviewed")
+    payloads.append({"path": str(payload_path), "sha256": sha256(payload_path)})
+unit_configuration = subprocess.check_output(["systemctl", "cat", unit])
+unit_hooks = {}
+for hook in ("ExecReload", "ExecStop", "ExecStopPost", "OnFailure", "OnSuccess", "SuccessAction", "FailureAction", "JobTimeoutAction"):
+    unit_hooks[hook] = subprocess.check_output(
+        ["systemctl", "show", unit, f"--property={hook}", "--value"], text=True
+    ).strip()
+if any(value not in {"", "none"} for value in unit_hooks.values()):
+    fail(f"reviewed supervisor has an unsealed lifecycle hook: {unit_hooks}")
+automatic_lifecycle = {
+    prop: subprocess.check_output(
+        ["systemctl", "show", unit, f"--property={prop}", "--value"], text=True
+    ).strip()
+    for prop in (
+        "WatchdogUSec", "RuntimeMaxUSec", "RuntimeRandomizedExtraUSec",
+        "StopWhenUnneeded", "BindsTo", "PartOf", "PropagatesStopTo", "OOMPolicy",
+        "Requires", "Requisite", "Conflicts", "Upholds", "UpheldBy",
+        "TriggeredBy", "RequiredBy", "WantedBy", "BoundBy", "ConflictedBy",
+        "OnFailureOf", "OnSuccessOf",
+        "CanReload", "StopPropagatedFrom", "ReloadPropagatedFrom",
+    )
+}
+if (
+    automatic_lifecycle["WatchdogUSec"] != "0"
+    or automatic_lifecycle["RuntimeMaxUSec"] != "infinity"
+    or automatic_lifecycle["RuntimeRandomizedExtraUSec"] != "0"
+    or automatic_lifecycle["StopWhenUnneeded"] != "no"
+    or automatic_lifecycle["BindsTo"]
+    or automatic_lifecycle["PartOf"]
+    or automatic_lifecycle["PropagatesStopTo"]
+    or set(automatic_lifecycle["Requires"].split()) != {"-.mount", "system.slice", "sysinit.target"}
+    or automatic_lifecycle["Requisite"]
+    or set(automatic_lifecycle["Conflicts"].split()) != {"shutdown.target"}
+    or any(automatic_lifecycle[prop] for prop in (
+        "Upholds", "UpheldBy", "TriggeredBy", "RequiredBy", "BoundBy", "ConflictedBy",
+        "OnFailureOf", "OnSuccessOf", "StopPropagatedFrom", "ReloadPropagatedFrom",
+    ))
+    or automatic_lifecycle["CanReload"] != "no"
+    or automatic_lifecycle["OOMPolicy"] not in {"continue", "stop"}
+):
+    fail(f"reviewed supervisor has an automatic stop/kill source: {automatic_lifecycle}")
+invocation_id = subprocess.check_output(
+    ["systemctl", "show", unit, "--property=InvocationID", "--value"], text=True
+).strip()
+if not re.fullmatch(r"[0-9a-f]{32}", invocation_id):
+    fail("reviewed supervisor InvocationID is malformed")
+control_group = subprocess.check_output(
+    ["systemctl", "show", unit, "--property=ControlGroup", "--value"], text=True
+).strip()
+if not re.fullmatch(r"/[A-Za-z0-9._@/-]+", control_group):
+    fail("reviewed supervisor ControlGroup is malformed")
+supervisor_cgroup_root = pathlib.Path("/sys/fs/cgroup") / control_group.lstrip("/")
+if supervisor_cgroup_root.is_symlink() or not supervisor_cgroup_root.is_dir():
+    fail("reviewed supervisor cgroup directory is unsafe")
+if (writer_supervision_mode == "detached-root-session"
+        and (writer_cgroup_path == control_group
+             or writer_cgroup_path.startswith(control_group.rstrip("/") + "/")
+             or control_group.startswith(writer_cgroup_path.rstrip("/") + "/"))):
+    fail("detached writer and supervisor cgroups are not disjoint")
+sleep_identity = None
+if unit == "arc-self-heal.service":
+    sleep_candidate = shutil.which("sleep")
+    if not sleep_candidate:
+        fail("self-heal supervisor has no reviewed sleep executable")
+    sleep_path = pathlib.Path(os.path.realpath(sleep_candidate))
+    sleep_identity = {"path": str(sleep_path), "sha256": sha256(sleep_path), "argv_policy": "sleep-duration-max-60s-v1", "max_seconds": 60}
+cgroup_procs = pathlib.Path("/sys/fs/cgroup") / control_group.lstrip("/") / "cgroup.procs"
+if not cgroup_procs.is_file():
+    fail("reviewed supervisor cgroup process inventory is unavailable")
+for member_raw in cgroup_procs.read_text(encoding="ascii").splitlines():
+    member = int(member_raw)
+    if member in {unit_main_pid, pid}:
+        continue
+    member_proc = pathlib.Path("/proc") / str(member)
+    try:
+        member_exe = os.readlink(member_proc / "exe")
+        member_argv = [item.decode("utf-8") for item in member_proc.joinpath("cmdline").read_bytes().rstrip(b"\0").split(b"\0")]
+    except (FileNotFoundError, ProcessLookupError, UnicodeDecodeError):
+        fail("supervisor cgroup membership changed during audit")
+    duration_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([smhd]?)", member_argv[1]) if len(member_argv) == 2 else None
+    duration_seconds = None if duration_match is None else float(duration_match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[duration_match.group(2)]
+    if (not sleep_identity or member_exe != sleep_identity["path"]
+            or duration_seconds is None or duration_seconds > sleep_identity["max_seconds"]):
+        fail(f"unreviewed process exists in supervisor cgroup: pid={member}")
+supervisor_context = {
+    "schema": "arc.recovery.supervisor-context.v1",
+    "unit": unit,
+    "unit_configuration_sha256": hashlib.sha256(unit_configuration).hexdigest(),
+    "lifecycle_hooks": unit_hooks,
+    "automatic_lifecycle": automatic_lifecycle,
+    "invocation_id": invocation_id,
+    "control_group": control_group,
+    "interpreter_payloads": payloads,
+    "allowed_transient_sleep": sleep_identity,
+    "term_traps_rejected": True,
+}
+supervisor_context_sha256 = hashlib.sha256(
+    (json.dumps(supervisor_context, sort_keys=True, separators=(",", ":")) + "\n").encode()
+).hexdigest()
+
+# Flush the helper's enablement-link removals again from this independent audit
+# process before sealing the precommit boot projection.
+os.sync()
+allow_marker = pathlib.Path("/etc/arc-recovery/legacy-start-allowed")
+allow_payload = b"schema=arc.recovery.legacy-start-allow.v1\n"
+if (allow_marker.is_symlink() or not allow_marker.is_file()
+        or allow_marker.read_bytes() != allow_payload):
+    fail("prepare allow marker is absent or differs")
+allow_details = allow_marker.lstat()
+if (allow_details.st_uid != 0 or allow_details.st_gid != 0
+        or stat.S_IMODE(allow_details.st_mode) != 0o400
+        or allow_details.st_dev != pathlib.Path("/etc/systemd/system").stat().st_dev):
+    fail("prepare allow marker ownership/mode/filesystem differs")
+start_barrier_bytes = b"[Unit]\nConditionPathExists=/etc/arc-recovery/legacy-start-allowed\n"
+prepare_units = (
+    "arc-self-heal.service", "arc-node.service",
+    "arc-node-update.service", "arc-node-update.timer",
+)
+barriers = {}
+merged_sources = {}
+unit_states = {}
+activation_closure = {}
+closure_properties = (
+    "Names", "Id", "Following",
+    "ActiveState", "SubState", "MainPID", "Job", "ControlGroup", "FreezerState",
+    "Restart", "KillMode", "SendSIGKILL", "OOMPolicy", "WatchdogUSec",
+    "RuntimeMaxUSec", "RuntimeRandomizedExtraUSec", "CanReload",
+    "StopWhenUnneeded", "BindsTo", "PartOf", "PropagatesStopTo",
+    "StopPropagatedFrom", "ReloadPropagatedFrom", "Upholds", "UpheldBy",
+    "TriggeredBy", "RequiredBy", "BoundBy", "ConflictedBy",
+    "WantedBy", "OnFailureOf", "OnSuccessOf",
+)
+for prepare_unit in prepare_units:
+    barrier = pathlib.Path(
+        f"/etc/systemd/system/{prepare_unit}.d/zzzz-arc-recovery-freeze.conf"
+    )
+    details = barrier.lstat()
+    if (barrier.is_symlink() or not stat.S_ISREG(details.st_mode)
+            or barrier.read_bytes() != start_barrier_bytes
+            or details.st_uid != 0 or details.st_gid != 0
+            or details.st_mode & 0o222):
+        fail(f"prepared persistent start barrier differs: {prepare_unit}")
+    barriers[prepare_unit] = {
+        "path": str(barrier), "sha256": sha256(barrier),
+        "mode": stat.S_IMODE(details.st_mode), "uid": details.st_uid, "gid": details.st_gid,
+    }
+    merged = subprocess.check_output(["systemctl", "cat", prepare_unit])
+    headers = re.findall(rb"(?m)^# (/[^\n]+)$", merged)
+    if not headers: fail(f"prepared unit has no merged source manifest: {prepare_unit}")
+    source_rows = []
+    for header in headers:
+        source = pathlib.Path(header.decode("utf-8")); source_details = source.lstat()
+        if source.is_symlink() or not stat.S_ISREG(source_details.st_mode):
+            fail(f"prepared unit source is unsafe: {source}")
+        source_rows.append({"path": str(source), "sha256": sha256(source)})
+    if len({row["path"] for row in source_rows}) != len(source_rows):
+        fail(f"prepared unit source manifest is duplicated: {prepare_unit}")
+    merged_sources[prepare_unit] = source_rows
+    def prepare_prop(name):
+        return subprocess.check_output(
+            ["systemctl", "show", prepare_unit, f"--property={name}", "--value"], text=True,
+        ).strip()
+    enabled_result = subprocess.run(
+        ["systemctl", "is-enabled", prepare_unit], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+    )
+    unit_states[prepare_unit] = {
+        "active_state": prepare_prop("ActiveState"),
+        "sub_state": prepare_prop("SubState"),
+        "main_pid": int(prepare_prop("MainPID")),
+        "job": prepare_prop("Job") or "0",
+        "enablement": enabled_result.stdout.strip(),
+    }
+    activation_closure[prepare_unit] = {
+        name: prepare_prop(name) for name in closure_properties
+    }
+    if (activation_closure[prepare_unit]["Names"] != prepare_unit
+            or activation_closure[prepare_unit]["Id"] != prepare_unit
+            or activation_closure[prepare_unit]["Following"]):
+        fail(f"prepared unit alias closure differs: {prepare_unit}")
+if (unit_states[unit]["active_state"] != "active"
+        or unit_states[unit]["sub_state"] != "running"
+        or unit_states[unit]["main_pid"] != unit_main_pid
+        or unit_states[unit]["job"] != "0"
+        or unit_states[unit]["enablement"] != "enabled"
+        or "multi-user.target" not in activation_closure[unit]["WantedBy"].split()):
+    fail("prepared selected supervisor state differs")
+for prepare_unit in prepare_units:
+    if prepare_unit == unit: continue
+    row = unit_states[prepare_unit]
+    if (row["active_state"] not in {"inactive", "failed"} or row["job"] != "0"
+            or (prepare_unit.endswith(".service") and row["main_pid"] != 0)):
+        fail(f"prepared alternative activation source is not quiescent: {prepare_unit}")
+    for reverse_start in (
+        "RequiredBy", "WantedBy", "BoundBy", "UpheldBy", "TriggeredBy",
+        "OnFailureOf", "OnSuccessOf",
+    ):
+        observed_edge = activation_closure[prepare_unit].get(reverse_start)
+        internal_timer_edge = (
+            prepare_unit == "arc-node-update.service"
+            and reverse_start == "TriggeredBy"
+            and set(observed_edge.split()) == {"arc-node-update.timer"}
+        )
+        if observed_edge and not internal_timer_edge:
+            fail(f"prepared alternative has a reverse activation edge: {prepare_unit} {reverse_start}")
+default_target = subprocess.check_output(["systemctl", "get-default"], text=True).strip()
+if default_target not in {"multi-user.target", "graphical.target"}:
+    fail(f"prepared boot default target is unsupported: {default_target}")
+def target_prop(target, name):
+    return subprocess.check_output(
+        ["systemctl", "show", target, f"--property={name}", "--value"], text=True,
+    ).strip()
+default_projection = {
+    name: target_prop(default_target, name)
+    for name in ("Names", "Id", "Following", "LoadState", "FragmentPath", "Requires", "Wants")
+}
+if (default_projection["Id"] != default_target or default_target not in default_projection["Names"].split()
+        or default_projection["Following"] or default_projection["LoadState"] != "loaded"
+        or (default_target == "graphical.target"
+            and "multi-user.target" not in default_projection["Requires"].split())):
+    fail(f"prepared default target does not durably reach multi-user: {default_projection}")
+default_link = next((candidate for candidate in (
+    pathlib.Path("/etc/systemd/system/default.target"),
+    pathlib.Path("/usr/local/lib/systemd/system/default.target"),
+    pathlib.Path("/usr/lib/systemd/system/default.target"),
+) if candidate.exists() or candidate.is_symlink()), None)
+if default_link is None:
+    fail("prepared default target has no durable unit-file symlink")
+default_details = default_link.lstat()
+default_target_raw = os.readlink(default_link) if default_link.is_symlink() else None
+if (not stat.S_ISLNK(default_details.st_mode) or default_details.st_uid != 0
+        or default_details.st_gid != 0 or pathlib.Path(os.path.realpath(default_link)).name != default_target):
+    fail("prepared default-target symlink identity differs")
+enablement_link = pathlib.Path(f"/etc/systemd/system/multi-user.target.wants/{unit}")
+enablement_details = enablement_link.lstat()
+enablement_target_raw = os.readlink(enablement_link) if enablement_link.is_symlink() else None
+enablement_target = pathlib.Path(os.path.realpath(enablement_link))
+if (not stat.S_ISLNK(enablement_details.st_mode) or enablement_details.st_uid != 0
+        or enablement_details.st_gid != 0 or not enablement_target.is_file()
+        or enablement_target.is_symlink()):
+    fail("prepared selected enablement symlink is not durable and exact")
+boot_activation = {
+    "default_target": default_target,
+    "default_target_projection": default_projection,
+    "default_target_symlink": {
+        "path": str(default_link), "target": default_target_raw,
+        "device": default_details.st_dev, "inode": default_details.st_ino,
+        "uid": default_details.st_uid, "gid": default_details.st_gid,
+    },
+    "selected_enablement_symlink": {
+        "path": str(enablement_link), "target": enablement_target_raw,
+        "device": enablement_details.st_dev, "inode": enablement_details.st_ino,
+        "uid": enablement_details.st_uid, "gid": enablement_details.st_gid,
+        "resolved_path": str(enablement_target), "resolved_sha256": sha256(enablement_target),
+    },
+    "selected_reached_from_multi_user": True,
+    "precommit_reboot_fail_open": True,
+}
+prepare_barrier = {
+    "schema": "arc.recovery.prepare-barrier.v1",
+    "allow_marker": {
+        "path": str(allow_marker), "sha256": hashlib.sha256(allow_payload).hexdigest(),
+        "mode": stat.S_IMODE(allow_details.st_mode), "uid": allow_details.st_uid,
+        "gid": allow_details.st_gid, "device": allow_details.st_dev,
+    },
+    "persistent_start_barriers": barriers,
+    "merged_unit_sources": merged_sources,
+    "unit_states": unit_states,
+    "activation_closure": activation_closure,
+    "boot_activation": boot_activation,
+    "selected_unit": unit,
+    "selected_main_pid": unit_main_pid,
+    "alternatives_inactive_no_jobs": True,
+    "alternative_enablement_sync_completed": True,
+    "writer_cgroup_relationship_sealed": True,
+}
 
 node_info = None
 rpc_origin = None
@@ -445,8 +877,20 @@ print(json.dumps({
     "boot_id": boot_id,
     "writer_pid": pid,
     "writer_start_ticks": start_ticks,
+    "writer_cgroup_sha256": writer_cgroup_sha256,
+    "writer_cgroup_path": writer_cgroup_path,
+    "writer_cgroup_device": writer_cgroup_details.st_dev,
+    "writer_cgroup_inode": writer_cgroup_details.st_ino,
+    "writer_supervision_mode": writer_supervision_mode,
     "supervisor_unit": unit,
     "supervisor_main_pid": unit_main_pid,
+    "supervisor_start_ticks": supervisor_start_ticks,
+    "supervisor_executable_path": supervisor_executable_path,
+    "supervisor_executable_sha256": sha256(f"/proc/{unit_main_pid}/exe"),
+    "supervisor_argv_sha256": hashlib.sha256(supervisor_argv_raw).hexdigest(),
+    "supervisor_context": supervisor_context,
+    "supervisor_context_sha256": supervisor_context_sha256,
+    "prepare_barrier": prepare_barrier,
     "executable_path": exe_path,
     "executable_sha256": sha256(f"/proc/{pid}/exe"),
     "argv_sha256": hashlib.sha256(argv_raw).hexdigest(),
@@ -539,6 +983,79 @@ for name, host in expected:
         raise SystemExit(f"controlled writer {name} lacks safe archive free space")
     if row["available_inodes"] < row["required_free_inodes"]:
         raise SystemExit(f"controlled writer {name} lacks safe archive free inodes")
+    for field in (
+        "writer_pid", "writer_start_ticks", "supervisor_main_pid",
+        "supervisor_start_ticks",
+    ):
+        if isinstance(row.get(field), bool) or not isinstance(row.get(field), int) or row[field] <= 0:
+            raise SystemExit(f"controlled writer {name} has an invalid {field}")
+    for field in (
+        "executable_sha256", "argv_sha256", "writer_cgroup_sha256",
+        "supervisor_executable_sha256",
+        "supervisor_argv_sha256",
+        "supervisor_context_sha256",
+    ):
+        if not isinstance(row.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", row[field]):
+            raise SystemExit(f"controlled writer {name} has an invalid {field}")
+    context = row.get("supervisor_context")
+    if not isinstance(context, dict) or context.get("schema") != "arc.recovery.supervisor-context.v1":
+        raise SystemExit(f"controlled writer {name} has an invalid supervisor context")
+    context_payload = (json.dumps(context, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if hashlib.sha256(context_payload).hexdigest() != row["supervisor_context_sha256"]:
+        raise SystemExit(f"controlled writer {name} supervisor context hash differs")
+    prepare = row.get("prepare_barrier")
+    expected_prepare_units = {
+        "arc-self-heal.service", "arc-node.service",
+        "arc-node-update.service", "arc-node-update.timer",
+    }
+    if (not isinstance(prepare, dict) or prepare.get("schema") != "arc.recovery.prepare-barrier.v1"
+            or prepare.get("selected_unit") != row.get("supervisor_unit")
+            or prepare.get("selected_main_pid") != row.get("supervisor_main_pid")
+            or prepare.get("alternatives_inactive_no_jobs") is not True
+            or prepare.get("alternative_enablement_sync_completed") is not True
+            or prepare.get("writer_cgroup_relationship_sealed") is not True
+            or set(prepare.get("persistent_start_barriers", {})) != expected_prepare_units
+            or set(prepare.get("merged_unit_sources", {})) != expected_prepare_units
+            or set(prepare.get("unit_states", {})) != expected_prepare_units
+            or set(prepare.get("activation_closure", {})) != expected_prepare_units):
+        raise SystemExit(f"controlled writer {name} prepare barrier is incomplete")
+    marker = prepare.get("allow_marker", {})
+    if (marker.get("path") != "/etc/arc-recovery/legacy-start-allowed"
+            or marker.get("sha256") != hashlib.sha256(
+                b"schema=arc.recovery.legacy-start-allow.v1\n"
+            ).hexdigest() or marker.get("mode") != 0o400
+            or marker.get("uid") != 0 or marker.get("gid") != 0):
+        raise SystemExit(f"controlled writer {name} prepare allow marker differs")
+    boot = prepare.get("boot_activation", {})
+    if (boot.get("default_target") not in {"multi-user.target", "graphical.target"}
+            or boot.get("selected_reached_from_multi_user") is not True
+            or boot.get("precommit_reboot_fail_open") is not True
+            or boot.get("selected_enablement_symlink", {}).get("path")
+            != f"/etc/systemd/system/multi-user.target.wants/{row.get('supervisor_unit')}"):
+        raise SystemExit(f"controlled writer {name} boot activation proof differs")
+    for field in ("executable_path", "supervisor_executable_path"):
+        if not isinstance(row.get(field), str) or not row[field].startswith("/"):
+            raise SystemExit(f"controlled writer {name} has an invalid {field}")
+    if row.get("writer_supervision_mode") not in {"systemd-unit", "detached-root-session"}:
+        raise SystemExit(f"controlled writer {name} has an invalid supervision mode")
+    if (not isinstance(row.get("writer_cgroup_path"), str)
+            or not re.fullmatch(r"/[A-Za-z0-9._@/-]+", row["writer_cgroup_path"])
+            or ".." in row["writer_cgroup_path"]
+            or row["writer_cgroup_path"] == "/"
+            or isinstance(row.get("writer_cgroup_device"), bool)
+            or not isinstance(row.get("writer_cgroup_device"), int)
+            or row["writer_cgroup_device"] <= 0
+            or isinstance(row.get("writer_cgroup_inode"), bool)
+            or not isinstance(row.get("writer_cgroup_inode"), int)
+            or row["writer_cgroup_inode"] <= 0):
+        raise SystemExit(f"controlled writer {name} has an invalid cgroup identity")
+    if row["supervisor_main_pid"] == row["writer_pid"] and (
+        row["supervisor_start_ticks"] != row["writer_start_ticks"]
+        or row["supervisor_executable_path"] != row["executable_path"]
+        or row["supervisor_executable_sha256"] != row["executable_sha256"]
+        or row["supervisor_argv_sha256"] != row["argv_sha256"]
+    ):
+        raise SystemExit(f"directly supervised writer {name} has conflicting process identities")
     if (row.get("model_sha256") != "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
             or row.get("model_size_bytes") != 4_081_004_224
             or not isinstance(row.get("model_path"), str)
@@ -566,7 +1083,7 @@ for row in nodes:
             external_observations[(item["address"], item["stake"])] = item
 
 value = {
-    "schema": "arc.recovery.writer-contracts.v1",
+    "schema": "arc.recovery.writer-contracts.v3",
     "created_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "legacy_validator_set_sha256": legacy_sha,
     "legacy_validators": legacy,
@@ -614,11 +1131,18 @@ PY
 
 seal_freeze_plan() {
     local window="" output="" legacy_validators="" writer_contracts=""
+    local drive_remote_root="$DRIVE_REMOTE" drive_client_sha="" drive_account_sha=""
+    local drive_daily_budget="" dedicated_drive_uploader=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --window) [ "$#" -ge 2 ] || die "--window needs a value"; window="$2"; shift 2 ;;
             --legacy-validator-set) [ "$#" -ge 2 ] || die "--legacy-validator-set needs a value"; legacy_validators="$2"; shift 2 ;;
             --writer-contracts) [ "$#" -ge 2 ] || die "--writer-contracts needs a value"; writer_contracts="$2"; shift 2 ;;
+            --drive-remote-root) [ "$#" -ge 2 ] || die "--drive-remote-root needs a value"; drive_remote_root="$2"; shift 2 ;;
+            --drive-client-id-sha256) [ "$#" -ge 2 ] || die "--drive-client-id-sha256 needs a value"; drive_client_sha="$2"; shift 2 ;;
+            --drive-account-sha256) [ "$#" -ge 2 ] || die "--drive-account-sha256 needs a value"; drive_account_sha="$2"; shift 2 ;;
+            --drive-daily-upload-budget-bytes) [ "$#" -ge 2 ] || die "--drive-daily-upload-budget-bytes needs a value"; drive_daily_budget="$2"; shift 2 ;;
+            --attest-dedicated-drive-uploader) dedicated_drive_uploader=true; shift ;;
             --output) [ "$#" -ge 2 ] || die "--output needs a value"; output="$2"; shift 2 ;;
             -h|--help) usage; return 0 ;;
             *) die "unknown seal-freeze-plan option: $1" ;;
@@ -630,22 +1154,37 @@ seal_freeze_plan() {
     require_absolute_file "$legacy_validators" "legacy validator set"
     require_absolute_file "$writer_contracts" "writer contracts"
     require_absolute_file "${writer_contracts}.sha256" "writer-contract checksum"
+    validate_drive_remote "$drive_remote_root"
+    [ "${drive_remote_root%%:*}" != arc-drive ] || die "legacy arc-drive remote cannot authorize a production freeze"
+    require_hash "$drive_client_sha" "Drive OAuth client-id hash"
+    require_hash "$drive_account_sha" "Drive account hash"
+    require_uint "$drive_daily_budget" "Drive daily upload budget"
+    [ "$drive_daily_budget" -le $((700 * 1024 * 1024 * 1024)) ] || \
+        die "Drive operational upload budget exceeds the reviewed 700 GiB ceiling"
+    [ "$dedicated_drive_uploader" = true ] || \
+        die "freeze sealing requires --attest-dedicated-drive-uploader"
     require_commands python3 git
     require_absolute_file "$ORCHESTRATOR" "archive orchestrator"
     require_absolute_file "$REMOTE_HELPER" "remote archive helper"
     require_absolute_file "$ROLLOUT_TOOL" "rollout verifier"
     require_absolute_file "$ROLLOUT_SCHEMA" "rollout schema"
-    local helper_sha orchestrator_sha rollout_tool_sha schema_sha source_commit legacy_sha contracts_sha
+    require_absolute_file "$DRIVE_PREFREEZE_GATE" "Drive prefreeze gate"
+    local helper_sha orchestrator_sha rollout_tool_sha schema_sha drive_gate_sha
+    local source_commit legacy_sha contracts_sha drive_root_sha
     helper_sha="$(tracked_source_hash "$REMOTE_HELPER")"
     orchestrator_sha="$(tracked_source_hash "$ORCHESTRATOR")"
     rollout_tool_sha="$(tracked_source_hash "$ROLLOUT_TOOL")"
     schema_sha="$(tracked_source_hash "$ROLLOUT_SCHEMA")"
+    drive_gate_sha="$(tracked_source_hash "$DRIVE_PREFREEZE_GATE")"
     source_commit="$(current_source_commit)"
     legacy_sha="$(hash_file "$legacy_validators")"
     contracts_sha="$(hash_file "$writer_contracts")"
+    drive_root_sha="$(printf '%s' "$drive_remote_root" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
     python3 - "$output" "$window" "$helper_sha" "$orchestrator_sha" \
-        "$rollout_tool_sha" "$schema_sha" "$source_commit" "$legacy_validators" \
-        "$legacy_sha" "$writer_contracts" "$contracts_sha" "${NODES[@]}" <<'PY'
+        "$rollout_tool_sha" "$schema_sha" "$drive_gate_sha" "$source_commit" \
+        "$legacy_validators" "$legacy_sha" "$writer_contracts" "$contracts_sha" \
+        "$drive_remote_root" "$drive_root_sha" "$drive_client_sha" "$drive_account_sha" \
+        "$drive_daily_budget" "${NODES[@]}" <<'PY'
 import datetime
 import hashlib
 import json
@@ -656,9 +1195,10 @@ import sys
 
 output = pathlib.Path(sys.argv[1])
 (window, helper_sha, orchestrator_sha, rollout_tool_sha, schema_sha,
- source_commit, legacy_path_raw, legacy_sha, contracts_path_raw,
- contracts_sha) = sys.argv[2:12]
-expected_nodes = [entry.split("=", 1) for entry in sys.argv[12:]]
+ drive_gate_sha, source_commit, legacy_path_raw, legacy_sha, contracts_path_raw,
+ contracts_sha, drive_remote_root, drive_root_sha, drive_client_sha,
+ drive_account_sha, drive_daily_budget_raw) = sys.argv[2:18]
+expected_nodes = [entry.split("=", 1) for entry in sys.argv[18:]]
 legacy_path = pathlib.Path(legacy_path_raw)
 contracts_path = pathlib.Path(contracts_path_raw)
 
@@ -682,7 +1222,7 @@ def verify_locked(path, expected_sha):
     return value
 
 contracts = verify_locked(contracts_path, contracts_sha)
-if contracts.get("schema") != "arc.recovery.writer-contracts.v1":
+if contracts.get("schema") != "arc.recovery.writer-contracts.v3":
     raise SystemExit("writer contract schema is unsupported")
 if contracts.get("legacy_validator_set_sha256") != legacy_sha:
     raise SystemExit("writer contract legacy-set hash differs")
@@ -698,7 +1238,7 @@ if (contracts.get("source_total_stake") != 40_000_000
         or contracts.get("global_legacy_halt_claimed") is not False):
     raise SystemExit("writer contract does not prove controlled sealed-source quorum removal")
 plan = {
-    "schema": "arc.recovery.freeze-plan.v2",
+    "schema": "arc.recovery.freeze-plan.v5",
     "window": window,
     "created_at": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "sentinels": ["nyc", "lax"],
@@ -710,6 +1250,15 @@ plan = {
     "source_commit": source_commit,
     "legacy_validator_set_sha256": legacy_sha,
     "writer_contracts_sha256": contracts_sha,
+    "drive_prefreeze": {
+        "gate_sha256": drive_gate_sha,
+        "remote_root": drive_remote_root,
+        "remote_root_sha256": drive_root_sha,
+        "oauth_client_id_sha256": drive_client_sha,
+        "account_sha256": drive_account_sha,
+        "daily_upload_budget_bytes": int(drive_daily_budget_raw),
+        "dedicated_no_other_upload_writers_attested": True,
+    },
     "quorum_proof": {
         "source_total_stake": contracts["source_total_stake"],
         "source_quorum_stake": contracts["source_quorum_stake"],
@@ -771,14 +1320,16 @@ freeze_plan_hash() {
     require_absolute_file "$REMOTE_HELPER" "remote archive helper"
     require_absolute_file "$ROLLOUT_TOOL" "rollout verifier"
     require_absolute_file "$ROLLOUT_SCHEMA" "rollout schema"
-    local helper_sha orchestrator_sha rollout_tool_sha schema_sha source_commit
+    require_absolute_file "$DRIVE_PREFREEZE_GATE" "Drive prefreeze gate"
+    local helper_sha orchestrator_sha rollout_tool_sha schema_sha drive_gate_sha source_commit
     helper_sha="$(tracked_source_hash "$REMOTE_HELPER")"
     orchestrator_sha="$(tracked_source_hash "$ORCHESTRATOR")"
     rollout_tool_sha="$(tracked_source_hash "$ROLLOUT_TOOL")"
     schema_sha="$(tracked_source_hash "$ROLLOUT_SCHEMA")"
+    drive_gate_sha="$(tracked_source_hash "$DRIVE_PREFREEZE_GATE")"
     source_commit="$(current_source_commit)"
     python3 - "$plan" "$helper_sha" "$orchestrator_sha" "$rollout_tool_sha" \
-        "$schema_sha" "$source_commit" "${NODES[@]}" <<'PY'
+        "$schema_sha" "$drive_gate_sha" "$source_commit" "${NODES[@]}" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -792,9 +1343,9 @@ for candidate in (path, sidecar):
     details = candidate.lstat()
     if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode) or details.st_mode & 0o222:
         raise SystemExit(f"sealed freeze plan input is mutable or not regular: {candidate}")
-helper_sha, orchestrator_sha, rollout_tool_sha, schema_sha, source_commit = sys.argv[2:7]
+helper_sha, orchestrator_sha, rollout_tool_sha, schema_sha, drive_gate_sha, source_commit = sys.argv[2:8]
 expected_nodes = []
-for entry in sys.argv[7:]:
+for entry in sys.argv[8:]:
     name, host = entry.split("=", 1)
     expected_nodes.append({"name": name, "host": host})
 value = json.loads(path.read_text(encoding="utf-8"))
@@ -802,10 +1353,10 @@ if set(value) != {
     "schema", "window", "created_at", "sentinels", "nodes",
     "remote_helper_sha256", "orchestrator_sha256", "rollout_tool_sha256",
     "rollout_schema_sha256", "source_commit", "legacy_validator_set_sha256",
-    "writer_contracts_sha256", "quorum_proof",
+    "writer_contracts_sha256", "drive_prefreeze", "quorum_proof",
 }:
     raise SystemExit("freeze plan has missing or unknown fields")
-if value["schema"] != "arc.recovery.freeze-plan.v2":
+if value["schema"] != "arc.recovery.freeze-plan.v5":
     raise SystemExit("unsupported freeze plan schema")
 if not isinstance(value["window"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}", value["window"]):
     raise SystemExit("freeze plan window is invalid")
@@ -827,8 +1378,85 @@ expected_shards = {
     "sgp": [[17, 22], [22, 27], [27, 32]],
 }
 for row in nodes:
-    if row.get("supervisor_main_pid") != row.get("writer_pid"):
-        raise SystemExit(f"freeze plan supervisor MainPID is not the exact writer for {row['name']}")
+    for field in (
+        "writer_pid", "writer_start_ticks", "supervisor_main_pid",
+        "supervisor_start_ticks",
+    ):
+        if isinstance(row.get(field), bool) or not isinstance(row.get(field), int) or row[field] <= 0:
+            raise SystemExit(f"freeze plan {field} is invalid for {row['name']}")
+    for field in (
+        "executable_sha256", "argv_sha256", "writer_cgroup_sha256",
+        "supervisor_executable_sha256",
+        "supervisor_argv_sha256",
+        "supervisor_context_sha256",
+    ):
+        if not isinstance(row.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", row[field]):
+            raise SystemExit(f"freeze plan {field} is invalid for {row['name']}")
+    context = row.get("supervisor_context")
+    if not isinstance(context, dict) or context.get("schema") != "arc.recovery.supervisor-context.v1":
+        raise SystemExit(f"freeze plan supervisor context is invalid for {row['name']}")
+    context_payload = (json.dumps(context, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if hashlib.sha256(context_payload).hexdigest() != row["supervisor_context_sha256"]:
+        raise SystemExit(f"freeze plan supervisor context hash differs for {row['name']}")
+    prepare = row.get("prepare_barrier")
+    expected_prepare_units = {
+        "arc-self-heal.service", "arc-node.service",
+        "arc-node-update.service", "arc-node-update.timer",
+    }
+    if (not isinstance(prepare, dict) or prepare.get("schema") != "arc.recovery.prepare-barrier.v1"
+            or prepare.get("selected_unit") != row.get("supervisor_unit")
+            or prepare.get("selected_main_pid") != row.get("supervisor_main_pid")
+            or prepare.get("alternatives_inactive_no_jobs") is not True
+            or prepare.get("alternative_enablement_sync_completed") is not True
+            or prepare.get("writer_cgroup_relationship_sealed") is not True
+            or set(prepare.get("persistent_start_barriers", {})) != expected_prepare_units
+            or set(prepare.get("merged_unit_sources", {})) != expected_prepare_units
+            or set(prepare.get("unit_states", {})) != expected_prepare_units
+            or set(prepare.get("activation_closure", {})) != expected_prepare_units):
+        raise SystemExit(f"freeze plan prepare barrier differs for {row['name']}")
+    boot = prepare.get("boot_activation", {})
+    if (boot.get("default_target") not in {"multi-user.target", "graphical.target"}
+            or boot.get("selected_reached_from_multi_user") is not True
+            or boot.get("precommit_reboot_fail_open") is not True
+            or boot.get("selected_enablement_symlink", {}).get("path")
+            != f"/etc/systemd/system/multi-user.target.wants/{row.get('supervisor_unit')}"):
+        raise SystemExit(f"freeze plan boot activation differs for {row['name']}")
+    for field in ("executable_path", "supervisor_executable_path", "data_dir", "model_path"):
+        if not isinstance(row.get(field), str) or not re.fullmatch(r"/[A-Za-z0-9._/@%+=,-]+", row[field]) or ".." in row[field]:
+            raise SystemExit(f"freeze plan {field} is invalid for {row['name']}")
+    if row.get("writer_supervision_mode") not in {"systemd-unit", "detached-root-session"}:
+        raise SystemExit(f"freeze plan supervision mode is invalid for {row['name']}")
+    if (not isinstance(row.get("writer_cgroup_path"), str)
+            or not re.fullmatch(r"/[A-Za-z0-9._@/-]+", row["writer_cgroup_path"])
+            or ".." in row["writer_cgroup_path"]
+            or row["writer_cgroup_path"] == "/"
+            or isinstance(row.get("writer_cgroup_device"), bool)
+            or not isinstance(row.get("writer_cgroup_device"), int)
+            or row["writer_cgroup_device"] <= 0
+            or isinstance(row.get("writer_cgroup_inode"), bool)
+            or not isinstance(row.get("writer_cgroup_inode"), int)
+            or row["writer_cgroup_inode"] <= 0):
+        raise SystemExit(f"freeze plan cgroup identity is invalid for {row['name']}")
+    if row.get("supervisor_unit") not in {"arc-node.service", "arc-self-heal.service"}:
+        raise SystemExit(f"freeze plan supervisor unit is invalid for {row['name']}")
+    if not isinstance(row.get("boot_id"), str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", row["boot_id"]):
+        raise SystemExit(f"freeze plan boot ID is invalid for {row['name']}")
+    if not isinstance(row.get("validator_address"), str) or not re.fullmatch(r"[0-9a-f]{64}", row["validator_address"]):
+        raise SystemExit(f"freeze plan validator address is invalid for {row['name']}")
+    if isinstance(row.get("stake"), bool) or not isinstance(row.get("stake"), int) or row["stake"] <= 0:
+        raise SystemExit(f"freeze plan stake is invalid for {row['name']}")
+    if row["supervisor_main_pid"] == row["writer_pid"] and (
+        row["supervisor_start_ticks"] != row["writer_start_ticks"]
+        or row["supervisor_executable_path"] != row["executable_path"]
+        or row["supervisor_executable_sha256"] != row["executable_sha256"]
+        or row["supervisor_argv_sha256"] != row["argv_sha256"]
+    ):
+        raise SystemExit(f"freeze plan direct supervisor identity conflicts for {row['name']}")
+    if row.get("supervisor_unit") == "arc-node.service" and (
+        row.get("writer_supervision_mode") != "systemd-unit"
+        or row["supervisor_main_pid"] != row["writer_pid"]
+    ):
+        raise SystemExit(f"freeze plan direct arc-node service relationship differs for {row['name']}")
     if (row.get("model_sha256") != "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
             or row.get("model_size_bytes") != 4_081_004_224
             or not isinstance(row.get("model_path"), str)
@@ -843,6 +1471,35 @@ if value["rollout_tool_sha256"] != rollout_tool_sha:
     raise SystemExit("rollout verifier bytes differ from the sealed freeze plan")
 if value["rollout_schema_sha256"] != schema_sha:
     raise SystemExit("rollout schema bytes differ from the sealed freeze plan")
+drive = value["drive_prefreeze"]
+if not isinstance(drive, dict) or set(drive) != {
+    "gate_sha256", "remote_root", "remote_root_sha256", "oauth_client_id_sha256",
+    "account_sha256", "daily_upload_budget_bytes",
+    "dedicated_no_other_upload_writers_attested",
+}:
+    raise SystemExit("freeze plan Drive prefreeze binding fields differ")
+if drive.get("gate_sha256") != drive_gate_sha:
+    raise SystemExit("Drive prefreeze gate bytes differ from the sealed freeze plan")
+for field in ("remote_root_sha256", "oauth_client_id_sha256", "account_sha256"):
+    if not isinstance(drive.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", drive[field]):
+        raise SystemExit(f"freeze plan Drive {field} is malformed")
+remote_root = drive.get("remote_root")
+if not isinstance(remote_root, str) or remote_root.startswith("arc-drive:") or ":" not in remote_root:
+    raise SystemExit("freeze plan uses an unsafe or legacy Drive remote")
+if hashlib.sha256(remote_root.encode("utf-8")).hexdigest() != drive["remote_root_sha256"]:
+    raise SystemExit("freeze plan Drive remote root hash differs")
+budget = drive.get("daily_upload_budget_bytes")
+if isinstance(budget, bool) or not isinstance(budget, int) or not 0 < budget <= 700 * 1024**3:
+    raise SystemExit("freeze plan Drive upload budget is outside the reviewed ceiling")
+if drive.get("dedicated_no_other_upload_writers_attested") is not True:
+    raise SystemExit("freeze plan lacks the dedicated ARC Drive uploader attestation")
+source_sizes = [row.get("data_bytes") for row in nodes]
+if any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in source_sizes):
+    raise SystemExit("freeze plan source byte reservations are malformed")
+if 3 * sum(source_sizes) + 32 * 1024**3 > budget:
+    raise SystemExit("freeze plan archive reservation exceeds the reviewed Drive budget")
+if 3 * max(source_sizes) + 4 * 1024**3 > 5_000_000_000_000:
+    raise SystemExit("freeze plan largest object reservation exceeds Google Drive's limit")
 if value["source_commit"] != source_commit:
     raise SystemExit("source commit differs from the sealed freeze plan")
 hash_re = re.compile(r"[0-9a-f]{64}")
@@ -876,6 +1533,7 @@ PY
 
 REMOTE_HELPER_PATH=""
 REMOTE_HELPER_SHA=""
+REMOTE_FREEZE_PLAN_PATH=""
 
 install_helpers() {
     local expected_sha="$1" node host remote_temporary
@@ -894,6 +1552,89 @@ install_helpers() {
             'set -eu; temporary=$1 target=$2 expected=$3; trap '\''rm -f -- "$temporary"'\'' EXIT; test -f "$temporary" && test ! -L "$temporary"; actual=$(sha256sum "$temporary" | cut -d" " -f1); test "$actual" = "$expected"; parent=${target%/*}; grand=${parent%/*}; if test -e "$grand"; then test -d "$grand" && test ! -L "$grand"; else mkdir -m 700 -- "$grand"; fi; if test -e "$parent"; then test -d "$parent" && test ! -L "$parent"; else mkdir -m 700 -- "$parent"; fi; chmod 500 -- "$temporary"; if ln -- "$temporary" "$target" 2>/dev/null; then :; else test -f "$target" && test ! -L "$target" && test "$(sha256sum "$target" | cut -d" " -f1)" = "$expected"; fi; chmod 500 -- "$target"; test "$(sha256sum "$target" | cut -d" " -f1)" = "$expected"' \
             sh "$remote_temporary" "$REMOTE_HELPER_PATH" "$REMOTE_HELPER_SHA"
     done
+}
+
+install_freeze_plan() {
+    local plan="$1" expected_sha="$2" node host remote_temporary
+    require_absolute_file "$plan" "pinned freeze plan"
+    require_hash "$expected_sha" "pinned freeze plan hash"
+    [ "$(hash_file "$plan")" = "$expected_sha" ] || die "pinned freeze plan bytes changed before remote staging"
+    REMOTE_FREEZE_PLAN_PATH="/root/.arc-recovery-plans/$expected_sha/freeze.lock.json"
+    for node in nyc lax ams lhr nrt sgp; do
+        host="$(host_for "$node")"
+        remote_temporary="$(ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" -- sh -c \
+            'umask 077; root=/root/.arc-recovery-plan-uploads; if test -e "$root"; then test -d "$root" && test ! -L "$root"; else mkdir -m 700 -- "$root"; fi; mktemp "$root/upload.XXXXXX"' sh)"
+        case "$remote_temporary" in /root/.arc-recovery-plan-uploads/upload.*) ;; *) die "unsafe remote freeze-plan temporary path" ;; esac
+        scp -q "${SSH_OPTIONS[@]}" "$plan" "$SSH_USER@$host:$remote_temporary"
+        ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" -- sh -c \
+            'set -eu; temporary=$1 target=$2 expected=$3; trap '\''rm -f -- "$temporary"'\'' EXIT; test -f "$temporary" && test ! -L "$temporary"; test "$(sha256sum "$temporary" | cut -d" " -f1)" = "$expected"; parent=${target%/*}; grand=${parent%/*}; top=${grand%/*}; for directory in "$top" "$grand" "$parent"; do if test -e "$directory"; then test -d "$directory" && test ! -L "$directory"; else mkdir -m 700 -- "$directory"; fi; done; chmod 400 -- "$temporary"; if ln -- "$temporary" "$target" 2>/dev/null; then :; else test -f "$target" && test ! -L "$target" && test "$(sha256sum "$target" | cut -d" " -f1)" = "$expected" && test ! -w "$target"; fi; sidecar="$target.sha256"; expected_line="$expected  ${target##*/}"; if test -e "$sidecar"; then test -f "$sidecar" && test ! -L "$sidecar" && test "$(cat "$sidecar")" = "$expected_line" && test ! -w "$sidecar"; else side_tmp="$sidecar.partial.$$"; (umask 077; printf "%s\n" "$expected_line" > "$side_tmp"); chmod 400 "$side_tmp"; ln "$side_tmp" "$sidecar"; rm -f "$side_tmp"; fi; python3 - "$target" "$sidecar" <<'\''PY'\''
+import os, pathlib, stat, sys
+for raw in sys.argv[1:]:
+    path = pathlib.Path(raw); details = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(details.st_mode) or details.st_mode & 0o222 or details.st_uid != 0 or details.st_gid != 0:
+        raise SystemExit("pinned freeze-plan artifact is unsafe")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
+for path in {pathlib.Path(sys.argv[1]).parent, pathlib.Path(sys.argv[1]).parent.parent, pathlib.Path(sys.argv[1]).parent.parent.parent}:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
+PY' \
+            sh "$remote_temporary" "$REMOTE_FREEZE_PLAN_PATH" "$expected_sha"
+    done
+}
+
+prepare_writers() {
+    local legacy_validators="" output="" execute=false
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --legacy-validator-set) [ "$#" -ge 2 ] || die "--legacy-validator-set needs a value"; legacy_validators="$2"; shift 2 ;;
+            --output) [ "$#" -ge 2 ] || die "--output needs a value"; output="$2"; shift 2 ;;
+            --plan) execute=false; shift ;;
+            --execute) execute=true; shift ;;
+            -h|--help) usage; return 0 ;;
+            *) die "unknown prepare-writers option: $1" ;;
+        esac
+    done
+    require_absolute_file "$legacy_validators" "legacy validator set"
+    case "$output" in /*.json) ;; *) die "--output must be an absolute .json path" ;; esac
+    [ "$SSH_USER" = root ] || die "writer preparation requires the sealed root SSH user"
+    require_commands git ssh scp python3
+    local orchestrator_sha helper_sha expected_go
+    orchestrator_sha="$(tracked_source_hash "$ORCHESTRATOR")"
+    helper_sha="$(tracked_source_hash "$REMOTE_HELPER")"
+    expected_go="STAGE-BARRIERS $orchestrator_sha HELPER $helper_sha"
+    printf 'archive fleet: PREPARE-WRITERS authorization=%s\n' "$expected_go"
+    printf 'archive fleet: preparation stages only fail-open persistent start barriers, stops/disables process-free alternatives, and seals either a systemd-owned writer or an exact detached root-session writer relationship; the shared allow marker remains present and no writer is stopped\n'
+    if [ "$execute" != true ]; then
+        printf 'archive fleet: PLAN ONLY; no host file, unit, cgroup, or local audit was changed\n'
+        return 0
+    fi
+    [ "${ARC_RECOVERY_PREPARE_GO:-}" = "$expected_go" ] || \
+        die "execution requires ARC_RECOVERY_PREPARE_GO='$expected_go'"
+    install_helpers "$helper_sha"
+    local log_root node failed=0 pid index
+    local pids=() names=()
+    log_root="$(mktemp -d)"
+    ARCHIVE_FLEET_TEMP_ROOT="$log_root"
+    trap cleanup_temporary_root EXIT
+    for node in nyc lax ams lhr nrt sgp; do
+        run_remote "$node" stage-recovery-barrier "$node" > "$log_root/$node.log" 2>&1 &
+        pids+=("$!"); names+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        if wait "${pids[$index]}"; then
+            sed -n '1,40p' "$log_root/${names[$index]}.log"
+        else
+            printf 'archive fleet: writer preparation failed: %s\n' "${names[$index]}" >&2
+            sed -n '1,120p' "$log_root/${names[$index]}.log" >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] || \
+        die "preparation is safely resumable while each present allow marker keeps its staged start barrier fail-open"
+    audit_writers --legacy-validator-set "$legacy_validators" --output "$output"
 }
 
 run_remote() {
@@ -936,8 +1677,15 @@ run_stopped_status_exact() {
         "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
         "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+        "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)" \
         "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)" \
         "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
         "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
@@ -952,8 +1700,15 @@ run_sealed_source_status_exact() {
         "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
         "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+        "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)" \
         "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)" \
         "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
         "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
@@ -962,15 +1717,25 @@ run_sealed_source_status_exact() {
 
 remote_readiness() {
     local capture_id="$1" freeze_sha="$2" freeze_plan="$3"
-    local node host pid start_ticks boot_id unit unit_main_pid exe_sha argv_sha data_dir
+    local node host pid start_ticks boot_id writer_cgroup_sha writer_supervision_mode
+    local unit unit_main_pid supervisor_start_ticks
+    local supervisor_executable_path supervisor_executable_sha supervisor_argv_sha
+    local executable_path exe_sha argv_sha data_dir
     local model_path model_sha model_size
     for node in nyc lax ams lhr nrt sgp; do
         host="$(host_for "$node")"
         pid="$(freeze_node_field "$freeze_plan" "$node" writer_pid)"
         start_ticks="$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)"
         boot_id="$(freeze_node_field "$freeze_plan" "$node" boot_id)"
+        writer_cgroup_sha="$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)"
+        writer_supervision_mode="$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)"
         unit="$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)"
         unit_main_pid="$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)"
+        supervisor_start_ticks="$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)"
+        supervisor_executable_path="$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)"
+        supervisor_executable_sha="$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)"
+        supervisor_argv_sha="$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)"
+        executable_path="$(freeze_node_field "$freeze_plan" "$node" executable_path)"
         exe_sha="$(freeze_node_field "$freeze_plan" "$node" executable_sha256)"
         argv_sha="$(freeze_node_field "$freeze_plan" "$node" argv_sha256)"
         data_dir="$(freeze_node_field "$freeze_plan" "$node" data_dir)"
@@ -978,9 +1743,12 @@ remote_readiness() {
         model_sha="$(freeze_node_field "$freeze_plan" "$node" model_sha256)"
         model_size="$(freeze_node_field "$freeze_plan" "$node" model_size_bytes)"
         if ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" -- sh -c \
-            'set -eu; capture=$1 pid=$2 start=$3 boot=$4 unit=$5 main=$6 exe_sha=$7 argv_sha=$8 data=$9 model=${10} model_sha=${11} model_size=${12}; test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"; test -d "/proc/$pid"; test "$(awk '\''{print $22}'\'' "/proc/$pid/stat")" = "$start"; test "$(cat "/proc/$pid/comm")" = arc-node; test "$(pgrep -x arc-node)" = "$pid"; test "$(systemctl show "$unit" --property=MainPID --value)" = "$main"; test "$(sha256sum "/proc/$pid/exe" | cut -d" " -f1)" = "$exe_sha"; test "$(sha256sum "/proc/$pid/cmdline" | cut -d" " -f1)" = "$argv_sha"; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; command -v curl >/dev/null; command -v python3 >/dev/null; command -v sha256sum >/dev/null; command -v zstd >/dev/null; command -v tar >/dev/null; command -v systemctl >/dev/null; test ! -e /root/arc-recovery-captures || { test -d /root/arc-recovery-captures && test ! -L /root/arc-recovery-captures; }; { test ! -e "$capture" || { test -d "$capture" && test ! -L "$capture"; }; }; bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal_bytes=$(stat -c %s "$data/state.wal"); snapshot_bytes=0; for snapshot in "$data/state.snapshot.lz4" "$data.snapshot.lz4"; do if test -f "$snapshot" && test ! -L "$snapshot"; then snapshot_bytes=$((snapshot_bytes + $(stat -c %s "$snapshot"))); fi; done; binding_bytes=$((wal_bytes + snapshot_bytes)); test "$binding_bytes" -ge "$bytes" || binding_bytes=$bytes; binding_bytes=$((binding_bytes + 2147483648)); required_bytes=$((bytes + binding_bytes)); required_inodes=$((files + 10000)); free_bytes=$(df -PB1 /root | awk '\''NR==2 {print $4}'\''); free_inodes=$(df -Pi /root | awk '\''NR==2 {print $4}'\''); test "$free_bytes" -ge "$required_bytes" || { printf "insufficient recovery bytes including v3 headroom: need=%s free=%s\n" "$required_bytes" "$free_bytes" >&2; exit 1; }; test "$free_inodes" -ge "$required_inodes" || { printf "insufficient recovery inodes including v3 headroom: need=%s free=%s\n" "$required_inodes" "$free_inodes" >&2; exit 1; }' \
+            'set -eu; capture=$1 pid=$2 start=$3 boot=$4 writer_cgroup_sha=$5 writer_mode=$6 unit=$7 main=$8 supervisor_start=$9 supervisor_executable=${10} supervisor_exe_sha=${11} supervisor_argv_sha=${12} executable=${13} exe_sha=${14} argv_sha=${15} data=${16} model=${17} model_sha=${18} model_size=${19}; test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"; test -d "/proc/$pid"; test "$(awk '\''{print $22}'\'' "/proc/$pid/stat")" = "$start"; test "$(cat "/proc/$pid/comm")" = arc-node; test "$(pgrep -x arc-node)" = "$pid"; test "$(sha256sum "/proc/$pid/cgroup" | cut -d" " -f1)" = "$writer_cgroup_sha"; case "$writer_mode" in systemd-unit) grep -Fq "$unit" "/proc/$pid/cgroup";; detached-root-session) ! grep -Fq "$unit" "/proc/$pid/cgroup" && test "$(awk '\''{print $4}'\'' "/proc/$pid/stat")" = 1;; *) exit 1;; esac; test "$(systemctl show "$unit" --property=MainPID --value)" = "$main"; test -d "/proc/$main"; test "$(awk '\''{print $22}'\'' "/proc/$main/stat")" = "$supervisor_start"; test "$(readlink "/proc/$main/exe")" = "$supervisor_executable"; test "$(sha256sum "/proc/$main/exe" | cut -d" " -f1)" = "$supervisor_exe_sha"; test "$(sha256sum "/proc/$main/cmdline" | cut -d" " -f1)" = "$supervisor_argv_sha"; grep -Fq "$unit" "/proc/$main/cgroup"; test "$(readlink "/proc/$pid/exe")" = "$executable"; test "$(sha256sum "/proc/$pid/exe" | cut -d" " -f1)" = "$exe_sha"; test "$(sha256sum "/proc/$pid/cmdline" | cut -d" " -f1)" = "$argv_sha"; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; command -v curl >/dev/null; command -v python3 >/dev/null; command -v sha256sum >/dev/null; command -v zstd >/dev/null; command -v tar >/dev/null; command -v systemctl >/dev/null; test ! -e /root/arc-recovery-captures || { test -d /root/arc-recovery-captures && test ! -L /root/arc-recovery-captures; }; { test ! -e "$capture" || { test -d "$capture" && test ! -L "$capture"; }; }; bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal_bytes=$(stat -c %s "$data/state.wal"); snapshot_bytes=0; for snapshot in "$data/state.snapshot.lz4" "$data.snapshot.lz4"; do if test -f "$snapshot" && test ! -L "$snapshot"; then snapshot_bytes=$((snapshot_bytes + $(stat -c %s "$snapshot"))); fi; done; binding_bytes=$((wal_bytes + snapshot_bytes)); test "$binding_bytes" -ge "$bytes" || binding_bytes=$bytes; binding_bytes=$((binding_bytes + 2147483648)); required_bytes=$((bytes + binding_bytes)); required_inodes=$((files + 10000)); free_bytes=$(df -PB1 /root | awk '\''NR==2 {print $4}'\''); free_inodes=$(df -Pi /root | awk '\''NR==2 {print $4}'\''); test "$free_bytes" -ge "$required_bytes" || { printf "insufficient recovery bytes including v3 headroom: need=%s free=%s\n" "$required_bytes" "$free_bytes" >&2; exit 1; }; test "$free_inodes" -ge "$required_inodes" || { printf "insufficient recovery inodes including v3 headroom: need=%s free=%s\n" "$required_inodes" "$free_inodes" >&2; exit 1; }' \
             sh "/root/arc-recovery-captures/$capture_id/$node" "$pid" "$start_ticks" \
-            "$boot_id" "$unit" "$unit_main_pid" "$exe_sha" "$argv_sha" "$data_dir" \
+            "$boot_id" "$writer_cgroup_sha" "$writer_supervision_mode" \
+            "$unit" "$unit_main_pid" "$supervisor_start_ticks" \
+            "$supervisor_executable_path" "$supervisor_executable_sha" "$supervisor_argv_sha" \
+            "$executable_path" "$exe_sha" "$argv_sha" "$data_dir" \
             "$model_path" "$model_sha" "$model_size" >/dev/null 2>&1; then
             printf '  exact live writer/disk ready: %s %s pid=%s data=%s\n' "$node" "$host" "$pid" "$data_dir"
             continue
@@ -1005,19 +1773,83 @@ ensure_stopped() {
         run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
         return 0
     fi
+    assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
     run_remote "$node" fence-stop "$capture_id" "$node" "$freeze_sha" \
         "$(freeze_node_field "$freeze_plan" "$node" validator_address)" \
         "$(freeze_node_field "$freeze_plan" "$node" stake)" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
         "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+        "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)" \
         "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)" \
         "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)" \
+        "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
         "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
         "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
     run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
+}
+
+run_drive_prefreeze_gate() {
+    local mode="$1" freeze_plan="$2" freeze_sha="$3" capture_id="$4"
+    assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
+    local receipt
+    receipt="$("$DRIVE_PREFREEZE_GATE" "$mode" \
+        --freeze-plan "$freeze_plan" \
+        --expected-freeze-plan-sha256 "$freeze_sha" \
+        --capture-id "$capture_id" \
+        --remote-root "$(manifest_field "$freeze_plan" drive_prefreeze.remote_root)" \
+        --expected-root-sha256 "$(manifest_field "$freeze_plan" drive_prefreeze.remote_root_sha256)" \
+        --expected-client-id-sha256 "$(manifest_field "$freeze_plan" drive_prefreeze.oauth_client_id_sha256)" \
+        --expected-account-sha256 "$(manifest_field "$freeze_plan" drive_prefreeze.account_sha256)" \
+        --daily-upload-budget-bytes "$(manifest_field "$freeze_plan" drive_prefreeze.daily_upload_budget_bytes)")"
+    python3 - "$receipt" "$mode" "$freeze_sha" "$capture_id" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+if value.get("schema") != "arc.recovery.drive-prefreeze.v1" or value.get("mode") != sys.argv[2]:
+    raise SystemExit("Drive prefreeze receipt schema/mode differs")
+if value.get("freeze_plan_sha256") != sys.argv[3] or value.get("capture_id") != sys.argv[4]:
+    raise SystemExit("Drive prefreeze receipt identity differs")
+if sys.argv[2] == "execute" and (value.get("canary_verified") is not True or value.get("canary_deleted") is not True):
+    raise SystemExit("Drive prefreeze execute receipt lacks verified/deleted canary")
+print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+    if [ "$mode" = execute ]; then
+        local receipt_root="${OPERATOR_FREEZE_PLAN}.drive-prefreeze-receipts/$capture_id"
+        python3 - "$receipt_root" "$receipt" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+value = json.loads(sys.argv[2])
+payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+root.mkdir(mode=0o700, parents=True, exist_ok=True)
+digest = hashlib.sha256(payload).hexdigest()
+output = root / f"{digest}.json"
+if output.exists():
+    if output.is_symlink() or output.read_bytes() != payload:
+        raise SystemExit("existing Drive prefreeze receipt differs")
+else:
+    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(payload); handle.flush(); os.fsync(handle.fileno())
+directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+print(output)
+PY
+    fi
 }
 
 ensure_offline_capture() {
@@ -1041,8 +1873,16 @@ capture_phase() {
             *) die "unknown capture option: $1" ;;
         esac
     done
-    require_commands python3 ssh scp grep git
+    require_commands python3 ssh scp grep git mktemp
     [ -x "$REMOTE_HELPER" ] || die "remote helper is missing or not executable"
+    [ -x "$DRIVE_PREFREEZE_GATE" ] || die "Drive prefreeze gate is missing or not executable"
+    OPERATOR_FREEZE_PLAN="$freeze_plan"
+    ARCHIVE_FLEET_PINNED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-freeze-plan.XXXXXX")"
+    [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
+        die "cannot create private freeze-plan snapshot root"
+    chmod 700 -- "$ARCHIVE_FLEET_PINNED_ROOT"
+    trap cleanup_temporary_root EXIT
+    freeze_plan="$(pin_freeze_plan "$OPERATOR_FREEZE_PLAN" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
     capture_id="$(capture_id_for_freeze_plan_hash "$freeze_sha")"
@@ -1055,6 +1895,7 @@ capture_phase() {
     require_hash "$REMOTE_HELPER_SHA" "sealed remote helper hash"
     REMOTE_HELPER_PATH="/root/.arc-recovery-helpers/$REMOTE_HELPER_SHA/archive-node.sh"
     remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan"
+    run_drive_prefreeze_gate preflight "$freeze_plan" "$freeze_sha" "$capture_id"
     if [ "$execute" != true ]; then
         printf 'archive fleet: PLAN ONLY; no service or remote/local file was changed\n'
         return 0
@@ -1066,6 +1907,10 @@ capture_phase() {
     [ "$(freeze_plan_hash "$freeze_plan")" = "$freeze_sha" ] || \
         die "freeze plan or source bindings changed before execution"
     install_helpers "$(manifest_field "$freeze_plan" remote_helper_sha256)"
+    printf 'archive fleet: running exact ARC Drive identity/capacity/write-read-delete gate\n'
+    run_drive_prefreeze_gate execute "$freeze_plan" "$freeze_sha" "$capture_id"
+    assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
+    install_freeze_plan "$freeze_plan" "$freeze_sha"
     printf 'archive fleet: persistently fencing and stopping first sentinel NYC\n'
     ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" nyc
     printf 'archive fleet: persistently fencing and stopping second sentinel LAX\n'
@@ -1216,6 +2061,7 @@ stage_file() {
 upload_immutable() {
     local source="$1" destination="$2"
     rclone copyto "$source" "$destination" --immutable --checksum --metadata \
+        --drive-stop-on-upload-limit \
         --retries 5 --low-level-retries 20
 }
 
@@ -1278,7 +2124,8 @@ stream_bundle_to_drive() {
         set +e
         run_remote "$node" stream-bundle "$capture_id" "$node" "$manifest_sha" | \
             forward_hash_size_stream "$work_root/$node-upload.hash-size" | \
-            rclone rcat "$partial_remote" --metadata --streaming-upload-cutoff 1M
+            rclone rcat "$partial_remote" --metadata --streaming-upload-cutoff 1M \
+                --drive-stop-on-upload-limit
         pipeline_status=("${PIPESTATUS[@]}")
         set -e
         if [ "${pipeline_status[0]}" -ne 0 ] || [ "${pipeline_status[1]}" -ne 0 ] || \
@@ -2370,6 +3217,7 @@ PY
     fi
     rclone mkdir "$destination"
     rclone copy "$shared_root" "$destination" --immutable --checksum --metadata \
+        --drive-stop-on-upload-limit \
         --retries 5 --low-level-retries 20
 
     # Stream at most three exact fenced sources concurrently. No full capture,
@@ -2414,6 +3262,7 @@ PY
     require_hash "$archive_manifest_sha" "archive manifest hash"
     rclone check "$shared_root" "$destination" --checksum --one-way --checkers 4
     rclone copy "$metadata_root" "$destination" --immutable --checksum --metadata \
+        --drive-stop-on-upload-limit \
         --retries 5 --low-level-retries 20
     rclone check "$metadata_root" "$destination" --checksum --one-way --checkers 4
     # This is deliberately the final remote mutation. A failed or partial run
@@ -2435,6 +3284,7 @@ if [ -n "$COMMAND" ]; then
     shift
 fi
 case "$COMMAND" in
+    prepare-writers) prepare_writers "$@" ;;
     audit-writers) audit_writers "$@" ;;
     seal-freeze-plan) seal_freeze_plan "$@" ;;
     capture) capture_phase "$@" ;;

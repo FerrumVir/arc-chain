@@ -45,7 +45,7 @@ commands above as a production download. The public fleet still requires the
 | Can an SSH-only EC2/VPS install ARC? | Not from public v0.7.11. The complete v0.8.0 release restores real headless `arc-node` assets for Linux amd64 and arm64; the GUI packages are not server binaries. |
 | Are Intel and Apple Silicon Macs supported? | The v0.8.0 contract builds separate Intel and Apple Silicon CLI and desktop assets. Those candidate links become installable only after the complete release is published. |
 | Does automatic update work? | Public v0.7.11 saved the desktop preference but never scheduled checks. The candidate adds signed desktop checks after startup and every 24 hours, plus a transactional daily headless updater. Desktop updates still require confirmation; `.deb` and `.rpm` remain package-manager owned. |
-| When are the seeds upgraded? | They are not upgraded yet, and there is no honest calendar promise in this repository. Publishing v0.8.0 alone does not update them. Operators must complete one coordinated, archive-bound checkpoint cutover and prove all six agree before reopening traffic. |
+| When are the seeds upgraded? | They are not upgraded yet, and there is no honest calendar promise in this repository. Publishing v0.8.0 alone does not update them. Operators must complete one coordinated, archive-bound checkpoint cutover and prove all six agree above the greatest block height users saw before maintenance before reopening traffic. |
 | Can a stake-zero worker earn the configured 2.5 testnet ARC? | Stake zero is eligible, but registration and raw inference tx `0x16` pay nothing. Exact-model assignment, independent verification, five-of-six reward authorization, activation, treasury limits, and a successful mined `0x25` receipt are all required. That payment path is not live on the public v2 fleet. |
 | What should a worker run? | A router needs no model or GPU. The current full-worker target is Llama-2-7B Q4_K_M (about 4 GB on disk) with at least 16 GB system RAM recommended; GPU is optional and hardware never guarantees work. |
 | Where are earnings and the block explorer? | The corrected dashboard and source-pinned explorer are release candidates, not supported public services yet. They remain in maintenance mode until live checkpoint, replica, inference, and receipt gates pass; projections fail closed to null when evidence is insufficient. |
@@ -135,22 +135,23 @@ trade, not a better prover.
 
 ## Public fleet snapshot
 
-**Read-only public-fleet snapshot, 2026-08-26 around 15:06 CDT.** These are
+**Read-only public-fleet snapshot, 2026-08-27 around 23:42 CDT.** These are
 observations, not a standing uptime promise:
 
-| Seed | Version | State height at snapshot | Latest-block observation |
-|---|---:|---:|---|
-| NYC | 0.7.2 | ~136,969 | ~157 seconds old |
-| LAX | 0.7.9 | ~127,188 | ~1,050 seconds old |
-| AMS | 0.7.9 | ~88,452 | ~125 seconds old |
-| LHR | 0.7.9 | ~51,422 | ~4.2 days old |
-| NRT | 0.7.9 | ~96,770 | ~4.2 days old |
-| SGP | 0.7.9 | ~97,591 | ~4.2 days old |
+| Seed | Version | State height | Peers | DAG round |
+|---|---:|---:|---:|---:|
+| NYC | 0.7.2 | 137,256 | 8 | 9,781,556 |
+| LAX | 0.7.9 | 127,660 | 8 | 9,781,556 |
+| AMS | 0.7.9 | 88,735 | 8 | 9,781,557 |
+| LHR | 0.7.9 | 51,422 | 9 | 9,781,555 |
+| NRT | 0.7.9 | 96,770 | 9 | 9,781,555 |
+| SGP | 0.7.9 | 97,591 | 8 | 9,781,556 |
 
 At common height 50,000, all six reachable seeds returned **six different
 block hashes and six different state roots**. The dashboard independently
-repeated the comparison at the then-highest common height, 51,422, with the
-same 6/6 divergence. Therefore the public fleet is not one replicated chain.
+repeated the comparison at the highest common height, 51,422, with the same
+6/6 divergence. Nearly matching DAG rounds in the newer snapshot do not repair
+that block/state disagreement. Therefore the public fleet is not one replicated chain.
 Stop reward issuance, pin one source for diagnosis, and choose an approved
 canonical recovery state before any rollout. An advancing DAG round or
 `status: ok` does not override this result.

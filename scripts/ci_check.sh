@@ -89,7 +89,7 @@ check_shell_syntax() {
     bash -n install.sh || status=1
     while IFS= read -r -d '' file; do
         bash -n "$file" || status=1
-    done < <(find scripts deploy tests/release -type f -name '*.sh' -print0)
+    done < <(find scripts deploy tests/release tests/integration -type f -name '*.sh' -print0)
     return "$status"
 }
 
@@ -98,7 +98,7 @@ check_shell_lint() {
     local file
     while IFS= read -r -d '' file; do
         files+=("$file")
-    done < <(find scripts deploy tests/release -type f -name '*.sh' -print0)
+    done < <(find scripts deploy tests/release tests/integration -type f -name '*.sh' -print0)
     shellcheck -S warning "${files[@]}"
 }
 

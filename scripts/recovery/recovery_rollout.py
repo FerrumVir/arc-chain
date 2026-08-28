@@ -405,6 +405,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             "recovery_epoch",
             "validator_set_id",
             "source_height",
+            "legacy_public_max_height",
             "source_consensus_round",
             "created_at_unix_ms",
             "source_block_hash",
@@ -423,6 +424,12 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     required_int(chain["recovery_epoch"], "manifest.chain.recovery_epoch", minimum=1)
     required_int(chain["validator_set_id"], "manifest.chain.validator_set_id", minimum=1)
     source_height = required_int(chain["source_height"], "manifest.chain.source_height")
+    legacy_public_max_height = required_int(
+        chain["legacy_public_max_height"],
+        "manifest.chain.legacy_public_max_height",
+    )
+    if legacy_public_max_height < source_height:
+        fail("manifest.chain.legacy_public_max_height must be at least source_height")
     required_int(chain["source_consensus_round"], "manifest.chain.source_consensus_round")
     required_int(chain["created_at_unix_ms"], "manifest.chain.created_at_unix_ms", minimum=1)
     transition_height = required_int(chain["transition_height"], "manifest.chain.transition_height", minimum=1)
@@ -796,11 +803,15 @@ def load_sealed_manifest(path: Path) -> tuple[dict[str, Any], str]:
 def write_frontend_config(rollout: "RecoveryRollout", output_path: Path) -> str:
     if output_path.suffix != ".json":
         fail("frontend config output must end in .json")
-    payload = canonical_bytes(rollout.frontend_config())
-    digest = sha256_bytes(payload)
     sidecar = output_path.with_name(output_path.name + ".sha256")
     if output_path.exists() or sidecar.exists():
         fail("frontend config or checksum already exists; refusing replacement")
+    # A recovered config is the publication/reopen artifact. Never create it
+    # from sealed metadata alone: repeat the live H/H+1, liveness, convergence,
+    # visible-height, and reward-policy gates immediately before writing it.
+    rollout.verify_live()
+    payload = canonical_bytes(rollout.frontend_config())
+    digest = sha256_bytes(payload)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     created: list[Path] = []
     try:
@@ -921,6 +932,7 @@ class RecoveryRollout:
             "checkpoint": {
                 "height": chain["source_height"],
                 "recoveryHeight": chain["transition_height"],
+                "legacyPublicMaxHeight": chain["legacy_public_max_height"],
                 "blockHash": bare_hash(chain["source_block_hash"], "source block hash"),
                 "stateRoot": bare_hash(chain["source_state_root"], "source state root"),
                 "manifestHash": bare_hash(
@@ -1034,6 +1046,7 @@ class RecoveryRollout:
         self.say(f"  checkpoint manifest hash:   {bare_hash(self.chain['approved_checkpoint_manifest_hash'], 'hash')}")
         self.say(f"  preserved source:           #{self.chain['source_height']} {self.chain['source_block_hash']}")
         self.say(f"  recovery boundary:          #{self.chain['transition_height']} {self.chain['transition_block_hash']}")
+        self.say(f"  legacy public height floor: must advance past #{self.chain['legacy_public_max_height']}")
         self.say(f"  validators:                 {len(self.validators)} (restart quorum proven in manifest)")
         self.say(
             "  reward gate:                "
@@ -1457,8 +1470,17 @@ case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit
             time.sleep(self.checks["poll_interval_seconds"])
         fail(f"fleet did not converge before timeout: {last_error}")
 
+    def prove_visible_height_continuity(self) -> tuple[int, str, str]:
+        minimum_height = self.chain["legacy_public_max_height"] + 1
+        result = self.wait_convergence(minimum_height=minimum_height)
+        self.say(
+            "PASS all six v3 validators agree strictly above the sealed legacy "
+            f"public maximum: #{result[0]} > #{self.chain['legacy_public_max_height']}"
+        )
+        return result
+
     def prove_advancing_convergence(self) -> None:
-        initial = self.wait_convergence()
+        initial = self.prove_visible_height_continuity()
         target = initial[0] + self.checks["min_height_advance"]
         deadline = time.monotonic() + self.checks["convergence_timeout_seconds"]
         not_before = time.monotonic() + self.checks["observation_seconds"]
@@ -1656,6 +1678,9 @@ case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit
         self.prove_reward_policy()
         if evidence is not None:
             self.prove_reward_receipt(evidence)
+        # Re-check immediately before a caller may treat verification as a
+        # publication signal; missing/lagging replicas fail closed.
+        self.prove_visible_height_continuity()
 
     def import_local(self, node: Mapping[str, Any]) -> None:
         if Path(node["data_dir"]).exists():
@@ -2653,6 +2678,7 @@ printf '%s  %s\n' "$model_sha" "$model" | sha256sum --check --strict
             if evidence is not None:
                 self.prove_reward_receipt(evidence)
             self.verify_production_archive(verify_live_captures=True)
+            self.prove_visible_height_continuity()
             complete = True
         finally:
             if not complete:
