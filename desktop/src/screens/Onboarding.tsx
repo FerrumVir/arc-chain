@@ -548,6 +548,18 @@ export function Onboarding() {
                   machines stay useful as observer/routers. A model creates
                   eligibility, not guaranteed assignments or rewards.
                 </p>
+                <p
+                  style={{
+                    color: "var(--text-muted)",
+                    fontSize: "var(--text-sm)",
+                    lineHeight: 1.5,
+                    marginTop: "var(--space-3)",
+                  }}
+                >
+                  Exact artifact ID: <code>llama-2-7b-chat.Q4_K_M.gguf</code>.
+                  Extra copies or machines do not multiply rewards or guarantee
+                  demand.
+                </p>
 
                 <div
                   style={{

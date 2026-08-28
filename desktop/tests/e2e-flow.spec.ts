@@ -443,10 +443,13 @@ test.describe("Unified release publishes a signed update manifest", () => {
     "utf8",
   );
 
-  test("workflow signs with TAURI_SIGNING_PRIVATE_KEY secret", () => {
+  test("workflow signs non-interactively with the protected updater key", () => {
     expect(wf).toContain("TAURI_SIGNING_PRIVATE_KEY");
     expect(wf).toContain("environment: release");
-    expect(wf).not.toContain("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
+    expect(wf).toMatch(/TAURI_SIGNING_PRIVATE_KEY_PASSWORD:\s*["']{2}/);
+    expect(wf).not.toContain(
+      "TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.",
+    );
   });
 
   test("assembler emits latest.json with per-target url + signature", () => {
