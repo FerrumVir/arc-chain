@@ -690,7 +690,7 @@ jobs:
           smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/arc-pretag-${{ matrix.platform }}.XXXXXX")"
           log="$smoke_dir/node.log"
           # Invoked indirectly by trap.
-          # shellcheck disable=SC2329
+          # shellcheck disable=SC2317,SC2329
           cleanup() {
             if [ -n "${node_pid:-}" ]; then
               if [ "$RUNNER_OS" = Windows ]; then
