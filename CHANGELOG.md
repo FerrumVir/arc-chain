@@ -18,19 +18,34 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.0 - Unreleased recovery candidate
+## v0.8.0 - Release-preparation snapshot (2026-08-31)
+
+> **Tag-stable lifecycle note:** At this review cutoff, v0.8.0 was an
+> unreleased recovery candidate and was not deployed or published. An
+> immutable v0.8.0 tag intentionally retains that historical fact. Determine
+> current publication and fleet status from the exact immutable release API
+> evidence and the signed coordinated-rollout receipts, not from this changelog
+> snapshot.
 
 - Restores one checksummed release graph for headless Linux amd64/arm64,
   Intel/Apple-Silicon macOS, Windows CLI, and signed desktop bundles. The
   installer resolves one exact version, works without a display, and refuses
   downgrade or unverified replacement. Workspace, Tauri, desktop npm, and lock
   metadata are all pinned to v0.8.0 before a matching tag can publish.
+- Splits unsigned builds, updater-payload signing, release-manifest signing,
+  draft publication, and read-only server verification across exact-ID,
+  digest-bound handoffs. Fresh protected signers run no repository program and
+  expose keys only to per-boundary absolute executable allowlists; the Node
+  signer runtime is exact-patch and byte bound. Publication never deletes a
+  release after its publish PATCH is attempted and boundedly polls GitHub's
+  eventually consistent immutable state before sealing evidence.
 - Adds the typed `arc health` command and makes the installer use it for
   readiness, accepting only explicit JSON `ok` or `degraded` states. Install
   and upgrade now share a complete rollback transaction across binaries,
   configuration, identity, service definitions, and prior service state.
 - Adds a blocking release/security harness: Rust format/check/Clippy/test
-  coverage, Linux 24.04/26.04 headless smoke tests, deterministic desktop E2E,
+  coverage, GUI-free node boot gates for Linux x86_64 on Ubuntu
+  22.04/24.04/26.04 and ARM64 on Ubuntu 24.04/26.04, deterministic desktop E2E,
   Tauri tests on every released desktop architecture, SDK packed-consumer
   tests, workflow/ShellCheck contracts, and staged plus working-copy secret
   scans.
@@ -59,10 +74,13 @@ All notable changes to ARC Chain are tracked here. This project follows
   projections fail closed unless policy, receipt history, and treasury support
   them. Stake-zero worker eligibility is explicit policy, not an installer
   promise.
-- Separates RPC from P2P discovery and configures all six reviewed dashed
-  `https://*.nip.io` origins explicitly. Remote plaintext, credentials, URL
-  paths, query strings, fragments, wildcard listeners, and port zero are
-  rejected outside the deliberate local/dev escape hatch.
+- Separates RPC from P2P discovery and configures all six reviewed literal-IPv4
+  HTTPS origins explicitly. The locked SHA-pinned Caddy 2.11.4 gateway requests
+  publicly trusted Let's Encrypt IP certificates with the `shortlived` profile
+  over HTTP-01, removing the shared `nip.io`/`sslip.io` wildcard-DNS dependency.
+  Remote plaintext, credentials, URL paths, query strings, fragments, wildcard
+  listeners, and port zero are rejected outside the deliberate local/dev escape
+  hatch.
 - Moves wallet transfer signing into Rust so the seed never crosses IPC,
   parses and formats ARC with exactly nine decimal base-unit precision, and
   treats sends and 1 ARC faucet claims as pending until the chain returns a
@@ -73,20 +91,42 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Hardens validator identity and rollout: validator key files are mandatory,
   legacy exposed keys are rejected, genesis/release contracts fail closed, and
   the six-node v3 cutover is explicitly coordinated rather than auto-deployed.
+- Adds an archive-bound recovery transaction around that cutover: a sealed
+  freeze plan, two independently captured quarantine samples at least 120
+  seconds apart, per-node stopped-writer/listener evidence, content-indexed
+  legacy bundles, and separately verified Google Drive completion roots must
+  all cross-bind before validator mutation. Every divergent legacy lineage is
+  retained with an explicit canonical, non-canonical-fork, or unclassified
+  disposition; recovery never rewrites those forks into one invented history.
+- Adds a boundary/tool/source-set-bound late-fork interlock. All six recovered
+  gateways must publish a fresh healthy status. A coherent legacy observation
+  above the sealed public-height cutoff creates a persistent incident and
+  forces the dashboard and explorer back to maintenance; it never auto-clears
+  or promotes the observation into canonical history.
+- Adds one-shot validator-vault rewrap and restore/install tooling. The
+  passphrase-encrypted source vault is metadata-validated and re-encrypted to
+  an operator-supplied CMS certificate without publishing plaintext. Restore
+  is exact-main/pre-tag/profile bound, and remote key installation is
+  create-only over pinned SSH only after authenticated offline-stop evidence
+  v2 proves the legacy writers remain fenced.
 - Makes community reward activation an authenticated genesis schedule plus an
   independent local issuance switch. An absent activation height disables tx
-  `0x25`; the issuance flag cannot override that absence, and the checked-in
-  migration-observer genesis deliberately has no activation schedule.
+  `0x25`, and the issuance flag cannot override that absence. The checked-in,
+  checkpoint-bound recovery genesis schedules activation at block `137146`;
+  rollout readiness and the independent local switch still keep issuance
+  fail-closed until the approved coordinated cutover.
 - Reworks dashboard and explorer rendering for safe DOM insertion, honest
   liveness/retained-history semantics, coordinator-specific compatible worker
-  capacity, visible inference/quorum/settlement evidence, and actual on-chain
-  balances. Production dashboard CSS is compiled locally instead of executing
-  the Tailwind development CDN.
+  capacity, visible inference/quorum/settlement evidence, actual on-chain
+  balances, and a fail-closed six-replica maintenance interlock. Production
+  dashboard CSS is compiled locally instead of executing the Tailwind
+  development CDN.
 
-This candidate is not deployed or published. The public fleet remains split
-across old v0.7.2/v0.7.9 binaries until operators rotate compromised keys,
-choose a clean-genesis or checkpoint recovery policy, and complete the rollout
-gate.
+At the 2026-08-31 source freeze, this candidate was not deployed or published,
+and the public fleet remained split across old v0.7.2/v0.7.9 binaries. A valid
+current deployment claim requires operators to have rotated compromised keys,
+chosen a clean-genesis or checkpoint recovery policy, and completed the signed
+rollout gate.
 
 ## v0.7.11 - 2026-06-15 (desktop-only)
 
@@ -191,7 +231,7 @@ across seeds could never work. (800d828, 6226342, b05bed5, 8e151de, bf1e14c,
   The 3-second timeout had made sharded inference unusable. (4acbcbb)
 - Connecting UX: syncing banner + onboarding progress. (0510fa4)
 - Alpha VPS hardening and UX polish. (34a393f, 9308d9d)
-- This is the version **NYC still runs today**.
+- At the 2026-08-31 source freeze, this was the version **NYC still ran**.
 
 ## v0.7.1 - 2026-05-12
 

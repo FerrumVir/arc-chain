@@ -40,6 +40,7 @@ path = "src/propose_verify_bench.rs"
 [[bin]]
 name = "arc-bench-multinode"
 path = "src/multinode_bench.rs"
+required-features = ["benchmark-tools"]
 
 [[bin]]
 name = "arc-bench-gpu-state"
@@ -66,6 +67,12 @@ name = "arc-bench-cached-integer"
 path = "src/cached_integer_bench.rs"
 
 [features]
+default = []
+benchmark-tools = [
+    "arc-crypto/benchmark-tools",
+    "arc-state/benchmark-tools",
+    "arc-node/benchmark-tools",
+]
 candle = ["arc-inference/candle"]
 
 [dependencies]

@@ -48,10 +48,10 @@ blst = { version = "0.3", features = ["portable"] }
 stwo = { path = "vendor/stwo/stwo", default-features = false, features = ["prover"] }
 stwo-constraint-framework = { path = "vendor/stwo/constraint-framework", default-features = false, features = ["prover"] }
 # GPU acceleration (ICICLE - Ingonyama's GPU library for M31 field ops)
-icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
-icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
-icicle-m31 = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
-icicle-hash = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
+icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
+icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
+icicle-m31 = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
+icicle-hash = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
 num-traits = "0.2"
 rand = "0.8"
 rand_core = "0.6"

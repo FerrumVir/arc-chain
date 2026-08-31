@@ -276,12 +276,16 @@ For each of the 5 currently-alive coordinators (LAX `140.82.16.112`, AMS `136.24
 ssh root@<IP>
 
 # 2. Upload full Llama-2-7B Q4_K_M to ~/.arc/models/
-curl -L "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf" \
+curl -L "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf" \
   -o ~/.arc/models/llama-2-7b.gguf
+test "$(wc -c < ~/.arc/models/llama-2-7b.gguf | tr -d ' ')" = 4081004224
+printf '%s  %s\n' \
+  08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa \
+  ~/.arc/models/llama-2-7b.gguf | sha256sum -c -
 
-# 3. Pull new arc-node binary
-curl -L https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-node-linux-x86_64 \
-  -o ~/.arc/bin/arc-node && chmod +x ~/.arc/bin/arc-node
+# 3. Retired: this draft never recorded an immutable binary version/checksum.
+# Do not install or deploy an executable from a moving "latest" release URL.
+# Use the exact-version, checksum-verifying current release process instead.
 
 # 4. Edit systemd unit — REMOVE any --shard-ranges flag (this triggers full-model candle mode)
 sudo systemctl edit arc-node   # set ExecStart with --model ~/.arc/models/llama-2-7b.gguf and NO --shard-ranges
@@ -401,11 +405,13 @@ cargo test -p arc-state --test inference_state_transitions
 
 # 3. Local end-to-end via desktop
 # Start single-validator local node
+KEY_FILE="/tmp/arc-test-validator.json"
+test -f "$KEY_FILE" || cargo run -p arc-cli -- keygen --scheme ed25519 --output "$KEY_FILE"
 cargo run -p arc-node -- \
   --rpc 127.0.0.1:9090 --p2p-port 9091 \
   --data-dir /tmp/arc-test \
   --model ~/.arc/models/llama-2-7b.gguf \
-  --validator-seed "test seed phrase here"
+  --validator-key-file "$KEY_FILE"
 
 # Desktop:
 cd desktop && npm run tauri:dev

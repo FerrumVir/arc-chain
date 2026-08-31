@@ -73,6 +73,11 @@ export function Dashboard() {
     queryFn: api.getAutostart,
     refetchInterval: 30_000,
   });
+  const inferenceActivity = (attestations ?? []).filter((row) =>
+    row.txType == null
+    || row.txType === "Inference"
+    || row.txType === "InferenceAttestation"
+    || row.txType === "CommunityInferenceReward");
 
   const startMutation = useMutation({
     mutationFn: () =>
@@ -493,8 +498,12 @@ export function Dashboard() {
                 </div>
               )}
               {earnings && !earnings.fromChain && (
-                <div title="Recent inference claims are not evidence of payment, so this fallback is not rendered as ARC.">
-                  reward receipt index unavailable
+                <div
+                  data-testid="dashboard-earnings-unavailable"
+                  title={earnings.unavailableReason
+                    ?? "Recent inference claims are not evidence of payment."}
+                >
+                  reward receipt index unavailable — no zero inferred
                 </div>
               )}
             </div>
@@ -637,7 +646,7 @@ export function Dashboard() {
           <CardHeader
             title={
               <span style={{ display: "inline-flex", alignItems: "center" }}>
-                Recent inference claims
+                Recent inference activity
                 <InfoPopover title="What this evidence proves">
                   <p>
                     On the protocol-v3 path, a worker is eligible only after it
@@ -684,14 +693,14 @@ export function Dashboard() {
             }
           />
           <div className="feed" data-testid="attestation-feed">
-            {!attestations || attestations.length === 0 ? (
+            {inferenceActivity.length === 0 ? (
               <EmptyState
                 icon={FileSignature}
                 title="No inference claims on this host"
                 description="A raw 0x16 claim appears here after submission; payment requires a separate successful mined 0x25 reward receipt."
               />
             ) : (
-              attestations.slice(0, 6).map((a) => (
+              inferenceActivity.slice(0, 6).map((a) => (
                 <div
                   key={a.txHash}
                   className="feed-item"
@@ -706,7 +715,7 @@ export function Dashboard() {
                     <div className="feed-item-title">
                       {a.inputPreview || (
                         <span style={{ color: "var(--text-muted)" }}>
-                          Inference attestation
+                          Inference activity
                         </span>
                       )}
                     </div>
@@ -735,13 +744,14 @@ export function Dashboard() {
                       fontWeight: 600,
                       whiteSpace: "nowrap",
                     }}
-                    title={
-                      a.mine
-                        ? "Submitted by your address. A raw 0x16 claim is not payment."
-                        : "Submitted by another address. A raw 0x16 claim is not payment."
-                    }
+                    data-testid={`activity-status-${a.txHash.slice(0, 10)}`}
+                    title={a.paid
+                      ? "Successful mined CommunityInferenceReward (0x25) receipt."
+                      : "Successful computation claim; this row is not a payment."}
                   >
-                    {a.mine ? "your claim" : "network claim"}
+                    {a.paid
+                      ? "COMPUTED + PAID"
+                      : `COMPUTED · NOT PAYMENT · ${a.mine ? "yours" : "network"}`}
                   </div>
                 </div>
               ))

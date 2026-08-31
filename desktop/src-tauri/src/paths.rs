@@ -91,7 +91,11 @@ mod tests {
     #[test]
     fn expand_tilde_replaces_leading_home() {
         let p = expand_tilde("~/.arc");
-        assert!(!p.starts_with("~"), "tilde should be expanded: {}", p.display());
+        assert!(
+            !p.starts_with("~"),
+            "tilde should be expanded: {}",
+            p.display()
+        );
         assert!(p.ends_with(".arc"));
     }
 

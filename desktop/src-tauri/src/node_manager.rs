@@ -1,16 +1,631 @@
 use crate::paths;
-use crate::types::{LogEntry, NodeConfig};
+use crate::types::{DataMigrationNotice, LogEntry, NodeConfig};
+use anyhow::Context as _;
+use fs2::FileExt as _;
 use std::collections::VecDeque;
+use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use zeroize::{Zeroize as _, Zeroizing};
 
 const LOG_RING_SIZE: usize = 2000;
+// Keep this synchronized with arc-node's managed shutdown contract and the
+// systemd/launchd services emitted by install.sh. A public inference handler
+// may validly run for 4,000 seconds and an already-claimed community job keeps
+// a 300-second late-submit window; the remaining two minutes cover task joins
+// and the final WAL durability barrier. Idle nodes still exit immediately.
+const GRACEFUL_STOP_TIMEOUT_SECS: u64 = 4_420;
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(GRACEFUL_STOP_TIMEOUT_SECS);
+const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
+const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
+const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
+const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
+const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str = "lifecycle.lock";
+const DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME: &str = "managed-executable.path";
+const DESKTOP_EXECUTABLE_IDENTITY_SCHEMA: &str = "arc.desktop.executable-path.v1";
+const DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES: u64 = 32 * 1024;
+const DESKTOP_SHUTDOWN_FILE_MAX_BYTES: u64 = 256;
+const DESKTOP_NETWORK_IDENTITY_DIR_NAME: &str = ".arc-desktop-network";
+const DESKTOP_STABLE_SEEDS_FILE_NAME: &str = "testnet-seeds.txt";
+const DESKTOP_STABLE_GENESIS_FILE_NAME: &str = "genesis.toml";
+const DESKTOP_NETWORK_RESOURCE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DESKTOP_SHUTDOWN_PUBLICATION_RETRIES: usize = 250;
+const DESKTOP_SHUTDOWN_PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(20);
+const LEGACY_VALIDATOR_SEED_MAX_BYTES: usize = 1_024;
+
+fn refresh_process_command_metadata(system: &mut sysinfo::System) {
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::new()
+            .with_exe(sysinfo::UpdateKind::OnlyIfNotSet)
+            .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
+            .with_cwd(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
+}
+
+struct DesktopShutdownControl {
+    data_dir: PathBuf,
+    token_file: PathBuf,
+    request_file: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    token: Zeroizing<String>,
+    receipt_executable: Option<PathBuf>,
+    receipt_genesis: Option<PathBuf>,
+    receipt_nonce: Option<[u8; 32]>,
+}
+
+/// Cross-process ownership of one canonical managed data directory. The lock
+/// is acquired before the final lifecycle-state check and is held across any
+/// executable/stable-resource mutation plus receipt arm→spawn. A running
+/// NodeManager retains it for the child's full lifetime; the OS releases it if
+/// the GUI crashes, allowing a new GUI to reconcile the still-fenced child.
+pub struct ManagedLifecycleLock {
+    data_dir: PathBuf,
+    _file: std::fs::File,
+}
+
+impl ManagedLifecycleLock {
+    fn ensure_data_dir(&self, data_dir: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.data_dir == data_dir,
+            "managed lifecycle lock does not belong to data directory {}",
+            data_dir.display()
+        );
+        Ok(())
+    }
+}
+
+pub fn acquire_managed_lifecycle_lock(
+    configured_data_dir: &str,
+) -> anyhow::Result<ManagedLifecycleLock> {
+    let data_dir = resolve_data_dir(configured_data_dir);
+    arc_crypto::secret_file::secure_private_directory_tree(&data_dir).with_context(|| {
+        format!(
+            "cannot durably secure managed data directory before lifecycle lock: {}",
+            data_dir.display()
+        )
+    })?;
+    let data_dir = data_dir.canonicalize()?;
+    let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
+    let lock_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+    arc_crypto::secret_file::durably_publish_new_private(
+        &lock_path,
+        b"arc.desktop.lifecycle-lock.v1\n",
+    )?;
+    let file = arc_crypto::secret_file::open_private_read_write(&lock_path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        anyhow::anyhow!(
+            "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    Ok(ManagedLifecycleLock {
+        data_dir,
+        _file: file,
+    })
+}
+
+impl DesktopShutdownControl {
+    fn token_bytes(&self) -> anyhow::Result<[u8; 32]> {
+        let decoded = Zeroizing::new(
+            hex::decode(self.token.as_str())
+                .context("desktop shutdown control token is not valid hexadecimal")?,
+        );
+        anyhow::ensure!(
+            decoded.len() == 32,
+            "desktop shutdown control token has an invalid length"
+        );
+        let mut token = [0u8; 32];
+        token.copy_from_slice(&decoded);
+        Ok(token)
+    }
+
+    fn arm_receipt(&mut self, executable: &Path, genesis: &Path) -> anyhow::Result<()> {
+        let token = self.token_bytes()?;
+        let arm = arc_crypto::secret_file::arm_desktop_shutdown_receipt(
+            &self.data_dir,
+            &token,
+            executable,
+            genesis,
+        )
+        .context("failed to durably arm the managed-node shutdown receipt")?;
+        self.receipt_executable = Some(executable.canonicalize()?);
+        self.receipt_genesis = Some(genesis.canonicalize()?);
+        self.receipt_nonce = Some(arm.nonce);
+        Ok(())
+    }
+
+    fn bind_receipt_identity(&mut self, executable: &Path, genesis: &Path) -> anyhow::Result<()> {
+        self.receipt_executable = Some(executable.canonicalize()?);
+        self.receipt_genesis = Some(genesis.canonicalize()?);
+        self.receipt_nonce = arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+            &self.data_dir,
+            &self.token_bytes()?,
+            executable,
+            genesis,
+        )
+        .context("failed to validate an inherited managed-node shutdown receipt")?;
+        Ok(())
+    }
+
+    fn validate_armed_receipt(&self) -> anyhow::Result<bool> {
+        let executable = self
+            .receipt_executable
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no executable binding"))?;
+        let genesis = self
+            .receipt_genesis
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no genesis binding"))?;
+        let nonce = self
+            .receipt_nonce
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no request nonce"))?;
+        arc_crypto::secret_file::validate_desktop_shutdown_receipt(
+            &self.data_dir,
+            &self.token_bytes()?,
+            nonce,
+            executable,
+            genesis,
+        )
+        .context("failed to validate the managed-node shutdown receipt")
+    }
+
+    fn validate_clean_ack(&self) -> anyhow::Result<bool> {
+        let executable = self
+            .receipt_executable
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no executable binding"))?;
+        let genesis = self
+            .receipt_genesis
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no genesis binding"))?;
+        let nonce = self
+            .receipt_nonce
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no request nonce"))?;
+        arc_crypto::secret_file::validate_desktop_shutdown_ack(
+            &self.data_dir,
+            &self.token_bytes()?,
+            nonce,
+            executable,
+            genesis,
+        )
+        .context("failed to validate the managed-node clean shutdown ACK")
+    }
+
+    fn consume_clean_ack(&self) -> anyhow::Result<()> {
+        let executable = self
+            .receipt_executable
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no executable binding"))?;
+        let genesis = self
+            .receipt_genesis
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no genesis binding"))?;
+        let nonce = self
+            .receipt_nonce
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no request nonce"))?;
+        arc_crypto::secret_file::consume_desktop_shutdown_ack(
+            &self.data_dir,
+            &self.token_bytes()?,
+            nonce,
+            executable,
+            genesis,
+        )
+        .context("failed to consume the exact clean shutdown ACK/marker pair")
+    }
+
+    fn ensure_receipt_armed(&mut self) -> anyhow::Result<()> {
+        let executable = self
+            .receipt_executable
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no executable binding"))?;
+        let genesis = self
+            .receipt_genesis
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("managed shutdown receipt has no genesis binding"))?;
+        self.arm_receipt(&executable, &genesis)
+    }
+}
+
+#[cfg(windows)]
+fn same_desktop_shutdown_control(
+    left: &DesktopShutdownControl,
+    right: &DesktopShutdownControl,
+) -> anyhow::Result<bool> {
+    let left_token = left.token_bytes()?;
+    let right_token = right.token_bytes()?;
+    let token_matches = left_token
+        .iter()
+        .zip(right_token.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0;
+    Ok(token_matches
+        && left.data_dir == right.data_dir
+        && left.token_file == right.token_file
+        && left.receipt_executable == right.receipt_executable
+        && left.receipt_genesis == right.receipt_genesis
+        && left.receipt_nonce == right.receipt_nonce)
+}
+
+#[derive(Clone)]
+struct LegacyWindowsStopContext {
+    data_dir: PathBuf,
+    validator_seed: Zeroizing<String>,
+    seeds_file: PathBuf,
+    genesis_file: PathBuf,
+    allowed_port_pairs: Vec<(u16, u16)>,
+    model_path: Option<PathBuf>,
+    worker_mode: bool,
+}
+
+fn read_private_shutdown_request(path: &Path) -> std::io::Result<Zeroizing<String>> {
+    let mut file = arc_crypto::secret_file::open_private(path)?;
+    if file.metadata()?.len() > DESKTOP_SHUTDOWN_FILE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private shutdown capability exceeds its bounded size",
+        ));
+    }
+    let mut text = String::new();
+    std::io::Read::by_ref(&mut file)
+        .take(DESKTOP_SHUTDOWN_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > DESKTOP_SHUTDOWN_FILE_MAX_BYTES {
+        text.zeroize();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private shutdown capability exceeds its bounded size",
+        ));
+    }
+    Ok(Zeroizing::new(text))
+}
+
+fn read_private_hex_token(path: &Path) -> std::io::Result<Zeroizing<String>> {
+    let mut text = read_private_shutdown_request(path)?;
+    let token = Zeroizing::new(text.trim().to_string());
+    text.zeroize();
+    if token.len() != 64 || hex::decode(token.as_str()).map_or(true, |bytes| bytes.len() != 32) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "private shutdown capability must contain exactly 32 hexadecimal bytes",
+        ));
+    }
+    Ok(token)
+}
+
+fn read_desktop_shutdown_control(token_file: &Path) -> anyhow::Result<DesktopShutdownControl> {
+    let control_dir = token_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("desktop shutdown token has no parent directory"))?;
+    arc_crypto::secret_file::validate_private_directory(control_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "desktop shutdown control directory is not private {}: {error}",
+            control_dir.display()
+        )
+    })?;
+    if token_file.file_name() != Some(std::ffi::OsStr::new(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME)) {
+        anyhow::bail!("desktop shutdown token has an unexpected filename");
+    }
+    if control_dir.file_name() != Some(std::ffi::OsStr::new(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)) {
+        anyhow::bail!("desktop shutdown token is outside the named control directory");
+    }
+    let token = read_private_hex_token(token_file).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot open private desktop shutdown token {}: {error}",
+            token_file.display()
+        )
+    })?;
+    let request_file = token_file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("desktop shutdown token has no parent directory"))?
+        .join(DESKTOP_SHUTDOWN_REQUEST_FILE_NAME);
+    let data_dir = control_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("desktop shutdown control has no data-directory parent"))?
+        .canonicalize()
+        .context("cannot canonicalize desktop shutdown data directory")?;
+    Ok(DesktopShutdownControl {
+        data_dir,
+        token_file: token_file.to_path_buf(),
+        request_file,
+        token,
+        receipt_executable: None,
+        receipt_genesis: None,
+        receipt_nonce: None,
+    })
+}
+
+fn prepare_desktop_shutdown_control(data_dir: &Path) -> anyhow::Result<DesktopShutdownControl> {
+    let data_dir = data_dir.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "cannot canonicalize desktop node data directory {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    arc_crypto::secret_file::secure_private_directory_tree(&control_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot secure desktop shutdown control directory {}: {error}",
+            control_dir.display()
+        )
+    })?;
+    let token_file = control_dir.join(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME);
+    if !token_file.exists() {
+        use rand::RngCore as _;
+        let mut token_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        let mut token_hex = Zeroizing::new(format!("{}\n", hex::encode(token_bytes)));
+        token_bytes.fill(0);
+        let publication =
+            arc_crypto::secret_file::durably_publish_new_private(&token_file, token_hex.as_bytes());
+        token_hex.as_mut_str().zeroize();
+        publication.map_err(|error| {
+            anyhow::anyhow!(
+                "cannot durably publish private desktop shutdown token {}: {error}",
+                token_file.display()
+            )
+        })?;
+    }
+    // Never delete an existing request here. A second desktop can reach this
+    // pre-spawn path while the first desktop's node owns the data-directory
+    // lock and is draining that exact request. Requests carry a target PID;
+    // only arc-node, after taking the exclusive lock, may consume a stale one.
+    read_desktop_shutdown_control(&token_file)
+}
+
+fn managed_executable_identity_file(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+        .join(DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME)
+}
+
+fn persist_managed_executable_identity(
+    data_dir: &Path,
+    executable: &Path,
+) -> anyhow::Result<PathBuf> {
+    let executable = executable.canonicalize().with_context(|| {
+        format!(
+            "cannot canonicalize managed arc-node executable {}",
+            executable.display()
+        )
+    })?;
+    let path = executable.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "managed arc-node executable path is not valid UTF-8 and cannot be persisted safely"
+        )
+    })?;
+    let payload = format!(
+        "{DESKTOP_EXECUTABLE_IDENTITY_SCHEMA}\npath_utf8_hex={}\n",
+        hex::encode(path.as_bytes())
+    );
+    anyhow::ensure!(
+        payload.len() as u64 <= DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES,
+        "managed arc-node executable identity exceeds its bounded size"
+    );
+    let identity_file = managed_executable_identity_file(data_dir);
+    arc_crypto::secret_file::durably_replace_private(&identity_file, payload.as_bytes())
+        .with_context(|| {
+            format!(
+                "cannot durably persist managed arc-node executable identity {}",
+                identity_file.display()
+            )
+        })?;
+    Ok(executable)
+}
+
+fn load_managed_executable_identity(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let identity_file = managed_executable_identity_file(data_dir);
+    let mut file = arc_crypto::secret_file::open_private(&identity_file).with_context(|| {
+        format!(
+            "managed-node recovery fence exists but exact executable identity {} is unavailable",
+            identity_file.display()
+        )
+    })?;
+    anyhow::ensure!(
+        file.metadata()?.len() <= DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES,
+        "managed arc-node executable identity exceeds its bounded size"
+    );
+    let mut payload = String::new();
+    std::io::Read::by_ref(&mut file)
+        .take(DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES + 1)
+        .read_to_string(&mut payload)?;
+    anyhow::ensure!(
+        payload.len() as u64 <= DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES,
+        "managed arc-node executable identity exceeds its bounded size"
+    );
+    let mut lines = payload.lines();
+    anyhow::ensure!(
+        lines.next() == Some(DESKTOP_EXECUTABLE_IDENTITY_SCHEMA),
+        "managed arc-node executable identity has an invalid schema"
+    );
+    let encoded = lines
+        .next()
+        .and_then(|line| line.strip_prefix("path_utf8_hex="))
+        .ok_or_else(|| anyhow::anyhow!("managed arc-node executable identity omits its path"))?;
+    anyhow::ensure!(
+        lines.next().is_none(),
+        "managed arc-node executable identity contains unexpected fields"
+    );
+    let decoded = hex::decode(encoded)
+        .map_err(|_| anyhow::anyhow!("managed arc-node executable identity is not hexadecimal"))?;
+    let path = std::str::from_utf8(&decoded)
+        .map_err(|_| anyhow::anyhow!("managed arc-node executable identity is not UTF-8"))?;
+    let path = PathBuf::from(path);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "managed arc-node executable identity is not absolute"
+    );
+    path.canonicalize().with_context(|| {
+        format!(
+            "cannot recover exact receipt-bound arc-node executable {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_desktop_shutdown_request(
+    control: &DesktopShutdownControl,
+    target_pid: u32,
+) -> anyhow::Result<()> {
+    let nonce = control
+        .receipt_nonce
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("desktop shutdown receipt was not armed"))?;
+    let request = Zeroizing::new(format!(
+        "{DESKTOP_SHUTDOWN_REQUEST_SCHEMA}\npid={target_pid}\ntoken={}\nnonce={}\n",
+        control.token.as_str(),
+        hex::encode(nonce),
+    ));
+    for attempt in 0..DESKTOP_SHUTDOWN_PUBLICATION_RETRIES {
+        let temporary_file = control.request_file.with_file_name(format!(
+            ".request.{}.{}.tmp",
+            std::process::id(),
+            uuid_like()
+        ));
+        let mut file =
+            arc_crypto::secret_file::create_new_private(&temporary_file).map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot create private desktop shutdown request staging file {}: {error}",
+                    temporary_file.display()
+                )
+            })?;
+        if let Err(error) = file
+            .write_all(request.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary_file);
+            return Err(anyhow::anyhow!(
+                "cannot persist private desktop shutdown request {}: {error}",
+                temporary_file.display()
+            ));
+        }
+        drop(file);
+
+        // A hard-link publication is a same-filesystem, atomic no-replace
+        // operation on Unix and Windows. The watcher can therefore observe
+        // either no request or the complete fsynced payload, never a torn
+        // final file. Concurrent desktop instances converge on one final
+        // request without deleting each other's request.
+        match std::fs::hard_link(&temporary_file, &control.request_file) {
+            Ok(()) => {
+                arc_crypto::secret_file::sync_parent_directory(&control.request_file)?;
+                let _ = std::fs::remove_file(&temporary_file);
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&temporary_file);
+                match read_private_shutdown_request(&control.request_file) {
+                    Ok(existing) if existing.as_str() == request.as_str() => return Ok(()),
+                    Ok(existing) => {
+                        let existing_token = existing
+                            .lines()
+                            .nth(2)
+                            .and_then(|line| line.strip_prefix("token="));
+                        if existing_token != Some(control.token.as_str()) {
+                            anyhow::bail!(
+                                "existing private desktop shutdown request is not authenticated by this control capability"
+                            );
+                        }
+                        // A valid request for a prior PID may still be in the
+                        // new node's early watcher or in the old node's drain.
+                        // Wait for node-side consumption; never replace it or
+                        // downgrade this race to force-kill.
+                    }
+                    Err(error)
+                        if !matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::InvalidData
+                        ) =>
+                    {
+                        return Err(anyhow::anyhow!(
+                            "cannot validate existing private desktop shutdown request {}: {error}",
+                            control.request_file.display()
+                        ));
+                    }
+                    Err(_) => {
+                        // Node-side consumption removes a bounded malformed or
+                        // stale private request after reading a stable handle.
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary_file);
+                return Err(anyhow::anyhow!(
+                    "cannot atomically publish private desktop shutdown request {}: {error}",
+                    control.request_file.display()
+                ));
+            }
+        }
+        if attempt + 1 < DESKTOP_SHUTDOWN_PUBLICATION_RETRIES {
+            std::thread::sleep(DESKTOP_SHUTDOWN_PUBLICATION_RETRY_DELAY);
+        }
+    }
+    anyhow::bail!("private desktop shutdown request publication did not settle")
+}
+
+#[derive(Clone, Debug, Default)]
+struct StopSummary {
+    stopped: usize,
+    forced: usize,
+}
+
+fn finish_legacy_reconciliation(
+    slot: &mut Option<LegacyWindowsStopContext>,
+    attempted: Option<LegacyWindowsStopContext>,
+    result: anyhow::Result<StopSummary>,
+) -> anyhow::Result<StopSummary> {
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            *slot = attempted;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChildStopOutcome {
+    forced_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct ManagedDurabilityRecoveryRequired {
+    reason: String,
+}
+
+impl std::fmt::Display for ManagedDurabilityRecoveryRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "managed-node durability recovery is unresolved; refusing Stop/update boundary: {}. Start the exact receipt-bound node and complete one authenticated clean shutdown before updating",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for ManagedDurabilityRecoveryRequired {}
+
+pub fn is_managed_durability_recovery_required(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<ManagedDurabilityRecoveryRequired>())
+}
 
 pub struct NodeManager {
     child: Option<Child>,
@@ -23,6 +638,22 @@ pub struct NodeManager {
     /// Intentional-stop flag - `stop()` sets this before killing, so the reaper
     /// doesn't misreport a clean shutdown as a crash.
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Private file-capability used by packaged Windows nodes, which have no
+    /// console signal channel under CREATE_NO_WINDOW. The token is persisted
+    /// mode-0600 beside chain data so a restarted desktop can also drain a
+    /// detached managed node without exposing a remote shutdown endpoint.
+    shutdown_control: Option<DesktopShutdownControl>,
+    lifecycle_lock: Option<ManagedLifecycleLock>,
+    /// Cross-process fence retained after a successful updater preflight and
+    /// through signed bundle installation/relaunch. Unlike `lifecycle_lock`,
+    /// this guard intentionally exists while no child is running: it prevents
+    /// a second GUI from starting a new writer after Stop has returned to the
+    /// WebView but before the updater has replaced and relaunched the app.
+    update_lifecycle_lock: Option<ManagedLifecycleLock>,
+    managed_data_dir: Option<PathBuf>,
+    durability_failure: Option<String>,
+    legacy_windows_stop_context: Option<LegacyWindowsStopContext>,
+    legacy_windows_stop_error: Option<String>,
     /// Core count the *running* child was actually launched with. Read back
     /// by `node_status` so the Dashboard reports the node's real compute
     /// width rather than whatever the config currently says — those diverge
@@ -47,6 +678,126 @@ pub struct TestnetResources {
     pub genesis_file: Option<PathBuf>,
 }
 
+fn read_bounded_bundle_resource(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
+    require_regular_bundle_resource(path, name)?;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open signed bundle resource {name}"))?;
+    let length = file.metadata()?.len();
+    anyhow::ensure!(
+        length > 0 && length <= DESKTOP_NETWORK_RESOURCE_MAX_BYTES,
+        "signed bundle resource {name} has invalid bounded size {length}"
+    );
+    let mut bytes = Vec::with_capacity(length as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(DESKTOP_NETWORK_RESOURCE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() as u64 <= DESKTOP_NETWORK_RESOURCE_MAX_BYTES,
+        "signed bundle resource {name} exceeded its bounded size while reading"
+    );
+    Ok(bytes)
+}
+
+/// Copy the signed bundle network identity into stable private app data before
+/// the lifecycle receipt is armed. AppImage mount paths change every launch
+/// and package/manual updates can replace bundle resources; a crash-recovery
+/// receipt must therefore bind files whose path and bytes survive GUI updates.
+fn materialize_stable_testnet_resources(
+    data_dir: &Path,
+    bundle: &TestnetResources,
+) -> anyhow::Result<TestnetResources> {
+    let lifecycle = arc_crypto::secret_file::desktop_shutdown_lifecycle_state(data_dir)
+        .context("cannot inspect managed-node lifecycle before network identity materialization")?;
+    let network_dir = data_dir.join(DESKTOP_NETWORK_IDENTITY_DIR_NAME);
+    let stable_seeds = network_dir.join(DESKTOP_STABLE_SEEDS_FILE_NAME);
+    let stable_genesis = network_dir.join(DESKTOP_STABLE_GENESIS_FILE_NAME);
+
+    if lifecycle.is_clear() {
+        let (bundle_seeds, bundle_genesis) = required_testnet_resources(bundle)?;
+        let seeds = read_bounded_bundle_resource(bundle_seeds, DESKTOP_STABLE_SEEDS_FILE_NAME)?;
+        let genesis =
+            read_bounded_bundle_resource(bundle_genesis, DESKTOP_STABLE_GENESIS_FILE_NAME)?;
+        arc_crypto::secret_file::secure_private_directory_tree(&network_dir).with_context(
+            || {
+                format!(
+                    "cannot durably create stable network identity directory {}",
+                    network_dir.display()
+                )
+            },
+        )?;
+        arc_crypto::secret_file::durably_replace_private(&stable_seeds, &seeds)
+            .context("cannot durably materialize stable signed seed identity")?;
+        arc_crypto::secret_file::durably_replace_private(&stable_genesis, &genesis)
+            .context("cannot durably materialize stable signed genesis identity")?;
+    } else {
+        // Never derive recovery identity from a new AppImage mount or replaced
+        // application bundle. The old stable copy is immutable until the node
+        // publishes a clean ACK and the supervisor consumes the marker.
+        arc_crypto::secret_file::validate_private_directory(&network_dir).with_context(|| {
+            format!(
+                "managed-node recovery fence exists but stable network directory {} is unavailable",
+                network_dir.display()
+            )
+        })?;
+        for (path, name) in [
+            (&stable_seeds, DESKTOP_STABLE_SEEDS_FILE_NAME),
+            (&stable_genesis, DESKTOP_STABLE_GENESIS_FILE_NAME),
+        ] {
+            let file = arc_crypto::secret_file::open_private(path).with_context(|| {
+                format!("managed-node recovery fence exists but stable {name} is unavailable")
+            })?;
+            let length = file.metadata()?.len();
+            anyhow::ensure!(
+                length > 0 && length <= DESKTOP_NETWORK_RESOURCE_MAX_BYTES,
+                "stable recovery resource {name} has invalid bounded size {length}"
+            );
+        }
+    }
+
+    Ok(TestnetResources {
+        seeds_file: Some(stable_seeds.canonicalize()?),
+        genesis_file: Some(stable_genesis.canonicalize()?),
+    })
+}
+
+fn build_legacy_windows_stop_context(
+    config: &NodeConfig,
+    data_dir: PathBuf,
+    validator_seed: Zeroizing<String>,
+    resources: &TestnetResources,
+) -> anyhow::Result<LegacyWindowsStopContext> {
+    let (seeds_file, genesis_file) = required_testnet_resources(resources)?;
+    anyhow::ensure!(
+        !validator_seed.is_empty() && validator_seed.len() <= LEGACY_VALIDATOR_SEED_MAX_BYTES,
+        "persisted legacy validator identity has an invalid bounded length"
+    );
+    anyhow::ensure!(
+        std::fs::symlink_metadata(&data_dir).is_ok_and(
+            |metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+        ),
+        "preserved legacy node data directory is not a regular non-link directory"
+    );
+    Ok(LegacyWindowsStopContext {
+        data_dir,
+        validator_seed,
+        seeds_file: seeds_file.canonicalize()?,
+        genesis_file: genesis_file.canonicalize()?,
+        allowed_port_pairs: (0..5)
+            .map(|offset| {
+                (
+                    config.rpc_port.saturating_add(offset * 10),
+                    config.p2p_port.saturating_add(offset * 10),
+                )
+            })
+            .collect(),
+        // v0.7 resolved relative model arguments in the child process cwd.
+        // Preserve the raw config form and resolve it against that exact cwd
+        // during process matching.
+        model_path: config.model_path.as_deref().map(PathBuf::from),
+        worker_mode: config.role == "worker" && config.model_path.is_some(),
+    })
+}
+
 impl NodeManager {
     pub fn new() -> Self {
         Self {
@@ -58,12 +809,124 @@ impl NodeManager {
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_SIZE))),
             crash_info: Arc::new(Mutex::new(None)),
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_control: None,
+            lifecycle_lock: None,
+            update_lifecycle_lock: None,
+            managed_data_dir: None,
+            durability_failure: None,
+            legacy_windows_stop_context: None,
+            legacy_windows_stop_error: None,
             active_worker_threads: None,
         }
     }
 
     pub async fn clear_crash(&self) {
         *self.crash_info.lock().await = None;
+    }
+
+    pub fn configure_legacy_windows_stop_context(
+        &mut self,
+        config: &NodeConfig,
+        migration_notice: &DataMigrationNotice,
+        validator_seed: Zeroizing<String>,
+        resources: &TestnetResources,
+    ) -> anyhow::Result<()> {
+        let result = (|| {
+            let active_data_dir = resolve_data_dir(&config.data_dir)
+                .canonicalize()
+                .with_context(|| {
+                    format!(
+                        "cannot canonicalize configured active node data directory {}",
+                        resolve_data_dir(&config.data_dir).display()
+                    )
+                })?;
+            let notice_active_data_dir = resolve_data_dir(&migration_notice.active_data_dir)
+                .canonicalize()
+                .context("cannot canonicalize migration notice active data directory")?;
+            anyhow::ensure!(
+                active_data_dir == notice_active_data_dir,
+                "migration notice active directory does not match the persisted node config"
+            );
+            let data_dir = resolve_data_dir(&migration_notice.legacy_data_dir)
+                .canonicalize()
+                .context("cannot canonicalize preserved legacy node data directory")?;
+            build_legacy_windows_stop_context(config, data_dir, validator_seed, resources)
+        })();
+        match result {
+            Ok(context) => {
+                self.legacy_windows_stop_context = Some(context);
+                self.legacy_windows_stop_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.legacy_windows_stop_context = None;
+                self.legacy_windows_stop_error = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn block_legacy_windows_reconciliation(&mut self, reason: impl Into<String>) {
+        self.legacy_windows_stop_context = None;
+        self.legacy_windows_stop_error = Some(reason.into());
+    }
+
+    pub fn configure_managed_data_dir(&mut self, configured: &str) -> anyhow::Result<()> {
+        let data_dir = resolve_data_dir(configured);
+        if !data_dir.exists() {
+            self.managed_data_dir = Some(data_dir);
+            return Ok(());
+        }
+        let data_dir = data_dir.canonicalize().with_context(|| {
+            format!(
+                "cannot canonicalize configured managed node data directory {}",
+                data_dir.display()
+            )
+        })?;
+        self.managed_data_dir = Some(data_dir.clone());
+        match arc_crypto::secret_file::desktop_shutdown_lifecycle_state(&data_dir) {
+            Ok(state) if !state.is_clear() => {
+                self.durability_failure = Some(
+                    "a prior managed node shutdown did not durably acknowledge its final WAL barrier"
+                        .into(),
+                );
+            }
+            Ok(_) => self.durability_failure = None,
+            Err(error) => {
+                let reason = format!(
+                    "the private managed-node shutdown receipt cannot be validated: {error}"
+                );
+                self.durability_failure = Some(reason.clone());
+                anyhow::bail!(reason);
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_durability_failure(&mut self) -> anyhow::Result<()> {
+        let Some(data_dir) = self.managed_data_dir.as_deref() else {
+            return Ok(());
+        };
+        match arc_crypto::secret_file::desktop_shutdown_lifecycle_state(data_dir) {
+            Ok(state) if !state.is_clear() => {
+                self.durability_failure = Some(
+                    "the managed node has not acknowledged a successful final WAL durability barrier"
+                        .into(),
+                );
+                Ok(())
+            }
+            Ok(_) => {
+                self.durability_failure = None;
+                Ok(())
+            }
+            Err(error) => {
+                let reason = format!(
+                    "the private managed-node shutdown receipt cannot be validated: {error}"
+                );
+                self.durability_failure = Some(reason.clone());
+                anyhow::bail!(reason)
+            }
+        }
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -85,8 +948,7 @@ impl NodeManager {
     ///   --rpc <ip>:<port>            bind the HTTP RPC server
     ///   --p2p-port <port>            QUIC P2P listener
     ///   --data-dir <dir>             where WAL + state live
-    ///   --validator-seed <string>    deterministic keypair seed
-    ///                                (the BIP-39 phrase from identity.rs)
+    ///   --validator-key-file <path>  persistent app-owned Ed25519 identity
     ///   --seeds-file <path>          testnet peer bootstrap list
     ///   --genesis <path>             testnet genesis.toml
     ///   --eth-rpc-port 0             disable the extra EVM RPC port
@@ -103,16 +965,88 @@ impl NodeManager {
     pub async fn start(
         &mut self,
         config: &NodeConfig,
-        validator_seed: &str,
+        validator_keyfile: &Path,
         resources: &TestnetResources,
+        lifecycle_lock: ManagedLifecycleLock,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.update_lifecycle_lock.is_none(),
+            "a signed desktop update is installing; refusing to start arc-node until this GUI relaunches"
+        );
         if self.is_running() {
-            return Ok(());
+            anyhow::bail!("managed arc-node is already running");
         }
 
-        let binary = resolve_binary()?;
+        // Network identity is application-owned, never WebView/config-owned.
+        // Both files must resolve from the signed Tauri resource bundle and
+        // must remain regular files. Falling back to arc-node defaults (or to
+        // a same-named file in the process working directory) can silently
+        // place a user's preserved history on a different network.
         let data_dir = resolve_data_dir(&config.data_dir);
-        std::fs::create_dir_all(&data_dir).ok();
+        arc_crypto::secret_file::secure_private_directory_tree(&data_dir).map_err(|error| {
+            anyhow::anyhow!(
+                "cannot durably secure desktop node data directory {}: {error}",
+                data_dir.display()
+            )
+        })?;
+        // Use one canonical path for both argv and the private shutdown
+        // control. In particular, Windows canonicalize may add a verbatim
+        // `\\?\` prefix; mixing normal data argv with a verbatim token argv
+        // makes later detached ownership recovery ambiguous.
+        let data_dir = data_dir.canonicalize().with_context(|| {
+            format!(
+                "cannot canonicalize desktop node data directory {}",
+                data_dir.display()
+            )
+        })?;
+        lifecycle_lock.ensure_data_dir(&data_dir)?;
+        self.managed_data_dir = Some(data_dir.clone());
+        self.refresh_durability_failure()?;
+        let recovery_launch = !arc_crypto::secret_file::desktop_shutdown_lifecycle_state(&data_dir)
+            .context("cannot inspect managed-node lifecycle before executable selection")?
+            .is_clear();
+        let binary = if recovery_launch {
+            // The new GUI environment may not retain the ARC_NODE_BIN/PATH/dev
+            // resolution that launched the fenced process. Recover from the
+            // private durable exact path selected before that process spawned;
+            // the receipt below still authenticates both path and bytes.
+            load_managed_executable_identity(&data_dir)?
+        } else {
+            persist_managed_executable_identity(&data_dir, &resolve_binary()?)?
+        };
+        if !binary_supports_flag(&binary, "--validator-key-file") {
+            anyhow::bail!(
+                "arc-node at {} cannot load the persistent desktop identity; update the managed node before restarting so the wallet/node address is preserved",
+                binary.display()
+            );
+        }
+        let stable_resources = materialize_stable_testnet_resources(&data_dir, resources)?;
+        let (seeds_file, genesis_file) = required_testnet_resources(&stable_resources)?;
+        let supports_desktop_shutdown =
+            binary_supports_flag(&binary, "--desktop-shutdown-token-file");
+        if !supports_desktop_shutdown {
+            anyhow::bail!(
+                "arc-node at {} lacks the authenticated durable desktop shutdown protocol; update the managed node before starting so Stop, Update, and rollback can prove its final WAL barrier",
+                binary.display()
+            );
+        }
+        let mut shutdown_control = if supports_desktop_shutdown {
+            let mut control = prepare_desktop_shutdown_control(&data_dir)?;
+            // A stale receipt is a recovery fence, not a file to overwrite.
+            // Only the same executable/genesis/data/token identity may start
+            // against it, and the node will clear it only after full replay
+            // plus a later authenticated clean shutdown.
+            control.bind_receipt_identity(&binary, genesis_file)?;
+            if control.receipt_nonce.is_some() {
+                self.durability_failure = Some(
+                    "a prior managed node shutdown did not durably acknowledge its final WAL barrier"
+                        .into(),
+                );
+            }
+            Some(control)
+        } else {
+            None
+        };
 
         // Probe for an available port pair. First preference is the configured
         // port; fall back in 10-port increments up to 5 tries. This catches the
@@ -166,8 +1100,19 @@ impl NodeManager {
             // field. Gate it on `binary_supports_flag(&binary, "--community")`.
             .arg("--stake")
             .arg("0")
+            // The wallet phrase never enters argv, the child environment, or
+            // logs. identity.rs derives the exact historical Ed25519 key and
+            // atomically materializes this private, app-owned JSON keyfile.
+            // Keeping it persistent preserves the node/reward address across
+            // desktop and machine restarts.
+            .arg("--validator-key-file")
+            .arg(validator_keyfile)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(control) = shutdown_control.as_ref() {
+            cmd.arg("--desktop-shutdown-token-file")
+                .arg(&control.token_file);
+        }
 
         // ── Compute contribution ────────────────────────────────────────
         // rayon sizes its global pool from RAYON_NUM_THREADS the first time
@@ -233,29 +1178,13 @@ impl NodeManager {
             cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
 
-        // Bundled testnet bootstrap config. Fall back to arc-node's built-in
-        // defaults if the resource wasn't found (shouldn't happen in a
-        // shipped build, but don't crash dev-mode).
-        if let Some(seeds) = &resources.seeds_file {
-            cmd.arg("--seeds-file").arg(seeds);
-        } else {
-            push_log(
-                &self.logs,
-                "warn",
-                "testnet-seeds.txt not bundled - node will start isolated".into(),
-            )
-            .await;
-        }
-        if let Some(genesis) = &resources.genesis_file {
-            cmd.arg("--genesis").arg(genesis);
-        } else {
-            push_log(
-                &self.logs,
-                "warn",
-                "genesis.toml not bundled - node validator set will be empty".into(),
-            )
-            .await;
-        }
+        // Required signed-bundle network bootstrap files. Their selection is
+        // deliberately absent from NodeConfig, so stale or malicious WebView
+        // IPC cannot redirect either one.
+        cmd.arg("--seeds-file")
+            .arg(seeds_file)
+            .arg("--genesis")
+            .arg(genesis_file);
 
         // Only register as a community inference worker if we actually
         // have a model to serve. role="worker" without model_path is
@@ -288,14 +1217,10 @@ impl NodeManager {
             &self.logs,
             "info",
             format!(
-                "spawning {} --rpc 127.0.0.1:{} --p2p-port {} --stake 0 --validator-seed <{}…> {}{}{}",
+                "spawning {} --rpc 127.0.0.1:{} --p2p-port {} --stake 0 --validator-key-file <app-owned-private-keyfile> {}{}{}",
                 binary.display(),
                 rpc_port,
                 p2p_port,
-                &validator_seed
-                    .chars()
-                    .take(8)
-                    .collect::<String>(),
                 if config.role == "worker" && config.model_path.is_some() {
                     "--community-mode --full-integer-worker "
                 } else {
@@ -315,41 +1240,38 @@ impl NodeManager {
         )
         .await;
 
-        // The validator seed is the wallet's BIP-39 phrase, so it goes in the
-        // environment rather than argv. A process's command line is readable
-        // by every user on the machine (`ps -ax -o command`), which would put
-        // the phrase that controls the user's funds in the process table;
-        // its environment is readable only by the owning user. arc-node reads
-        // ARC_VALIDATOR_SEED as the fallback for --validator-seed.
-        //
-        // Older binaries (<= v0.7.11) predate the env fallback and would
-        // silently derive the DEFAULT identity from "arc-validator-0" — a
-        // different address, so earnings would accrue to a key the user does
-        // not hold. Only omit the flag when the binary advertises the env var.
-        // clap prints `[env: ARC_VALIDATOR_SEED=]` in --help for an arg with an
-        // env fallback, so the existing --help probe answers this too.
-        if binary_supports_flag(&binary, "ARC_VALIDATOR_SEED") {
-            cmd.env("ARC_VALIDATOR_SEED", validator_seed);
-        } else {
-            tracing::warn!(
-                "arc-node at {} predates ARC_VALIDATOR_SEED; passing the seed on \
-                 the command line, where other users on this machine can read it. \
-                 Update the node binary to keep it out of the process table.",
-                binary.display()
+        if let Some(control) = shutdown_control.as_mut() {
+            // All fallible identity/port/flag/resource preflight is complete.
+            // Arm immediately before spawn so any later desktop/node/OS crash
+            // leaves a durable recovery fence for the full process lifetime.
+            control.ensure_receipt_armed()?;
+            self.durability_failure = Some(
+                "the running managed node has not yet acknowledged its final WAL durability barrier"
+                    .into(),
             );
-            cmd.arg("--validator-seed").arg(validator_seed);
         }
-
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to start arc-node at {}: {}. If this is your first launch, the binary should have been auto-downloaded. Check ~/.arc/bin/arc-node exists and is executable.",
-                binary.display(),
-                e
-            )
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // Leave the published receipt fail-closed even when spawn
+                // fails. Another desktop may have accepted the identical
+                // marker and successfully spawned between our arm and this
+                // error; cancelling it would leave that live writer unfenced.
+                // An exact recovery start can reuse the marker and clear it
+                // only through a later full replay + clean WAL ACK.
+                self.refresh_durability_failure()?;
+                return Err(anyhow::anyhow!(
+                    "Failed to start arc-node at {}: {}. If this is your first launch, the binary should have been auto-downloaded. Check ~/.arc/bin/arc-node exists and is executable.",
+                    binary.display(),
+                    error
+                ));
+            }
+        };
 
         self.rpc_port = rpc_port;
         self.started_at = Some(Instant::now());
+        self.shutdown_control = shutdown_control;
+        self.lifecycle_lock = Some(lifecycle_lock);
         self.active_worker_threads = config.worker_threads.filter(|n| *n > 0);
 
         // Drain stdout/stderr into the log ring.
@@ -403,6 +1325,8 @@ impl NodeManager {
                     .swap(false, std::sync::atomic::Ordering::SeqCst);
                 self.child = None;
                 self.started_at = None;
+                self.shutdown_control = None;
+                self.lifecycle_lock = None;
                 self.active_worker_threads = None;
                 if !was_stopping {
                     let code = status.code();
@@ -423,46 +1347,253 @@ impl NodeManager {
         }
     }
 
-    pub async fn stop(&mut self) -> anyhow::Result<()> {
+    async fn stop_owned_child(&mut self) -> anyhow::Result<usize> {
+        let mut stopped = 0usize;
         if let Some(mut child) = self.child.take() {
+            let mut shutdown_control = self.shutdown_control.take();
             // Tell the crash reaper this is intentional so it doesn't fire.
             self.stopping
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let outcome =
+                terminate_owned_child(&mut child, shutdown_control.as_mut(), GRACEFUL_STOP_TIMEOUT)
+                    .await;
+            self.stopping
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // A request, termination, or reap error is not proof that
+                    // the WAL writer is gone. Preserve the exact owned Child
+                    // handle and its capability whenever it may still be live,
+                    // so the UI cannot launch another writer against the same
+                    // data directory and a later Stop can safely retry.
+                    let receipt_error = self.refresh_durability_failure().err();
+                    self.restore_child_after_failed_stop(child, shutdown_control);
+                    if let Some(receipt_error) = receipt_error {
+                        return Err(error.context(format!(
+                            "shutdown receipt state is also invalid: {receipt_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(reason) = outcome.forced_reason {
+                push_log(
+                    &self.logs,
+                    "warn",
+                    format!(
+                        "arc-node did not complete a graceful shutdown ({}); forced termination was required after the bounded wait",
+                        reason
+                    ),
+                )
+                .await;
+            }
+            stopped += 1;
+            self.refresh_durability_failure()?;
+            self.lifecycle_lock = None;
             self.started_at = None;
             self.active_worker_threads = None;
             *self.crash_info.lock().await = None;
-            push_log(&self.logs, "info", "arc-node stopped".into()).await;
-            return Ok(());
         }
+        Ok(stopped)
+    }
+
+    fn restore_child_after_failed_stop(
+        &mut self,
+        mut child: Child,
+        shutdown_control: Option<DesktopShutdownControl>,
+    ) {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                self.started_at = None;
+                self.active_worker_threads = None;
+                self.lifecycle_lock = None;
+            }
+            Ok(None) | Err(_) => {
+                self.child = Some(child);
+                self.shutdown_control = shutdown_control;
+            }
+        }
+    }
+
+    async fn stop_and_retain_lifecycle_lock(
+        &mut self,
+    ) -> anyhow::Result<Option<ManagedLifecycleLock>> {
+        anyhow::ensure!(
+            self.update_lifecycle_lock.is_none(),
+            "a signed desktop update already owns the managed-node lifecycle fence"
+        );
+        if let Some(error) = self.legacy_windows_stop_error.as_deref() {
+            anyhow::bail!(
+                "legacy desktop node reconciliation is unresolved; refusing Stop/update boundary: {error}"
+            );
+        }
+        // Transfer the owned-child guard into this stop transaction. Keeping
+        // it in `self` is insufficient: `stop_owned_child` consumes the ACK
+        // and clears `self.lifecycle_lock`, which used to leave a cross-GUI
+        // race before the detached scan and final lifecycle-state check. A
+        // second desktop could start a new writer in that gap and this caller
+        // could still report an update-safe boundary. A restarted GUI instead
+        // acquires the same guard here before inspecting detached processes.
+        let mut lifecycle_lock = match self.lifecycle_lock.take() {
+            Some(lock) => Some(lock),
+            None => self
+                .managed_data_dir
+                .as_deref()
+                .map(|data_dir| acquire_managed_lifecycle_lock(&data_dir.to_string_lossy()))
+                .transpose()?,
+        };
+        let mut stopped = match self.stop_owned_child().await {
+            Ok(stopped) => stopped,
+            Err(error) => {
+                // A failed owned-child stop may restore the live Child and its
+                // shutdown capability. Reassociate the same OS-held guard so
+                // no other desktop can enter the lifecycle while it remains
+                // live. If the child is already gone, the durable receipt is
+                // the fail-closed recovery fence and the local guard may drop.
+                if self.child.is_some() {
+                    self.lifecycle_lock = lifecycle_lock.take();
+                }
+                return Err(error);
+            }
+        };
         // No managed child handle. This happens when the Tauri process
         // restarted (e.g. cargo rebuild in dev) while arc-node — spawned
         // with CREATE_NEW_PROCESS_GROUP — kept running detached. Locate
         // it by the managed binary path and kill it so the UI's Stop
         // button is not a no-op.
-        let killed = kill_detached_arc_node();
-        if killed > 0 {
+        //
+        // Run this even after stopping an owned child. Multiple app instances
+        // or an interrupted updater can leave more than one matching detached
+        // process, and a release boundary must drain all of them.
+        // The tokenless v0.7 proof is a one-time upgrade capability. Move it
+        // out before reconciliation so its Zeroizing seed is dropped after a
+        // successful scan (including zero matches). Restore it only when the
+        // exact proof/termination operation errors and a safe retry is needed.
+        let legacy_context = self.legacy_windows_stop_context.take();
+        let reconciliation =
+            stop_detached_arc_node(legacy_context.as_ref(), self.managed_data_dir.as_deref()).await;
+        let detached = finish_legacy_reconciliation(
+            &mut self.legacy_windows_stop_context,
+            legacy_context,
+            reconciliation,
+        )?;
+        stopped += detached.stopped;
+        if detached.forced > 0 {
+            push_log(
+                &self.logs,
+                "warn",
+                format!(
+                    "{} detached arc-node process(es) did not complete a graceful shutdown; forced termination was required after the bounded wait",
+                    detached.forced
+                ),
+            )
+            .await;
+        }
+        if stopped > 0 {
             self.started_at = None;
+            self.active_worker_threads = None;
             *self.crash_info.lock().await = None;
             push_log(
                 &self.logs,
                 "info",
-                format!("arc-node stopped (detached, {} pid)", killed),
+                format!("arc-node stopped ({} managed process(es))", stopped),
             )
             .await;
         }
+        self.refresh_durability_failure()?;
+        if let Some(error) = self.durability_failure.as_deref() {
+            return Err(ManagedDurabilityRecoveryRequired {
+                reason: error.to_owned(),
+            }
+            .into());
+        }
+        // Return the still-live guard so callers performing a local mutation
+        // or update can extend the same transaction without a release/reopen
+        // gap. Plain Stop drops it immediately after this function returns.
+        Ok(lifecycle_lock)
+    }
+
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
+        drop(self.stop_and_retain_lifecycle_lock().await?);
+        Ok(())
+    }
+
+    /// Stop every proven managed writer and retain the exact data-directory
+    /// lifecycle lock for the caller's following mutation/start transaction.
+    pub async fn stop_for_local_mutation(&mut self) -> anyhow::Result<ManagedLifecycleLock> {
+        self.stop_and_retain_lifecycle_lock()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("managed node data directory is not configured"))
+    }
+
+    /// Establish the native half of the updater boundary. The guard remains
+    /// owned by this NodeManager after IPC returns and is released only by
+    /// process exit/relaunch or an explicit failed-install abort transaction.
+    pub async fn prepare_update_relaunch(&mut self) -> anyhow::Result<()> {
+        if self.update_lifecycle_lock.is_some() {
+            // A second prepare is never a harmless idempotent success. The
+            // previous pre-install abort may have retained this fence because
+            // detached-process reconciliation failed even though no receipt
+            // was visible. Reporting success here would let a UI retry enter
+            // install() without re-proving that boundary. The controller
+            // coalesces legitimate concurrent clicks, so fail closed until a
+            // successful abort releases the existing fence or this GUI exits.
+            anyhow::bail!(
+                "a signed desktop update already owns the managed-node lifecycle fence"
+            );
+        }
+        let lifecycle_lock = self.stop_for_local_mutation().await?;
+        self.update_lifecycle_lock = Some(lifecycle_lock);
+        Ok(())
+    }
+
+    /// Release an updater fence only after a rejected/cancelled install, and
+    /// only after re-proving that no owned or detached writer exists and the
+    /// authenticated lifecycle receipt is clear. Successful installation never
+    /// calls this: a relaunch failure must stay fenced until manual GUI exit.
+    pub async fn abort_update_relaunch(&mut self) -> anyhow::Result<()> {
+        if self.update_lifecycle_lock.is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.child.is_none(),
+            "cannot release update lifecycle fence while an owned node is live"
+        );
+
+        let legacy_context = self.legacy_windows_stop_context.take();
+        let reconciliation =
+            stop_detached_arc_node(legacy_context.as_ref(), self.managed_data_dir.as_deref()).await;
+        let detached = finish_legacy_reconciliation(
+            &mut self.legacy_windows_stop_context,
+            legacy_context,
+            reconciliation,
+        )?;
+        anyhow::ensure!(
+            detached.forced == 0,
+            "cannot release update lifecycle fence after an unproven forced stop"
+        );
+        self.refresh_durability_failure()?;
+        if let Some(error) = self.durability_failure.as_deref() {
+            return Err(ManagedDurabilityRecoveryRequired {
+                reason: error.to_owned(),
+            }
+            .into());
+        }
+        self.update_lifecycle_lock = None;
         Ok(())
     }
 
     pub async fn restart(
         &mut self,
         config: &NodeConfig,
-        validator_seed: &str,
+        validator_keyfile: &Path,
         resources: &TestnetResources,
     ) -> anyhow::Result<()> {
         self.stop().await?;
-        self.start(config, validator_seed, resources).await
+        let lifecycle_lock = acquire_managed_lifecycle_lock(&config.data_dir)?;
+        self.start(config, validator_keyfile, resources, lifecycle_lock)
+            .await
     }
 
     pub async fn logs_snapshot(&self, limit: usize) -> Vec<LogEntry> {
@@ -478,6 +1609,153 @@ impl NodeManager {
             .rev()
             .collect()
     }
+}
+
+/// Ask the node to run its signal-driven shutdown path first so it can drain
+/// RPC work and sync the WAL. A force-kill is a bounded, explicitly reported
+/// fallback only; merely accepting a termination request is never treated as
+/// a completed updater boundary.
+async fn terminate_owned_child(
+    child: &mut Child,
+    shutdown_control: Option<&mut DesktopShutdownControl>,
+    graceful_timeout: Duration,
+) -> anyhow::Result<ChildStopOutcome> {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| anyhow::anyhow!("failed to inspect managed arc-node process: {error}"))?
+    {
+        anyhow::ensure!(
+            status.success(),
+            "managed arc-node exited with {status} before the shutdown boundary; final WAL durability was not proven"
+        );
+        if let Some(control) = shutdown_control.as_deref() {
+            anyhow::ensure!(
+                control.validate_clean_ack()?,
+                "managed arc-node exited successfully but did not publish its authenticated clean shutdown ACK"
+            );
+            control.consume_clean_ack()?;
+        }
+        return Ok(ChildStopOutcome {
+            forced_reason: None,
+        });
+    }
+
+    let control = shutdown_control
+        .ok_or_else(|| anyhow::anyhow!("managed node has no private durable shutdown control"))?;
+    control.ensure_receipt_armed()?;
+    anyhow::ensure!(
+        control.validate_armed_receipt()?,
+        "managed-node shutdown receipt disappeared before request publication"
+    );
+    request_graceful_stop(child, Some(control)).with_context(|| {
+        "the platform graceful-stop request failed; refusing an unauthenticated force-stop"
+    })?;
+    let forced_reason = match tokio::time::timeout(graceful_timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            anyhow::ensure!(
+                status.success(),
+                "managed arc-node exited with {status} after the authenticated shutdown request; final WAL durability was not proven"
+            );
+            anyhow::ensure!(
+                control.validate_clean_ack()?,
+                "managed arc-node exited successfully but did not publish its authenticated clean shutdown ACK"
+            );
+            control.consume_clean_ack()?;
+            return Ok(ChildStopOutcome {
+                forced_reason: None,
+            });
+        }
+        Ok(Err(error)) => {
+            return Err(anyhow::anyhow!(
+                "waiting for graceful managed arc-node exit failed: {error}"
+            ));
+        }
+        Err(_) => format!(
+            "the process remained alive for {} seconds after the authenticated graceful request",
+            graceful_timeout.as_secs_f32()
+        ),
+    };
+
+    // Avoid a force-kill if the process exited in the narrow interval between
+    // the timeout/request error and this fallback decision.
+    if let Some(status) = child.try_wait().map_err(|error| {
+        anyhow::anyhow!("failed to re-inspect managed arc-node process: {error}")
+    })? {
+        anyhow::ensure!(
+            status.success(),
+            "managed arc-node exited with {status} after the authenticated shutdown request; final WAL durability was not proven"
+        );
+        anyhow::ensure!(
+            control.validate_clean_ack()?,
+            "managed arc-node exited successfully but did not publish its authenticated clean shutdown ACK"
+        );
+        control.consume_clean_ack()?;
+        return Ok(ChildStopOutcome {
+            forced_reason: None,
+        });
+    } else {
+        child.start_kill().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to force-stop managed arc-node process after {forced_reason}: {error}"
+            )
+        })?;
+        match tokio::time::timeout(FORCE_STOP_TIMEOUT, child.wait()).await {
+            Ok(Ok(_status)) => {}
+            Ok(Err(error)) => {
+                anyhow::bail!("forced arc-node process could not be reaped: {error}")
+            }
+            Err(_) => anyhow::bail!(
+                "timed out after {} seconds reaping the force-stopped arc-node process",
+                FORCE_STOP_TIMEOUT.as_secs()
+            ),
+        }
+    }
+    anyhow::bail!(
+        "managed arc-node required force termination after {forced_reason}; its unproven receipt remains armed and the updater boundary is blocked"
+    )
+}
+
+#[cfg(unix)]
+fn request_graceful_stop(
+    child: &Child,
+    shutdown_control: Option<&DesktopShutdownControl>,
+) -> anyhow::Result<()> {
+    let target_pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("managed process has no live PID"))?;
+    write_desktop_shutdown_request(
+        shutdown_control.ok_or_else(|| {
+            anyhow::anyhow!("managed Unix node has no authenticated shutdown control")
+        })?,
+        target_pid,
+    )
+}
+
+#[cfg(windows)]
+fn request_graceful_stop(
+    child: &Child,
+    shutdown_control: Option<&DesktopShutdownControl>,
+) -> anyhow::Result<()> {
+    // CREATE_NO_WINDOW deliberately removes the console-control channel.
+    // Use the private local file capability shared with arc-node instead;
+    // there is no remotely reachable shutdown route or bearer token in argv.
+    let target_pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("managed process has no live PID"))?;
+    write_desktop_shutdown_request(
+        shutdown_control.ok_or_else(|| {
+            anyhow::anyhow!("managed Windows node has no authenticated shutdown control")
+        })?,
+        target_pid,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn request_graceful_stop(
+    _child: &Child,
+    _shutdown_control: Option<&DesktopShutdownControl>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("this platform exposes no supported graceful process signal")
 }
 
 async fn push_log(logs: &Arc<Mutex<VecDeque<LogEntry>>>, level: &str, message: String) {
@@ -604,6 +1882,39 @@ fn resolve_binary() -> anyhow::Result<PathBuf> {
     ))
 }
 
+fn required_testnet_resources(resources: &TestnetResources) -> anyhow::Result<(&Path, &Path)> {
+    let seeds = resources.seeds_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ARC refused to start because signed bundle resource testnet-seeds.txt is missing"
+        )
+    })?;
+    let genesis = resources.genesis_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ARC refused to start because signed bundle resource genesis.toml is missing"
+        )
+    })?;
+
+    require_regular_bundle_resource(seeds, "testnet-seeds.txt")?;
+    require_regular_bundle_resource(genesis, "genesis.toml")?;
+    Ok((seeds, genesis))
+}
+
+fn require_regular_bundle_resource(path: &Path, name: &str) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        anyhow::anyhow!(
+            "ARC refused to start because signed bundle resource {name} at {} cannot be inspected: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "ARC refused to start because signed bundle resource {name} at {} is not a regular file",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Does this arc-node accept `flag`?
 ///
 /// clap aborts the process on an unrecognized argument, so every optional
@@ -613,20 +1924,71 @@ fn resolve_binary() -> anyhow::Result<PathBuf> {
 ///
 /// Cached per (binary, flag): `--help` costs a process spawn, and `start()`
 /// runs on every user-visible Start click.
+#[cfg(windows)]
+fn windows_binary_file_identity(path: &Path) -> Option<String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: the all-zero value is a valid output buffer for the Win32 API.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the File owns a live handle and `information` is writable for
+    // the duration of this synchronous call.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return None;
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some(format!("{}:{file_index}", information.dwVolumeSerialNumber))
+}
+
 pub fn binary_supports_flag(binary: &Path, flag: &str) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex as StdMutex, OnceLock};
 
     static CACHE: OnceLock<StdMutex<HashMap<String, bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
-    let key = format!("{}\u{0}{}", binary.display(), flag);
+    let canonical = binary
+        .canonicalize()
+        .unwrap_or_else(|_| binary.to_path_buf());
+    let freshness = std::fs::metadata(&canonical)
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let created = metadata
+                .created()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            #[cfg(unix)]
+            let stable_identity = {
+                use std::os::unix::fs::MetadataExt as _;
+                format!("{}:{}", metadata.dev(), metadata.ino())
+            };
+            #[cfg(windows)]
+            let stable_identity = windows_binary_file_identity(&canonical)
+                .unwrap_or_else(|| "unavailable-file-identity".into());
+            format!("{stable_identity}:{}:{modified}:{created}", metadata.len())
+        })
+        .unwrap_or_else(|_| "missing".into());
+    // The updater replaces the executable at the same managed path. Include
+    // file freshness so a v0.7 negative probe cannot poison the subsequent
+    // v0.8 capability check in the same desktop process.
+    let key = format!("{}\u{0}{freshness}\u{0}{flag}", canonical.display());
     if let Ok(guard) = cache.lock() {
         if let Some(hit) = guard.get(&key) {
             return *hit;
         }
     }
 
-    let mut cmd = std::process::Command::new(binary);
+    let mut cmd = std::process::Command::new(&canonical);
     cmd.arg("--help");
     #[cfg(windows)]
     {
@@ -657,35 +2019,1250 @@ pub fn binary_supports_flag(binary: &Path, flag: &str) -> bool {
 /// Canonical location for the auto-downloaded arc-node binary.
 /// `~/.arc/bin/arc-node` (or `.exe` on Windows). Public so commands.rs can
 /// write to the same path during auto-download.
-/// Find and kill any arc-node process whose executable matches the managed
-/// binary path. Returns the count killed. Used by `stop()` when the in-memory
-/// child handle is gone (typically after a Tauri-side dev rebuild).
-fn kill_detached_arc_node() -> usize {
-    // Match every path the node could have been launched from, not just the
-    // managed one — otherwise Stop is a silent no-op for anyone running the
-    // dev build or an ARC_NODE_BIN override, which is exactly the demo
-    // machine's configuration.
-    let candidates: Vec<PathBuf> = [
-        env_binary_override(),
-        Some(managed_binary_path()),
-        dev_build_binary(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|p| p.canonicalize().unwrap_or(p))
-    .collect();
+fn unique_command_flag_value<'a>(
+    command: &'a [std::ffi::OsString],
+    flag: &str,
+) -> Option<&'a std::ffi::OsStr> {
+    let flag = std::ffi::OsStr::new(flag);
+    let mut values = command
+        .windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_os_str());
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    let mut killed = 0;
-    for proc_ in sys.processes().values() {
-        let Some(exe) = proc_.exe() else { continue };
-        let exe_canon = exe.canonicalize().unwrap_or(exe.to_path_buf());
-        if candidates.contains(&exe_canon) && proc_.kill() {
-            killed += 1;
+/// Recover a capability only from the exact argv shape emitted by the
+/// desktop: one canonical data directory and the exact token beneath that
+/// directory's named private control boundary. Merely executing the same
+/// arc-node binary is never evidence that a manual/headless node belongs to
+/// the desktop.
+#[cfg(any(unix, windows, test))]
+fn desktop_shutdown_control_from_command(
+    command: &[std::ffi::OsString],
+) -> anyhow::Result<Option<DesktopShutdownControl>> {
+    let token_flag = std::ffi::OsStr::new("--desktop-shutdown-token-file");
+    let token_occurrences = command.iter().filter(|value| *value == token_flag).count();
+    if token_occurrences == 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        token_occurrences == 1,
+        "managed desktop shutdown capability flag is duplicated"
+    );
+    let token_file_arg = unique_command_flag_value(command, "--desktop-shutdown-token-file")
+        .ok_or_else(|| anyhow::anyhow!("managed desktop shutdown capability has no value"))?;
+    let data_flag = std::ffi::OsStr::new("--data-dir");
+    anyhow::ensure!(
+        command.iter().filter(|value| *value == data_flag).count() == 1,
+        "managed desktop shutdown capability requires exactly one data directory"
+    );
+    let data_dir_arg = unique_command_flag_value(command, "--data-dir")
+        .ok_or_else(|| anyhow::anyhow!("managed desktop data directory has no value"))?;
+    let raw_data_dir = Path::new(data_dir_arg);
+    let raw_token_file = Path::new(token_file_arg);
+    let Some(raw_control_dir) = raw_token_file.parent() else {
+        anyhow::bail!("managed desktop shutdown capability has no parent directory");
+    };
+    if raw_token_file.file_name() != Some(std::ffi::OsStr::new(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME))
+        || raw_control_dir.file_name()
+            != Some(std::ffi::OsStr::new(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME))
+    {
+        anyhow::bail!("managed desktop shutdown capability has an unexpected path shape");
+    }
+    // Once argv has the exact desktop-emitted path binding, recovery is
+    // fail-closed: a deleted token, corrupt private directory, or access/DACL
+    // failure means the updater cannot prove a safe stop boundary.
+    let data_dir = raw_data_dir.canonicalize().with_context(|| {
+        format!(
+            "cannot recover exact managed desktop data directory {}",
+            raw_data_dir.display()
+        )
+    })?;
+    let expected_control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    let control_dir = raw_control_dir.canonicalize().with_context(|| {
+        format!(
+            "cannot recover advertised desktop shutdown control directory {}",
+            raw_control_dir.display()
+        )
+    })?;
+    if control_dir != expected_control_dir {
+        anyhow::bail!("managed desktop shutdown capability is not bound to its data directory");
+    }
+    let token_file = raw_token_file.canonicalize().with_context(|| {
+        format!(
+            "cannot recover exact managed desktop shutdown token {}",
+            raw_token_file.display()
+        )
+    })?;
+    let expected_token_file = control_dir.join(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME);
+    anyhow::ensure!(
+        token_file == expected_token_file,
+        "exact managed desktop shutdown token changed identity"
+    );
+    read_desktop_shutdown_control(&token_file)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "cannot recover exact managed desktop shutdown control {}",
+                token_file.display()
+            )
+        })
+}
+
+fn constant_time_legacy_seed_eq(candidate: &std::ffi::OsStr, expected: &Zeroizing<String>) -> bool {
+    let Some(candidate) = candidate.to_str() else {
+        return false;
+    };
+    let candidate = candidate.trim().as_bytes();
+    let expected = expected.trim().as_bytes();
+    if candidate.len() > LEGACY_VALIDATOR_SEED_MAX_BYTES
+        || expected.len() > LEGACY_VALIDATOR_SEED_MAX_BYTES
+    {
+        return false;
+    }
+    // Both identities are compared across the same public upper bound. This
+    // avoids a secret-dependent early mismatch while retaining exact equality
+    // (including length) for the recovery phrase that old desktop builds put
+    // in argv. The expected copy remains Zeroizing and is never formatted.
+    let mut difference = candidate.len() ^ expected.len();
+    for index in 0..LEGACY_VALIDATOR_SEED_MAX_BYTES {
+        let left = candidate.get(index).copied().unwrap_or(0);
+        let right = expected.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
+}
+
+fn canonical_process_path(value: &std::ffi::OsStr, process_cwd: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(value);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        process_cwd?.join(path)
+    };
+    resolved.canonicalize().ok()
+}
+
+fn legacy_packaged_resource_matches(
+    value: &std::ffi::OsStr,
+    process_cwd: Option<&Path>,
+    current_signed_resource: &Path,
+    expected_name: &str,
+) -> bool {
+    if let Some(canonical) = canonical_process_path(value, process_cwd) {
+        return canonical == current_signed_resource;
+    }
+    // Linux AppImage resources live beneath an ephemeral /tmp/.mount_* tree
+    // that disappears when the old GUI relaunches even though its detached
+    // node survives. The real public tags always emitted both resources from
+    // the signed bundle's `resources/` directory. When that mount is gone, the
+    // remaining exact evidence is the immutable tag argv shape plus managed
+    // executable, persisted secret seed, data dir, ports, role and model. Only
+    // accept that exact packaged lexical suffix; arbitrary missing paths do
+    // not qualify.
+    let path = Path::new(value);
+    path.file_name() == Some(std::ffi::OsStr::new(expected_name))
+        && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("resources"))
+}
+
+fn legacy_windows_command_matches(
+    command: &[std::ffi::OsString],
+    process_cwd: Option<&Path>,
+    context: &LegacyWindowsStopContext,
+) -> bool {
+    use std::collections::HashMap;
+
+    if unique_command_flag_value(command, "--desktop-shutdown-token-file").is_some() {
+        return false;
+    }
+    let mut values = HashMap::<&str, Vec<&std::ffi::OsStr>>::new();
+    let mut flags = Vec::<&str>::new();
+    let mut index = usize::from(
+        command
+            .first()
+            .and_then(|arg| arg.to_str())
+            .is_some_and(|arg| !arg.starts_with("--")),
+    );
+    while index < command.len() {
+        let Some(flag) = command[index].to_str() else {
+            return false;
+        };
+        match flag {
+            "--community-mode" => {
+                flags.push(flag);
+                index += 1;
+            }
+            "--rpc" | "--p2p-port" | "--data-dir" | "--eth-rpc-port" | "--validator-seed"
+            | "--seeds-file" | "--genesis" | "--model" => {
+                let Some(value) = command.get(index + 1) else {
+                    return false;
+                };
+                values.entry(flag).or_default().push(value.as_os_str());
+                index += 2;
+            }
+            _ => return false,
         }
     }
-    killed
+    let exactly_one = |flag: &str| values.get(flag).filter(|found| found.len() == 1);
+    let canonical_value = |flag: &str| {
+        exactly_one(flag).and_then(|found| canonical_process_path(found[0], process_cwd))
+    };
+    let resources_match = match (values.get("--seeds-file"), values.get("--genesis")) {
+        (Some(seeds), Some(genesis)) if seeds.len() == 1 && genesis.len() == 1 => {
+            legacy_packaged_resource_matches(
+                seeds[0],
+                process_cwd,
+                &context.seeds_file,
+                "testnet-seeds.txt",
+            ) && legacy_packaged_resource_matches(
+                genesis[0],
+                process_cwd,
+                &context.genesis_file,
+                "genesis.toml",
+            )
+        }
+        _ => false,
+    };
+    if canonical_value("--data-dir").as_ref() != Some(&context.data_dir)
+        || !resources_match
+        || exactly_one("--eth-rpc-port").and_then(|v| v[0].to_str()) != Some("0")
+        || !exactly_one("--validator-seed")
+            .is_some_and(|values| constant_time_legacy_seed_eq(values[0], &context.validator_seed))
+    {
+        return false;
+    }
+    let Some(rpc) = exactly_one("--rpc").and_then(|v| v[0].to_str()) else {
+        return false;
+    };
+    let Some(rpc_port) = rpc
+        .strip_prefix("127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    let Some(p2p_port) = exactly_one("--p2p-port")
+        .and_then(|v| v[0].to_str())
+        .and_then(|port| port.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    if !context.allowed_port_pairs.contains(&(rpc_port, p2p_port)) {
+        return false;
+    }
+    let model_matches = match (&context.model_path, exactly_one("--model")) {
+        (None, None) => true,
+        (Some(expected), Some(found)) => {
+            canonical_process_path(found[0], process_cwd)
+                == canonical_process_path(expected.as_os_str(), process_cwd)
+        }
+        _ => false,
+    };
+    if !model_matches {
+        return false;
+    }
+    flags.sort_unstable();
+    let expected_flags = if context.worker_mode {
+        vec!["--community-mode"]
+    } else {
+        Vec::new()
+    };
+    if flags != expected_flags {
+        return false;
+    }
+    std::fs::symlink_metadata(&context.data_dir)
+        .is_ok_and(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+}
+
+pub fn detect_running_legacy_v07_data_dir(
+    config: &NodeConfig,
+    validator_seed: &Zeroizing<String>,
+    resources: &TestnetResources,
+) -> anyhow::Result<Option<PathBuf>> {
+    let managed_path = managed_binary_path();
+    let managed = match managed_path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("cannot canonicalize managed legacy executable"),
+    };
+    let mut system = sysinfo::System::new();
+    refresh_process_command_metadata(&mut system);
+    let mut matches = Vec::new();
+    for process in system.processes().values() {
+        let Some(executable) = process.exe() else {
+            continue;
+        };
+        if executable
+            .canonicalize()
+            .unwrap_or_else(|_| executable.to_path_buf())
+            != managed
+        {
+            continue;
+        }
+        let Some(data_value) = unique_command_flag_value(process.cmd(), "--data-dir") else {
+            continue;
+        };
+        let Some(data_dir) = canonical_process_path(data_value, process.cwd()) else {
+            continue;
+        };
+        let context = build_legacy_windows_stop_context(
+            config,
+            data_dir.clone(),
+            validator_seed.clone(),
+            resources,
+        )?;
+        if legacy_windows_command_matches(process.cmd(), process.cwd(), &context) {
+            matches.push(data_dir);
+        }
+    }
+    anyhow::ensure!(
+        matches.len() <= 1,
+        "more than one exact managed v0.7 desktop process is live; refusing ambiguous data migration"
+    );
+    Ok(matches.pop())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetachedProcessIdentity {
+    pid: sysinfo::Pid,
+    start_time: u64,
+    executable: PathBuf,
+}
+
+struct ManagedDetachedProcess {
+    identity: DetachedProcessIdentity,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    shutdown_control: DesktopShutdownControl,
+    #[cfg(windows)]
+    handle: WindowsProcessHandle,
+}
+
+#[cfg(windows)]
+struct WindowsProcessHandle {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+// Windows process handles are kernel object references and may be waited or
+// terminated from any thread. Ownership remains unique in this RAII wrapper.
+unsafe impl Send for WindowsProcessHandle {}
+#[cfg(windows)]
+// Waiting/querying a process kernel object through shared references is safe;
+// termination remains serialized by the owning NodeManager stop operation.
+unsafe impl Sync for WindowsProcessHandle {}
+
+#[cfg(windows)]
+impl WindowsProcessHandle {
+    fn open(pid: u32, expected_start_time: u64) -> std::io::Result<Self> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE,
+        };
+        // SAFETY: OpenProcess receives a numeric PID and returns an owned
+        // kernel handle; handle inheritance is explicitly disabled.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: outputs point to initialized FILETIME storage and the
+        // retained handle has query access.
+        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
+        {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        let windows_ticks =
+            ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+        let start_time = windows_ticks
+            .checked_div(10_000_000)
+            .and_then(|seconds| seconds.checked_sub(WINDOWS_TO_UNIX_EPOCH_SECONDS))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed Windows process has an invalid creation timestamp",
+                )
+            })?;
+        if start_time != expected_start_time {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "managed Windows PID was recycled while its identity handle was captured",
+            ));
+        }
+        Ok(Self { handle })
+    }
+
+    fn is_live(&self) -> std::io::Result<bool> {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: this wrapper owns a valid process handle for its lifetime.
+        match unsafe { WaitForSingleObject(self.handle, 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+
+    fn exit_code(&self) -> std::io::Result<Option<u32>> {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+        let mut code = 0u32;
+        // SAFETY: this wrapper owns a query-capable process handle and `code`
+        // is a live writable output for the duration of the call.
+        if unsafe { GetExitCodeProcess(self.handle, &mut code) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((code != STILL_ACTIVE as u32).then_some(code))
+    }
+
+    fn image_path(&self) -> std::io::Result<PathBuf> {
+        use std::os::windows::ffi::OsStringExt as _;
+        use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+        let mut buffer = vec![0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        // SAFETY: the buffer is writable for `length` UTF-16 units and this
+        // wrapper owns a query-capable process handle.
+        if unsafe { QueryFullProcessImageNameW(self.handle, 0, buffer.as_mut_ptr(), &mut length) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        buffer.truncate(length as usize);
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)))
+    }
+
+    fn terminate(&self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        // SAFETY: this is the retained handle opened for the exact managed
+        // process before the graceful wait; PID reuse cannot retarget it.
+        if unsafe { TerminateProcess(self.handle, 1) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the successful OpenProcess handle.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct UnixLegacyProcessHandle {
+    pidfd: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl UnixLegacyProcessHandle {
+    fn open(pid: u32, _expected_executable: &Path) -> anyhow::Result<Self> {
+        use std::os::fd::FromRawFd as _;
+
+        // SAFETY: pidfd_open takes a numeric pid and zero flags, retains no
+        // caller pointers, and returns a new owned descriptor on success.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Linux pidfd_open is unavailable for legacy reconciliation");
+        }
+        // SAFETY: the successful syscall returned a uniquely owned descriptor.
+        Ok(Self {
+            pidfd: unsafe { std::fs::File::from_raw_fd(fd) },
+        })
+    }
+
+    fn signal_term(&self) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        // SAFETY: pidfd_send_signal targets the retained process object, not a
+        // reusable numeric PID. siginfo is null and flags are zero.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+                .context("kernel-bound SIGTERM to legacy arc-node failed")
+        }
+    }
+
+    fn is_live(&self) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        let mut descriptor = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd for this call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error()).context("polling legacy pidfd failed");
+        }
+        Ok(result == 0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacAuditToken {
+    values: [u32; 8],
+}
+
+#[cfg(target_os = "macos")]
+struct UnixLegacyProcessHandle {
+    token: MacAuditToken,
+    pidpath: unsafe extern "C" fn(*mut MacAuditToken, *mut std::ffi::c_void, u32) -> i32,
+    signal: unsafe extern "C" fn(*mut MacAuditToken, i32) -> i32,
+}
+
+#[cfg(target_os = "macos")]
+impl UnixLegacyProcessHandle {
+    fn symbol<T: Copy>(name: &'static [u8]) -> anyhow::Result<T> {
+        anyhow::ensure!(
+            name.last() == Some(&0),
+            "dynamic symbol name is not terminated"
+        );
+        // SAFETY: RTLD_DEFAULT asks dyld for a process-global symbol. The
+        // caller supplies the exact public SDK function signature.
+        let pointer =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast::<libc::c_char>()) };
+        anyhow::ensure!(
+            !pointer.is_null(),
+            "required macOS audit-token process API is unavailable"
+        );
+        // SAFETY: dlsym returned the named function; T is the matching ABI.
+        Ok(unsafe { std::mem::transmute_copy::<*mut std::ffi::c_void, T>(&pointer) })
+    }
+
+    fn open(pid: u32, expected_executable: &Path) -> anyhow::Result<Self> {
+        type MachPort = u32;
+        type KernReturn = i32;
+        const KERN_SUCCESS: KernReturn = 0;
+        const TASK_AUDIT_TOKEN: i32 = 15;
+        const TASK_AUDIT_TOKEN_COUNT: u32 = 8;
+
+        unsafe extern "C" {
+            static mach_task_self_: MachPort;
+            fn task_name_for_pid(
+                target_task: MachPort,
+                pid: libc::c_int,
+                task_name: *mut MachPort,
+            ) -> KernReturn;
+            fn task_info(
+                target_task: MachPort,
+                flavor: i32,
+                task_info: *mut i32,
+                task_info_count: *mut u32,
+            ) -> KernReturn;
+            fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
+        }
+
+        let self_task = unsafe { mach_task_self_ };
+        let mut name = 0;
+        let status = unsafe { task_name_for_pid(self_task, pid as i32, &mut name) };
+        anyhow::ensure!(
+            status == KERN_SUCCESS && name != 0,
+            "cannot retain a macOS task-name port for legacy pid {pid}"
+        );
+        let mut token = MacAuditToken { values: [0; 8] };
+        let mut count = TASK_AUDIT_TOKEN_COUNT;
+        let status = unsafe {
+            task_info(
+                name,
+                TASK_AUDIT_TOKEN,
+                token.values.as_mut_ptr().cast::<i32>(),
+                &mut count,
+            )
+        };
+        // The audit token remains stable after releasing the temporary task
+        // port and includes the kernel pidversion that rejects PID reuse.
+        let _ = unsafe { mach_port_deallocate(self_task, name) };
+        anyhow::ensure!(
+            status == KERN_SUCCESS && count == TASK_AUDIT_TOKEN_COUNT,
+            "cannot obtain a macOS audit token for legacy pid {pid}"
+        );
+        let pidpath = Self::symbol::<
+            unsafe extern "C" fn(*mut MacAuditToken, *mut std::ffi::c_void, u32) -> i32,
+        >(b"proc_pidpath_audittoken\0")?;
+        let signal = Self::symbol::<unsafe extern "C" fn(*mut MacAuditToken, i32) -> i32>(
+            b"proc_signal_with_audittoken\0",
+        )?;
+        let handle = Self {
+            token,
+            pidpath,
+            signal,
+        };
+        let actual = handle.image_path()?;
+        let actual = actual.canonicalize().unwrap_or(actual);
+        anyhow::ensure!(
+            actual == expected_executable,
+            "macOS audit token names a different legacy executable"
+        );
+        Ok(handle)
+    }
+
+    fn image_path(&self) -> anyhow::Result<PathBuf> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let mut token = self.token;
+        let mut buffer = vec![0u8; 4096];
+        let length = unsafe {
+            (self.pidpath)(
+                &mut token,
+                buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+                buffer.len() as u32,
+            )
+        };
+        if length <= 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("macOS audit-token process path is unavailable");
+        }
+        buffer.truncate(length as usize);
+        if buffer.last() == Some(&0) {
+            buffer.pop();
+        }
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+    }
+
+    fn signal_term(&self) -> anyhow::Result<()> {
+        let mut token = self.token;
+        let result = unsafe { (self.signal)(&mut token, libc::SIGTERM) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+                .context("audit-token-bound SIGTERM to legacy arc-node failed")
+        }
+    }
+
+    fn is_live(&self) -> anyhow::Result<bool> {
+        match self.image_path() {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let gone = error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|cause| {
+                        cause.raw_os_error().is_some_and(|code| {
+                            code == libc::ESRCH || code == libc::ENOENT || code == libc::EINVAL
+                        })
+                    });
+                if gone {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+struct UnixLegacyProcessHandle;
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+impl UnixLegacyProcessHandle {
+    fn open(_pid: u32, _expected_executable: &Path) -> anyhow::Result<Self> {
+        anyhow::bail!("this Unix platform has no supported kernel-bound legacy process handle")
+    }
+
+    fn signal_term(&self) -> anyhow::Result<()> {
+        anyhow::bail!("this Unix platform has no supported kernel-bound legacy signal API")
+    }
+
+    fn is_live(&self) -> anyhow::Result<bool> {
+        anyhow::bail!("this Unix platform has no supported kernel-bound legacy liveness API")
+    }
+}
+
+/// Find and stop only detached arc-node processes that prove desktop ownership
+/// through an exact data-dir-bound private capability in argv. Same-binary
+/// manual/headless nodes are deliberately ignored. Unix nodes receive SIGTERM;
+/// Windows nodes use the private request and a retained process handle so PID
+/// reuse can never redirect the force fallback.
+async fn stop_detached_arc_node(
+    legacy_context: Option<&LegacyWindowsStopContext>,
+    expected_data_dir: Option<&Path>,
+) -> anyhow::Result<StopSummary> {
+    let mut sys = sysinfo::System::new();
+    refresh_process_command_metadata(&mut sys);
+    let mut targeted = Vec::<ManagedDetachedProcess>::new();
+    for proc_ in sys.processes().values() {
+        let Some(expected_data_dir) = expected_data_dir else {
+            continue;
+        };
+        let token_flag = std::ffi::OsStr::new("--desktop-shutdown-token-file");
+        if !proc_.cmd().iter().any(|argument| argument == token_flag) {
+            continue;
+        }
+        let Some(exe) = proc_.exe() else { continue };
+        let exe_canon = exe.canonicalize().unwrap_or(exe.to_path_buf());
+        let mut shutdown_control = match desktop_shutdown_control_from_command(proc_.cmd()) {
+            Ok(Some(control)) if control.data_dir == expected_data_dir => control,
+            Ok(Some(_)) => continue,
+            Ok(None) => continue,
+            Err(error) => {
+                let data_targets_expected = unique_command_flag_value(proc_.cmd(), "--data-dir")
+                    .and_then(|value| canonical_process_path(value, proc_.cwd()))
+                    .as_deref()
+                    == Some(expected_data_dir);
+                let token_targets_expected = proc_
+                    .cmd()
+                    .windows(2)
+                    .filter(|pair| pair[0] == token_flag)
+                    .any(|pair| {
+                        let token = Path::new(&pair[1]);
+                        token.file_name()
+                            == Some(std::ffi::OsStr::new(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME))
+                            && token
+                                .parent()
+                                .and_then(Path::parent)
+                                .and_then(|parent| parent.canonicalize().ok())
+                                .as_deref()
+                                == Some(expected_data_dir)
+                    });
+                if !data_targets_expected && !token_targets_expected {
+                    continue;
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "managed detached arc-node pid {} advertises an unrecoverable desktop shutdown capability; refusing to cross the update boundary",
+                        proc_.pid()
+                    )
+                });
+            }
+        };
+        let genesis_arg = unique_command_flag_value(proc_.cmd(), "--genesis").ok_or_else(|| {
+            anyhow::anyhow!(
+                "managed detached arc-node pid {} does not advertise exactly one genesis file",
+                proc_.pid()
+            )
+        })?;
+        let genesis = canonical_process_path(genesis_arg, proc_.cwd()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "managed detached arc-node pid {} has an unreadable genesis path",
+                proc_.pid()
+            )
+        })?;
+        shutdown_control
+            .bind_receipt_identity(&exe_canon, &genesis)
+            .with_context(|| {
+                format!(
+                    "managed detached arc-node pid {} has an invalid inherited shutdown receipt",
+                    proc_.pid()
+                )
+            })?;
+        let identity = DetachedProcessIdentity {
+            pid: proc_.pid(),
+            start_time: proc_.start_time(),
+            executable: exe_canon,
+        };
+        #[cfg(windows)]
+        let handle = WindowsProcessHandle::open(proc_.pid().as_u32(), proc_.start_time())
+            .with_context(|| {
+                format!(
+                    "failed to retain exact identity handle for managed detached arc-node pid {}",
+                    proc_.pid()
+                )
+            })?;
+        #[cfg(windows)]
+        ensure_windows_process_image(&handle, &identity)?;
+        #[cfg(windows)]
+        {
+            // sysinfo timestamps have one-second resolution. After retaining
+            // the kernel handle, refresh argv/cwd and repeat the full private
+            // capability + receipt proof for this PID so same-exe PID reuse
+            // within that second cannot inherit the stale initial proof.
+            let mut refreshed = sysinfo::System::new();
+            refresh_process_command_metadata(&mut refreshed);
+            let process = refreshed
+                .process(identity.pid)
+                .filter(|process| process_matches_identity(process, &identity))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed detached process identity changed while retaining pid {}",
+                        identity.pid
+                    )
+                })?;
+            let mut fresh_control = desktop_shutdown_control_from_command(process.cmd())?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed detached process pid {} lost its shutdown capability",
+                        identity.pid
+                    )
+                })?;
+            let fresh_genesis_arg = unique_command_flag_value(process.cmd(), "--genesis")
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed detached process pid {} lost its exact genesis argument",
+                        identity.pid
+                    )
+                })?;
+            let fresh_genesis = canonical_process_path(fresh_genesis_arg, process.cwd())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed detached process pid {} has an unreadable refreshed genesis path",
+                        identity.pid
+                    )
+                })?;
+            fresh_control.bind_receipt_identity(&identity.executable, &fresh_genesis)?;
+            anyhow::ensure!(
+                same_desktop_shutdown_control(&shutdown_control, &fresh_control)?,
+                "managed detached process capability changed while retaining pid {}",
+                identity.pid
+            );
+            ensure_windows_process_image(&handle, &identity)?;
+        }
+        targeted.push(ManagedDetachedProcess {
+            identity,
+            shutdown_control,
+            #[cfg(windows)]
+            handle,
+        });
+    }
+    if targeted.is_empty() {
+        if let Some(context) = legacy_context {
+            return stop_one_proven_legacy_node(context).await;
+        }
+        return Ok(StopSummary::default());
+    }
+
+    // Arm every exact-bound receipt before publishing any request. This
+    // avoids partially draining a multi-process set when another target's
+    // durable receipt cannot be established.
+    for target in &mut targeted {
+        target
+            .shutdown_control
+            .ensure_receipt_armed()
+            .with_context(|| {
+                format!(
+                    "failed to arm durable shutdown receipt for managed detached arc-node pid {}",
+                    target.identity.pid
+                )
+            })?;
+    }
+    for target in &targeted {
+        write_desktop_shutdown_request(
+            &target.shutdown_control,
+            target.identity.pid.as_u32(),
+        )
+        .with_context(|| {
+            format!(
+                "failed to deliver authenticated graceful stop to managed detached arc-node pid {}; refusing force fallback",
+                target.identity.pid
+            )
+        })?;
+    }
+
+    let still_targeted = wait_for_managed_processes(&targeted, GRACEFUL_STOP_TIMEOUT).await?;
+    for (index, target) in targeted.iter().enumerate() {
+        if still_targeted.contains(&index) {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            let code = target.handle.exit_code()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "managed detached arc-node pid {} remained live after its wait completed",
+                    target.identity.pid
+                )
+            })?;
+            anyhow::ensure!(
+                code == 0,
+                "managed detached arc-node pid {} exited with code {code}; final WAL durability was not proven",
+                target.identity.pid
+            );
+        }
+        anyhow::ensure!(
+            target.shutdown_control.validate_clean_ack()?,
+            "managed detached arc-node pid {} exited without publishing its authenticated clean shutdown ACK",
+            target.identity.pid
+        );
+        target.shutdown_control.consume_clean_ack()?;
+    }
+    #[cfg(unix)]
+    if let Some(index) = still_targeted.first() {
+        anyhow::bail!(
+            "managed detached arc-node pid {} exceeded the graceful shutdown budget; Unix exposes no retained child exit status/kernel handle here, so refusing a numeric-PID force fallback and keeping its receipt armed",
+            targeted[*index].identity.pid
+        );
+    }
+    #[cfg(windows)]
+    for index in &still_targeted {
+        let target = &targeted[*index];
+        ensure_windows_process_image(&target.handle, &target.identity)?;
+        target.handle.terminate().with_context(|| {
+                format!(
+                    "operating system refused the retained-handle force fallback for detached arc-node pid {}",
+                    target.identity.pid
+                )
+            })?;
+    }
+
+    let remaining =
+        wait_for_managed_process_indices(&targeted, &still_targeted, FORCE_STOP_TIMEOUT).await?;
+    if !remaining.is_empty() {
+        anyhow::bail!(
+            "timed out waiting for force-stopped detached arc-node process(es) {} to exit",
+            remaining
+                .iter()
+                .map(|index| targeted[*index].identity.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !still_targeted.is_empty() {
+        anyhow::bail!(
+            "{} managed detached arc-node process(es) required force termination; their unproven receipts remain armed and the updater boundary is blocked",
+            still_targeted.len()
+        );
+    }
+
+    let summary = StopSummary {
+        stopped: targeted.len(),
+        forced: still_targeted.len(),
+    };
+    let mut summary = summary;
+    if let Some(context) = legacy_context {
+        let legacy = stop_one_proven_legacy_node(context).await?;
+        summary.stopped += legacy.stopped;
+        summary.forced += legacy.forced;
+    }
+    Ok(summary)
+}
+
+#[cfg(windows)]
+async fn stop_one_proven_legacy_node(
+    context: &LegacyWindowsStopContext,
+) -> anyhow::Result<StopSummary> {
+    let managed_path = managed_binary_path();
+    let managed = match managed_path.canonicalize() {
+        Ok(managed) => managed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StopSummary::default());
+        }
+        Err(error) => {
+            return Err(error)
+                .context("cannot canonicalize the legacy managed arc-node executable");
+        }
+    };
+    if binary_supports_flag(&managed, "--desktop-shutdown-token-file") {
+        // The running-image lock prevents replacing a live legacy executable
+        // at this exact managed path on Windows. A capability-aware image is
+        // therefore proof that the one-time tokenless upgrade edge is over.
+        return Ok(StopSummary::default());
+    }
+    let mut system = sysinfo::System::new();
+    refresh_process_command_metadata(&mut system);
+    let matches = system
+        .processes()
+        .values()
+        .filter(|process| {
+            process
+                .exe()
+                .map(|exe| exe.canonicalize().unwrap_or(exe.to_path_buf()) == managed)
+                .unwrap_or(false)
+                && legacy_windows_command_matches(process.cmd(), process.cwd(), context)
+        })
+        .map(|process| DetachedProcessIdentity {
+            pid: process.pid(),
+            start_time: process.start_time(),
+            executable: managed.clone(),
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(StopSummary::default());
+    }
+    anyhow::ensure!(
+        matches.len() == 1,
+        "refusing tokenless legacy migration because more than one exact desktop argv match is live"
+    );
+    let identity = &matches[0];
+    let handle = WindowsProcessHandle::open(identity.pid.as_u32(), identity.start_time)
+        .context("failed to retain the one-time legacy migration process handle")?;
+    ensure_windows_process_image(&handle, identity)?;
+
+    let mut refreshed = sysinfo::System::new();
+    refresh_process_command_metadata(&mut refreshed);
+    refreshed
+        .process(identity.pid)
+        .filter(|process| process_matches_identity(process, identity))
+        .filter(|process| legacy_windows_command_matches(process.cmd(), process.cwd(), context))
+        .ok_or_else(|| {
+            anyhow::anyhow!("legacy managed process identity changed during migration proof")
+        })?;
+    ensure_windows_process_image(&handle, identity)?;
+    tracing::warn!(
+        pid = identity.pid.as_u32(),
+        data_dir = %context.data_dir.display(),
+        "LEGACY MIGRATION RECEIPT: force-stopping one exact tokenless pre-v0.8 desktop node; no graceful channel exists, chain data is preserved, and this is not a clean shutdown"
+    );
+    handle
+        .terminate()
+        .context("one-time legacy retained-handle termination failed")?;
+    let deadline = Instant::now() + FORCE_STOP_TIMEOUT;
+    while handle.is_live()? {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out reaping the one-time legacy Windows node"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(StopSummary {
+        stopped: 1,
+        forced: 1,
+    })
+}
+
+#[cfg(unix)]
+fn legacy_rpc_port(command: &[std::ffi::OsString]) -> Option<u16> {
+    unique_command_flag_value(command, "--rpc")?
+        .to_str()?
+        .strip_prefix("127.0.0.1:")?
+        .parse()
+        .ok()
+}
+
+#[cfg(unix)]
+async fn wait_for_legacy_v07_shutdown_readiness(rpc_port: u16) -> anyhow::Result<()> {
+    const LEGACY_READINESS_TIMEOUT: Duration = Duration::from_secs(300);
+    const LEGACY_VERSIONS: [&str; 3] = ["0.7.7", "0.7.10", "0.7.11"];
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let url = format!("http://127.0.0.1:{rpc_port}/health");
+    let deadline = Instant::now() + LEGACY_READINESS_TIMEOUT;
+    loop {
+        if let Ok(response) = client.get(&url).send().await {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<serde_json::Value>().await {
+                    if legacy_v07_health_ready(&body, &LEGACY_VERSIONS)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "exact legacy arc-node never reached v0.7 readiness; its SIGTERM WAL handler may not be installed, so manual recovery is required"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(unix)]
+fn legacy_v07_health_ready(
+    body: &serde_json::Value,
+    allowed_versions: &[&str],
+) -> anyhow::Result<bool> {
+    let version = body.get("version").and_then(serde_json::Value::as_str);
+    let status = body.get("status").and_then(serde_json::Value::as_str);
+    if status == Some("ok") && version.is_some_and(|value| allowed_versions.contains(&value)) {
+        return Ok(true);
+    }
+    if let Some(version) = version {
+        anyhow::bail!(
+            "legacy argv matched but loopback health reports unexpected version {version}; refusing to signal"
+        );
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+async fn stop_one_proven_legacy_node(
+    context: &LegacyWindowsStopContext,
+) -> anyhow::Result<StopSummary> {
+    let managed_path = managed_binary_path();
+    let managed = match managed_path.canonicalize() {
+        Ok(managed) => managed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StopSummary::default());
+        }
+        Err(error) => {
+            return Err(error).context("cannot canonicalize legacy managed arc-node executable");
+        }
+    };
+    let mut system = sysinfo::System::new();
+    refresh_process_command_metadata(&mut system);
+    let matches = system
+        .processes()
+        .values()
+        .filter_map(|process| {
+            let executable = process.exe()?;
+            let executable = executable
+                .canonicalize()
+                .unwrap_or_else(|_| executable.to_path_buf());
+            (executable == managed
+                && legacy_windows_command_matches(process.cmd(), process.cwd(), context))
+            .then(|| {
+                Some((
+                    DetachedProcessIdentity {
+                        pid: process.pid(),
+                        start_time: process.start_time(),
+                        executable,
+                    },
+                    legacy_rpc_port(process.cmd())?,
+                ))
+            })?
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(StopSummary::default());
+    }
+    anyhow::ensure!(
+        matches.len() == 1,
+        "refusing tokenless legacy migration because more than one exact desktop argv match is live"
+    );
+    let (identity, rpc_port) = &matches[0];
+    let handle = UnixLegacyProcessHandle::open(identity.pid.as_u32(), &identity.executable)
+        .context("failed to retain kernel-bound identity for the legacy desktop node")?;
+
+    // Reprove the full argv/cwd/executable grammar after retaining the kernel
+    // identity. If PID reuse happened before handle acquisition, this catches
+    // it; if it happens later, pidfd/audit-token signaling remains bound to the
+    // old process object and cannot target the replacement.
+    let mut refreshed = sysinfo::System::new();
+    refresh_process_command_metadata(&mut refreshed);
+    refreshed
+        .process(identity.pid)
+        .filter(|process| process_matches_identity(process, identity))
+        .filter(|process| legacy_windows_command_matches(process.cmd(), process.cwd(), context))
+        .ok_or_else(|| {
+            anyhow::anyhow!("legacy managed process identity changed during retained proof")
+        })?;
+
+    wait_for_legacy_v07_shutdown_readiness(*rpc_port).await?;
+    anyhow::ensure!(
+        handle.is_live()?,
+        "legacy node exited before the token-bound graceful signal"
+    );
+    tracing::warn!(
+        pid = identity.pid.as_u32(),
+        data_dir = %context.data_dir.display(),
+        "LEGACY MIGRATION RECEIPT: sending kernel-identity-bound SIGTERM to one exact ready v0.7 desktop node; preserved legacy data will not be replayed by v0.8"
+    );
+    handle.signal_term()?;
+    let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
+    while handle.is_live()? {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for exact legacy v0.7 node to finish its WAL handler; refusing numeric-PID force fallback"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(StopSummary {
+        stopped: 1,
+        forced: 0,
+    })
+}
+
+#[cfg(windows)]
+fn ensure_windows_process_image(
+    handle: &WindowsProcessHandle,
+    identity: &DetachedProcessIdentity,
+) -> anyhow::Result<()> {
+    let image = handle
+        .image_path()
+        .context("failed to query retained Windows process image")?;
+    let image = image.canonicalize().unwrap_or(image);
+    anyhow::ensure!(
+        image == identity.executable,
+        "retained Windows process image changed from the exact managed executable"
+    );
+    Ok(())
+}
+
+fn process_matches_identity(
+    process: &sysinfo::Process,
+    identity: &DetachedProcessIdentity,
+) -> bool {
+    process.start_time() == identity.start_time
+        && process
+            .exe()
+            .map(|exe| exe.canonicalize().unwrap_or(exe.to_path_buf()) == identity.executable)
+            .unwrap_or(false)
+}
+
+async fn wait_for_managed_processes(
+    processes: &[ManagedDetachedProcess],
+    timeout: Duration,
+) -> anyhow::Result<Vec<usize>> {
+    wait_for_managed_process_indices(
+        processes,
+        &(0..processes.len()).collect::<Vec<_>>(),
+        timeout,
+    )
+    .await
+}
+
+async fn wait_for_managed_process_indices(
+    processes: &[ManagedDetachedProcess],
+    indices: &[usize],
+    timeout: Duration,
+) -> anyhow::Result<Vec<usize>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        #[cfg(unix)]
+        let mut refreshed = sysinfo::System::new();
+        #[cfg(unix)]
+        refreshed.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let mut live = Vec::new();
+        for index in indices {
+            let target = &processes[*index];
+            #[cfg(unix)]
+            let is_live = refreshed
+                .process(target.identity.pid)
+                .map(|process| process_matches_identity(process, &target.identity))
+                .unwrap_or(false);
+            #[cfg(windows)]
+            let is_live = target.handle.is_live().with_context(|| {
+                format!(
+                    "failed to inspect retained process handle for detached arc-node pid {}",
+                    target.identity.pid
+                )
+            })?;
+            if is_live {
+                live.push(*index);
+            }
+        }
+        if live.is_empty() || Instant::now() >= deadline {
+            return Ok(live);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 pub fn managed_binary_path() -> PathBuf {
@@ -717,6 +3294,25 @@ fn which_on_path(name: &str) -> anyhow::Result<PathBuf> {
 /// `./.arc` relative to the GUI's CWD.
 pub fn resolve_data_dir(s: &str) -> PathBuf {
     paths::expand_tilde(s)
+}
+
+/// Inspect a stale durability receipt before any updater/download is allowed
+/// to replace the exact executable or signed genesis bytes it binds. A true
+/// result means Start is a recovery launch and must use the installed bytes
+/// already on disk; NodeManager::start performs the full binding check.
+pub fn managed_shutdown_recovery_required(configured_data_dir: &str) -> anyhow::Result<bool> {
+    let data_dir = resolve_data_dir(configured_data_dir);
+    if !data_dir.exists() {
+        return Ok(false);
+    }
+    arc_crypto::secret_file::desktop_shutdown_lifecycle_state(&data_dir)
+        .map(|state| !state.is_clear())
+        .with_context(|| {
+            format!(
+                "cannot inspect managed-node durability receipt/ACK under {}",
+                data_dir.display()
+            )
+        })
 }
 
 /// Can we bind TCP on this port? Correct probe for the RPC listener.
@@ -759,9 +3355,288 @@ fn choose_port_pair(preferred_rpc: u16, preferred_p2p: u16) -> anyhow::Result<(u
     ))
 }
 
+impl Default for NodeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+fn _path_sanity(_: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource_test_dir(label: &str) -> PathBuf {
+        // macOS exposes its temporary directory through `/var`, which is a
+        // compatibility symlink to `/private/var`. Production lifecycle paths
+        // deliberately reject linked ancestors, so build test paths beneath
+        // the already-resolved temporary-directory prefix.
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "arc-desktop-network-resource-{label}-{}-{}",
+            std::process::id(),
+            uuid_like()
+        ))
+    }
+
+    fn receipt_control_for_executable(
+        dir: &Path,
+        executable: &Path,
+    ) -> (DesktopShutdownControl, PathBuf) {
+        arc_crypto::secret_file::secure_private_directory_tree(dir).unwrap();
+        let genesis = dir.join("receipt-genesis.toml");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &genesis,
+            b"[chain]\nname='desktop-stop-test'\n",
+        )
+        .unwrap();
+        let mut control = prepare_desktop_shutdown_control(dir).unwrap();
+        control.arm_receipt(executable, &genesis).unwrap();
+        (control, genesis)
+    }
+
+    #[test]
+    fn receipt_bound_executable_identity_survives_new_gui_environment_resolution() {
+        let dir = resource_test_dir("persisted-executable");
+        arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
+        let _control = prepare_desktop_shutdown_control(&dir).unwrap();
+        let original = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let persisted = persist_managed_executable_identity(&dir, &original).unwrap();
+        assert_eq!(persisted, original);
+
+        // Recovery must not recompute ARC_NODE_BIN/PATH/dev candidates from a
+        // new desktop process. The private exact path selected before spawn is
+        // independent of that ephemeral environment and is re-authenticated
+        // against the receipt's executable path+content digests at Start.
+        let recovered = load_managed_executable_identity(&dir).unwrap();
+        assert_eq!(recovered, original);
+
+        let identity = managed_executable_identity_file(&dir);
+        arc_crypto::secret_file::durably_replace_private(
+            &identity,
+            b"arc.desktop.executable-path.v1\npath_utf8_hex=zz\n",
+        )
+        .unwrap();
+        assert!(load_managed_executable_identity(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn testnet_resources_are_required_regular_bundle_files() {
+        let dir = resource_test_dir("regular");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seeds = dir.join("testnet-seeds.txt");
+        let genesis = dir.join("genesis.toml");
+        std::fs::write(&seeds, "127.0.0.1:9000\n").unwrap();
+        std::fs::write(&genesis, "chain_id = \"arc-testnet\"\n").unwrap();
+
+        let resources = TestnetResources {
+            seeds_file: Some(seeds.clone()),
+            genesis_file: Some(genesis.clone()),
+        };
+        let (validated_seeds, validated_genesis) =
+            required_testnet_resources(&resources).expect("regular bundle files are valid");
+        assert_eq!(validated_seeds, seeds);
+        assert_eq!(validated_genesis, genesis);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_testnet_resource_fails_closed() {
+        let dir = resource_test_dir("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seeds = dir.join("testnet-seeds.txt");
+        std::fs::write(&seeds, "127.0.0.1:9000\n").unwrap();
+        let resources = TestnetResources {
+            seeds_file: Some(seeds),
+            genesis_file: None,
+        };
+
+        let error = required_testnet_resources(&resources).unwrap_err();
+        assert!(error.to_string().contains("genesis.toml is missing"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stable_network_identity_survives_bundle_mount_path_change_while_fenced() {
+        let root = resource_test_dir("stable-appimage-recovery");
+        let data = root.join("data-v3");
+        let mount_a = root.join(".mount_A/resources");
+        let mount_b = root.join(".mount_B/resources");
+        std::fs::create_dir_all(&mount_a).unwrap();
+        std::fs::create_dir_all(&mount_b).unwrap();
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let seeds_a = mount_a.join("testnet-seeds.txt");
+        let genesis_a = mount_a.join("genesis.toml");
+        std::fs::write(&seeds_a, b"seed-A\n").unwrap();
+        std::fs::write(&genesis_a, b"[chain]\nname='A'\n").unwrap();
+        let first = materialize_stable_testnet_resources(
+            &data,
+            &TestnetResources {
+                seeds_file: Some(seeds_a),
+                genesis_file: Some(genesis_a),
+            },
+        )
+        .unwrap();
+        let stable_genesis = first.genesis_file.clone().unwrap();
+        let old_bytes = std::fs::read(&stable_genesis).unwrap();
+
+        let mut control = prepare_desktop_shutdown_control(&data).unwrap();
+        control
+            .arm_receipt(&std::env::current_exe().unwrap(), &stable_genesis)
+            .unwrap();
+        std::fs::remove_dir_all(root.join(".mount_A")).unwrap();
+        std::fs::write(mount_b.join("testnet-seeds.txt"), b"seed-B\n").unwrap();
+        std::fs::write(mount_b.join("genesis.toml"), b"[chain]\nname='B'\n").unwrap();
+
+        let recovered = materialize_stable_testnet_resources(
+            &data,
+            &TestnetResources {
+                seeds_file: Some(mount_b.join("testnet-seeds.txt")),
+                genesis_file: Some(mount_b.join("genesis.toml")),
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.genesis_file.unwrap(), stable_genesis);
+        assert_eq!(std::fs::read(stable_genesis).unwrap(), old_bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_lifecycle_lock_serializes_desktop_processes() {
+        let root = resource_test_dir("lifecycle-lock");
+        let configured = root.join("data-v3").to_string_lossy().into_owned();
+        let first = acquire_managed_lifecycle_lock(&configured).unwrap();
+        assert!(acquire_managed_lifecycle_lock(&configured).is_err());
+        drop(first);
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn updater_fence_survives_ipc_window_and_failed_install_abort_releases_it() {
+        let root = resource_test_dir("updater-lifecycle-window");
+        let configured = root.join("data-v3").to_string_lossy().into_owned();
+        let mut installer_gui = NodeManager::new();
+        installer_gui
+            .configure_managed_data_dir(&configured)
+            .unwrap();
+        let mut competing_gui = NodeManager::new();
+        competing_gui
+            .configure_managed_data_dir(&configured)
+            .unwrap();
+
+        installer_gui.prepare_update_relaunch().await.unwrap();
+        assert!(installer_gui.update_lifecycle_lock.is_some());
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "a second GUI must not start during download/install after prepare IPC returns"
+        );
+        assert!(
+            installer_gui.prepare_update_relaunch().await.is_err(),
+            "an already-held fence must not be reported as a fresh successful prepare after a failed abort/reconciliation"
+        );
+        assert!(
+            competing_gui.prepare_update_relaunch().await.is_err(),
+            "a second NodeManager must not enter its updater transaction during the installer window"
+        );
+        assert!(
+            installer_gui.stop().await.is_err(),
+            "ordinary lifecycle commands must not accidentally release the updater fence"
+        );
+
+        // A rejected installer calls the explicit native abort. Native code
+        // re-scans for detached writers and revalidates the receipt before it
+        // releases the guard, after which a second GUI may own the lifecycle.
+        installer_gui.abort_update_relaunch().await.unwrap();
+        assert!(installer_gui.update_lifecycle_lock.is_none());
+        competing_gui.prepare_update_relaunch().await.unwrap();
+        assert!(competing_gui.update_lifecycle_lock.is_some());
+        competing_gui.abort_update_relaunch().await.unwrap();
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_mutation_guard_spans_exact_peer_cache_delete() {
+        let root = resource_test_dir("peer-cache-mutation-window");
+        let data = root.join("data-v3");
+        let configured = data.to_string_lossy().into_owned();
+        let peers = data.join("known_peers.json");
+        let mut reset_gui = NodeManager::new();
+        reset_gui.configure_managed_data_dir(&configured).unwrap();
+
+        let lifecycle_lock = reset_gui.stop_for_local_mutation().await.unwrap();
+        std::fs::write(&peers, b"[]\n").unwrap();
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "a competing GUI must stay fenced before the peer-cache mutation"
+        );
+        std::fs::remove_file(&peers).unwrap();
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "the same lifecycle guard must remain held after the exact delete and until restart/start accepts it"
+        );
+        drop(lifecycle_lock);
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_network_directory_symlink_is_rejected_without_external_write() {
+        use std::os::unix::fs::symlink;
+
+        let root = resource_test_dir("stable-network-symlink");
+        let data = root.join("data-v3");
+        let outside = root.join("outside");
+        let bundle = root.join("bundle");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        symlink(&outside, data.join(DESKTOP_NETWORK_IDENTITY_DIR_NAME)).unwrap();
+        let seeds = bundle.join("testnet-seeds.txt");
+        let genesis = bundle.join("genesis.toml");
+        std::fs::write(&seeds, b"seed\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\n").unwrap();
+        assert!(materialize_stable_testnet_resources(
+            &data,
+            &TestnetResources {
+                seeds_file: Some(seeds),
+                genesis_file: Some(genesis),
+            },
+        )
+        .is_err());
+        assert!(!outside.join(DESKTOP_STABLE_GENESIS_FILE_NAME).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_testnet_resource_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = resource_test_dir("symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let actual_seeds = dir.join("actual-seeds.txt");
+        let seeds_link = dir.join("testnet-seeds.txt");
+        let genesis = dir.join("genesis.toml");
+        std::fs::write(&actual_seeds, "127.0.0.1:9000\n").unwrap();
+        symlink(&actual_seeds, &seeds_link).unwrap();
+        std::fs::write(&genesis, "chain_id = \"arc-testnet\"\n").unwrap();
+        let resources = TestnetResources {
+            seeds_file: Some(seeds_link),
+            genesis_file: Some(genesis),
+        };
+
+        let error = required_testnet_resources(&resources).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn managed_binary_is_under_home_bin() {
@@ -838,6 +3713,30 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn flag_probe_cache_tracks_same_path_binary_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = resource_test_dir("flag-cache-replacement");
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("arc-node");
+        let flag = "--desktop-shutdown-token-file";
+        let old_help = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", "x".repeat(flag.len()));
+        let new_help = format!("#!/bin/sh\nprintf '%s\\n' '{flag}'\n");
+        assert_eq!(old_help.len(), new_help.len());
+        std::fs::write(&binary, old_help).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!binary_supports_flag(&binary, flag));
+
+        let replacement = dir.join("arc-node.new");
+        std::fs::write(&replacement, new_help).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &binary).unwrap();
+        assert!(binary_supports_flag(&binary, flag));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn production_community_origins_are_six_distinct_https_origins() {
         let unique: std::collections::HashSet<_> = crate::rpc_client::PRODUCTION_RPC_ORIGINS
@@ -845,10 +3744,25 @@ mod tests {
             .collect();
         assert_eq!(unique.len(), 6);
         for origin in unique {
-            assert!(origin.starts_with("https://"));
-            assert!(origin.ends_with(".nip.io"));
+            let host = origin.strip_prefix("https://").unwrap();
             assert!(!origin.contains(":9090"));
-            assert!(!origin["https://".len()..].contains('/'));
+            assert!(!host.contains('/'));
+            let ip: std::net::Ipv4Addr = host.parse().expect("origin host must be literal IPv4");
+            let octets = ip.octets();
+            assert!(
+                !ip.is_private()
+                    && !ip.is_loopback()
+                    && !ip.is_link_local()
+                    && !ip.is_unspecified()
+                    && !ip.is_broadcast()
+                    && !ip.is_multicast()
+                    && !ip.is_documentation()
+                    && octets[0] != 0
+                    && octets[0] < 240
+                    && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                    && !(octets[0] == 198 && (18..=19).contains(&octets[1])),
+                "origin must be a public IPv4 literal: {ip}"
+            );
         }
     }
 
@@ -860,13 +3774,613 @@ mod tests {
         assert!(p.is_absolute() || p.starts_with(paths::home_dir()));
         assert!(!p.starts_with("./"));
     }
-}
 
-impl Default for NodeManager {
-    fn default() -> Self {
-        Self::new()
+    #[test]
+    fn desktop_stop_budget_matches_the_managed_node_durability_window() {
+        assert_eq!(GRACEFUL_STOP_TIMEOUT_SECS, 4_420);
+        assert_eq!(GRACEFUL_STOP_TIMEOUT, Duration::from_secs(4_420));
+    }
+
+    #[test]
+    fn desktop_shutdown_request_uses_a_persistent_private_file_capability() {
+        let dir = resource_test_dir("shutdown-capability");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (control, _genesis) =
+            receipt_control_for_executable(&dir, &std::env::current_exe().unwrap());
+        assert_eq!(
+            control.token_file.file_name().unwrap(),
+            DESKTOP_SHUTDOWN_TOKEN_FILE_NAME
+        );
+        assert_eq!(hex::decode(control.token.as_str()).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&control.token_file)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+
+        write_desktop_shutdown_request(&control, 4_242).unwrap();
+        // Idempotent concurrent/repeated publication must converge on the
+        // exact complete payload and never replace it.
+        write_desktop_shutdown_request(&control, 4_242).unwrap();
+        let request = read_private_shutdown_request(&control.request_file).unwrap();
+        assert_eq!(
+            request.as_str(),
+            format!(
+                "{DESKTOP_SHUTDOWN_REQUEST_SCHEMA}\npid=4242\ntoken={}\nnonce={}\n",
+                control.token.as_str(),
+                hex::encode(control.receipt_nonce.unwrap()),
+            )
+        );
+
+        let command = vec![
+            std::ffi::OsString::from("arc-node"),
+            std::ffi::OsString::from("--data-dir"),
+            dir.canonicalize().unwrap().into_os_string(),
+            std::ffi::OsString::from("--desktop-shutdown-token-file"),
+            control.token_file.clone().into_os_string(),
+        ];
+        let recovered = desktop_shutdown_control_from_command(&command)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.request_file, control.request_file);
+        assert_eq!(recovered.token.as_str(), control.token.as_str());
+
+        // A second desktop reaching pre-spawn preparation must not erase the
+        // first node's live request while that node owns the data-dir lock.
+        let _ = prepare_desktop_shutdown_control(&dir).unwrap();
+        assert!(control.request_file.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detached_shutdown_requires_exact_data_dir_bound_control_argv() {
+        let dir = resource_test_dir("shutdown-command-binding");
+        let other = resource_test_dir("shutdown-command-other");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let control = prepare_desktop_shutdown_control(&dir).unwrap();
+
+        let manual = vec![
+            std::ffi::OsString::from("arc-node"),
+            std::ffi::OsString::from("--data-dir"),
+            dir.canonicalize().unwrap().into_os_string(),
+        ];
+        assert!(desktop_shutdown_control_from_command(&manual)
+            .unwrap()
+            .is_none());
+
+        let mismatched = vec![
+            std::ffi::OsString::from("arc-node"),
+            std::ffi::OsString::from("--data-dir"),
+            other.canonicalize().unwrap().into_os_string(),
+            std::ffi::OsString::from("--desktop-shutdown-token-file"),
+            control.token_file.clone().into_os_string(),
+        ];
+        assert!(desktop_shutdown_control_from_command(&mismatched).is_err());
+
+        let exact = vec![
+            std::ffi::OsString::from("arc-node"),
+            std::ffi::OsString::from("--data-dir"),
+            dir.canonicalize().unwrap().into_os_string(),
+            std::ffi::OsString::from("--desktop-shutdown-token-file"),
+            control.token_file.clone().into_os_string(),
+        ];
+        assert!(desktop_shutdown_control_from_command(&exact)
+            .unwrap()
+            .is_some());
+        let nested = dir.join("path-form-fixture");
+        std::fs::create_dir(&nested).unwrap();
+        let noncanonical_data = nested.join("..");
+        let path_form = vec![
+            std::ffi::OsString::from("arc-node"),
+            std::ffi::OsString::from("--data-dir"),
+            noncanonical_data.into_os_string(),
+            std::ffi::OsString::from("--desktop-shutdown-token-file"),
+            control.token_file.clone().into_os_string(),
+        ];
+        assert!(
+            desktop_shutdown_control_from_command(&path_form)
+                .unwrap()
+                .is_some(),
+            "normal/noncanonical data argv and canonical token argv must recover one control"
+        );
+        let mut duplicate_data = exact.clone();
+        duplicate_data.extend([
+            std::ffi::OsString::from("--data-dir"),
+            dir.canonicalize().unwrap().into_os_string(),
+        ]);
+        assert!(desktop_shutdown_control_from_command(&duplicate_data).is_err());
+        let mut duplicate_token = exact.clone();
+        duplicate_token.extend([
+            std::ffi::OsString::from("--desktop-shutdown-token-file"),
+            control.token_file.clone().into_os_string(),
+        ]);
+        assert!(desktop_shutdown_control_from_command(&duplicate_token).is_err());
+        std::fs::remove_file(&control.token_file).unwrap();
+        assert!(
+            desktop_shutdown_control_from_command(&exact).is_err(),
+            "an exact managed argv with a deleted token must block Stop/update"
+        );
+        let mut corrupt = arc_crypto::secret_file::create_new_private(&control.token_file).unwrap();
+        corrupt.write_all(b"not-a-token\n").unwrap();
+        corrupt.sync_all().unwrap();
+        drop(corrupt);
+        assert!(
+            desktop_shutdown_control_from_command(&exact).is_err(),
+            "an exact managed argv with a corrupt token must block Stop/update"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn tokenless_legacy_migration_requires_the_exact_desktop_argv_grammar() {
+        let dir = resource_test_dir("legacy-argv");
+        let data = dir.join("legacy-v07-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state.wal"), b"preserved-v07-state").unwrap();
+        let seeds = dir.join("testnet-seeds.txt");
+        let genesis = dir.join("genesis.toml");
+        std::fs::write(&seeds, "127.0.0.1:9000\n").unwrap();
+        std::fs::write(&genesis, "chain_id='arc-testnet'\n").unwrap();
+        let validator_seed = "test recovery phrase stays private";
+        let old_config = NodeConfig {
+            data_dir: data.to_string_lossy().into_owned(),
+            ..NodeConfig::default()
+        };
+        let mut store = crate::store::Store {
+            identity: Some(crate::types::Identity {
+                address: "11".repeat(32),
+                public_key: format!("0x{}", "22".repeat(32)),
+                seed_phrase: validator_seed.to_string(),
+                created_at: 1,
+            }),
+            config: Some(old_config),
+            data_migration_notice: None,
+        };
+        let notice = store
+            .protect_legacy_v07_data()
+            .unwrap()
+            .expect("first v0.8 launch fences the v0.7 WAL");
+        let migrated_config = store.config.as_ref().unwrap();
+        let resources = TestnetResources {
+            seeds_file: Some(seeds.clone()),
+            genesis_file: Some(genesis.clone()),
+        };
+        let mut manager = NodeManager::new();
+        manager
+            .configure_legacy_windows_stop_context(
+                migrated_config,
+                &notice,
+                Zeroizing::new(validator_seed.to_string()),
+                &resources,
+            )
+            .expect("legacy proof does not depend on a first-launch v0.8 keyfile");
+        assert!(!dir.join("identity/validator-key.json").exists());
+        let context = manager.legacy_windows_stop_context.as_ref().unwrap();
+
+        // Exact argv emitted by the v0.7.7/v0.7.10/v0.7.11 release launcher.
+        // The newly configured data-v3 path did not exist in this already-
+        // running process, and those tags had no stake/current-worker flags.
+        let exact = vec![
+            "arc-node.exe".into(),
+            "--rpc".into(),
+            "127.0.0.1:9090".into(),
+            "--p2p-port".into(),
+            "9091".into(),
+            "--data-dir".into(),
+            data.clone().into_os_string(),
+            "--validator-seed".into(),
+            validator_seed.into(),
+            "--eth-rpc-port".into(),
+            "0".into(),
+            "--seeds-file".into(),
+            seeds.clone().into_os_string(),
+            "--genesis".into(),
+            genesis.clone().into_os_string(),
+        ];
+        assert!(legacy_windows_command_matches(&exact, None, context));
+        let without_bundle_resources = vec![
+            "arc-node.exe".into(),
+            "--rpc".into(),
+            "127.0.0.1:9090".into(),
+            "--p2p-port".into(),
+            "9091".into(),
+            "--data-dir".into(),
+            data.clone().into_os_string(),
+            "--validator-seed".into(),
+            validator_seed.into(),
+            "--eth-rpc-port".into(),
+            "0".into(),
+        ];
+        assert!(!legacy_windows_command_matches(
+            &without_bundle_resources,
+            None,
+            context
+        ));
+        let mut one_sided_resources = without_bundle_resources.clone();
+        one_sided_resources.extend(["--seeds-file".into(), seeds.clone().into_os_string()]);
+        assert!(!legacy_windows_command_matches(
+            &one_sided_resources,
+            None,
+            context
+        ));
+
+        for extra in [
+            vec!["--archive".into()],
+            vec!["--stake".into(), "0".into()],
+            vec!["--data-dir".into(), data.clone().into_os_string()],
+            vec!["--rpc".into(), "127.0.0.1:9090".into()],
+            vec!["--genesis".into(), genesis.clone().into_os_string()],
+            vec!["--validator-seed".into(), validator_seed.into()],
+            vec!["--validator-key-file".into(), "missing.json".into()],
+        ] {
+            let mut near_miss = exact.clone();
+            near_miss.extend(extra);
+            assert!(!legacy_windows_command_matches(&near_miss, None, context));
+        }
+        let mut wrong_pair = exact.clone();
+        *wrong_pair
+            .iter_mut()
+            .find(|value| *value == "9091")
+            .unwrap() = "9101".into();
+        assert!(!legacy_windows_command_matches(&wrong_pair, None, context));
+        let mut wrong_seed = exact.clone();
+        *wrong_seed
+            .iter_mut()
+            .find(|value| *value == validator_seed)
+            .unwrap() = "different recovery phrase".into();
+        assert!(!legacy_windows_command_matches(&wrong_seed, None, context));
+        let attempted = manager.legacy_windows_stop_context.take();
+        assert!(finish_legacy_reconciliation(
+            &mut manager.legacy_windows_stop_context,
+            attempted,
+            Err(anyhow::anyhow!("simulated retained-handle refusal")),
+        )
+        .is_err());
+        assert!(manager.legacy_windows_stop_context.is_some());
+
+        let model = dir.join("legacy-worker.gguf");
+        std::fs::write(&model, b"legacy worker fixture").unwrap();
+        let mut worker_config = migrated_config.clone();
+        worker_config.role = "worker".into();
+        worker_config.model_path = Some(model.to_string_lossy().into_owned());
+        let mut worker_manager = NodeManager::new();
+        worker_manager
+            .configure_legacy_windows_stop_context(
+                &worker_config,
+                &notice,
+                Zeroizing::new(validator_seed.to_string()),
+                &resources,
+            )
+            .unwrap();
+        let worker_context = worker_manager.legacy_windows_stop_context.as_ref().unwrap();
+        let mut worker_exact = exact.clone();
+        let insertion = worker_exact.len();
+        worker_exact.splice(
+            insertion..insertion,
+            [
+                "--community-mode".into(),
+                "--model".into(),
+                model.into_os_string(),
+            ],
+        );
+        assert!(legacy_windows_command_matches(
+            &worker_exact,
+            None,
+            worker_context
+        ));
+        let mut current_origin_near_miss = worker_exact.clone();
+        current_origin_near_miss.extend([
+            "--community-rpc-url".into(),
+            crate::rpc_client::PRODUCTION_RPC_ORIGINS[0].into(),
+        ]);
+        assert!(!legacy_windows_command_matches(
+            &current_origin_near_miss,
+            None,
+            worker_context
+        ));
+
+        // Successful first-upgrade reconciliation consumes and zeroizes the
+        // legacy proof. A later stop of the capability-aware v0.8 child sees
+        // no tokenless context and therefore cannot re-enter force migration.
+        let attempted = worker_manager.legacy_windows_stop_context.take();
+        assert!(attempted.is_some());
+        let first = finish_legacy_reconciliation(
+            &mut worker_manager.legacy_windows_stop_context,
+            attempted,
+            Ok(StopSummary {
+                stopped: 1,
+                forced: 1,
+            }),
+        )
+        .unwrap();
+        assert_eq!(first.stopped, 1);
+        assert!(worker_manager.legacy_windows_stop_context.is_none());
+        let second_attempt = worker_manager.legacy_windows_stop_context.take();
+        let second = finish_legacy_reconciliation(
+            &mut worker_manager.legacy_windows_stop_context,
+            second_attempt,
+            Ok(StopSummary::default()),
+        )
+        .unwrap();
+        assert_eq!(second.stopped, 0);
+        assert!(worker_manager.legacy_windows_stop_context.is_none());
+
+        // Public Windows tags used HOME only for `~/.arc`; with HOME absent
+        // they emitted relative `.arc` even though the managed executable was
+        // under USERPROFILE. Resolve that argv against the target process cwd,
+        // never the new v0.8 GUI cwd, and fence the exact resulting history.
+        let old_cwd = dir.join("v07-old-cwd");
+        let new_cwd = dir.join("v08-new-cwd");
+        let relative_data = old_cwd.join(".arc");
+        std::fs::create_dir_all(&relative_data).unwrap();
+        std::fs::create_dir_all(&new_cwd).unwrap();
+        std::fs::write(relative_data.join("state.wal"), b"relative v07 history").unwrap();
+        let relative_config = NodeConfig::default();
+        let relative_context = build_legacy_windows_stop_context(
+            &relative_config,
+            relative_data.canonicalize().unwrap(),
+            Zeroizing::new(validator_seed.to_string()),
+            &resources,
+        )
+        .unwrap();
+        let relative_argv = vec![
+            "arc-node.exe".into(),
+            "--rpc".into(),
+            "127.0.0.1:9090".into(),
+            "--p2p-port".into(),
+            "9091".into(),
+            "--data-dir".into(),
+            ".arc".into(),
+            "--validator-seed".into(),
+            validator_seed.into(),
+            "--eth-rpc-port".into(),
+            "0".into(),
+            "--seeds-file".into(),
+            seeds.into_os_string(),
+            "--genesis".into(),
+            genesis.into_os_string(),
+        ];
+        assert!(legacy_windows_command_matches(
+            &relative_argv,
+            Some(&old_cwd),
+            &relative_context
+        ));
+        assert!(!legacy_windows_command_matches(
+            &relative_argv,
+            Some(&new_cwd),
+            &relative_context
+        ));
+        let mut relative_store = crate::store::Store {
+            identity: Some(crate::types::Identity {
+                address: "55".repeat(32),
+                public_key: format!("0x{}", "66".repeat(32)),
+                seed_phrase: validator_seed.into(),
+                created_at: 2,
+            }),
+            config: Some(relative_config),
+            data_migration_notice: None,
+        };
+        let relative_notice = relative_store
+            .protect_legacy_v07_data_at(&relative_data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(relative_notice.legacy_data_dir)
+                .canonicalize()
+                .unwrap(),
+            relative_data.canonicalize().unwrap()
+        );
+        assert!(PathBuf::from(relative_notice.active_data_dir).starts_with(&relative_data));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_stop_preserves_a_live_owned_writer_and_control() {
+        let dir = resource_test_dir("failed-stop-ownership");
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = prepare_desktop_shutdown_control(&dir).unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn disposable live child");
+        let pid = child.id().unwrap();
+        let mut manager = NodeManager::new();
+        manager.started_at = Some(Instant::now());
+        manager.restore_child_after_failed_stop(child, Some(control));
+        assert_eq!(manager.pid(), Some(pid));
+        assert!(manager.shutdown_control.is_some());
+        assert!(
+            manager.is_running(),
+            "the command-level Start guard must observe the preserved owned writer"
+        );
+
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.child = None;
+        manager.shutdown_control = None;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_requests_graceful_exit_reaps_child_and_clears_stop_state() {
+        let dir = resource_test_dir("graceful-stop");
+        arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
+        let marker = dir.join("graceful");
+        let ack_ready = dir.join("ack-ready");
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let (control, genesis) = receipt_control_for_executable(&dir, &shell);
+        let request = control.request_file.clone();
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "while [ ! -f \"$ARC_STOP_REQUEST\" ]; do sleep 0.01; done; printf graceful > \"$ARC_STOP_MARKER\"; while [ ! -f \"$ARC_ACK_READY\" ]; do sleep 0.01; done; exit 0",
+            ])
+            .env("ARC_STOP_REQUEST", &request)
+            .env("ARC_STOP_MARKER", &marker)
+            .env("ARC_ACK_READY", &ack_ready)
+            .spawn()
+            .expect("spawn disposable child");
+        let pid = child.id().expect("child pid");
+        let token = control.token_bytes().unwrap();
+        let data = control.data_dir.clone();
+        let executable = control.receipt_executable.clone().unwrap();
+        let nonce = control.receipt_nonce.unwrap();
+        let ack_request = request.clone();
+        let ack_task = tokio::spawn(async move {
+            for _ in 0..500 {
+                if ack_request.is_file() {
+                    arc_crypto::secret_file::acknowledge_desktop_shutdown_receipt(
+                        &data,
+                        &token,
+                        &nonce,
+                        &executable,
+                        &genesis,
+                    )
+                    .unwrap();
+                    std::fs::write(ack_ready, b"ready").unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("authenticated shutdown request was never published");
+        });
+        let mut manager = NodeManager::new();
+        manager.child = Some(child);
+        manager.shutdown_control = Some(control);
+        manager.started_at = Some(Instant::now());
+
+        // Exercise only the child handle created by this test. Calling the
+        // public `stop()` here would also scan production managed paths and
+        // could terminate a real ARC node running on the developer's machine.
+        assert_eq!(manager.stop_owned_child().await.expect("verified stop"), 1);
+        ack_task.await.unwrap();
+        assert!(manager.child.is_none());
+        assert!(manager.started_at.is_none());
+        assert!(!manager.stopping.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "graceful",
+            "authenticated request handler must run before the child is reaped"
+        );
+
+        let mut processes = sysinfo::System::new();
+        processes.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        assert!(
+            processes.process(sysinfo::Pid::from_u32(pid)).is_none(),
+            "stop must reap the old child before an updater relaunch"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unresponsive_child_is_force_killed_only_after_grace_period() {
+        let dir = resource_test_dir("unresponsive-stop");
+        let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
+        let (mut control, _genesis) = receipt_control_for_executable(&dir, &shell);
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn TERM-resistant disposable child");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = Instant::now();
+        let error =
+            terminate_owned_child(&mut child, Some(&mut control), Duration::from_millis(100))
+                .await
+                .expect_err("force fallback must leave the updater boundary blocked");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(
+            error.to_string().contains("required force termination"),
+            "force-kill must be reported and leave the receipt armed: {error}"
+        );
+        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+        assert!(
+            arc_crypto::secret_file::desktop_shutdown_receipt_exists(&dir).unwrap(),
+            "an unproven forced stop must retain its durable fence"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn durability_recovery_error_remains_typed_through_context() {
+        let error = anyhow::Error::new(ManagedDurabilityRecoveryRequired {
+            reason: "test fence".into(),
+        })
+        .context("startup reconciliation");
+        assert!(is_managed_durability_recovery_required(&error));
+        assert!(!is_managed_durability_recovery_required(&anyhow::anyhow!(
+            "detached process is still live"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_health_requires_exact_ready_public_release_version() {
+        let versions = ["0.7.7", "0.7.10", "0.7.11"];
+        assert!(legacy_v07_health_ready(
+            &serde_json::json!({"status": "ok", "version": "0.7.11"}),
+            &versions,
+        )
+        .unwrap());
+        assert!(
+            !legacy_v07_health_ready(&serde_json::json!({"status": "starting"}), &versions)
+                .unwrap()
+        );
+        assert!(legacy_v07_health_ready(
+            &serde_json::json!({"status": "ok", "version": "0.8.0"}),
+            &versions,
+        )
+        .is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_legacy_handle_signals_only_the_retained_process_identity() {
+        let executable = PathBuf::from("/bin/sleep").canonicalize().unwrap();
+        let mut target = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut unrelated = std::process::Command::new(&executable)
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let result = (|| -> anyhow::Result<()> {
+            let handle = UnixLegacyProcessHandle::open(target.id(), &executable)?;
+            anyhow::ensure!(handle.is_live()?, "retained target must start live");
+            handle.signal_term()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle.is_live()? {
+                anyhow::ensure!(Instant::now() < deadline, "target did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            anyhow::ensure!(
+                unrelated.try_wait()?.is_none(),
+                "kernel-bound signal affected an unrelated process"
+            );
+            Ok(())
+        })();
+        if target.try_wait().unwrap().is_none() {
+            let _ = target.kill();
+        }
+        let _ = target.wait();
+        if unrelated.try_wait().unwrap().is_none() {
+            let _ = unrelated.kill();
+        }
+        let _ = unrelated.wait();
+        result.unwrap();
     }
 }
-
-#[allow(dead_code)]
-fn _path_sanity(_: &Path) {}

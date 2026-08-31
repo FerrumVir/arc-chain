@@ -4,16 +4,24 @@
 //! using deterministic Ed25519 keypairs. The consensus loop drains signed txs
 //! from a bounded channel and feeds them to `execute_block_signed_benchmark()`.
 
+#[cfg(feature = "benchmark-tools")]
 use arc_crypto::Hash256;
+#[cfg(feature = "benchmark-tools")]
 use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_types::Transaction;
+#[cfg(feature = "benchmark-tools")]
 use crossbeam::channel::{self, Receiver};
+#[cfg(feature = "benchmark-tools")]
 use std::sync::Arc;
+#[cfg(feature = "benchmark-tools")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "benchmark-tools")]
 use std::thread::JoinHandle;
+#[cfg(feature = "benchmark-tools")]
 use tracing::info;
 
 /// Pre-signing pool that feeds signed transactions to the consensus loop.
+#[cfg(feature = "benchmark-tools")]
 pub struct BenchmarkPool {
     rx: Receiver<Vec<Transaction>>,
     stop: Arc<AtomicBool>,
@@ -21,6 +29,12 @@ pub struct BenchmarkPool {
     handles: Vec<JoinHandle<()>>,
 }
 
+#[cfg(not(feature = "benchmark-tools"))]
+pub struct BenchmarkPool {
+    _private: (),
+}
+
+#[cfg(feature = "benchmark-tools")]
 impl BenchmarkPool {
     /// Start the pre-signing pool.
     ///
@@ -156,6 +170,16 @@ impl BenchmarkPool {
     }
 }
 
+#[cfg(not(feature = "benchmark-tools"))]
+impl BenchmarkPool {
+    /// Default/release builds retain only an inert consensus API shape; they
+    /// cannot construct a signing pool or generate benchmark transactions.
+    pub fn drain(&self, _max: usize) -> Vec<Transaction> {
+        Vec::new()
+    }
+}
+
+#[cfg(feature = "benchmark-tools")]
 impl Drop for BenchmarkPool {
     fn drop(&mut self) {
         self.stop();

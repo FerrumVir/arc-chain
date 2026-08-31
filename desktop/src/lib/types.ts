@@ -37,7 +37,7 @@ export interface NodeStatus {
   lastError: string | null;
   /**
    * If the local node has no peers but a public seed coordinator's `/health`
-   * responded, this is its origin (e.g. `https://140-82-16-112.nip.io`). The UI
+   * responded, this is its origin (e.g. `https://140.82.16.112`). The UI
    * shows "Client mode (via LAX)" and the onboarding gate lets the user
    * through even when residential UDP P2P is blocked.
    */
@@ -68,6 +68,7 @@ export interface ConfirmedRewardReceipt {
 }
 
 export interface Earnings {
+  /** Gross rewards visible in the selected host's current retained window. */
   totalArc: number;
   /** null = the chain does not report it. Not the same as zero. */
   todayArc: number | null;
@@ -85,6 +86,12 @@ export interface Earnings {
   projectedDailyUnavailableReason: string | null;
   recoveryEpoch: number | null;
   validatorSetId: number | null;
+  /** Non-null only when the selected host's receipt index is unavailable. */
+  unavailableReason: string | null;
+  /** Backend-declared source of the bounded receipt window. */
+  receiptSource: string | null;
+  /** Whether the selected host reports archival state. */
+  archiveMode: boolean | null;
   /** True only for the candidate's mined-0x25 receipt/readiness contract. */
   fromChain: boolean;
 }
@@ -110,8 +117,16 @@ export interface Attestation {
    * chain view is not half transfers presented as inference evidence.
    */
   txType: string | null;
+  /** Protocol-v3 activity discriminator from `/inference/attestations`. */
+  recordKind: string | null;
+  /** True when the row proves a successful computation. */
+  computed: boolean;
+  /** True only for a successful mined 0x25 reward receipt. */
+  paid: boolean;
+  /** Same receipt-backed earning gate as `paid`; never inferred from 0x16. */
+  earned: boolean;
   from: string | null;
-  /** `from` matches the user's address. */
+  /** The activity worker (falling back to legacy `from`) matches the user. */
   mine: boolean;
   verified: boolean;
 }
@@ -148,9 +163,22 @@ export const DEFAULT_NODE_CONFIG: NodeConfig = {
   p2pPort: 9091,
   autoStart: true,
   autoUpdate: true,
-  dataDir: "~/.arc",
+  dataDir: "~/.arc/data-v3",
   workerThreads: null,
 };
+
+/**
+ * One-time evidence that an updater/relaunch fenced chain data that could not
+ * be safely replayed (an unbound v0.7 WAL or malformed v3 binding). The native
+ * layer leaves source bytes untouched and points v0.8 at a fresh protocol-v3
+ * directory before it can auto-start.
+ */
+export interface DataMigrationNotice {
+  legacyDataDir: string;
+  activeDataDir: string;
+  migratedAt: number;
+  reason: string;
+}
 
 /**
  * The identity as the UI sees it — no `seedPhrase`.
@@ -242,9 +270,9 @@ export type RateSource = "chain" | "constant" | "unknown";
 /**
  * `GET /worker/earnings/{addr}` — the inputs a projection needs.
  *
- * Kept separate from `Earnings` (which is lifetime-to-date) because a
- * projection has a completely different honesty burden: it is the one number
- * in the app that describes something that has not happened yet.
+ * Kept separate from `Earnings` (the selected host's retained receipt window)
+ * because a projection has a completely different honesty burden: it is the
+ * one number in the app that describes something that has not happened yet.
  */
 export interface EarningsProjection extends Unavailable {
   /** ARC per successful mined community-reward receipt. */
@@ -535,6 +563,21 @@ export interface InferenceHop {
   isTerminal: boolean;
 }
 
+/** Reward state returned when `/inference/run` used a community worker. */
+export interface InferenceSettlement {
+  status: string;
+  /** `0x25` for a CommunityInferenceReward; never an unpaid 0x16 claim. */
+  txType: string;
+  txHash: string;
+  jobId: string;
+  submitted: boolean;
+  included: boolean;
+  /** True only for a successful mined reward receipt. */
+  confirmed: boolean;
+  rewardArc: number | null;
+  receiptUrl: string;
+}
+
 export interface InferenceResult {
   input: string;
   output: string;
@@ -544,8 +587,17 @@ export interface InferenceResult {
   inferenceMs: number;
   txHash: string;
   deterministic: boolean;
+  /** Every shard hop was selected under one exact execution profile. */
+  profileBound: boolean;
+  /** Coordinator reports a complete authenticated same-profile quorum grid. */
+  quorumVerified: boolean;
+  executionProfile: string;
   engine: string;
   explorerUrl: string;
+  /** Exact server routing declaration (`community:<worker>`, `local`, ...). */
+  routedVia?: string;
+  /** Community reward state, kept separate from the unpaid 0x16 claim. */
+  settlement?: InferenceSettlement;
   /** Present when the inference was served by a coordinator (seed RPC). */
   consensus?: InferenceConsensus;
   /** Origin URL of the coordinator that served the request. */

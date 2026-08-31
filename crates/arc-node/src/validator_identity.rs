@@ -2,20 +2,22 @@
 //!
 //! Production validators load the JSON format written by `arc keygen` from a
 //! mode-0600 regular file. Secret-derived identity is retained only for
-//! stake-zero clients and deliberately opted-in local development networks.
+//! deliberately opted-in local development networks. A process-ephemeral
+//! observer identity is allowed only after the caller proves a strict local
+//! runtime boundary.
 
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, KeyPair};
 use serde::Deserialize;
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
 use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(all(test, unix))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_KEYFILE_BYTES: u64 = 16 * 1024;
-const DEFAULT_OBSERVER_SEED: &str = "arc-stake-zero-observer";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +39,7 @@ impl Drop for ArcKeyfile {
 pub enum IdentitySource {
     Keyfile,
     InsecureDevelopmentSeed,
-    StakeZeroSeed,
+    EphemeralLoopbackObserver,
 }
 
 pub struct LoadedIdentity {
@@ -48,21 +50,12 @@ pub struct LoadedIdentity {
 /// Load an ARC CLI-compatible Ed25519 keyfile after enforcing its filesystem
 /// and self-consistency contract.
 pub fn load_ed25519_keyfile(path: &Path) -> Result<KeyPair> {
-    let path_metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect validator keyfile {}", path.display()))?;
-    ensure!(
-        !path_metadata.file_type().is_symlink(),
-        "validator keyfile must not be a symbolic link: {}",
-        path.display()
-    );
-    ensure!(
-        path_metadata.is_file(),
-        "validator keyfile is not a regular file: {}",
-        path.display()
-    );
-
-    let mut file = File::open(path)
-        .with_context(|| format!("failed to open validator keyfile {}", path.display()))?;
+    let mut file = arc_crypto::secret_file::open_private(path).with_context(|| {
+        format!(
+            "failed to open validator keyfile {} through the private-file boundary",
+            path.display()
+        )
+    })?;
     let metadata = file.metadata().with_context(|| {
         format!(
             "failed to inspect open validator keyfile {}",
@@ -70,33 +63,11 @@ pub fn load_ed25519_keyfile(path: &Path) -> Result<KeyPair> {
         )
     })?;
 
-    #[cfg(unix)]
-    ensure!(
-        path_metadata.dev() == metadata.dev() && path_metadata.ino() == metadata.ino(),
-        "validator keyfile changed while it was being opened; retry with a stable regular file"
-    );
-
     ensure!(
         metadata.len() <= MAX_KEYFILE_BYTES,
         "validator keyfile is unexpectedly large ({} bytes; maximum {})",
         metadata.len(),
         MAX_KEYFILE_BYTES
-    );
-
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        ensure!(
-            mode == 0o600,
-            "validator keyfile {} must have mode 0600 (found {:04o}); run: chmod 600 {}",
-            path.display(),
-            mode,
-            path.display()
-        );
-    }
-    #[cfg(not(unix))]
-    bail!(
-        "production validator keyfile permission validation is not implemented on this OS; run a stake-zero node or use a supported Unix validator host"
     );
 
     let mut encoded = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
@@ -161,15 +132,16 @@ pub fn resolve_identity(
     seed: Option<&str>,
     stake: u64,
     allow_insecure_dev_seed: bool,
+    allow_ephemeral_observer: bool,
 ) -> Result<LoadedIdentity> {
     ensure!(
         keyfile.is_none() || seed.is_none(),
         "validator identity is ambiguous: configure either validator_key_file or validator_seed, never both"
     );
 
-    if stake > 0 && seed.is_some() && !allow_insecure_dev_seed {
+    if seed.is_some() && !allow_insecure_dev_seed {
         bail!(
-            "a staked validator cannot accept --validator-seed, ARC_VALIDATOR_SEED, or [validator].seed. Remove the seed and provide --validator-key-file <mode-0600 arc keygen JSON>; use --insecure-dev-validator-seed only for a disposable local network"
+            "--validator-seed, ARC_VALIDATOR_SEED, and [validator].seed require --insecure-dev-validator-seed on a numeric-loopback-only disposable network; use --validator-key-file <mode-0600 arc keygen JSON> for every persistent or networked identity"
         );
     }
 
@@ -180,29 +152,30 @@ pub fn resolve_identity(
         });
     }
 
-    if stake > 0 && !allow_insecure_dev_seed {
+    if stake > 0 && seed.is_none() {
         bail!(
             "staked validators require --validator-key-file <path> (or ARC_VALIDATOR_KEY_FILE) pointing to a mode-0600 Ed25519 JSON file created by `arc keygen --scheme ed25519`; seed/argv identities are forbidden"
         );
     }
 
-    let (seed, source) = if stake > 0 {
-        let seed = seed.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--insecure-dev-validator-seed also requires an explicit --validator-seed or [validator].seed"
-            )
-        })?;
-        (seed, IdentitySource::InsecureDevelopmentSeed)
-    } else {
-        (
-            seed.unwrap_or(DEFAULT_OBSERVER_SEED),
-            IdentitySource::StakeZeroSeed,
-        )
-    };
+    if let Some(seed) = seed {
+        return Ok(LoadedIdentity {
+            keypair: derive_insecure_seed_keypair(seed),
+            source: IdentitySource::InsecureDevelopmentSeed,
+        });
+    }
 
+    ensure!(
+        !allow_insecure_dev_seed,
+        "--insecure-dev-validator-seed also requires an explicit --validator-seed or [validator].seed"
+    );
+    ensure!(
+        stake == 0 && allow_ephemeral_observer,
+        "a persistent identity is required: generate a mode-0600 keyfile with `arc keygen --scheme ed25519` and pass --validator-key-file <path>; process-ephemeral identity is allowed only for numeric-loopback, stake-zero, non-community local observation and changes on every restart"
+    );
     Ok(LoadedIdentity {
-        keypair: derive_insecure_seed_keypair(seed),
-        source,
+        keypair: KeyPair::generate_ed25519(),
+        source: IdentitySource::EphemeralLoopbackObserver,
     })
 }
 
@@ -303,20 +276,23 @@ mod tests {
         let path = temp_path("mode");
         write_keyfile(&path, [11u8; 32], |_| {});
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        let error = load_ed25519_keyfile(&path).err().unwrap().to_string();
+        let error = format!("{:#}", load_ed25519_keyfile(&path).err().unwrap());
         assert!(error.contains("mode 0600"), "{error}");
         fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn production_stake_rejects_seed_and_requires_keyfile() {
-        let seed_error = resolve_identity(None, Some("public-seed"), 5_000_000, false)
+        let seed_error = resolve_identity(None, Some("public-seed"), 5_000_000, false, false)
             .err()
             .unwrap()
             .to_string();
-        assert!(seed_error.contains("cannot accept"), "{seed_error}");
+        assert!(
+            seed_error.contains("require --insecure-dev-validator-seed"),
+            "{seed_error}"
+        );
 
-        let missing_error = resolve_identity(None, None, 5_000_000, false)
+        let missing_error = resolve_identity(None, None, 5_000_000, false, false)
             .err()
             .unwrap()
             .to_string();
@@ -328,7 +304,8 @@ mod tests {
 
     #[test]
     fn explicit_insecure_flag_preserves_local_dev_seed() {
-        let loaded = resolve_identity(None, Some("local-dev-only"), 5_000_000, true).unwrap();
+        let loaded =
+            resolve_identity(None, Some("local-dev-only"), 5_000_000, true, false).unwrap();
         assert_eq!(loaded.source, IdentitySource::InsecureDevelopmentSeed);
         assert_eq!(
             loaded.keypair.address(),
@@ -343,10 +320,45 @@ mod tests {
             Some("dev-seed"),
             0,
             true,
+            false,
         )
         .err()
         .unwrap()
         .to_string();
         assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[test]
+    fn stake_zero_seed_also_requires_explicit_insecure_dev_mode() {
+        let error = resolve_identity(None, Some("still-predictable"), 0, false, true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("require --insecure-dev-validator-seed"),
+            "{error}"
+        );
+
+        let loaded = resolve_identity(None, Some("still-predictable"), 0, true, false).unwrap();
+        assert_eq!(loaded.source, IdentitySource::InsecureDevelopmentSeed);
+    }
+
+    #[test]
+    fn local_observer_identity_is_ephemeral_and_never_a_fixed_default() {
+        let first = resolve_identity(None, None, 0, false, true).unwrap();
+        let second = resolve_identity(None, None, 0, false, true).unwrap();
+        assert_eq!(first.source, IdentitySource::EphemeralLoopbackObserver);
+        assert_eq!(second.source, IdentitySource::EphemeralLoopbackObserver);
+        assert_ne!(first.keypair.address(), second.keypair.address());
+    }
+
+    #[test]
+    fn ephemeral_observer_requires_caller_proven_local_runtime() {
+        let error = resolve_identity(None, None, 0, false, false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("persistent identity is required"), "{error}");
+        assert!(error.contains("changes on every restart"), "{error}");
     }
 }

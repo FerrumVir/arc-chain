@@ -98,7 +98,7 @@ test.describe("Live node (port 9090) - real data", () => {
     await page.screenshot({ path: "screenshots/live-dashboard-full.png" });
   });
 
-  test("legacy inference results are not rendered as paid rewards", async ({ page }) => {
+  test("legacy earnings are unavailable rather than rendered as zero or paid rewards", async ({ page }) => {
     await seedOnboarded(page);
     await injectLive(page);
     await page.goto("/");
@@ -107,9 +107,10 @@ test.describe("Live node (port 9090) - real data", () => {
 
     // The browser-live fallback can see historical /inference/results, but
     // those are not successful mined 0x25 reward receipts.
-    await expect(page.getByTestId("earnings-empty")).toContainText(
-      "No mined reward receipts yet",
+    await expect(page.getByTestId("earnings-unavailable")).toContainText(
+      "Legacy or malformed inference-count arithmetic is not earnings",
     );
+    await expect(page.getByTestId("earnings-empty")).toHaveCount(0);
     await expect(page.getByTestId("weekly-chart")).toHaveCount(0);
     await expect(page.getByText(/\+2\.50 ARC/)).toHaveCount(0);
 

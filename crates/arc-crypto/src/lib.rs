@@ -13,6 +13,7 @@ pub mod merkle;
 pub mod pedersen;
 pub mod poseidon;
 pub mod proof_compress;
+pub mod secret_file;
 pub mod signature;
 pub mod stark;
 #[cfg(feature = "stwo-prover")]
@@ -48,9 +49,10 @@ pub use signature::{
     FALCON_PK_LEN, FALCON_SIG_MAX_LEN, FALCON_SK_LEN, KeyPair, Signature, SignatureError,
     address_from_ed25519_pubkey, address_from_falcon_pubkey, address_from_ml_dsa_pubkey,
     address_from_secp256k1_pubkey, batch_verify_ed25519, batch_verify_falcon512,
-    batch_verify_ml_dsa, benchmark_address, benchmark_keypair, falcon_batch_verify, falcon_keygen,
-    falcon_sign, falcon_verify,
+    batch_verify_ml_dsa, falcon_batch_verify, falcon_keygen, falcon_sign, falcon_verify,
 };
+#[cfg(feature = "benchmark-tools")]
+pub use signature::{benchmark_address, benchmark_keypair};
 pub use threshold::{
     KeyGeneration, PartialSignature, SecretShare, ShareVerification, THRESHOLD_TAG_LEN,
     ThresholdEncryption, ThresholdError, ThresholdScheme, ThresholdSignature, ThresholdSigner,

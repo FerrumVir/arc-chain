@@ -428,8 +428,148 @@ pub struct CachedIntegerModel {
 /// quantization path, not merely start from the same GGUF bytes.
 pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
     "INT8 integer (per-row, cross-platform deterministic)";
+pub const I16_INFERENCE_PROFILE: &str = "INT16 integer (per-row, cross-platform deterministic)";
+pub const BLOCK_I8_INFERENCE_PROFILE: &str =
+    "block-INT8 integer (32-weight blocks, cross-platform deterministic)";
+pub const Q4_INFERENCE_PROFILE: &str = "Q4 integer (cross-platform deterministic)";
+pub const TERNARY_INFERENCE_PROFILE: &str = "ternary (1.58-bit, ASIC-compatible)";
+pub const TERNARY_HYBRID_INFERENCE_PROFILE: &str = "ternary-hybrid (per-row sparse-INT8 outliers)";
+
+/// True only for a protocol-v3 execution profile whose dispatch semantics are
+/// defined by this binary. Shard announcements use these exact identifiers as
+/// signed protocol identity, rather than treating a display-only model name as
+/// sufficient evidence that two replicas will execute the same arithmetic.
+pub fn is_supported_inference_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        CANONICAL_REWARD_INFERENCE_PROFILE
+            | I16_INFERENCE_PROFILE
+            | BLOCK_I8_INFERENCE_PROFILE
+            | Q4_INFERENCE_PROFILE
+            | TERNARY_INFERENCE_PROFILE
+            | TERNARY_HYBRID_INFERENCE_PROFILE
+    )
+}
+
+/// Every whole-model generation performs one internal BOS forward before it
+/// consumes the caller's prompt and generation budget.
+pub const GENERATION_INTERNAL_BOS_POSITIONS: usize = 1;
+
+/// A successful, immutable context-window admission decision.
+///
+/// `required_positions` is the exact maximum number of calls to
+/// [`CachedIntegerModel::forward_one_token`] the request can make:
+///
+/// `1 internal BOS + prompt_tokens + max_tokens`.
+///
+/// Generation may stop earlier on EOS, but callers must reserve the full
+/// advertised `max_tokens` budget before any model compute begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a successful preflight must gate untrusted generation"]
+pub struct GenerationPreflight {
+    pub prompt_tokens: usize,
+    pub max_tokens: u32,
+    pub required_positions: usize,
+    pub max_seq: usize,
+}
+
+/// Why a whole-model generation request was rejected before compute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationError {
+    /// The position-count formula overflowed the platform's `usize`.
+    PositionCountOverflow {
+        prompt_tokens: usize,
+        max_tokens: u32,
+    },
+    /// The complete advertised generation budget does not fit in the model's
+    /// precomputed RoPE/context window.
+    ContextWindowExceeded {
+        prompt_tokens: usize,
+        max_tokens: u32,
+        required_positions: usize,
+        max_seq: usize,
+    },
+}
+
+impl GenerationError {
+    /// Stable machine-readable tag for RPC error mapping.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PositionCountOverflow { .. } => "position_count_overflow",
+            Self::ContextWindowExceeded { .. } => "context_window_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PositionCountOverflow {
+                prompt_tokens,
+                max_tokens,
+            } => write!(
+                f,
+                "position_count_overflow: 1 internal BOS + {prompt_tokens} prompt tokens + \
+                 {max_tokens} generated tokens exceeds the platform position counter"
+            ),
+            Self::ContextWindowExceeded {
+                prompt_tokens,
+                max_tokens,
+                required_positions,
+                max_seq,
+            } => write!(
+                f,
+                "context_window_exceeded: 1 internal BOS + {prompt_tokens} prompt tokens + \
+                 {max_tokens} generated tokens requires {required_positions} positions, but \
+                 the model supports at most {max_seq}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GenerationError {}
 
 impl CachedIntegerModel {
+    /// Validate a whole-model generation request before any model compute.
+    ///
+    /// This is the central admission check for untrusted prompts. The exact
+    /// boundary is accepted; a request requiring even one additional forward
+    /// is rejected before it can index past the precomputed RoPE tables.
+    pub fn preflight_generation(
+        &self,
+        prompt_tokens: usize,
+        max_tokens: u32,
+    ) -> Result<GenerationPreflight, GenerationError> {
+        let generated_positions =
+            usize::try_from(max_tokens).map_err(|_| GenerationError::PositionCountOverflow {
+                prompt_tokens,
+                max_tokens,
+            })?;
+        let required_positions = GENERATION_INTERNAL_BOS_POSITIONS
+            .checked_add(prompt_tokens)
+            .and_then(|positions| positions.checked_add(generated_positions))
+            .ok_or(GenerationError::PositionCountOverflow {
+                prompt_tokens,
+                max_tokens,
+            })?;
+
+        if required_positions > self.config.max_seq {
+            return Err(GenerationError::ContextWindowExceeded {
+                prompt_tokens,
+                max_tokens,
+                required_positions,
+                max_seq: self.config.max_seq,
+            });
+        }
+
+        Ok(GenerationPreflight {
+            prompt_tokens,
+            max_tokens,
+            required_positions,
+            max_seq: self.config.max_seq,
+        })
+    }
+
     /// True only when every configured transformer layer has real weights.
     ///
     /// Tokenizer-only and range-sharded loaders intentionally leave
@@ -535,15 +675,15 @@ impl CachedIntegerModel {
     /// response shows what's running, not a hardcoded string.
     pub fn effective_precision_label(&self) -> &'static str {
         if self.ternary_hybrid_layers.is_some() {
-            "ternary-hybrid (per-row sparse-INT8 outliers)"
+            TERNARY_HYBRID_INFERENCE_PROFILE
         } else if self.ternary_layers.is_some() {
-            "ternary (1.58-bit, ASIC-compatible)"
+            TERNARY_INFERENCE_PROFILE
         } else if self.i16_layers.is_some() {
-            "INT16 integer (per-row, cross-platform deterministic)"
+            I16_INFERENCE_PROFILE
         } else if self.block_i8_layers.is_some() {
-            "block-INT8 integer (32-weight blocks, cross-platform deterministic)"
+            BLOCK_I8_INFERENCE_PROFILE
         } else if self.q4_layers.is_some() {
-            "Q4 integer (cross-platform deterministic)"
+            Q4_INFERENCE_PROFILE
         } else {
             CANONICAL_REWARD_INFERENCE_PROFILE
         }
@@ -2814,7 +2954,38 @@ impl CachedIntegerModel {
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
+    /// Generate with fallible context-window admission for untrusted callers.
+    ///
+    /// The complete request is preflighted before allocating a KV cache or
+    /// performing the internal BOS forward. Consequently an oversized
+    /// request returns [`GenerationError`] instead of reaching `apply_rope`
+    /// with an out-of-range position (an abort in release builds).
+    pub fn try_generate(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        let _admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        Ok(self.generate_preflighted(prompt, max_tokens, eos_tokens))
+    }
+
+    /// Trusted compatibility wrapper around [`Self::try_generate`].
+    ///
+    /// RPC, P2P, and other untrusted entry points must call `try_generate`
+    /// and map its typed error. This infallible signature remains for existing
+    /// offline tools and callers whose request bounds are already proven.
     pub fn generate(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> (Vec<u32>, Hash256) {
+        self.try_generate(prompt, max_tokens, eos_tokens)
+            .expect("trusted generation request must fit the model context window")
+    }
+
+    fn generate_preflighted(
         &self,
         prompt: &[u32],
         max_tokens: u32,
@@ -2823,8 +2994,10 @@ impl CachedIntegerModel {
         let mut cache = KVCache::new(self.config.n_layers);
         let mut generated = Vec::new();
 
-        // Prepend BOS token (1) - Llama requires it
-        let _ = self.forward_one_token(1, &mut cache);
+        // The whole-model API owns the one required BOS forward. Callers pass
+        // raw prompt tokens; using the artifact's configured token avoids both
+        // a duplicate BOS and the hardcoded LLaMA-2 ID on other tokenizers.
+        let _ = self.forward_one_token(self.config.bos_token, &mut cache);
 
         for &tok in prompt {
             let _logits = self.forward_one_token(tok, &mut cache);
@@ -4883,6 +5056,68 @@ mod tests {
         let mut inconsistent = build_test_model(32, 16, 2, 32, 1);
         inconsistent.config.n_layers = 2;
         assert!(!inconsistent.has_all_transformer_layers());
+    }
+
+    #[test]
+    fn generation_preflight_and_execution_accept_exact_context_boundary() {
+        let mut model = build_test_model(32, 16, 2, 32, 1);
+        model.config.max_seq = 6;
+        let prompt = [3, 4];
+
+        let admission = model
+            .preflight_generation(prompt.len(), 3)
+            .expect("1 BOS + 2 prompt + 3 generated exactly fills six positions");
+        assert_eq!(admission.prompt_tokens, 2);
+        assert_eq!(admission.max_tokens, 3);
+        assert_eq!(admission.required_positions, 6);
+        assert_eq!(admission.max_seq, 6);
+
+        let (generated, _) = model
+            .try_generate(&prompt, 3, &[])
+            .expect("the exact context boundary must execute without indexing past RoPE");
+        assert_eq!(generated.len(), 3);
+    }
+
+    #[test]
+    fn generation_one_position_over_returns_error_before_compute() {
+        let mut model = build_test_model(32, 16, 2, 32, 1);
+        model.config.max_seq = 6;
+        let prompt = [3, 4];
+
+        // Make every forward unusable. Returning the typed admission error
+        // still proves the +1 request was refused before BOS/model compute.
+        model.embedding_q16.clear();
+        let err = model
+            .try_generate(&prompt, 4, &[])
+            .expect_err("1 BOS + 2 prompt + 4 generated is one over six");
+
+        assert_eq!(err.kind(), "context_window_exceeded");
+        assert_eq!(
+            err,
+            GenerationError::ContextWindowExceeded {
+                prompt_tokens: 2,
+                max_tokens: 4,
+                required_positions: 7,
+                max_seq: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn generation_preflight_rejects_position_count_overflow() {
+        let model = build_test_model(32, 16, 2, 32, 1);
+        let err = model
+            .preflight_generation(usize::MAX, 0)
+            .expect_err("the internal BOS addition must use checked arithmetic");
+
+        assert_eq!(err.kind(), "position_count_overflow");
+        assert_eq!(
+            err,
+            GenerationError::PositionCountOverflow {
+                prompt_tokens: usize::MAX,
+                max_tokens: 0,
+            }
+        );
     }
 
     #[test]

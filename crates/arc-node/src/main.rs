@@ -4,7 +4,9 @@ mod validator_identity;
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, hash_bytes};
 use arc_mempool::Mempool;
-use arc_net::transport::{InboundMessage, OutboundMessage, run_transport_with_readiness};
+use arc_net::transport::{
+    InboundMessage, OutboundMessage, run_transport_with_readiness_and_shutdown,
+};
 use arc_node::{
     benchmark::BenchmarkPool,
     consensus::{ConsensusManager, RecoveryDagRollover},
@@ -21,7 +23,7 @@ use arc_types::Block;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +31,7 @@ use std::sync::atomic::AtomicU32;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Parser)]
 #[command(name = "arc-node", version, about = "ARC Chain Node")]
@@ -41,6 +43,11 @@ struct Cli {
     /// RPC listen address (changed from 9090 to avoid Prometheus default port conflict)
     #[arg(long, default_value = "127.0.0.1:9944")]
     rpc: String,
+
+    /// Permission-sealed Unix RPC listener for production reverse proxies.
+    /// Conflicts with an explicitly supplied --rpc TCP address.
+    #[arg(long, value_name = "PATH", conflicts_with = "rpc")]
+    rpc_unix: Option<PathBuf>,
 
     /// P2P listen port (QUIC) (changed from 9091 to avoid Transmission BitTorrent default)
     #[arg(long, default_value_t = 9945)]
@@ -60,6 +67,14 @@ struct Cli {
     /// Data directory for WAL/snapshots
     #[arg(long, default_value = "./arc-data")]
     data_dir: String,
+
+    /// Private desktop shutdown capability file inside --data-dir.
+    ///
+    /// Packaged Windows nodes use CREATE_NO_WINDOW and therefore cannot
+    /// receive a console control event. The desktop writes an authenticated
+    /// sibling request file instead; no network shutdown endpoint is exposed.
+    #[arg(long)]
+    desktop_shutdown_token_file: Option<PathBuf>,
 
     /// Bootstrap peer addresses (comma-separated host:port)
     #[arg(long, value_delimiter = ',')]
@@ -113,8 +128,9 @@ struct Cli {
     #[arg(long, env = "ARC_VALIDATOR_KEY_FILE")]
     validator_key_file: Option<String>,
 
-    /// Legacy deterministic seed for stake-zero nodes or disposable devnets.
-    /// A production staked node always rejects this secret-bearing interface.
+    /// Legacy deterministic seed for an explicitly insecure disposable devnet.
+    /// Requires --insecure-dev-validator-seed and numeric-loopback-only RPC,
+    /// P2P, and peers; every persistent/community/reward/shard role rejects it.
     #[arg(long, env = "ARC_VALIDATOR_SEED")]
     validator_seed: Option<String>,
 
@@ -140,31 +156,38 @@ struct Cli {
 
     /// Enable continuous transaction generation (testnet benchmark mode).
     /// Generates transfers between genesis accounts to keep the chain busy.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = false)]
     benchmark: bool,
 
     /// Transactions per batch in benchmark mode.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = 500)]
     bench_batch: usize,
 
     /// Milliseconds between benchmark batches.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = 200)]
     bench_interval: u64,
 
     /// First sender index for benchmark mode (0-49). Use to partition senders
     /// across nodes in multi-node benchmarks to avoid nonce conflicts.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = 0)]
     bench_sender_start: u8,
 
     /// Number of senders this node owns in benchmark mode.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = 50)]
     bench_sender_count: u8,
 
     /// Number of signing threads in benchmark mode.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = 4)]
     bench_sign_threads: usize,
 
     /// Number of rayon threads for batch verification.
+    #[cfg(feature = "benchmark-tools")]
     #[arg(long, default_value_t = 6)]
     bench_rayon_threads: usize,
 
@@ -361,6 +384,55 @@ enum OperatorCommand {
     Recovery {
         #[command(subcommand)]
         command: RecoveryCommand,
+    },
+    /// Query one cryptographically pinned, stopped legacy fork without
+    /// starting a node, WAL, P2P, consensus, signing, or mutation endpoint.
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum ArchiveCommand {
+    /// Serve an immutable ARCCHKPT view on an explicit GET-only transport.
+    Serve {
+        #[arg(long)]
+        archive_manifest: String,
+        #[arg(long)]
+        complete: String,
+        #[arg(long)]
+        inventory: String,
+        #[arg(long)]
+        binding_index: String,
+        #[arg(long)]
+        binding: String,
+        #[arg(long)]
+        checkpoint: String,
+        /// Finalized, out-of-band archive manifest SHA-256 trust root.
+        #[arg(long)]
+        expected_archive_manifest_sha256: String,
+        /// Finalized, out-of-band COMPLETE.json SHA-256 trust root.
+        #[arg(long)]
+        expected_complete_sha256: String,
+        #[arg(long)]
+        node: String,
+        /// Explicit development listener; must be loopback. Production uses
+        /// --listen-unix so a crashed archive cannot be impersonated locally.
+        #[arg(
+            long,
+            conflicts_with = "listen_unix",
+            required_unless_present = "listen_unix"
+        )]
+        listen: Option<SocketAddr>,
+        /// Permission-sealed production origin socket.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "listen",
+            required_unless_present = "listen"
+        )]
+        listen_unix: Option<PathBuf>,
     },
 }
 
@@ -1942,8 +2014,7 @@ fn compact_replayed_recovery_generation(
     Ok(successor)
 }
 
-fn run_operator_command(command: OperatorCommand) -> Result<()> {
-    let OperatorCommand::Recovery { command } = command;
+fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
     match command {
         RecoveryCommand::Inspect { checkpoint } => {
             let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
@@ -2087,6 +2158,54 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
     }
 }
 
+async fn run_operator_command(command: OperatorCommand) -> Result<()> {
+    match command {
+        OperatorCommand::Recovery { command } => run_recovery_operator_command(command),
+        OperatorCommand::Archive {
+            command:
+                ArchiveCommand::Serve {
+                    archive_manifest,
+                    complete,
+                    inventory,
+                    binding_index,
+                    binding,
+                    checkpoint,
+                    expected_archive_manifest_sha256,
+                    expected_complete_sha256,
+                    node,
+                    listen,
+                    listen_unix,
+                },
+        } => {
+            let archive_listen = match (listen, listen_unix) {
+                (Some(address), None) => {
+                    arc_node::legacy_archive::LegacyArchiveListen::Tcp(address)
+                }
+                #[cfg(unix)]
+                (None, Some(path)) => arc_node::legacy_archive::LegacyArchiveListen::Unix(path),
+                #[cfg(not(unix))]
+                (None, Some(_path)) => anyhow::bail!("--listen-unix requires a Unix host"),
+                _ => anyhow::bail!("select exactly one archive listener"),
+            };
+            arc_node::legacy_archive::serve(
+                arc_node::legacy_archive::LegacyArchiveSpec {
+                    archive_manifest: archive_manifest.into(),
+                    complete: complete.into(),
+                    inventory: inventory.into(),
+                    binding_index: binding_index.into(),
+                    checkpoint: checkpoint.into(),
+                    binding: binding.into(),
+                    expected_archive_manifest_sha256,
+                    expected_complete_sha256,
+                    node,
+                },
+                archive_listen,
+            )
+            .await
+        }
+    }
+}
+
 /// Return the first candidate whose complete SHA-256 matches the canonical
 /// community artifact. A similarly named or same-sized GGUF is not eligible.
 fn discover_matching_model(candidates: Vec<String>, expected_sha: &str) -> Option<String> {
@@ -2131,6 +2250,13 @@ fn auto_discover_model() -> Option<String> {
 /// Stream a file through SHA-256 in-process. This works identically on Linux,
 /// macOS and Windows and keeps memory bounded for multi-gigabyte GGUF files.
 fn sha256_of(path: &str) -> Option<String> {
+    sha256_of_with_shutdown(path, None)
+}
+
+fn sha256_of_with_shutdown(
+    path: &str,
+    shutdown_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
@@ -2139,6 +2265,11 @@ fn sha256_of(path: &str) -> Option<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
+        if shutdown_requested
+            .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return None;
+        }
         let read = reader.read(&mut buffer).ok()?;
         if read == 0 {
             break;
@@ -2165,10 +2296,12 @@ const TESTNET_MODEL_SHA256: &str =
 /// git-lfs for 4-GB+ files, and works behind any NAT (HTTPS only). Add
 /// mirrors by appending URLs here, no recompile needed for ad-hoc mirrors
 /// via the env var.
-const DEFAULT_MODEL_SOURCES: &[&str] =
-    &["https://huggingface.co/FerrumVir/llama-2-7b-arc/resolve/main/llama2-7b.gguf"];
+const DEFAULT_MODEL_SOURCES: &[&str] = &[
+    "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
+];
 
-/// Resolve a HuggingFace `/resolve/main/` URL to its `/raw/main/` form,
+/// Resolve a HuggingFace `/resolve/<immutable-revision>/` URL to its matching
+/// `/raw/<immutable-revision>/` form,
 /// which returns the git-lfs pointer text (~200 bytes) for large files.
 /// The pointer contains the file's real sha256 — letting us fail in 1 KB
 /// instead of 4 GB on a misconfigured mirror. Returns None for non-HF URLs
@@ -2199,8 +2332,13 @@ fn hf_lfs_pointer_sha(url: &str) -> Option<String> {
 /// sha256. Returns true only when the on-disk bytes hash to expected_sha.
 /// Cleans up the partial on sha mismatch so a poisoned file can't infect
 /// a later retry's resume.
-fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
-    let status = std::process::Command::new("curl")
+async fn download_and_verify(
+    url: &str,
+    tmp: &str,
+    expected_sha: &str,
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let mut child = match tokio::process::Command::new("curl")
         .args([
             "-fL",
             "--retry",
@@ -2213,13 +2351,32 @@ fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
             tmp,
             url,
         ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let status = loop {
+        if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            tracing::info!("auto-download interrupted by node shutdown request");
+            return false;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            Err(_) => return false,
+        }
+    };
     if !status {
         return false;
     }
-    let got = sha256_of(tmp).unwrap_or_default();
+    let got = sha256_of_with_shutdown(tmp, Some(shutdown_requested)).unwrap_or_default();
+    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
     if got != expected_sha {
         tracing::warn!(
             "  sha mismatch from {} (got {}); discarding partial",
@@ -2244,13 +2401,13 @@ fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
 /// Sources come from ARC_MODEL_URL (comma-separated) if set, else from
 /// DEFAULT_MODEL_SOURCES. Only invoked when `--community` was explicit, so
 /// other run modes never silently fetch multi-GB files.
-fn auto_download_model() -> Option<String> {
+async fn auto_download_model(shutdown_requested: &std::sync::atomic::AtomicBool) -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let target_dir = format!("{}/.arc-models", home);
     let target = format!("{}/llama2-7b.gguf", target_dir);
 
     if std::path::Path::new(&target).is_file() {
-        match sha256_of(&target) {
+        match sha256_of_with_shutdown(&target, Some(shutdown_requested)) {
             Some(digest) if digest == TESTNET_MODEL_SHA256 => return Some(target),
             Some(digest) => tracing::warn!(
                 path = %target,
@@ -2295,6 +2452,9 @@ fn auto_download_model() -> Option<String> {
     tracing::info!("  target: {}", target);
 
     for url in &sources {
+        if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
         tracing::info!("--community: trying {}", url);
 
         // 1) Fast LFS pre-check: HuggingFace `/raw/` URL returns the LFS
@@ -2313,7 +2473,7 @@ fn auto_download_model() -> Option<String> {
         }
 
         // 2) Download with resume + final sha verification.
-        if download_and_verify(url, &tmp, TESTNET_MODEL_SHA256) {
+        if download_and_verify(url, &tmp, TESTNET_MODEL_SHA256, shutdown_requested).await {
             if let Err(e) = std::fs::rename(&tmp, &target) {
                 tracing::warn!("  rename {} -> {} failed: {}", tmp, target, e);
                 continue;
@@ -2389,6 +2549,11 @@ struct ValidatorHttpAudience {
     transaction_domain: Option<Hash256>,
 }
 
+fn parse_validator_http_audience_hash(value: &str, field: &str) -> Result<Hash256> {
+    Hash256::from_hex(value.strip_prefix("0x").unwrap_or(value))
+        .map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))
+}
+
 /// Resolve the exact validator and recovery domain that an authenticated HTTP
 /// mutation targets. Callers may cache this result, but must evict it after a
 /// failed request so a recovery transition can never keep using stale domain
@@ -2412,20 +2577,16 @@ async fn fetch_validator_http_audience(
         .get("validator_address")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("validator omitted validator_address"))
-        .and_then(|value| {
-            Hash256::from_hex(value)
-                .map_err(|error| anyhow::anyhow!("invalid validator_address: {error}"))
-        })?;
+        .and_then(|value| parse_validator_http_audience_hash(value, "validator_address"))?;
     ensure!(
         target_validator != Hash256::ZERO,
         "validator HTTP audience cannot be the zero address"
     );
     let transaction_domain = match info.get("transaction_domain") {
-        Some(serde_json::Value::String(value)) => {
-            Some(Hash256::from_hex(value).map_err(|error| {
-                anyhow::anyhow!("invalid validator transaction_domain: {error}")
-            })?)
-        }
+        Some(serde_json::Value::String(value)) => Some(parse_validator_http_audience_hash(
+            value,
+            "validator transaction_domain",
+        )?),
         Some(serde_json::Value::Null) | None => None,
         Some(_) => {
             return Err(anyhow::anyhow!("validator transaction_domain is malformed"));
@@ -2470,6 +2631,136 @@ async fn post_signed_shard_announcement(
         .error_for_status()
         .with_context(|| format!("validator {rpc_base} rejected shard announcement"))?;
     Ok(())
+}
+
+const SHARD_ANNOUNCEMENT_STARTUP_DELAY_SECS: u64 = 3;
+const SHARD_ANNOUNCEMENT_INTERVAL_SECS: u64 = 15;
+
+async fn wait_for_optional_runtime_shutdown(
+    receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let Some(receiver) = receiver.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn sleep_or_runtime_shutdown(
+    receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    duration: std::time::Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = wait_for_optional_runtime_shutdown(receiver) => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+/// Keep every locally held range live at each explicitly configured
+/// coordinator. The receiver authenticates the holder, destination audience,
+/// recovery domain, exact artifact and execution profile before mutating its
+/// registry. Read-only topology responses are never imported as a fallback.
+#[cfg(test)]
+async fn run_signed_shard_announcement_loop(
+    shards: Vec<rpc::ShardInfo>,
+    targets: Vec<String>,
+    keypair: arc_crypto::KeyPair,
+) {
+    run_signed_shard_announcement_loop_inner(shards, targets, keypair, None).await;
+}
+
+async fn run_signed_shard_announcement_loop_with_shutdown(
+    shards: Vec<rpc::ShardInfo>,
+    targets: Vec<String>,
+    keypair: arc_crypto::KeyPair,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    run_signed_shard_announcement_loop_inner(shards, targets, keypair, Some(shutdown)).await;
+}
+
+async fn run_signed_shard_announcement_loop_inner(
+    shards: Vec<rpc::ShardInfo>,
+    targets: Vec<String>,
+    keypair: arc_crypto::KeyPair,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    // Let the local RPC listener start before the first self-announcement.
+    if sleep_or_runtime_shutdown(
+        &mut shutdown,
+        std::time::Duration::from_secs(SHARD_ANNOUNCEMENT_STARTUP_DELAY_SECS),
+    )
+    .await
+    {
+        return;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(%error, "Cannot build authenticated shard-announcement client");
+            return;
+        }
+    };
+    let mut audiences = std::collections::HashMap::<String, ValidatorHttpAudience>::new();
+    loop {
+        for rpc_base in &targets {
+            let audience = if let Some(audience) = audiences.get(rpc_base).copied() {
+                audience
+            } else {
+                match fetch_validator_http_audience(&client, rpc_base).await {
+                    Ok(audience) => {
+                        audiences.insert(rpc_base.clone(), audience);
+                        audience
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %rpc_base,
+                            %error,
+                            "Cannot resolve authenticated shard-announcement audience"
+                        );
+                        continue;
+                    }
+                }
+            };
+            let mut target_succeeded = true;
+            for shard in &shards {
+                if let Err(error) =
+                    post_signed_shard_announcement(&client, rpc_base, shard, &keypair, audience)
+                        .await
+                {
+                    tracing::warn!(
+                        %rpc_base,
+                        %error,
+                        "Authenticated shard announcement failed; evicting cached audience"
+                    );
+                    target_succeeded = false;
+                    break;
+                }
+            }
+            if !target_succeeded {
+                audiences.remove(rpc_base);
+            }
+        }
+        if sleep_or_runtime_shutdown(
+            &mut shutdown,
+            std::time::Duration::from_secs(SHARD_ANNOUNCEMENT_INTERVAL_SECS),
+        )
+        .await
+        {
+            return;
+        }
+    }
 }
 
 /// POST one authenticated community mutation. A new timestamp and CSPRNG
@@ -2543,6 +2834,374 @@ async fn post_signed_community<T: serde::Serialize>(
         .with_context(|| format!("POST authenticated community mutation to {rpc_base}{path}"))
 }
 
+async fn decline_community_assignment(
+    client: reqwest::Client,
+    coordinator: String,
+    job: serde_json::Value,
+    worker_id: String,
+    keypair: arc_crypto::KeyPair,
+    reason: &'static str,
+) {
+    let Some(job_id) = job
+        .get("job_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        tracing::warn!(seed = %coordinator, "cannot decline community assignment without a job_id");
+        return;
+    };
+    let decline = rpc::WorkResult {
+        job_id: job_id.clone(),
+        worker_id,
+        success: false,
+        declined: true,
+        output: String::new(),
+        output_hash: String::new(),
+        tokens_generated: 0,
+        total_ms: 0,
+        ms_per_token: 0,
+        engine: String::new(),
+        error: Some(reason.to_string()),
+        signed_attestation_hex: None,
+    };
+    match post_signed_community(
+        &client,
+        &coordinator,
+        rpc::COMMUNITY_SUBMIT_WORK_PATH,
+        decline,
+        &keypair,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(response) if response.status().is_success() => {
+            tracing::debug!(job_id, seed = %coordinator, %reason, "declined community assignment");
+        }
+        Ok(response) => {
+            tracing::warn!(
+                job_id,
+                seed = %coordinator,
+                status = %response.status(),
+                %reason,
+                "coordinator rejected community assignment decline"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                job_id,
+                seed = %coordinator,
+                %error,
+                %reason,
+                "could not decline community assignment"
+            );
+        }
+    }
+}
+
+const COMMUNITY_SUBMIT_LATE_GRACE_SECS: u64 = 5 * 60;
+const COMMUNITY_ASSIGNMENT_CLOCK_SKEW_SECS: u64 = 60;
+const COMMUNITY_SUBMIT_BACKOFF_BASE_MS: u64 = 250;
+const COMMUNITY_SUBMIT_BACKOFF_CAP_MS: u64 = 30_000;
+// Background admission closes at the lifecycle signal. A community assignment
+// already owned at that edge can use the complete public request window plus
+// its crash/late-submit grace; the managed-service contract then retains 120s
+// for task joins and the final WAL durability barrier.
+const MANAGED_NODE_STOP_BUDGET_SECS: u64 = 4_420;
+const _: () = assert!(
+    rpc::PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS + COMMUNITY_SUBMIT_LATE_GRACE_SECS + 120
+        == MANAGED_NODE_STOP_BUDGET_SECS
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommunitySubmitResponseDisposition {
+    Accepted,
+    Retry,
+    Rejected,
+}
+
+#[derive(Debug)]
+enum CommunitySubmitOutcome {
+    Accepted { body: String },
+    Rejected { body: String },
+    DeadlineExceeded,
+    LocalError,
+}
+
+impl CommunitySubmitOutcome {
+    fn response_body(&self) -> Option<&str> {
+        match self {
+            Self::Accepted { body } | Self::Rejected { body } => Some(body),
+            Self::DeadlineExceeded | Self::LocalError => None,
+        }
+    }
+}
+
+fn community_submit_response_disposition(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> CommunitySubmitResponseDisposition {
+    if status.is_success() {
+        return CommunitySubmitResponseDisposition::Accepted;
+    }
+    if matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    ) {
+        return CommunitySubmitResponseDisposition::Retry;
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        let body_lower = body.to_ascii_lowercase();
+        let structured_in_progress = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .or_else(|| value.pointer("/error/code"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_ascii_lowercase)
+            })
+            .is_some_and(|code| {
+                matches!(
+                    code.as_str(),
+                    "submit_in_progress" | "submission_in_progress" | "submitting"
+                )
+            });
+        if structured_in_progress
+            || body_lower.contains("already being verified")
+            || body_lower.contains("submission is in progress")
+            || body_lower.contains("submit is in progress")
+        {
+            return CommunitySubmitResponseDisposition::Retry;
+        }
+    }
+    CommunitySubmitResponseDisposition::Rejected
+}
+
+fn community_submit_error_is_network(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|error| {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                || error.status().is_some_and(|status| {
+                    matches!(
+                        status,
+                        reqwest::StatusCode::REQUEST_TIMEOUT
+                            | reqwest::StatusCode::TOO_MANY_REQUESTS
+                            | reqwest::StatusCode::BAD_GATEWAY
+                            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                            | reqwest::StatusCode::GATEWAY_TIMEOUT
+                    )
+                })
+        })
+}
+
+fn community_submit_deadline_unix_ms(submitted_at_unix_ms: i64) -> Option<i64> {
+    let budget_ms = rpc::PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS
+        .checked_add(COMMUNITY_SUBMIT_LATE_GRACE_SECS)?
+        .checked_mul(1_000)?;
+    submitted_at_unix_ms.checked_add(i64::try_from(budget_ms).ok()?)
+}
+
+/// Validate an authenticated coordinator's wall-clock assignment metadata and
+/// return a monotonic duration to the stricter of its exact expiry and the
+/// public protocol's 4,000-second ceiling plus late-submit grace.
+fn community_submit_window(
+    submitted_at_unix_ms: i64,
+    expires_at_unix_ms: u64,
+    now_unix_ms: i64,
+) -> Result<std::time::Duration, String> {
+    if submitted_at_unix_ms <= 0 {
+        return Err("assignment omitted a positive submitted_at_unix_ms".to_string());
+    }
+    let expires_at_unix_ms = i64::try_from(expires_at_unix_ms)
+        .map_err(|_| "assignment expiry exceeds the Unix timestamp range".to_string())?;
+    if expires_at_unix_ms <= submitted_at_unix_ms {
+        return Err("assignment expiry is not after its submission time".to_string());
+    }
+    let allowed_future_ms = i64::try_from(COMMUNITY_ASSIGNMENT_CLOCK_SKEW_SECS * 1_000)
+        .expect("clock-skew constant fits i64");
+    if submitted_at_unix_ms > now_unix_ms.saturating_add(allowed_future_ms) {
+        return Err("assignment submission time is too far in the future".to_string());
+    }
+    let outer_deadline = community_submit_deadline_unix_ms(submitted_at_unix_ms)
+        .ok_or_else(|| "assignment submission deadline overflowed".to_string())?;
+    let deadline_unix_ms = expires_at_unix_ms.min(outer_deadline);
+    let remaining_ms = deadline_unix_ms
+        .checked_sub(now_unix_ms)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| "assignment submission window has expired".to_string())?;
+    Ok(std::time::Duration::from_millis(
+        u64::try_from(remaining_ms).expect("positive i64 milliseconds fit u64"),
+    ))
+}
+
+fn community_generation_required_positions(prompt_tokens: usize, max_tokens: u32) -> Option<usize> {
+    let max_tokens = usize::try_from(max_tokens).ok()?;
+    1usize.checked_add(prompt_tokens)?.checked_add(max_tokens)
+}
+
+fn community_generation_fits_context(
+    prompt_tokens: usize,
+    max_tokens: u32,
+    max_seq: usize,
+) -> bool {
+    community_generation_required_positions(prompt_tokens, max_tokens)
+        .is_some_and(|required| required <= max_seq)
+}
+
+fn community_submit_backoff(attempt: u32, jitter: u64) -> std::time::Duration {
+    let exponent = attempt.min(16);
+    let ceiling_ms = COMMUNITY_SUBMIT_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << exponent)
+        .min(COMMUNITY_SUBMIT_BACKOFF_CAP_MS);
+    let floor_ms = ceiling_ms / 2;
+    let jitter_span = ceiling_ms.saturating_sub(floor_ms).saturating_add(1);
+    std::time::Duration::from_millis(floor_ms + jitter % jitter_span)
+}
+
+fn community_log_body(body: &str) -> String {
+    const MAX_CHARS: usize = 1_024;
+    let mut chars = body.chars();
+    let prefix: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…[truncated]")
+    } else {
+        prefix
+    }
+}
+
+/// Submit one immutable result to its assigning coordinator. Each attempt
+/// invokes `post_signed_community` again, so a timeout-after-server-success is
+/// recovered idempotently with a fresh HTTP nonce and signature while the
+/// WorkResult, job id, output and signed attestation remain byte-for-byte
+/// semantically identical.
+async fn submit_community_result_with_retry(
+    client: &reqwest::Client,
+    coordinator: &str,
+    result: &rpc::WorkResult,
+    keypair: &arc_crypto::KeyPair,
+    deadline: tokio::time::Instant,
+) -> CommunitySubmitOutcome {
+    let mut attempt = 0u32;
+    loop {
+        let now = tokio::time::Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            tracing::warn!(
+                job_id = %result.job_id,
+                seed = %coordinator,
+                attempts = attempt,
+                terminal = "deadline_exceeded",
+                "community result submission reached its immutable assignment deadline"
+            );
+            return CommunitySubmitOutcome::DeadlineExceeded;
+        };
+        if remaining.is_zero() {
+            tracing::warn!(
+                job_id = %result.job_id,
+                seed = %coordinator,
+                attempts = attempt,
+                terminal = "deadline_exceeded",
+                "community result submission reached its immutable assignment deadline"
+            );
+            return CommunitySubmitOutcome::DeadlineExceeded;
+        }
+
+        attempt = attempt.saturating_add(1);
+        let request_timeout = remaining.min(std::time::Duration::from_secs(
+            rpc::COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS,
+        ));
+        let attempt_future = async {
+            let response = post_signed_community(
+                client,
+                coordinator,
+                rpc::COMMUNITY_SUBMIT_WORK_PATH,
+                (*result).clone(),
+                keypair,
+                request_timeout,
+            )
+            .await?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("read community submit response body")?;
+            Ok::<_, anyhow::Error>((status, body))
+        };
+
+        let retry_reason = match tokio::time::timeout(remaining, attempt_future).await {
+            Err(_) => "attempt_timeout".to_string(),
+            Ok(Err(error)) if community_submit_error_is_network(&error) => {
+                format!("network_error: {error:#}")
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    job_id = %result.job_id,
+                    seed = %coordinator,
+                    attempts = attempt,
+                    terminal = "local_error",
+                    %error,
+                    "community result submission stopped on a non-network local error"
+                );
+                return CommunitySubmitOutcome::LocalError;
+            }
+            Ok(Ok((status, body))) => match community_submit_response_disposition(status, &body) {
+                CommunitySubmitResponseDisposition::Accepted => {
+                    tracing::info!(
+                        job_id = %result.job_id,
+                        seed = %coordinator,
+                        attempts = attempt,
+                        status = %status,
+                        terminal = "accepted",
+                        "community result submission completed"
+                    );
+                    return CommunitySubmitOutcome::Accepted { body };
+                }
+                CommunitySubmitResponseDisposition::Rejected => {
+                    tracing::warn!(
+                        job_id = %result.job_id,
+                        seed = %coordinator,
+                        attempts = attempt,
+                        status = %status,
+                        response = %community_log_body(&body),
+                        terminal = "rejected",
+                        "community result submission was terminally rejected"
+                    );
+                    return CommunitySubmitOutcome::Rejected { body };
+                }
+                CommunitySubmitResponseDisposition::Retry => {
+                    format!("retryable_http_{status}")
+                }
+            },
+        };
+
+        let now = tokio::time::Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            continue;
+        };
+        let jitter_uuid = uuid::Uuid::new_v4().as_u128();
+        let jitter = (jitter_uuid as u64) ^ (jitter_uuid >> 64) as u64;
+        let delay = community_submit_backoff(attempt.saturating_sub(1), jitter).min(remaining);
+        tracing::warn!(
+            job_id = %result.job_id,
+            seed = %coordinator,
+            attempts = attempt,
+            reason = %retry_reason,
+            retry_in_ms = delay.as_millis(),
+            "retrying immutable community result with a fresh authenticated envelope"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// A stake-zero node may continue providing outbound community inference
 /// while the shipped production genesis awaits its public validator keys.
 /// It must not treat that placeholder as a consensus validator set.
@@ -2565,6 +3224,25 @@ fn chain_participation_allowed(
     insecure_dev_validator_seed: bool,
 ) -> bool {
     !migration_observer && (stake > 0 || insecure_dev_validator_seed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeRuntimeRoles {
+    chain_participation: bool,
+    tier1_background_inference: bool,
+}
+
+fn node_runtime_roles(chain_participation_enabled: bool, protocol_major: u16) -> NodeRuntimeRoles {
+    // Protocol v3 intentionally keeps paid Tier-1 inference dark until its
+    // authorization path is complete, and consensus rejects legacy vote and
+    // finalize transactions. Do not rebuild restored legacy requests into an
+    // unbounded background compute task that cannot produce an admissible v3
+    // transaction or fit the managed service's shutdown contract. Chain
+    // participation is independent and must remain enabled for v3 validators.
+    NodeRuntimeRoles {
+        chain_participation: chain_participation_enabled,
+        tier1_background_inference: chain_participation_enabled && protocol_major < 3,
+    }
 }
 
 fn validate_full_integer_worker_role(
@@ -2605,9 +3283,148 @@ fn validate_full_integer_worker_role(
     Ok(())
 }
 
+#[cfg(feature = "benchmark-tools")]
+fn benchmark_mode_enabled(cli: &Cli) -> bool {
+    cli.benchmark
+}
+
+#[cfg(not(feature = "benchmark-tools"))]
+fn benchmark_mode_enabled(_cli: &Cli) -> bool {
+    false
+}
+
+/// Keep deliberately predictable benchmark signers inside one isolated
+/// process-local development network. This has no public-network override.
+#[cfg(feature = "benchmark-tools")]
+fn validate_benchmark_runtime(
+    cli: &Cli,
+    rpc_addr: &str,
+    peers: &[String],
+    community_rpc_urls: &[String],
+    stake: u64,
+) -> Result<()> {
+    if !cli.benchmark {
+        return Ok(());
+    }
+
+    let rpc_socket = rpc_addr.parse::<SocketAddr>().with_context(|| {
+        format!("benchmark RPC listen must be a numeric socket address, got {rpc_addr:?}")
+    })?;
+    ensure!(
+        rpc_socket.ip().is_loopback(),
+        "benchmark RPC must listen on a numeric loopback address"
+    );
+    for peer in peers {
+        let peer_socket = peer.parse::<SocketAddr>().with_context(|| {
+            format!("benchmark P2P peer must be a numeric socket address, got {peer:?}")
+        })?;
+        ensure!(
+            peer_socket.ip().is_loopback(),
+            "benchmark P2P peers must use numeric loopback addresses"
+        );
+    }
+
+    ensure!(
+        cli.insecure_dev_validator_seed && cli.genesis.is_none() && stake > 0,
+        "--benchmark requires an isolated local devnet: a positive stake, --insecure-dev-validator-seed, and no --genesis"
+    );
+    ensure!(
+        community_rpc_urls.is_empty()
+            && cli.shard_hosts.is_empty()
+            && !cli.auto_shard_join
+            && !cli.enable_community_rewards_v1
+            && !cli.community
+            && !cli.community_mode,
+        "--benchmark forbids community, shard, reward, and auto-join network targets"
+    );
+
+    Ok(())
+}
+
+fn identity_requires_persistent_role(cli: &Cli, community_rpc_urls: &[String]) -> bool {
+    cli.community
+        || cli.community_mode
+        || cli.full_integer_worker
+        || cli.enable_community_rewards_v1
+        || !community_rpc_urls.is_empty()
+        || !cli.shard_hosts.is_empty()
+        || cli.auto_shard_join
+        || !cli.shard_ranges.is_empty()
+        || cli.shard_start.is_some()
+        || cli.shard_end.is_some()
+}
+
+/// Validate the identity/network boundary before any signing identity is
+/// loaded or derived. Returns whether a fresh process-ephemeral stake-zero
+/// observer is permitted.
+fn validate_identity_runtime(
+    cli: &Cli,
+    rpc_addr: &str,
+    peers: &[String],
+    community_rpc_urls: &[String],
+    keyfile_configured: bool,
+    seed_configured: bool,
+    stake: u64,
+) -> Result<bool> {
+    let rpc_socket = rpc_addr.parse::<SocketAddr>();
+    let peer_sockets = peers
+        .iter()
+        .map(|peer| {
+            peer.parse::<SocketAddr>().with_context(|| {
+                format!("identity P2P peer must be a numeric socket address, got {peer:?}")
+            })
+        })
+        .collect::<Result<Vec<_>>>();
+    let persistent_role = identity_requires_persistent_role(cli, community_rpc_urls);
+
+    if seed_configured {
+        ensure!(
+            cli.insecure_dev_validator_seed,
+            "every validator seed requires --insecure-dev-validator-seed; use a generated mode-0600 --validator-key-file for persistent or networked identity"
+        );
+        let rpc_socket = rpc_socket.with_context(|| {
+            format!(
+                "insecure development seed RPC must be a numeric socket address, got {rpc_addr:?}"
+            )
+        })?;
+        ensure!(
+            rpc_socket.ip().is_loopback(),
+            "insecure development seed RPC must use a numeric loopback address"
+        );
+        for peer in peer_sockets? {
+            ensure!(
+                peer.ip().is_loopback(),
+                "insecure development seed P2P peers must use numeric loopback addresses"
+            );
+        }
+        ensure!(
+            !persistent_role,
+            "insecure development seeds cannot be used for community, reward, shard, auto-join, or external RPC roles; generate a persistent keyfile"
+        );
+        return Ok(false);
+    }
+
+    ensure!(
+        !cli.insecure_dev_validator_seed,
+        "--insecure-dev-validator-seed requires an explicit --validator-seed or [validator].seed"
+    );
+    if keyfile_configured || stake > 0 {
+        return Ok(false);
+    }
+
+    let strictly_loopback = rpc_socket.is_ok_and(|socket| socket.ip().is_loopback())
+        && peer_sockets.is_ok_and(|sockets| sockets.iter().all(|socket| socket.ip().is_loopback()));
+    ensure!(
+        strictly_loopback && !persistent_role,
+        "a persistent node identity is required for non-loopback networking and every community/reward/shard role: create an arc-keygen-compatible mode-0600 keyfile, pass --validator-key-file <path>, and preserve it across restarts; ephemeral observer identity is local-only and changes on restart"
+    );
+    Ok(true)
+}
+
 async fn auto_shard_join(
     cli: &Cli,
     rpc_base: &str,
+    advertised_socket: &str,
     model_artifact_id: Hash256,
 ) -> Option<(usize, usize)> {
     if rpc_base.is_empty() {
@@ -2622,10 +3439,11 @@ async fn auto_shard_join(
     let model_id_hex = hex::encode(model_artifact_id.0);
 
     let body = serde_json::json!({
-        "socket_addr": cli.rpc,
+        "socket_addr": advertised_socket,
         "node_name": public_node_name(cli),
         "model_id": model_id_hex,
         "model_name": "Llama-2-7B",
+        "execution_profile": arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
         "total_layers": 32u32,
         "available_memory_mb": detect_ram_mb(),
         "gpu_tier": 0u8,
@@ -2659,7 +3477,417 @@ async fn auto_shard_join(
     Some((start, end))
 }
 
-#[tokio::main]
+fn advertised_shard_rpc_origin(cli: &Cli, rpc_addr: &str) -> Result<String> {
+    let raw = match std::env::var("ARC_PUBLIC_SOCKET") {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => anyhow::bail!("ARC_PUBLIC_SOCKET must not be empty"),
+        Err(std::env::VarError::NotPresent) if cli.rpc_unix.is_some() => anyhow::bail!(
+            "a --rpc-unix shard holder requires ARC_PUBLIC_SOCKET to name its reviewed public gateway"
+        ),
+        Err(std::env::VarError::NotPresent) => rpc_addr.to_string(),
+        Err(error) => return Err(anyhow::anyhow!("cannot read ARC_PUBLIC_SOCKET: {error}")),
+    };
+    let canonical = rpc::canonical_shard_rpc_origin(&raw)
+        .map_err(|error| anyhow::anyhow!("invalid advertised shard RPC origin: {error}"))?;
+    if cli.rpc_unix.is_some() {
+        rpc::validate_community_rpc_bases(std::slice::from_ref(&canonical), false)
+            .map_err(|error| anyhow::anyhow!("unsafe production shard RPC origin: {error}"))?;
+    }
+    Ok(canonical)
+}
+
+/// Process status for the final shutdown durability barrier. Keeping this
+/// decision pure makes the fail-closed contract regression-testable without
+/// terminating the test process.
+fn shutdown_exit_code(wal_result: &Result<(), arc_state::StateError>) -> i32 {
+    if wal_result.is_ok() { 0 } else { 1 }
+}
+
+const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
+const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
+const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
+const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
+const DESKTOP_SHUTDOWN_FILE_MAX_BYTES: u64 = 256;
+
+struct DesktopShutdownControl {
+    request_file: PathBuf,
+    expected_token: [u8; 32],
+    data_dir: PathBuf,
+    executable: PathBuf,
+    genesis: PathBuf,
+}
+
+#[derive(Clone)]
+struct DesktopShutdownReceiptIdentity {
+    data_dir: PathBuf,
+    expected_token: [u8; 32],
+    nonce: [u8; 32],
+    executable: PathBuf,
+    genesis: PathBuf,
+}
+
+impl DesktopShutdownReceiptIdentity {
+    fn acknowledge(&self) -> Result<()> {
+        arc_crypto::secret_file::acknowledge_desktop_shutdown_receipt(
+            &self.data_dir,
+            &self.expected_token,
+            &self.nonce,
+            &self.executable,
+            &self.genesis,
+        )
+        .context("failed to durably acknowledge the desktop shutdown receipt")
+    }
+}
+
+impl Drop for DesktopShutdownReceiptIdentity {
+    fn drop(&mut self) {
+        self.expected_token.zeroize();
+        self.nonce.zeroize();
+    }
+}
+
+impl Drop for DesktopShutdownControl {
+    fn drop(&mut self) {
+        self.expected_token.zeroize();
+    }
+}
+
+fn prepare_desktop_shutdown_control(
+    data_dir: &Path,
+    token_file: Option<&Path>,
+    genesis_file: Option<&Path>,
+) -> Result<Option<DesktopShutdownControl>> {
+    let Some(token_file) = token_file else {
+        return Ok(None);
+    };
+    let canonical_data_dir = data_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize node data directory {} for desktop shutdown control",
+            data_dir.display()
+        )
+    })?;
+    let control_dir = canonical_data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    arc_crypto::secret_file::validate_private_directory(&control_dir).with_context(|| {
+        format!(
+            "desktop shutdown control directory is not private: {}",
+            control_dir.display()
+        )
+    })?;
+    let expected_token_file = control_dir.join(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME);
+    let canonical_token_file = token_file.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize desktop shutdown token {}",
+            token_file.display()
+        )
+    })?;
+    ensure!(
+        canonical_token_file == expected_token_file,
+        "desktop shutdown token must be the exact {} file inside --data-dir",
+        DESKTOP_SHUTDOWN_TOKEN_FILE_NAME
+    );
+    let mut token_file_handle = arc_crypto::secret_file::open_private(&canonical_token_file)
+        .with_context(|| {
+            format!(
+                "failed to open private desktop shutdown token {}",
+                canonical_token_file.display()
+            )
+        })?;
+    ensure!(
+        token_file_handle.metadata()?.len() <= DESKTOP_SHUTDOWN_FILE_MAX_BYTES,
+        "desktop shutdown token exceeds its bounded size"
+    );
+    let mut token_text = Zeroizing::new(String::new());
+    std::io::Read::by_ref(&mut token_file_handle)
+        .take(DESKTOP_SHUTDOWN_FILE_MAX_BYTES + 1)
+        .read_to_string(&mut token_text)
+        .context("failed to read bounded desktop shutdown token")?;
+    ensure!(
+        token_text.len() as u64 <= DESKTOP_SHUTDOWN_FILE_MAX_BYTES,
+        "desktop shutdown token exceeds its bounded size"
+    );
+    let trimmed = token_text.trim();
+    ensure!(
+        trimmed.len() == 64,
+        "desktop shutdown token must contain exactly 32 hexadecimal bytes"
+    );
+    let decoded =
+        Zeroizing::new(hex::decode(trimmed).context("desktop shutdown token is not hexadecimal")?);
+    ensure!(
+        decoded.len() == 32,
+        "desktop shutdown token must contain exactly 32 bytes"
+    );
+    let mut expected_token = [0u8; 32];
+    expected_token.copy_from_slice(&decoded);
+    let genesis = genesis_file
+        .ok_or_else(|| anyhow::anyhow!("desktop-managed nodes require an explicit genesis file"))?
+        .canonicalize()
+        .context("failed to canonicalize desktop-managed genesis file")?;
+    let executable = std::env::current_exe()
+        .context("failed to resolve the running node executable for shutdown receipt binding")?
+        .canonicalize()
+        .context("failed to canonicalize the running node executable")?;
+    ensure!(
+        arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+            &canonical_data_dir,
+            &expected_token,
+            &executable,
+            &genesis,
+        )
+        .context("failed to validate the supervisor's desktop shutdown receipt")?
+        .is_some(),
+        "desktop-managed node startup requires a prearmed durable shutdown receipt"
+    );
+    Ok(Some(DesktopShutdownControl {
+        request_file: control_dir.join(DESKTOP_SHUTDOWN_REQUEST_FILE_NAME),
+        expected_token,
+        data_dir: canonical_data_dir,
+        executable,
+        genesis,
+    }))
+}
+
+fn constant_time_token_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+/// Consume one local request file and authenticate its exact 32-byte token and
+/// target process. Every read is through the existing cross-platform private
+/// no-follow handle boundary. A valid request for an older PID is stale and is
+/// removed; malformed or unauthenticated input remains fail-closed.
+fn take_authenticated_desktop_shutdown_request(
+    control: &DesktopShutdownControl,
+) -> Result<Option<DesktopShutdownReceiptIdentity>> {
+    let mut request_file = match arc_crypto::secret_file::open_private(&control.request_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to open private desktop shutdown request {}",
+                    control.request_file.display()
+                )
+            });
+        }
+    };
+    // Parse only the stable snapshot behind this validated no-follow handle.
+    // Once the handle exists, every bounded malformed/stale request is
+    // consumed as a one-shot message. That makes a crash-torn legacy request
+    // recoverable instead of permanently wedging future graceful stops.
+    let parsed = (|| -> Result<Option<DesktopShutdownReceiptIdentity>> {
+        ensure!(
+            request_file.metadata()?.len() <= DESKTOP_SHUTDOWN_FILE_MAX_BYTES,
+            "desktop shutdown request exceeds its bounded size"
+        );
+        let mut request_text = Zeroizing::new(String::new());
+        std::io::Read::by_ref(&mut request_file)
+            .take(DESKTOP_SHUTDOWN_FILE_MAX_BYTES + 1)
+            .read_to_string(&mut request_text)
+            .context("failed to read bounded desktop shutdown request")?;
+        ensure!(
+            request_text.len() as u64 <= DESKTOP_SHUTDOWN_FILE_MAX_BYTES,
+            "desktop shutdown request exceeds its bounded size"
+        );
+        let mut lines = request_text.lines();
+        ensure!(
+            lines.next() == Some(DESKTOP_SHUTDOWN_REQUEST_SCHEMA),
+            "desktop shutdown request has an invalid schema"
+        );
+        let target_pid = lines
+            .next()
+            .and_then(|line| line.strip_prefix("pid="))
+            .ok_or_else(|| anyhow::anyhow!("desktop shutdown request omits its target PID"))?
+            .parse::<u32>()
+            .context("desktop shutdown request target PID is invalid")?;
+        let token = lines
+            .next()
+            .and_then(|line| line.strip_prefix("token="))
+            .ok_or_else(|| anyhow::anyhow!("desktop shutdown request omits its token"))?;
+        let nonce = lines
+            .next()
+            .and_then(|line| line.strip_prefix("nonce="))
+            .ok_or_else(|| anyhow::anyhow!("desktop shutdown request omits its receipt nonce"))?;
+        ensure!(
+            lines.next().is_none(),
+            "desktop shutdown request contains trailing fields"
+        );
+        ensure!(
+            token.len() == 64,
+            "desktop shutdown request token has an invalid length"
+        );
+        let decoded = Zeroizing::new(
+            hex::decode(token).context("desktop shutdown request token is not hex")?,
+        );
+        ensure!(
+            decoded.len() == 32,
+            "desktop shutdown request token has an invalid length"
+        );
+        let mut candidate = [0u8; 32];
+        candidate.copy_from_slice(&decoded);
+        let authenticated = constant_time_token_eq(&control.expected_token, &candidate);
+        candidate.zeroize();
+        ensure!(authenticated, "desktop shutdown request token is invalid");
+        let nonce_decoded = Zeroizing::new(
+            hex::decode(nonce).context("desktop shutdown request nonce is not hex")?,
+        );
+        ensure!(
+            nonce_decoded.len() == 32,
+            "desktop shutdown request nonce has an invalid length"
+        );
+        let mut receipt_nonce = [0u8; 32];
+        receipt_nonce.copy_from_slice(&nonce_decoded);
+        if target_pid != std::process::id() {
+            receipt_nonce.zeroize();
+            return Ok(None);
+        }
+        ensure!(
+            arc_crypto::secret_file::validate_desktop_shutdown_receipt(
+                &control.data_dir,
+                &control.expected_token,
+                &receipt_nonce,
+                &control.executable,
+                &control.genesis,
+            )
+            .context("desktop shutdown request does not bind a valid durable receipt")?,
+            "desktop shutdown request has no armed durable receipt"
+        );
+        Ok(Some(DesktopShutdownReceiptIdentity {
+            data_dir: control.data_dir.clone(),
+            expected_token: control.expected_token,
+            nonce: receipt_nonce,
+            executable: control.executable.clone(),
+            genesis: control.genesis.clone(),
+        }))
+    })();
+    let removal =
+        arc_crypto::secret_file::remove_private_while_open(&request_file, &control.request_file);
+    drop(request_file);
+    match removal {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to consume private desktop shutdown request {}",
+                    control.request_file.display()
+                )
+            });
+        }
+    }
+    parsed
+}
+
+async fn wait_for_authenticated_desktop_shutdown(
+    control: DesktopShutdownControl,
+    mut http_shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<DesktopShutdownReceiptIdentity> {
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *http_shutdown.borrow() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            changed = http_shutdown.changed() => {
+                if changed.is_err() || *http_shutdown.borrow_and_update() {
+                    return None;
+                }
+            }
+            _ = poll.tick() => {
+                match take_authenticated_desktop_shutdown_request(&control) {
+                    Ok(Some(receipt)) => return Some(receipt),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "ignored invalid desktop shutdown request");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Close HTTP and background-work admission from one synchronous signal edge.
+///
+/// HTTP handlers that Axum already accepted are not cancelled by this watch
+/// notification; each server drains them before returning. Background loops
+/// use the second notification to stop admitting compute immediately. The
+/// separate transport/consensus signal remains open until both HTTP servers
+/// have drained, preserving the dependencies of already-accepted writes.
+fn broadcast_node_shutdown(
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+    http_shutdown: &tokio::sync::watch::Sender<bool>,
+    background_admission_shutdown: &tokio::sync::watch::Sender<bool>,
+) {
+    shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = background_admission_shutdown.send(true);
+    let _ = http_shutdown.send(true);
+}
+
+fn complete_startup_shutdown_if_requested(
+    shutdown_requested: &std::sync::atomic::AtomicBool,
+    state: Option<&StateDB>,
+    desktop_shutdown_receipt: &std::sync::Mutex<Option<DesktopShutdownReceiptIdentity>>,
+) -> Result<bool> {
+    if !shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(false);
+    }
+    let authenticated_desktop_shutdown = desktop_shutdown_receipt
+        .lock()
+        .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
+        .is_some();
+    if state.is_none() && authenticated_desktop_shutdown {
+        // A recovery receipt can be cleared only after StateDB has opened and
+        // replayed. Keep advancing initialization with admission already
+        // closed until a state-aware barrier can run.
+        return Ok(false);
+    }
+    if let Some(state) = state {
+        state
+            .try_sync_wal()
+            .context("startup shutdown WAL durability barrier failed")?;
+        if let Some(receipt) = desktop_shutdown_receipt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
+            .take()
+        {
+            // A receipt inherited from a prior crash/nonzero exit is a
+            // recovery fence. It may be acknowledged during startup only
+            // after StateDB has opened and replayed and its WAL barrier has
+            // succeeded. The state=None path below deliberately leaves it
+            // armed so an early exit cannot launder a failed prior shutdown.
+            receipt.acknowledge()?;
+        }
+        tracing::info!(
+            "shutdown requested during initialization; persistent state is durable and later runtime stages were skipped"
+        );
+    } else {
+        tracing::info!(
+            "shutdown requested before persistent state opened; later initialization stages were skipped"
+        );
+    }
+    Ok(true)
+}
+
+// Keep one scheduler worker available for lifecycle admission while startup
+// performs unavoidable synchronous hashing/recovery/model work on the main
+// future. A one-vCPU host must still observe SIGTERM or the authenticated
+// desktop request within the managed shutdown budget.
+fn p2p_listen_ip(
+    p2p_port: u16,
+    benchmark_mode: bool,
+    insecure_dev_validator_seed: bool,
+) -> std::net::Ipv4Addr {
+    if p2p_port == 0 || benchmark_mode || insecure_dev_validator_seed {
+        std::net::Ipv4Addr::LOCALHOST
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED
+    }
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
@@ -2667,10 +3895,76 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
 
+    #[cfg(feature = "benchmark-tools")]
+    if cli.benchmark && (cli.community || cli.community_mode) {
+        bail!("--benchmark cannot be combined with community modes");
+    }
+
     if let Some(command) = cli.operator_command.take() {
-        run_operator_command(command)?;
+        run_operator_command(command).await?;
         return Ok(());
     }
+
+    // Arm lifecycle capture before community auto-download, config work,
+    // persistent recovery/replay, or model loading. The signal edge records
+    // intent synchronously in an atomic and closes both admission channels;
+    // each potentially long startup phase observes that intent before the
+    // next phase. This prevents the OS default action from bypassing the WAL
+    // barrier during initialization.
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (background_admission_shutdown_tx, background_admission_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    let (runtime_shutdown_tx, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
+    let desktop_shutdown_receipt = Arc::new(std::sync::Mutex::new(
+        None::<DesktopShutdownReceiptIdentity>,
+    ));
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install SIGTERM handler before node initialization")?;
+    {
+        let shutdown_requested = shutdown_requested.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
+        tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    tracing::info!(
+                        "SIGINT received - stopping HTTP/background admission and draining active work"
+                    );
+                    broadcast_node_shutdown(
+                        &shutdown_requested,
+                        &shutdown_tx,
+                        &background_admission_shutdown_tx,
+                    );
+                }
+                Err(error) => tracing::warn!(%error, "failed to install SIGINT handler"),
+            }
+        });
+    }
+    #[cfg(unix)]
+    {
+        let shutdown_requested = shutdown_requested.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
+        tokio::spawn(async move {
+            sigterm.recv().await;
+            tracing::info!(
+                "SIGTERM received - stopping HTTP/background admission and draining active work"
+            );
+            broadcast_node_shutdown(
+                &shutdown_requested,
+                &shutdown_tx,
+                &background_admission_shutdown_tx,
+            );
+        });
+    }
+    // ctrl_c installs its platform handler on first poll. Yield before any
+    // synchronous startup phase so both signal listeners are polled and the
+    // Unix stream above is already registered on the calling thread.
+    tokio::task::yield_now().await;
+    tracing::info!("lifecycle signal handlers armed before node initialization");
+    let mut runtime_tasks = Vec::<tokio::task::JoinHandle<()>>::new();
 
     // ── --community: one-flag community-node setup ─────────────────────
     // Forces stake=0 + community_mode=true, and auto-discovers a local
@@ -2692,7 +3986,7 @@ async fn main() -> Result<()> {
         // the sha-pinned Llama-2-7B Q4_K_M GGUF from HuggingFace. Sha-mismatch or
         // any failure falls through to None and we print the manual instructions.
         if cli.model.is_none() && cli.community {
-            cli.model = auto_download_model();
+            cli.model = auto_download_model(&shutdown_requested).await;
         }
         match &cli.model {
             Some(p) => tracing::info!("community mode: model at {}", p),
@@ -2719,6 +4013,10 @@ async fn main() -> Result<()> {
             }
         }
     }
+    if complete_startup_shutdown_if_requested(&shutdown_requested, None, &desktop_shutdown_receipt)?
+    {
+        return Ok(());
+    }
 
     // ── Load config file and merge with CLI args ────────────────────────
     // Priority: explicit CLI arg > config file value > hardcoded default.
@@ -2738,6 +4036,18 @@ async fn main() -> Result<()> {
         cli.rpc.clone()
     } else {
         node_cfg.rpc.listen.clone()
+    };
+    #[cfg(unix)]
+    let rpc_listener = if let Some(path) = &cli.rpc_unix {
+        rpc::RpcListen::Unix(path.clone())
+    } else {
+        rpc::RpcListen::Tcp(rpc_addr.clone())
+    };
+    #[cfg(not(unix))]
+    let rpc_listener = if cli.rpc_unix.is_some() {
+        anyhow::bail!("--rpc-unix requires a Unix host")
+    } else {
+        rpc::RpcListen::Tcp(rpc_addr.clone())
     };
 
     let p2p_port =
@@ -2769,6 +4079,47 @@ async fn main() -> Result<()> {
             node_cfg.storage.data_dir.clone()
         };
     let _data_dir_lock = acquire_node_data_dir_lock(Path::new(&data_dir))?;
+    let desktop_shutdown_control = prepare_desktop_shutdown_control(
+        Path::new(&data_dir),
+        cli.desktop_shutdown_token_file.as_deref(),
+        cli.genesis.as_deref().map(Path::new),
+    )?;
+    if let Some(control) = desktop_shutdown_control {
+        let shutdown_requested = shutdown_requested.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
+        let http_shutdown = shutdown_rx.clone();
+        let receipt_slot = desktop_shutdown_receipt.clone();
+        runtime_tasks.push(tokio::spawn(async move {
+            if let Some(receipt) =
+                wait_for_authenticated_desktop_shutdown(control, http_shutdown).await
+            {
+                match receipt_slot.lock() {
+                    Ok(mut slot) => *slot = Some(receipt),
+                    Err(_) => {
+                        tracing::error!("desktop shutdown receipt lock was poisoned");
+                        return;
+                    }
+                }
+                tracing::info!(
+                    "authenticated local desktop shutdown requested - stopping HTTP/background admission and draining active work"
+                );
+                broadcast_node_shutdown(
+                    &shutdown_requested,
+                    &shutdown_tx,
+                    &background_admission_shutdown_tx,
+                );
+            }
+        }));
+        // The first interval tick is immediate. Poll the watcher once before
+        // persistent recovery or model work can monopolize this future.
+        tokio::task::yield_now().await;
+        tracing::info!("authenticated desktop shutdown watcher armed before persistent state");
+    }
+    if complete_startup_shutdown_if_requested(&shutdown_requested, None, &desktop_shutdown_receipt)?
+    {
+        return Ok(());
+    }
 
     let min_stake =
         if matches.value_source("min_stake") == Some(clap::parser::ValueSource::CommandLine) {
@@ -2838,6 +4189,18 @@ async fn main() -> Result<()> {
     } else {
         node_cfg.community.rpc_urls.clone()
     };
+    let benchmark_mode = benchmark_mode_enabled(&cli);
+    #[cfg(feature = "benchmark-tools")]
+    validate_benchmark_runtime(&cli, &rpc_addr, &peers, &raw_community_rpc_urls, stake)?;
+    let allow_ephemeral_observer = validate_identity_runtime(
+        &cli,
+        &rpc_addr,
+        &peers,
+        &raw_community_rpc_urls,
+        validator_key_file.is_some(),
+        validator_seed.is_some(),
+        stake,
+    )?;
     let allow_insecure_community_rpc = if matches.value_source("allow_insecure_community_rpc")
         == Some(clap::parser::ValueSource::CommandLine)
     {
@@ -2881,7 +4244,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Benchmark settings: CLI > config > default
+    // Benchmark settings exist only in explicitly opted-in tool builds.
+    #[cfg(feature = "benchmark-tools")]
     let _bench_batch =
         if matches.value_source("bench_batch") == Some(clap::parser::ValueSource::CommandLine) {
             cli.bench_batch
@@ -2889,6 +4253,7 @@ async fn main() -> Result<()> {
             node_cfg.benchmark.batch_size
         };
 
+    #[cfg(feature = "benchmark-tools")]
     let _bench_interval =
         if matches.value_source("bench_interval") == Some(clap::parser::ValueSource::CommandLine) {
             cli.bench_interval
@@ -2896,6 +4261,7 @@ async fn main() -> Result<()> {
             node_cfg.benchmark.interval_ms
         };
 
+    #[cfg(feature = "benchmark-tools")]
     let bench_sender_start = if matches.value_source("bench_sender_start")
         == Some(clap::parser::ValueSource::CommandLine)
     {
@@ -2904,6 +4270,7 @@ async fn main() -> Result<()> {
         node_cfg.benchmark.sender_start
     };
 
+    #[cfg(feature = "benchmark-tools")]
     let bench_sender_count = if matches.value_source("bench_sender_count")
         == Some(clap::parser::ValueSource::CommandLine)
     {
@@ -2912,6 +4279,7 @@ async fn main() -> Result<()> {
         node_cfg.benchmark.sender_count
     };
 
+    #[cfg(feature = "benchmark-tools")]
     let bench_sign_threads = if matches.value_source("bench_sign_threads")
         == Some(clap::parser::ValueSource::CommandLine)
     {
@@ -2920,6 +4288,7 @@ async fn main() -> Result<()> {
         node_cfg.benchmark.sign_threads
     };
 
+    #[cfg(feature = "benchmark-tools")]
     let bench_rayon_threads = if matches.value_source("bench_rayon_threads")
         == Some(clap::parser::ValueSource::CommandLine)
     {
@@ -2930,7 +4299,8 @@ async fn main() -> Result<()> {
 
     // ── Configure rayon thread pool ─────────────────────────────────────
     // In benchmark mode, limit rayon to leave CPU for signing threads
-    if cli.benchmark {
+    #[cfg(feature = "benchmark-tools")]
+    if benchmark_mode {
         rayon::ThreadPoolBuilder::new()
             .num_threads(bench_rayon_threads)
             .build_global()
@@ -2992,6 +4362,7 @@ async fn main() -> Result<()> {
         validator_seed.as_deref(),
         stake,
         cli.insecure_dev_validator_seed,
+        allow_ephemeral_observer,
     )
     .context("failed to establish validator signing identity")?;
     let validator_address = identity.keypair.address();
@@ -3040,6 +4411,14 @@ async fn main() -> Result<()> {
         tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
     }
 
+    // Give the already-armed lifecycle listeners one final scheduling edge
+    // before artifact hashing can synchronously occupy this startup future.
+    tokio::task::yield_now().await;
+    if complete_startup_shutdown_if_requested(&shutdown_requested, None, &desktop_shutdown_receipt)?
+    {
+        return Ok(());
+    }
+
     // Establish one exact model identity before any shard registration or
     // inference-capability advertisement. Failure to open/read --model is a
     // startup error: proceeding with a guessed identity would mix weights.
@@ -3061,12 +4440,14 @@ async fn main() -> Result<()> {
         && cli.shard_start.is_none()
         && cli.shard_end.is_none()
     {
+        let advertised_socket = advertised_shard_rpc_origin(&cli, &rpc_addr)?;
         match auto_shard_join(
             &cli,
             coordinator_rpc_bases
                 .first()
                 .map(String::as_str)
                 .unwrap_or(""),
+            &advertised_socket,
             model_artifact_id.expect("--model commitment established above"),
         )
         .await
@@ -3139,11 +4520,17 @@ async fn main() -> Result<()> {
             validator_identity::IdentitySource::InsecureDevelopmentSeed => {
                 "INSECURE development seed"
             }
-            validator_identity::IdentitySource::StakeZeroSeed => "stake-zero observer identity",
+            validator_identity::IdentitySource::EphemeralLoopbackObserver => {
+                "ephemeral loopback observer (changes on restart)"
+            }
         }
     );
     tracing::info!("Stake      : {} ARC ({})", stake, tier);
-    tracing::info!("RPC        : {}", rpc_addr);
+    match &rpc_listener {
+        rpc::RpcListen::Tcp(address) => tracing::info!("RPC        : {}", address),
+        #[cfg(unix)]
+        rpc::RpcListen::Unix(path) => tracing::info!("RPC Unix   : {}", path.display()),
+    }
     tracing::info!("P2P port   : {}", p2p_port);
     tracing::info!("Data dir   : {}", data_dir);
     if let Some(config_path) = &cli.config {
@@ -3189,11 +4576,19 @@ async fn main() -> Result<()> {
                 (Hash256(bytes), a.balance)
             })
             .collect()
-    } else if cli.benchmark {
-        // Benchmark mode: deterministic ed25519 keypair-derived addresses
-        (0..100u8)
-            .map(|i| (arc_crypto::benchmark_address(i), 1_000_000_000_000))
-            .collect()
+    } else if benchmark_mode {
+        #[cfg(feature = "benchmark-tools")]
+        {
+            // Benchmark mode: deterministic ed25519 keypair-derived addresses.
+            // This code and its predictable keys do not exist in default builds.
+            (0..100u8)
+                .map(|i| (arc_crypto::benchmark_address(i), 1_000_000_000_000))
+                .collect()
+        }
+        #[cfg(not(feature = "benchmark-tools"))]
+        {
+            bail!("benchmark mode is unavailable in this default build")
+        }
     } else {
         // Default: blake3-hashed addresses for testing
         (0..100u8)
@@ -3201,6 +4596,10 @@ async fn main() -> Result<()> {
             .collect()
     };
 
+    if complete_startup_shutdown_if_requested(&shutdown_requested, None, &desktop_shutdown_receipt)?
+    {
+        return Ok(());
+    }
     let state = Arc::new({
         let reward_activation_height = genesis_cfg
             .as_ref()
@@ -3294,6 +4693,13 @@ async fn main() -> Result<()> {
     // existed (pre-2026-06-04) can't be recovered automatically and stay
     // stuck.
     rebuild_replayed_derived_indexes(&state);
+    if complete_startup_shutdown_if_requested(
+        &shutdown_requested,
+        Some(state.as_ref()),
+        &desktop_shutdown_receipt,
+    )? {
+        return Ok(());
+    }
 
     // ── State Sync Protocol (A5) - bootstrap from peer snapshot ─────
     // Auto-sync: if this node has peers configured and state is fresh (height 0),
@@ -3338,11 +4744,20 @@ async fn main() -> Result<()> {
         tracing::info!("Bootstrapping from peer: {}", peer);
 
         let sync_mgr = arc_node::state_sync::StateSyncManager::new();
-        match sync_mgr.sync_from_peer(peer, &state).await {
-            Ok(height) => {
+        let mut startup_shutdown = Some(shutdown_rx.clone());
+        let sync_result = tokio::select! {
+            biased;
+            _ = wait_for_optional_runtime_shutdown(&mut startup_shutdown) => None,
+            result = sync_mgr.sync_from_peer(peer, &state) => Some(result),
+        };
+        match sync_result {
+            None => {
+                tracing::info!("State sync cancelled by startup shutdown request");
+            }
+            Some(Ok(height)) => {
                 tracing::info!("State sync complete, height = {}", height);
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!(
                     "Sync from peer failed ({}), continuing from genesis state",
                     e
@@ -3351,6 +4766,13 @@ async fn main() -> Result<()> {
                 // up via DAG consensus. This is fine for testnet.
             }
         }
+    }
+    if complete_startup_shutdown_if_requested(
+        &shutdown_requested,
+        Some(state.as_ref()),
+        &desktop_shutdown_receipt,
+    )? {
+        return Ok(());
     }
 
     let mempool = Arc::new(Mempool::new(10_000_000));
@@ -3406,6 +4828,17 @@ async fn main() -> Result<()> {
     }
 
     let is_shard_holder = !held_ranges.is_empty();
+    ensure!(
+        !(is_shard_holder && cli.enable_i16),
+        "--enable-i16 is local/nonreward-only and cannot be combined with validator shard ranges; protocol-v3 shard execution is pinned to canonical per-row INT8"
+    );
+    if complete_startup_shutdown_if_requested(
+        &shutdown_requested,
+        Some(state.as_ref()),
+        &desktop_shutdown_receipt,
+    )? {
+        return Ok(());
+    }
     let (candle_engine, candle_model_id): (
         Option<Arc<arc_inference::candle_backend::GgufEngine>>,
         Option<arc_crypto::Hash256>,
@@ -3479,6 +4912,13 @@ async fn main() -> Result<()> {
                             "Pinned full community worker to the validator-compatible reward profile"
                         );
                     }
+                    if is_shard_holder {
+                        model.enforce_canonical_i8_profile();
+                        tracing::info!(
+                            profile = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+                            "Pinned protocol-v3 shard holder to the canonical reward verification profile"
+                        );
+                    }
                     let elapsed = load_start.elapsed();
                     let mb_held: usize = model
                         .layers
@@ -3496,37 +4936,14 @@ async fn main() -> Result<()> {
                         .sum::<usize>()
                         / (1024 * 1024);
                     let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
-                    // Multi-range / sharded loaders explicitly drop the I16
-                    // quantization at the merge step (cached_integer_model.rs
-                    // line 3311) since each sub-load's i16 slices were keyed
-                    // on its own subrange and rebuilding from f32 is too
-                    // expensive at startup. The single-range loader populates
-                    // i16_layers directly. To make the dispatch order (I16 >
-                    // block-I8 > Q4 > I8) reach I16 on shard-holder seeds —
-                    // and to make `effective_precision_label()` honestly
-                    // report "INT16 integer" — promote the in-memory I8
-                    // weights to I16 storage format here. This is the
-                    // `enable_i16()` path documented at
-                    // cached_integer_model.rs:451: same I8-level precision
-                    // (no f32 source), but the dispatch now flows through
-                    // matmul_i16_into. Real quality improvement requires the
-                    // multi-range loader to stitch per-range f32 I16 weights
-                    // — separate change.
-                    //
-                    // GATED as of this change. On aarch64 the promotion is a
-                    // real win: `matmul_i16_into` dispatches to
-                    // `dot_i16_i64_neon`, an actual widening SIMD kernel. On
-                    // x86 it is a pure loss — `from_i8` carries no extra
-                    // precision (no f32 source), and `dot_i16_i64` resolves to
-                    // `dot_i16_i64_avx2`, which is literally a call to
-                    // `dot_i16_i64_scalar` (the AVX-512 path was reverted after
-                    // segfaults). So an x86 seed doubled the weight bytes it
-                    // streamed per layer, kept the I8 weights resident
-                    // alongside the I16 ones, and got byte-identical output out
-                    // of the same scalar loop. `--enable-i16` forces it on any
-                    // architecture.
-                    let want_i16 = cli.enable_i16
-                        || (cfg!(target_arch = "aarch64") && !cli.full_integer_worker);
+                    // I16 remains a local, nonreward optimization. Validator
+                    // shards and full community workers participate in signed
+                    // cross-node verification, so their arithmetic identity is
+                    // pinned above to canonical I8 and must never be silently
+                    // promoted based on host architecture.
+                    let want_i16 = !is_shard_holder
+                        && !cli.full_integer_worker
+                        && (cli.enable_i16 || cfg!(target_arch = "aarch64"));
                     if model.i16_layers.is_none() && layers_held > 0 && want_i16 {
                         model.enable_i16();
                         tracing::info!(
@@ -3583,9 +5000,18 @@ async fn main() -> Result<()> {
             "--full-integer-worker invariant failed: worker must use the canonical per-row INT8 profile and must not advertise shard ranges"
         );
     }
+    if complete_startup_shutdown_if_requested(
+        &shutdown_requested,
+        Some(state.as_ref()),
+        &desktop_shutdown_receipt,
+    )? {
+        return Ok(());
+    }
 
     // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
+
+    let mut consensus_thread = None::<std::thread::JoinHandle<()>>;
 
     // ── Create channels for P2P transport ↔ consensus ─────────────────
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(1000);
@@ -3593,7 +5019,8 @@ async fn main() -> Result<()> {
     let peer_count = Arc::new(AtomicU32::new(0));
 
     // ── Start benchmark signing pool + indexer (if benchmark mode) ─────
-    let benchmark_pool = if cli.benchmark {
+    #[cfg(feature = "benchmark-tools")]
+    let benchmark_pool = if benchmark_mode {
         state.start_benchmark_indexer();
         let pool = BenchmarkPool::start(
             bench_sender_start,
@@ -3610,6 +5037,8 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    #[cfg(not(feature = "benchmark-tools"))]
+    let benchmark_pool: Option<Arc<BenchmarkPool>> = None;
 
     // ── Start DAG consensus in background ─────────────────────────────
     // Initialize the exact approved genesis validator identities and stakes.
@@ -3620,7 +5049,11 @@ async fn main() -> Result<()> {
         .filter(|(addr, _)| *addr != validator_address)
         .cloned()
         .collect();
-    let all_vals: Vec<(Hash256, u64)> = if chain_participation_enabled {
+    let runtime_roles = node_runtime_roles(
+        chain_participation_enabled,
+        state.active_protocol_version().major,
+    );
+    let all_vals: Vec<(Hash256, u64)> = if runtime_roles.chain_participation {
         let mut v = vec![(validator_address, stake)];
         v.extend(&peer_vals);
         v
@@ -3631,13 +5064,13 @@ async fn main() -> Result<()> {
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    if chain_participation_enabled {
+    if runtime_roles.chain_participation {
         let recovery_dag_startup = prepare_recovery_dag_startup(Path::new(&data_dir), &state)?;
         let mut consensus = ConsensusManager::new_with_keypair(
             validator_address,
             stake,
             4, /* num_shards */
-            cli.benchmark,
+            benchmark_mode,
             &peer_vals,
             validator_keypair.clone(),
         );
@@ -3802,12 +5235,14 @@ async fn main() -> Result<()> {
         // allowed to start.
         let bootstrap_peers: Vec<SocketAddr> =
             peers.iter().filter_map(|peer| peer.parse().ok()).collect();
-        let listen_addr: SocketAddr = format!("0.0.0.0:{p2p_port}").parse()?;
+        let listen_ip = p2p_listen_ip(p2p_port, benchmark_mode, cli.insecure_dev_validator_seed);
+        let listen_addr = SocketAddr::from((listen_ip, p2p_port));
         let mut allowed_validator_addresses = std::collections::HashSet::new();
         allowed_validator_addresses.insert(validator_address.0);
         allowed_validator_addresses.extend(genesis_validators.iter().map(|(address, _)| address.0));
         let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
-        let transport_task = tokio::spawn(run_transport_with_readiness(
+        let transport_shutdown = runtime_shutdown_rx.clone();
+        let transport_task = tokio::spawn(run_transport_with_readiness_and_shutdown(
             listen_addr,
             bootstrap_peers,
             validator_address,
@@ -3820,6 +5255,7 @@ async fn main() -> Result<()> {
             validator_keypair.clone(),
             data_dir.clone(),
             startup_tx,
+            transport_shutdown,
         ));
         let bound_addr =
             match tokio::time::timeout(std::time::Duration::from_secs(15), startup_rx).await {
@@ -3841,60 +5277,78 @@ async fn main() -> Result<()> {
             bound = %bound_addr,
             "Authenticated validator transport is ready before consensus startup"
         );
-        tokio::spawn(async move {
+        let transport_exit_shutdown = runtime_shutdown_rx.clone();
+        runtime_tasks.push(tokio::spawn(async move {
             match transport_task.await {
-                Ok(()) => tracing::error!(
-                    "Authenticated validator transport exited after readiness; terminating node"
-                ),
-                Err(error) => tracing::error!(
-                    error = %error,
-                    "Authenticated validator transport task failed after readiness; terminating node"
-                ),
+                Ok(()) if *transport_exit_shutdown.borrow() => {
+                    tracing::info!("Authenticated validator transport joined for shutdown");
+                    return;
+                }
+                Ok(()) => {
+                    tracing::error!(
+                        "Authenticated validator transport exited after readiness; terminating node"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "Authenticated validator transport task failed after readiness; terminating node"
+                    );
+                }
             }
             std::process::exit(1);
-        });
+        }));
 
         consensus.set_proposer_mode(cli.proposer_mode);
         let state_clone = state.clone();
         let mempool_clone = mempool.clone();
         let pool_clone = benchmark_pool.clone();
+        let consensus_shutdown = runtime_shutdown_rx.clone();
+        let consensus_exit_shutdown = runtime_shutdown_rx.clone();
         // Run consensus on a dedicated thread with its own tokio runtime.
         // This prevents broadcast/transport/RPC tasks from starving the
         // consensus loop (the root cause of random freezes at ~4000 rounds).
         // If the consensus thread panics, log the error and exit the process -
         // a node without consensus is useless and should restart via systemd.
-        std::thread::Builder::new()
-            .name("consensus".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("consensus runtime");
-                    rt.block_on(async move {
-                        consensus
-                            .run_consensus_loop(
-                                state_clone,
-                                mempool_clone,
-                                Some(inbound_rx),
-                                Some(outbound_tx),
-                                pool_clone,
-                            )
-                            .await;
-                    });
-                }));
-                match result {
-                    Ok(()) => {
-                        tracing::error!("Consensus loop exited unexpectedly - shutting down");
+        consensus_thread = Some(
+            std::thread::Builder::new()
+                .name("consensus".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("consensus runtime");
+                        rt.block_on(async move {
+                            consensus
+                                .run_consensus_loop_with_shutdown(
+                                    state_clone,
+                                    mempool_clone,
+                                    Some(inbound_rx),
+                                    Some(outbound_tx),
+                                    pool_clone,
+                                    consensus_shutdown,
+                                )
+                                .await;
+                        });
+                    }));
+                    match result {
+                        Ok(()) if *consensus_exit_shutdown.borrow() => {
+                            tracing::info!("Consensus thread joined for shutdown");
+                            return;
+                        }
+                        Ok(()) => {
+                            tracing::error!("Consensus loop exited unexpectedly - shutting down");
+                        }
+                        Err(panic_info) => {
+                            tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
+                        }
                     }
-                    Err(panic_info) => {
-                        tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
-                    }
-                }
-                // Exit the process - a node without consensus must restart
-                std::process::exit(1);
-            })
-            .context("failed to spawn consensus thread")?;
+                    // Exit the process - a node without consensus must restart
+                    std::process::exit(1);
+                })
+                .context("failed to spawn consensus thread")?,
+        );
     } else {
         drop(inbound_rx);
         drop(outbound_tx);
@@ -3906,7 +5360,7 @@ async fn main() -> Result<()> {
     }
 
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
-    if eth_rpc_port > 0 {
+    let eth_server_task = if eth_rpc_port > 0 {
         // Keep this unauthenticated compatibility surface local by default.
         // Operators that need remote access should publish it through an
         // authenticated, rate-limited reverse proxy rather than exposing the
@@ -3928,12 +5382,13 @@ async fn main() -> Result<()> {
         // Same declared identity on the ETH port's state.
         eth_node.chain_identity = genesis_chain_identity.clone();
         tracing::info!("ETH RPC    : {} (MetaMask/Hardhat/Foundry)", eth_addr);
-        tokio::spawn(async move {
-            if let Err(e) = rpc::serve_eth(&eth_addr, eth_node).await {
-                tracing::error!("ETH RPC server error: {}", e);
-            }
-        });
-    }
+        let eth_shutdown = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            rpc::serve_eth(&eth_addr, eth_node, Some(eth_shutdown)).await
+        }))
+    } else {
+        None
+    };
 
     // ── Start RPC server ────────────────────────────────────────────────
     if candle_engine.is_some() {
@@ -3941,7 +5396,16 @@ async fn main() -> Result<()> {
     } else if inference_model.is_some() {
         tracing::info!("Inference  : ENABLED (INT8 integer engine)");
     }
-    tracing::info!("RPC server listening on {}", rpc_addr);
+    match &rpc_listener {
+        rpc::RpcListen::Tcp(address) => tracing::info!("RPC server listening on {}", address),
+        #[cfg(unix)]
+        rpc::RpcListen::Unix(path) => {
+            tracing::info!(
+                "RPC server listening on sealed Unix socket {}",
+                path.display()
+            )
+        }
+    }
 
     // ── Spawn Tier 1 on-chain inference validator task ──────────────────
     // The task polls StateDB for open InferenceRequest escrows, checks
@@ -3953,7 +5417,7 @@ async fn main() -> Result<()> {
     // Safe to spawn without a model: missing engine/tokenizer/exact artifact
     // identity makes this validator abstain. Synthetic fallback votes are
     // forbidden because they would claim execution of bytes never loaded.
-    if chain_participation_enabled {
+    if runtime_roles.tier1_background_inference {
         let validator_task = arc_node::inference_validator::InferenceValidatorTask::new(
             state.clone(),
             mempool.clone(),
@@ -3963,56 +5427,24 @@ async fn main() -> Result<()> {
             inference_model.clone(),
             model_artifact_id,
         );
-        tokio::spawn(async move { validator_task.run().await });
+        let validator_shutdown = background_admission_shutdown_rx.clone();
+        runtime_tasks.push(tokio::spawn(async move {
+            validator_task.run_with_shutdown(validator_shutdown).await;
+        }));
         tracing::info!(
             "Tier 1 validator task spawned (candle={}, tokenizer={})",
             candle_engine.is_some(),
             inference_model.is_some()
         );
-    } else {
+    } else if !runtime_roles.chain_participation {
         tracing::info!(
             "Tier 1 on-chain validator task skipped in genesis-migration community observer mode"
         );
-    }
-
-    // ── Graceful shutdown handler ───────────────────────────────────────
-    // On SIGTERM (from systemd stop / rolling upgrade), drain pending state
-    // and close connections before exiting. This prevents lost transactions
-    // and allows other validators to see a clean disconnect.
-    let shutdown_state = state.clone();
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                tracing::info!("SIGINT received - initiating graceful shutdown...");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to install SIGINT handler: {}", e);
-                return;
-            }
-        }
-        tracing::info!("Flushing WAL and pending state...");
-        shutdown_state.sync_wal();
-        tracing::info!("Graceful shutdown complete. Exiting.");
-        std::process::exit(0);
-    });
-
-    // Also handle SIGTERM (systemd sends this)
-    #[cfg(unix)]
-    {
-        let shutdown_state = state.clone();
-        tokio::spawn(async move {
-            let Ok(mut sigterm) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            else {
-                tracing::warn!("Failed to install SIGTERM handler");
-                return;
-            };
-            sigterm.recv().await;
-            tracing::info!("SIGTERM received - initiating graceful shutdown...");
-            shutdown_state.sync_wal();
-            tracing::info!("Graceful shutdown complete. Exiting.");
-            std::process::exit(0);
-        });
+    } else {
+        tracing::info!(
+            protocol_major = state.active_protocol_version().major,
+            "Tier 1 background validator disabled while paid inference is dark for this protocol"
+        );
     }
 
     // Build one ShardInfo per held range if this node is a shard holder, then
@@ -4064,13 +5496,7 @@ async fn main() -> Result<()> {
                     model.config.n_heads,
                     model.config.vocab_size
                 );
-                let socket_addr = std::env::var("ARC_PUBLIC_SOCKET").unwrap_or_else(|_| {
-                    format!(
-                        "{}:{}",
-                        rpc_addr.split(':').next().unwrap_or("127.0.0.1"),
-                        rpc_addr.split(':').nth(1).unwrap_or("9090")
-                    )
-                });
+                let socket_addr = advertised_shard_rpc_origin(&cli, &rpc_addr)?;
                 ranges
                     .iter()
                     .map(|&(start, end)| rpc::ShardInfo {
@@ -4079,6 +5505,7 @@ async fn main() -> Result<()> {
                         total_layers,
                         model_id: format!("0x{}", hex::encode(artifact_id.0)),
                         model_name: model_display_name.clone(),
+                        execution_profile: model.effective_precision_label().to_string(),
                         memory_mb: per_layer_mb * (end - start),
                         full_model_mb,
                         socket_addr: socket_addr.clone(),
@@ -4101,87 +5528,25 @@ async fn main() -> Result<()> {
         let sis = shard_infos_for_broadcast.clone();
         // RPC origins are explicit TLS/gateway configuration. Never infer an
         // HTTP port from a P2P bootstrap address.
-        let seed_rpc_bases = coordinator_rpc_bases.clone();
-        let local_rpc_base = format!(
-            "http://127.0.0.1:{}",
-            rpc_addr.split(':').nth(1).unwrap_or("9090")
-        );
+        let announcement_targets = coordinator_rpc_bases.clone();
+        if announcement_targets.is_empty() {
+            tracing::info!(
+                "No remote shard announcement origin configured; local shard TTL is refreshed in-process"
+            );
+        } else {
+            let shard_announcement_keypair = validator_keypair.clone();
+            let shard_announcement_shutdown = background_admission_shutdown_rx.clone();
+            runtime_tasks.push(tokio::spawn(
+                run_signed_shard_announcement_loop_with_shutdown(
+                    sis,
+                    announcement_targets,
+                    shard_announcement_keypair,
+                    shard_announcement_shutdown,
+                ),
+            ));
 
-        // Background broadcaster: post our shard to every seed AND to our
-        // own localhost so the self-entry in the local registry gets its
-        // timestamp refreshed every tick. Without the localhost post, the
-        // 60s TTL on the registry would prune the self entry even while
-        // the node is still live.
-        let mut announcement_targets = Vec::with_capacity(seed_rpc_bases.len() + 1);
-        announcement_targets.push(local_rpc_base.clone());
-        for rpc_base in seed_rpc_bases {
-            if !announcement_targets.contains(&rpc_base) {
-                announcement_targets.push(rpc_base);
-            }
+            tracing::info!("Signed direct-holder shard broadcaster started (15s tick)");
         }
-        let shard_announcement_keypair = validator_keypair.clone();
-        tokio::spawn(async move {
-            // Brief settle so the local /shards endpoint is up before we ask
-            // peers to fetch from us
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            let mut audiences = std::collections::HashMap::<String, ValidatorHttpAudience>::new();
-            loop {
-                for rpc_base in &announcement_targets {
-                    let audience = if let Some(audience) = audiences.get(rpc_base).copied() {
-                        audience
-                    } else {
-                        match fetch_validator_http_audience(&client, rpc_base).await {
-                            Ok(audience) => {
-                                audiences.insert(rpc_base.clone(), audience);
-                                audience
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %rpc_base,
-                                    %error,
-                                    "Cannot resolve authenticated shard-announcement audience"
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    let mut target_succeeded = true;
-                    for shard in &sis {
-                        if let Err(error) = post_signed_shard_announcement(
-                            &client,
-                            rpc_base,
-                            shard,
-                            &shard_announcement_keypair,
-                            audience,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                %rpc_base,
-                                %error,
-                                "Authenticated shard announcement failed; evicting cached audience"
-                            );
-                            target_succeeded = false;
-                            break;
-                        }
-                    }
-                    if !target_succeeded {
-                        audiences.remove(rpc_base);
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            }
-        });
-
-        tracing::info!("Signed direct-holder shard broadcaster started (15s tick)");
     }
 
     // ── Community-mode HTTP registration + heartbeat ──────────────────
@@ -4233,7 +5598,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "unknown".to_string());
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let worker_model = inference_model.as_ref().and_then(|m| {
-            if !m.has_all_transformer_layers() {
+            if !m.has_all_transformer_layers() || !m.has_canonical_i8_profile() {
                 return None;
             }
             let artifact_id = model_artifact_id?;
@@ -4246,8 +5611,8 @@ async fn main() -> Result<()> {
         });
         if inference_model.is_some() && worker_model.is_none() {
             tracing::warn!(
-                "Loaded model is partial or tokenizer-only; registering as relay/observer and \
-                 disabling the full inference worker"
+                "Loaded model is partial, tokenizer-only, or non-canonical; registering as \
+                 relay/observer and disabling reward-bearing community inference"
             );
         }
 
@@ -4260,12 +5625,23 @@ async fn main() -> Result<()> {
         let model_id_c = worker_model
             .as_ref()
             .map(|(_, model_id, _)| model_id.clone());
+        let execution_profile_c = worker_model.as_ref().map(|_| {
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string()
+        });
         let community_rpc_targets_c = community_rpc_targets.clone();
         let registration_keypair = validator_keypair.clone();
+        let mut registration_shutdown = Some(background_admission_shutdown_rx.clone());
 
-        tokio::spawn(async move {
+        runtime_tasks.push(tokio::spawn(async move {
             // Settle before first POST
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if sleep_or_runtime_shutdown(
+                &mut registration_shutdown,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            {
+                return;
+            }
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
@@ -4295,6 +5671,7 @@ async fn main() -> Result<()> {
                 capabilities,
                 model: model_name_c,
                 model_id: model_id_c,
+                execution_profile: execution_profile_c,
                 platform: platform_c,
             };
             let heartbeat_payload = rpc::CommunityHeartbeatRequest {
@@ -4360,9 +5737,16 @@ async fn main() -> Result<()> {
                 }
                 while set.join_next().await.is_some() {}
                 ticks += 1;
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if sleep_or_runtime_shutdown(
+                    &mut registration_shutdown,
+                    std::time::Duration::from_secs(15),
+                )
+                .await
+                {
+                    return;
+                }
             }
-        });
+        }));
         tracing::info!(
             "Community-mode HTTP registration started (worker_id={})",
             worker_id
@@ -4392,9 +5776,17 @@ async fn main() -> Result<()> {
             let attestation_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let attestation_nonce_initialized =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut worker_shutdown = Some(background_admission_shutdown_rx.clone());
 
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            runtime_tasks.push(tokio::spawn(async move {
+                if sleep_or_runtime_shutdown(
+                    &mut worker_shutdown,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+                {
+                    return;
+                }
                 let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(35)) // 30s claim + 5s overhead
                     .redirect(reqwest::redirect::Policy::none())
@@ -4407,7 +5799,19 @@ async fn main() -> Result<()> {
                     address = %format!("0x{}", hex::encode(worker_address.0)),
                     "Community inference worker started - polling for jobs"
                 );
+                let mut decline_tasks = tokio::task::JoinSet::new();
                 loop {
+                    while let Some(result) = decline_tasks.try_join_next() {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "community decline task failed");
+                        }
+                    }
+                    if worker_shutdown
+                        .as_ref()
+                        .is_some_and(|receiver| *receiver.borrow())
+                    {
+                        break;
+                    }
                     // Long-poll EVERY seed at once and take the first to hand
                     // us work.
                     //
@@ -4432,6 +5836,9 @@ async fn main() -> Result<()> {
                         worker_id: worker_id_w.clone(),
                         capabilities: vec!["inference".to_string()],
                         model_id: worker_model_id.clone(),
+                        execution_profile:
+                            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+                                .to_string(),
                     };
                     let mut claims = tokio::task::JoinSet::new();
                     for addr in &community_rpc_targets_w {
@@ -4478,71 +5885,43 @@ async fn main() -> Result<()> {
                         let decline_client = client.clone();
                         let decline_worker = worker_id_w.clone();
                         let decline_keypair = worker_keypair.clone();
-                        tokio::spawn(async move {
+                        decline_tasks.spawn(async move {
                             while let Some(result) = claims.join_next().await {
                                 let Ok(Some((coordinator, job))) = result else {
                                     continue;
                                 };
-                                let Some(job_id) = job
-                                    .get("job_id")
-                                    .and_then(|value| value.as_str())
-                                    .filter(|value| !value.is_empty())
-                                else {
-                                    continue;
-                                };
-                                let decline = rpc::WorkResult {
-                                    job_id: job_id.to_string(),
-                                    worker_id: decline_worker.clone(),
-                                    success: false,
-                                    declined: true,
-                                    output: String::new(),
-                                    output_hash: String::new(),
-                                    tokens_generated: 0,
-                                    total_ms: 0,
-                                    ms_per_token: 0,
-                                    engine: String::new(),
-                                    error: Some(
-                                        "worker already accepted a concurrent coordinator job"
-                                            .to_string(),
-                                    ),
-                                    signed_attestation_hex: None,
-                                };
-                                match post_signed_community(
-                                    &decline_client,
-                                    &coordinator,
-                                    rpc::COMMUNITY_SUBMIT_WORK_PATH,
-                                    decline,
-                                    &decline_keypair,
-                                    std::time::Duration::from_secs(10),
+                                decline_community_assignment(
+                                    decline_client.clone(),
+                                    coordinator,
+                                    job,
+                                    decline_worker.clone(),
+                                    decline_keypair.clone(),
+                                    "worker already accepted a concurrent coordinator job",
                                 )
-                                .await
-                                {
-                                    Ok(response) if response.status().is_success() => {
-                                        tracing::debug!(
-                                            job_id,
-                                            seed = %coordinator,
-                                            "declined concurrent community job without dropping it"
-                                        );
-                                    }
-                                    Ok(response) => {
-                                        tracing::warn!(
-                                            job_id,
-                                            seed = %coordinator,
-                                            status = %response.status(),
-                                            "coordinator rejected concurrent-job decline"
-                                        );
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            job_id,
-                                            seed = %coordinator,
-                                            %error,
-                                            "could not decline concurrent community job"
-                                        );
-                                    }
-                                }
+                                .await;
                             }
                         });
+                    }
+
+                    // A long-poll can return a job at the same instant the
+                    // lifecycle signal closes admission. Decline that claimed
+                    // item and drain the remaining claim futures; never begin
+                    // a new blocking inference after shutdown was requested.
+                    if worker_shutdown
+                        .as_ref()
+                        .is_some_and(|receiver| *receiver.borrow())
+                    {
+                        if let Some((coordinator, job)) = claimed.take() {
+                            decline_tasks.spawn(decline_community_assignment(
+                                client.clone(),
+                                coordinator,
+                                job,
+                                worker_id_w.clone(),
+                                worker_keypair.clone(),
+                                "worker is shutting down before compute admission",
+                            ));
+                        }
+                        break;
                     }
 
                     {
@@ -4561,8 +5940,11 @@ async fn main() -> Result<()> {
                             .and_then(|s| s.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let max_tokens =
-                            job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+                        let assignment_max_tokens = job
+                            .get("max_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        let max_tokens = assignment_max_tokens.unwrap_or(0);
                         if job_id.is_empty() {
                             tracing::warn!(
                                 seed = %winner,
@@ -4603,16 +5985,51 @@ async fn main() -> Result<()> {
                             transaction_domain_required && assignment_transaction_domain.is_none();
                         let assignment_model_matches =
                             assignment_model_id == Some(worker_model_id_hash);
+                        let assignment_execution_profile_matches = job
+                            .get("execution_profile")
+                            .and_then(|value| value.as_str())
+                            == Some(
+                                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+                            );
+                        let deadline_anchor = tokio::time::Instant::now();
+                        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+                        let assignment_submit_window = job
+                            .get("submitted_at_unix_ms")
+                            .and_then(serde_json::Value::as_i64)
+                            .ok_or_else(|| {
+                                "assignment omitted an integer submitted_at_unix_ms".to_string()
+                            })
+                            .and_then(|submitted_at_unix_ms| {
+                                job.get("expires_at_unix_ms")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .ok_or_else(|| {
+                                        "assignment omitted an integer expires_at_unix_ms"
+                                            .to_string()
+                                    })
+                                    .and_then(|expires_at_unix_ms| {
+                                        community_submit_window(
+                                            submitted_at_unix_ms,
+                                            expires_at_unix_ms,
+                                            now_unix_ms,
+                                        )
+                                    })
+                            });
                         if !assignment_model_matches
+                            || !assignment_execution_profile_matches
                             || transaction_domain_is_malformed
                             || required_transaction_domain_is_missing
+                            || assignment_submit_window.is_err()
                             || input.is_empty()
                             || input.len() > 32_768
+                            || assignment_max_tokens.is_none()
                             || max_tokens == 0
                             || max_tokens > rpc::INFERENCE_RUN_MAX_TOKENS
                         {
                             let reason = if !assignment_model_matches {
                                 "assignment omitted or mismatched the worker's exact model artifact"
+                                    .to_string()
+                            } else if !assignment_execution_profile_matches {
+                                "assignment omitted or mismatched the canonical INT8 execution profile"
                                     .to_string()
                             } else if transaction_domain_is_malformed {
                                 "assignment carried a malformed recovery transaction domain"
@@ -4620,6 +6037,8 @@ async fn main() -> Result<()> {
                             } else if required_transaction_domain_is_missing {
                                 "assignment requires recovery-domain signing but omitted the transaction domain"
                                     .to_string()
+                            } else if let Err(error) = &assignment_submit_window {
+                                error.clone()
                             } else {
                                 format!(
                                     "invalid assignment bounds (input_bytes={}, max_tokens={})",
@@ -4639,7 +6058,8 @@ async fn main() -> Result<()> {
                                 success: false,
                                 // A coordinator identity mismatch is not a
                                 // model failure by this worker.
-                                declined: !assignment_model_matches,
+                                declined: !assignment_model_matches
+                                    || !assignment_execution_profile_matches,
                                 output: String::new(),
                                 output_hash: String::new(),
                                 tokens_generated: 0,
@@ -4661,6 +6081,11 @@ async fn main() -> Result<()> {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
+                        let submission_deadline = deadline_anchor
+                            .checked_add(assignment_submit_window.expect(
+                                "the malformed-assignment branch rejects invalid deadlines",
+                            ))
+                            .expect("the protocol submission window fits Tokio's Instant");
 
                         let input_preview: String = input.chars().take(40).collect();
 
@@ -4679,24 +6104,87 @@ async fn main() -> Result<()> {
                         // blocking pool so networking remains responsive.
                         let start = std::time::Instant::now();
                         let inference_model = model.clone();
-                        let inference_input = input.clone();
-                        let inference = tokio::task::spawn_blocking(move || {
-                            let (generated, hash) = inference_model.generate(
-                                &{
-                                    let mut toks = vec![inference_model.config.bos_token];
-                                    toks.extend(inference_model.encode(&inference_input));
-                                    toks
-                                },
-                                max_tokens,
-                                &inference_model.config.eos_tokens,
+                        // CachedIntegerModel owns the one configured BOS
+                        // forward. Passing a caller-prefixed BOS here made the
+                        // worker use a different prompt than ordinary sharded
+                        // inference and its independent shard verifier.
+                        let inference_tokens = inference_model.encode(&input);
+                        let generation_error = if inference_tokens.is_empty() {
+                            Some("assigned prompt encoded to zero tokens".to_string())
+                        } else {
+                            inference_model
+                                .preflight_generation(inference_tokens.len(), max_tokens)
+                                .err()
+                                .map(|error| error.to_string())
+                        };
+                        if let Some(error) = generation_error {
+                            let error = format!(
+                                "{error}; worker_context_helper_admitted={}",
+                                community_generation_fits_context(
+                                    inference_tokens.len(),
+                                    max_tokens,
+                                    inference_model.config.max_seq,
+                                )
                             );
+                            tracing::warn!(
+                                job_id,
+                                seed = %winner,
+                                %error,
+                                "declining community assignment before blocking compute"
+                            );
+                            let failure = rpc::WorkResult {
+                                job_id: job_id.clone(),
+                                worker_id: worker_id_w.clone(),
+                                success: false,
+                                declined: true,
+                                output: String::new(),
+                                output_hash: String::new(),
+                                tokens_generated: 0,
+                                total_ms: 0,
+                                ms_per_token: 0,
+                                engine: String::new(),
+                                error: Some(format!("invalid generation context: {error}")),
+                                signed_attestation_hex: None,
+                            };
+                            let _ = submit_community_result_with_retry(
+                                &client,
+                                &winner,
+                                &failure,
+                                &worker_keypair,
+                                submission_deadline,
+                            )
+                            .await;
+                            continue;
+                        }
+                        let inference = tokio::task::spawn_blocking(move || {
+                            // The fallible model API is authoritative at this
+                            // untrusted boundary. It performs checked context
+                            // admission immediately before allocating KV state;
+                            // even a tokenizer-expanded prompt can only become
+                            // a typed worker failure, never an indexing panic.
+                            let (generated, hash) = inference_model
+                                .try_generate(
+                                    &inference_tokens,
+                                    max_tokens,
+                                    &inference_model.config.eos_tokens,
+                                )
+                                .map_err(|error| {
+                                    let helper_admitted = community_generation_fits_context(
+                                        inference_tokens.len(),
+                                        max_tokens,
+                                        inference_model.config.max_seq,
+                                    );
+                                    format!(
+                                        "{error}; worker_context_helper_admitted={helper_admitted}"
+                                    )
+                                })?;
                             let output_text = inference_model.decode(&generated);
-                            (generated, hash, output_text)
+                            Ok::<_, String>((generated, hash, output_text))
                         })
                         .await;
                         let (generated, hash, output_text) = match inference {
-                            Ok(result) => result,
-                            Err(error) => {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(error)) => {
                                 tracing::error!(
                                     job_id,
                                     seed = %winner,
@@ -4717,13 +6205,43 @@ async fn main() -> Result<()> {
                                     error: Some(format!("local inference task failed: {error}")),
                                     signed_attestation_hex: None,
                                 };
-                                let _ = post_signed_community(
+                                let _ = submit_community_result_with_retry(
                                     &client,
                                     &winner,
-                                    rpc::COMMUNITY_SUBMIT_WORK_PATH,
-                                    failure,
+                                    &failure,
                                     &worker_keypair,
-                                    std::time::Duration::from_secs(10),
+                                    submission_deadline,
+                                )
+                                .await;
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id,
+                                    seed = %winner,
+                                    %error,
+                                    "community inference worker blocking task aborted"
+                                );
+                                let failure = rpc::WorkResult {
+                                    job_id: job_id.clone(),
+                                    worker_id: worker_id_w.clone(),
+                                    success: false,
+                                    declined: false,
+                                    output: String::new(),
+                                    output_hash: String::new(),
+                                    tokens_generated: 0,
+                                    total_ms: 0,
+                                    ms_per_token: 0,
+                                    engine: String::new(),
+                                    error: Some(format!("local inference task aborted: {error}")),
+                                    signed_attestation_hex: None,
+                                };
+                                let _ = submit_community_result_with_retry(
+                                    &client,
+                                    &winner,
+                                    &failure,
+                                    &worker_keypair,
+                                    submission_deadline,
                                 )
                                 .await;
                                 continue;
@@ -4824,83 +6342,57 @@ async fn main() -> Result<()> {
                             signed_attestation_hex,
                         };
 
-                        let submit_resp = post_signed_community(
+                        let submit_outcome = submit_community_result_with_retry(
                             &client,
                             &winner,
-                            rpc::COMMUNITY_SUBMIT_WORK_PATH,
-                            result_body,
+                            &result_body,
                             &worker_keypair,
-                            // The coordinator independently repeats inference through
-                            // a 2-of-3 validator quorum before acknowledging success.
-                            // Use the RPC protocol's audited end-to-end budget;
-                            // the public gateway has a wider 4,000-second ceiling.
-                            std::time::Duration::from_secs(
-                                rpc::COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS,
-                            ),
+                            submission_deadline,
                         )
                         .await;
 
-                        // If submit reports invalid_nonce, force a re-query
-                        // of the chain on the next loop iteration.
-                        match submit_resp {
-                            Ok(resp) => {
-                                let status_code = resp.status();
-                                match resp.json::<serde_json::Value>().await {
-                                    Ok(body) => {
-                                        if !status_code.is_success() {
-                                            tracing::warn!(
-                                                job_id,
-                                                seed = %winner,
-                                                status = %status_code,
-                                                response = %body,
-                                                "coordinator rejected community result"
-                                            );
-                                        }
-                                        let attestation = body.get("attestation");
-                                        if let Some(a) = attestation {
-                                            let status = a
-                                                .get("status")
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or("");
-                                            let err = a
-                                                .get("error")
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or("");
-                                            if status == "rejected" && err.contains("InvalidNonce")
-                                            {
-                                                tracing::warn!(
-                                                    "attestation nonce drifted; will re-query chain on next submit"
-                                                );
-                                                attestation_nonce_initialized.store(
-                                                    false,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            job_id,
-                                            seed = %winner,
-                                            status = %status_code,
-                                            %error,
-                                            "coordinator returned an invalid submit response"
-                                        );
-                                    }
-                                }
+                        // If a terminal response reports invalid_nonce, force
+                        // a chain re-query before building the next immutable
+                        // attestation. A network timeout is deliberately not
+                        // treated as rejection: the server may have succeeded.
+                        if let Some(body) = submit_outcome.response_body()
+                            && let Ok(body) = serde_json::from_str::<serde_json::Value>(body)
+                            && let Some(attestation) = body.get("attestation")
+                        {
+                            let status = attestation
+                                .get("status")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            let error = attestation
+                                .get("error")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("");
+                            if status == "rejected" && error.contains("InvalidNonce") {
+                                tracing::warn!(
+                                    "attestation nonce drifted; will re-query chain on next submit"
+                                );
+                                attestation_nonce_initialized
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
                             }
-                            Err(error) => tracing::warn!(
-                                job_id,
-                                seed = %winner,
-                                %error,
-                                "could not submit verified community result"
-                            ),
                         }
                     }
                     // Brief sleep between poll rounds to avoid hammering
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if sleep_or_runtime_shutdown(
+                        &mut worker_shutdown,
+                        std::time::Duration::from_millis(500),
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
-            });
+                while let Some(result) = decline_tasks.join_next().await {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "community decline task failed during shutdown");
+                    }
+                }
+                tracing::info!("Community inference worker stopped at the lifecycle barrier");
+            }));
             tracing::info!("Community inference worker loop spawned");
         }
     }
@@ -4919,9 +6411,9 @@ async fn main() -> Result<()> {
             node_cfg.inference.threads
         };
 
-    rpc::serve(
-        &rpc_addr,
-        state,
+    let rpc_result = rpc::serve(
+        rpc_listener,
+        state.clone(),
         mempool,
         validator_address,
         Some(Arc::new(validator_keypair)),
@@ -4941,8 +6433,84 @@ async fn main() -> Result<()> {
         compute_threads,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
+        Some(shutdown_rx),
     )
-    .await?;
+    .await;
+
+    let eth_result = if let Some(task) = eth_server_task {
+        match task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("ETH RPC server task join failed: {error}")),
+        }
+    } else {
+        Ok(())
+    };
+
+    if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        // Both HTTP servers have now drained accepted handlers. Close the
+        // transport/consensus barrier only at this point, then join every
+        // runtime/background task and the dedicated consensus OS thread. Only
+        // that completed join set proves there can be no writer racing the
+        // final StateDB WAL fsync.
+        let _ = runtime_shutdown_tx.send(true);
+        let mut runtime_join_error = None::<String>;
+        for task in runtime_tasks {
+            if let Err(error) = task.await
+                && runtime_join_error.is_none()
+            {
+                runtime_join_error = Some(format!("node runtime task failed to join: {error}"));
+            }
+        }
+        if let Some(thread) = consensus_thread {
+            match tokio::task::spawn_blocking(move || thread.join()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    runtime_join_error.get_or_insert_with(|| {
+                        "consensus thread panicked during shutdown".to_string()
+                    });
+                }
+                Err(error) => {
+                    runtime_join_error.get_or_insert_with(|| {
+                        format!("consensus thread join task failed during shutdown: {error}")
+                    });
+                }
+            }
+        }
+
+        // A failed fsync must never be logged or returned as a clean exit. Run
+        // it even when a prior join reported failure so the best available
+        // durable boundary is still established before systemd restarts us.
+        let wal_result = state.try_sync_wal();
+        if shutdown_exit_code(&wal_result) != 0 {
+            let error = wal_result.expect_err("nonzero shutdown status requires WAL failure");
+            tracing::error!(%error, "shutdown WAL durability barrier failed");
+            return Err(anyhow::anyhow!(
+                "shutdown WAL durability barrier failed: {error}"
+            ));
+        }
+        rpc_result?;
+        eth_result?;
+        if let Some(error) = runtime_join_error {
+            return Err(anyhow::anyhow!(error));
+        }
+        if let Some(receipt) = desktop_shutdown_receipt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
+            .take()
+        {
+            // This is the node's durable acknowledgement to its supervisor.
+            // A nonzero return, panic, forced kill, join failure, or WAL fsync
+            // failure reaches no removal path and leaves the receipt armed.
+            receipt.acknowledge()?;
+        }
+        tracing::info!(
+            "RPC handlers drained, node writers joined, WAL durability barrier completed, and the desktop receipt was acknowledged; shutdown is clean"
+        );
+        return Ok(());
+    }
+
+    rpc_result?;
+    eth_result?;
 
     Ok(())
 }
@@ -4952,6 +6520,792 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn shutdown_exit_status_fails_closed_on_wal_barrier_error() {
+        assert_eq!(shutdown_exit_code(&Ok(())), 0);
+        assert_eq!(
+            shutdown_exit_code(&Err(arc_state::StateError::PersistenceError(
+                "fsync failed".to_string()
+            ))),
+            1
+        );
+    }
+
+    #[test]
+    fn shutdown_broadcast_is_two_phase_and_matches_the_managed_stop_budget() {
+        let requested = std::sync::atomic::AtomicBool::new(false);
+        let (http_tx, http_rx) = tokio::sync::watch::channel(false);
+        let (background_tx, background_rx) = tokio::sync::watch::channel(false);
+        let (runtime_tx, runtime_rx) = tokio::sync::watch::channel(false);
+
+        broadcast_node_shutdown(&requested, &http_tx, &background_tx);
+
+        assert!(requested.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            *http_rx.borrow(),
+            "HTTP admission did not close at the signal edge"
+        );
+        assert!(
+            *background_rx.borrow(),
+            "background admission did not close at the signal edge"
+        );
+        assert!(
+            !*runtime_rx.borrow(),
+            "transport/consensus stopped before accepted HTTP handlers drained"
+        );
+
+        runtime_tx.send(true).unwrap();
+        assert!(*runtime_rx.borrow());
+        assert_eq!(
+            rpc::PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS + COMMUNITY_SUBMIT_LATE_GRACE_SECS + 120,
+            MANAGED_NODE_STOP_BUDGET_SECS
+        );
+        assert_eq!(MANAGED_NODE_STOP_BUDGET_SECS, 4_420);
+    }
+
+    #[test]
+    fn explicit_ephemeral_p2p_port_is_loopback_only_for_community_canaries() {
+        let p2p_port = 0;
+        let benchmark_mode = false;
+        let insecure_dev_validator_seed = false;
+        let listen_ip = p2p_listen_ip(p2p_port, benchmark_mode, insecure_dev_validator_seed);
+        let socket = std::net::UdpSocket::bind(SocketAddr::from((listen_ip, p2p_port))).unwrap();
+        assert!(socket.local_addr().unwrap().ip().is_loopback());
+
+        let public_default = p2p_listen_ip(9945, benchmark_mode, insecure_dev_validator_seed);
+        assert!(public_default.is_unspecified());
+    }
+
+    fn write_test_desktop_shutdown_token(data_dir: &Path, token: &str) -> PathBuf {
+        std::fs::create_dir_all(data_dir).unwrap();
+        let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        arc_crypto::secret_file::secure_private_directory(&control_dir).unwrap();
+        let path = control_dir.join(DESKTOP_SHUTDOWN_TOKEN_FILE_NAME);
+        let mut file = arc_crypto::secret_file::create_new_private(&path).unwrap();
+        file.write_all(format!("{token}\n").as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        path
+    }
+
+    fn write_test_desktop_shutdown_request(path: &Path, pid: u32, token: &str, nonce: &[u8; 32]) {
+        let mut file = arc_crypto::secret_file::create_new_private(path).unwrap();
+        file.write_all(
+            format!(
+                "{DESKTOP_SHUTDOWN_REQUEST_SCHEMA}\npid={pid}\ntoken={token}\nnonce={}\n",
+                hex::encode(nonce)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_shutdown_file_requires_the_exact_private_capability() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-desktop-shutdown-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let token = "42".repeat(32);
+        let token_file = write_test_desktop_shutdown_token(&data_dir, &token);
+        let genesis = data_dir.join("genesis.toml");
+        std::fs::write(&genesis, b"chain_id = \"receipt-test\"\n").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let token_bytes = [0x42u8; 32];
+        let arm = arc_crypto::secret_file::arm_desktop_shutdown_receipt(
+            &data_dir,
+            &token_bytes,
+            &executable,
+            &genesis,
+        )
+        .unwrap();
+        let control =
+            prepare_desktop_shutdown_control(&data_dir, Some(&token_file), Some(&genesis))
+                .unwrap()
+                .unwrap();
+        assert!(constant_time_token_eq(
+            &control.expected_token,
+            &control.expected_token
+        ));
+        let mut different = control.expected_token;
+        different[31] ^= 1;
+        assert!(!constant_time_token_eq(&control.expected_token, &different));
+
+        write_test_desktop_shutdown_request(
+            &control.request_file,
+            std::process::id(),
+            &"43".repeat(32),
+            &arm.nonce,
+        );
+        assert!(take_authenticated_desktop_shutdown_request(&control).is_err());
+        assert!(!control.request_file.exists());
+
+        // A crash-torn/malformed legacy request is consumed after its stable
+        // private-handle snapshot, allowing the next atomic publication.
+        let mut torn = arc_crypto::secret_file::create_new_private(&control.request_file).unwrap();
+        torn.write_all(b"arc.desktop.shutdown.v1\npid=").unwrap();
+        torn.sync_all().unwrap();
+        drop(torn);
+        assert!(take_authenticated_desktop_shutdown_request(&control).is_err());
+        assert!(!control.request_file.exists());
+
+        write_test_desktop_shutdown_request(
+            &control.request_file,
+            std::process::id().wrapping_add(1),
+            &token,
+            &arm.nonce,
+        );
+        assert!(
+            take_authenticated_desktop_shutdown_request(&control)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!control.request_file.exists());
+
+        write_test_desktop_shutdown_request(
+            &control.request_file,
+            std::process::id(),
+            &token,
+            &arm.nonce,
+        );
+        let (_http_tx, http_rx) = tokio::sync::watch::channel(false);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_authenticated_desktop_shutdown(control, http_rx),
+            )
+            .await
+            .expect("authenticated shutdown watcher timed out")
+            .is_some()
+        );
+
+        let outside = data_dir.with_extension("outside-token");
+        std::fs::write(&outside, format!("{token}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(
+            prepare_desktop_shutdown_control(&data_dir, Some(&outside), Some(&genesis)).is_err(),
+            "a token outside the locked data directory became a shutdown capability"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                prepare_desktop_shutdown_control(&data_dir, Some(&token_file), Some(&genesis))
+                    .is_err(),
+                "a group/world-readable shutdown token was accepted"
+            );
+        }
+        std::fs::remove_file(outside).unwrap();
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn startup_shutdown_gate_skips_later_stages_and_syncs_open_state() {
+        let requested = std::sync::atomic::AtomicBool::new(false);
+        let receipt = std::sync::Mutex::new(None);
+        assert!(!complete_startup_shutdown_if_requested(&requested, None, &receipt).unwrap());
+        requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(complete_startup_shutdown_if_requested(&requested, None, &receipt).unwrap());
+
+        let state = StateDB::new();
+        assert!(
+            complete_startup_shutdown_if_requested(&requested, Some(&state), &receipt).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_background_work_is_rejected_while_preexisting_work_drains() {
+        let requested = std::sync::atomic::AtomicBool::new(false);
+        let (http_tx, http_rx) = tokio::sync::watch::channel(false);
+        let (background_tx, background_rx) = tokio::sync::watch::channel(false);
+        let (runtime_tx, runtime_rx) = tokio::sync::watch::channel(false);
+        let (late_work_tx, late_work_rx) = tokio::sync::oneshot::channel::<()>();
+        let (existing_started_tx, existing_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (existing_finish_tx, existing_finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let late_work_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admitted = late_work_admitted.clone();
+
+        let mut background_task = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            children.spawn(async move {
+                let _ = existing_started_tx.send(());
+                let _ = existing_finish_rx.await;
+            });
+            let mut shutdown = Some(background_rx);
+            tokio::select! {
+                biased;
+                _ = wait_for_optional_runtime_shutdown(&mut shutdown) => {}
+                _ = late_work_rx => {
+                    admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            while children.join_next().await.is_some() {}
+        });
+        existing_started_rx.await.unwrap();
+
+        // This work appears after the lifecycle edge, modeling a claim/tick
+        // becoming ready near the end of a long accepted-handler drain.
+        broadcast_node_shutdown(&requested, &http_tx, &background_tx);
+        let _ = late_work_tx.send(());
+        tokio::task::yield_now().await;
+        assert!(!late_work_admitted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(*http_rx.borrow());
+        assert!(!*runtime_rx.borrow());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut background_task,)
+                .await
+                .is_err(),
+            "preexisting background work was abandoned instead of drained"
+        );
+
+        existing_finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), background_task)
+            .await
+            .expect("preexisting background work did not join")
+            .unwrap();
+        assert!(
+            !*runtime_rx.borrow(),
+            "transport/consensus closed before the modeled HTTP drain completed"
+        );
+        runtime_tx.send(true).unwrap();
+        assert!(*runtime_rx.borrow());
+    }
+
+    #[test]
+    fn protocol_v3_keeps_consensus_but_disables_the_legacy_tier1_worker() {
+        assert_eq!(
+            node_runtime_roles(true, 2),
+            NodeRuntimeRoles {
+                chain_participation: true,
+                tier1_background_inference: true,
+            }
+        );
+        assert_eq!(
+            node_runtime_roles(true, 3),
+            NodeRuntimeRoles {
+                chain_participation: true,
+                tier1_background_inference: false,
+            },
+            "protocol v3 must keep P2P/consensus live while paid Tier-1 inference is dark"
+        );
+        assert_eq!(
+            node_runtime_roles(false, 2),
+            NodeRuntimeRoles {
+                chain_participation: false,
+                tier1_background_inference: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_holder_populates_empty_coordinator_before_first_refresh_interval() {
+        let holder_key = arc_crypto::KeyPair::generate_ed25519();
+        let coordinator_key = arc_crypto::KeyPair::generate_ed25519();
+        let model_id = hash_bytes(b"signed-holder-startup-model");
+        let state = Arc::new(StateDB::new());
+        state.seed_genesis_validators(&[
+            (
+                holder_key.address(),
+                arc_state::StateDB::MIN_VALIDATOR_STAKE,
+            ),
+            (
+                coordinator_key.address(),
+                arc_state::StateDB::MIN_VALIDATOR_STAKE,
+            ),
+        ]);
+
+        // The coordinator authenticates the announced execution destination
+        // independently from the signed POST, so expose the holder's exact
+        // validator identity at its declared shard origin.
+        let holder_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let holder_addr = holder_listener.local_addr().unwrap();
+        let holder_origin = format!("http://{holder_addr}");
+        let holder_address = holder_key.address();
+        let holder_app = axum::Router::new()
+            .route(
+                "/network/info",
+                axum::routing::get(move || async move {
+                    axum::Json(json!({
+                        "validator_address": format!("0x{}", holder_address.to_hex()),
+                        "transaction_domain": serde_json::Value::Null,
+                        "recovery_active": false,
+                    }))
+                }),
+            )
+            .route("/health", axum::routing::get(|| async { "ok" }));
+        let holder_server = tokio::spawn(async move {
+            axum::serve(holder_listener, holder_app).await.unwrap();
+        });
+
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator_addr = reserved.local_addr().unwrap();
+        drop(reserved);
+        let coordinator_origin = format!("http://{coordinator_addr}");
+        let (coordinator_shutdown_tx, coordinator_shutdown_rx) = tokio::sync::watch::channel(false);
+        let coordinator_server = tokio::spawn({
+            let coordinator_addr = coordinator_addr.to_string();
+            let coordinator_key = coordinator_key.clone();
+            let state = state.clone();
+            let holder_origin = holder_origin.clone();
+            async move {
+                rpc::serve(
+                    rpc::RpcListen::Tcp(coordinator_addr),
+                    state,
+                    Arc::new(Mempool::new(1_000)),
+                    coordinator_key.address(),
+                    Some(Arc::new(coordinator_key)),
+                    arc_state::StateDB::MIN_VALIDATOR_STAKE,
+                    Instant::now(),
+                    Arc::new(AtomicU32::new(0)),
+                    None,
+                    None,
+                    None,
+                    Some(model_id),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![holder_origin],
+                    0,
+                    None,
+                    false,
+                    Some(coordinator_shutdown_rx),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..100 {
+            if client
+                .get(format!("{coordinator_origin}/health"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ready, "coordinator RPC did not start");
+
+        let startup_shard = rpc::ShardInfo {
+            start_layer: 0,
+            end_layer: 1,
+            total_layers: 1,
+            model_id: format!("0x{}", model_id.to_hex()),
+            model_name: "signed-holder-startup-model".to_string(),
+            execution_profile:
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            socket_addr: holder_origin,
+            node_name: "signed-holder".to_string(),
+        };
+        let broadcaster = tokio::spawn(run_signed_shard_announcement_loop(
+            vec![startup_shard],
+            vec![coordinator_origin.clone()],
+            holder_key,
+        ));
+
+        let topology = tokio::time::timeout(
+            std::time::Duration::from_secs(SHARD_ANNOUNCEMENT_INTERVAL_SECS),
+            async {
+                loop {
+                    if let Ok(response) = client
+                        .get(format!("{coordinator_origin}/shards"))
+                        .send()
+                        .await
+                        && let Ok(body) = response.json::<serde_json::Value>().await
+                        && body["shard_count"] == 1
+                    {
+                        break body;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            },
+        )
+        .await
+        .expect("signed holder did not populate coordinator before the first 15-second refresh");
+        assert_eq!(
+            topology["shards"][0]["execution_profile"],
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert_eq!(
+            topology["shards"][0]["model_id"],
+            format!("0x{}", model_id.to_hex())
+        );
+
+        broadcaster.abort();
+        coordinator_shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), coordinator_server)
+            .await
+            .expect("coordinator did not drain after its shutdown signal")
+            .unwrap();
+        holder_server.abort();
+    }
+
+    #[test]
+    fn validator_http_audience_hash_accepts_one_prefix_and_rejects_malformed_mixed_prefixes() {
+        let expected = hash_bytes(b"validator-http-audience");
+        let bare = expected.to_hex();
+        let prefixed = format!("0x{bare}");
+        assert_eq!(
+            parse_validator_http_audience_hash(&bare, "validator_address").unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_validator_http_audience_hash(&prefixed, "validator transaction_domain").unwrap(),
+            expected
+        );
+
+        for malformed in [
+            format!("0x{prefixed}"),
+            format!("0X{bare}"),
+            format!("0x0X{bare}"),
+            format!(" {prefixed}"),
+            format!("0x{}", &bare[..bare.len() - 1]),
+        ] {
+            assert!(
+                parse_validator_http_audience_hash(&malformed, "validator_address").is_err(),
+                "malformed or mixed-prefix audience was accepted: {malformed}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "benchmark-tools"))]
+    #[test]
+    fn default_cli_omits_benchmark_mutation_mode() {
+        assert!(Cli::try_parse_from(["arc-node", "--benchmark"]).is_err());
+    }
+
+    #[cfg(feature = "benchmark-tools")]
+    fn isolated_benchmark_cli() -> Cli {
+        Cli::try_parse_from([
+            "arc-node",
+            "--benchmark",
+            "--stake",
+            "500000",
+            "--insecure-dev-validator-seed",
+            "--validator-seed",
+            "isolated-benchmark-only",
+        ])
+        .unwrap()
+    }
+
+    #[cfg(feature = "benchmark-tools")]
+    #[test]
+    fn benchmark_runtime_accepts_only_numeric_loopback_devnet() {
+        let cli = isolated_benchmark_cli();
+        validate_benchmark_runtime(
+            &cli,
+            "127.0.0.1:9944",
+            &["127.42.0.9:9945".to_string(), "[::1]:9946".to_string()],
+            &[],
+            500_000,
+        )
+        .unwrap();
+
+        for rpc in ["localhost:9944", "0.0.0.0:9944", "140.82.16.112:9944"] {
+            assert!(
+                validate_benchmark_runtime(&cli, rpc, &[], &[], 500_000).is_err(),
+                "unsafe benchmark RPC was accepted: {rpc}"
+            );
+        }
+        for peer in ["localhost:9945", "0.0.0.0:9945", "140.82.16.112:9945"] {
+            assert!(
+                validate_benchmark_runtime(
+                    &cli,
+                    "127.0.0.1:9944",
+                    &[peer.to_string()],
+                    &[],
+                    500_000,
+                )
+                .is_err(),
+                "unsafe benchmark P2P peer was accepted: {peer}"
+            );
+        }
+        assert!(
+            validate_benchmark_runtime(
+                &cli,
+                "127.0.0.1:9944",
+                &[],
+                &["http://127.0.0.1:9090".to_string()],
+                500_000,
+            )
+            .is_err(),
+            "benchmark mode accepted an external RPC role"
+        );
+
+        let community_cli = Cli::try_parse_from([
+            "arc-node",
+            "--benchmark",
+            "--stake",
+            "500000",
+            "--insecure-dev-validator-seed",
+            "--validator-seed",
+            "isolated-benchmark-only",
+            "--community-mode",
+        ])
+        .unwrap();
+        assert!(
+            validate_benchmark_runtime(&community_cli, "127.0.0.1:9944", &[], &[], 500_000,)
+                .is_err(),
+            "benchmark mode accepted a community runtime"
+        );
+    }
+
+    #[test]
+    fn ephemeral_identity_is_only_available_to_strict_loopback_observers() {
+        let observer = Cli::try_parse_from(["arc-node", "--stake", "0"]).unwrap();
+        assert!(
+            validate_identity_runtime(
+                &observer,
+                "127.0.0.1:9944",
+                &["127.9.8.7:9945".to_string(), "[::1]:9946".to_string()],
+                &[],
+                false,
+                false,
+                0,
+            )
+            .unwrap()
+        );
+
+        for unsafe_rpc in ["localhost:9944", "0.0.0.0:9944", "140.82.16.112:9944"] {
+            assert!(
+                validate_identity_runtime(&observer, unsafe_rpc, &[], &[], false, false, 0,)
+                    .is_err(),
+                "ephemeral identity accepted unsafe RPC {unsafe_rpc}"
+            );
+        }
+        for unsafe_peer in ["localhost:9945", "0.0.0.0:9945", "140.82.16.112:9945"] {
+            assert!(
+                validate_identity_runtime(
+                    &observer,
+                    "127.0.0.1:9944",
+                    &[unsafe_peer.to_string()],
+                    &[],
+                    false,
+                    false,
+                    0,
+                )
+                .is_err(),
+                "ephemeral identity accepted unsafe peer {unsafe_peer}"
+            );
+        }
+
+        let community = Cli::try_parse_from(["arc-node", "--community-mode"]).unwrap();
+        let error = validate_identity_runtime(
+            &community,
+            "127.0.0.1:9944",
+            &[],
+            &["https://validator.example".to_string()],
+            false,
+            false,
+            0,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("persistent node identity"), "{error}");
+        assert!(error.contains("preserve it across restarts"), "{error}");
+
+        assert!(
+            !validate_identity_runtime(
+                &community,
+                "0.0.0.0:9944",
+                &["validator.example:9945".to_string()],
+                &["https://validator.example".to_string()],
+                true,
+                false,
+                0,
+            )
+            .unwrap(),
+            "a configured persistent keyfile should disable ephemeral identity"
+        );
+    }
+
+    #[test]
+    fn insecure_seed_runtime_has_no_public_or_role_override() {
+        let seed_cli = Cli::try_parse_from([
+            "arc-node",
+            "--stake",
+            "0",
+            "--validator-seed",
+            "disposable-local-only",
+            "--insecure-dev-validator-seed",
+        ])
+        .unwrap();
+        assert!(
+            !validate_identity_runtime(
+                &seed_cli,
+                "[::1]:9944",
+                &["127.0.0.1:9945".to_string()],
+                &[],
+                false,
+                true,
+                0,
+            )
+            .unwrap()
+        );
+
+        for (rpc, peers) in [
+            ("localhost:9944", Vec::new()),
+            ("0.0.0.0:9944", Vec::new()),
+            ("127.0.0.1:9944", vec!["validator.example:9945".to_string()]),
+        ] {
+            assert!(
+                validate_identity_runtime(&seed_cli, rpc, &peers, &[], false, true, 0).is_err(),
+                "insecure seed accepted unsafe runtime RPC={rpc} peers={peers:?}"
+            );
+        }
+
+        let community_seed = Cli::try_parse_from([
+            "arc-node",
+            "--community-mode",
+            "--validator-seed",
+            "disposable-local-only",
+            "--insecure-dev-validator-seed",
+        ])
+        .unwrap();
+        assert!(
+            validate_identity_runtime(&community_seed, "127.0.0.1:9944", &[], &[], false, true, 0,)
+                .is_err(),
+            "insecure seed accepted a community mutation role"
+        );
+
+        let missing_flag = Cli::try_parse_from([
+            "arc-node",
+            "--stake",
+            "0",
+            "--validator-seed",
+            "disposable-local-only",
+        ])
+        .unwrap();
+        assert!(
+            validate_identity_runtime(&missing_flag, "127.0.0.1:9944", &[], &[], false, true, 0,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn community_context_helper_accepts_exact_boundary_and_rejects_plus_one() {
+        // try_generate owns the one internal BOS position; the worker passes
+        // only the raw one-token prompt.
+        assert_eq!(community_generation_required_positions(1, 3), Some(5));
+        assert!(community_generation_fits_context(1, 3, 5));
+        assert!(!community_generation_fits_context(1, 4, 5));
+        assert_eq!(community_generation_required_positions(usize::MAX, 0), None);
+    }
+
+    #[test]
+    fn community_submit_classifier_retries_only_transient_responses() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                community_submit_response_disposition(status, "transient"),
+                CommunitySubmitResponseDisposition::Retry
+            );
+        }
+        assert_eq!(
+            community_submit_response_disposition(
+                reqwest::StatusCode::CONFLICT,
+                "an authenticated submit for this job is already being verified",
+            ),
+            CommunitySubmitResponseDisposition::Retry
+        );
+        assert_eq!(
+            community_submit_response_disposition(
+                reqwest::StatusCode::CONFLICT,
+                r#"{"error":{"code":"submission_in_progress"}}"#,
+            ),
+            CommunitySubmitResponseDisposition::Retry
+        );
+
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::GONE,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert_eq!(
+                community_submit_response_disposition(status, "expired/not-found/invalid"),
+                CommunitySubmitResponseDisposition::Rejected
+            );
+        }
+        assert_eq!(
+            community_submit_response_disposition(
+                reqwest::StatusCode::CONFLICT,
+                "job already submitted with different output semantics",
+            ),
+            CommunitySubmitResponseDisposition::Rejected
+        );
+        assert_eq!(
+            community_submit_response_disposition(reqwest::StatusCode::OK, "not-json"),
+            CommunitySubmitResponseDisposition::Accepted
+        );
+    }
+
+    #[test]
+    fn community_submit_window_uses_exact_expiry_and_public_outer_cap() {
+        let submitted = 1_700_000_000_000i64;
+        let now = submitted + 10_000;
+        let exact_expiry = u64::try_from(submitted + 45_000).unwrap();
+        assert_eq!(
+            community_submit_window(submitted, exact_expiry, now).unwrap(),
+            std::time::Duration::from_secs(35)
+        );
+
+        let beyond_public_cap = u64::try_from(submitted + 10_000_000).unwrap();
+        assert_eq!(
+            community_submit_window(submitted, beyond_public_cap, now).unwrap(),
+            std::time::Duration::from_millis(
+                (rpc::PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS + COMMUNITY_SUBMIT_LATE_GRACE_SECS)
+                    * 1_000
+                    - 10_000,
+            )
+        );
+        assert!(community_submit_window(submitted, exact_expiry, submitted + 45_000).is_err());
+        assert!(
+            community_submit_window(
+                submitted + (COMMUNITY_ASSIGNMENT_CLOCK_SKEW_SECS as i64 + 1) * 1_000,
+                exact_expiry + 120_000,
+                submitted,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn community_submit_backoff_is_exponential_jittered_and_capped() {
+        let first_low = community_submit_backoff(0, 0);
+        let first_high = community_submit_backoff(0, u64::MAX);
+        assert!(first_low >= std::time::Duration::from_millis(125));
+        assert!(first_high <= std::time::Duration::from_millis(250));
+
+        let capped_low = community_submit_backoff(31, 0);
+        let capped_high = community_submit_backoff(31, u64::MAX);
+        assert!(capped_low >= std::time::Duration::from_millis(15_000));
+        assert!(capped_high <= std::time::Duration::from_millis(30_000));
+    }
 
     fn recovery_test_binding(domain: arc_consensus::ConsensusDomain) -> RecoveryDagBinding {
         RecoveryDagBinding {
@@ -5053,22 +7407,37 @@ mod tests {
     }
 
     #[test]
-    fn shipped_placeholder_allows_stake_zero_community_observer_only() {
+    fn automatic_model_source_is_immutable_and_digest_bound() {
+        assert_eq!(DEFAULT_MODEL_SOURCES.len(), 1);
+        assert!(
+            DEFAULT_MODEL_SOURCES[0].contains("/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/")
+        );
+        assert!(!DEFAULT_MODEL_SOURCES[0].contains("/resolve/main/"));
+        assert_eq!(
+            TESTNET_MODEL_SHA256,
+            "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+        );
+    }
+
+    #[test]
+    fn shipped_complete_genesis_keeps_stake_zero_community_worker_off_chain_transport() {
         let cli =
             Cli::try_parse_from(["arc-node", "--community", "--genesis", "genesis.toml"]).unwrap();
         let genesis: config::GenesisConfig =
             toml::from_str(include_str!("../../../genesis.toml")).unwrap();
 
         assert_eq!(cli.stake, 0);
-        assert!(is_genesis_migration_observer(
+        assert!(genesis.chain.validator_set_complete);
+        assert!(!is_genesis_migration_observer(
             Some(&genesis),
             cli.stake,
             cli.insecure_dev_validator_seed,
         ));
-        assert!(genesis.validated_validator_set(false).is_err());
-        assert_ne!(
-            genesis.migration_observer_network_hash().unwrap(),
-            Hash256::ZERO
+        assert_eq!(genesis.validated_validator_set(false).unwrap().len(), 6);
+        assert_ne!(genesis.network_hash(false).unwrap(), Hash256::ZERO);
+        assert!(
+            !chain_participation_allowed(cli.stake, false, cli.insecure_dev_validator_seed),
+            "a stake-zero community worker must not start chain P2P or consensus"
         );
     }
 
@@ -5114,8 +7483,72 @@ mod tests {
     fn cli_defaults_keep_unauthenticated_rpc_local_and_eth_disabled() {
         let cli = Cli::try_parse_from(["arc-node"]).unwrap();
         assert_eq!(cli.rpc, "127.0.0.1:9944");
+        assert!(cli.rpc_unix.is_none());
         assert_eq!(cli.eth_rpc_port, 0);
         assert!(cli.community_rpc_urls.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_rpc_unix_listener_is_exclusive_and_archive_selects_exactly_one_transport() {
+        let cli = Cli::try_parse_from(["arc-node", "--rpc-unix", "/run/arc/rpc.sock"])
+            .expect("Unix RPC listener should not require the default TCP listener");
+        assert_eq!(
+            cli.rpc_unix.as_deref(),
+            Some(std::path::Path::new("/run/arc/rpc.sock"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "--rpc",
+                "127.0.0.1:9944",
+                "--rpc-unix",
+                "/run/arc/rpc.sock",
+            ])
+            .is_err(),
+            "explicit TCP and Unix RPC listeners must conflict"
+        );
+
+        let required = [
+            "archive",
+            "serve",
+            "--archive-manifest",
+            "/sealed/ARCHIVE-MANIFEST.json",
+            "--complete",
+            "/sealed/COMPLETE.json",
+            "--inventory",
+            "/sealed/legacy-nyc.inventory",
+            "--binding-index",
+            "/sealed/binding.files.sha256",
+            "--binding",
+            "/sealed/binding.json",
+            "--checkpoint",
+            "/sealed/candidate.arcchkpt",
+            "--expected-archive-manifest-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-complete-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--node",
+            "nyc",
+        ];
+        let mut unix_args = vec!["arc-node"];
+        unix_args.extend(required);
+        unix_args.extend(["--listen-unix", "/run/arc-archive/rpc.sock"]);
+        assert!(Cli::try_parse_from(unix_args).is_ok());
+
+        let mut missing_args = vec!["arc-node"];
+        missing_args.extend(required);
+        assert!(Cli::try_parse_from(missing_args).is_err());
+
+        let mut both_args = vec!["arc-node"];
+        both_args.extend(required);
+        both_args.extend([
+            "--listen",
+            "127.0.0.1:9950",
+            "--listen-unix",
+            "/run/arc-archive/rpc.sock",
+        ]);
+        assert!(Cli::try_parse_from(both_args).is_err());
     }
 
     #[test]

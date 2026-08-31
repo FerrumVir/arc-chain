@@ -970,6 +970,7 @@ pub async fn run_transport(
         local_keypair,
         data_dir,
         None,
+        None,
     )
     .await;
 }
@@ -1006,6 +1007,46 @@ pub async fn run_transport_with_readiness(
         local_keypair,
         data_dir,
         Some(startup),
+        None,
+    )
+    .await;
+}
+
+/// Start validator transport with the same readiness contract as
+/// [`run_transport_with_readiness`], then stop accepting/dialing peers when the
+/// node lifecycle requests shutdown. The future returns only after the QUIC
+/// endpoint is closed and the transport-owned fanout and peer-maintenance tasks
+/// have stopped.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_transport_with_readiness_and_shutdown(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<SocketAddr>,
+    local_address: Hash256,
+    local_stake: u64,
+    genesis_hash: Hash256,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    outbound_rx: mpsc::Receiver<OutboundMessage>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
+    startup: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    run_transport_inner(
+        listen_addr,
+        bootstrap_peers,
+        local_address,
+        local_stake,
+        genesis_hash,
+        allowed_validators,
+        outbound_rx,
+        inbound_tx,
+        peer_count,
+        local_keypair,
+        data_dir,
+        Some(startup),
+        Some(shutdown),
     )
     .await;
 }
@@ -1016,6 +1057,23 @@ fn report_transport_startup_failure(
 ) {
     if let Some(sender) = startup.take() {
         let _ = sender.send(Err(message));
+    }
+}
+
+async fn wait_for_transport_shutdown(receiver: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(receiver) = receiver.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            // Dropping the lifecycle owner means the transport can no longer
+            // prove it is supervised. Fail closed by stopping network input.
+            return;
+        }
     }
 }
 
@@ -1033,6 +1091,7 @@ async fn run_transport_inner(
     local_keypair: KeyPair,
     data_dir: String,
     mut startup: Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
     if allowed_validators.is_empty() || !allowed_validators.contains(&local_address.0) {
         let message = format!(
@@ -1318,8 +1377,17 @@ async fn run_transport_inner(
 
     // ── Spawn outbound fanout task ──────────────────────────────────────
     let conn_out = connections.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
+    let mut outbound_shutdown = shutdown.clone();
+    let outbound_task = tokio::spawn(async move {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = wait_for_transport_shutdown(&mut outbound_shutdown) => break,
+                message = outbound_rx.recv() => message,
+            };
+            let Some(msg) = msg else {
+                break;
+            };
             match msg {
                 OutboundMessage::BroadcastDagBlock {
                     block,
@@ -1483,7 +1551,7 @@ async fn run_transport_inner(
 
     // ── Spawn PEX + reconnect as independent task ──────────────────
     // This prevents the accept loop from starving timer-driven work.
-    {
+    let pex_task = {
         let conn_bg = connections.clone();
         let bp = bootstrap_peers.clone();
         let ep = endpoint.clone();
@@ -1493,6 +1561,7 @@ async fn run_transport_inner(
         let rl = rate_limiter.clone();
         let av = allowed_validators.clone();
         let dd = data_dir.clone();
+        let mut pex_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
             pex_tick.tick().await;
@@ -1504,6 +1573,8 @@ async fn run_transport_inner(
             recon_tick.tick().await;
             loop {
                 tokio::select! {
+                    biased;
+                    _ = wait_for_transport_shutdown(&mut pex_shutdown) => break,
                     _ = pex_tick.tick() => {
                         let mut all_peers: Vec<crate::protocol::PexPeerInfo> = conn_bg
                             .peers.iter()
@@ -1610,11 +1681,18 @@ async fn run_transport_inner(
                     }
                 }
             }
-        });
-    }
+        })
+    };
 
+    let mut lifecycle_stop = false;
     loop {
         tokio::select! {
+            biased;
+            _ = wait_for_transport_shutdown(&mut shutdown) => {
+                info!("P2P transport lifecycle shutdown requested");
+                lifecycle_stop = true;
+                break;
+            }
             // ── Accept inbound connections ──────────────────────────────
             incoming_opt = endpoint.accept() => {
                 let incoming = match incoming_opt {
@@ -1718,6 +1796,27 @@ async fn run_transport_inner(
             // Reconnect is handled by the background task above.
         }
     }
+
+    // Closing the endpoint wakes every peer receive loop and prevents any
+    // reconnect child that raced the lifecycle signal from establishing a new
+    // session. The two transport-owned long-lived tasks are joined before this
+    // future returns, so peer-file writes and outbound fanout cannot cross the
+    // node's final persistence barrier.
+    endpoint.close(0_u32.into(), b"node lifecycle shutdown");
+    if !lifecycle_stop {
+        outbound_task.abort();
+        pex_task.abort();
+    }
+    if let Err(error) = outbound_task.await {
+        warn!(%error, "P2P outbound task failed during shutdown");
+    }
+    if let Err(error) = pex_task.await {
+        warn!(%error, "P2P peer-maintenance task failed during shutdown");
+    }
+    endpoint.wait_idle().await;
+    connections.peers.clear();
+    peer_count.store(0, Ordering::SeqCst);
+    info!("P2P transport stopped at the lifecycle barrier");
 }
 
 // ─── Shared Connection-Setup Context ───────────────────────────────────────
@@ -2732,6 +2831,44 @@ mod tests {
 
         drop(outbound_tx);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_joins_bound_transport() {
+        let keypair = KeyPair::generate_ed25519();
+        let address = keypair.address();
+        let (_outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let peer_count = Arc::new(AtomicU32::new(0));
+        let task = tokio::spawn(run_transport_with_readiness_and_shutdown(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            address,
+            5_000_000,
+            Hash256([43_u8; 32]),
+            Arc::new([address.0].into_iter().collect()),
+            outbound_rx,
+            inbound_tx,
+            peer_count.clone(),
+            keypair,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            startup_tx,
+            shutdown_rx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), startup_rx)
+            .await
+            .expect("authenticated endpoint startup timed out")
+            .expect("transport dropped its startup result")
+            .expect("authenticated endpoint must bind");
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("transport did not join after lifecycle shutdown")
+            .expect("transport task panicked");
+        assert_eq!(peer_count.load(Ordering::SeqCst), 0);
     }
 
     #[test]

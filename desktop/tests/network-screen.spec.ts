@@ -389,13 +389,17 @@ test.describe("Network screen - blocks and attestations", () => {
     await expect(note).toBeVisible();
     // The mock carries exactly one `tx_type: "Other"` padding row.
     await expect(note).toContainText("1 row from LAX was not an inference record");
-    // Three of four fixtures are real inference records.
+    // Five of six fixtures are real inference records: three mined 0x16
+    // computations and two distinct mined 0x25 reward receipts.
     await expect(
       page.getByTestId("recent-inference").locator(".feed-item"),
-    ).toHaveCount(3);
+    ).toHaveCount(5);
     await expect(page.getByTestId("recent-inference")).toContainText(
-      "not payments",
+      "COMPUTED + PAID",
     );
+    await expect(
+      page.getByTestId("recent-inference").getByText("COMPUTED + PAID", { exact: true }),
+    ).toHaveCount(2);
   });
 });
 

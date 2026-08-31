@@ -266,11 +266,41 @@ non_semver_release_tag_is_rejected() {
     fi
 }
 
+assembler_preserves_unowned_and_last_good_outputs() {
+    local sandbox before_hash after_hash
+    new_assembly_fixture
+    sandbox="$NEW_ASSEMBLY_SANDBOX"
+    printf 'do not delete\n' > "$sandbox/output/important.txt"
+    if run_assembler "$sandbox" >"$sandbox/unowned.out" 2>&1; then
+        printf 'assembler replaced an unowned non-empty output directory\n'
+        return 1
+    fi
+    [ "$(cat "$sandbox/output/important.txt")" = 'do not delete' ] || {
+        printf 'assembler altered an unowned output directory on refusal\n'
+        return 1
+    }
+
+    rm -- "$sandbox/output/important.txt"
+    run_assembler "$sandbox" >"$sandbox/first.out" 2>&1 || return 1
+    before_hash="$(shasum -a 256 "$sandbox/output/SHA256SUMS")"
+    find "$sandbox/artifacts" -type f -name arc-node-linux-x86_64 -delete
+    if run_assembler "$sandbox" >"$sandbox/failed-rebuild.out" 2>&1; then
+        printf 'assembler unexpectedly accepted a missing required artifact\n'
+        return 1
+    fi
+    after_hash="$(shasum -a 256 "$sandbox/output/SHA256SUMS")"
+    [ "$before_hash" = "$after_hash" ] || {
+        printf 'failed release assembly replaced the last good output\n'
+        return 1
+    }
+}
+
 run_test 'complete fixture produces exact-tag manifest and verified SHA256SUMS' complete_fixture_produces_verifiable_contract
 run_test 'complete production genesis preserves its explicit activation schedule' complete_scheduled_genesis_is_preserved
 run_test 'unsafe production genesis is rejected before a publishable manifest exists' unsafe_production_genesis_is_rejected_before_manifest
 run_test 'each of the ten canonical headless assets is independently required' every_headless_asset_is_individually_required
 run_test 'duplicate same-named artifacts fail closed' duplicate_asset_is_rejected
 run_test 'release assembly accepts only strict vX.Y.Z tags' non_semver_release_tag_is_rejected
+run_test 'release assembly preserves unowned and last-good outputs' assembler_preserves_unowned_and_last_good_outputs
 
 finish_tests

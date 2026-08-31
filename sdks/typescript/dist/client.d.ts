@@ -4,7 +4,7 @@
  * Typed HTTP client for all ARC Chain RPC endpoints.
  * Uses the native `fetch` API (Node 18+, Deno, Bun, browsers).
  */
-import type { Account, BatchResult, Block, BlockSummary, ChainInfo, ChainStats, ContractCallResult, ContractInfo, EthRpcResponse, HealthInfo, LightSnapshot, NodeInfo, Receipt, SyncSnapshotInfo, Transaction } from "./types";
+import type { Account, BatchResult, Block, BlockSummary, ChainInfo, ChainStats, ContractCallResult, ContractInfo, EthRpcResponse, HealthInfo, LightSnapshot, NodeInfo, Receipt, SyncSnapshotInfo, SignedTransferTransaction, SignedTransferSubmitPayload, U64 } from "./types";
 export declare class ArcError extends Error {
     statusCode?: number;
     detail?: string;
@@ -83,7 +83,7 @@ export declare class ArcClient {
      *
      * @returns Transaction hash string.
      */
-    submitTransaction(tx: Record<string, unknown> | Transaction): Promise<string>;
+    submitTransaction(tx: SignedTransferSubmitPayload | SignedTransferTransaction): Promise<string>;
     /**
      * GET /tx/{hash} -- Look up a transaction receipt by hash.
      */
@@ -99,7 +99,13 @@ export declare class ArcClient {
     /**
      * POST /tx/submit_batch -- Submit multiple transactions.
      */
-    submitBatch(txs: Array<Record<string, unknown>>): Promise<BatchResult>;
+    submitBatch(txs: Array<SignedTransferSubmitPayload | SignedTransferTransaction>): Promise<BatchResult>;
+    /** Return the current v3 signing domain, or null for a pre-v3 node. */
+    getTransactionDomain(): Promise<string | null>;
+    private _normalizeSignedTransfer;
+    private _assertSignedTransferU64Fields;
+    private _assertTransactionDomain;
+    private _requireMatchingTransactionDomain;
     /**
      * GET /info -- Chain information.
      */
@@ -123,7 +129,7 @@ export declare class ArcClient {
     /**
      * POST /contract/{address}/call -- Read-only contract call.
      */
-    callContract(address: string, func: string, calldata?: string, fromAddr?: string, gasLimit?: number): Promise<ContractCallResult>;
+    callContract(address: string, func: string, calldata?: string, fromAddr?: string, gasLimit?: U64): Promise<ContractCallResult>;
     /**
      * GET /light/snapshot -- Lightweight snapshot for light client bootstrapping.
      */

@@ -1,9 +1,9 @@
 // Current zero-peer recovery UI.
 //
 // Live mode (window.__ARC_LIVE__ = 9090) makes tauri.ts hit fetch
-// instead of its in-process mock. The configured coordinators now use dashed
-// HTTPS nip.io origins, so these routes mirror the origins a shipped v0.8
-// desktop actually probes.
+// instead of its in-process mock. The configured coordinators use publicly
+// trusted direct-IP HTTPS origins, so these routes mirror the origins a
+// shipped v0.8 desktop actually probes.
 
 import { expect, test } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
@@ -35,7 +35,7 @@ test.describe("Dashboard zero-peer recovery", () => {
           }),
         });
       }
-      if (host === "149-28-32-76.nip.io") {
+      if (host === "149.28.32.76") {
         return route.fulfill({
           status: 200,
           contentType: "application/json",

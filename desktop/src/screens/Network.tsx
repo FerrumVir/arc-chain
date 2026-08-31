@@ -816,14 +816,15 @@ function BlockTxList({ height }: { height: number }) {
 }
 
 /**
- * Recent inference attestations, filtered to real inference records.
+ * Recent mined inference activity, filtered to protocol inference records.
  *
  * The deployed seeds pad `/inference/attestations` with unrelated transactions
  * tagged `tx_type: "Other"` once genuine rows run out — at `limit=500` some
  * seeds returned 500 padding rows and zero real ones. Presenting those as
  * inference evidence on a screen whose whole job is letting someone check the
  * chain would be the worst place in the app to get this wrong. Rows are kept
- * only when the host labelled them `Inference`; how many were dropped is
+ * only when the host labelled them `Inference` or
+ * `CommunityInferenceReward`; how many were dropped is
  * stated rather than hidden.
  */
 function RecentInferenceCard({
@@ -838,13 +839,17 @@ function RecentInferenceCard({
   const all = attestations ?? [];
   // A row with no tx_type at all is kept: older adapters did not carry the
   // field, and dropping those would empty the list on hosts that are fine.
-  const real = all.filter((a) => a.txType == null || a.txType === "Inference");
+  const real = all.filter((a) =>
+    a.txType == null
+    || a.txType === "Inference"
+    || a.txType === "InferenceAttestation"
+    || a.txType === "CommunityInferenceReward");
   const dropped = all.length - real.length;
 
   return (
     <Card data-testid="recent-inference">
       <CardHeader
-        title="Recent 0x16 inference claims (not payments)"
+        title="Recent inference activity"
         action={
           <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
             {formatInt(real.length)} shown
@@ -886,7 +891,7 @@ function RecentInferenceCard({
                 <div className="feed-item-title">
                   {a.inputPreview || (
                     <span style={{ color: "var(--text-muted)" }}>
-                      Inference attestation
+                      Inference activity
                     </span>
                   )}
                 </div>
@@ -905,6 +910,18 @@ function RecentInferenceCard({
                       : "recent"}
                   </span>
                 </div>
+              </div>
+              <div
+                data-testid={`activity-status-${a.txHash.slice(0, 10)}`}
+                style={{
+                  color: a.paid ? "var(--success)" : "var(--text-muted)",
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 600,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {a.paid ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"}
               </div>
               <button
                 className="btn btn-ghost btn-sm"

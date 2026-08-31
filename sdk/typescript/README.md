@@ -86,19 +86,39 @@ console.log(full.body);     // Typed body matching tx_type
 const proof = await client.getTxProof("a1b2c3d4...");
 console.log(proof.verified);
 
-// Submit a transaction
+// Submit a transfer signed for the exact domain from /network/info.
+// A v3 signer must include that domain in its ARC-chain-tx-v3 hash.
+const transactionDomain = await client.getTransactionDomain();
 const result = await client.submitTx({
   from: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
   to:   "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
   amount: 1000,
   nonce: 0,
+  fee: 1,
+  signature: "<128 hex characters from the domain-bound signer>",
+  public_key: "<64 hex characters>",
+  transaction_domain: transactionDomain,
 });
 console.log(result.tx_hash, result.status);
 
-// Submit a batch
+// Rust u64 values above Number.MAX_SAFE_INTEGER must use bigint. The SDK
+// emits exact unquoted JSON integers and rejects unsafe/fractional numbers.
+// Large u64 fields read from RPC responses are returned as bigint.
+const exactResult = await client.submitTx({
+  from: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  to:   "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+  amount: 9_007_199_254_740_993n,
+  nonce: 9_007_199_254_740_995n,
+  fee: 1n,
+  signature: "<128 hex characters from the domain-bound signer>",
+  public_key: "<64 hex characters>",
+  transaction_domain: transactionDomain,
+});
+
+// Submit a batch (maximum 64 transactions, matching the node admission cap)
 const batch = await client.submitTxBatch([
-  { from: "af1349...", to: "2d3ade...", amount: 100, nonce: 0 },
-  { from: "af1349...", to: "2d3ade...", amount: 200, nonce: 1 },
+  { from: "af1349...", to: "2d3ade...", amount: 100, nonce: 0, fee: 1, signature: "...", public_key: "...", transaction_domain: transactionDomain },
+  { from: "af1349...", to: "2d3ade...", amount: 200, nonce: 1, fee: 1, signature: "...", public_key: "...", transaction_domain: transactionDomain },
 ]);
 console.log(batch.accepted, batch.rejected);
 
@@ -304,7 +324,7 @@ ARC Chain supports 21 transaction types. The `TransactionBody` type is a discrim
 
 ## Requirements
 
-- Node.js >= 18 (for native `fetch`)
+- Node.js >= 24 (the package's declared LTS runtime floor)
 - TypeScript >= 5.0 (for development)
 
 ## License

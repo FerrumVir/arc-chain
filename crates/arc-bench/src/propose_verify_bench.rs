@@ -12,8 +12,9 @@
 //!   3. Aggregate TPS across all proposers
 //!   4. Fraud detection: tampered diff caught by verifier
 
+mod ephemeral_keys;
+
 use arc_crypto::Hash256;
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 // Pipeline not used - we call execute_block() directly to avoid channel overhead
 use arc_state::StateDB;
 use arc_types::Transaction;
@@ -65,68 +66,47 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Build a unified genesis (all proposers' senders + receivers) for
-/// the verifier StateDB that checks all diffs.
-fn build_verifier_genesis(num_proposers: usize, senders_per_proposer: u8) -> Vec<(Hash256, u64)> {
-    let mut genesis = Vec::new();
-
-    for p in 0..num_proposers {
-        let sender_base = (p as u8) * senders_per_proposer;
-        for i in 0..senders_per_proposer {
-            genesis.push((benchmark_address(sender_base + i), u64::MAX / 4));
-        }
-    }
-
-    for r in 200u8..=255 {
-        genesis.push((benchmark_address(r), 0));
-    }
-
-    genesis
-}
-
-/// Pre-sign transactions for one proposer.
-fn presign_for_proposer(
-    proposer_id: usize,
+/// Generate one process-local identity set, its unified genesis, and each
+/// proposer's signed transaction partition.
+fn build_benchmark_inputs(
+    num_proposers: usize,
     senders_per_proposer: u8,
-    total_txs: usize,
-) -> Vec<Transaction> {
-    use ed25519_dalek::Signer;
+    txs_per_proposer: usize,
+) -> (Vec<Vec<Transaction>>, Vec<(Hash256, u64)>) {
+    let senders_per_proposer = senders_per_proposer as usize;
+    let keypairs = ephemeral_keys::signing_keypairs(num_proposers * senders_per_proposer);
+    let receivers = ephemeral_keys::addresses(56);
+    let mut genesis: Vec<(Hash256, u64)> = keypairs
+        .iter()
+        .map(|(_, address)| (*address, u64::MAX / 4))
+        .collect();
+    genesis.extend(receivers.iter().map(|address| (*address, 0)));
 
-    let sender_base = (proposer_id as u8) * senders_per_proposer;
-    let keypairs: Vec<_> = (0..senders_per_proposer)
-        .map(|i| {
-            (
-                benchmark_keypair(sender_base + i),
-                benchmark_address(sender_base + i),
-            )
+    let proposer_txs = (0..num_proposers)
+        .map(|proposer_id| {
+            let sender_start = proposer_id * senders_per_proposer;
+            let proposer_keys = &keypairs[sender_start..sender_start + senders_per_proposer];
+            let mut nonces = vec![0u64; proposer_keys.len()];
+            (0..txs_per_proposer)
+                .map(|tx_idx| {
+                    let key_index = tx_idx % proposer_keys.len();
+                    let (keypair, sender) = &proposer_keys[key_index];
+                    let mut tx = Transaction::new_transfer(
+                        *sender,
+                        receivers[tx_idx % receivers.len()],
+                        1,
+                        nonces[key_index],
+                    );
+                    tx.sign(keypair)
+                        .expect("ephemeral benchmark signing must succeed");
+                    nonces[key_index] += 1;
+                    tx
+                })
+                .collect()
         })
         .collect();
 
-    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
-
-    let mut transactions = Vec::with_capacity(total_txs);
-    let mut nonces = vec![0u64; keypairs.len()];
-
-    for tx_idx in 0..total_txs {
-        let kp_idx = tx_idx % keypairs.len();
-        let (sk, sender) = &keypairs[kp_idx];
-        let receiver = receivers[tx_idx % receivers.len()];
-        let nonce = nonces[kp_idx];
-
-        let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
-
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
-
-        nonces[kp_idx] += 1;
-        transactions.push(tx);
-    }
-
-    transactions
+    (proposer_txs, genesis)
 }
 
 /// Run one proposer: execute all transactions, then export the state diff.
@@ -137,7 +117,7 @@ fn run_proposer(
     batch_size: usize,
 ) -> (Duration, usize, arc_types::StateDiff) {
     let state = Arc::new(StateDB::with_genesis(genesis));
-    let producer = benchmark_address(250);
+    let producer = genesis[0].0;
 
     // Collect all touched addresses from transactions (execute_block drains
     // dirty_accounts internally via compute_state_root, so we track them here)
@@ -212,9 +192,11 @@ fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let sign_start = Instant::now();
-    let proposer_txs: Vec<Vec<Transaction>> = (0..args.proposers)
-        .map(|p| presign_for_proposer(p, args.senders_per_proposer, args.txs_per_proposer))
-        .collect();
+    let (proposer_txs, all_genesis) = build_benchmark_inputs(
+        args.proposers,
+        args.senders_per_proposer,
+        args.txs_per_proposer,
+    );
     let sign_elapsed = sign_start.elapsed();
 
     let total_txs = args.proposers * args.txs_per_proposer;
@@ -232,12 +214,10 @@ fn main() {
     println!("  Phase 2: Single-Proposer Baseline (1 node executes everything)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let all_genesis = build_verifier_genesis(args.proposers, args.senders_per_proposer);
-
     // Run each proposer's tx set sequentially on a single node (how ETH/Solana work).
     // We keep proposer ordering intact to preserve nonce correctness.
     let single_state = Arc::new(StateDB::with_genesis(&all_genesis));
-    let single_producer = benchmark_address(255);
+    let single_producer = all_genesis[0].0;
 
     let single_start = Instant::now();
     let mut single_success = 0usize;

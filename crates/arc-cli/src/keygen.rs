@@ -14,15 +14,19 @@ use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::signature::KeyPair;
 use arc_crypto::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(all(test, unix))]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_KEYFILE_BYTES: u64 = 1024 * 1024;
+const MAX_LEGACY_SEED_BYTES: u64 = 4096;
 const KEYFILE_VALIDATION_CHALLENGE: &[u8] = b"ARC-keyfile-public-secret-consistency-v1";
+static NEXT_PRIVATE_SIDECAR: AtomicU64 = AtomicU64::new(0);
 
 /// JSON-serializable keyfile representation.
 #[derive(Serialize, Deserialize)]
@@ -61,44 +65,67 @@ pub fn save_keyfile(keypair: &KeyPair, path: &str) -> Result<()> {
         Zeroizing::new(serde_json::to_vec_pretty(&keyfile).context("failed to serialize keyfile")?);
     let path = Path::new(path);
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = options.open(path).with_context(|| {
+    let (sidecar, mut file) = create_private_sidecar(path).with_context(|| {
         format!(
-            "failed to create new keyfile {} (the target must not already exist or be a symlink)",
+            "failed to create a private keyfile sidecar for {}",
             path.display()
         )
     })?;
-
-    // `mode(0600)` guarantees the inode is never born group/world-accessible.
-    // fchmod through the already-open descriptor also defeats an unusually
-    // restrictive/modified umask without introducing a path-following race.
-    #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .context("failed to enforce mode 0600 on new keyfile")?;
+    let mut pending = PendingPrivateSidecar(Some(sidecar.clone()));
 
     file.write_all(&json)
         .context("failed to write complete keyfile")?;
     file.write_all(b"\n").context("failed to finish keyfile")?;
     file.sync_all().context("failed to fsync keyfile")?;
+    drop(file);
+    fs::hard_link(&sidecar, path).with_context(|| {
+        format!(
+            "failed to publish new keyfile {} without replacing an existing path",
+            path.display()
+        )
+    })?;
+    fs::remove_file(&sidecar).context("failed to remove keyfile sidecar after publication")?;
+    pending.0 = None;
     sync_parent_directory(path)?;
     Ok(())
+}
+
+struct PendingPrivateSidecar(Option<std::path::PathBuf>);
+
+impl Drop for PendingPrivateSidecar {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn create_private_sidecar(path: &Path) -> Result<(std::path::PathBuf, File)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("keyfile path has no filename"))?;
+    for _ in 0..64 {
+        let sequence = NEXT_PRIVATE_SIDECAR.fetch_add(1, Ordering::Relaxed);
+        let mut sidecar_name = OsString::from(".");
+        sidecar_name.push(name);
+        sidecar_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let sidecar = parent.join(sidecar_name);
+        match arc_crypto::secret_file::create_new_private(&sidecar) {
+            Ok(file) => return Ok((sidecar, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("could not allocate a unique private keyfile sidecar")
 }
 
 /// Load a keypair from a JSON keyfile.
 pub fn load_keyfile(path: &str) -> Result<KeyPair> {
     let path = Path::new(path);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    let file = options.open(path).with_context(|| {
+    let file = arc_crypto::secret_file::open_private(path).with_context(|| {
         format!(
-            "failed to open keyfile {} without following symlinks",
+            "failed to open private keyfile {} without following links",
             path.display()
         )
     })?;
@@ -116,14 +143,6 @@ pub fn load_keyfile(path: &str) -> Result<KeyPair> {
         path.display(),
         MAX_KEYFILE_BYTES
     );
-    #[cfg(unix)]
-    ensure!(
-        metadata.permissions().mode() & 0o077 == 0,
-        "keyfile {} has group/world permissions {:03o}; require 0600 or stricter",
-        path.display(),
-        metadata.permissions().mode() & 0o777
-    );
-
     let mut json = Zeroizing::new(Vec::with_capacity(metadata.len() as usize + 1));
     file.take(MAX_KEYFILE_BYTES + 1)
         .read_to_end(&mut json)
@@ -140,17 +159,8 @@ pub fn load_keyfile(path: &str) -> Result<KeyPair> {
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        File::open(parent)
-            .with_context(|| format!("failed to open parent directory {}", parent.display()))?
-            .sync_all()
-            .with_context(|| format!("failed to fsync parent directory {}", parent.display()))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    arc_crypto::secret_file::sync_parent_directory(path)
+        .with_context(|| format!("failed to sync keyfile directory for {}", path.display()))
 }
 
 /// Convert a `KeyPair` to a serializable `Keyfile`.
@@ -264,6 +274,72 @@ pub fn run(scheme: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
+/// Convert one protected legacy validator-seed file to an Ed25519 keyfile.
+///
+/// This migration-only path deliberately accepts no seed on argv or through
+/// the environment. It reproduces the historical validator derivation byte
+/// for byte, publishes the output without replacement, and verifies the
+/// resulting public key and address before reporting success.
+pub fn run_legacy_seed_file(input: &str, output: &str) -> Result<()> {
+    let keypair = keypair_from_legacy_seed_file(Path::new(input))?;
+    let expected_address = keypair.address();
+    let expected_public = keypair.public_key_bytes();
+    save_keyfile(&keypair, output)?;
+    let loaded = load_keyfile(output).context("failed to verify converted validator keyfile")?;
+    ensure!(
+        loaded.address() == expected_address && loaded.public_key_bytes() == expected_public,
+        "converted validator keyfile did not preserve the legacy public identity"
+    );
+
+    println!("Converted protected legacy Ed25519 identity");
+    println!("  Address: {}", expected_address.to_hex());
+    println!("  Keyfile: {}", output);
+    println!("Preserve this keyfile across restarts; the legacy seed is migration evidence only.");
+    Ok(())
+}
+
+/// Validate a private keyfile and print only its public ARC address.
+pub fn run_verify_keyfile(path: &str) -> Result<()> {
+    let keypair = load_keyfile(path)?;
+    println!("{}", keypair.address().to_hex());
+    Ok(())
+}
+
+fn keypair_from_legacy_seed_file(path: &Path) -> Result<KeyPair> {
+    let file = arc_crypto::secret_file::open_private(path).with_context(|| {
+        format!(
+            "failed to open protected legacy seed file {}",
+            path.display()
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect legacy seed file {}", path.display()))?;
+    ensure!(
+        metadata.len() > 0 && metadata.len() <= MAX_LEGACY_SEED_BYTES,
+        "legacy seed file must contain 1..={MAX_LEGACY_SEED_BYTES} bytes"
+    );
+    let mut seed = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+    file.take(MAX_LEGACY_SEED_BYTES + 1)
+        .read_to_end(&mut seed)
+        .with_context(|| format!("failed to read legacy seed file {}", path.display()))?;
+    ensure!(
+        seed.len() as u64 <= MAX_LEGACY_SEED_BYTES,
+        "legacy seed file exceeded the {MAX_LEGACY_SEED_BYTES}-byte limit while reading"
+    );
+    if seed.last() == Some(&b'\n') {
+        seed.pop();
+    }
+    ensure!(
+        !seed.is_empty() && !seed.iter().any(|byte| *byte == b'\n' || *byte == b'\r'),
+        "legacy seed file must contain exactly one non-empty LF-terminated or unterminated line"
+    );
+    let mut secret = blake3::derive_key("ARC-chain-validator-keypair-v1", &seed);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
+    secret.zeroize();
+    Ok(KeyPair::Ed25519(signing_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,8 +399,55 @@ mod tests {
         let original = std::fs::read(&path).unwrap();
 
         let error = save_keyfile(&KeyPair::generate_ed25519(), path.to_str().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("failed to create new keyfile"));
+        assert!(error.to_string().contains("failed to publish new keyfile"));
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn legacy_seed_file_conversion_preserves_exact_identity_without_overwrite() {
+        let dir = TestDir::new("legacy-convert");
+        let seed_path = dir.join("validator-seed");
+        let output = dir.join("validator.json");
+        let phrase = b"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut seed_file = arc_crypto::secret_file::create_new_private(&seed_path).unwrap();
+        seed_file.write_all(phrase).unwrap();
+        seed_file.write_all(b"\n").unwrap();
+        seed_file.sync_all().unwrap();
+        drop(seed_file);
+
+        run_legacy_seed_file(seed_path.to_str().unwrap(), output.to_str().unwrap()).unwrap();
+        let converted = load_keyfile(output.to_str().unwrap()).unwrap();
+        let mut secret = blake3::derive_key("ARC-chain-validator-keypair-v1", phrase);
+        let expected = KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(&secret));
+        secret.zeroize();
+        assert_eq!(converted.address(), expected.address());
+        assert_eq!(converted.public_key_bytes(), expected.public_key_bytes());
+
+        let original = std::fs::read(&output).unwrap();
+        assert!(
+            run_legacy_seed_file(seed_path.to_str().unwrap(), output.to_str().unwrap()).is_err()
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), original);
+        assert!(
+            !original
+                .windows(phrase.len())
+                .any(|window| window == phrase)
+        );
+    }
+
+    #[test]
+    fn legacy_seed_conversion_rejects_multiline_material() {
+        let dir = TestDir::new("legacy-multiline");
+        let seed_path = dir.join("validator-seed");
+        let mut seed_file = arc_crypto::secret_file::create_new_private(&seed_path).unwrap();
+        seed_file.write_all(b"first\nsecond\n").unwrap();
+        seed_file.sync_all().unwrap();
+        drop(seed_file);
+        let error = keypair_from_legacy_seed_file(&seed_path)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("exactly one"), "{error}");
     }
 
     #[cfg(unix)]
@@ -341,7 +464,7 @@ mod tests {
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = load_keyfile(path.to_str().unwrap()).unwrap_err();
-        assert!(error.to_string().contains("group/world permissions"));
+        assert!(format!("{error:#}").contains("mode 0600"));
     }
 
     #[cfg(unix)]

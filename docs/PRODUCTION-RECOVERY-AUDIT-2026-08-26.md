@@ -53,7 +53,8 @@ The candidate unifies one release publisher for checksummed headless and
 desktop artifacts: Linux amd64/arm64, Intel and Apple Silicon macOS, Windows
 x86_64 CLI, plus the desktop packages. The installer is exact-tagged, preserves
 identity, verifies checksums, refuses downgrade/incomplete releases, and has
-rollback coverage. Ubuntu 24 and Ubuntu 26 no-display smoke tests are blocking.
+rollback coverage. GUI-free node boot is blocking for Linux x86_64 on Ubuntu
+22.04, 24.04, and 26.04 and for Linux ARM64 on Ubuntu 24.04 and 26.04.
 
 The desktop updater now performs signed-manifest checks after startup and every
 24 hours when enabled. Background checks never download or install an update;
@@ -115,10 +116,10 @@ Free/community inference remains available without opening escrow.
   this candidate and its coordinated v3 trust root are not deployed.
 - **What hardware is required?** A stake-zero router that does not execute
   inference needs no model or GPU. The current full-model worker target is
-  Llama-2-7B Q4_K_M, about 4 GB on disk. Use at least 16 GB system RAM for the
-  expanded integer weights plus OS/chain headroom. More CPU cores can reduce
-  latency. A GPU is optional. Hardware size is not a reward multiplier and
-  cannot guarantee jobs.
+  Llama-2-7B Q4_K_M, about 4 GB on disk. The release does not establish a minimum-RAM
+  figure; prove a complete model load and inference with OS/chain headroom on
+  the target host. More CPU cores can reduce latency. A GPU is optional.
+  Hardware size is not a reward multiplier and cannot guarantee jobs.
 
 ## Human-controlled cutover gates
 
@@ -244,6 +245,45 @@ shared reference pair. Every stopped source is streamed directly to
 `arc-drive-arc:ARC Chain Recovery v0.8/captures/<capture-id>` without a full
 second local copy.
 
+The supported seal path is `build-production-manifest.py prearchive`, never a
+hand-edited production manifest. It consumes the exact
+protected-main Linux x86_64 pre-tag artifacts and build run, sealed freeze and
+fresh legacy public-height receipt, canonical six-root
+`arc.validator-vault.offline-stop-evidence.v2` receipt, source artifacts,
+signed checkpoint, exact Caddy 2.11.4 binary, and reward probe. Capture derives
+that offline-stop receipt from fresh hash-pinned remote stopped-status calls;
+each fixed node/host row binds the real offline-stop.v4 `stop.complete` and
+index roots plus the exact status argv/output hashes.
+
+Before any semantic check, the builder creates a new operator-private stage,
+copies every binary and recovery input through stable no-follow descriptors,
+fsyncs a canonical inventory, and seals the directories without write bits.
+All later checkpoint inspection/reproduction, archive copying, and deployment
+refer only to these single-link staged paths, closing the caller-path
+hash/open/stage substitution window.
+
+The sealed local receipt cannot authorize prearchive or key delivery on its
+own: mode 0400 and a checksum prove only local integrity. The builder requires
+an exact mode-0400 six-IP known-hosts anchor with six unique Ed25519 keys and an
+explicit mode-0400 SSH identity. It privately stages the already validated
+bytes, creates a new 256-bit challenge, and uses absolute root-owned
+`/usr/bin/ssh` with a fixed empty environment/config, pinned keys, no agent,
+proxy, redirect, forwarding, or password fallback. All six fixed hosts must
+return fresh canonical hash-pinned-helper responses binding the source commit,
+freeze/capture, node/IP, legacy validator address/stake, challenge, and newly
+re-derived stop roots. The parallel attempt is bounded to 120 seconds and the
+result must be at most 300 seconds old at create-only prearchive sealing. The
+public known-hosts anchor and exact verification receipt are manifest/archive
+bound; the private SSH identity is never published or archived.
+
+The verifier's local interpreter is itself selected only from the protected
+`/usr/bin/python3` entry point and byte-hash pinned. The check accepts macOS's
+legitimate signed-system Python hard links and Linux's protected
+same-directory versioned symlink, validates root-owned non-writable ancestry
+with `lstat`/opened-file identity, and has no GNU `stat -c` or `readlink -f`
+dependency. Caller `PATH`, loaders, proxies, agents, and Python environment are
+not inherited.
+
 Google Drive is not WORM or intrinsically immutable. Partial uploads are
 resumable but not consumable; `COMPLETE.json` is only the last create-only
 write in this execution, and the verifier re-downloads and hashes every object
@@ -256,6 +296,12 @@ the archived premanifest. Production execution then requires both
 <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>`. New v3 release
 and data paths must be disjoint from every preserved legacy source, which is
 reverified after cutover.
+
+Final production sealing uses `build-production-manifest.py finalize` with
+separately downloaded canonical completion evidence and independently verified
+roots. It changes exactly the four archive-finalization roots, proves the
+zero-root projection is the exact prearchive digest, and creates a new
+mode-0400 manifest and checksum sidecar without overwrite.
 
 The prearchive and finalized rollout manifests also seal
 `chain.legacy_public_max_height`, sampled as the greatest block number exposed

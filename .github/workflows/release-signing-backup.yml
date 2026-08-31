@@ -29,15 +29,10 @@ jobs:
     environment: release
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-
       - name: Bind to exact protected main and explicit authorization
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           CONFIRMATION: ${{ inputs.confirmation }}
           EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
         run: |
@@ -50,26 +45,15 @@ jobs:
           [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
           [ "$GITHUB_SHA" = "$EXPECTED_MAIN_SHA" ]
 
-          checked_out_sha="$(git rev-parse HEAD)"
-          git fetch --no-tags --force origin main:refs/remotes/origin/main
-          remote_main_sha="$(git rev-parse refs/remotes/origin/main)"
+          remote_main_sha="$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          [ "$remote_main_sha" = "$EXPECTED_MAIN_SHA" ]
 
-          [ "$checked_out_sha" = "$EXPECTED_MAIN_SHA" ]
-          [ "$checked_out_sha" = "$remote_main_sha" ]
-
-          printf 'Exact protected-main SHA: %s\n' "$checked_out_sha" \
+          printf 'Exact protected-main SHA: %s\n' "$remote_main_sha" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify audited backup implementation
-        shell: bash
-        run: |
-          set +x
-          set -Eeuo pipefail
-          printf '%s  %s\n' \
-            'f515c8937dfe8bc764f72d12580793647b445cac8bb6ed78b31e260f6f5bb14b' \
-            'scripts/release/backup-signing-keys.sh' |
-            sha256sum -c -
-
+      # This fresh protected job never checks out or executes repository code.
+      # Only fixed system tools touch the three recovery-equivalent secrets.
       - name: Create restore-tested ciphertext
         id: backup
         shell: bash
@@ -78,52 +62,108 @@ jobs:
           ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
           ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}
           EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
         run: |
           set +x
           set -Eeuo pipefail
           ulimit -c 0
           umask 077
-          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-          unset BASH_ENV ENV CDPATH
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB NODE_OPTIONS NODE_PATH \
+            OPENSSL_CONF OPENSSL_MODULES GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+            GIT_CONFIG_NOSYSTEM SSH_AUTH_SOCK SSH_SK_PROVIDER
 
           [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]
           [ -n "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]
           [ "${#ARC_SIGNING_BACKUP_PASSPHRASE}" -ge 32 ]
+          backup_passphrase="$ARC_SIGNING_BACKUP_PASSPHRASE"
+          unset ARC_SIGNING_BACKUP_PASSPHRASE
 
           work_dir="$RUNNER_TEMP/arc-signing-backup-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           tauri_key="$work_dir/tauri-updater.key"
           manifest_key="$work_dir/release-manifest-ed25519"
           ciphertext="$work_dir/arc-signing-keys.tar.gpg"
+          payload="$work_dir/payload"
+          restored="$work_dir/restored"
+          plaintext_archive="$work_dir/signing-keys.tar"
+          restored_archive="$work_dir/restored.tar"
 
-          install -d -m 700 -- "$work_dir"
+          /usr/bin/install -d -m 700 -- "$work_dir" "$payload" "$restored"
 
           cleanup_keys() {
-            chmod u+rw -- "$tauri_key" "$manifest_key" 2>/dev/null || true
-            rm -f -- "$tauri_key" "$manifest_key"
+            unset TAURI_SIGNING_PRIVATE_KEY ARC_RELEASE_MANIFEST_PRIVATE_KEY \
+              ARC_SIGNING_BACKUP_PASSPHRASE backup_passphrase
+            for secret_path in \
+              "$tauri_key" "$manifest_key" "$plaintext_archive" "$restored_archive" \
+              "$payload/tauri-updater.key" "$payload/release-manifest-ed25519" \
+              "$restored/tauri-updater.key" "$restored/release-manifest-ed25519"; do
+              if [ -f "$secret_path" ] && [ ! -L "$secret_path" ]; then
+                /usr/bin/shred -u -- "$secret_path" || true
+              fi
+            done
           }
           trap cleanup_keys EXIT HUP INT TERM
 
-          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$tauri_key"
-          printf '%s' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"
-          chmod 600 "$tauri_key" "$manifest_key"
+          /usr/bin/printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$tauri_key"
+          /usr/bin/printf '%s' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"
+          /usr/bin/chmod 600 "$tauri_key" "$manifest_key"
 
           unset TAURI_SIGNING_PRIVATE_KEY ARC_RELEASE_MANIFEST_PRIVATE_KEY
 
-          scripts/release/backup-signing-keys.sh \
-            "$tauri_key" \
-            "$manifest_key" \
-            "$ciphertext"
+          /usr/bin/install -m 600 -- "$tauri_key" "$payload/tauri-updater.key"
+          /usr/bin/install -m 600 -- "$manifest_key" "$payload/release-manifest-ed25519"
+          /usr/bin/ssh-keygen -y -f "$manifest_key" \
+            > "$payload/release-manifest-ed25519.pub"
+          /usr/bin/chmod 600 "$payload/release-manifest-ed25519.pub"
+          (
+            cd "$payload"
+            /usr/bin/sha256sum tauri-updater.key release-manifest-ed25519 \
+              > KEY-SHA256SUMS
+            /usr/bin/chmod 600 KEY-SHA256SUMS
+            /usr/bin/tar -cf "$plaintext_archive" \
+              KEY-SHA256SUMS release-manifest-ed25519 \
+              release-manifest-ed25519.pub tauri-updater.key
+          )
+          /usr/bin/printf '%s' "$backup_passphrase" | /usr/bin/gpg \
+            --batch --yes --no-symkey-cache --pinentry-mode loopback \
+            --passphrase-fd 0 --symmetric --cipher-algo AES256 \
+            --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 \
+            --compress-algo none --output "$ciphertext" "$plaintext_archive"
+          /usr/bin/printf '%s' "$backup_passphrase" | /usr/bin/gpg \
+            --batch --yes --no-symkey-cache --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt --output "$restored_archive" "$ciphertext"
+          unset backup_passphrase
+          /usr/bin/tar --extract --file "$restored_archive" --directory "$restored" \
+            --no-same-owner --no-same-permissions -- \
+            KEY-SHA256SUMS release-manifest-ed25519 \
+            release-manifest-ed25519.pub tauri-updater.key
+          (
+            cd "$restored"
+            /usr/bin/sha256sum -c KEY-SHA256SUMS >/dev/null
+          )
+          /usr/bin/cmp -s -- "$tauri_key" "$restored/tauri-updater.key"
+          /usr/bin/cmp -s -- "$manifest_key" "$restored/release-manifest-ed25519"
+          /usr/bin/ssh-keygen -y -f "$restored/release-manifest-ed25519" \
+            > "$work_dir/restored-manifest.pub"
+          /usr/bin/cmp -s -- \
+            "$payload/release-manifest-ed25519.pub" "$work_dir/restored-manifest.pub"
 
-          unset ARC_SIGNING_BACKUP_PASSPHRASE
           cleanup_keys
           trap - EXIT HUP INT TERM
 
           [ -f "$ciphertext" ]
           [ ! -L "$ciphertext" ]
           [ -s "$ciphertext" ]
-          chmod 600 "$ciphertext"
+          /usr/bin/chmod 600 "$ciphertext"
 
-          cipher_sha256="$(sha256sum "$ciphertext" | awk '{print $1}')"
+          cipher_row="$(/usr/bin/sha256sum "$ciphertext")"
+          cipher_sha256="${cipher_row%% *}"
           artifact_name="arc-signing-backup-$EXPECTED_MAIN_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$cipher_sha256"
 
           {

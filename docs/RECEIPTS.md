@@ -73,14 +73,11 @@ always produces the exact same answer on any computer, which means anyone can
 re-run it and confirm. Then I tried to forge a fake answer four different ways
 and it caught all four.
 
-Run it yourself — this one needs nothing but the repo and an internet
-connection, and it checks a real answer against the live network:
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain
-cd arc-chain
-bash scripts/arc-verify.sh --latest
-```
+The original text suggested cloning an unpinned default branch and immediately
+running its verifier. That mutable execution path is retired and intentionally
+omitted. Reproduce historical receipts only from an existing reviewed local
+checkout at an exact commit; this archived page is not authority for the
+current public network.
 
 ### Layer 2 — five minutes, some technical background
 

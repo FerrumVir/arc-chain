@@ -81,13 +81,44 @@ requires exactly
 `ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256> CAPTURE <capture-id>"`;
 the capture ID is deterministically derived from the freeze-plan digest.
 
-Plan mode runs the Drive identity/capacity gate read-only. After the exact
-authorization, execute mode repeats it immediately before the first writer
-signal and must immutable-create, download and hash-verify, permanently delete,
-and prove absence of one unique 8 MiB root canary. It also rechecks the ARC
-OAuth client, account, and capacity and persists an
-`arc.recovery.drive-prefreeze.v1` receipt. Any rclone warning or mismatch is a
-hard stop.
+Plan mode runs the Drive identity/capacity gate read-only and accepts only the
+reviewed rclone v1.75.0, whose version is recorded in the receipt. The gate
+first uses a benign `rclone about` to refresh the selected OAuth configuration,
+then streams `rclone config show <selected-remote>` only into a hash-pinned,
+isolated helper. It does not use backend-dependent `rclone config userinfo`.
+The helper performs the bounded verified-TLS Drive v3 request
+`GET /drive/v3/about?fields=user(emailAddress,permissionId,me)`, requires
+`me=true` plus exactly one normalized email and permission ID, and releases
+only their hashes. No token, client secret, raw account field, or raw API body
+is placed in argv, environment, logs, durable temporary storage, or receipts.
+
+After the exact authorization, execute mode repeats the gate immediately
+before the first writer signal and must immutable-create, download and
+hash-verify, permanently delete, and prove absence of one unique 8 MiB root
+canary. It then repeats the rclone-version, ARC OAuth client, account,
+permission identity, and capacity checks before persisting an
+`arc.recovery.drive-prefreeze.v1` receipt. Any rclone warning or mismatch,
+including an account or permission-ID switch around the canary, is a hard stop.
+
+Immediately after the verified canary and before the first cgroup freeze,
+restart-fence commit, or signal, execute mode takes exactly three bounded
+read-only observations from every sealed writer's loopback origin:
+`/inference/results`, `/workers/scoreboard`, and
+`/inference/attestations`. It must never request `/community/list`. Each GET
+has a 20-second deadline and an 8 MiB captured-body ceiling. HTTP 404,
+unreachable, timeout, and oversize outcomes are recorded faithfully with UTC
+time, node, endpoint, raw captured byte count, and SHA-256 rather than treated
+as canonical state or reward evidence.
+
+Each durable request intent is one-way: a crash/resume records an interrupted
+attempt instead of issuing the GET again. A complete receipt is reused exactly;
+if any receipt is missing, a fleet-wide eligibility barrier requires all six
+writers to remain live and unfenced. After any writer's fence/stop begins, no
+missing receipt may be captured or recaptured.
+All six create-only `arc.recovery.legacy-live-observations.v1` trees must be
+fsynced and reverified before any signal. They are labelled `diagnostic`,
+`noncanonical`, and `nonreward`; endpoint failures do not invent data, but
+failure to durably write a receipt aborts before the freeze.
 
 After the Drive gate, the helper installs exact volatile lifecycle safety and
 uses cgroup v2 as the only quiescence mechanism. It freezes and inode-checks
@@ -132,7 +163,11 @@ a global legacy-network halt.
 
 After the fence is stable, `capture-offline` records source path/device/inode,
 a complete regular-file content index, final WAL identity, external snapshot
-identity, and stop evidence. The original legacy data directory stays in place;
+identity, stop evidence, and the exact live-observation tree/receipt hashes.
+Each bundle retains that immutable observation tree. The final Drive archive
+adds canonical `legacy-live-observations.json`, whose ordered six roots are
+covered by the archive manifest and `SHA256SUMS` and rechecked during restore
+verification. The original legacy data directory stays in place;
 it is content-sealed by repeated hashing, not mounted read-only and not copied
 into a second full local tree. Changed, missing, unexpected, cross-device,
 symlink, or special-file content fails closed. The legacy `/sync/snapshot`
@@ -174,6 +209,144 @@ Collect only these non-secret values in the rollout manifest:
 No production staked validator may start from a seed string, environment
 seed, CLI seed, incomplete validator set, or a genesis entry that does not
 match both its public key and intended stake.
+
+### Restore and deliver the reviewed six-key vault
+
+Use `scripts/release/restore-validator-vault.py`; do not run `openssl cms
+-decrypt` or `tar -x` by hand. The `restore` subcommand requires the downloaded
+CMS ciphertext and its typed SHA-256, canonical rewrap receipt, exact
+protected-main SHA, matching mode-`0600` RSA restore certificate/private key,
+and the raw exact-ID Linux x86_64 headless Actions ZIP. A fresh anonymous
+public GitHub REST proof must bind the current protected `main`, exact
+completed/successful preflight run and attempt, and exact unexpired artifact
+ID/name/server digest/size. The helper then privately derives the exact
+`arc-cli`, `BUILD-METADATA.json`, and complete genesis from the two verified
+archive layers; caller-selected unpacked files or local receipts never
+authorize a restore. The output path must be a new absolute directory; an
+existing path is never merged or replaced.
+
+```bash
+umask 077
+export ARC_PROOF_CURL='/usr/bin/curl'
+export ARC_PROOF_CA_BUNDLE='/private/etc/ssl/cert.pem'
+export ARC_PROOF_CURL_SHA256="$(/usr/bin/shasum -a 256 "$ARC_PROOF_CURL" | /usr/bin/cut -d ' ' -f 1)"
+export ARC_PROOF_CA_BUNDLE_SHA256="$(/usr/bin/shasum -a 256 "$ARC_PROOF_CA_BUNDLE" | /usr/bin/cut -d ' ' -f 1)"
+
+python3 scripts/release/restore-validator-vault.py restore \
+  --cms /secure/operator/arc-validator-keys-v0.8.0.tar.cms \
+  --expected-cms-sha256 "$cms_sha256" \
+  --rewrap-receipt /secure/operator/REWRAP-RECEIPT.json \
+  --source-main-sha "$protected_main_sha" \
+  --raw-actions-zip /secure/pretag/headless-linux-x86_64-actions.zip \
+  --pretag-run-id "$pretag_run_id" \
+  --pretag-run-attempt "$pretag_run_attempt" \
+  --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
+  --curl "$ARC_PROOF_CURL" \
+  --curl-sha256 "$ARC_PROOF_CURL_SHA256" \
+  --ca-bundle "$ARC_PROOF_CA_BUNDLE" \
+  --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
+  --restore-certificate /secure/operator/restore.cert.pem \
+  --restore-private-key /secure/operator/restore.key.pem \
+  --openssl /opt/homebrew/Cellar/openssl@3/3.6.3/bin/openssl \
+  --openssl-sha256 05d34e15209fe2cc68faa813cbae5a9d607441c7498a953c2fa5916fccc32854 \
+  --openssl-libssl /opt/homebrew/Cellar/openssl@3/3.6.3/lib/libssl.3.dylib \
+  --openssl-libssl-sha256 4a466b82b563ce7bcf90062811ca36c8d57ce5f7fca22333dd68b2f7f41ee7ba \
+  --openssl-libcrypto /opt/homebrew/Cellar/openssl@3/3.6.3/lib/libcrypto.3.dylib \
+  --openssl-libcrypto-sha256 c853c9fefb6d391ab52d8db288b21c106db98e22efd148f2812cb7c27531cd41 \
+  --output-dir /secure/operator/arc-v0.8-validator-restore
+```
+
+Those are the reviewed local Homebrew 3.6.3 executable/library identities for
+this recovery. A different operating system or OpenSSL build requires a new
+explicit path-and-hash review; neither `PATH` nor an unpinned loader dependency
+is accepted. The helper copies all three into a private create-new runtime,
+executes the copied binary directly with a sanitized environment, and proves
+from every loader trace that the copied `libssl` and `libcrypto` were used.
+
+The helper validates one RSA-OAEP-SHA256 recipient and AES-256-GCM content,
+decrypts only below a mode-`0700` temporary directory, and extracts through
+no-follow/create-new file descriptors. It rejects traversal, absolute or
+Windows paths, links, special/PAX/sparse members, duplicate or case-folded
+paths, non-private modes, and every size/count violation. Exactly six strict
+Ed25519 JSON files must pass `arc keygen --verify-keyfile` under the hash-pinned
+pre-tag CLI. Their derived addresses—not filenames or archive order—map to the
+reviewed NYC/LAX/AMS/LHR/NRT/SGP trust root and must exactly match the complete
+genesis addresses and stakes.
+
+The new directory contains six mode-`0600` keyfiles, a mode-`0600` private
+`RESTORE-RECEIPT.json`, and canonical `validator-public-keys.json`. The public
+manifest is an array whose records contain only `address`, `public_key`, and
+`stake`; the private receipt contains paths and hashes but never secret bytes.
+Neither command emits private bytes on stdout, argv, or environment variables.
+
+Key delivery is a separate post-freeze operation. A v5 freeze **plan is not
+proof that a writer stopped**, and a caller-authored or merely self-hashed JSON
+claim is never accepted. Use only the mode-`0400` canonical
+`arc.validator-vault.offline-stop-evidence.v2` receipt and sidecar emitted by
+`archive-fleet-to-drive.sh` after it re-runs the hash-pinned `stopped-status`
+operation on all six `arc.recovery.offline-stop.v4` roots. It binds the exact
+protected-main commit, freeze plan and sidecar, capture ID, remote-helper path
+and SHA-256, and ordered stop-complete/files/status/argv roots for the fixed
+NYC/LAX/AMS/LHR/NRT/SGP hosts.
+
+```bash
+python3 scripts/release/restore-validator-vault.py install \
+  --restore-receipt /secure/operator/arc-v0.8-validator-restore/RESTORE-RECEIPT.json \
+  --source-main-sha "$protected_main_sha" \
+  --raw-actions-zip /secure/pretag/headless-linux-x86_64-actions.zip \
+  --pretag-run-id "$pretag_run_id" \
+  --pretag-run-attempt "$pretag_run_attempt" \
+  --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
+  --curl "$ARC_PROOF_CURL" \
+  --curl-sha256 "$ARC_PROOF_CURL_SHA256" \
+  --ca-bundle "$ARC_PROOF_CA_BUNDLE" \
+  --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
+  --freeze-plan /secure/operator/arc-freeze.lock.json \
+  --freeze-plan-sidecar /secure/operator/arc-freeze.lock.json.sha256 \
+  --freeze-plan-sha256 "$freeze_sha256" \
+  --offline-stop-evidence /secure/operator/offline-stop-evidence.json \
+  --offline-stop-evidence-sidecar /secure/operator/offline-stop-evidence.json.sha256 \
+  --offline-stop-evidence-sha256 "$offline_stop_evidence_sha256" \
+  --known-hosts /secure/operator/arc-validator-known-hosts \
+  --known-hosts-sha256 "$known_hosts_sha256" \
+  --ssh-identity /secure/operator/arc-validator-maintenance-ed25519 \
+  --ssh-identity-sha256 "$ssh_identity_sha256" \
+  --ssh /usr/bin/ssh \
+  --ssh-sha256 75ae4b414b57e0c52ad1cb24a9d7dae2496071fdf153c7fc8e94db3c9c4b0faa \
+  --scp /usr/bin/scp \
+  --scp-sha256 46079e23e675b6876b502e6d0c2f8cb75af6d80abd70ed44a0d429ed3b110eba \
+  --receipt-output /secure/operator/arc-validator-key-install.json
+```
+
+The known-hosts source must be an operator-owned, single-link mode-`0400` file
+with exactly six canonical, ordered literal-IP `ssh-ed25519` records for
+NYC/LAX/AMS/LHR/NRT/SGP and six unique canonical key blobs. Wildcards, hashed
+hosts, aliases, extra fields, reordered hosts, duplicate keys, or another key
+algorithm fail closed. The explicit maintenance identity must also be one
+operator-owned, single-link mode-`0400` file with its reviewed SHA-256.
+Transport always uses `-F /dev/null`, exactly one `-i`, `IdentitiesOnly=yes`,
+and `IdentityAgent=none`; it drops `SSH_AUTH_SOCK` and never consults an agent,
+default identity, user SSH config, or global known-hosts file.
+
+Install rejects any plan/evidence host mapping except NYC `149.28.32.76`, LAX
+`140.82.16.112`, AMS `136.244.109.1`, LHR `104.238.171.11`, NRT
+`202.182.107.41`, and SGP `149.28.153.31` before transport. It privately copies
+the reviewed SSH/SCP images, sanitizes their environment and user config, and
+forces SCP to use the same private SSH image. Before any key probe or upload it
+re-runs the evidence-bound, hash-pinned remote helper on all six hosts and
+requires byte-identical canonical stopped-status output and roots. It repeats
+that same proof at each node's immediate install boundary.
+
+Install freshly repeats the full GitHub artifact proof after all six remote
+stopped-status checks and immediately before any remote key probe or mutation;
+both complete initial/final public-API provenances are sealed in the receipt.
+It uses batch-only, strict host-key-pinned SSH with forwarding and password
+fallbacks disabled. Each already locally verified key is copied to a fresh
+remote temporary inode, hash-checked, made `root:root` mode `0600`, fsynced,
+and hard-linked create-only as `/etc/arc-v3/validator-key.json`. A matching
+existing final file is an exact resume; any different bytes, type, owner, or
+mode abort without overwrite. The final receipt contains only public
+addresses, paths, states, and artifact/key/proof hashes.
 
 ## 3. Approve a new trust root
 
@@ -244,11 +417,35 @@ Workflow text does not prove that repository settings are enabled. Before a
 release owner runs the tag workflow, the owner must verify all of these controls
 in GitHub's settings:
 
+```bash
+immutable_enabled="$(gh api \
+  repos/FerrumVir/arc-chain/immutable-releases \
+  --jq '.enabled')"
+test "$immutable_enabled" = true || {
+  printf 'immutable GitHub releases are not enabled; do not create the tag\n' >&2
+  exit 1
+}
+```
+
+Run that command from the existing owner/admin `gh` session immediately before
+tag creation. GitHub's endpoint requires repository Administration read access,
+which is intentionally unavailable to the workflow `GITHUB_TOKEN`. The
+least-privilege publisher instead creates a hidden draft, uploads and compares
+every GitHub-computed asset digest to the local bytes, publishes the validated
+draft, and requires the resulting release to report `immutable: true`. If it
+does not, the workflow immediately deletes that exact release ID without
+deleting the protected tag, so the same unchanged tag can be rerun after the
+setting is repaired.
+
 - protect `main` with a no-bypass PR/check/review ruleset. Protect **all** tag
   names with two `~ALL` tag rulesets: owner-only creation, plus no-bypass
   update, deletion, and non-fast-forward prevention. Enable immutable releases;
 - restrict Actions to an owner-reviewed allowlist and require full commit-SHA
   pinning;
+- keep Pages on the GitHub Actions source, restrict the `github-pages`
+  environment to protected `main`, and disable administrator bypass. The Pages
+  workflow runs on every `main` commit, cancels superseded runs, and re-resolves
+  current `main` before artifact upload and immediately before deployment;
 - create a protected `release` environment, restrict its deployment tags, add
   required reviewers, move `TAURI_SIGNING_PRIVATE_KEY` and the separate
   `ARC_RELEASE_MANIFEST_PRIVATE_KEY` into that environment, and remove all
@@ -273,41 +470,62 @@ in GitHub's settings:
   the write-only GitHub environment secrets, store a random 32+-character
   backup passphrase in macOS Keychain and the protected `release` environment,
   then manually dispatch `release-signing-backup.yml` with the exact protected
-  `main` SHA and confirmation `BACKUP_EXISTING_RELEASE_KEYS`. That one-shot
-  workflow runs `scripts/release/backup-signing-keys.sh`,
+  `main` SHA and confirmation `BACKUP_EXISTING_RELEASE_KEYS`. Do not create the
+  immutable tag yet. That one-shot
+  workflow uses a fresh no-checkout job to create the encrypted archive,
   immediately restores and byte-compares both keys, uploads ciphertext only,
-  and retains the temporary Actions artifact for one day. Before dispatch,
+  and retains the temporary Actions artifact for one day. While either private
+  key or `ARC_SIGNING_BACKUP_PASSPHRASE` exists, only workflow-inline logic and
+  fixed system executables may run: no repository script, package lifecycle
+  hook, interpreter-loaded repository module, or unpinned downloaded program
+  is permitted. Before dispatch,
   disable administrator bypass and self-review on the `release` environment
   and require a distinct trusted reviewer. The artifact name binds protected
   `main`, run/attempt, and its ciphertext SHA-256. Download it into a
-  FileVault-protected directory, set it mode 0600, and restore-test it from a
-  clean checkout of that exact commit. Disable inherited shell tracing before
-  reading Keychain so the passphrase cannot enter a trace:
-
-  ```bash
-  (
-    set +x
-    unset BASH_ENV ENV CDPATH
-    chmod 600 -- "$CIPHERTEXT"
-    export ARC_SIGNING_BACKUP_PASSPHRASE
-    ARC_SIGNING_BACKUP_PASSPHRASE="$(security find-generic-password \
-      -a 'FerrumVir ARC release' \
-      -s 'com.arc-chain.release-signing-backup.current' -w)"
-    trap 'unset ARC_SIGNING_BACKUP_PASSPHRASE' EXIT HUP INT TERM
-    scripts/release/verify-signing-key-backup.sh \
-      "$CIPHERTEXT" "$EXPECTED_MAIN_SHA" "$EXPECTED_CIPHERTEXT_SHA256"
-  )
-  ```
-
-  The verifier binds its checkout and trust inputs to the expected protected
-  `main` commit, verifies the ciphertext hash before decryption, prepares all
-  locked build tools before plaintext exists, and signs both manifest and
-  updater canaries without exporting either private key. Copy only the
-  ciphertext to ARC
-  Drive and a second independent recovery medium, re-download and hash-match
-  both copies, then delete the Actions artifact, delete only the temporary
-  passphrase environment secret, and remove the one-shot workflow through a
-  protected PR. Keep the passphrase outside every ciphertext provider. Never
+  FileVault-protected directory, set it mode 0600, and verify the published
+  exact-main/run/attempt identity, ciphertext SHA-256, and public-key
+  fingerprints. Operators must not run a repository backup/restore script or
+  expose the passphrase to a checkout. The protected job clears the passphrase,
+  shreds both plaintext key files, and only then allows repository verification
+  code to run against public outputs. Copy only the
+  ciphertext to ARC Drive and a second independent recovery medium, then
+  re-download and hash-match both copies. Do not delete the short-lived Actions
+  artifact yet. Keep the passphrase environment secret in place while manually
+  dispatching `release-signing-preflight.yml`: its `backup-readiness` job fails
+  unless the 32+-character secret exists, the exact protected-main SHA has one
+  successful backup artifact, that passphrase decrypts it, and both restored
+  keys match the committed manifest and updater trust roots. After that job is
+  green, delete the short-lived backup artifact; the two independently hash-matched
+  ciphertext copies remain the recovery media. The same preflight binds every
+  job to one dispatch-time main SHA; boots all five promised headless targets
+  (Linux x86_64/ARM64, macOS Intel/ARM64, and Windows x86_64); assembles all
+  four signed desktop groups; and rechecks unchanged protected main after the
+  matrix, so every platform failure happens before a non-movable tag exists.
+  Each matrix leg uploads a create-only 30-day candidate whose name binds kind,
+  platform, candidate commit, workflow run/attempt, and inner archive SHA-256.
+  The seal requires exactly nine unexpired, nonempty, unique artifact IDs with
+  GitHub server SHA-256 digests. Use the Linux x86_64 payload from that selection
+  to stage the six validators before updater users can see v0.8. These exact
+  bytes are both rollout inputs and release assets: the tag workflow re-resolves
+  the latest successful exact-commit preflight, pins its run/attempt and all nine
+  artifact IDs, downloads raw ZIPs with digest mismatch set to error, independently
+  re-hashes them against the selected server digests, safely extracts them, and
+  publishes those bytes without an independent release rebuild.
+  Before tagging, exercise the selected macOS arm64 headless node as the
+  bounded stake-zero full-integer community worker in
+  [MACOS-PRETAG-COMMUNITY-CANARY.md](MACOS-PRETAG-COMMUNITY-CANARY.md). The
+  helper retains the already-verified build metadata, pins the exact
+  commit/run/attempt and canonical GGUF, exposes RPC on loopback only, uses all
+  six literal-IP HTTPS community origins, and stops only after exact
+  PID/executable/argv proof with the full 4,420-second SIGTERM budget. Preserve
+  its registration/work/receipt evidence; a running process alone is not a
+  successful inference or reward canary.
+  Only after every job in that exact-SHA preflight succeeds may the owner create
+  `v0.8.0` at that SHA. Then delete only the temporary passphrase environment
+  secret. Remove the one-shot workflow through a protected PR only after the
+  immutable release is complete, because changing `main` before tagging would
+  invalidate the exact-SHA backup and preflight evidence. Keep the passphrase
+  outside every ciphertext provider. Never
   upload either private key in plaintext and never rotate the updater key
   before v0.8.0: every v0.7 client must still be able to verify the v0.8.0
   bridge release;
@@ -321,16 +539,19 @@ downstream job to the commit SHA validated from `v0.8.0`, re-checks the remote
 tag immediately before creation, and refuses to replace an existing release.
 Its publisher is blocked on the full quality harness, Cargo
 and npm dependency policy, and the five-platform inference known-answer matrix.
+It also refuses a superseded preflight run/attempt immediately before each
+artifact download and again before immutable publication.
 That one new release must contain the CLI/headless and desktop artifacts,
 installer, updater manifest/signature, owner-signed `SHA256SUMS` plus
 `SHA256SUMS.sig`, seeds, and genesis from the same commit and version. The
 signed manifest header binds repository, tag, and commit. The publication gate
 cryptographically verifies its signature and all
 four updater payloads against the public key embedded in that exact commit.
-Test Linux x86_64 in clean Ubuntu 24.04 and 26.04 containers with `DISPLAY`
-unset. Test Intel macOS with the headless x86_64 artifact. Confirm that
-update/install tests preserve node identity and roll back the entire failed
-replacement.
+Test Linux x86_64 in clean Ubuntu 22.04, 24.04, and 26.04 containers with
+`DISPLAY` unset. Test Linux ARM64 in clean Ubuntu 24.04 and 26.04 environments
+with `DISPLAY` unset. Test Intel macOS with the headless x86_64 artifact.
+Confirm that update/install tests preserve node identity and roll back the
+entire failed replacement.
 
 Run the release against an isolated six-validator v3 network loaded from the
 approved public manifest. Require:
@@ -399,11 +620,34 @@ lower quorum.
    zero-signal reboot path. The controlled
    30M has now been removed from the sealed 40M source set, leaving at most 10M
    of that set available; record external dynamic identities as untrusted
-   forks rather than claiming a global legacy halt.
+   forks rather than claiming a global legacy halt. Require `capture` to seal
+   the mode-0400 `arc.validator-vault.offline-stop-evidence.v2` receipt and
+   sidecar: all six fixed node-to-host identities, exact `stop.complete` and
+`stop.files.sha256` roots, hash-pinned helper, and full stopped-status
+argv/output hashes must verify before any new validator key is installed.
+   Treat that local receipt and its mode bits as integrity only, never as proof
+   of origin. Prearchive additionally requires an operator-reviewed mode-0400
+   known-hosts file containing one unique Ed25519 key for each exact fixed IP
+   and one explicit mode-0400 SSH identity. The protected builder must generate
+   a fresh random challenge and, through absolute root-owned `/usr/bin/ssh`
+   with empty config/environment and agents/proxies/forwarding/passwords
+   disabled, re-run the hash-pinned helper on all six hosts in parallel. Each
+   canonical response binds the source commit, freeze/capture, helper, node/IP,
+   legacy address/stake, challenge, and freshly re-derived stop tree roots. A
+   missing host, host-key mismatch, replay, root mismatch, run over 120 seconds,
+   or receipt older than 300 seconds fails before prearchive creation.
+   The verifier's local Python is the exact normalized non-symlink
+   `freeze_plan.operator_python_path` and is hash-bound before use. On Ubuntu,
+   export its versioned target (for example `/usr/bin/python3.12`), never the
+   usual `/usr/bin/python3` symlink; every parent must be root-owned and
+   non-writable. No
+   GNU-only `stat -c`/`readlink -f` or caller `PATH` is part of this gate.
 4. Build and verify all six capture evidence trees and complete content indexes
    against the original fenced data directories. Preserve every source in
    place; do not discard a fork because it is not ultimately selected and do
-   not create a second full local data-tree copy.
+   not create a second full local data-tree copy. Confirm each capture inventory
+   binds the immutable pre-freeze observation root/receipt and that all three
+   outcomes remain labelled diagnostic, noncanonical, and nonreward.
 5. Use `arc-node recovery export --data-dir <reference-pair> --snapshot
    <reference-pair/state.snapshot.lz4> --legacy-validator-set
    <legacy-validator-set-40m.json> ...` to reproduce the candidate from the
@@ -413,13 +657,37 @@ lower quorum.
    The audited legacy WAL needs the explicit `--allow-unbound-legacy-wal`
    exception because it predates the genesis network hash; record that fact.
 6. Sign the accepted candidate offline with the required 5-of-6 recovery
-   quorum and seal the **prearchive** production manifest. Its
+   quorum and run `scripts/recovery/build-production-manifest.py prearchive`
+   with the exact protected-main pre-tag Linux x86_64 node/CLI/build metadata,
+   sealed freeze and public-height/offline-stop receipts, genesis/public and
+   legacy validator sets, standalone `--legacy-maintenance-evidence-bundle`,
+   `--legacy-maintenance-boundary`, and `--legacy-late-fork-source-set`
+   artifacts with their exact sidecar-bound roots, the reviewed six-host
+   known-hosts anchor and explicit
+   SSH identity, preserved snapshot/WAL, checkpoint, reviewed Caddy
+   2.11.4 binary, community reward probe, and a new private `--stage-root`.
+   The builder copies every semantic input once through no-follow descriptors,
+   fsyncs and seals the tree read-only, and only executes, reproduces, archives,
+   or deploys those staged bytes. The builder—not a hand-authored
+   draft—seals the **prearchive** production manifest and sidecar at mode 0400. Its
    `complete_sha256`, `archive_manifest_sha256`, `sha256sums_sha256`, and
    `prearchive_rollout_sha256` fields must all be 64 zeroes.
 7. Run `archive-fleet-to-drive.sh seal` in plan mode, then execute it only with
    the exact `ARC_RECOVERY_GO="GO <prearchive-rollout-sha256> FREEZE
    <freeze-plan-sha256> CAPTURE <capture-id> DEST
-   <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>"`. It
+   <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>"`.
+   First run the authoritative [hash-pinned operator environment and exact
+   seal commands](../scripts/recovery/README.md).
+   That block requires the freeze-plan's versioned non-symlink Python path,
+   exact SSH/SCP/known-hosts/identity hashes, rclone binary/config hashes, and
+   `ARC_RECOVERY_GH_PATH`, `ARC_RECOVERY_GH_SHA256`, and
+   `ARC_RECOVERY_GITHUB_LOGIN=FerrumVir`. Both plan and execute must pass the
+   exact staged `--validator-install-receipt`, staged
+   `--vault-restore-receipt`, protected `--finalization-intent`, and a distinct
+   operator-owned mode-0700 `--work-root`. The execute boundary first proves a
+   private Gist create/read-by-immutable-revision/delete canary; COMPLETE v2
+   then binds the independently stored finalization intent's Gist id, revision,
+   and content hash. It
    re-exports each stopped WAL only against that capture's own on-disk
    snapshot. A derivable pair is classified as `valid_canonical` or
    `valid_noncanonical_fork`; a missing, ambiguous, torn, or otherwise
@@ -435,9 +703,18 @@ lower quorum.
    execution; partial uploads are resumable but unusable, and every object
    named by `SHA256SUMS` and `ARCHIVE-MANIFEST.json` must be re-downloaded and
    hashed.
-9. Create the final rollout manifest by changing only the four archive roots
-   from step 6 to the verified `COMPLETE.json`, archive manifest, checksum, and
-   prearchive-manifest digests. Its canonical projection with those four fields
+9. Run `scripts/recovery/build-production-manifest.py finalize` with the sealed
+   prearchive plus separately downloaded canonical `COMPLETE.json`,
+   `ARCHIVE-MANIFEST.json` and sidecar, and `SHA256SUMS`, each accompanied by
+   its independently verified trust root, plus the exact archived
+   `drive-archive-seal-prefreeze.json` through required argument
+   `--drive-archive-seal-prefreeze`, the unique immediately-pre-upload
+   `drive-archive-seal-attempt.json` through required argument
+   `--drive-archive-seal-attempt`, and archived
+   `github-gist-write-canary.json` through required argument
+   `--github-gist-write-canary`. The finalizer creates the final
+   rollout and sidecar at mode 0400 by changing only the four archive roots
+   from step 6. Its canonical projection with those four fields
    reset to zero must hash exactly to the archived prearchive digest.
 10. Install the exact checksummed candidate and approved genesis/checkpoint on
    every host; install the host's new keyfile separately. The new release and
@@ -448,41 +725,159 @@ lower quorum.
    `ARC_RECOVERY_GO="GO <final-rollout-sha256> FREEZE
    <freeze-plan-sha256> CAPTURE <capture-id> ARCHIVE
    <verified-archive-manifest-sha256> DEST
-   <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>"`.
+   <sha256-of-exact-drive-destination> LEGACY_WAL <BOUND|UNBOUND>"`. The exact
+   executable plan and receipt-mode execute forms are:
+
+   ```bash
+   python3 scripts/recovery/recovery_rollout.py run \
+     --manifest /secure/operator/arc-recovery-final.lock.json \
+     --reward-evidence-output /secure/operator/recovery-v3.reward-evidence.json \
+     --rollback-journal /secure/operator/rollback-final-rollout
+
+   ARC_RECOVERY_GO="GO $final_rollout_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id ARCHIVE $archive_manifest_sha256 DEST $destination_sha256 LEGACY_WAL $legacy_wal_policy" \
+     python3 scripts/recovery/recovery_rollout.py run \
+       --manifest /secure/operator/arc-recovery-final.lock.json \
+       --execute \
+       --go-hash "$final_rollout_sha256" \
+       --archive-manifest-sha256 "$archive_manifest_sha256" \
+       --reward-evidence-output /secure/operator/recovery-v3.reward-evidence.json \
+       --rollback-journal /secure/operator/rollback-final-rollout
+   ```
 12. Confirm public address, keyfile source, protocol v3, genesis/checkpoint,
    binary checksum, connected authenticated stake, and advancing chain on
    every host.
-13. Seal the greatest block number exposed by any legacy public source before
-   maintenance as `chain.legacy_public_max_height` (a higher conservative
-   ceiling is allowed). Require all six to converge on the same height/hash/root
-   strictly above that number and continue advancing for the full observation
-   window. Recheck the floor after restarts and immediately before generating
-   the recovered frontend config; one missing or lagging replica keeps the app
-   and explorer in maintenance rather than showing a lower public block number.
+13. Before any frozen writer is thawed for SIGTERM, install and prove the
+   durable capture-bound maintenance fence on all six hosts. It must isolate
+   legacy RPC and P2P ingress **and** egress (including established/source-port
+   replies, TCP 9090, UDP 9091 and redirected UDP 443, IPv4/IPv6) while keeping
+   SSH, exact loopback inspection, and persistence across reboot; public ARC
+   surfaces on ports 80/3100 must be unreachable or serve proved maintenance.
+   Take stable authenticated loopback heads, stop concurrently, then run the
+   hash-pinned `arc-node recovery export` offline against each final captured
+   snapshot/WAL and bind its exact height/hash/state root. Define the official
+   six-origin cutoff as the maximum of pre-fence public observations, six
+   stable fenced heads, and six final persisted heads. Seal
+   `global_absence_claimed=false`, the exact official-origin set, late-fork
+   maintenance policy, and `continuity_safety_margin=128`; set
+   `chain.legacy_public_max_height` to cutoff plus that operational margin.
+   The margin is not a cryptographic claim that no external legacy fork exists.
+   Any independently validated higher late fork keeps v3/app/explorer in
+   maintenance and is archived without rewriting v3 history. Require all six
+   v3 nodes to converge on the same height/hash/root strictly above the sealed
+   threshold and continue advancing through restarts and final publication.
+14. In receipt mode, supply `--reward-evidence-output` before plan/preflight.
+   Submit one real one-token job, wait (with the bounded rollout poll) until all
+   six report the same `mined_success` 0x25 receipt, then submit the second.
+   Require distinct transaction hashes, job IDs, block heights, and block
+   hashes for the same worker. Each receipt must be exactly 2.5 ARC =
+   2,500,000,000 base units; all six earnings indexes must show exactly 5 ARC
+   gross in this fresh two-canary window. Because two immediate receipts are
+   not a valid rate sample, all six must report null observed rate and null
+   `projected_daily_arc`, with both reasons exactly
+   `collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries`. Any numeric
+   two-canary rate/projection fails closed. The tool then
+   writes the two identities as a create-only, mode-0444, rollout-SHA-bound
+   evidence file and checksum. Same-height/different-hash results are a fork,
+   not two blocks, and fail closed. Frontend publication may proceed with the
+   honest null projection and must not synthesize a forecast.
+15. Let the authorized rollout automatically deploy every sealed
+   `valid_noncanonical_fork`: it re-verifies the live stopped captures before
+   mutation, stages only hash-indexed evidence on that validator's local disk,
+   creates the locked `arc-archive` account, and generates the archive-only
+   systemd unit plus GET-only loopback filter and derived
+   `/legacy/<node>` TLS route. Require exact archive/validator MainPIDs,
+   loopback listeners, provenance roots, method rejection, and Pages-only CORS
+   before completion. Never mount or proxy Google Drive, and never expose
+   archive POST, WAL, P2P, consensus, or signing state. No manual template or
+   environment-file installation is part of the production sequence.
+16. Generate the recovered frontend config only after its default path fully
+   verifies and fetches the finalized Drive `ARCHIVE-MANIFEST.json`,
+   `COMPLETE.json`, and fork inventories, plus the rollout-bound two-receipt
+   evidence. (A paired mode-read-only local manifest/COMPLETE cache is an
+   optional air-gapped input, never a required handoff.) The generator derives
+   fork membership from the sealed six-node classification and URLs from
+   sealed validator origins, verifies every live provenance pin, then writes
+   create-only config bytes. Publish those exact
+   bytes in one reviewable Git commit; verify the Pages hash and all
+   provenance endpoints. Rollback by reverting only that config commit, which
+   restores maintenance without rolling back or renumbering the canonical
+   chain.
 
-Each production validator RPC must bind loopback. Configure these six explicit
-origins on every validator, each as its own repeated `--community-rpc-url`
-argument; P2P peers are not RPC discovery:
+Each production validator accepts RPC only on its rollout-derived Unix-domain
+socket. The remote unit passes `--rpc-unix` and omits `--rpc`; the manifest's
+loopback `rpc_listen` value is retained only for local rehearsal and an exact
+retired-TCP-port absence check. Configure these six explicit HTTPS origins on
+every validator, each as its own repeated `--community-rpc-url` argument; P2P
+peers are not RPC discovery:
 
 ```text
-https://149-28-32-76.nip.io
-https://140-82-16-112.nip.io
-https://136-244-109-1.nip.io
-https://104-238-171-11.nip.io
-https://202-182-107-41.nip.io
-https://149-28-153-31.nip.io
+https://149.28.32.76
+https://140.82.16.112
+https://136.244.109.1
+https://104.238.171.11
+https://202.182.107.41
+https://149.28.153.31
 ```
 
 `/community/reward_policy.configured_community_rpc_origins` reports the
 configured origin **count**, so the sealed production value is `6`; it does
-not return the URL array. The locked rollout installs a SHA-pinned Caddy TLS gateway for
-an exact IP-derived `nip.io` hostname (`sslip.io` is the resealed-manifest
-fallback), a loopback request/rate-limit filter, strict body limits, security
-headers, an exact GitHub Pages CORS origin, and a reviewed path allowlist.
-Public preflight terminates at Caddy; internal validator routes never receive
-browser CORS. Unknown paths fail closed. Raw public
-`:9090` endpoints and clear-text remote community origins are not acceptable
-frontend or validator configuration.
+not return the URL array. The locked rollout installs the SHA-pinned Caddy
+2.11.4 gateway for each exact literal public IPv4 address. Caddy requests a
+publicly trusted IP-address certificate from Let's Encrypt's production ACME
+directory using its `shortlived` profile and HTTP-01 challenge; the
+TLS-ALPN challenge is disabled. This removes any `nip.io`, `sslip.io`, or other
+shared wildcard-DNS operator from the trust and availability path. Certificate
+issuance and renewal still require the public ACME service and inbound port 80,
+and the rollout fails closed unless a fresh direct-IP handshake validates
+through the system public-CA store with hostname/IP verification, presents the
+exact validator IPv4 as its sole SAN, identifies the public Let's Encrypt
+issuer, has a total leaf lifetime <=160 hours with >=48 hours remaining, and
+returns the expected HTTPS probe response. Exact leaf/timestamp evidence is
+sealed once after all six maintenance gateways are installed but before any v3
+start, then freshly sealed again after public promotion. A service restart
+proves protected certificate-storage reuse only. The rollout does not wait
+days and does not claim to have observed renewal; continuous expiry/renewal
+monitoring is still required after handoff. The gateway also installs a request/rate-limit filter
+reachable only over a permission-sealed Unix socket, strict body limits,
+security headers, an exact GitHub Pages CORS origin,
+and a reviewed path allowlist. Public preflight terminates at Caddy; internal
+validator routes never receive browser CORS. Unknown paths fail closed. These
+origins remain candidate configuration until the coordinated cutover passes.
+Raw public `:9090` endpoints and clear-text remote community origins are not
+acceptable frontend or validator configuration.
+
+The filter security boundary is pinned to Ubuntu Noble nginx
+`1.24.0-2ubuntu7.17`, binary SHA-256
+`1f16b72bea2f44e5d04fe6cf9e3e4b0dec53a82c50c7c1533c302a8ecaeccacf`.
+It runs under the dedicated no-login `arc-rpc-filter` identity with no
+capabilities and a strict systemd sandbox. Its exact binary, package, module,
+config, preflight, and unit hashes are re-proved at each start and sealed in the
+gateway security receipt. Every proxying location—including reward approval
+and validator shard routes—uses nginx `auth_request`; stopping the interlock is
+runtime-proved to deny both classes before any v3 process starts. Generated
+Caddy configs require `admin off` and contain zero `forward_auth` handlers.
+The distribution nginx unit remains stopped/disabled and its preserved config
+is never loaded. The nginx package is not held: a replacement fails the next
+preflight/restart closed. Update it only by changing the reviewed version and
+binary pins in protected code and rerunning the security tests and receipt,
+never by an ad-hoc per-host hold/unhold or upgrade.
+
+Validator RPC, legacy archive reads, Caddy-to-filter traffic,
+filter-to-interlock checks, and filter-to-validator/archive traffic use
+separate mode-`0660` Unix sockets beneath sealed mode-`0750` runtime
+directories. The exact service identities and group memberships are proved;
+there is no production TCP origin on the former loopback filter, interlock,
+validator, or archive ports. The late-fork response schema is exactly
+`arc.recovery.legacy-late-fork-interlock-status.v2`. A healthy gate has reason
+`capture-bound-retirement-tripwire-clear`. Any retired official origin that
+answers or is inconsistent, and any observed source above the cutoff, latches
+`latched-legacy-source-incident`; an unavailable/inconsistent required
+community monitor yields `community-source-observation-unavailable`. Every
+status keeps `global_absence_claimed=false` because this is a capture-bound
+retirement tripwire, not a global absence proof. The generated frontend
+contract also pins `sourceMainCommit`, `observedCutoffHeight`, source-set hash,
+boundary hash, and tool hash, so a status from another capture or code lineage
+fails closed.
 
 If five prepared v3 validators cannot establish the approved chain, stop all
 new processes and preserve logs/data for diagnosis. Do not fall back to the

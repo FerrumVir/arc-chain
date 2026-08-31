@@ -130,7 +130,7 @@ reward_activation_must_be_a_representable_integer() {
 
 shipped_genesis_templates_are_identical_recovered_network() {
     local canonical="$REPO_ROOT/genesis.toml" template output actual_sha
-    local expected_sha=833636c0c4d87430fb891f9a843d2adcef28853659734e3179996da1dd39caaf
+    local expected_sha=8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269
 
     actual_sha="$(python3 - "$canonical" <<'PY'
 import hashlib

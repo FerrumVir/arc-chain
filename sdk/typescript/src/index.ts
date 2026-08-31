@@ -34,6 +34,7 @@ export type {
   Address,
   HexString,
   PrefixedHexString,
+  U64,
 
   // Health & Info
   HealthResponse,
@@ -60,6 +61,7 @@ export type {
   TxProof,
   TxSignature,
   FullTransaction,
+  SignedTransferTransaction,
   TxSubmitResponse,
   TxSubmitBatchResponse,
 
@@ -138,4 +140,5 @@ export type {
   BlockTxsQueryOptions,
   ContractCallOptions,
   TxSubmitPayload,
+  TransactionDomainInfo,
 } from "./types.js";

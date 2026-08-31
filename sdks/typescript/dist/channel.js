@@ -15,6 +15,11 @@
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Channel = exports.ChannelState = void 0;
+function assertSafeU64Number(value, fieldName) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+        throw new RangeError(`${fieldName} must be a non-negative safe integer`);
+    }
+}
 /** Channel lifecycle states. */
 var ChannelState;
 (function (ChannelState) {
@@ -35,6 +40,7 @@ class Channel {
         this.state = ChannelState.Opening;
         this.nonce = 0;
         this.history = [];
+        assertSafeU64Number(totalDeposit, 'totalDeposit');
         this.channelId = channelId;
         this.role = role;
         this.totalDeposit = totalDeposit;
@@ -70,6 +76,7 @@ class Channel {
         if (this.state !== ChannelState.Open) {
             throw new Error(`Cannot pay: channel is ${this.state}`);
         }
+        assertSafeU64Number(amount, 'amount');
         if (amount > this.myBalance()) {
             throw new Error(`Insufficient balance: have ${this.myBalance()}, need ${amount}`);
         }
@@ -82,6 +89,8 @@ class Channel {
             newOpener = this.openerBalance + amount;
             newCounter = this.counterpartyBalance - amount;
         }
+        assertSafeU64Number(newOpener, 'openerBalance');
+        assertSafeU64Number(newCounter, 'counterpartyBalance');
         return this.proposeState(newOpener, newCounter);
     }
     /** Propose a new state with arbitrary balances. */
@@ -89,10 +98,14 @@ class Channel {
         if (this.state !== ChannelState.Open) {
             throw new Error(`Cannot propose: channel is ${this.state}`);
         }
-        if (openerBalance + counterpartyBalance !== this.totalDeposit) {
+        assertSafeU64Number(openerBalance, 'openerBalance');
+        assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
+        if (BigInt(openerBalance) + BigInt(counterpartyBalance) !==
+            BigInt(this.totalDeposit)) {
             throw new Error(`Conservation violated: ${openerBalance} + ${counterpartyBalance} != ${this.totalDeposit}`);
         }
         const newNonce = this.nonce + 1;
+        assertSafeU64Number(newNonce, 'nonce');
         const commitment = {
             channelId: this.channelId,
             nonce: newNonce,
@@ -114,10 +127,14 @@ class Channel {
         if (commitment.channelId !== this.channelId) {
             throw new Error('Channel ID mismatch');
         }
+        assertSafeU64Number(commitment.nonce, 'nonce');
+        assertSafeU64Number(commitment.openerBalance, 'openerBalance');
+        assertSafeU64Number(commitment.counterpartyBalance, 'counterpartyBalance');
         if (commitment.nonce <= this.nonce) {
             throw new Error(`Nonce must increase: got ${commitment.nonce}, current ${this.nonce}`);
         }
-        if (commitment.openerBalance + commitment.counterpartyBalance !== this.totalDeposit) {
+        if (BigInt(commitment.openerBalance) + BigInt(commitment.counterpartyBalance) !==
+            BigInt(this.totalDeposit)) {
             throw new Error('Conservation violated');
         }
         // In a full implementation, verify proposer's Ed25519 signature here.
@@ -136,6 +153,13 @@ class Channel {
     finalizeState(commitment) {
         if (!commitment.acceptorSig) {
             throw new Error('Commitment not fully signed');
+        }
+        assertSafeU64Number(commitment.nonce, 'nonce');
+        assertSafeU64Number(commitment.openerBalance, 'openerBalance');
+        assertSafeU64Number(commitment.counterpartyBalance, 'counterpartyBalance');
+        if (BigInt(commitment.openerBalance) + BigInt(commitment.counterpartyBalance) !==
+            BigInt(this.totalDeposit)) {
+            throw new Error('Conservation violated');
         }
         this.nonce = commitment.nonce;
         this.openerBalance = commitment.openerBalance;
@@ -171,6 +195,8 @@ class Channel {
     }
     /** Build a ChannelOpen transaction body. */
     static buildOpenBody(channelId, counterparty, deposit, timeoutBlocks = 100) {
+        assertSafeU64Number(deposit, 'deposit');
+        assertSafeU64Number(timeoutBlocks, 'timeoutBlocks');
         return {
             type: 'ChannelOpen',
             channel_id: channelId,
@@ -181,6 +207,9 @@ class Channel {
     }
     /** Build a ChannelClose transaction body. */
     static buildCloseBody(channelId, openerBalance, counterpartyBalance, counterpartySig, stateNonce) {
+        assertSafeU64Number(openerBalance, 'openerBalance');
+        assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
+        assertSafeU64Number(stateNonce, 'stateNonce');
         return {
             type: 'ChannelClose',
             channel_id: channelId,
@@ -192,6 +221,10 @@ class Channel {
     }
     /** Build a ChannelDispute transaction body. */
     static buildDisputeBody(channelId, openerBalance, counterpartyBalance, otherPartySig, stateNonce, challengePeriod = 100) {
+        assertSafeU64Number(openerBalance, 'openerBalance');
+        assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
+        assertSafeU64Number(stateNonce, 'stateNonce');
+        assertSafeU64Number(challengePeriod, 'challengePeriod');
         return {
             type: 'ChannelDispute',
             channel_id: channelId,

@@ -1,0 +1,420 @@
+name: One-shot validator vault rewrap
+
+run-name: Rewrap validator vault at ${{ inputs.expected_main_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: Full protected-main SHA whose reviewed workflow is authorized to handle the vault
+        required: true
+        type: string
+      expected_ciphertext_sha256:
+        description: SHA-256 of the retained passphrase-encrypted validator vault
+        required: true
+        type: string
+      expected_restore_cert_sha256:
+        description: SHA-256 of the operator-supplied public CMS restore certificate PEM
+        required: true
+        type: string
+      confirmation:
+        description: Type REWRAP ARC VALIDATOR VAULT followed by one space and expected_main_sha
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-shot-validator-vault-rewrap
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: authorize exact-main vault rewrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.authorize.outputs.sha }}
+      ciphertext_sha256: ${{ steps.authorize.outputs.ciphertext_sha256 }}
+      restore_cert_sha256: ${{ steps.authorize.outputs.restore_cert_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: authorize
+        name: Require exact protected main and typed one-shot authorization
+        shell: bash
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          EXPECTED_CIPHERTEXT_SHA256: ${{ inputs.expected_ciphertext_sha256 }}
+          EXPECTED_RESTORE_CERT_SHA256: ${{ inputs.expected_restore_cert_sha256 }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -Eeuo pipefail
+          [ "$GITHUB_REPOSITORY" = FerrumVir/arc-chain ]
+          [ "$DISPATCH_REF" = refs/heads/main ] || {
+            echo "::error::Dispatch the one-shot rewrap only from protected main."
+            exit 1
+          }
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [ "$EXPECTED_MAIN_SHA" = "$DISPATCH_SHA" ] || {
+            echo "::error::Typed expected_main_sha does not match the dispatched commit."
+            exit 1
+          }
+          [ "$EXPECTED_CIPHERTEXT_SHA256" = bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9 ] || {
+            echo "::error::Typed source ciphertext SHA-256 is not the retained validator vault."
+            exit 1
+          }
+          [ "$EXPECTED_RESTORE_CERT_SHA256" = 6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43 ] || {
+            echo "::error::Typed restore-certificate SHA-256 is not the approved operator certificate."
+            exit 1
+          }
+          [ "$CONFIRMATION" = "REWRAP ARC VALIDATOR VAULT $EXPECTED_MAIN_SHA" ] || {
+            echo "::error::Explicit one-shot confirmation phrase does not match the expected main SHA."
+            exit 1
+          }
+
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_MAIN_SHA" ]
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_MAIN_SHA" ] || {
+            echo "::error::Protected main moved before authorization. Dispatch again."
+            exit 1
+          }
+          {
+            echo "sha=$EXPECTED_MAIN_SHA"
+            echo "ciphertext_sha256=$EXPECTED_CIPHERTEXT_SHA256"
+            echo "restore_cert_sha256=$EXPECTED_RESTORE_CERT_SHA256"
+          } >> "$GITHUB_OUTPUT"
+
+  rewrap:
+    name: rewrap validator vault for operator restore
+    needs: authorize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      # This protected job never checks out repository content. A compromised
+      # source helper therefore cannot persist and observe the later key window.
+      - name: Reconfirm exact protected main before exposing secrets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN_SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          [ "$GITHUB_REPOSITORY" = FerrumVir/arc-chain ]
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          remote_main_sha="$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          [ "$remote_main_sha" = "$EXPECTED_MAIN_SHA" ] || {
+            echo "::error::Protected main moved while waiting for release-environment approval."
+            exit 1
+          }
+
+      - id: rewrap
+        name: Inline-decrypt, metadata-validate, and public-key rewrap
+        shell: bash
+        env:
+          EXPECTED_MAIN_SHA: ${{ needs.authorize.outputs.sha }}
+          EXPECTED_CIPHERTEXT_SHA256: ${{ needs.authorize.outputs.ciphertext_sha256 }}
+          EXPECTED_RESTORE_CERT_SHA256: ${{ needs.authorize.outputs.restore_cert_sha256 }}
+          ARC_VALIDATOR_VAULT_CIPHERTEXT_B64: ${{ secrets.ARC_VALIDATOR_VAULT_CIPHERTEXT_B64 }}
+          ARC_VALIDATOR_VAULT_PASSPHRASE: ${{ secrets.ARC_VALIDATOR_VAULT_PASSPHRASE }}
+          ARC_VALIDATOR_VAULT_RESTORE_CERT_B64: ${{ secrets.ARC_VALIDATOR_VAULT_RESTORE_CERT_B64 }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set +x
+          set -Eeuo pipefail
+          umask 077
+          ulimit -c 0
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH PYTHONHOME PYTHONPATH LD_PRELOAD \
+            LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB NODE_OPTIONS NODE_PATH \
+            OPENSSL_CONF OPENSSL_MODULES GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+            GIT_CONFIG_NOSYSTEM SSH_AUTH_SOCK SSH_SK_PROVIDER
+
+          [ -n "${ARC_VALIDATOR_VAULT_CIPHERTEXT_B64:-}" ] || {
+            echo "::error::ARC_VALIDATOR_VAULT_CIPHERTEXT_B64 is unavailable."
+            exit 1
+          }
+          [ -n "${ARC_VALIDATOR_VAULT_PASSPHRASE:-}" ] || {
+            echo "::error::ARC_VALIDATOR_VAULT_PASSPHRASE is unavailable."
+            exit 1
+          }
+          [ -n "${ARC_VALIDATOR_VAULT_RESTORE_CERT_B64:-}" ] || {
+            echo "::error::ARC_VALIDATOR_VAULT_RESTORE_CERT_B64 is unavailable."
+            exit 1
+          }
+
+          input_dir="$(/usr/bin/mktemp -d "$RUNNER_TEMP/arc-validator-vault-input.XXXXXXXX")"
+          work_dir="$(/usr/bin/mktemp -d "$RUNNER_TEMP/arc-validator-vault-work.XXXXXXXX")"
+          output_dir="$(/usr/bin/mktemp -d "$RUNNER_TEMP/arc-validator-vault-output.XXXXXXXX")"
+          source_ciphertext="$input_dir/arc-validator-keys-v0.8.0.tar.enc"
+          restore_cert="$input_dir/operator-restore.cert.pem"
+          cms_output="$output_dir/arc-validator-keys-v0.8.0.tar.cms"
+          plain_tar="$work_dir/validator-vault.tar"
+          candidate_cms="$work_dir/validator-vault.tar.cms"
+          keep_output=false
+          clear_secret_material() {
+            unset ARC_VALIDATOR_VAULT_CIPHERTEXT_B64
+            unset ARC_VALIDATOR_VAULT_PASSPHRASE
+            unset ARC_VALIDATOR_VAULT_RESTORE_CERT_B64
+            if [ -d "$input_dir" ] && [ ! -L "$input_dir" ]; then
+              /usr/bin/find "$input_dir" -xdev -type f -exec /usr/bin/shred -u -z -n 1 -- {} + \
+                >/dev/null 2>&1 || true
+              /usr/bin/rmdir "$input_dir" >/dev/null 2>&1 || true
+            fi
+            if [ -d "$work_dir" ] && [ ! -L "$work_dir" ]; then
+              /usr/bin/find "$work_dir" -xdev -type f -exec /usr/bin/shred -u -z -n 1 -- {} + \
+                >/dev/null 2>&1 || true
+              /usr/bin/rmdir "$work_dir" >/dev/null 2>&1 || true
+            fi
+          }
+          cleanup() {
+            local status="$?"
+            trap - EXIT
+            clear_secret_material
+            if [ "$keep_output" != true ] \
+              && [ -d "$output_dir" ] && [ ! -L "$output_dir" ]; then
+              /usr/bin/find "$output_dir" -xdev -type f -exec /usr/bin/shred -u -z -n 1 -- {} + \
+                >/dev/null 2>&1 || true
+              /usr/bin/rmdir "$output_dir" >/dev/null 2>&1 || true
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' HUP INT TERM
+
+          /usr/bin/printf '%s' "$ARC_VALIDATOR_VAULT_CIPHERTEXT_B64" \
+            | /usr/bin/base64 --decode > "$source_ciphertext" \
+            || { echo "::error::Validator-vault ciphertext secret is not valid base64."; exit 1; }
+          /usr/bin/printf '%s' "$ARC_VALIDATOR_VAULT_RESTORE_CERT_B64" \
+            | /usr/bin/base64 --decode > "$restore_cert" \
+            || { echo "::error::Restore-certificate secret is not valid base64."; exit 1; }
+          unset ARC_VALIDATOR_VAULT_CIPHERTEXT_B64
+          unset ARC_VALIDATOR_VAULT_RESTORE_CERT_B64
+          /usr/bin/chmod 600 "$source_ciphertext" "$restore_cert"
+          source_row="$(/usr/bin/sha256sum "$source_ciphertext")"
+          cert_row="$(/usr/bin/sha256sum "$restore_cert")"
+          [ "${source_row%% *}" = "$EXPECTED_CIPHERTEXT_SHA256" ]
+          [ "${cert_row%% *}" = "$EXPECTED_RESTORE_CERT_SHA256" ]
+          [ "$(/usr/bin/grep -c '^-----BEGIN CERTIFICATE-----$' "$restore_cert" || true)" -eq 1 ]
+          [ "$(/usr/bin/grep -c '^-----END CERTIFICATE-----$' "$restore_cert" || true)" -eq 1 ]
+          if /usr/bin/grep -Eq -- '-----BEGIN .*PRIVATE KEY-----' "$restore_cert"; then
+            echo "::error::Restore certificate unexpectedly contains private-key material."
+            exit 1
+          fi
+
+          cert_text="$work_dir/certificate.txt"
+          key_usage="$work_dir/key-usage.txt"
+          extended_usage="$work_dir/extended-key-usage.txt"
+          /usr/bin/openssl x509 -in "$restore_cert" -noout -text > "$cert_text" 2>/dev/null
+          /usr/bin/openssl verify -purpose any -CAfile "$restore_cert" "$restore_cert" >/dev/null 2>&1
+          /usr/bin/openssl x509 -in "$restore_cert" -checkend 86400 -noout >/dev/null 2>&1
+          /usr/bin/grep -Fq 'Public Key Algorithm: rsaEncryption' "$cert_text"
+          rsa_bits="$(/usr/bin/sed -n 's/.*Public-Key: (\([0-9][0-9]*\) bit).*/\1/p' "$cert_text")"
+          [[ "$rsa_bits" =~ ^[0-9]+$ ]] && [ "$rsa_bits" -ge 3072 ]
+          /usr/bin/openssl x509 -in "$restore_cert" -noout -ext keyUsage > "$key_usage" 2>/dev/null
+          if [ -s "$key_usage" ] \
+            && ! /usr/bin/grep -Eq 'Key Encipherment|Data Encipherment|Key Agreement' "$key_usage"; then
+            echo "::error::Restore certificate key usage does not permit encryption."
+            exit 1
+          fi
+          /usr/bin/openssl x509 -in "$restore_cert" -noout -ext extendedKeyUsage > "$extended_usage" 2>/dev/null
+          if [ -s "$extended_usage" ] \
+            && ! /usr/bin/grep -Eq 'E-mail Protection|Any Extended Key Usage' "$extended_usage"; then
+            echo "::error::Restore certificate extended usage does not permit CMS."
+            exit 1
+          fi
+
+          passphrase="$ARC_VALIDATOR_VAULT_PASSPHRASE"
+          unset ARC_VALIDATOR_VAULT_PASSPHRASE
+          [ "${#passphrase}" -ge 32 ]
+          if ! /usr/bin/printf '%s' "$passphrase" | /usr/bin/openssl enc -d \
+            -aes-256-cbc -pbkdf2 -iter 600000 -md sha256 -pass stdin \
+            -in "$source_ciphertext" -out "$plain_tar" 2>/dev/null; then
+            unset passphrase
+            echo "::error::Exact-profile validator-vault decryption failed."
+            exit 1
+          fi
+          unset passphrase
+          /usr/bin/chmod 600 "$plain_tar"
+
+          # Isolated stdlib code validates metadata only. There is no checkout,
+          # import path, extraction, member read, or source-generated executable.
+          /usr/bin/python3 -I - "$plain_tar" <<'PY'
+          import pathlib, stat, sys, tarfile
+          from pathlib import PurePosixPath
+          path = pathlib.Path(sys.argv[1])
+          info = path.lstat()
+          if path.is_symlink() or not stat.S_ISREG(info.st_mode) or \
+             not 0 < info.st_size <= 1024 * 1024 or info.st_size % 512:
+              raise SystemExit("decrypted archive is outside the bounded plain-tar contract")
+          names, folded = set(), set()
+          count = total = 0
+          try:
+              with tarfile.open(path, mode="r:") as archive:
+                  members = archive.getmembers()
+                  if not 0 < len(members) <= 64:
+                      raise ValueError("member count")
+                  for member in members:
+                      name = member.name
+                      pure = PurePosixPath(name)
+                      if not name or len(name.encode("utf-8", "strict")) > 192 or \
+                         any(ord(c) < 32 or ord(c) == 127 for c in name) or \
+                         pure.is_absolute() or "\\" in name or ":" in name or \
+                         any(part in ("", ".", "..") for part in pure.parts) or len(pure.parts) > 4:
+                          raise ValueError("unsafe member path")
+                      normalized = pure.as_posix()
+                      if normalized in names or normalized.casefold() in folded:
+                          raise ValueError("duplicate member path")
+                      names.add(normalized); folded.add(normalized.casefold())
+                      if {"path", "linkpath", "size", "GNU.sparse.map", "GNU.sparse.name", "GNU.sparse.realsize"}.intersection(member.pax_headers):
+                          raise ValueError("path/size-changing PAX metadata")
+                      if member.isdir():
+                          if member.mode & 0o7777 not in (0o500, 0o700):
+                              raise ValueError("non-private directory")
+                          continue
+                      if not member.isfile() or member.issym() or member.islnk() or member.issparse():
+                          raise ValueError("non-regular vault member")
+                      if not 0 < member.size <= 128 * 1024 or member.mode & 0o7777 not in (0o400, 0o600):
+                          raise ValueError("unbounded or non-private vault member")
+                      count += 1; total += member.size
+                      if total > 512 * 1024:
+                          raise ValueError("aggregate size")
+          except (OSError, UnicodeError, tarfile.TarError, ValueError) as error:
+              raise SystemExit(f"validator vault metadata validation failed: {type(error).__name__}")
+          if count < 6:
+              raise SystemExit("validator vault contains fewer than six private files")
+          PY
+
+          /usr/bin/openssl cms -encrypt -binary -outform DER -aes-256-gcm \
+            -recip "$restore_cert" -keyopt rsa_padding_mode:oaep \
+            -keyopt rsa_oaep_md:sha256 -in "$plain_tar" -out "$candidate_cms" 2>/dev/null
+          [ -s "$candidate_cms" ] && [ ! -L "$candidate_cms" ]
+          /usr/bin/chmod 600 "$candidate_cms"
+          /usr/bin/ln -- "$candidate_cms" "$cms_output"
+          /usr/bin/unlink "$candidate_cms"
+
+          # No plaintext, passphrase, source ciphertext, or certificate remains
+          # when post-rewrap inspection and network-bound steps begin.
+          clear_secret_material
+          cms_text="$RUNNER_TEMP/arc-validator-vault-cms-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.txt"
+          /usr/bin/openssl cms -cmsout -inform DER -in "$cms_output" -print -noout \
+            > "$cms_text" 2>/dev/null
+          /usr/bin/grep -Fq 'algorithm: rsaesOaep' "$cms_text"
+          /usr/bin/grep -Fq 'algorithm: aes-256-gcm' "$cms_text"
+          [ "$(/usr/bin/grep -Fc 'OBJECT            :sha256' "$cms_text")" -ge 2 ]
+          /usr/bin/shred -u -- "$cms_text"
+
+          cms_row="$(/usr/bin/sha256sum "$cms_output")"
+          cms_sha256="${cms_row%% *}"
+          [[ "$cms_sha256" =~ ^[0-9a-f]{64}$ ]]
+          /usr/bin/jq -n \
+            --arg schema arc.validator-vault-rewrap.v1 \
+            --arg source_commit "$EXPECTED_MAIN_SHA" \
+            --arg source_ciphertext_sha256 "$EXPECTED_CIPHERTEXT_SHA256" \
+            --arg restore_cert_sha256 "$EXPECTED_RESTORE_CERT_SHA256" \
+            --arg cms_sha256 "$cms_sha256" \
+            --arg key_transport RSA-OAEP-SHA256 \
+            --arg content_encryption AES-256-GCM \
+            '{
+              schema: $schema,
+              source_commit: $source_commit,
+              source_ciphertext_sha256: $source_ciphertext_sha256,
+              restore_cert_sha256: $restore_cert_sha256,
+              cms_sha256: $cms_sha256,
+              key_transport: $key_transport,
+              content_encryption: $content_encryption
+            }' > "$output_dir/REWRAP-RECEIPT.json"
+          /usr/bin/printf '%s  %s\n' "$cms_sha256" \
+            arc-validator-keys-v0.8.0.tar.cms > "$output_dir/SHA256SUMS"
+          /usr/bin/chmod 600 "$output_dir/REWRAP-RECEIPT.json" "$output_dir/SHA256SUMS"
+
+          artifact_name="arc-validator-vault-rewrap-$EXPECTED_MAIN_SHA-$EXPECTED_RESTORE_CERT_SHA256-$cms_sha256"
+          {
+            echo "output_dir=$output_dir"
+            echo "artifact_name=$artifact_name"
+            echo "cms_sha256=$cms_sha256"
+          } >> "$GITHUB_OUTPUT"
+          keep_output=true
+
+      - name: Reconfirm protected main after every secret and plaintext is gone
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MAIN_SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          remote_main_sha="$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          [ "$remote_main_sha" = "$EXPECTED_MAIN_SHA" ] || {
+            echo "::error::Protected main moved during rewrap; encrypted output will be discarded."
+            exit 1
+          }
+
+      - id: upload
+        name: Upload one-day encrypted operator restore artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.rewrap.outputs.artifact_name }}
+          path: |
+            ${{ steps.rewrap.outputs.output_dir }}/arc-validator-keys-v0.8.0.tar.cms
+            ${{ steps.rewrap.outputs.output_dir }}/REWRAP-RECEIPT.json
+            ${{ steps.rewrap.outputs.output_dir }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Record encrypted-artifact receipt
+        shell: bash
+        env:
+          EXPECTED_MAIN_SHA: ${{ needs.authorize.outputs.sha }}
+          SOURCE_CIPHERTEXT_SHA256: ${{ needs.authorize.outputs.ciphertext_sha256 }}
+          RESTORE_CERT_SHA256: ${{ needs.authorize.outputs.restore_cert_sha256 }}
+          CMS_SHA256: ${{ steps.rewrap.outputs.cms_sha256 }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          {
+            echo '## One-shot validator vault rewrap'
+            echo
+            echo "Source commit: \`$EXPECTED_MAIN_SHA\`"
+            echo "Source ciphertext SHA-256: \`$SOURCE_CIPHERTEXT_SHA256\`"
+            echo "Restore certificate SHA-256: \`$RESTORE_CERT_SHA256\`"
+            echo "CMS ciphertext SHA-256: \`$CMS_SHA256\`"
+            echo "Actions artifact ID: \`$ARTIFACT_ID\`"
+            echo "Actions artifact digest: \`$ARTIFACT_DIGEST\`"
+            echo 'Retention: one day. Download into the operator-controlled private-key host before expiry.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove runner copy of the encrypted restore artifact
+        if: always() && steps.rewrap.outputs.output_dir != ''
+        shell: bash
+        env:
+          OUTPUT_DIR: ${{ steps.rewrap.outputs.output_dir }}
+        run: |
+          set +x
+          set -Eeuo pipefail
+          case "$OUTPUT_DIR" in
+            "$RUNNER_TEMP"/arc-validator-vault-output.*) ;;
+            *) echo "::error::Refusing cleanup outside the exact runner-temp output namespace."; exit 1 ;;
+          esac
+          [ -d "$OUTPUT_DIR" ] && [ ! -L "$OUTPUT_DIR" ]
+          find "$OUTPUT_DIR" -xdev -type f -exec shred -u -z -n 1 -- {} +
+          rmdir "$OUTPUT_DIR"

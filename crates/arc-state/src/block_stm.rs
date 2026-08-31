@@ -100,6 +100,13 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
                 .0,
             );
             accounts.insert(
+                arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                    &body.chain_domain,
+                    &body.job_id,
+                )
+                .0,
+            );
+            accounts.insert(
                 arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
                     &body.chain_domain,
                     &body.worker,
@@ -107,6 +114,28 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
                 )
                 .0,
             );
+            accounts.insert(
+                arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                    &body.chain_domain,
+                    &body.worker,
+                    &body.worker_certificate.attestation_hash,
+                )
+                .0,
+            );
+            if let Some(marker) =
+                arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                    &body.chain_domain,
+                    &body.assignment_epoch,
+                )
+            {
+                accounts.insert(marker.0);
+            }
+            if let Some(marker) = arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
+            ) {
+                accounts.insert(marker.0);
+            }
         }
         TxBody::InferenceChallenge(body) => {
             // Competing challenges for one attestation mutate the same escrow.
@@ -178,6 +207,9 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
             accounts
                 .insert(arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient).0);
+            accounts.insert(
+                arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient).0,
+            );
             accounts.insert(validator_set_access_key());
         }
         TxBody::InferenceRequest(body) => {

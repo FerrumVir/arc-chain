@@ -7,8 +7,9 @@
 //!
 //! Also benchmarks GPU Ed25519 verification vs CPU.
 
+mod ephemeral_keys;
+
 use arc_crypto::Hash256;
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_node::pipeline::{ExecutionMode, Pipeline, PipelineBatch, PipelineConfig, VerifyMode};
 use arc_state::StateDB;
 use arc_types::Transaction;
@@ -50,11 +51,9 @@ fn presign_transactions(
     sender_count: u8,
     total_txs: usize,
 ) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
-    let keypairs: Vec<_> = (0..sender_count)
-        .map(|i| (benchmark_keypair(i), benchmark_address(i)))
-        .collect();
+    let keypairs = ephemeral_keys::signing_keypairs(sender_count as usize);
 
-    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
+    let receivers = ephemeral_keys::addresses(56);
 
     let mut genesis: Vec<(Hash256, u64)> = keypairs
         .iter()
@@ -75,13 +74,8 @@ fn presign_transactions(
 
         let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
+        tx.sign(sk)
+            .expect("ephemeral benchmark signing must succeed");
 
         nonces[kp_idx] += 1;
         transactions.push(tx);
@@ -101,7 +95,7 @@ fn run_mode(
 ) -> (usize, Duration) {
     let state = Arc::new(StateDB::with_genesis(genesis));
     let pipeline = Pipeline::with_config(Arc::clone(&state), config);
-    let producer = benchmark_address(255);
+    let producer = genesis[0].0;
 
     let pipeline_start = Instant::now();
     let mut batches_submitted = 0usize;
@@ -146,7 +140,6 @@ fn run_mode(
 
 /// Benchmark GPU (Metal) vs CPU Ed25519 batch verification.
 fn bench_gpu_verify(count: usize) {
-    use arc_crypto::signature::benchmark_keypair;
     use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
     use ed25519_dalek::Signer;
 
@@ -159,9 +152,12 @@ fn bench_gpu_verify(count: usize) {
 
     // Generate signed messages as VerifyTasks
     let mut tasks = Vec::with_capacity(count);
+    let keypairs = (0..count.clamp(1, 200))
+        .map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng))
+        .collect::<Vec<_>>();
 
     for i in 0..count {
-        let sk = benchmark_keypair((i % 200) as u8);
+        let sk = &keypairs[i % keypairs.len()];
         let msg = format!("benchmark-message-{}", i);
         let sig = sk.sign(msg.as_bytes());
         let vk = sk.verifying_key();

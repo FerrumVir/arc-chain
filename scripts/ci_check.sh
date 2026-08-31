@@ -190,7 +190,19 @@ run_check "Explorer contract" node explorer/test-contract.mjs
 run_check "Rust formatting" ./scripts/rustfmt-workspace.sh --check
 run_check "Workspace compilation" cargo check --workspace --all-targets --locked
 run_check "Clippy" cargo clippy --workspace --all-targets --locked -- -D warnings
+run_check "Release candle clippy" \
+    cargo clippy -p arc-inference -p arc-node --all-targets --features candle --locked -- -D warnings
+run_check "Benchmark-tools clippy" \
+    cargo clippy -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked -- -D warnings
 run_check "Workspace library tests" cargo test --workspace --lib --locked
+run_check "ARC node binary shutdown and startup tests" \
+    cargo test -p arc-node --bin arc-node --locked -- --test-threads=1
+run_check "Release candle tests" \
+    cargo test -p arc-inference -p arc-node --lib --features candle --locked
+run_check "Benchmark-tools compilation" \
+    cargo check -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked
+run_check "Benchmark-tools tests" \
+    cargo test -p arc-crypto -p arc-state -p arc-node -p arc-bench --lib --bins --tests --features benchmark-tools --locked
 
 if [ "$PROFILE" = full ]; then
     run_check "Releasable-worktree secret scan" bash tests/release/current_tree_secret_scan.sh --worktree

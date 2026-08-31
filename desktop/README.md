@@ -4,11 +4,13 @@ A Tauri 2 desktop app that resolves the exact matching `arc-node` release
 binary so a user can run an ARC observer or worker from a `.dmg`, NSIS/MSI
 installer, or Linux package without a terminal.
 
-> **Release status:** the source tree is the unreleased v0.8.0 recovery
-> candidate. The public v0.7.11 desktop does not contain this full updater,
-> evidence, or node-download behavior, and the public seeds do not run v0.8.0.
-> See [`../README.md`](../README.md) before presenting a build as released,
-> deployed, synced, or reward-producing.
+> **Source-freeze release status (2026-08-31; tag-stable):** At this review
+> cutoff, the source tree was the unreleased v0.8.0 recovery candidate. Public
+> v0.7.11 did not contain this full updater, evidence, or node-download
+> behavior, and the public seeds did not run v0.8.0. This is historical status,
+> not a live probe. See [`../README.md`](../README.md) and require exact release
+> plus rollout evidence before presenting a build as released, deployed,
+> synced, or reward-producing.
 
 ## What's inside
 
@@ -102,10 +104,11 @@ npm test                # all suites, headless
 npm run test:ui         # Playwright UI mode (time-travel debugger)
 ```
 
-At this commit, `npx playwright test --list` enumerates 176 tests in 19 files,
-and `cargo test --manifest-path src-tauri/Cargo.toml -- --list` enumerates 68
-native tests. Treat those as inventory counts; a passing command is the
-evidence. The suites cover onboarding, dashboard/evidence semantics, earnings,
+At this audited tree state, `npx playwright test --list` enumerates 211 tests in
+20 files. Native test inventory is intentionally not hard-coded: run
+`cargo test --manifest-path src-tauri/Cargo.toml -- --list`, and treat only a
+successful compiling listing as evidence. The suites cover onboarding,
+dashboard/evidence semantics, earnings,
 inference, updates, peer recovery, persistence, accessibility, resilience,
 navigation, wallet behavior, and visual/screenshots contracts.
 
@@ -146,10 +149,13 @@ every Playwright test).
 - **zustand** + `localStorage` for UI-only state (route, onboarded flag)
 - **Rust `store.rs`** writes identity + config to the OS app-data dir
   (for example `~/Library/Application Support/network.arc.desktop/store.json`
-  on macOS). The recovery phrase is present because the node must sign after a
-  restart. Unix directory/file permissions are forced to `0700`/`0600`, writes
-  are atomic, and symlink destinations are refused. v0.8.0 does not yet use an
-  OS keychain, so users still need a protected offline backup.
+  on macOS). The recovery phrase is present in this native store for
+  backup/restoration and to
+  verify or recreate the persistent node keyfile; the node itself receives
+  only that keyfile path. The app-data directory and store are owner-validated
+  through open handles (`0700`/`0600` on Unix and a protected DACL on Windows),
+  writes are atomic, and symlink/reparse destinations are refused. v0.8.0 does
+  not yet use an OS keychain, so users still need a protected offline backup.
 - Frontend state is scrubbed of the recovery phrase; an explicit native IPC
   call reveals it only on the backup screen.
 

@@ -58,10 +58,12 @@ pub fn validate_rpc_origin(value: &str) -> Result<String, String> {
         "http" => {
             return Err(
                 "remote wallet RPC must use HTTPS; plaintext HTTP is local-dev only".to_string(),
-            )
+            );
         }
         _ => {
-            return Err("wallet RPC must use HTTPS (or HTTP on loopback for local dev)".to_string())
+            return Err(
+                "wallet RPC must use HTTPS (or HTTP on loopback for local dev)".to_string(),
+            );
         }
     }
     Ok(value.trim().trim_end_matches('/').to_string())
@@ -200,8 +202,7 @@ mod tests {
     use super::*;
     use crate::identity;
 
-    const PHRASE: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
     fn arc_amounts_are_exact_to_nine_decimals() {
@@ -215,8 +216,8 @@ mod tests {
     #[test]
     fn wallet_origins_reject_remote_plaintext_and_url_smuggling() {
         assert_eq!(
-            validate_rpc_origin("https://149-28-32-76.nip.io/").unwrap(),
-            "https://149-28-32-76.nip.io"
+            validate_rpc_origin("https://149.28.32.76/").unwrap(),
+            "https://149.28.32.76"
         );
         assert!(validate_rpc_origin("http://127.0.0.1:9090").is_ok());
         assert!(validate_rpc_origin("http://localhost:9090").is_ok());

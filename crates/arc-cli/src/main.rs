@@ -36,6 +36,12 @@ enum Commands {
         /// Output keyfile path
         #[arg(long, default_value = "arc-key.json")]
         output: String,
+        /// Migration only: read one protected legacy seed file and preserve its Ed25519 address
+        #[arg(long, value_name = "PATH")]
+        legacy_seed_file: Option<String>,
+        /// Validate one private keyfile and print only its public ARC address
+        #[arg(long, value_name = "PATH", conflicts_with = "legacy_seed_file")]
+        verify_keyfile: Option<String>,
     },
     /// Query account balance
     Balance {
@@ -89,7 +95,22 @@ async fn main() {
     let rpc_client = rpc::RpcClient::new(&rpc_url);
 
     let result = match cli.command {
-        Commands::Keygen { scheme, output } => keygen::run(&scheme, &output),
+        Commands::Keygen {
+            scheme,
+            output,
+            legacy_seed_file,
+            verify_keyfile,
+        } => match (legacy_seed_file, verify_keyfile) {
+            (Some(input), None) if scheme == "ed25519" => {
+                keygen::run_legacy_seed_file(&input, &output)
+            }
+            (Some(_), None) => Err(anyhow::anyhow!(
+                "--legacy-seed-file is migration-only and requires --scheme ed25519"
+            )),
+            (None, Some(path)) => keygen::run_verify_keyfile(&path),
+            (None, None) => keygen::run(&scheme, &output),
+            (Some(_), Some(_)) => unreachable!("clap rejects conflicting keygen modes"),
+        },
         Commands::Balance { address } => commands::balance::run(&rpc_client, &address).await,
         Commands::Transfer { from, to, amount } => {
             commands::transfer::run(&rpc_client, &from, &to, amount).await

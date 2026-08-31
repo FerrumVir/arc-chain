@@ -1,6 +1,8 @@
 // ─── @arc-chain/sdk - RPC Client ──────────────────────────────
 // Full-featured client for the ARC Chain native REST API.
-// Zero dependencies - uses the built-in Fetch API (Node 18+, all browsers).
+// Zero dependencies - uses the built-in Fetch API (Node 24+, modern browsers).
+import { assertU64, parseJsonWithBigInts, stringifyJsonWithBigInts, u64ToBigInt, } from "./u64.js";
+const MAX_TX_SUBMIT_BATCH_SIZE = 64;
 // ─── Error ──────────────────────────────────────────────────
 /**
  * Error thrown when an RPC request fails.
@@ -174,7 +176,10 @@ export class ArcClient {
      * @throws {ArcRpcError} 409 if transaction already exists (duplicate hash).
      */
     async submitTx(tx) {
-        return this._post("/tx/submit", tx);
+        assertSignedTransferU64Fields(tx);
+        await this._assertTransactionDomain(tx.transaction_domain);
+        const { transaction_domain: _domain, ...wire } = tx;
+        return this._post("/tx/submit", wire);
     }
     /**
      * `POST /tx/submit` - Submit a fully-formed signed transaction.
@@ -182,7 +187,22 @@ export class ArcClient {
      * Use this when you have constructed and signed the transaction yourself.
      */
     async submitSignedTx(tx) {
-        return this._post("/tx/submit", tx);
+        assertU64(tx.gas_limit, "gas_limit");
+        if (u64ToBigInt(tx.gas_limit, "gas_limit") !== 0n) {
+            throw new RangeError("gas_limit must be zero for the flat transfer RPC");
+        }
+        const signature = tx.signature.Ed25519;
+        return this.submitTx({
+            from: tx.from,
+            to: tx.body.to,
+            amount: tx.body.amount,
+            nonce: tx.nonce,
+            fee: tx.fee,
+            tx_type: "Transfer",
+            signature: signature.signature,
+            public_key: signature.public_key,
+            transaction_domain: tx.transaction_domain,
+        });
     }
     /**
      * `POST /tx/submit_batch` - Submit multiple transactions in one request.
@@ -191,9 +211,66 @@ export class ArcClient {
      * while others are rejected.
      */
     async submitTxBatch(transactions) {
+        if (transactions.length > MAX_TX_SUBMIT_BATCH_SIZE) {
+            throw new RangeError(`transaction batch exceeds the maximum of ${MAX_TX_SUBMIT_BATCH_SIZE} items`);
+        }
+        for (const tx of transactions)
+            assertSignedTransferU64Fields(tx);
+        const domain = await this.getTransactionDomain();
+        for (const tx of transactions) {
+            this._requireMatchingTransactionDomain(tx.transaction_domain, domain);
+        }
         return this._post("/tx/submit_batch", {
-            transactions,
+            transactions: transactions.map(({ transaction_domain: _domain, ...wire }) => wire),
         });
+    }
+    /**
+     * Fetch the exact transaction-signing domain advertised by the node.
+     * Legacy nodes without `/network/info` use the v1 null domain.
+     */
+    async getTransactionDomain() {
+        let value;
+        try {
+            value = await this._get("/network/info");
+        }
+        catch (error) {
+            if (error instanceof ArcRpcError && error.statusCode === 404)
+                return null;
+            throw error;
+        }
+        const raw = value.transaction_domain;
+        const recoveryActive = value.recovery_active === true;
+        const protocolMajor = Number.parseInt(String(value.protocol_version ?? "0").split(".")[0] ?? "0", 10);
+        if (raw == null) {
+            if (recoveryActive || protocolMajor >= 3) {
+                throw new Error("node requires recovery-domain signatures but omitted transaction_domain");
+            }
+            return null;
+        }
+        if (typeof raw !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+            throw new Error("node returned a malformed 32-byte transaction_domain");
+        }
+        if (/^0x0{64}$/i.test(raw)) {
+            throw new Error("node returned an all-zero transaction_domain");
+        }
+        return raw.toLowerCase();
+    }
+    async _assertTransactionDomain(signedDomain) {
+        const advertised = await this.getTransactionDomain();
+        this._requireMatchingTransactionDomain(signedDomain, advertised);
+    }
+    _requireMatchingTransactionDomain(signedDomain, advertised) {
+        let normalized = null;
+        if (signedDomain !== null) {
+            if (!/^0x[0-9a-fA-F]{64}$/.test(signedDomain) || /^0x0{64}$/i.test(signedDomain)) {
+                throw new Error("transaction signature domain must be a non-zero 32-byte 0x-prefixed hex value");
+            }
+            normalized = signedDomain.toLowerCase();
+        }
+        if (normalized !== advertised) {
+            throw new Error(`transaction signature domain mismatch: signed for ${normalized ?? "legacy-v1"}, ` +
+                `node requires ${advertised ?? "legacy-v1"}`);
+        }
     }
     // ─── Accounts ───────────────────────────────────────────
     /**
@@ -214,9 +291,7 @@ export class ArcClient {
     async getAccountTxs(address) {
         return this._get(`/account/${address}/txs`);
     }
-    /**
-     * Convenience: get account balance as a number.
-     */
+    /** Convenience: get an exact account balance (`bigint` above 2^53 - 1). */
     async getBalance(address) {
         const account = await this.getAccount(address);
         return account.balance;
@@ -255,6 +330,9 @@ export class ArcClient {
      * @param options.gasLimit - Gas limit for execution.
      */
     async callContract(address, fn, options) {
+        if (options?.gasLimit !== undefined) {
+            assertU64(options.gasLimit, "gas_limit");
+        }
         return this._post(`/contract/${address}/call`, {
             function: fn,
             calldata: options?.calldata,
@@ -449,7 +527,7 @@ export class ArcClient {
             if (!res.ok) {
                 throw new ArcRpcError(res.status, await res.text());
             }
-            return (await res.json());
+            return parseJsonWithBigInts(await res.text());
         }
         finally {
             clearTimeout(timer);
@@ -459,17 +537,18 @@ export class ArcClient {
     async _post(path, body) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeout);
+        const serializedBody = stringifyJsonWithBigInts(body);
         try {
             const res = await fetch(`${this.baseUrl}${path}`, {
                 method: "POST",
                 headers: this.headers,
-                body: JSON.stringify(body),
+                body: serializedBody,
                 signal: controller.signal,
             });
             if (!res.ok) {
                 throw new ArcRpcError(res.status, await res.text());
             }
-            return (await res.json());
+            return parseJsonWithBigInts(await res.text());
         }
         finally {
             clearTimeout(timer);
@@ -479,5 +558,10 @@ export class ArcClient {
 // ─── Helpers ────────────────────────────────────────────────
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function assertSignedTransferU64Fields(tx) {
+    assertU64(tx.amount, "amount");
+    assertU64(tx.nonce, "nonce");
+    assertU64(tx.fee, "fee");
 }
 //# sourceMappingURL=client.js.map

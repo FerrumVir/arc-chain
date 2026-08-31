@@ -64,6 +64,8 @@ _PLAN_KEYS = frozenset(
         "orchestrator_sha256",
         "rollout_tool_sha256",
         "rollout_schema_sha256",
+        "operator_python_path",
+        "operator_python_sha256",
         "source_commit",
         "legacy_validator_set_sha256",
         "writer_contracts_sha256",
@@ -1438,10 +1440,16 @@ def validate_pinned_freeze_plan(
         "orchestrator_sha256",
         "rollout_tool_sha256",
         "rollout_schema_sha256",
+        "operator_python_sha256",
         "legacy_validator_set_sha256",
         "writer_contracts_sha256",
     ):
         _require_hash(plan[field], f"freeze plan {field}")
+    operator_python_path = _require_absolute_path(
+        plan["operator_python_path"], "freeze plan operator_python_path"
+    )
+    if re.fullmatch(r"/usr/bin/python3(?:\.[0-9]+)?", operator_python_path) is None:
+        raise FreezeValidationError("freeze plan operator Python escaped /usr/bin/python3[.VERSION]")
     if not isinstance(plan["source_commit"], str) or not _COMMIT_RE.fullmatch(plan["source_commit"]):
         raise FreezeValidationError("freeze plan source_commit is malformed")
     drive = _exact_keys(plan["drive_prefreeze"], _DRIVE_KEYS, "Drive prefreeze")

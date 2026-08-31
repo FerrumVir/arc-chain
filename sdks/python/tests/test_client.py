@@ -125,6 +125,7 @@ class TestSubmitTransaction(unittest.TestCase):
     @patch("arc_sdk.client.httpx.Client")
     def test_submit_raw_tx(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
+        mock_instance.get.return_value = MockResponse({"transaction_domain": None})
         expected_hash = "de" * 32
         mock_instance.post.return_value = MockResponse(
             {
@@ -140,14 +141,31 @@ class TestSubmitTransaction(unittest.TestCase):
                 "to": "bb" * 32,
                 "amount": 100,
                 "nonce": 0,
+                "fee": 1,
+                "signature": "cc" * 64,
+                "public_key": "dd" * 32,
+                "transaction_domain": None,
             }
         )
 
         self.assertEqual(tx_hash, expected_hash)
+        mock_instance.post.assert_called_once_with(
+            "/tx/submit",
+            json={
+                "from": "aa" * 32,
+                "to": "bb" * 32,
+                "amount": 100,
+                "nonce": 0,
+                "fee": 1,
+                "signature": "cc" * 64,
+                "public_key": "dd" * 32,
+            },
+        )
 
     @patch("arc_sdk.client.httpx.Client")
     def test_submit_builder_tx(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
+        mock_instance.get.return_value = MockResponse({"transaction_domain": None})
         expected_hash = "de" * 32
         mock_instance.post.return_value = MockResponse(
             {
@@ -168,10 +186,17 @@ class TestSubmitTransaction(unittest.TestCase):
         tx_hash = client.submit_transaction(signed)
 
         self.assertEqual(tx_hash, expected_hash)
+        wire = mock_instance.post.call_args.kwargs["json"]
+        self.assertEqual(wire["fee"], signed["fee"])
+        self.assertEqual(wire["signature"], signed["signature"]["Ed25519"]["signature"])
+        self.assertEqual(wire["public_key"], signed["signature"]["Ed25519"]["public_key"])
+        self.assertNotIn("body", wire)
+        self.assertNotIn("transaction_domain", wire)
 
     @patch("arc_sdk.client.httpx.Client")
     def test_submit_conflict(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
+        mock_instance.get.return_value = MockResponse({"transaction_domain": None})
         mock_instance.post.return_value = MockResponse({}, status_code=409)
 
         client = ArcClient("http://localhost:9000")
@@ -182,8 +207,53 @@ class TestSubmitTransaction(unittest.TestCase):
                     "to": "bb" * 32,
                     "amount": 100,
                     "nonce": 0,
+                    "fee": 1,
+                    "signature": "cc" * 64,
+                    "public_key": "dd" * 32,
+                    "transaction_domain": None,
                 }
             )
+
+    @patch("arc_sdk.client.httpx.Client")
+    def test_unsigned_transfer_fails_before_post(self, MockHttpClient):
+        mock_instance = MockHttpClient.return_value
+        client = ArcClient("http://localhost:9000")
+        with self.assertRaisesRegex(ArcTransactionError, "Signed transfer requires"):
+            client.submit_transaction(
+                {
+                    "from": "aa" * 32,
+                    "to": "bb" * 32,
+                    "amount": 100,
+                    "nonce": 0,
+                }
+            )
+        mock_instance.post.assert_not_called()
+
+    @patch("arc_sdk.client.httpx.Client")
+    def test_transaction_domain_mismatch_fails_before_post(self, MockHttpClient):
+        mock_instance = MockHttpClient.return_value
+        mock_instance.get.return_value = MockResponse(
+            {
+                "protocol_version": "3.0.0",
+                "recovery_active": True,
+                "transaction_domain": "0x" + "11" * 32,
+            }
+        )
+        client = ArcClient("http://localhost:9000")
+        with self.assertRaisesRegex(ArcTransactionError, "domain mismatch"):
+            client.submit_transaction(
+                {
+                    "from": "aa" * 32,
+                    "to": "bb" * 32,
+                    "amount": 100,
+                    "nonce": 0,
+                    "fee": 1,
+                    "signature": "cc" * 64,
+                    "public_key": "dd" * 32,
+                    "transaction_domain": "0x" + "22" * 32,
+                }
+            )
+        mock_instance.post.assert_not_called()
 
 
 class TestSubmitBatch(unittest.TestCase):
@@ -192,6 +262,7 @@ class TestSubmitBatch(unittest.TestCase):
     @patch("arc_sdk.client.httpx.Client")
     def test_submit_batch_success(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
+        mock_instance.get.return_value = MockResponse({"transaction_domain": None})
         mock_instance.post.return_value = MockResponse(
             {
                 "accepted": 2,
@@ -203,8 +274,26 @@ class TestSubmitBatch(unittest.TestCase):
         client = ArcClient("http://localhost:9000")
         result = client.submit_batch(
             [
-                {"from": "11" * 32, "to": "22" * 32, "amount": 10, "nonce": 0},
-                {"from": "33" * 32, "to": "44" * 32, "amount": 20, "nonce": 0},
+                {
+                    "from": "11" * 32,
+                    "to": "22" * 32,
+                    "amount": 10,
+                    "nonce": 0,
+                    "fee": 1,
+                    "signature": "55" * 64,
+                    "public_key": "66" * 32,
+                    "transaction_domain": None,
+                },
+                {
+                    "from": "33" * 32,
+                    "to": "44" * 32,
+                    "amount": 20,
+                    "nonce": 0,
+                    "fee": 1,
+                    "signature": "77" * 64,
+                    "public_key": "88" * 32,
+                    "transaction_domain": None,
+                },
             ]
         )
 
@@ -426,6 +515,27 @@ class TestTransactionBuilder(unittest.TestCase):
         tx2 = TransactionBuilder.transfer(addr_from, addr_to, 1000, nonce=1)
         self.assertNotEqual(tx1["hash"], tx2["hash"])
 
+    def test_transfer_hash_matches_rust_v1_and_v3_contract(self):
+        from_addr = "11" * 32
+        to_addr = "22" * 32
+        v1 = TransactionBuilder.transfer(from_addr, to_addr, 7, fee=1, nonce=4)
+        v3 = TransactionBuilder.transfer(
+            from_addr,
+            to_addr,
+            7,
+            fee=1,
+            nonce=4,
+            transaction_domain="0x" + "33" * 32,
+        )
+        self.assertEqual(
+            v1["hash"],
+            "267d4e0c25020d50ae17ce254a28f9556cc086814304902a499916993cb8f05b",
+        )
+        self.assertEqual(
+            v3["hash"],
+            "5accadc1f889e29e95d2fdac38b3b0db2f76e727c8593bdddb6598c04172f522",
+        )
+
     def test_transfer_invalid_address(self):
         with self.assertRaises(ArcValidationError):
             TransactionBuilder.transfer("short", "bb" * 32, 1000)
@@ -527,6 +637,24 @@ class TestTransactionSigning(unittest.TestCase):
         _ = TransactionBuilder.sign(tx, kp)
         self.assertIsNone(tx["signature"])
         self.assertEqual(tx["signature"], original_sig)
+
+    def test_sign_recomputes_canonical_hash(self):
+        kp = KeyPair.generate()
+        tx = TransactionBuilder.transfer(
+            from_addr=kp.address(),
+            to_addr="bb" * 32,
+            amount=1000,
+        )
+        original_hash = tx["hash"]
+        tx["nonce"] = 7
+        signed = TransactionBuilder.sign(tx, kp)
+        self.assertNotEqual(signed["hash"], original_hash)
+        self.assertTrue(
+            kp.verify(
+                bytes.fromhex(signed["hash"]),
+                bytes.fromhex(signed["signature"]["Ed25519"]["signature"]),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

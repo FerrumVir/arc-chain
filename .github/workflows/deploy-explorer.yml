@@ -3,32 +3,48 @@ name: Deploy ARC public console
 on:
   push:
     branches: [main]
-    paths:
-      - 'dashboard/**'
-      - 'explorer/**'
-      - 'shared/frontend/**'
-      - 'scripts/build-public-site.sh'
-      - '.github/workflows/deploy-explorer.yml'
   workflow_dispatch:
 
 concurrency:
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build:
     name: Verify and assemble public console
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
           persist-credentials: false
+
+      - name: Bind this site candidate to current protected main
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          [ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]
+          [ "$EXPECTED_REF" = refs/heads/main ] || {
+            echo "::error::Pages may only be deployed from protected main, not $EXPECTED_REF."
+            exit 1
+          }
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" ] || {
+            echo "::error::This Pages candidate was superseded before validation began."
+            exit 1
+          }
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -72,6 +88,19 @@ jobs:
           ARC_PUBLIC_SITE_SHA: ${{ github.sha }}
         run: ./scripts/build-public-site.sh public-site
 
+      - name: Refuse a site artifact superseded while tests ran
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" ] || {
+            echo "::error::Protected main advanced while the Pages candidate was assembled."
+            exit 1
+          }
+
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
@@ -84,9 +113,46 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Final current-main gate before Pages publication
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          [ "$EXPECTED_REF" = refs/heads/main ]
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" ] || {
+            echo "::error::A newer protected-main commit superseded this Pages deployment."
+            exit 1
+          }
+
       - id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+      - name: Detect a main advance during Pages publication
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" ] || {
+            echo "::error::Protected main advanced during deployment; the newer main workflow must replace this deployment."
+            exit 1
+          }

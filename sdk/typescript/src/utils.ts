@@ -2,6 +2,9 @@
 // Address validation, hash formatting, hex encoding/decoding.
 // Pure functions with zero dependencies.
 
+import type { U64 } from "./u64.js";
+import { u64ToBigInt } from "./u64.js";
+
 /**
  * ARC Chain addresses are 64-character hex strings (32 bytes, BLAKE3).
  * No `0x` prefix on the native API.
@@ -97,7 +100,7 @@ export function formatHash(
  *
  * ARC uses 6 decimal places by default.
  *
- * @param amount - Raw balance as a number.
+ * @param amount - Raw balance as a safe number or exact bigint.
  * @param decimals - Decimal places (default 6).
  *
  * @example
@@ -106,11 +109,16 @@ export function formatHash(
  * formatArc(500);       // "0.000500"
  * ```
  */
-export function formatArc(amount: number, decimals: number = 6): string {
-  const divisor = 10 ** decimals;
-  const whole = Math.floor(amount / divisor);
-  const frac = amount % divisor;
-  return `${whole}.${String(frac).padStart(decimals, "0")}`;
+export function formatArc(amount: U64, decimals: number = 6): string {
+  if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 255) {
+    throw new RangeError("decimals must be a safe integer from 0 through 255");
+  }
+  const exact = u64ToBigInt(amount, "amount");
+  const divisor = 10n ** BigInt(decimals);
+  const whole = exact / divisor;
+  if (decimals === 0) return whole.toString(10);
+  const fraction = (exact % divisor).toString(10).padStart(decimals, "0");
+  return `${whole}.${fraction}`;
 }
 
 // ─── Hex Encoding ───────────────────────────────────────────

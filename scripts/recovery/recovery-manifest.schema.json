@@ -18,26 +18,164 @@
     {
       "if": { "properties": { "mode": { "const": "production" } }, "required": ["mode"] },
       "then": {
-        "required": ["archive"],
+        "required": ["archive", "provenance"],
         "properties": {
+          "chain": {
+            "required": [
+              "legacy_maintenance_evidence_bundle_sha256",
+              "legacy_maintenance_boundary_sha256",
+              "legacy_late_fork_source_set_sha256",
+              "legacy_observed_cutoff_height",
+              "legacy_continuity_safety_margin",
+              "legacy_global_absence_claimed",
+              "legacy_official_origins",
+              "legacy_reopening_policy",
+              "legacy_late_fork_circuit",
+              "legacy_quarantine_threat_model"
+            ]
+          },
+          "artifacts": {
+            "required": [
+              "binary", "cli", "build_metadata", "pretag_artifact_input_set",
+              "pretag_initial_live_provenance_set", "production_input_stage_manifest",
+              "validator_vault_restore_receipt", "validator_key_install_receipt",
+              "pretag_raw_headless_linux_x86_64", "pretag_raw_headless_linux_arm64",
+              "pretag_raw_headless_macos_arm64", "pretag_raw_headless_macos_x86_64",
+              "pretag_raw_headless_windows_x86_64", "pretag_raw_desktop_linux_x86_64",
+              "pretag_raw_desktop_macos_arm64", "pretag_raw_desktop_macos_x86_64",
+              "pretag_raw_desktop_windows_x86_64", "genesis",
+              "validator_public_keys", "legacy_public_height_receipt",
+              "legacy_maintenance_evidence_bundle", "legacy_maintenance_evidence_bundle_sidecar",
+              "legacy_maintenance_boundary", "legacy_maintenance_boundary_sidecar",
+              "legacy_late_fork_source_set", "legacy_late_fork_source_set_sidecar",
+              "legacy_late_fork_interlock_tool",
+              "offline_stop_evidence", "offline_stop_evidence_sidecar",
+              "ssh_known_hosts", "reward_probe", "checkpoint", "legacy_validator_set",
+              "source_snapshot", "source_wal", "caddy"
+            ]
+          },
           "validators": {
             "items": {
               "required": [
                 "host", "ssh_user", "remote_root", "service_user", "service_name",
-                "public_hostname", "model_path", "model_sha256", "model_size_bytes",
+                "model_path", "model_sha256", "model_size_bytes",
                 "shard_ranges"
-              ]
+              ],
+              "properties": {
+                "remote_root": { "const": "/opt/arc/recovery-v3" }
+              }
             }
           }
         }
       },
-      "else": { "not": { "required": ["archive"] } }
+      "else": {
+        "not": {
+          "anyOf": [
+            { "required": ["archive"] },
+            { "required": ["provenance"] }
+          ]
+        }
+      }
     }
   ],
   "properties": {
     "schema": { "const": "arc.recovery.rollout.v1" },
     "rollout_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
     "mode": { "enum": ["local", "production"] },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_main_commit",
+        "pretag_repository",
+        "pretag_version",
+        "pretag_workflow_run_id",
+        "pretag_workflow_run_attempt",
+        "protected_pretag_artifact",
+        "production_input_stage_manifest_sha256",
+        "validator_key_receipt_chain",
+        "validator_installed_key_proof",
+        "freeze_plan_sidecar_sha256",
+        "offline_stop_verification"
+      ],
+      "properties": {
+        "source_main_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "pretag_repository": { "const": "FerrumVir/arc-chain" },
+        "pretag_version": { "const": "0.8.0" },
+        "pretag_workflow_run_id": { "type": "integer", "minimum": 1 },
+        "pretag_workflow_run_attempt": { "type": "integer", "minimum": 1 },
+        "production_input_stage_manifest_sha256": { "$ref": "#/$defs/hash" },
+        "protected_pretag_artifact": { "$ref": "#/$defs/protectedPretagWindowSet" },
+        "validator_key_receipt_chain": { "$ref": "#/$defs/validatorKeyReceiptChain" },
+        "validator_installed_key_proof": { "$ref": "#/$defs/validatorInstalledKeyProof" },
+        "freeze_plan_sidecar_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "offline_stop_verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "remote_helper_sha256", "remote_helper_path", "offline_stop_evidence_sha256",
+            "ssh_known_hosts_sha256", "ssh_path", "ssh_sha256", "challenge",
+            "started_at", "completed_at", "duration_ms", "nodes"
+          ],
+          "properties": {
+            "schema": { "const": "arc.recovery.offline-stop-remote-verification.v1" },
+            "source_main_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "freeze_plan_sha256": { "$ref": "#/$defs/hash" },
+            "capture_id": { "$ref": "#/$defs/hash" },
+            "remote_helper_sha256": { "$ref": "#/$defs/hash" },
+            "remote_helper_path": { "type": "string", "pattern": "^/root/\\.arc-recovery-helpers/[0-9a-f]{64}/archive-node\\.sh$" },
+            "offline_stop_evidence_sha256": { "$ref": "#/$defs/hash" },
+            "ssh_known_hosts_sha256": { "$ref": "#/$defs/hash" },
+            "ssh_path": { "const": "/usr/bin/ssh" },
+            "ssh_sha256": { "$ref": "#/$defs/hash" },
+            "challenge": { "$ref": "#/$defs/hash" },
+            "started_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+            "completed_at": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+            "duration_ms": { "type": "integer", "minimum": 0, "maximum": 120000 },
+            "nodes": {
+              "type": "array",
+              "minItems": 6,
+              "maxItems": 6,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["node", "host", "status", "status_sha256"],
+                "properties": {
+                  "node": { "type": "string" },
+                  "host": { "type": "string" },
+                  "status_sha256": { "$ref": "#/$defs/hash" },
+                  "status": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "schema", "capture_id", "node", "host", "freeze_plan_sha256",
+                      "validator_address", "stake", "stopped", "restart_fenced", "stop_schema",
+                      "stop_complete_sha256", "stop_files_sha256", "challenge"
+                    ],
+                    "properties": {
+                      "schema": { "const": "arc.recovery.offline-stop-challenged-status.v1" },
+                      "capture_id": { "$ref": "#/$defs/hash" },
+                      "node": { "type": "string" },
+                      "host": { "type": "string" },
+                      "freeze_plan_sha256": { "$ref": "#/$defs/hash" },
+                      "validator_address": { "$ref": "#/$defs/hash" },
+                      "stake": { "type": "integer", "minimum": 1 },
+                      "stopped": { "const": true },
+                      "restart_fenced": { "const": true },
+                      "stop_schema": { "const": "arc.recovery.offline-stop.v4" },
+                      "stop_complete_sha256": { "$ref": "#/$defs/hash" },
+                      "stop_files_sha256": { "$ref": "#/$defs/hash" },
+                      "challenge": { "$ref": "#/$defs/hash" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "archive": {
       "type": "object",
       "additionalProperties": false,
@@ -101,7 +239,46 @@
         "recovery_epoch": { "type": "integer", "minimum": 1 },
         "validator_set_id": { "type": "integer", "minimum": 1 },
         "source_height": { "type": "integer", "minimum": 0 },
+        "legacy_maintenance_evidence_bundle_sha256": { "$ref": "#/$defs/hash" },
+        "legacy_maintenance_boundary_sha256": { "$ref": "#/$defs/hash" },
+        "legacy_late_fork_source_set_sha256": { "$ref": "#/$defs/hash" },
+        "legacy_observed_cutoff_height": { "type": "integer", "minimum": 0 },
+        "legacy_continuity_safety_margin": { "const": 128 },
         "legacy_public_max_height": { "type": "integer", "minimum": 0 },
+        "legacy_global_absence_claimed": { "const": false },
+        "legacy_official_origins": {
+          "const": [
+            { "node": "nyc", "host": "149.28.32.76", "origin": "http://149.28.32.76:9090" },
+            { "node": "lax", "host": "140.82.16.112", "origin": "http://140.82.16.112:9090" },
+            { "node": "ams", "host": "136.244.109.1", "origin": "http://136.244.109.1:9090" },
+            { "node": "lhr", "host": "104.238.171.11", "origin": "http://104.238.171.11:9090" },
+            { "node": "nrt", "host": "202.182.107.41", "origin": "http://202.182.107.41:9090" },
+            { "node": "sgp", "host": "149.28.153.31", "origin": "http://149.28.153.31:9090" }
+          ]
+        },
+        "legacy_reopening_policy": {
+          "const": {
+            "required_validator_count": 6,
+            "height_relation": "strictly-greater-than-legacy_public_max_height",
+            "required_equal_fields": ["block_hash", "state_root"]
+          }
+        },
+        "legacy_late_fork_circuit": {
+          "const": {
+            "monitor_scope": "retired-and-community-legacy-sources",
+            "trigger": "self-consistent-legacy-fork-candidate-above-observed-cutoff-height",
+            "action": "enter-maintenance-preserve-and-offline-validate",
+            "rewrite_v3_history_allowed": false
+          }
+        },
+        "legacy_quarantine_threat_model": {
+          "const": {
+            "trusted_host_root_required": true,
+            "sealed_reviewed_legacy_binary_non_adversarial": true,
+            "quarantine_purpose": "operational-network-isolation",
+            "hostile_root_containment_claimed": false
+          }
+        },
         "source_consensus_round": { "type": "integer", "minimum": 0 },
         "created_at_unix_ms": { "type": "integer", "minimum": 1 },
         "source_block_hash": { "$ref": "#/$defs/hash" },
@@ -119,12 +296,41 @@
       "required": ["binary", "genesis", "checkpoint", "legacy_validator_set"],
       "properties": {
         "binary": { "$ref": "#/$defs/artifact" },
+        "cli": { "$ref": "#/$defs/artifact" },
+        "build_metadata": { "$ref": "#/$defs/artifact" },
+        "pretag_artifact_input_set": { "$ref": "#/$defs/artifact" },
+        "pretag_initial_live_provenance_set": { "$ref": "#/$defs/artifact" },
+        "production_input_stage_manifest": { "$ref": "#/$defs/artifact" },
+        "validator_vault_restore_receipt": { "$ref": "#/$defs/artifact" },
+        "validator_key_install_receipt": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_headless_linux_x86_64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_headless_linux_arm64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_headless_macos_arm64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_headless_macos_x86_64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_headless_windows_x86_64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_desktop_linux_x86_64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_desktop_macos_arm64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_desktop_macos_x86_64": { "$ref": "#/$defs/artifact" },
+        "pretag_raw_desktop_windows_x86_64": { "$ref": "#/$defs/artifact" },
         "genesis": { "$ref": "#/$defs/artifact" },
+        "validator_public_keys": { "$ref": "#/$defs/artifact" },
+        "legacy_public_height_receipt": { "$ref": "#/$defs/artifact" },
+        "legacy_maintenance_evidence_bundle": { "$ref": "#/$defs/artifact" },
+        "legacy_maintenance_evidence_bundle_sidecar": { "$ref": "#/$defs/artifact" },
+        "legacy_maintenance_boundary": { "$ref": "#/$defs/artifact" },
+        "legacy_maintenance_boundary_sidecar": { "$ref": "#/$defs/artifact" },
+        "legacy_late_fork_source_set": { "$ref": "#/$defs/artifact" },
+        "legacy_late_fork_source_set_sidecar": { "$ref": "#/$defs/artifact" },
+        "legacy_late_fork_interlock_tool": { "$ref": "#/$defs/artifact" },
+        "offline_stop_evidence": { "$ref": "#/$defs/artifact" },
+        "offline_stop_evidence_sidecar": { "$ref": "#/$defs/artifact" },
+        "ssh_known_hosts": { "$ref": "#/$defs/artifact" },
+        "reward_probe": { "$ref": "#/$defs/artifact" },
         "checkpoint": { "$ref": "#/$defs/artifact" },
         "legacy_validator_set": { "$ref": "#/$defs/artifact" },
         "source_snapshot": { "$ref": "#/$defs/artifact" },
         "source_wal": { "$ref": "#/$defs/artifact" },
-        "caddy": { "$ref": "#/$defs/artifact" }
+        "caddy": { "$ref": "#/$defs/caddyArtifact" }
       }
     },
     "checks": {
@@ -160,10 +366,22 @@
               "items": { "type": "string", "minLength": 1 }
             },
             "probe_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-            "tx_hash": { "$ref": "#/$defs/hash" },
-            "job_id": { "$ref": "#/$defs/hash" },
-            "worker": { "$ref": "#/$defs/hash" },
-            "expected_reward_base": { "type": "integer", "minimum": 1 }
+            "receipts": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tx_hash", "job_id", "worker"],
+                "properties": {
+                  "tx_hash": { "$ref": "#/$defs/hash" },
+                  "job_id": { "$ref": "#/$defs/hash" },
+                  "worker": { "$ref": "#/$defs/hash" }
+                }
+              }
+            },
+            "expected_reward_base": { "const": 2500000000 }
           }
         }
       }
@@ -211,7 +429,9 @@
                 "/community/heartbeat",
                 "/community/claim_work",
                 "/community/submit_work",
+                "/tx/submit",
                 "/tx/submit_signed",
+                "/tx/submit_batch",
                 "/faucet/claim"
               ]
             }
@@ -228,6 +448,177 @@
   },
   "$defs": {
     "hash": { "type": "string", "pattern": "^(0x)?[0-9a-f]{64}$" },
+    "protectedPretagResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "body_sha256", "response_unix", "request_id", "cache_control", "age"],
+      "properties": {
+        "label": { "enum": ["workflow", "run", "artifact", "artifact_set", "protected_main"] },
+        "body_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "response_unix": { "type": "integer", "minimum": 1 },
+        "request_id": { "type": "string", "pattern": "^[A-F0-9:-]{8,128}$" },
+        "cache_control": { "type": "string", "maxLength": 1024 },
+        "age": { "const": 0 }
+      }
+    },
+    "protectedPretagProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "live", "api", "artifact"],
+      "properties": {
+        "schema": { "const": "arc.protected-pretag-artifact.v1" },
+        "live": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "protected_branch", "commit", "workflow_id", "workflow_path", "run_id", "run_attempt", "artifact_id", "artifact_name", "artifact_digest", "artifact_size_in_bytes", "api_verified_at_unix"],
+          "properties": {
+            "repository": { "const": "FerrumVir/arc-chain" },
+            "protected_branch": { "const": "main" },
+            "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "workflow_id": { "type": "integer", "minimum": 1 },
+            "workflow_path": { "const": ".github/workflows/release-signing-preflight.yml" },
+            "run_id": { "type": "integer", "minimum": 1 },
+            "run_attempt": { "type": "integer", "minimum": 1 },
+            "artifact_id": { "type": "integer", "minimum": 1 },
+            "artifact_name": { "type": "string", "minLength": 1 },
+            "artifact_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "artifact_size_in_bytes": { "type": "integer", "minimum": 1 },
+            "api_verified_at_unix": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin", "anonymous", "redirects_followed", "max_age_seconds", "curl_sha256", "ca_bundle_sha256", "responses"],
+          "properties": {
+            "origin": { "const": "https://api.github.com" },
+            "anonymous": { "const": true },
+            "redirects_followed": { "const": false },
+            "max_age_seconds": { "const": 300 },
+            "curl_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "ca_bundle_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "responses": {
+              "type": "array", "minItems": 4, "maxItems": 4,
+              "items": { "$ref": "#/$defs/protectedPretagResponse" }
+            }
+          }
+        },
+        "artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "platform", "version", "raw_actions_zip_sha256", "raw_actions_zip_size", "archive_sha256", "build_metadata_sha256", "files"],
+          "properties": {
+            "kind": { "enum": ["headless", "desktop"] },
+            "platform": { "enum": ["linux-x86_64", "linux-arm64", "macos-arm64", "macos-x86_64", "windows-x86_64"] },
+            "version": { "const": "0.8.0" },
+            "raw_actions_zip_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "raw_actions_zip_size": { "type": "integer", "minimum": 1 },
+            "archive_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "build_metadata_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "files": {
+              "type": "object", "minProperties": 3, "maxProperties": 4,
+              "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        }
+      }
+    },
+    "protectedPretagWindowGroup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "platform", "initial", "final"],
+      "properties": {
+        "kind": { "enum": ["headless", "desktop"] },
+        "platform": { "enum": ["linux-x86_64", "linux-arm64", "macos-arm64", "macos-x86_64", "windows-x86_64"] },
+        "initial": { "$ref": "#/$defs/protectedPretagProof" },
+        "final": { "$ref": "#/$defs/protectedPretagProof" }
+      }
+    },
+    "protectedPretagWindowSet": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "groups"],
+      "properties": {
+        "schema": { "const": "arc.protected-pretag-artifact-window-set.v1" },
+        "groups": {
+          "type": "array", "minItems": 9, "maxItems": 9,
+          "items": { "$ref": "#/$defs/protectedPretagWindowGroup" }
+        }
+      }
+    },
+    "validatorKeyReceiptChain": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "source_main_commit", "restore_receipt_sha256", "install_receipt_sha256", "linux_pretag_artifact_id", "linux_pretag_raw_actions_zip_sha256", "arc_cli_sha256", "genesis_sha256", "validator_public_keys_sha256", "freeze_plan_sha256", "offline_stop_evidence_sha256", "known_hosts_sha256", "ssh_identity_sha256", "ssh_sha256", "scp_sha256", "validators"],
+      "properties": {
+        "schema": { "const": "arc.recovery.validator-key-receipt-chain.v1" },
+        "source_main_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "restore_receipt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "install_receipt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "linux_pretag_artifact_id": { "type": "integer", "minimum": 1 },
+        "linux_pretag_raw_actions_zip_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "arc_cli_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "genesis_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "validator_public_keys_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "freeze_plan_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "offline_stop_evidence_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "known_hosts_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "ssh_identity_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "ssh_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "scp_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "validators": {
+          "type": "array", "minItems": 6, "maxItems": 6,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["node", "host", "address", "keyfile_sha256"],
+            "properties": {
+              "node": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+              "host": { "type": "string", "minLength": 1 },
+              "address": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "keyfile_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        }
+      }
+    },
+    "validatorInstalledKeyProof": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "source_main_commit", "production_input_stage_manifest_sha256", "freeze_plan_sha256", "offline_stop_evidence_sha256", "validator_install_receipt_sha256", "validator_public_keys_sha256", "arc_cli_sha256", "remote_helper_sha256", "remote_helper_path", "ssh_known_hosts_sha256", "ssh_identity_sha256", "ssh_path", "ssh_sha256", "scp_path", "scp_sha256", "challenge", "started_at_unix_ms", "completed_at_unix_ms", "validators"],
+      "properties": {
+        "schema": { "const": "arc.recovery.validator-installed-key-proof.v1" },
+        "source_main_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "production_input_stage_manifest_sha256": { "$ref": "#/$defs/hash" },
+        "freeze_plan_sha256": { "$ref": "#/$defs/hash" },
+        "offline_stop_evidence_sha256": { "$ref": "#/$defs/hash" },
+        "validator_install_receipt_sha256": { "$ref": "#/$defs/hash" },
+        "validator_public_keys_sha256": { "$ref": "#/$defs/hash" },
+        "arc_cli_sha256": { "$ref": "#/$defs/hash" },
+        "remote_helper_sha256": { "$ref": "#/$defs/hash" },
+        "remote_helper_path": { "type": "string", "pattern": "^/root/\\.arc-recovery-helpers/[0-9a-f]{64}/archive-node\\.sh$" },
+        "ssh_known_hosts_sha256": { "$ref": "#/$defs/hash" },
+        "ssh_identity_sha256": { "$ref": "#/$defs/hash" },
+        "ssh_path": { "const": "/usr/bin/ssh" },
+        "ssh_sha256": { "$ref": "#/$defs/hash" },
+        "scp_path": { "const": "/usr/bin/scp" },
+        "scp_sha256": { "$ref": "#/$defs/hash" },
+        "challenge": { "$ref": "#/$defs/hash" },
+        "started_at_unix_ms": { "type": "integer", "minimum": 1 },
+        "completed_at_unix_ms": { "type": "integer", "minimum": 1 },
+        "validators": {
+          "type": "array", "minItems": 6, "maxItems": 6,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["node", "host", "key_path", "address", "keyfile_sha256", "remote_response_sha256", "state"],
+            "properties": {
+              "node": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+              "host": { "type": "string", "minLength": 1 },
+              "key_path": { "const": "/etc/arc-v3/validator-key.json" },
+              "address": { "$ref": "#/$defs/hash" },
+              "keyfile_sha256": { "$ref": "#/$defs/hash" },
+              "remote_response_sha256": { "$ref": "#/$defs/hash" },
+              "state": { "const": "verified" }
+            }
+          }
+        }
+      }
+    },
     "artifact": {
       "type": "object",
       "additionalProperties": false,
@@ -235,6 +626,17 @@
       "properties": {
         "path": { "type": "string", "pattern": "^/" },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "caddyArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "sha256": {
+          "const": "b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9"
+        }
       }
     },
     "validator": {
@@ -268,7 +670,6 @@
         "remote_root": { "type": "string", "pattern": "^/" },
         "service_user": { "type": "string", "minLength": 1 },
         "service_name": { "type": "string", "pattern": "^arc-node-v3-[a-z0-9-]+\\.service$" },
-        "public_hostname": { "type": "string", "pattern": "^[A-Za-z0-9.-]+\\.(nip|sslip)\\.io$" },
         "model_path": { "type": "string", "pattern": "^/" },
         "model_sha256": {
           "const": "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"

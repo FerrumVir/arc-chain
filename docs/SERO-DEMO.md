@@ -107,15 +107,10 @@ This is what cryptographic verifiability means: anyone can re-run the same promp
 
 ## Step 5 - Curl it from your terminal (30 seconds)
 
-If you prefer the command line:
-
-```bash
-# Pick a healthy coordinator (any seed works - this one survives outages)
-COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
-curl -X POST "$COORDINATOR/inference/run_sharded" \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"The capital of France is","max_tokens":20}'
-```
+**Retired historical instruction.** The original command downloaded a
+coordinator picker from the mutable default branch and executed it. It is
+intentionally omitted. This archived network is not a valid command-line
+target; use a reviewed local checkout and the current runbook instead.
 
 Response includes the full per-hop trace:
 ```json
@@ -138,12 +133,10 @@ Response includes the full per-hop trace:
 
 ## Step 6 - Verify a past inference (30 seconds)
 
-Anyone can independently audit any inference run on the network. Take the `tx_hash` from any prior attestation (e.g. from the dashboard's "On-chain attestation" link, or from a previous `arc-demo.sh` output) and run:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
-  | bash -s -- 0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d
-```
+The original mutable network-to-shell verifier command is intentionally
+omitted. Any historical reconstruction must start from a reviewed local
+checkout at an exact commit and must not treat this stale public network as a
+verification authority.
 
 The verifier fetches the original attestation, re-runs the same input on the coordinator, and compares both the new `output_hash` and the new `model_hash` against the on-chain claim. Prints `✓ VERIFIED` if they match.
 
@@ -153,22 +146,25 @@ This is the cryptographic claim turned into a tool. The model and the network ar
 
 ## Step 7 - Join the network as a shard holder (90 seconds)
 
-This is what makes it permissionless. Run **one command** on your laptop:
+The original one-command mutable installer is retired and intentionally
+omitted. Use the version-pinned, checksum-verifying process in
+[`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) only after that exact release is
+published.
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-```
-
-The installer:
-1. Detects your platform (macOS arm64/x86, Linux x86_64/aarch64)
-2. Downloads the latest pre-built binary from the v0.4.1 release (no compile)
-3. Downloads Llama-2-7B-Chat Q4_K_M (~4 GB) - or TinyLlama on machines with < 6 GB RAM
-4. Generates a unique validator seed for your machine
+The v0.8 installer:
+1. Detects your platform (macOS arm64/x86_64, Linux x86_64/aarch64).
+2. Resolves one explicitly selected immutable `vX.Y.Z` release, then verifies
+   its signed release manifest, checksums, exact asset set, and binary version.
+3. Uses only a pre-staged local model path when inference is requested; it
+   never downloads a mutable model automatically.
+4. Generates a persistent mode-0600 Ed25519 validator keyfile. It never puts
+   signing seed or phrase material in argv, environment, or logs.
 5. Installs as a persistent service:
    - macOS: `~/Library/LaunchAgents/com.arc.inference.plist` (launchd)
    - Linux: `/etc/systemd/system/arc-node.service` (systemd, with sudo)
-6. Schedules a daily auto-updater (04:17 local) that polls GitHub releases and seamlessly upgrades the binary
-7. Joins the testnet as an inference observer
+6. Schedules a daily updater (04:17 local) that accepts only immutable,
+   signed, checksummed release assets.
+7. Joins as a stake-zero observer only after the selected release exists.
 
 After ~3 min your node is running, contributing inference compute, and visible at the live dashboard.
 
@@ -241,8 +237,7 @@ Either:
 - Coordinator RPC: auto-selected by `scripts/arc-pick-coordinator.sh` - any of the 8 seeds works (e.g. `http://136.244.109.1:9090/inference/run_sharded`, `http://202.182.107.41:9090/inference/run_sharded`)
 - Shard registry: `/shards` on whichever coordinator was picked above
 - GitHub: https://github.com/FerrumVir/arc-chain
-- Latest release: https://github.com/FerrumVir/arc-chain/releases/latest
-- Community installer: https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh
+- Current installation contract: [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md)
 
 ---
 

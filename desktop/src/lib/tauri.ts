@@ -7,6 +7,7 @@ import type {
   Attestation,
   BinaryStatus,
   BlockTxs,
+  DataMigrationNotice,
   Earnings,
   EarningsProjection,
   FaucetResult,
@@ -51,6 +52,9 @@ const IS_PROD_TAURI_BUNDLE =
 // directly, adapting the shapes the same way src-tauri/src/rpc_client.rs does.
 function liveBase(): string | null {
   if (typeof window === "undefined") return null;
+  // `__ARC_LIVE__` is an E2E-only browser seam. A packaged production bundle
+  // opened outside Tauri must stay blocked even if page script tries to set it.
+  if (IS_PROD_TAURI_BUNDLE) return null;
   const port = (window as Window & { __ARC_LIVE__?: number | string }).__ARC_LIVE__;
   if (!port) return null;
   return `http://127.0.0.1:${port}`;
@@ -66,7 +70,10 @@ function settlementWriteUnavailable(flow: string): Error {
   return new Error(`${flow} ${SETTLEMENT_WRITE_UNAVAILABLE}`);
 }
 
-function emptyEarnings(): Earnings {
+const RETAINED_EARNINGS_SOURCE =
+  "scan of this node's in-memory full_transactions map";
+
+function unavailableEarnings(unavailableReason: string): Earnings {
   return {
     totalArc: 0,
     todayArc: null,
@@ -81,6 +88,9 @@ function emptyEarnings(): Earnings {
       "confirmed mined reward receipts are unavailable",
     recoveryEpoch: null,
     validatorSetId: null,
+    unavailableReason,
+    receiptSource: null,
+    archiveMode: null,
     fromChain: false,
   };
 }
@@ -102,6 +112,8 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
   const effective = o.community_rewards_v1_enabled;
   const protocolActive = o.community_rewards_v1_protocol_active;
   const approvalReady = o.community_rewards_v1_approval_collection_ready;
+  const receiptSource = o.source;
+  const archiveMode = o.archive_mode;
   if (
     typeof totalRewards !== "number" ||
     !Number.isSafeInteger(totalRewards) ||
@@ -119,13 +131,22 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     !note.includes("CommunityInferenceReward") ||
     typeof effective !== "boolean" ||
     typeof protocolActive !== "boolean" ||
-    typeof approvalReady !== "boolean"
+    typeof approvalReady !== "boolean" ||
+    receiptSource !== RETAINED_EARNINGS_SOURCE ||
+    typeof archiveMode !== "boolean"
   ) {
     return null;
   }
   if (effective && (!protocolActive || !approvalReady)) return null;
   let receiptBaseSum = 0;
   let receiptArcSum = 0;
+  const hash32 = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const bare = value.replace(/^0x/i, "");
+    return /^[0-9a-fA-F]{64}$/.test(bare) ? `0x${bare.toLowerCase()}` : null;
+  };
+  const receiptTxHashes = new Set<string>();
+  const receiptJobIds = new Set<string>();
   const confirmedReceipts = [] as Earnings["confirmedReceipts"];
   for (const value of rows as unknown[]) {
     if (!value || typeof value !== "object") return null;
@@ -133,26 +154,31 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     if (
       receipt.tx_type !== "0x25" ||
       receipt.success !== true ||
-      typeof receipt.tx_hash !== "string" ||
-      typeof receipt.job_id !== "string" ||
+      hash32(receipt.tx_hash) === null ||
+      hash32(receipt.job_id) === null ||
       !Number.isSafeInteger(receipt.block_height) ||
-      typeof receipt.block_hash !== "string" ||
-      !Number.isSafeInteger(receipt.reward_base) ||
-      (receipt.reward_base as number) < 0 ||
-      typeof receipt.reward_arc !== "number" ||
-      !Number.isFinite(receipt.reward_arc) ||
-      receipt.reward_arc < 0
+      (receipt.block_height as number) < 0 ||
+      hash32(receipt.block_hash) === null ||
+      receipt.reward_base !== 2_500_000_000 ||
+      receipt.reward_arc !== 2.5
     ) {
       return null;
     }
+    const normalizedTxHash = hash32(receipt.tx_hash)!;
+    const normalizedJobId = hash32(receipt.job_id)!;
+    if (receiptTxHashes.has(normalizedTxHash) || receiptJobIds.has(normalizedJobId)) {
+      return null;
+    }
+    receiptTxHashes.add(normalizedTxHash);
+    receiptJobIds.add(normalizedJobId);
     receiptBaseSum += receipt.reward_base as number;
     receiptArcSum += receipt.reward_arc;
     if (!Number.isSafeInteger(receiptBaseSum)) return null;
     confirmedReceipts.push({
-      txHash: receipt.tx_hash,
-      jobId: receipt.job_id,
+      txHash: normalizedTxHash,
+      jobId: normalizedJobId,
       blockHeight: receipt.block_height as number,
-      blockHash: receipt.block_hash,
+      blockHash: hash32(receipt.block_hash)!,
       rewardBase: receipt.reward_base as number,
       rewardArc: receipt.reward_arc,
       recoveryEpoch:
@@ -181,9 +207,16 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     projectionReason !== null &&
     (typeof projectionReason !== "string" || projectionReason.trim().length === 0)
   ) return null;
-  const projectedDailyArc = projection as number | null;
-  const projectedDailyUnavailableReason = projectionReason as string | null;
-  if ((projectedDailyArc === null) === (projectedDailyUnavailableReason === null)) return null;
+  const hostProjectedDailyArc = projection as number | null;
+  const hostProjectionReason = projectionReason as string | null;
+  if ((hostProjectedDailyArc === null) === (hostProjectionReason === null)) return null;
+  // Treat the host's numeric field as a candidate only. The exact receipt rows
+  // above, not `total_rewards` alone, establish the observation count used by
+  // the minimum-history gate.
+  const observationGate = projectionObservationGate(o, confirmedReceipts.length);
+  const projectedDailyArc = observationGate === null ? hostProjectedDailyArc : null;
+  const projectedDailyUnavailableReason =
+    observationGate ?? hostProjectionReason;
   if (
     !Object.prototype.hasOwnProperty.call(o, "last_reward_block") ||
     !Object.prototype.hasOwnProperty.call(o, "last_reward_tx_hash")
@@ -196,12 +229,14 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     o.last_reward_block >= 0
       ? o.last_reward_block
       : null;
-  const lastHash =
-    typeof o.last_reward_tx_hash === "string" &&
-    o.last_reward_tx_hash.trim().length > 0
-      ? o.last_reward_tx_hash
-      : null;
+  const lastHash = hash32(o.last_reward_tx_hash);
   if (totalRewards > 0 && (lastBlock === null || lastHash === null)) return null;
+  if (
+    totalRewards > 0
+    && !confirmedReceipts.some(
+      (receipt) => receipt.txHash === lastHash && receipt.blockHeight === lastBlock,
+    )
+  ) return null;
 
   return {
     totalArc,
@@ -222,18 +257,21 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
       typeof o.recovery_epoch === "number" ? o.recovery_epoch : null,
     validatorSetId:
       typeof o.validator_set_id === "number" ? o.validator_set_id : null,
+    unavailableReason: null,
+    receiptSource,
+    archiveMode,
     fromChain: true,
   };
 }
 
 /** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
 const COORDINATOR_HOSTS = [
-  "https://149-28-32-76.nip.io", // NYC
-  "https://140-82-16-112.nip.io", // LAX
-  "https://136-244-109-1.nip.io", // AMS
-  "https://104-238-171-11.nip.io", // LHR
-  "https://202-182-107-41.nip.io", // NRT
-  "https://149-28-153-31.nip.io", // SGP
+  "https://149.28.32.76", // NYC
+  "https://140.82.16.112", // LAX
+  "https://136.244.109.1", // AMS
+  "https://104.238.171.11", // LHR
+  "https://202.182.107.41", // NRT
+  "https://149.28.153.31", // SGP
 ];
 
 /**
@@ -265,6 +303,32 @@ function strip0x(s: string): string {
 
 /** ARC base units per whole ARC. Mirrors rpc_client.rs::ARC_BASE_UNITS. */
 const ARC_BASE_UNITS = 1_000_000_000;
+const MIN_PROJECTION_RECEIPTS = 3;
+const MIN_PROJECTION_WINDOW_MS = 86_400_000;
+const PROJECTION_COLLECTING_REASON =
+  "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries";
+
+function projectionObservationGate(
+  body: Record<string, unknown>,
+  receiptCount: number,
+): string | null {
+  if (receiptCount < MIN_PROJECTION_RECEIPTS) {
+    return PROJECTION_COLLECTING_REASON;
+  }
+  const first = body.observed_window_first_timestamp_ms;
+  const last = body.observed_window_last_timestamp_ms;
+  if (
+    typeof first !== "number" ||
+    !Number.isSafeInteger(first) ||
+    typeof last !== "number" ||
+    !Number.isSafeInteger(last) ||
+    last <= first ||
+    last - first < MIN_PROJECTION_WINDOW_MS
+  ) {
+    return "collecting data: this host has not supplied a valid confirmed-receipt window spanning at least 24 hours";
+  }
+  return null;
+}
 
 function exactBaseUnits(value: unknown, field: string): string {
   if (typeof value === "string" && /^\d+$/.test(value)) return value;
@@ -283,6 +347,127 @@ function arcFromBaseUnits(value: string): string {
   const whole = padded.slice(0, -9).replace(/^0+(?=\d)/, "");
   const fraction = padded.slice(-9).replace(/0+$/, "");
   return fraction ? `${whole}.${fraction}` : whole;
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringField(value: Record<string, unknown> | null, key: string): string {
+  const field = value?.[key];
+  return typeof field === "string" ? field : "";
+}
+
+function numberField(value: Record<string, unknown> | null, key: string): number {
+  const field = value?.[key];
+  return typeof field === "number" && Number.isFinite(field) ? field : 0;
+}
+
+/** Adapt the node's common `/inference/run` envelope for browser-live tests. */
+function parseInferenceRunBody(
+  body: unknown,
+  servedLocally: boolean,
+  coordinator?: string,
+): InferenceResult {
+  const value = asObject(body);
+  if (!value) throw new Error("inference endpoint returned invalid JSON");
+  if (value.success === false) {
+    throw new Error(
+      typeof value.error === "string"
+        ? value.error
+        : "inference endpoint reported success=false",
+    );
+  }
+  const inference =
+    asObject(value.inference) ??
+    (typeof value.output === "string" ? value : null);
+  if (!inference) {
+    throw new Error("inference response omitted inference output");
+  }
+  const attestation = asObject(value.attestation);
+  const verification = asObject(value.verification);
+  const settlementValue = asObject(value.settlement);
+  const settlementStatus = stringField(settlementValue, "status").trim();
+  const rewardArc = settlementValue?.reward_arc;
+  const trace = Array.isArray(value.shard_trace)
+    ? value.shard_trace
+        .map((raw) => asObject(raw))
+        .filter((hop): hop is Record<string, unknown> => hop !== null)
+        .map((hop) => ({
+          hop: numberField(hop, "hop"),
+          node: stringField(hop, "node") || stringField(hop, "node_name") || "unknown",
+          layers: stringField(hop, "layers"),
+          computeMs: numberField(hop, "compute_ms"),
+          wallMs: numberField(hop, "wall_ms"),
+          isTerminal: hop.is_terminal === true,
+        }))
+    : undefined;
+
+  return {
+    input: stringField(inference, "input"),
+    output: stringField(inference, "output"),
+    outputHash: stringField(inference, "output_hash"),
+    modelHash: stringField(inference, "model_hash"),
+    tokensGenerated: numberField(inference, "tokens_generated"),
+    inferenceMs:
+      typeof inference.inference_ms === "number"
+        ? numberField(inference, "inference_ms")
+        : numberField(inference, "total_ms"),
+    // Keep the unpaid 0x16 claim separate from community 0x25 settlement.
+    txHash: stringField(attestation, "tx_hash"),
+    deterministic: inference.deterministic === true,
+    profileBound:
+      typeof verification?.profile_bound === "boolean"
+        ? verification.profile_bound
+        : inference.profile_bound === true,
+    quorumVerified:
+      typeof verification?.quorum_verified === "boolean"
+        ? verification.quorum_verified
+        : inference.quorum_verified === true,
+    executionProfile:
+      stringField(verification, "execution_profile") ||
+      stringField(inference, "execution_profile"),
+    engine: stringField(inference, "engine"),
+    explorerUrl: stringField(value, "explorer_url"),
+    routedVia:
+      stringField(value, "routed_via") ||
+      (Array.isArray(value.shard_trace) ? "sharded_seed_pipeline" : ""),
+    settlement: settlementStatus
+      ? {
+          status: settlementStatus,
+          txType: stringField(settlementValue, "tx_type"),
+          txHash: stringField(settlementValue, "tx_hash"),
+          jobId: stringField(settlementValue, "job_id"),
+          submitted: settlementValue?.submitted === true,
+          included: settlementValue?.included === true,
+          confirmed: settlementValue?.confirmed === true,
+          rewardArc:
+            typeof rewardArc === "number" &&
+            Number.isFinite(rewardArc) &&
+            rewardArc >= 0
+              ? rewardArc
+              : null,
+          receiptUrl: stringField(settlementValue, "receipt_url"),
+        }
+      : undefined,
+    consensus: undefined,
+    coordinator,
+    servedLocally,
+    trace: trace && trace.length > 0 ? trace : undefined,
+  };
+}
+
+/** Errors after a claimed community assignment must never trigger duplicate work. */
+function directInferenceMustNotRetry(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("may still settle") ||
+    normalized.includes("refusing a second late") ||
+    normalized.includes("query its job status") ||
+    /http (400|401|403|409|413|422|504)\b/.test(normalized)
+  );
 }
 
 async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
@@ -414,6 +599,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "load_config":
       return null as T;
+    case "load_data_migration_notice":
+      return null as T;
+    case "dismiss_data_migration_notice":
+      return undefined as T;
     case "node_status": {
       // Mirror desktop/src-tauri/src/rpc_client.rs::fetch_status:
       // if local /health is missing peers, probe the public seed
@@ -504,11 +693,19 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const addr = stored
         ? (JSON.parse(stored).identity?.address as string | undefined)
         : undefined;
-      if (!addr) return emptyEarnings() as T;
+      if (!addr) {
+        return unavailableEarnings(
+          "No identity exists on this device yet, so retained reward receipts cannot be queried.",
+        ) as T;
+      }
       const path = `/worker/earnings/${strip0x(addr)}`;
       const response = await getDetailed(path);
-      if (response.kind !== "ok") return emptyEarnings() as T;
-      return (confirmedEarningsFromBody(response.body) ?? emptyEarnings()) as T;
+      if (response.kind !== "ok") {
+        return unavailableEarnings(reason(path, response)) as T;
+      }
+      return (confirmedEarningsFromBody(response.body) ?? unavailableEarnings(
+        `${base} answered ${path}, but did not provide the candidate mined-0x25 retained-receipt contract. Legacy or malformed inference-count arithmetic is not earnings.`,
+      )) as T;
     }
     case "fetch_attestations": {
       // Shape-tolerant, matching rpc_client.rs::fetch_attestations. The live
@@ -519,7 +716,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         const limit = (args as { limit?: number } | undefined)?.limit ?? 20;
         const r = await fetchJson(`/inference/attestations?limit=${limit}`);
         type Raw = Record<string, unknown>;
-        const arr = (r.attestations ?? []) as Raw[];
+        const hasActivityRows = Array.isArray(r.activities);
+        const arr = (hasActivityRows ? r.activities : (r.attestations ?? [])) as Raw[];
         const stored = localStorage.getItem("arc-desktop-state-v1");
         const mineAddr = stored
           ? (JSON.parse(stored).identity?.address as string | undefined)
@@ -533,13 +731,35 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         };
 
         return arr
+          .filter((v) => {
+            if (!hasActivityRows) return true;
+            const common = v.schema === "arc.inference.activity.v1"
+              && v.source === "chain_receipt"
+              && v.mined === true
+              && v.success === true
+              && v.computed === true;
+            if (!common) return false;
+            if (v.record_kind === "mined_community_inference_reward") {
+              return v.tx_type === "CommunityInferenceReward"
+                && v.tx_type_code === "0x25"
+                && v.paid === true
+                && v.earned === true;
+            }
+            if (v.record_kind === "mined_inference_attestation") {
+              return v.tx_type === "InferenceAttestation"
+                && v.tx_type_code === "0x16"
+                && v.paid === false
+                && v.earned === false;
+            }
+            return false;
+          })
           .map((v) => {
             const inf = (v.inference as Raw | undefined) ?? v;
             const txHash = (v.tx_hash as string) ?? "";
             if (!txHash) return null;
             const tokens = num(inf, "tokens_generated");
             const msPerTok = num(inf, "ms_per_token");
-            const from = ((v.from as string) ?? "")
+            const from = (((v.worker as string) ?? (v.from as string)) ?? "")
               .replace(/^0x/, "")
               .toLowerCase();
             const mine = !!mineAddr && !!from && from === mineAddr;
@@ -559,9 +779,13 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
               timestamp: num(v, "timestamp"),
               blockHeight: num(v, "block_height"),
               txType: (v.tx_type as string) ?? null,
+              recordKind: (v.record_kind as string) ?? null,
+              computed: hasActivityRows ? v.computed === true : !!v.success,
+              paid: hasActivityRows ? v.paid === true : false,
+              earned: hasActivityRows ? v.earned === true : false,
               from: from || null,
               mine,
-              verified: !!v.success,
+              verified: hasActivityRows ? v.success === true && v.mined === true : !!v.success,
             };
           })
           .filter((x): x is NonNullable<typeof x> => x !== null)
@@ -596,6 +820,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "start_node":
     case "stop_node":
+    case "prepare_update_relaunch":
+    case "abort_update_relaunch":
     case "restart_node":
       return undefined as T;
     case "reset_peer_state":
@@ -739,23 +965,14 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           chat_template: chatTemplate ?? true,
         }),
       });
-      if (!r.ok) throw new Error(`inference error ${r.status}`);
+      if (!r.ok) {
+        const detail = await r.text().catch(() => "");
+        throw new Error(`inference error HTTP ${r.status}: ${detail}`);
+      }
       const v = await r.json();
-      return {
-        input: v.inference?.input ?? "",
-        output: v.inference?.output ?? "",
-        outputHash: v.inference?.output_hash ?? "",
-        modelHash: v.inference?.model_hash ?? "",
-        tokensGenerated: v.inference?.tokens_generated ?? 0,
-        inferenceMs: v.inference?.inference_ms ?? 0,
-        txHash: v.attestation?.tx_hash ?? "",
-        deterministic: v.inference?.deterministic ?? false,
-        engine: v.inference?.engine ?? "",
-        explorerUrl: v.explorer_url ?? "",
-        // liveBase() is 127.0.0.1 - this IS the local node.
-        servedLocally: true,
-        trace: v.shard_trace ?? undefined,
-      } as T;
+      // liveBase() is 127.0.0.1 - this IS the local node, even when that
+      // coordinator dispatches the actual compute to a community worker.
+      return parseInferenceRunBody(v, true) as T;
     }
     case "run_inference_via_coordinator": {
       const { prompt, maxTokens, k, chatTemplate } = args as {
@@ -794,9 +1011,14 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             tokensGenerated: v.tokens_generated ?? 0,
             inferenceMs: v.total_ms ?? 0,
             txHash: "",
-            deterministic: true,
-            engine: "consensus",
+            deterministic: v.deterministic ?? false,
+            profileBound: v.profile_bound ?? false,
+            quorumVerified: v.quorum_verified ?? false,
+            executionProfile: v.execution_profile ?? "",
+            engine: v.engine ?? "consensus",
             explorerUrl: "",
+            routedVia: "sharded_consensus",
+            settlement: undefined,
             consensus: {
               k: c.k ?? 0,
               votesTotal: c.votes_total ?? 0,
@@ -808,6 +1030,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
                 : 0,
             },
             coordinator: host,
+            servedLocally: false,
           } as T;
         } catch (e) {
           lastErr = `${host} → ${String(e)}`;
@@ -834,30 +1057,20 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             }),
           });
           if (!r.ok) {
-            lastErr = `${host} → HTTP ${r.status}`;
+            const detail = await r.text().catch(() => "");
+            const message = `${host} → HTTP ${r.status}: ${detail}`;
+            if (directInferenceMustNotRetry(message)) {
+              throw new Error(message);
+            }
+            lastErr = message;
             continue;
           }
           const v = await r.json();
-          const inf = v.inference ?? {};
-          const att = v.attestation ?? {};
-          return {
-            input: inf.input ?? "",
-            output: inf.output ?? "",
-            outputHash: inf.output_hash ?? "",
-            modelHash: inf.model_hash ?? "",
-            tokensGenerated: inf.tokens_generated ?? 0,
-            inferenceMs: inf.inference_ms ?? 0,
-            txHash: att.tx_hash ?? "",
-            deterministic: inf.deterministic ?? false,
-            engine: inf.engine ?? "",
-            explorerUrl: v.explorer_url ?? "",
-            consensus: undefined,
-            coordinator: host,
-            servedLocally: false,
-            trace: v.shard_trace ?? undefined,
-          } as T;
+          return parseInferenceRunBody(v, false, host) as T;
         } catch (e) {
-          lastErr = `${host} → ${String(e)}`;
+          const message = `${host} → ${String(e)}`;
+          if (directInferenceMustNotRetry(message)) throw e;
+          lastErr = message;
         }
       }
       throw new Error(`all coordinators failed (direct path); last: ${lastErr}`);
@@ -1005,12 +1218,21 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rateBase !== null
           ? rateBase / ARC_BASE_UNITS
           : numOf(d.body, ["reward_per_attestation_arc"]);
-      const attestationsTotal = numOf(d.body, ["total_rewards"]) ?? 0;
+      // `confirmedEarningsFromBody` has already reconciled this value against
+      // every exact successful mined 0x25 receipt row. Never trust a parallel
+      // host count when receipt identities are available.
+      const attestationsTotal = confirmed.attestations;
+      const observationGate = projectionObservationGate(
+        d.body,
+        attestationsTotal,
+      );
       const payableRate =
         chainRate !== null && chainRate >= 0 ? chainRate : null;
       const observedPerDay = numOf(d.body, ["attestations_per_day_observed"]);
       const perDay =
-        observedPerDay !== null && observedPerDay >= 0
+        observationGate === null &&
+        observedPerDay !== null &&
+        observedPerDay >= 0
           ? observedPerDay
           : null;
       const rewardBudget =
@@ -1030,9 +1252,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           d.body,
           "community_rewards_v1_enabled",
         ),
-        projectedDailyArc: confirmed.projectedDailyArc,
+        projectedDailyArc:
+          observationGate === null ? confirmed.projectedDailyArc : null,
         projectedDailyUnavailableReason:
-          confirmed.projectedDailyUnavailableReason,
+          observationGate ?? confirmed.projectedDailyUnavailableReason,
         rewardPolicyHash: strOf(d.body, ["reward_issuance_policy_hash"]),
         rewardBudgetEpoch: numOf(rewardBudget, ["epoch"]),
         rewardsRemainingThisEpoch: numOf(rewardBudget, [
@@ -1053,7 +1276,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rateUnavailableReason:
           perDay !== null
             ? null
-            : (strOf(d.body, ["attestations_per_day_unavailable_reason"]) ??
+            : (observationGate ??
+              strOf(d.body, ["attestations_per_day_unavailable_reason"]) ??
               (attestationsTotal === 0
                 ? "No successful mined reward receipts are retained for this address, so there is no history to measure a rate from."
                 : `${base} reports ${attestationsTotal} successful mined reward receipt(s) for this address but no observed rate, so a per-day figure cannot be measured here.`)),
@@ -1420,7 +1644,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           id: "standard",
           displayName: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
           sizeBytes: 4_081_004_224,
-          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
+          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
         },
       ] as T;
     case "recommended_tier":
@@ -1444,24 +1668,47 @@ const mockLogs: LogEntry[] = [];
 // receipt contract is ready. These are static layout values, never a claim
 // about the public fleet and never increased merely because a process runs.
 const mockEarnings: Earnings = {
-  totalArc: 12_847.5,
+  totalArc: 5,
   todayArc: null,
   pendingArc: null,
   rank: null,
-  attestations: 1283,
+  attestations: 2,
   lastPayoutAt: null,
   lastPayoutBlock: 123_462,
-  confirmedReceipts: [],
-  projectedDailyArc: null,
-  projectedDailyUnavailableReason: "browser preview fixture",
+  confirmedReceipts: [
+    {
+      txHash: `0x${"aa".repeat(32)}`,
+      jobId: `0x${"01".repeat(32)}`,
+      blockHeight: 123_461,
+      blockHash: `0x${"10".repeat(32)}`,
+      rewardBase: 2_500_000_000,
+      rewardArc: 2.5,
+      recoveryEpoch: 1,
+      validatorSetId: 1,
+    },
+    {
+      txHash: `0x${"ab".repeat(32)}`,
+      jobId: `0x${"02".repeat(32)}`,
+      blockHeight: 123_462,
+      blockHash: `0x${"11".repeat(32)}`,
+      rewardBase: 2_500_000_000,
+      rewardArc: 2.5,
+      recoveryEpoch: 1,
+      validatorSetId: 1,
+    },
+  ],
+  projectedDailyArc: 5,
+  projectedDailyUnavailableReason: null,
   recoveryEpoch: 1,
   validatorSetId: 1,
+  unavailableReason: null,
+  receiptSource: RETAINED_EARNINGS_SOURCE,
+  archiveMode: false,
   fromChain: true,
 };
 
-// The mock deliberately exercises BOTH attestation shapes the UI must
-// survive: raw 0x16 rows submitted by the user's address (with tokens and a
-// timestamp, but no reward) and a row from another address with no telemetry.
+// The mock deliberately exercises raw 0x16 claims, two distinct successful
+// mined 0x25 payment receipts, another worker's activity, and old-seed padding.
 const MOCK_ADDRESS = "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p";
 
 const mockAttestations: Attestation[] = [
@@ -1475,6 +1722,10 @@ const mockAttestations: Attestation[] = [
     timestamp: Date.now() - 1000 * 34,
     blockHeight: 123_462,
     txType: "Inference",
+    recordKind: "mined_inference_attestation",
+    computed: true,
+    paid: false,
+    earned: false,
     from: MOCK_ADDRESS,
     mine: true,
     verified: true,
@@ -1489,6 +1740,10 @@ const mockAttestations: Attestation[] = [
     timestamp: Date.now() - 1000 * 89,
     blockHeight: 123_455,
     txType: "Inference",
+    recordKind: "mined_inference_attestation",
+    computed: true,
+    paid: false,
+    earned: false,
     from: MOCK_ADDRESS,
     mine: true,
     verified: true,
@@ -1506,6 +1761,10 @@ const mockAttestations: Attestation[] = [
     timestamp: null,
     blockHeight: 123_401,
     txType: "Inference",
+    recordKind: "mined_inference_attestation",
+    computed: true,
+    paid: false,
+    earned: false,
     from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
     mine: false,
     verified: true,
@@ -1525,8 +1784,48 @@ const mockAttestations: Attestation[] = [
     timestamp: null,
     blockHeight: 123_390,
     txType: "Other",
+    recordKind: null,
+    computed: false,
+    paid: false,
+    earned: false,
     from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
     mine: false,
+    verified: true,
+  },
+  {
+    txHash: `0x${"aa".repeat(32)}`,
+    inputPreview: "Verified community inference reward",
+    outputHash: `0x${"21".repeat(32)}`,
+    modelHash: `0x${"31".repeat(32)}`,
+    tokens: 42,
+    latencyMs: 147,
+    timestamp: Date.now() - 1000 * 28,
+    blockHeight: 123_461,
+    txType: "CommunityInferenceReward",
+    recordKind: "mined_community_inference_reward",
+    computed: true,
+    paid: true,
+    earned: true,
+    from: MOCK_ADDRESS,
+    mine: true,
+    verified: true,
+  },
+  {
+    txHash: `0x${"ab".repeat(32)}`,
+    inputPreview: "Verified community inference reward",
+    outputHash: `0x${"22".repeat(32)}`,
+    modelHash: `0x${"32".repeat(32)}`,
+    tokens: 128,
+    latencyMs: 412,
+    timestamp: Date.now() - 1000 * 18,
+    blockHeight: 123_462,
+    txType: "CommunityInferenceReward",
+    recordKind: "mined_community_inference_reward",
+    computed: true,
+    paid: true,
+    earned: true,
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
 ];
@@ -1650,6 +1949,10 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "load_config":
       return null as T;
+    case "load_data_migration_notice":
+      return null as T;
+    case "dismiss_data_migration_notice":
+      return undefined as T;
     case "node_status": {
       const running = mockStartedAt !== null;
       const uptime = running
@@ -1684,6 +1987,11 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "stop_node":
       mockStartedAt = null;
+      return undefined as T;
+    case "prepare_update_relaunch":
+      mockStartedAt = null;
+      return undefined as T;
+    case "abort_update_relaunch":
       return undefined as T;
     case "restart_node":
       mockStartedAt = Date.now();
@@ -1922,6 +2230,9 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         txHash:
           "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
         deterministic: true,
+        profileBound: false,
+        quorumVerified: false,
+        executionProfile: "local mock",
         engine: "mock",
         explorerUrl: "/tx/0x1a2b3c4d5e6f7a8b",
         servedLocally: true,
@@ -1941,6 +2252,10 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         inferenceMs: 18_400,
         txHash: "",
         deterministic: true,
+        profileBound: true,
+        quorumVerified: true,
+        executionProfile:
+          "INT8 integer (per-row, cross-platform deterministic)",
         engine: "consensus",
         explorerUrl: "",
         servedLocally: false,
@@ -1970,6 +2285,10 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         inferenceMs: 7_800,
         txHash: "0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         deterministic: true,
+        profileBound: false,
+        quorumVerified: false,
+        executionProfile:
+          "INT8 integer (per-row, cross-platform deterministic)",
         engine: "INT8 integer (cross-platform deterministic)",
         explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         consensus: undefined,
@@ -2062,7 +2381,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           id: "standard",
           displayName: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
           sizeBytes: 4_081_004_224,
-          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
+          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
         },
       ] as T;
     case "recommended_tier":
@@ -2087,6 +2406,11 @@ async function realInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   if (IS_TAURI) return realInvoke<T>(cmd, args);
+  if (IS_PROD_TAURI_BUNDLE) {
+    throw new Error(
+      "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
+    );
+  }
   if (liveBase()) return liveInvoke<T>(cmd, args);
   return mockInvoke<T>(cmd, args);
 }
@@ -2107,8 +2431,14 @@ export const api = {
   revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
+  loadDataMigrationNotice: () =>
+    invoke<DataMigrationNotice | null>("load_data_migration_notice"),
+  dismissDataMigrationNotice: () =>
+    invoke<void>("dismiss_data_migration_notice"),
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
   stopNode: () => invoke<void>("stop_node"),
+  prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),
+  abortUpdateRelaunch: () => invoke<void>("abort_update_relaunch"),
   restartNode: () => invoke<void>("restart_node"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
@@ -2228,3 +2558,16 @@ export const api = {
 };
 
 export const isTauri = IS_TAURI;
+/**
+ * A plain Vite browser build is a visual test fixture, never a network client.
+ * Keep this exported so every screen can make that boundary unmistakable.
+ */
+export const isSyntheticPreview =
+  !IS_TAURI && !IS_PROD_TAURI_BUNDLE && liveBase() === null;
+
+/**
+ * A production Tauri bundle opened as ordinary HTML must render a blocker and
+ * refuse every IPC call. It must never degrade into the synthetic preview.
+ */
+export const isBlockedProductionBrowser =
+  !IS_TAURI && IS_PROD_TAURI_BUNDLE;

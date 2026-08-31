@@ -4,6 +4,47 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::Address;
 
+/// Protocol-v3 state-machine-owned dynamic accounts share this 120-bit
+/// prefix; byte 15 identifies the exact account family.  The remaining 128
+/// bits are a transcript hash.  Every externally writable v3 transaction
+/// family must reject all addresses in this namespace before it mutates
+/// state, so a normal account can neither pre-dust nor overwrite a future
+/// replay/budget marker.
+pub const V3_SYSTEM_ACCOUNT_PREFIX: [u8; 15] = *b"ARC-V3-REWARD:\0";
+
+/// Exhaustive protocol-v3 dynamic system-account families.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum V3SystemAccountKind {
+    CommunityRewardJob = 1,
+    CommunityRewardCertificate = 2,
+    RecoveryRewardProbe = 3,
+    CommunityRewardBlockBudget = 4,
+    CommunityRewardEpochBudget = 5,
+    CommunityRewardWorkerBudget = 6,
+    CommunityRewardCoordinatorBudget = 7,
+    FaucetClaimMarker = 8,
+}
+
+/// Embed a full transcript digest in a type-specific 128-bit reserved
+/// namespace.  Truncating only the digest suffix retains 128-bit collision
+/// resistance while making ownership recognizable without enumerating
+/// unbounded content-derived addresses.
+pub fn v3_system_account_address(kind: V3SystemAccountKind, digest: &Hash256) -> Address {
+    let mut bytes = [0u8; 32];
+    bytes[..V3_SYSTEM_ACCOUNT_PREFIX.len()].copy_from_slice(&V3_SYSTEM_ACCOUNT_PREFIX);
+    bytes[V3_SYSTEM_ACCOUNT_PREFIX.len()] = kind as u8;
+    bytes[16..].copy_from_slice(&digest.as_ref()[..16]);
+    Hash256(bytes)
+}
+
+/// Whether an address belongs to one of the explicitly allocated v3 dynamic
+/// system-account namespaces.
+pub fn is_v3_system_account(address: &Address) -> bool {
+    address.as_ref()[..V3_SYSTEM_ACCOUNT_PREFIX.len()] == V3_SYSTEM_ACCOUNT_PREFIX
+        && matches!(address.as_ref()[V3_SYSTEM_ACCOUNT_PREFIX.len()], 1..=8)
+}
+
 fn serialize_unverified<S>(_: &bool, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -767,9 +808,10 @@ pub struct CommunityInferenceRewardBody {
     /// Active validator that created the assignment. Validators authenticate
     /// this coordinator before independently recomputing and approving work.
     pub coordinator: Address,
-    /// Cryptographically random coordinator boot/session epoch. Binding it in
-    /// every approval prevents a restarted coordinator from reusing an old
-    /// assignment namespace.
+    /// Cryptographically random coordinator boot/session epoch for ordinary
+    /// jobs, or a namespaced rollout/ordinal identity for recovery probes.
+    /// Binding it in every approval prevents semantic reuse; recovery probes
+    /// additionally receive a consensus replay marker across coordinators.
     pub assignment_epoch: Hash256,
     /// Monotonic nonce within `assignment_epoch`.
     pub job_nonce: u64,
@@ -829,6 +871,12 @@ pub const COMMUNITY_REWARD_APPROVALS_REQUIRED: usize = 5;
 /// constant is the single code-level policy switch; raising it requires a
 /// coordinated protocol release rather than an unsafe per-node flag.
 pub const COMMUNITY_REWARD_MIN_WORKER_STAKE: u64 = 0;
+
+/// Wire-compatible namespace for rollout recovery probes.  Recovery probes
+/// reuse the existing `assignment_epoch` commitment so old blocks retain the
+/// exact same bincode layout, while consensus can recognize the small subset
+/// that also needs a rollout/ordinal-wide replay marker across coordinators.
+pub const RECOVERY_REWARD_PROBE_PREFIX: [u8; 16] = *b"ARC-RCV-PROBE1\0\0";
 
 /// One validator's approval of a community reward's complete semantic
 /// commitment. The split 64-byte signature keeps the wire representation
@@ -909,6 +957,17 @@ impl CommunityInferenceRewardBody {
         arc_crypto::hash_bytes(&bytes)
     }
 
+    /// Protocol-v3 replay marker. The legacy full-hash derivation above must
+    /// remain stable for historical state; v3 writes the same transcript into
+    /// a transfer-inaccessible namespace so predictable jobs cannot be
+    /// pre-dusted by an ordinary account.
+    pub fn v3_marker_address(chain_domain: &Hash256, job_id: &Hash256) -> Address {
+        v3_system_account_address(
+            V3SystemAccountKind::CommunityRewardJob,
+            &Self::marker_address(chain_domain, job_id),
+        )
+    }
+
     /// Independent one-shot marker for the worker-signed certificate. A
     /// validator must not be able to wrap one valid certificate in fresh job
     /// IDs and collect the flat treasury reward repeatedly.
@@ -923,6 +982,54 @@ impl CommunityInferenceRewardBody {
         bytes.extend_from_slice(worker.as_ref());
         bytes.extend_from_slice(attestation_hash.as_ref());
         arc_crypto::hash_bytes(&bytes)
+    }
+
+    /// Protocol-v3 namespaced certificate replay marker.
+    pub fn v3_certificate_marker_address(
+        chain_domain: &Hash256,
+        worker: &Address,
+        attestation_hash: &Hash256,
+    ) -> Address {
+        v3_system_account_address(
+            V3SystemAccountKind::CommunityRewardCertificate,
+            &Self::certificate_marker_address(chain_domain, worker, attestation_hash),
+        )
+    }
+
+    /// Whether this assignment carries the explicit recovery-probe namespace.
+    pub fn is_recovery_probe_assignment(assignment_epoch: &Hash256) -> bool {
+        assignment_epoch.as_ref()[..RECOVERY_REWARD_PROBE_PREFIX.len()]
+            == RECOVERY_REWARD_PROBE_PREFIX
+    }
+
+    /// Cross-coordinator one-shot marker for a rollout-bound recovery probe.
+    ///
+    /// Normal community jobs deliberately share a random boot epoch and must
+    /// not receive this marker.  The fixed 128-bit namespace makes accidental
+    /// classification of a normal random epoch cryptographically negligible
+    /// without adding a field that would break historical bincode decoding.
+    pub fn recovery_probe_marker_address(
+        chain_domain: &Hash256,
+        assignment_epoch: &Hash256,
+    ) -> Option<Address> {
+        if !Self::is_recovery_probe_assignment(assignment_epoch) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(31 + 64);
+        bytes.extend_from_slice(b"arc-recovery-reward-probe-marker-v1");
+        bytes.extend_from_slice(chain_domain.as_ref());
+        bytes.extend_from_slice(assignment_epoch.as_ref());
+        Some(arc_crypto::hash_bytes(&bytes))
+    }
+
+    /// Protocol-v3 namespaced rollout-probe replay marker.
+    pub fn v3_recovery_probe_marker_address(
+        chain_domain: &Hash256,
+        assignment_epoch: &Hash256,
+    ) -> Option<Address> {
+        Self::recovery_probe_marker_address(chain_domain, assignment_epoch).map(|legacy| {
+            v3_system_account_address(V3SystemAccountKind::RecoveryRewardProbe, &legacy)
+        })
     }
 
     /// Common transcript independently signed by every reward approver.
@@ -1377,6 +1484,15 @@ impl FaucetClaimBody {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-faucet-recipient-marker-v1");
         hasher.update(recipient.as_ref());
         Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Protocol-v3 exactly-once marker protected from arbitrary transfer
+    /// writes. The original derivation remains the legacy/v2 state key.
+    pub fn v3_marker_address(recipient: &Address) -> Address {
+        v3_system_account_address(
+            V3SystemAccountKind::FaucetClaimMarker,
+            &Self::marker_address(recipient),
+        )
     }
 }
 
@@ -2265,6 +2381,79 @@ mod tests {
             }
             other => panic!("wrong variant after roundtrip: {:?}", other),
         }
+    }
+
+    #[test]
+    fn recovery_probe_marker_is_namespace_bound_and_cross_coordinator() {
+        let chain_domain = CommunityInferenceRewardBody::expected_chain_domain();
+        let mut encoded = [0u8; 32];
+        encoded[..RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&RECOVERY_REWARD_PROBE_PREFIX);
+        encoded[RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(7);
+        let probe_id = Hash256(encoded);
+        assert!(CommunityInferenceRewardBody::is_recovery_probe_assignment(
+            &probe_id
+        ));
+        let marker =
+            CommunityInferenceRewardBody::recovery_probe_marker_address(&chain_domain, &probe_id)
+                .expect("recovery namespace receives a marker");
+        assert_eq!(
+            Some(marker),
+            CommunityInferenceRewardBody::recovery_probe_marker_address(&chain_domain, &probe_id,)
+        );
+        assert!(
+            CommunityInferenceRewardBody::recovery_probe_marker_address(
+                &chain_domain,
+                &hash_bytes(b"ordinary-random-boot-epoch"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn v3_dynamic_system_accounts_have_distinct_reserved_128_bit_namespaces() {
+        let digest = hash_bytes(b"same transcript for every namespace");
+        let kinds = [
+            V3SystemAccountKind::CommunityRewardJob,
+            V3SystemAccountKind::CommunityRewardCertificate,
+            V3SystemAccountKind::RecoveryRewardProbe,
+            V3SystemAccountKind::CommunityRewardBlockBudget,
+            V3SystemAccountKind::CommunityRewardEpochBudget,
+            V3SystemAccountKind::CommunityRewardWorkerBudget,
+            V3SystemAccountKind::CommunityRewardCoordinatorBudget,
+            V3SystemAccountKind::FaucetClaimMarker,
+        ];
+        let addresses: Vec<_> = kinds
+            .iter()
+            .map(|kind| v3_system_account_address(*kind, &digest))
+            .collect();
+        let unique: std::collections::HashSet<_> =
+            addresses.iter().map(|address| address.0).collect();
+        assert_eq!(unique.len(), kinds.len());
+        for (address, kind) in addresses.iter().zip(kinds) {
+            assert!(is_v3_system_account(address));
+            assert_eq!(
+                &address.as_ref()[..V3_SYSTEM_ACCOUNT_PREFIX.len()],
+                &V3_SYSTEM_ACCOUNT_PREFIX
+            );
+            assert_eq!(address.as_ref()[V3_SYSTEM_ACCOUNT_PREFIX.len()], kind as u8);
+            assert_eq!(&address.as_ref()[16..], &digest.as_ref()[..16]);
+        }
+        assert!(!is_v3_system_account(&digest));
+
+        let chain_domain = CommunityInferenceRewardBody::expected_chain_domain();
+        let job = hash_bytes(b"job");
+        assert_ne!(
+            CommunityInferenceRewardBody::marker_address(&chain_domain, &job),
+            CommunityInferenceRewardBody::v3_marker_address(&chain_domain, &job),
+            "legacy full-hash state keys remain distinct and unchanged"
+        );
+        assert!(is_v3_system_account(
+            &CommunityInferenceRewardBody::v3_marker_address(&chain_domain, &job)
+        ));
+        assert!(is_v3_system_account(&FaucetClaimBody::v3_marker_address(
+            &hash_bytes(b"recipient")
+        )));
     }
 
     #[test]

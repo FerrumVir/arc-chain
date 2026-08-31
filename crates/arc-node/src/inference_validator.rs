@@ -42,6 +42,26 @@ use tracing::{info, warn};
 /// upper bound — finer polling than that wastes cycles.
 const TICK: Duration = Duration::from_millis(500);
 
+/// Candle's model object owns one mutable KV cache and therefore serializes
+/// work per loaded artifact. Admit only one Tier-1 compute at a time instead
+/// of spawning an unbounded set of blocking jobs that merely wait on the
+/// model lock. Public inference has its own independently bounded permits.
+const TIER1_INFERENCE_COMPUTE_CONCURRENCY: usize = 1;
+
+fn spawn_blocking_with_tier1_compute_permit<T, F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    compute: F,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _compute_permit = permit;
+        compute()
+    })
+}
+
 /// The validator background task.
 pub struct InferenceValidatorTask {
     pub state: Arc<StateDB>,
@@ -70,6 +90,7 @@ pub struct InferenceValidatorTask {
     /// retry every `FINALIZE_RETRY_AFTER` seconds while the request stays
     /// non-terminal.
     finalize_submitted: Arc<DashMap<[u8; 32], std::time::Instant>>,
+    compute_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// How long to wait after a finalize submit before allowing a retry on the
@@ -98,6 +119,9 @@ impl InferenceValidatorTask {
             model_id,
             voted: Arc::new(DashMap::new()),
             finalize_submitted: Arc::new(DashMap::new()),
+            compute_permits: Arc::new(tokio::sync::Semaphore::new(
+                TIER1_INFERENCE_COMPUTE_CONCURRENCY,
+            )),
         }
     }
 
@@ -108,13 +132,33 @@ impl InferenceValidatorTask {
     /// already have an `Arc<InferenceValidatorTask>`, call `run_arc` instead
     /// to avoid the move.
     pub async fn run(self) {
-        Self::run_arc(Arc::new(self)).await
+        Self::run_arc_inner(Arc::new(self), None).await
+    }
+
+    /// Run until the node lifecycle closes admission, then wait for every
+    /// already-started inference/vote job to finish before returning.
+    pub async fn run_with_shutdown(self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        Self::run_arc_inner(Arc::new(self), Some(shutdown)).await
     }
 
     /// Same as `run` but operates on a pre-built `Arc<Self>`. Used by
     /// integration tests that need to keep a reference for assertions
     /// while the loop runs.
     pub async fn run_arc(me: Arc<Self>) {
+        Self::run_arc_inner(me, None).await
+    }
+
+    pub async fn run_arc_with_shutdown(
+        me: Arc<Self>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        Self::run_arc_inner(me, Some(shutdown)).await
+    }
+
+    async fn run_arc_inner(
+        me: Arc<Self>,
+        mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
         info!(
             validator = %me.validator_address.to_hex(),
             has_engine = me.engine.is_some(),
@@ -123,14 +167,42 @@ impl InferenceValidatorTask {
         );
         let mut ticker = time::interval(TICK);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut jobs = tokio::task::JoinSet::new();
         loop {
-            ticker.tick().await;
-            me.tick().await;
+            tokio::select! {
+                biased;
+                _ = async {
+                    let Some(receiver) = shutdown.as_mut() else {
+                        std::future::pending::<()>().await;
+                        return;
+                    };
+                    loop {
+                        if *receiver.borrow_and_update() {
+                            return;
+                        }
+                        if receiver.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                } => break,
+                _ = ticker.tick() => me.tick(&mut jobs).await,
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        warn!(%error, "Tier 1 inference child task failed");
+                    }
+                }
+            }
         }
+        while let Some(result) = jobs.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "Tier 1 inference child task failed during shutdown");
+            }
+        }
+        info!("Tier 1 inference validator stopped at the lifecycle barrier");
     }
 
     /// One pass over the pending request set. Idempotent.
-    async fn tick(self: &Arc<Self>) {
+    async fn tick(self: &Arc<Self>, jobs: &mut tokio::task::JoinSet<()>) {
         let pending = self.state.tier1_pending_requests();
         if pending.is_empty() {
             return;
@@ -160,21 +232,30 @@ impl InferenceValidatorTask {
                 );
                 let in_committee = committee.iter().any(|a| a.0 == self.validator_address.0);
                 if in_committee {
-                    // Mark optimistically; clear on submission failure.
-                    self.voted.insert(request_id, ());
-                    let task = self.clone();
-                    let task_for_cleanup = self.clone();
-                    let snap_for_task = snap.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = task.run_inference_and_vote(snap_for_task).await {
-                            warn!(
-                                request_id = %hex::encode(request_id),
-                                error = %e,
-                                "Tier 1 vote submission failed"
-                            );
-                            task_for_cleanup.voted.remove(&request_id);
-                        }
-                    });
+                    // A busy model is retried on the next tick. Do not create
+                    // one waiter/task per pending request: the engine itself
+                    // is serialized, so queued blocking jobs add no throughput
+                    // and can exhaust runtime memory under adversarial demand.
+                    if let Ok(compute_permit) = self.compute_permits.clone().try_acquire_owned() {
+                        // Mark optimistically; clear on submission failure.
+                        self.voted.insert(request_id, ());
+                        let task = self.clone();
+                        let task_for_cleanup = self.clone();
+                        let snap_for_task = snap.clone();
+                        jobs.spawn(async move {
+                            if let Err(e) = task
+                                .run_inference_and_vote(snap_for_task, compute_permit)
+                                .await
+                            {
+                                warn!(
+                                    request_id = %hex::encode(request_id),
+                                    error = %e,
+                                    "Tier 1 vote submission failed"
+                                );
+                                task_for_cleanup.voted.remove(&request_id);
+                            }
+                        });
+                    }
                 }
             }
 
@@ -212,6 +293,7 @@ impl InferenceValidatorTask {
     async fn run_inference_and_vote(
         self: Arc<Self>,
         snap: Tier1RequestSnapshot,
+        compute_permit: tokio::sync::OwnedSemaphorePermit,
     ) -> anyhow::Result<()> {
         let request_id = snap.request_id;
         info!(
@@ -230,9 +312,9 @@ impl InferenceValidatorTask {
         let model_id = self
             .model_id
             .ok_or_else(|| anyhow::anyhow!("exact loaded model artifact commitment unavailable"))?;
-        let requested_model_id = self.request_model_id(&request_id).ok_or_else(|| {
-            anyhow::anyhow!("request model identity unavailable from chain state")
-        })?;
+        let (requested_model_id, requested_max_tokens, expected_input_hash) = self
+            .request_parameters(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("request parameters unavailable from chain state"))?;
         if model_id != requested_model_id {
             anyhow::bail!(
                 "request model 0x{} does not match loaded artifact 0x{}",
@@ -240,18 +322,23 @@ impl InferenceValidatorTask {
                 model_id.to_hex()
             );
         }
-        let snap_for_inf = snap.clone();
-        let (output_hash, output_blob) = tokio::task::spawn_blocking(move || {
-            Self::compute_output_blocking(
-                &engine,
-                &tokenizer,
-                model_id,
-                requested_model_id,
-                &snap_for_inf,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("inference task join: {}", e))??;
+        if arc_crypto::hash_bytes(&snap.input_blob) != expected_input_hash {
+            anyhow::bail!("request input blob does not match the canonical input commitment");
+        }
+        let generation_tokens =
+            Self::prepare_generation_tokens(&tokenizer, &snap.input_blob, requested_max_tokens)?;
+        let (output_hash, output_blob) =
+            spawn_blocking_with_tier1_compute_permit(compute_permit, move || {
+                Self::compute_output_blocking(
+                    &engine,
+                    model_id,
+                    requested_model_id,
+                    &generation_tokens,
+                    requested_max_tokens,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("inference task join: {}", e))??;
 
         // Submit InferenceVote tx
         let nonce = self
@@ -346,10 +433,10 @@ impl InferenceValidatorTask {
     /// artifact and could influence consensus.
     fn compute_output_blocking(
         engine: &Option<Arc<GgufEngine>>,
-        tokenizer: &Option<Arc<CachedIntegerModel>>,
         loaded_model_id: Hash256,
         requested_model_id: Hash256,
-        snap: &Tier1RequestSnapshot,
+        tokens: &[u32],
+        max_tokens: u32,
     ) -> anyhow::Result<(Hash256, Vec<u8>)> {
         if loaded_model_id != requested_model_id {
             anyhow::bail!("loaded model artifact does not match the requested model");
@@ -357,32 +444,73 @@ impl InferenceValidatorTask {
         let engine = engine
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("candle engine unavailable for requested artifact"))?;
-        let tok = tokenizer
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("tokenizer unavailable for requested artifact"))?;
-        let text = String::from_utf8_lossy(&snap.input_blob).to_string();
-        let templated = tok.apply_chat_template(&text);
-        let tokens = tok.encode(&templated);
-        if tokens.is_empty() {
-            anyhow::bail!("tokenizer produced 0 tokens");
-        }
         let result = engine
-            .generate(&loaded_model_id, &tokens, 32)
+            .generate(&loaded_model_id, tokens, max_tokens)
             .map_err(|e| anyhow::anyhow!("candle generate: {:?}", e))?;
         // Engine already provides bitwise-deterministic output bytes and the
         // BLAKE3 hash over them.
         Ok((result.output_hash, result.output))
     }
 
+    fn prepare_generation_tokens(
+        tokenizer: &Option<Arc<CachedIntegerModel>>,
+        input_blob: &[u8],
+        max_tokens: u32,
+    ) -> anyhow::Result<Vec<u32>> {
+        if input_blob.len() > arc_types::transaction::TIER1_INPUT_BLOB_MAX {
+            anyhow::bail!(
+                "tier1 input exceeds the chain-enforced {}-byte maximum",
+                arc_types::transaction::TIER1_INPUT_BLOB_MAX
+            );
+        }
+        if max_tokens == 0 || max_tokens > arc_types::transaction::TIER1_MAX_TOKENS {
+            anyhow::bail!(
+                "tier1 max_tokens {max_tokens} outside [1, {}]",
+                arc_types::transaction::TIER1_MAX_TOKENS
+            );
+        }
+        let tokenizer = tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer unavailable for requested artifact"))?;
+        let text = String::from_utf8_lossy(input_blob);
+        let templated = tokenizer.apply_chat_template(&text);
+        let encoded = tokenizer.encode(&templated);
+        Self::preflight_generation_context(encoded.len(), max_tokens, tokenizer.config.max_seq)?;
+        let mut tokens = Vec::with_capacity(encoded.len() + 1);
+        tokens.push(tokenizer.config.bos_token);
+        tokens.extend(encoded);
+        Ok(tokens)
+    }
+
+    fn preflight_generation_context(
+        encoded_prompt_tokens: usize,
+        max_tokens: u32,
+        context_window: usize,
+    ) -> anyhow::Result<usize> {
+        let input_tokens = encoded_prompt_tokens
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Tier-1 BOS position count overflow"))?;
+        arc_inference::candle_backend::GgufEngine::preflight_generation_for_context(
+            input_tokens,
+            max_tokens,
+            context_window,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid Tier-1 generation context: {error}"))
+    }
+
     /// Recover the model commitment from the canonical request transaction.
     /// If pruning or incomplete state makes it unavailable, voting fails
     /// closed instead of guessing from model dimensions or a display name.
-    fn request_model_id(&self, request_id: &[u8; 32]) -> Option<Hash256> {
+    fn request_parameters(&self, request_id: &[u8; 32]) -> Option<(Hash256, u32, Hash256)> {
         self.state.full_transactions.iter().find_map(|entry| {
             let TxBody::InferenceRequest(body) = &entry.value().body else {
                 return None;
             };
-            (body.request_id == *request_id).then_some(body.model_id)
+            (body.request_id == *request_id).then_some((
+                body.model_id,
+                body.max_tokens,
+                body.input_hash,
+            ))
         })
     }
 
@@ -420,5 +548,73 @@ impl InferenceValidatorTask {
             "Tier 1 finalize submitted"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tier1_context_preflight_counts_bos_and_full_requested_output() {
+        assert_eq!(
+            InferenceValidatorTask::preflight_generation_context(3, 3, 6).unwrap(),
+            6
+        );
+        let error = InferenceValidatorTask::preflight_generation_context(4, 3, 6)
+            .expect_err("one tokenizer-expanded position past context must fail");
+        assert!(error.to_string().contains("context_window_exceeded"));
+        assert!(InferenceValidatorTask::preflight_generation_context(1, 0, 6).is_err());
+    }
+
+    #[test]
+    fn tier1_compute_admission_has_no_waiter_queue() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(
+            TIER1_INFERENCE_COMPUTE_CONCURRENCY,
+        ));
+        let held = permits.clone().try_acquire_owned().unwrap();
+        assert!(
+            permits.clone().try_acquire_owned().is_err(),
+            "a busy model must be retried by the polling loop, not queued"
+        );
+        drop(held);
+        assert!(permits.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_tier1_waiter_cannot_release_blocking_compute_permit() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().try_acquire_owned().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(0);
+
+        let waiter = tokio::spawn(async move {
+            spawn_blocking_with_tier1_compute_permit(permit, move || {
+                let _ = started_tx.send(());
+                finish_rx.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(
+            permits.clone().try_acquire_owned().is_err(),
+            "cancelling the async waiter must not advertise capacity while blocking compute runs"
+        );
+
+        finish_tx.send(()).unwrap();
+        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(permit) = permits.clone().try_acquire_owned() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking compute did not release its permit after completion");
+        drop(reacquired);
     }
 }

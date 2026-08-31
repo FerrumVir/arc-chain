@@ -283,7 +283,7 @@ export function Settings() {
             data-testid="update-error"
           >
             {update.phase === "ready"
-              ? `Relaunch failed: ${update.error}`
+              ? `Safe restart blocked: ${update.error}`
               : `Update error: ${update.error}`}
           </p>
         )}
@@ -297,7 +297,7 @@ export function Settings() {
         >
           {updateInstallPolicy.data?.canInstall === false
             ? `Install policy: ${updateInstallPolicy.data.instructions}`
-            : "Install policy: after you choose Install, ARC downloads and verifies the signed bundle, installs it, then immediately relaunches. If installation fails, ARC keeps running this version."}
+            : "Install policy: after you choose Install, ARC downloads and verifies the signed bundle before installation starts. Once bundle installation begins, the node stays stopped until ARC exits; if completion cannot be verified, quit and reopen ARC (or reinstall from the verified release)."}
         </p>
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
           <button

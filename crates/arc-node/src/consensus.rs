@@ -798,9 +798,56 @@ impl ConsensusManager {
         &self,
         state: Arc<StateDB>,
         mempool: Arc<Mempool>,
+        inbound_rx: Option<mpsc::Receiver<InboundMessage>>,
+        outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
+        benchmark_pool: Option<Arc<crate::benchmark::BenchmarkPool>>,
+    ) {
+        self.run_consensus_loop_inner(
+            state,
+            mempool,
+            inbound_rx,
+            outbound_tx,
+            benchmark_pool,
+            None,
+        )
+        .await;
+    }
+
+    /// Run consensus until the node lifecycle requests shutdown.
+    ///
+    /// The receiver is checked before every new consensus tick. Returning from
+    /// this method therefore proves that no later proposal, commit, StateDB
+    /// mutation, or DAG-WAL append can start on this manager. The process-level
+    /// shutdown path joins the owning OS thread before its final StateDB WAL
+    /// barrier.
+    pub async fn run_consensus_loop_with_shutdown(
+        &self,
+        state: Arc<StateDB>,
+        mempool: Arc<Mempool>,
+        inbound_rx: Option<mpsc::Receiver<InboundMessage>>,
+        outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
+        benchmark_pool: Option<Arc<crate::benchmark::BenchmarkPool>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.run_consensus_loop_inner(
+            state,
+            mempool,
+            inbound_rx,
+            outbound_tx,
+            benchmark_pool,
+            Some(shutdown),
+        )
+        .await;
+    }
+
+    async fn run_consensus_loop_inner(
+        &self,
+        state: Arc<StateDB>,
+        mempool: Arc<Mempool>,
         mut inbound_rx: Option<mpsc::Receiver<InboundMessage>>,
         outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
         benchmark_pool: Option<Arc<crate::benchmark::BenchmarkPool>>,
+        mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
         use arc_types::Transaction;
         use dashmap::DashMap;
@@ -902,7 +949,31 @@ impl ConsensusManager {
             // At 50ms, rounds advance as fast as blocks propagate
             // (~100-200ms cross-continent = 5-10 rounds/sec actual).
             let tick = if self.is_multi_validator() { 50 } else { 1 };
-            tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
+            let tick_delay = tokio::time::Duration::from_millis(tick);
+            let shutdown_before_tick = if let Some(receiver) = shutdown.as_mut() {
+                if *receiver.borrow() {
+                    true
+                } else {
+                    tokio::select! {
+                        biased;
+                        changed = receiver.changed() => {
+                            changed.is_err() || *receiver.borrow_and_update()
+                        }
+                        _ = tokio::time::sleep(tick_delay) => false,
+                    }
+                }
+            } else {
+                tokio::time::sleep(tick_delay).await;
+                false
+            };
+            if shutdown_before_tick {
+                info!(
+                    round = self.engine.current_round(),
+                    committed_round = self.engine.last_committed_round(),
+                    "Consensus loop stopped at the lifecycle barrier"
+                );
+                break 'consensus_loop;
+            }
 
             // A previous reconnect attempt may have found the outbound queue
             // full. Retry its exact parent-first window before accepting a
@@ -2829,6 +2900,44 @@ mod tests {
                 (configured_peer, configured_stake)
             ],
             "transport discovery must not enter the RPC validator authority list"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_prevents_another_consensus_tick() {
+        let local_key = KeyPair::generate_ed25519();
+        let manager = ConsensusManager::new_with_keypair(
+            local_key.address(),
+            5_000_000,
+            4,
+            false,
+            &[],
+            local_key,
+        );
+        let state = Arc::new(StateDB::with_genesis(&[]));
+        let initial_height = state.height();
+        let mempool = Arc::new(Mempool::new(16));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            manager.run_consensus_loop_with_shutdown(
+                state.clone(),
+                mempool,
+                None,
+                None,
+                None,
+                shutdown_rx,
+            ),
+        )
+        .await
+        .expect("pre-signalled consensus shutdown must return promptly");
+
+        assert_eq!(
+            state.height(),
+            initial_height,
+            "a pre-signalled lifecycle barrier must prevent a new proposal or commit"
         );
     }
 }

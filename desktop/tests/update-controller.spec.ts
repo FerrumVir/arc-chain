@@ -93,6 +93,8 @@ test.describe("UpdateController", () => {
           checkCalls += 1;
           return null;
         },
+        prepareRelaunch: async () => {},
+        abortRelaunch: async () => {},
         relaunch: async () => {},
       },
       { startupDelayMs: 1_000, intervalMs: 10_000 },
@@ -131,6 +133,8 @@ test.describe("UpdateController", () => {
           checkCalls += 1;
           return pending.promise;
         },
+        prepareRelaunch: async () => {},
+        abortRelaunch: async () => {},
         relaunch: async () => {},
       },
       { startupDelayMs: 10, intervalMs: 20 },
@@ -148,7 +152,8 @@ test.describe("UpdateController", () => {
 
     pending.resolve({
       version: "0.8.0",
-      downloadAndInstall: async () => {},
+      download: async () => {},
+      install: async () => {},
     });
     await first;
     expect(controller.getSnapshot()).toMatchObject({
@@ -162,20 +167,30 @@ test.describe("UpdateController", () => {
   test("reports download progress, then marks ready and relaunches", async () => {
     const installDone = deferred<void>();
     const relaunchDone = deferred<void>();
-    let relaunchCalls = 0;
-    const downloadAndInstall = async (
+    const restartOrder: string[] = [];
+    const download = async (
       onEvent?: (event: UpdateDownloadEvent) => void,
     ) => {
+      restartOrder.push("download");
       onEvent?.({ event: "Started", data: { contentLength: 100 } });
       onEvent?.({ event: "Progress", data: { chunkLength: 35 } });
       onEvent?.({ event: "Finished" });
+    };
+    const install = async () => {
+      restartOrder.push("install");
       await installDone.promise;
     };
     const controller = createUpdateController({
       supported: true,
-      check: async () => ({ version: "0.8.0", downloadAndInstall }),
+      check: async () => ({ version: "0.8.0", download, install }),
+      prepareRelaunch: async () => {
+        restartOrder.push("stop-node");
+      },
+      abortRelaunch: async () => {
+        restartOrder.push("abort");
+      },
       relaunch: () => {
-        relaunchCalls += 1;
+        restartOrder.push("relaunch");
         return relaunchDone.promise;
       },
     });
@@ -191,7 +206,13 @@ test.describe("UpdateController", () => {
     });
 
     installDone.resolve();
-    while (relaunchCalls === 0) await Promise.resolve();
+    while (!restartOrder.includes("relaunch")) await Promise.resolve();
+    expect(restartOrder).toEqual([
+      "stop-node",
+      "download",
+      "install",
+      "relaunch",
+    ]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "ready",
       version: "0.8.0",
@@ -204,16 +225,28 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  test("never claims installation when the signed updater fails", async () => {
+  test("aborts the fence when download/signature verification fails before install", async () => {
     let relaunchCalls = 0;
+    let installCalls = 0;
+    const order: string[] = [];
     const controller = createUpdateController({
       supported: true,
       check: async () => ({
         version: "0.8.0",
-        downloadAndInstall: async () => {
+        download: async () => {
+          order.push("download");
           throw new Error("signature verification failed");
         },
+        install: async () => {
+          installCalls += 1;
+        },
       }),
+      prepareRelaunch: async () => {
+        order.push("prepare");
+      },
+      abortRelaunch: async () => {
+        order.push("abort");
+      },
       relaunch: async () => {
         relaunchCalls += 1;
       },
@@ -229,7 +262,92 @@ test.describe("UpdateController", () => {
       error: "signature verification failed",
     });
     expect(controller.getSnapshot().message).toContain("was not installed");
+    expect(installCalls).toBe(0);
     expect(relaunchCalls).toBe(0);
+    expect(order).toEqual(["prepare", "download", "abort"]);
+    controller.dispose();
+  });
+
+  test("keeps the native fence after install invocation rejects", async () => {
+    const order: string[] = [];
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.0",
+        download: async () => {
+          order.push("download");
+        },
+        install: async () => {
+          order.push("install");
+          throw new Error("bundle rename failed after mutation began");
+        },
+      }),
+      prepareRelaunch: async () => {
+        order.push("prepare");
+      },
+      abortRelaunch: async () => {
+        order.push("abort");
+        throw new Error("install rejection must never abort the fence");
+      },
+      relaunch: async () => {
+        order.push("relaunch");
+      },
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+
+    expect(order).toEqual(["prepare", "download", "install"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "ready",
+      restartRequired: true,
+      canInstall: false,
+      error: "bundle rename failed after mutation began",
+    });
+    expect(controller.getSnapshot().message).toContain("node remains safely stopped");
+    controller.dispose();
+  });
+
+  test("blocks relaunch when the old node cannot be stopped safely", async () => {
+    let downloadCalls = 0;
+    let installCalls = 0;
+    let relaunchCalls = 0;
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.0",
+        download: async () => {
+          downloadCalls += 1;
+        },
+        install: async () => {
+          installCalls += 1;
+        },
+      }),
+      prepareRelaunch: async () => {
+        throw new Error("old arc-node pid 4312 did not exit");
+      },
+      abortRelaunch: async () => {
+        throw new Error("abort must not run when prepare failed");
+      },
+      relaunch: async () => {
+        relaunchCalls += 1;
+      },
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+
+    expect(downloadCalls).toBe(0);
+    expect(installCalls).toBe(0);
+    expect(relaunchCalls).toBe(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      version: "0.8.0",
+      restartRequired: false,
+      canInstall: true,
+      error: "old arc-node pid 4312 did not exit",
+    });
+    expect(controller.getSnapshot().message).toContain("was not installed");
     controller.dispose();
   });
 
@@ -243,10 +361,15 @@ test.describe("UpdateController", () => {
         version: "0.8.1",
         canInstall: false,
         installInstructions: instructions,
-        downloadAndInstall: async () => {
+        download: async () => {
+          installCalls += 1;
+        },
+        install: async () => {
           installCalls += 1;
         },
       }),
+      prepareRelaunch: async () => {},
+      abortRelaunch: async () => {},
       relaunch: async () => {},
     });
 
@@ -276,8 +399,13 @@ test.describe("UpdateController", () => {
         checkCalls += 1;
         return {
           version: "0.8.0",
-          downloadAndInstall: async () => {},
+          download: async () => {},
+          install: async () => {},
         };
+      },
+      prepareRelaunch: async () => {},
+      abortRelaunch: async () => {
+        throw new Error("successful install must keep its fence");
       },
       relaunch: async () => {
         throw new Error("restart denied");
@@ -313,13 +441,16 @@ test.describe("UpdateController", () => {
         if (checkCalls === 1) {
           return {
             version: "0.8.0",
-            downloadAndInstall: async () => {
+            download: async () => {},
+            install: async () => {
               oldInstalls += 1;
             },
           };
         }
         return nextCheck.promise;
       },
+      prepareRelaunch: async () => {},
+      abortRelaunch: async () => {},
       relaunch: async () => {},
     });
 
@@ -331,7 +462,8 @@ test.describe("UpdateController", () => {
 
     nextCheck.resolve({
       version: "0.7.13",
-      downloadAndInstall: async () => {
+      download: async () => {},
+      install: async () => {
         newInstalls += 1;
       },
     });
@@ -360,6 +492,8 @@ test.describe("UpdateController", () => {
           checkCalls += 1;
           return null;
         },
+        prepareRelaunch: async () => {},
+        abortRelaunch: async () => {},
         relaunch: async () => {},
       },
       { startupDelayMs: 1, intervalMs: 2 },

@@ -854,27 +854,44 @@ Sample transaction hashes:
 
 #text(size: 9pt)[
 ```
-# Clone and build
-git clone https://github.com/FerrumVir/arc-chain.git
+# Fetch the exact reviewed source into a new checkout. The date-pinned Rust
+# toolchain must already be installed; this procedure never downloads and
+# pipes executable bootstrap code into a shell.
+ARC_SOURCE_REV=cfb4780030c76b79b4e16ebf912882102cf30192
+ARC_RUST_TOOLCHAIN=nightly-2025-05-31
+mkdir arc-chain && git -C arc-chain init
+git -C arc-chain remote add origin https://github.com/FerrumVir/arc-chain.git
+git -C arc-chain fetch --depth 1 origin "$ARC_SOURCE_REV"
+git -C arc-chain checkout --detach "$ARC_SOURCE_REV"
+test "$(git -C arc-chain rev-parse HEAD)" = "$ARC_SOURCE_REV"
+rustup run "$ARC_RUST_TOOLCHAIN" rustc --version
 cd arc-chain
-cargo build --release --features candle -p arc-node
+cargo +"$ARC_RUST_TOOLCHAIN" build --release --features candle -p arc-node
 
 # Download model
+MODEL_REPO=https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF
+MODEL_REV=191239b3e26b2882fb562ffccdd1cf0f65402adb
+MODEL_FILE=llama-2-7b-chat.Q4_K_M.gguf
 curl -L -o model.gguf \
-  https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf
+  "$MODEL_REPO/resolve/$MODEL_REV/$MODEL_FILE"
+test "$(wc -c < model.gguf | tr -d ' ')" = 4081004224
+printf '%s  %s\n' \
+  08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa \
+  model.gguf | sha256sum -c -
 
 # Run integer engine benchmark (cross-platform determinism)
-cargo run --example bench_int8 --features candle --release -- model.gguf 32
+cargo +"$ARC_RUST_TOOLCHAIN" run --example bench_int8 \
+  --features candle --release -- model.gguf 32
 
 # Evaluate perplexity (quality metric)
-cargo run --example eval_perplexity --features candle --release -- \
+cargo +"$ARC_RUST_TOOLCHAIN" run --example eval_perplexity --features candle --release -- \
     model.gguf /path/to/wikitext-2-raw/wiki.test.raw
 
 # Run STARK proof generation (60 proofs, 1B-70B dimensions)
-cargo run --example generate_proofs --features stwo-icicle --release
+cargo +"$ARC_RUST_TOOLCHAIN" run --example generate_proofs --features stwo-icicle --release
 
 # Run STARK proofs at real 7B layer dimensions (3x reproducibility)
-cargo run --example prove_7b_layers --features stwo-icicle --release
+cargo +"$ARC_RUST_TOOLCHAIN" run --example prove_7b_layers --features stwo-icicle --release
 
 # Start node with inference
 ./target/release/arc-node --model model.gguf --rpc 0.0.0.0:9090

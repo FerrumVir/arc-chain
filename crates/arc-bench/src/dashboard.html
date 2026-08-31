@@ -69,7 +69,7 @@
         .st-v { font-size: 1.8rem; font-weight: 600; font-variant-numeric: tabular-nums; }
         .st-l { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 0.15rem; }
 
-        /* Join */
+        /* Worker */
         .join {
             text-align: center; padding: 2rem; margin: 1.5rem 0;
             background: var(--surface); border: 1px solid var(--border);
@@ -139,9 +139,9 @@
     </div>
 
     <div class="join">
-        <h2>Join the Swarm</h2>
-        <code id="jc" onclick="copyCmd()">curl -sSL http://localhost:8080/join.sh | sh</code>
-        <div class="hint">Click to copy &middot; macOS or Linux</div>
+        <h2>Add a reviewed local worker</h2>
+        <code id="jc" onclick="copyCmd()">arc-bench-node worker --coord http://127.0.0.1:8080</code>
+        <div class="hint">Use a locally built binary from the same reviewed revision &middot; click to copy</div>
     </div>
 
     <div class="nodes-hdr"><h2>Active Nodes</h2></div>
@@ -226,7 +226,7 @@ function copyCmd() {
     const el=$('jc'), t=el.textContent;
     navigator.clipboard.writeText(t).then(()=>{ el.textContent='Copied!'; setTimeout(()=>el.textContent=t,1500); });
 }
-$('jc').textContent = `curl -sSL http://${location.host}/join.sh | sh`;
+$('jc').textContent = `arc-bench-node worker --coord ${location.protocol}//${location.host}`;
 connect(); tick();
 </script>
 </body>

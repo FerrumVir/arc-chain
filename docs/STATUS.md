@@ -4,9 +4,11 @@
 >
 > The body below is a **2026-04-22 snapshot** and much of it describes a v0.4.6
 > world: the release table stops at v0.4.6, it refers to a Mac joining as a
-> "9th node", and it says the community installer pulls v0.4.6. The workspace
-> is now the **unreleased v0.8.0 recovery candidate**; public v0.7.11 is
-> desktop-only, while the seeds still run v0.7.2/v0.7.9.
+> "9th node", and it says the community installer pulls v0.4.6. At the
+> 2026-08-31 source-freeze review cutoff, the workspace was the **unreleased
+> v0.8.0 recovery candidate**; public v0.7.11 was desktop-only, while the seeds
+> still ran v0.7.2/v0.7.9. That sentence is historical status, not a live
+> probe.
 >
 > Two sections have been corrected in place because they were actively
 > misleading — the precision claim (see "On precision" below) and the pointers
@@ -21,7 +23,7 @@
 > - [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) — gated recording script
 > - [`docs/VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) — blocking cutover checklist
 > - [`ALERTS.md`](../ALERTS.md) — what is broken on the live network right now
-> - [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — the current run-of-show
+> - [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — archived public-v2 diagnostic runbook
 > - [`CLAUDE.md`](../CLAUDE.md) — live network table and safety rules
 > - [`docs/TESTNET_STATE_DIVERGENCE_2026-06-03.md`](TESTNET_STATE_DIVERGENCE_2026-06-03.md) — why the seeds are not one chain
 >
@@ -34,15 +36,10 @@ A real **Llama-2-7B** is running across **6 separate VPS in 6 cities** (NYC, LAX
 
 **Live demo**: http://140.82.16.112:3200 - type a prompt in the "Sharded AI" panel.
 
-**One-command end-to-end demo**:
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
-```
-
-**One-command verify the network's most recent inference**:
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh | bash -s -- --latest
-```
+**Historical one-command demo and verifier:** retired and intentionally
+omitted. Both downloaded mutable default-branch scripts into a shell. Use a
+reviewed local checkout and the current runbook; do not execute commands from
+this archived snapshot.
 
 **Historical one-command join:** retired; do not run it. The replacement is
 documented in [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) and is not usable
@@ -196,9 +193,10 @@ is not yet accurate.
 
 1. **Read** [`ALERTS.md`](../ALERTS.md) — four active alerts, including block
    production stalled on 4 of 6 seeds for ~6 days.
-2. **Read** [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — the current run-of-show.
-   It supersedes `docs/SERO-DEMO.md`, which describes a 7-node topology that no
-   longer exists.
+2. **Read** [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md)
+   — the current gated recording run-of-show. `docs/DEMO-RUNBOOK.md` and
+   `docs/SERO-DEMO.md` are archived public-v2 diagnostics, not current rollout
+   instructions.
 3. **Try the verifier**: `bash scripts/arc-verify.sh --latest`. It now sweeps
    every seed and reports whether the re-run was recomputed or served from
    cache.

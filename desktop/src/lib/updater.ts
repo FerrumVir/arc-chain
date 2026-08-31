@@ -29,15 +29,18 @@ export const appUpdater = createUpdateController({
       version: update.version,
       canInstall: policy.canInstall,
       installInstructions: policy.instructions,
-      downloadAndInstall: (onEvent) =>
-        update.downloadAndInstall(
+      download: (onEvent) =>
+        update.download(
           onEvent as ((event: DownloadEvent) => void) | undefined,
           { timeout: DOWNLOAD_TIMEOUT_MS },
         ),
+      install: () => update.install(),
       close: () => update.close(),
     };
     return candidate;
   },
+  prepareRelaunch: api.prepareUpdateRelaunch,
+  abortRelaunch: api.abortUpdateRelaunch,
   relaunch: tauriRelaunch,
 });
 

@@ -17,6 +17,39 @@ use arc_crypto::Hash256;
 #[cfg(feature = "candle")]
 use tracing::info;
 
+/// The quantized-Llama backend precomputes RoPE tables for exactly this many
+/// positions. Keep the public admission contract visibly tied to the backend
+/// constant so a dependency upgrade cannot silently widen or shrink it.
+pub const GGUF_CONTEXT_WINDOW: usize = 4096;
+
+#[cfg(feature = "candle")]
+const _: () =
+    assert!(GGUF_CONTEXT_WINDOW == candle_transformers::models::quantized_llama::MAX_SEQ_LEN);
+
+fn generation_index_pos(
+    input_tokens: usize,
+    generation_step: u32,
+) -> Result<usize, InferenceError> {
+    if generation_step == 0 {
+        return Ok(0);
+    }
+    let decoded = usize::try_from(generation_step - 1)
+        .map_err(|_| InferenceError::Runtime("generation position overflow".to_string()))?;
+    input_tokens
+        .checked_add(decoded)
+        .ok_or_else(|| InferenceError::Runtime("generation position overflow".to_string()))
+}
+
+fn enforce_generation_timeout(elapsed_ms: u64, limit_ms: u64) -> Result<(), InferenceError> {
+    if elapsed_ms > limit_ms {
+        return Err(InferenceError::Timeout {
+            elapsed_ms,
+            limit_ms,
+        });
+    }
+    Ok(())
+}
+
 /// GGUF model inference engine.
 ///
 /// Loads quantized models from GGUF files and executes transformer
@@ -54,6 +87,50 @@ impl GgufEngine {
             #[cfg(feature = "candle")]
             models: dashmap::DashMap::new(),
         }
+    }
+
+    /// Reject an untrusted prompt before model lookup, KV-cache mutation or
+    /// tensor allocation. The first forward consumes the whole prompt and
+    /// produces token one; each later token consumes one additional RoPE
+    /// position, so the exact requirement is `prompt + max_tokens - 1`.
+    pub fn preflight_generation(
+        input_tokens: usize,
+        max_tokens: u32,
+    ) -> Result<usize, InferenceError> {
+        Self::preflight_generation_for_context(input_tokens, max_tokens, GGUF_CONTEXT_WINDOW)
+    }
+
+    /// Apply a paired tokenizer/model context limit in addition to Candle's
+    /// fixed backend ceiling. Callers that loaded tokenizer metadata from the
+    /// same artifact use this before dispatching blocking work.
+    pub fn preflight_generation_for_context(
+        input_tokens: usize,
+        max_tokens: u32,
+        context_window: usize,
+    ) -> Result<usize, InferenceError> {
+        if input_tokens == 0 {
+            return Err(InferenceError::Runtime(
+                "empty_prompt: GGUF generation requires at least one input token".to_string(),
+            ));
+        }
+        if max_tokens == 0 {
+            return Err(InferenceError::Runtime(
+                "invalid_max_tokens: GGUF generation requires at least one output token"
+                    .to_string(),
+            ));
+        }
+        let decode_positions = usize::try_from(max_tokens - 1)
+            .map_err(|_| InferenceError::Runtime("generation position overflow".to_string()))?;
+        let required_positions = input_tokens
+            .checked_add(decode_positions)
+            .ok_or_else(|| InferenceError::Runtime("generation position overflow".to_string()))?;
+        let effective_context_window = context_window.min(GGUF_CONTEXT_WINDOW);
+        if required_positions > effective_context_window {
+            return Err(InferenceError::Runtime(format!(
+                "context_window_exceeded: {input_tokens} prompt tokens + {decode_positions} subsequent decode positions requires {required_positions} positions, but the paired GGUF context supports at most {effective_context_window}"
+            )));
+        }
+        Ok(required_positions)
     }
 
     /// Load a GGUF quantized model from a file path.
@@ -154,6 +231,7 @@ impl GgufEngine {
     ) -> Result<InferenceResult, InferenceError> {
         use candle_core::{Device, Tensor};
 
+        Self::preflight_generation(input_tokens.len(), max_tokens)?;
         let start = std::time::Instant::now();
 
         let mut model_ref = self
@@ -169,8 +247,7 @@ impl GgufEngine {
         let mut generated_tokens: Vec<u32> = Vec::new();
 
         // Autoregressive generation
-        let tokens_to_generate = max_tokens.min(256);
-        for i in 0..tokens_to_generate {
+        for i in 0..max_tokens {
             let context = if i == 0 {
                 // First pass: use full input
                 Tensor::new(all_tokens.as_slice(), &device)
@@ -193,7 +270,7 @@ impl GgufEngine {
             // Forward pass through quantized transformer
             let logits = model_ref
                 .model
-                .forward(&context, i as usize)
+                .forward(&context, generation_index_pos(input_tokens.len(), i)?)
                 .map_err(|e| InferenceError::Runtime(format!("Forward: {e}")))?;
 
             // Get logits for last position
@@ -218,15 +295,12 @@ impl GgufEngine {
             generated_tokens.push(next_token);
             all_tokens.push(next_token);
 
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            enforce_generation_timeout(elapsed_ms, self.timeout_ms)?;
+
             // Stop on EOS - token 2 (LLaMA-2), 128001/128009 (LLaMA-3)
             // Token 0 is PAD, not EOS - do not stop on it
             if matches!(next_token, 2 | 128001 | 128009) {
-                break;
-            }
-
-            // Timeout check
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            if elapsed_ms > self.timeout_ms {
                 break;
             }
         }
@@ -298,6 +372,38 @@ mod tests {
     fn test_gguf_engine_creation() {
         let engine = GgufEngine::new(30_000);
         assert_eq!(engine.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn gguf_context_preflight_accepts_exact_boundary_and_rejects_plus_one() {
+        assert_eq!(
+            GgufEngine::preflight_generation(GGUF_CONTEXT_WINDOW - 3, 4).unwrap(),
+            GGUF_CONTEXT_WINDOW
+        );
+        let error = GgufEngine::preflight_generation(GGUF_CONTEXT_WINDOW - 3, 5)
+            .expect_err("one position past the backend RoPE table must fail before compute");
+        assert!(error.to_string().contains("context_window_exceeded"));
+        assert!(GgufEngine::preflight_generation(0, 1).is_err());
+        assert!(GgufEngine::preflight_generation(1, 0).is_err());
+    }
+
+    #[test]
+    fn gguf_decode_positions_follow_prompt_tail_not_generation_ordinal() {
+        assert_eq!(generation_index_pos(37, 0).unwrap(), 0);
+        assert_eq!(generation_index_pos(37, 1).unwrap(), 37);
+        assert_eq!(generation_index_pos(37, 2).unwrap(), 38);
+    }
+
+    #[test]
+    fn gguf_timeout_is_a_typed_failure_not_partial_success() {
+        assert!(enforce_generation_timeout(100, 100).is_ok());
+        assert!(matches!(
+            enforce_generation_timeout(101, 100),
+            Err(InferenceError::Timeout {
+                elapsed_ms: 101,
+                limit_ms: 100,
+            })
+        ));
     }
 
     #[cfg(not(feature = "candle"))]

@@ -27,9 +27,12 @@ export interface UpdateCandidate {
   canInstall?: boolean;
   /** Exact next step shown when `canInstall` is false. */
   installInstructions?: string;
-  downloadAndInstall: (
+  /** Download and signature-verify without mutating the installed bundle. */
+  download: (
     onEvent?: (event: UpdateDownloadEvent) => void,
   ) => Promise<void>;
+  /** Begin bundle mutation. Any return or rejection is an irreversible fence boundary. */
+  install: () => Promise<void>;
   close?: () => Promise<void>;
 }
 
@@ -48,6 +51,10 @@ export interface UpdateSnapshot {
 export interface UpdateRuntime {
   supported: boolean;
   check: () => Promise<UpdateCandidate | null>;
+  /** Stop/reap arc-node and retain its cross-process lifecycle fence. */
+  prepareRelaunch: () => Promise<void>;
+  /** Release that fence only after the signed installer rejects/cancels. */
+  abortRelaunch: () => Promise<void>;
   relaunch: () => Promise<void>;
   now?: () => number;
 }
@@ -307,8 +314,16 @@ export class UpdateController {
     });
 
     const install = (async () => {
+      let prepared = false;
+      let installInvoked = false;
       try {
-        await candidate.downloadAndInstall((event) => {
+        // Establish the native durability boundary before the updater mutates
+        // the app bundle. The shutdown receipt binds the exact arc-node and
+        // genesis bytes; installing first could replace those resources and
+        // make a failed old-node shutdown impossible to recover safely.
+        await this.runtime.prepareRelaunch();
+        prepared = true;
+        await candidate.download((event) => {
           if (event.event === "Started") {
             this.setSnapshot({
               ...this.snapshot,
@@ -335,33 +350,69 @@ export class UpdateController {
           }
         });
 
+        // The pinned Tauri installer can reject after it has already renamed
+        // or replaced bundle paths. From the instant install() is invoked, a
+        // rejection therefore cannot prove that the old bundle is intact and
+        // must never release the native node/update fence.
+        installInvoked = true;
+        await candidate.install();
+
         this.candidate = null;
         void candidate.close?.().catch(() => {});
         this.setSnapshot({
           ...this.snapshot,
           phase: "ready",
           version,
-          message: `Version ${version} installed. Restarting ARC now…`,
+          message: `Version ${version} installed. Safely stopping the node before restart…`,
           error: null,
           canInstall: false,
           restartRequired: true,
         });
 
         try {
+          this.setSnapshot({
+            ...this.snapshot,
+            message: `Version ${version} installed. Restarting ARC now…`,
+          });
           await this.runtime.relaunch();
         } catch (error) {
           const detail = errorMessage(error);
           this.setSnapshot({
             ...this.snapshot,
             phase: "ready",
-            message: `Version ${version} is installed, but ARC could not relaunch. Close and reopen the app to finish updating.`,
+            message: `Version ${version} is installed, but ARC could not safely stop the old node and relaunch. Quit ARC from the tray, then reopen it to finish updating.`,
             error: detail,
             canInstall: false,
             restartRequired: true,
           });
         }
       } catch (error) {
-        const detail = errorMessage(error);
+        let detail = errorMessage(error);
+        if (prepared && !installInvoked) {
+          // Download/signature verification failed before install() was
+          // invoked. Only this pre-mutation failure may release the native
+          // fence, and native code still re-proves that no writer/receipt is
+          // live before doing so.
+          try {
+            await this.runtime.abortRelaunch();
+          } catch (abortError) {
+            detail = `${detail}; failed-update lifecycle fence remains active: ${errorMessage(abortError)}`;
+          }
+        }
+        if (installInvoked) {
+          this.candidate = null;
+          void candidate.close?.().catch(() => {});
+          this.setSnapshot({
+            ...this.snapshot,
+            phase: "ready",
+            version,
+            message: `ARC could not verify that update ${version} finished installing. The node remains safely stopped. Quit ARC from the tray, then reopen it; reinstall from the verified release if ARC does not reopen.`,
+            error: detail,
+            canInstall: false,
+            restartRequired: true,
+          });
+          return this.snapshot;
+        }
         this.setSnapshot({
           ...this.snapshot,
           phase: "error",

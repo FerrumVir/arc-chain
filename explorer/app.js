@@ -46,7 +46,7 @@
 
   function extractRows(payload) {
     if (Array.isArray(payload)) return payload;
-    for (const key of ["attestations", "transactions", "items", "records", "activity", "workers"]) {
+    for (const key of ["activities", "attestations", "transactions", "items", "records", "activity", "workers"]) {
       if (Array.isArray(payload?.[key])) return payload[key];
       if (Array.isArray(payload?.data?.[key])) return payload.data[key];
     }
@@ -61,6 +61,30 @@
     return null;
   }
 
+  function integerOrNull(...values) {
+    for (const value of values) {
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+      if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+        const parsed = Number(value);
+        if (Number.isSafeInteger(parsed)) return parsed;
+      }
+    }
+    return null;
+  }
+
+  function formatExactInteger(value) {
+    if (typeof value === "number") {
+      return Number.isSafeInteger(value) && value >= 0
+        ? new Intl.NumberFormat().format(value)
+        : "Unavailable";
+    }
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+      try { return new Intl.NumberFormat().format(BigInt(value.trim())); }
+      catch (_) { return "Unavailable"; }
+    }
+    return "Unavailable";
+  }
+
   function reportedHeight(snapshot) {
     const values = [
       snapshot?.health?.height,
@@ -70,7 +94,7 @@
       snapshot?.stats?.height,
       snapshot?.stats?.block_height,
       network.blockHeight(snapshot?.latest),
-    ].map((value) => numberOrNull(value)).filter((value) => value !== null);
+    ].map((value) => integerOrNull(value)).filter((value) => value !== null);
     return values.length ? Math.max(...values) : null;
   }
 
@@ -136,10 +160,24 @@
     return { ...route, canonical: false, configuredCanonical: true, reason, warning };
   }
 
+  async function requireLegacyArchiveProvenance(source, fetchImpl, signal) {
+    if (source?.kind !== "legacy-fork") return null;
+    const verification = await network.verifyLegacyArchiveSource({ source, fetchImpl, signal });
+    if (verification.state !== "verified") {
+      throw new RpcError(
+        `Legacy archive provenance rejected (${verification.reason || verification.state})`,
+        0,
+        source.id,
+      );
+    }
+    return verification;
+  }
+
   async function queryBlock(options) {
     const { resolver, fetchImpl, height, sourceId, signal, checkpointAudit } = options;
     const configuredRoute = resolver.routeBlock(height, { sourceId });
     if (!configuredRoute.ok) throw new RpcError(`Cannot resolve block: ${configuredRoute.reason}`, 0, configuredRoute.sourceId);
+    const archiveVerification = await requireLegacyArchiveProvenance(configuredRoute.source, fetchImpl, signal);
     const [blockResult, txsResult] = await Promise.all([
       optionalRequest(fetchImpl, configuredRoute.source, `/block/${configuredRoute.height}`, { signal }),
       optionalRequest(fetchImpl, configuredRoute.source, `/block/${configuredRoute.height}/txs?offset=0&limit=100`, { signal }),
@@ -163,6 +201,7 @@
       block: blockResult.value,
       transactions: txsResult.ok ? txsResult.value : null,
       boundary,
+      archiveVerification,
     };
   }
 
@@ -170,22 +209,43 @@
     const { resolver, fetchImpl, hash, sourceId, signal, checkpointAudit } = options;
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
-      const [full, receipt] = await Promise.all([
+      const archiveVerification = await requireLegacyArchiveProvenance(source, fetchImpl, signal);
+      const [full, receipt, occurrence] = await Promise.all([
         optionalRequest(fetchImpl, source, `/tx/${hash}/full`, { signal }),
         optionalRequest(fetchImpl, source, `/tx/${hash}`, { signal }),
+        source.kind === "legacy-fork"
+          ? optionalRequest(fetchImpl, source, `/tx/${hash}/occurrences`, { signal })
+          : Promise.resolve({ ok: false, error: null }),
       ]);
-      if (!full.ok && !receipt.ok) return { source, found: false, errors: [full.error, receipt.error] };
+      if (!full.ok && !receipt.ok && !occurrence.ok) {
+        return { source, found: false, errors: [full.error, receipt.error, occurrence.error].filter(Boolean) };
+      }
       const fullValue = full.ok ? full.value : null;
       const receiptValue = receipt.ok ? receipt.value : null;
+      const occurrenceValue = occurrence.ok ? occurrence.value : null;
       const classification = network.classifyReceipt({
         tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue,
         receipt: receiptValue?.receipt ?? receiptValue,
       });
-      const configured = classification.height === null
+      const occurrenceRows = Array.isArray(occurrenceValue?.occurrences) ? occurrenceValue.occurrences : [];
+      const occurrenceHeight = occurrenceValue?.unique_occurrence === true && occurrenceRows.length === 1
+        ? integerOrNull(occurrenceRows[0]?.block_height)
+        : null;
+      const evidenceHeight = classification.height ?? occurrenceHeight;
+      const configured = evidenceHeight === null
         ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" }
-        : resolver.classifyOccurrence(source.id, classification.height);
+        : resolver.classifyOccurrence(source.id, evidenceHeight);
       const provenance = network.gateCanonical(configured, checkpointAudit);
-      return { source, found: true, full: fullValue, receipt: receiptValue, classification, provenance };
+      return {
+        source,
+        found: true,
+        full: fullValue,
+        receipt: receiptValue,
+        occurrence: occurrenceValue,
+        classification,
+        provenance,
+        archiveVerification,
+      };
     }));
     return {
       occurrences: attempts.filter((attempt) => attempt.found),
@@ -198,6 +258,7 @@
     const { resolver, fetchImpl, address, sourceId, signal, checkpointAudit } = options;
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
+      const archiveVerification = await requireLegacyArchiveProvenance(source, fetchImpl, signal);
       const [account, history] = await Promise.all([
         optionalRequest(fetchImpl, source, `/account/${address}`, { signal }),
         optionalRequest(fetchImpl, source, `/account/${address}/txs`, { signal }),
@@ -211,7 +272,7 @@
         configuredCanonical ? { canonical: true, segment: "canonical-segment-source" } : { canonical: false, segment: "alternate-source" },
         checkpointAudit,
       );
-      return { source, found, account: account.ok ? account.value : null, history: historyValue, provenance };
+      return { source, found, account: account.ok ? account.value : null, history: historyValue, provenance, archiveVerification };
     }));
     return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
   }
@@ -236,10 +297,7 @@
       if (content !== undefined && content !== null) node.textContent = String(content);
       return node;
     };
-    const formatInteger = (value) => {
-      const number = numberOrNull(value);
-      return number === null ? "Unavailable" : new Intl.NumberFormat().format(number);
-    };
+    const formatInteger = formatExactInteger;
     const formatTimestamp = (timestamp) => {
       const raw = numberOrNull(timestamp);
       if (raw === null) return "Unavailable";
@@ -396,8 +454,9 @@
       for (const { row, receipt } of confirmed.slice(0, 8)) {
         const card = create("article", "evidence-card");
         const heading = create("div", "evidence-heading");
-        heading.append(create("strong", "", `Inference receipt · #${formatInteger(receipt.height)}`), create("span", "status-pill online", "MINED SUCCESS"));
-        card.append(heading, create("code", "", receipt.txHash ? `0x${receipt.txHash}` : "Transaction hash unavailable"), create("small", "", `Source: ${source.name} · ${row.model_id ? `model ${network.formatHash(row.model_id)}` : "model unavailable"}`));
+        heading.append(create("strong", "", `Inference receipt · #${formatInteger(receipt.height)}`), create("span", "status-pill online", receipt.paymentConfirmed ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
+        const model = row.inference?.model_hash ?? row.model_id;
+        card.append(heading, create("code", "", receipt.txHash ? `0x${receipt.txHash}` : "Transaction hash unavailable"), create("small", "", `Source: ${source.name} · ${model ? `model ${network.formatHash(model)}` : "model unavailable"}`));
         if (receipt.txHash) card.addEventListener("click", () => navigate("tx", receipt.txHash));
         elements.inferenceList.append(card);
       }
@@ -418,16 +477,18 @@
       const active = economicValue(payload, ["community_rewards_v1_protocol_active", "protocol_active", "issuance.protocol_active"]);
       const reward = economicValue(payload, ["attestation_reward_arc", "community_attestation_reward_arc", "reward_per_attestation_arc"]);
       const observed = economicValue(payload, ["attestations_per_day_observed", "observed.attestations_per_day"]);
-      const projected = numberOrNull(payload?.projected_daily_arc);
       const projectionReason = typeof payload?.projected_daily_unavailable_reason === "string" && payload.projected_daily_unavailable_reason.trim()
         ? payload.projected_daily_unavailable_reason.trim()
-        : "worker-specific authoritative projection is available only from /worker/earnings/{worker}";
+        : "worker-specific authoritative projection is available only from /worker/earnings/{worker} after at least 3 exact successful mined 0x25 receipts spanning 24 hours";
       const readiness = enabled === true && active === true ? "Enabled and protocol-active" : enabled === false || active === false ? "Not issuing" : "Unavailable";
       elements.rewardsList.append(
         fact("Issuance", readiness),
         fact("Attestation reward", reward === null ? "Unavailable" : `${reward} ARC configured rate`),
         fact("Observed worker rate", observed === null ? "Unavailable" : `${observed}/day · backward-looking`),
-        fact("Projected earnings", projected !== null && projected >= 0 ? `${projected} ARC/day · endpoint projection, not earned` : `Unavailable · ${projectionReason}`),
+        // `/economics/rewards` has no worker identity or exact receipt rows.
+        // A numeric field on this fleet-wide endpoint can never establish a
+        // worker projection, so the explorer always withholds it.
+        fact("Projected earnings", `Unavailable · ${projectionReason}`),
       );
       text(elements.rewardsStatus, payload ? "Current source report" : "Unavailable");
     }
@@ -442,7 +503,7 @@
       ]);
       const [health, info, stats, validators, latest] = requests.map((result) => result.ok ? result.value : null);
       if (!requests.some((result) => result.ok)) throw requests[0].error;
-      const height = network.blockHeight(latest) ?? numberOrNull(health?.height, info?.block_height, stats?.block_height);
+      const height = network.blockHeight(latest) ?? integerOrNull(health?.height, info?.block_height, stats?.block_height);
       let blocks = latest ? [latest] : [];
       if (height !== null) {
         const from = Math.max(0, height - 11);
@@ -474,13 +535,29 @@
       const alternate = state.sourceId !== "canonical" && source.id !== state.config.checkpoint?.v3SourceId && source.id !== state.config.checkpoint?.legacySourceId;
       setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
       try {
-        const [snapshotResult, checkpointAudit, inferenceResult, rewardsResult] = await Promise.all([
+        await requireLegacyArchiveProvenance(source, window.fetch.bind(window), signal);
+        const [snapshotResult, checkpointAudit, inferenceResult, rewardsResult, maintenanceAudit] = await Promise.all([
           loadSnapshot(source, signal).then((value) => ({ ok: true, value }), (error) => ({ ok: false, error })),
           verifyRecoveryCheckpoint({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
           optionalRequest(window.fetch.bind(window), source, "/inference/attestations?limit=20", { signal }),
           optionalRequest(window.fetch.bind(window), source, "/economics/rewards", { signal }),
+          network.auditMaintenanceInterlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
         ]);
         if (signal.aborted) return;
+        if (!alternate && maintenanceAudit.state !== "healthy") {
+          state.checkpointAudit = { state: "unknown", reason: maintenanceAudit.reason || "maintenance-interlock-not-healthy" };
+          resetMetrics();
+          renderFacts(source, null, null);
+          renderRecovery(state.checkpointAudit);
+          renderBlocks([], source);
+          renderInference(null, source);
+          renderRewards(null);
+          text(elements.blocksStatus, "Paused by maintenance interlock");
+          text(elements.inferenceStatus, "Paused by maintenance interlock");
+          text(elements.rewardsStatus, "Paused by maintenance interlock");
+          setBanner("error", "Network maintenance safety interlock active", `Canonical publication is paused: ${maintenanceAudit.reason || "fresh six-validator maintenance evidence is unavailable"}. Preserved alternate archives remain explicitly queryable.`);
+          return;
+        }
         if (!snapshotResult.ok) throw snapshotResult.error;
         state.checkpointAudit = checkpointAudit;
         const snapshot = snapshotResult.value;
@@ -583,25 +660,32 @@
         ]), rawSection("Block response", result.block));
         if (result.transactions) elements.inspectorContent.append(rawSection("Transaction index response", result.transactions));
       } catch (error) {
-        if (!state.lookupController.signal.aborted) inspectorError("Block", "Block unavailable", error.message);
+        if (!signal.aborted) inspectorError("Block", "Block unavailable", error.message);
       }
     }
 
     function occurrenceCard(occurrence) {
       const { source, classification, provenance } = occurrence;
+      const archiveOccurrences = Array.isArray(occurrence.occurrence?.occurrences)
+        ? occurrence.occurrence.occurrences
+        : [];
+      const preservedHeight = occurrence.occurrence?.unique_occurrence === true && archiveOccurrences.length === 1
+        ? integerOrNull(archiveOccurrences[0]?.block_height)
+        : null;
       const card = create("article", `occurrence-card ${provenance.canonical ? "canonical" : "alternate"}`);
       const heading = create("div", "evidence-heading");
       heading.append(create("strong", "", sourceDisplay(source)), create("span", `status-pill ${provenance.canonical ? "online" : "degraded"}`, provenance.canonical ? "CANONICAL" : "NOT CANONICAL"));
       card.append(heading, detailGrid([
-        ["Receipt", classification.receiptBacked ? classification.status : "Absent / unproven"],
+        ["Receipt", classification.receiptBacked ? classification.status : preservedHeight === null ? "Absent / unproven" : "Pruned · block inclusion preserved"],
         ["Category", classification.category],
-        ["Block", formatInteger(classification.height)],
+        ["Block", formatInteger(classification.height ?? preservedHeight)],
         ["Segment", provenance.segment?.replaceAll("-", " ")],
         ["Inference", classification.inferenceConfirmed ? "Confirmed mined receipt" : "Not confirmed"],
         ["Reward", classification.rewardEarned ? "Earned · successful mined receipt" : "Not counted as earned"],
       ]));
       if (occurrence.full) card.append(rawSection("Transaction", occurrence.full));
       if (occurrence.receipt) card.append(rawSection("Receipt", occurrence.receipt));
+      if (occurrence.occurrence) card.append(rawSection("Preserved block occurrence", occurrence.occurrence));
       return card;
     }
 
@@ -730,6 +814,8 @@
     classifyLookup,
     extractBlocks,
     extractRows,
+    integerOrNull,
+    formatExactInteger,
     reportedHeight,
     requestJson,
     verifyRecoveryCheckpoint,

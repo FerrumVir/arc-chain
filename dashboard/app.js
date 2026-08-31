@@ -10,6 +10,13 @@
   if (!network) throw new Error("ARC network resolver did not load");
   const REQUEST_TIMEOUT_MS = 8_000;
   const REFRESH_INTERVAL_MS = 30_000;
+  const COMMUNITY_REWARD_BASE = 2_500_000_000;
+  const COMMUNITY_REWARD_ARC = 2.5;
+  const MIN_PROJECTION_RECEIPTS = 3;
+  const MIN_PROJECTION_WINDOW_MS = 86_400_000;
+  const PROJECTION_COLLECTING_REASON = "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries";
+  const PROJECTION_WINDOW_REASON = "collecting data: this host has not supplied a valid confirmed-receipt window spanning at least 24 hours";
+  const PROJECTION_RECEIPT_EVIDENCE_REASON = "confirmed mined 0x25 receipt evidence is unavailable or internally inconsistent";
 
   class RpcError extends Error {
     constructor(message, status, sourceId) {
@@ -35,7 +42,7 @@
 
   function extractRows(payload) {
     if (Array.isArray(payload)) return payload;
-    for (const key of ["attestations", "transactions", "records", "items", "activity"]) {
+    for (const key of ["activities", "attestations", "transactions", "records", "items", "activity"]) {
       if (Array.isArray(payload?.[key])) return payload[key];
       if (Array.isArray(payload?.data?.[key])) return payload.data[key];
     }
@@ -136,8 +143,9 @@
     return { state, samples, reachable, current, commonHeight, drift, commonAudit, commitments, replicaCount: replicas.length };
   }
 
-  function activeFleetPublicationError(config, fleet) {
+  function activeFleetPublicationError(config, fleet, maintenanceAudit) {
     if (!config || !["recovered", "degraded"].includes(config.state)) return "configuration is not an active recovery state";
+    if (maintenanceAudit?.state !== "healthy" || maintenanceAudit?.samples?.length !== 6) return "all six maintenance interlocks must be fresh and healthy";
     if (fleet?.replicaCount !== 6 || fleet?.samples?.length !== 6) return "active recovery must declare exactly six validator replicas";
     if (fleet.reachable?.length !== fleet.replicaCount) return "all six validator health snapshots must be reachable";
     if (fleet.commitments?.length !== fleet.replicaCount || fleet.commitments.some((entry) => !entry?.ok)) return "all six validators must return a common-height commitment";
@@ -199,32 +207,90 @@
     return null;
   }
 
+  function projectionObservationGate(earnings, confirmedReceiptCount) {
+    if (!Number.isSafeInteger(confirmedReceiptCount) || confirmedReceiptCount < 0) {
+      return PROJECTION_RECEIPT_EVIDENCE_REASON;
+    }
+    if (confirmedReceiptCount < MIN_PROJECTION_RECEIPTS) return PROJECTION_COLLECTING_REASON;
+    const first = earnings?.observed_window_first_timestamp_ms;
+    const last = earnings?.observed_window_last_timestamp_ms;
+    if (typeof first !== "number" || !Number.isSafeInteger(first) || first < 0
+      || typeof last !== "number" || !Number.isSafeInteger(last) || last <= first
+      || last - first < MIN_PROJECTION_WINDOW_MS) return PROJECTION_WINDOW_REASON;
+    return null;
+  }
+
   function normalizeWorkerEarnings(earnings, economics) {
     const balance = numberOrNull(earnings?.onchain_balance_arc, earnings?.balance_arc);
     const confirmedReceipts = Array.isArray(earnings?.confirmed_receipts) ? earnings.confirmed_receipts : null;
     const confirmedReceiptCount = integerOrNull(earnings?.confirmed_receipt_count);
     const confirmedGross = numberOrNull(earnings?.confirmed_gross_earnings_arc);
+    const receiptTxHashes = new Set();
+    const receiptJobIds = new Set();
+    const confirmedReceiptGross = confirmedReceipts?.reduce((sum, receipt) => {
+      if (!receipt || typeof receipt !== "object"
+        || receipt.tx_type !== "0x25"
+        || receipt.success !== true
+        || !network.normalizeHex(receipt.tx_hash, 32)
+        || !network.normalizeHex(receipt.job_id, 32)
+        || !network.normalizeHex(receipt.block_hash, 32)
+        || !Number.isSafeInteger(receipt.block_height)
+        || receipt.block_height < 0
+        || receipt.reward_base !== COMMUNITY_REWARD_BASE
+        || receipt.reward_arc !== COMMUNITY_REWARD_ARC) return Number.NaN;
+      const txHash = network.normalizeHex(receipt.tx_hash, 32);
+      const jobId = network.normalizeHex(receipt.job_id, 32);
+      if (receiptTxHashes.has(txHash) || receiptJobIds.has(jobId)) return Number.NaN;
+      receiptTxHashes.add(txHash);
+      receiptJobIds.add(jobId);
+      return sum + COMMUNITY_REWARD_ARC;
+    }, 0) ?? null;
     const receiptEvidenceConsistent = confirmedReceipts !== null
       && confirmedReceiptCount !== null
       && confirmedReceipts.length === confirmedReceiptCount
       && confirmedGross !== null
-      && confirmedGross >= 0;
+      && confirmedGross >= 0
+      && confirmedReceiptGross !== null
+      && Number.isFinite(confirmedReceiptGross)
+      && Math.abs(confirmedReceiptGross - confirmedGross) <= 1e-9;
     const totalRewards = receiptEvidenceConsistent ? confirmedReceiptCount : null;
     const observedRateValue = numberOrNull(earnings?.attestations_per_day_observed);
     const observedRate = observedRateValue !== null && observedRateValue >= 0 ? observedRateValue : null;
     const rewardValue = numberOrNull(earnings?.reward_per_attestation_arc);
-    const rewardPerAttestation = rewardValue !== null && rewardValue >= 0 ? rewardValue : null;
+    const rewardPerAttestation = rewardValue === COMMUNITY_REWARD_ARC ? rewardValue : null;
     const enabled = earnings?.community_rewards_v1_enabled;
     const active = earnings?.community_rewards_v1_protocol_active;
     const approvals = earnings?.community_rewards_v1_approval_collection_ready;
-    const projectionValue = numberOrNull(earnings?.projected_daily_arc);
-    const projectionReason = typeof earnings?.projected_daily_unavailable_reason === "string" && earnings.projected_daily_unavailable_reason.trim()
-      ? earnings.projected_daily_unavailable_reason.trim()
-      : null;
-    const projectedPerDay = projectionValue !== null && projectionValue >= 0 && projectionReason === null ? projectionValue : null;
     let readiness = "unknown";
     if (enabled === false || active === false || approvals === false) readiness = "blocked";
     else if (enabled === true && active === true && approvals === true) readiness = "ready";
+    const rawProjection = earnings?.projected_daily_arc;
+    const projectionValue = typeof rawProjection === "number" && Number.isFinite(rawProjection) && rawProjection >= 0
+      ? rawProjection
+      : null;
+    const hostProjectionReason = typeof earnings?.projected_daily_unavailable_reason === "string" && earnings.projected_daily_unavailable_reason.trim()
+      ? earnings.projected_daily_unavailable_reason.trim()
+      : null;
+    const observationGate = projectionObservationGate(
+      earnings,
+      receiptEvidenceConsistent ? confirmedReceipts.length : null,
+    );
+    const projectedPerDay = receiptEvidenceConsistent
+      && readiness === "ready"
+      && observationGate === null
+      && projectionValue !== null
+      && hostProjectionReason === null
+      ? projectionValue
+      : null;
+    let projectionReason = projectedPerDay === null ? hostProjectionReason : null;
+    if (projectedPerDay === null && projectionReason === null) {
+      if (observationGate !== null) projectionReason = observationGate;
+      else if (readiness !== "ready" && rawProjection !== null && rawProjection !== undefined) {
+        projectionReason = "reward issuance, protocol activation, and validator approval readiness are not all confirmed";
+      } else if (rawProjection !== null && rawProjection !== undefined && projectionValue === null) {
+        projectionReason = "the earnings endpoint supplied a malformed projection";
+      }
+    }
     return { balance, totalRewards, confirmedGross: receiptEvidenceConsistent ? confirmedGross : null, confirmedReceipts, receiptEvidenceConsistent, observedRate, rewardPerAttestation, projectedPerDay, projectionReason, enabled, active, approvals, readiness, raw: earnings, economics };
   }
 
@@ -283,7 +349,7 @@
       continuityTitle: $("continuity-title"), boundaryBadge: $("boundary-badge"), continuityCopy: $("continuity-copy"), manifestValue: $("manifest-value"), chainId: $("chain-id"), legacyRange: $("legacy-range"), legacyAnchor: $("legacy-anchor"), boundaryBlock: $("boundary-block"), boundaryProof: $("boundary-proof"), v3Range: $("v3-range"), v3Source: $("v3-source"),
       fleetBadge: $("fleet-badge"), canonicalHeight: $("canonical-height"), heightNote: $("height-note"), blockAge: $("block-age"), livenessNote: $("liveness-note"), replicaCount: $("replica-count"), replicaNote: $("replica-note"), commonHeight: $("common-height"), forkNote: $("fork-note"), sourceGrid: $("source-grid"),
       inferenceBadge: $("inference-badge"), inferenceSummary: $("inference-summary"), inferenceBody: $("inference-body"),
-      workerForm: $("worker-form"), workerId: $("worker-id"), workerError: $("worker-error"), workerBalance: $("worker-balance"), workerRewards: $("worker-rewards"), workerRate: $("worker-rate"), workerProjection: $("worker-projection"), workerReadiness: $("worker-readiness"),
+      workerForm: $("worker-form"), workerId: $("worker-id"), workerError: $("worker-error"), workerBalance: $("worker-balance"), workerRewards: $("worker-rewards"), workerRewardsDetail: $("worker-rewards-detail"), workerRate: $("worker-rate"), workerProjection: $("worker-projection"), workerReadiness: $("worker-readiness"),
       receiptForm: $("receipt-form"), receiptHash: $("receipt-hash"), receiptError: $("receipt-error"), receiptResult: $("receipt-result"),
     };
     const state = { config: null, resolver: null, checkpointAudit: { state: "unknown", reason: "not-audited" }, controller: null, timer: null };
@@ -379,7 +445,8 @@
         const link = create("a", "tx-link", network.formatHash(entry.receipt.txHash));
         if (entry.receipt.txHash) link.href = `../explorer/#/tx/${entry.receipt.txHash}`;
         hashCell.append(link);
-        row.append(create("td", "", formatInteger(entry.receipt.height)), hashCell, create("td", "", network.formatHash(entry.row.model_id ?? entry.row.model)), create("td", "", network.formatHash(entry.row.worker_id ?? entry.row.worker)), create("td", "receipt-ok", "MINED SUCCESS"));
+        const paid = entry.receipt.paymentConfirmed;
+        row.append(create("td", "", formatInteger(entry.receipt.height)), hashCell, create("td", "", network.formatHash(entry.row.inference?.model_hash ?? entry.row.model_id ?? entry.row.model)), create("td", "", network.formatHash(entry.row.worker_id ?? entry.row.worker)), create("td", "receipt-ok", paid ? "COMPUTED + PAID" : "COMPUTED · NOT PAYMENT"));
         elements.inferenceBody.append(row);
       }
       text(elements.inferenceSummary, `${result.confirmed.length} confirmed · ${result.excluded} unproven or non-canonical excluded · source ${result.source?.name ?? "unavailable"}`);
@@ -388,7 +455,10 @@
 
     function renderWorker(result) {
       text(elements.workerBalance, formatArc(result.balance));
-      text(elements.workerRewards, formatInteger(result.totalRewards));
+      text(elements.workerRewards, formatArc(result.confirmedGross));
+      text(elements.workerRewardsDetail, !result.receiptEvidenceConsistent
+        ? "Mined reward ARC unavailable: retained 0x25 receipt evidence is incomplete or inconsistent"
+        : `${formatInteger(result.totalRewards)} successful retained 0x25 receipt${result.totalRewards === 1 ? "" : "s"}`);
       text(elements.workerRate, result.observedRate === null ? "—" : `${result.observedRate}/day`);
       text(elements.workerProjection, formatArc(result.projectedPerDay));
       const mapping = {
@@ -433,20 +503,26 @@
       elements.refresh.classList.add("spinning"); elements.refresh.disabled = true;
       setTruth("loading", "Auditing configured canonical sources…", "Checking H+1 parent linkage, replica freshness, and one common-height commitment.");
       try {
-        const [fleet, boundary] = await Promise.all([
+        const [fleet, boundary, maintenanceAudit] = await Promise.all([
           collectFleetHealth({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
           verifyRecoveryBoundary({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
+          network.auditMaintenanceInterlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
         ]);
         if (signal.aborted) return;
-        state.checkpointAudit = boundary;
-        const inference = await loadInferenceEvidence({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal, checkpointAudit: boundary });
+        const publicationError = activeFleetPublicationError(state.config, fleet, maintenanceAudit);
+        const effectiveBoundary = maintenanceAudit.state === "healthy"
+          ? boundary
+          : { state: "unknown", reason: maintenanceAudit.reason || "maintenance-interlock-not-healthy" };
+        state.checkpointAudit = effectiveBoundary;
+        const inference = await loadInferenceEvidence({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal, checkpointAudit: effectiveBoundary });
         if (signal.aborted) return;
-        renderContinuity(boundary); renderFleet(fleet); renderInference(inference);
-        if (boundary.state === "mismatch") setTruth("bad", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, recovery epoch, validator set, domain, or manifest differs on a configured replica. Canonical and earnings claims are paused.");
+        renderContinuity(effectiveBoundary); renderFleet(fleet); renderInference(inference);
+        if (maintenanceAudit.state !== "healthy") setTruth("bad", "Network maintenance safety interlock active", `Public canonical and earnings claims are paused: ${maintenanceAudit.reason || "fresh six-validator maintenance evidence is unavailable"}.`);
+        else if (boundary.state === "mismatch") setTruth("bad", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, recovery epoch, validator set, domain, or manifest differs on a configured replica. Canonical and earnings claims are paused.");
         else if (fleet.state === "fork") setTruth("bad", "COMMON-HEIGHT FORK CONFIRMED", `Configured v3 replicas disagree at #${formatInteger(fleet.commonHeight)}. Stop canonical and reward claims until recovery selection is resolved.`);
-        else if (fleet.state === "healthy" && boundary.state === "verified") setTruth("good", "Canonical v3 continuation verified", `Signed H, exact H+1, and chain/recovery identity match on all ${boundary.replicas.length} configured v3 replica(s); ${fleet.reachable.length}/${fleet.replicaCount} are healthy.`);
+        else if (!publicationError && fleet.state === "healthy" && boundary.state === "verified") setTruth("good", "Canonical v3 continuation verified", `Signed H, exact H+1, chain/recovery identity, and all six maintenance interlocks are verified; ${fleet.reachable.length}/${fleet.replicaCount} validators are healthy.`);
         else if (fleet.state === "unconfigured") setTruth("warn", "Canonical recovery is not configured", state.config.notices[0] || "Publish signed checkpoint and endpoint metadata before using this console.");
-        else setTruth("warn", "Canonical evidence is incomplete", `Fleet ${fleet.state}; boundary ${boundary.state}. Missing evidence is not treated as success.`);
+        else setTruth("warn", "Canonical evidence is incomplete", `${publicationError || `Fleet ${fleet.state}; boundary ${boundary.state}`}. Missing evidence is not treated as success.`);
         text(elements.lastUpdated, `Updated ${new Date().toLocaleTimeString()}`);
       } catch (error) {
         if (!signal.aborted) { renderContinuity({ state: "unknown", reason: error.message }); renderSources(null); setTruth("bad", "Dashboard audit failed", error.message); }
@@ -499,6 +575,7 @@
     activeFleetPublicationError,
     verifyRecoveryBoundary,
     loadInferenceEvidence,
+    projectionObservationGate,
     normalizeWorkerEarnings,
     validateWorkerId,
     loadWorkerEarnings,

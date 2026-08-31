@@ -21,8 +21,9 @@
 //! Usage:
 //!   arc-bench-production [--txs 100000] [--batch 10000] [--proposers 1]
 
+mod ephemeral_keys;
+
 use arc_crypto::Hash256;
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_node::pipeline::{Pipeline, PipelineBatch};
 use arc_state::StateDB;
 use arc_types::Transaction;
@@ -68,16 +69,14 @@ fn format_tps(tps: f64) -> String {
 /// Pre-sign a batch of transactions for a given proposer's sender partition.
 /// Each proposer gets senders [start..start+count), receivers from a separate range.
 fn presign_transactions(
-    sender_start: u8,
+    _sender_start: u8,
     sender_count: u8,
     total_txs: usize,
 ) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
-    let keypairs: Vec<_> = (sender_start..sender_start + sender_count)
-        .map(|i| (benchmark_keypair(i), benchmark_address(i)))
-        .collect();
+    let keypairs = ephemeral_keys::signing_keypairs(sender_count as usize);
 
     // Receiver addresses (don't overlap with senders)
-    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
+    let receivers = ephemeral_keys::addresses(56);
 
     // Genesis accounts: fund all senders and receivers
     let mut genesis: Vec<(Hash256, u64)> = keypairs
@@ -99,14 +98,8 @@ fn presign_transactions(
 
         let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
-        // Real Ed25519 signing
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
+        tx.sign(sk)
+            .expect("ephemeral benchmark signing must succeed");
 
         nonces[kp_idx] += 1;
         transactions.push(tx);
@@ -145,7 +138,7 @@ fn run_single_proposer(
 
     // Create the actual production pipeline
     let pipeline = Pipeline::new(Arc::clone(&state));
-    let producer = benchmark_address(255);
+    let producer = genesis[0].0;
 
     // Feed batches into the pipeline and collect results
     let pipeline_start = Instant::now();

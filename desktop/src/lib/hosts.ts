@@ -15,18 +15,8 @@ export const SEED_LABELS: Record<string, string> = {
   "149.28.153.31": "SGP",
 };
 
-/**
- * HTTPS seed origins use nip.io names because the desktop talks to them over
- * TLS. Keep those aliases tied to the exact configured IPs: a custom nip.io
- * host must not inherit a city merely because its text happens to resemble a
- * seed address.
- */
-const SEED_ORIGIN_LABELS: Record<string, string> = Object.fromEntries(
-  Object.entries(SEED_LABELS).flatMap(([ip, label]) => [
-    [ip, label],
-    [`${ip.replaceAll(".", "-")}.nip.io`, label],
-  ]),
-);
+/** Direct-IP HTTPS origins are certificate-bound to these exact seed IPs. */
+const SEED_ORIGIN_LABELS: Record<string, string> = SEED_LABELS;
 
 function hostnameOf(origin: string): string | null {
   try {

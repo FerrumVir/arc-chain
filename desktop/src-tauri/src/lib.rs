@@ -15,6 +15,19 @@ use std::sync::Arc;
 use tauri::{Manager, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
+
+fn durable_legacy_stop_material(
+    migration_notice_is_durable: bool,
+    notice: Option<types::DataMigrationNotice>,
+    seed: Option<Zeroizing<String>>,
+) -> Option<(types::DataMigrationNotice, Zeroizing<String>)> {
+    if migration_notice_is_durable {
+        notice.zip(seed)
+    } else {
+        None
+    }
+}
 
 pub struct AppState {
     pub node: Arc<Mutex<node_manager::NodeManager>>,
@@ -38,6 +51,11 @@ pub struct AppState {
     /// on a desktop with no tray, hiding the window makes the app
     /// unreachable.
     pub has_tray: Arc<std::sync::atomic::AtomicBool>,
+    /// Authoritative native fail-closed fence for an unresolved data
+    /// migration preflight. Every command that can start arc-node consults
+    /// this state; a WebView Start/Restart click cannot bypass a startup
+    /// failure and replay an ambiguous legacy WAL.
+    pub data_migration_error: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -63,6 +81,7 @@ pub fn run() {
         .unwrap_or_default();
 
     let has_tray = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let data_migration_error = Arc::new(Mutex::new(None));
     let state = AppState {
         node,
         store: store.clone(),
@@ -72,6 +91,7 @@ pub fn run() {
         chain_host: Arc::new(Mutex::new(None)),
         wallet_write: Arc::new(Mutex::new(())),
         has_tray: has_tray.clone(),
+        data_migration_error: data_migration_error.clone(),
     };
 
     tauri::Builder::default()
@@ -111,7 +131,73 @@ pub fn run() {
             }
 
             // Load existing store from the resolved dir, if any.
-            let loaded_store = store::Store::load_from(&resolved);
+            let mut loaded_store = store::Store::load_from(&resolved);
+            let had_durable_migration_notice = loaded_store.data_migration_notice.is_some();
+            let legacy_identity_seed = loaded_store
+                .identity
+                .as_ref()
+                .map(|identity| Zeroizing::new(identity.seed_phrase.clone()));
+            let legacy_process_data_dir = match (
+                loaded_store.config.as_ref(),
+                legacy_identity_seed.as_ref(),
+            ) {
+                (Some(config), Some(seed)) => {
+                    let resources = commands::resolve_testnet_resources(app.handle());
+                    node_manager::detect_running_legacy_v07_data_dir(config, seed, &resources)
+                }
+                _ => Ok(None),
+            };
+            // A v0.7 desktop stored unbound chain state in the same ~/.arc
+            // root as binaries and models. Fence that WAL before deriving the
+            // auto-start config: old bytes stay untouched while only the
+            // persisted data-dir pointer moves to a fresh protocol-v3 child.
+            let migration_result = match legacy_process_data_dir {
+                Ok(Some(path)) => loaded_store.protect_running_legacy_v07_data_at(&path),
+                Ok(None) => loaded_store.protect_legacy_v07_data(),
+                Err(error) => Err(error),
+            };
+            let (
+                migration_allows_autostart,
+                migration_failure_reason,
+                migration_notice_is_durable,
+            ) =
+                match migration_result {
+                Ok(Some(notice)) => match loaded_store.save_to(&resolved) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            legacy = %notice.legacy_data_dir,
+                            active = %notice.active_data_dir,
+                            "preserved legacy ARC data and selected a fresh protocol-v3 directory"
+                        );
+                        (true, None, true)
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "legacy data was detected but the protected v3 config could not be persisted; suppressing node auto-start"
+                        );
+                        (
+                            false,
+                            Some(format!(
+                                "the protected protocol-v3 data pointer could not be persisted: {error}"
+                            )),
+                            false,
+                        )
+                    }
+                },
+                Ok(None) => (true, None, had_durable_migration_notice),
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "legacy data migration preflight failed; suppressing node auto-start"
+                    );
+                    (
+                        false,
+                        Some(format!("legacy-data migration preflight failed: {error}")),
+                        false,
+                    )
+                }
+            };
             let autostart_desired = loaded_store
                 .config
                 .as_ref()
@@ -121,12 +207,26 @@ pub fn run() {
             // store moves into the shared mutex.
             let start_config = loaded_store.config.clone().unwrap_or_default();
             let has_identity = loaded_store.identity.is_some();
+            let legacy_windows_stop = durable_legacy_stop_material(
+                migration_notice_is_durable,
+                loaded_store.data_migration_notice.clone(),
+                legacy_identity_seed,
+            );
+            let legacy_migration_block = migration_failure_reason.clone();
 
             let store_shared = store.clone();
             let data_dir_shared = data_dir.clone();
+            let migration_error_shared = data_migration_error.clone();
+            let startup_boundary_reason = migration_failure_reason.clone().or_else(|| {
+                Some(
+                    "managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked"
+                        .to_string(),
+                )
+            });
             tauri::async_runtime::block_on(async move {
                 *store_shared.lock().await = loaded_store;
                 *data_dir_shared.lock().await = resolved;
+                *migration_error_shared.lock().await = startup_boundary_reason;
             });
 
             // Sync the autostart plugin with what the user chose during
@@ -193,34 +293,155 @@ pub fn run() {
             // Start button was unreachable (it read a remote seed and
             // therefore always believed the node was running), quitting and
             // reopening left the user with no way to run their node at all.
-            if start_config.auto_start && has_identity {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let Some(state) = handle.try_state::<AppState>() else { return };
+            let should_start =
+                start_config.auto_start && has_identity && migration_allows_autostart;
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let Some(state) = handle.try_state::<AppState>() else {
+                    return;
+                };
 
-                    // Don't fight an already-running node: a community
-                    // installer daemon, or our own child surviving a dev
-                    // rebuild, already owns this port.
-                    let probe = format!(
-                        "{}/health",
-                        paths::local_host(start_config.rpc_port)
-                    );
-                    if let Ok(r) = state.http.get(&probe).send().await {
-                        if r.status().is_success() {
-                            tracing::info!("a node already answers on {} - not starting another", probe);
+                // Adopt an already-running local node only when it is the
+                // exact matched version. A v0.7 child deliberately survives
+                // the old GUI's Tauri relaunch on some platforms; treating
+                // any HTTP 200 as compatible left the v0.8 desktop driving
+                // that stale process and its unbound WAL indefinitely.
+                let mut managed_recovery_required = false;
+                match commands::probe_local_node_compatibility(
+                    &state.http,
+                    start_config.rpc_port,
+                )
+                .await
+                {
+                    commands::LocalNodeCompatibility::Exact if should_start => {
+                        tracing::info!(
+                            version = commands::EXPECTED_NODE_VERSION,
+                            port = start_config.rpc_port,
+                            "exact-version local node detected; proving its private shutdown receipt before restart/adoption"
+                        );
+                    }
+                    commands::LocalNodeCompatibility::Exact => {
+                        // `auto_start=false` must also clean up a desktop child
+                        // left by an older updater. NodeManager only targets
+                        // ARC-managed executable paths, so a separately
+                        // installed system service remains operator-owned.
+                        tracing::info!(
+                            version = commands::EXPECTED_NODE_VERSION,
+                            port = start_config.rpc_port,
+                            "desktop auto-start is disabled; draining any managed leftover node"
+                        );
+                    }
+                    commands::LocalNodeCompatibility::Absent => {}
+                    commands::LocalNodeCompatibility::Incompatible(reason) => {
+                        tracing::warn!(
+                            %reason,
+                            port = start_config.rpc_port,
+                            "refusing to adopt incompatible local node"
+                        );
+                    }
+                }
+
+                // Drain any desktop-managed child left by an older app
+                // process, including one listening on a fallback port. This
+                // reconciliation runs even when auto-start is off or migration
+                // persistence failed: those states forbid starting a node but
+                // must not leave the pre-update child alive. A stop failure is
+                // a hard updater/startup boundary; do not race two versions
+                // against one data directory.
+                {
+                    let legacy_resources = commands::resolve_testnet_resources(&handle);
+                    let mut node = state.node.lock().await;
+                    if let Err(error) =
+                        node.configure_managed_data_dir(&start_config.data_dir)
+                    {
+                        tracing::error!(
+                            %error,
+                            "managed-node durability receipt is invalid; blocking startup/update"
+                        );
+                        return;
+                    }
+                    if let Some(reason) = legacy_migration_block {
+                        node.block_legacy_windows_reconciliation(reason.clone());
+                        *state.data_migration_error.lock().await = Some(reason.clone());
+                        tracing::error!(
+                            %reason,
+                            "legacy desktop migration is not durable; leaving the old node running and blocking startup/update"
+                        );
+                        return;
+                    }
+                    if let Some((notice, validator_seed)) = legacy_windows_stop {
+                        if let Err(error) = node.configure_legacy_windows_stop_context(
+                            &start_config,
+                            &notice,
+                            validator_seed,
+                            &legacy_resources,
+                        ) {
+                            *state.data_migration_error.lock().await = Some(format!(
+                                "one-time legacy node reconciliation context is invalid: {error}"
+                            ));
+                            tracing::error!(
+                                %error,
+                                "one-time tokenless legacy node context is invalid; blocking startup/update"
+                            );
                             return;
                         }
                     }
-
-                    match commands::start_node_inner(&handle, &state, &start_config).await {
-                        Ok(()) => tracing::info!("auto-started arc-node on launch"),
-                        // Surfaced in the log ring and the Dashboard's error
-                        // state rather than thrown away; a failed auto-start
-                        // is exactly what the user needs told.
-                        Err(e) => tracing::error!("auto-start failed: {}", e),
+                    if let Err(error) = node.stop().await {
+                        if node_manager::is_managed_durability_recovery_required(&error) {
+                            managed_recovery_required = true;
+                            tracing::warn!(
+                                %error,
+                                "an inherited managed-node durability fence requires a quarantined recovery cycle"
+                            );
+                        } else {
+                            *state.data_migration_error.lock().await = Some(format!(
+                                "managed-node startup reconciliation failed: {error}"
+                            ));
+                            tracing::error!(
+                                %error,
+                                "could not stop stale managed arc-node; suppressing auto-start"
+                            );
+                            return;
+                        }
                     }
-                });
-            }
+                }
+
+                if managed_recovery_required {
+                    if let Err(error) =
+                        commands::recover_managed_shutdown_inner(&handle, &state).await
+                    {
+                        *state.data_migration_error.lock().await = Some(format!(
+                            "managed-node durability recovery failed: {error}"
+                        ));
+                        tracing::error!(
+                            %error,
+                            "quarantined managed-node replay/WAL recovery failed; blocking startup/update"
+                        );
+                        return;
+                    }
+                }
+
+                // Only after the exact old/detached process boundary is clear
+                // may WebView Start/Ensure/Update entrypoints mutate or spawn.
+                *state.data_migration_error.lock().await = None;
+
+                if !should_start {
+                    if start_config.auto_start && !migration_allows_autostart {
+                        tracing::error!(
+                            "node auto-start remains suppressed because legacy-data migration was not durably persisted"
+                        );
+                    }
+                    return;
+                }
+
+                match commands::start_node_inner(&handle, &state).await {
+                    Ok(()) => tracing::info!("auto-started arc-node on launch"),
+                    // Surfaced in the log ring and the Dashboard's error
+                    // state rather than thrown away; a failed auto-start
+                    // is exactly what the user needs told.
+                    Err(e) => tracing::error!("auto-start failed: {}", e),
+                }
+            });
 
             Ok(())
         })
@@ -262,8 +483,12 @@ pub fn run() {
             commands::load_identity,
             commands::save_config,
             commands::load_config,
+            commands::load_data_migration_notice,
+            commands::dismiss_data_migration_notice,
             commands::start_node,
             commands::stop_node,
+            commands::prepare_update_relaunch,
+            commands::abort_update_relaunch,
             commands::restart_node,
             commands::reset_peer_state,
             commands::node_status,

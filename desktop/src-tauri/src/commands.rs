@@ -1,12 +1,16 @@
-use crate::node_manager::{TestnetResources, managed_binary_path};
+use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
-use crate::{AppState, hardware, identity, paths, rpc_client};
+use crate::{hardware, identity, paths, rpc_client, AppState};
+use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
+use ssh_key::{PublicKey, SshSig};
 use std::io::Read as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tokio::io::AsyncWriteExt;
+use zeroize::Zeroize as _;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -103,11 +107,19 @@ pub async fn reveal_seed_phrase(state: State<'_, AppState>) -> CmdResult<String>
 pub async fn save_config(
     app: AppHandle,
     state: State<'_, AppState>,
-    config: NodeConfig,
+    mut config: NodeConfig,
 ) -> CmdResult<()> {
-    let auto_start = config.auto_start;
+    let auto_start;
     {
         let mut store = state.store.lock().await;
+        // `data_dir` is a native chain-history boundary, not a WebView
+        // preference. Once one is persisted (including a freshly fenced v3
+        // directory), generic config saves may update ports, role, model and
+        // lifecycle flags but can never repoint the node at preserved v0.7
+        // history. A future data-move feature needs its own verified native
+        // transaction instead of widening this IPC surface.
+        preserve_authoritative_data_dir(&mut config, store.config.as_ref());
+        auto_start = config.auto_start;
         store.config = Some(config);
         let dir = state.data_dir.lock().await.clone();
         store.save_to(&dir).map_err(map_err)?;
@@ -126,6 +138,12 @@ pub async fn save_config(
         _ => {}
     }
     Ok(())
+}
+
+fn preserve_authoritative_data_dir(config: &mut NodeConfig, persisted: Option<&NodeConfig>) {
+    if let Some(persisted) = persisted {
+        config.data_dir.clone_from(&persisted.data_dir);
+    }
 }
 
 #[tauri::command]
@@ -177,6 +195,22 @@ pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeCon
     Ok(store.config.clone())
 }
 
+#[tauri::command]
+pub async fn load_data_migration_notice(
+    state: State<'_, AppState>,
+) -> CmdResult<Option<DataMigrationNotice>> {
+    let store = state.store.lock().await;
+    Ok(store.data_migration_notice.clone())
+}
+
+#[tauri::command]
+pub async fn dismiss_data_migration_notice(state: State<'_, AppState>) -> CmdResult<()> {
+    let mut store = state.store.lock().await;
+    store.data_migration_notice = None;
+    let dir = state.data_dir.lock().await.clone();
+    store.save_to(&dir).map_err(map_err)
+}
+
 /// The one path that actually starts arc-node.
 ///
 /// Factored out of the `start_node` command so `lib.rs` `setup()` can launch
@@ -186,30 +220,126 @@ pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeCon
 ///
 /// Takes `&AppState` rather than `State<'_, AppState>` so it is callable both
 /// from a command and from a background task holding an `AppHandle`.
-pub async fn start_node_inner(
+async fn start_node_transaction(
     app: &AppHandle,
     state: &AppState,
-    config: &NodeConfig,
+    start_after_recovery: bool,
 ) -> Result<(), String> {
-    // Make sure we have a runnable binary. This must never be able to block
-    // a start when a usable binary already exists — see `ensure_binary`.
-    ensure_binary_inner(app).await?;
-
-    let validator_seed = {
+    require_data_migration_ready(state).await?;
+    let (config, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
-        store
+        let config = store.config.clone().unwrap_or_default();
+        let identity = store
             .identity
             .as_ref()
-            .map(|i| i.seed_phrase.clone())
             .ok_or_else(|| {
                 "no identity - run onboarding so we can derive an on-chain validator address before starting arc-node".to_string()
-            })?
+            })?;
+        (
+            config,
+            identity.seed_phrase.clone(),
+            identity.address.clone(),
+        )
     };
     let resources = resolve_testnet_resources(app);
+    {
+        let mut node = state.node.lock().await;
+        if node.is_running() {
+            return Ok(());
+        }
+    }
+    let lock_data_dir = config.data_dir.clone();
+    let lifecycle_lock = tokio::task::spawn_blocking(move || {
+        crate::node_manager::acquire_managed_lifecycle_lock(&lock_data_dir)
+    })
+    .await
+    .map_err(map_err)?
+    .map_err(map_err)?;
+    // Recheck only after owning the cross-process data lifecycle. The lock is
+    // held through binary mutation, stable-resource materialization, receipt
+    // arm and the spawn outcome, closing check→replace races between GUIs.
+    let recovery_launch = crate::node_manager::managed_shutdown_recovery_required(&config.data_dir)
+        .map_err(map_err)?;
+    if !recovery_launch {
+        if !start_after_recovery {
+            return Ok(());
+        }
+        // Make sure we have a runnable binary only after proving there is no
+        // stale receipt bound to the currently installed bytes. Replacing an
+        // executable first would strand the only safe recovery identity.
+        ensure_binary_inner(app).await?;
+    }
+    let app_data_dir = state.data_dir.lock().await.clone();
+    let keyfile_result =
+        identity::ensure_validator_keyfile(&app_data_dir, &recovery_phrase, &persisted_address);
+    recovery_phrase.zeroize();
+    let validator_keyfile = keyfile_result?;
     let mut node = state.node.lock().await;
-    node.start(config, &validator_seed, &resources)
+    node.start(&config, &validator_keyfile, &resources, lifecycle_lock)
+        .await
+        .map_err(map_err)?;
+    if !recovery_launch {
+        return Ok(());
+    }
+
+    // A stale marker is a quarantined recovery transaction, not permission to
+    // expose the old receipt-bound node to the normal dashboard/RPC flow. The
+    // node's early authenticated request path defers exit until StateDB has
+    // opened/replayed, all writers join, and the final WAL fsync publishes the
+    // positive ACK. Only after exact death + ACK consumption may we replace
+    // the binary/stable network identity and launch the requested current node.
+    node.stop()
+        .await
+        .map_err(|error| format!("managed-node durability recovery failed: {error}"))?;
+    drop(node);
+
+    if !start_after_recovery {
+        return Ok(());
+    }
+
+    let lock_data_dir = config.data_dir.clone();
+    let lifecycle_lock = tokio::task::spawn_blocking(move || {
+        crate::node_manager::acquire_managed_lifecycle_lock(&lock_data_dir)
+    })
+    .await
+    .map_err(map_err)?
+    .map_err(map_err)?;
+    if crate::node_manager::managed_shutdown_recovery_required(&config.data_dir).map_err(map_err)? {
+        return Err(
+            "recovery node exited but its authenticated shutdown boundary remains unresolved"
+                .into(),
+        );
+    }
+    ensure_binary_inner(app).await?;
+    let mut node = state.node.lock().await;
+    node.start(&config, &validator_keyfile, &resources, lifecycle_lock)
         .await
         .map_err(map_err)
+}
+
+pub async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    start_node_transaction(app, state, true).await
+}
+
+pub(crate) async fn recover_managed_shutdown_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
+    start_node_transaction(app, state, false).await
+}
+
+fn data_migration_start_gate(reason: Option<&str>) -> Result<(), String> {
+    match reason {
+        None => Ok(()),
+        Some(reason) => Err(format!(
+            "ARC refused to start the node because chain-data migration is not safely resolved: {reason}. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory."
+        )),
+    }
+}
+
+async fn require_data_migration_ready(state: &AppState) -> Result<(), String> {
+    let reason = state.data_migration_error.lock().await.clone();
+    data_migration_start_gate(reason.as_deref())
 }
 
 #[tauri::command]
@@ -218,7 +348,11 @@ pub async fn start_node(
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
-    start_node_inner(&app, &state, &config).await
+    // Retain the command argument for IPC compatibility with older WebViews,
+    // but never trust it for chain-state selection. Onboarding persists its
+    // candidate first; the native store is the sole launch authority.
+    let _ = config;
+    start_node_inner(&app, &state).await
 }
 
 #[tauri::command]
@@ -227,18 +361,52 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
     node.stop().await.map_err(map_err)
 }
 
+/// Establish the native updater/relaunch boundary.
+///
+/// Tauri replaces and relaunches the desktop process, but `arc-node` is a
+/// separate child (and is deliberately placed in a new process group on
+/// Windows). Without an explicit stop it survives the GUI update, so the new
+/// desktop can see a healthy old node and silently keep using an incompatible
+/// protocol. A failed stop blocks download/install instead of pretending the
+/// boundary is safe.
+#[tauri::command]
+pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
+    require_data_migration_ready(&state).await?;
+    let mut node = state.node.lock().await;
+    node.prepare_update_relaunch()
+        .await
+        .map_err(|error| format!("could not establish the native update lifecycle fence: {error}"))
+}
+
+/// Release a prepared native update fence only when the signed installer
+/// rejects/cancels before accepting bundle mutation. Successful installation
+/// deliberately has no release path in the old GUI: relaunch or manual quit
+/// must end that process before another node can start.
+#[tauri::command]
+pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
+    let mut node = state.node.lock().await;
+    node.abort_update_relaunch()
+        .await
+        .map_err(|error| format!("could not safely release the failed-update fence: {error}"))
+}
+
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
-    let (cfg, validator_seed) = {
+    require_data_migration_ready(&state).await?;
+    let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
-        let seed = store
+        let identity = store
             .identity
             .as_ref()
-            .map(|i| i.seed_phrase.clone())
             .ok_or_else(|| "no identity - cannot restart arc-node".to_string())?;
-        (cfg, seed)
+        (cfg, identity.seed_phrase.clone(), identity.address.clone())
     };
+    let app_data_dir = state.data_dir.lock().await.clone();
+    let keyfile_result =
+        identity::ensure_validator_keyfile(&app_data_dir, &recovery_phrase, &persisted_address);
+    recovery_phrase.zeroize();
+    let validator_keyfile = keyfile_result?;
 
     // ORDER MATTERS: stop the child BEFORE ensure_binary may rename over the
     // executable.
@@ -256,13 +424,26 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
         node.stop().await.map_err(map_err)?;
     }
 
+    let lock_data_dir = cfg.data_dir.clone();
+    let lifecycle_lock = tokio::task::spawn_blocking(move || {
+        crate::node_manager::acquire_managed_lifecycle_lock(&lock_data_dir)
+    })
+    .await
+    .map_err(map_err)?
+    .map_err(map_err)?;
+    if crate::node_manager::managed_shutdown_recovery_required(&cfg.data_dir).map_err(map_err)? {
+        return Err(
+            "restart stopped the node but its durable shutdown receipt remains unresolved".into(),
+        );
+    }
+
     // A restart is a good moment to pick up a newer arc-node, since the user
     // is already paying the restart cost. Now safe: nothing holds the file.
     ensure_binary_inner(&app).await?;
 
     let resources = resolve_testnet_resources(&app);
     let mut node = state.node.lock().await;
-    node.start(&cfg, &validator_seed, &resources)
+    node.start(&cfg, &validator_keyfile, &resources, lifecycle_lock)
         .await
         .map_err(map_err)
 }
@@ -281,22 +462,45 @@ pub async fn reset_peer_state(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CmdResult<ResetPeerStateResult> {
+    // This command mutates the configured data directory before restarting.
+    // Apply the same native migration fence first: when legacy selection is
+    // ambiguous, even deleting its peer cache would violate the promise that
+    // every preserved v0.7 byte remains untouched.
+    require_data_migration_ready(&state).await?;
     // Resolve the data dir through the SAME helper node_manager uses.
     // Duplicating the expansion here (HOME-only) meant this deleted
     // known_peers.json from a different directory than the node actually
     // uses on Windows, then reported success.
-    let cfg = {
+    let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
-        store.config.clone().unwrap_or_default()
+        let cfg = store.config.clone().unwrap_or_default();
+        let identity = store
+            .identity
+            .as_ref()
+            .ok_or_else(|| "no identity - cannot reset peer state".to_string())?;
+        (cfg, identity.seed_phrase.clone(), identity.address.clone())
     };
     let data_dir = crate::node_manager::resolve_data_dir(&cfg.data_dir);
     let peers_path = data_dir.join("known_peers.json");
+    let app_data_dir = state.data_dir.lock().await.clone();
+    let keyfile_result =
+        identity::ensure_validator_keyfile(&app_data_dir, &recovery_phrase, &persisted_address);
+    recovery_phrase.zeroize();
+    let validator_keyfile = keyfile_result?;
+    let resources = resolve_testnet_resources(&app);
 
-    // Stop first so the node isn't holding the file open or racing on writes.
-    {
+    // Stop first and retain the exact cross-process data-directory guard
+    // through deletion, binary readiness, receipt arm, and replacement spawn.
+    // Releasing it after Stop used to let a second GUI start a writer while
+    // this command removed that writer's peer cache.
+    let lifecycle_lock = {
         let mut node = state.node.lock().await;
-        let _ = node.stop().await;
-    }
+        node.stop_for_local_mutation().await.map_err(|error| {
+            format!(
+                "refusing to mutate peer state because the managed node did not prove a clean shutdown: {error}"
+            )
+        })?
+    };
 
     let removed = match std::fs::remove_file(&peers_path) {
         Ok(()) => true,
@@ -304,8 +508,11 @@ pub async fn reset_peer_state(
         Err(e) => return Err(format!("failed to remove {}: {}", peers_path.display(), e)),
     };
 
-    // Restart. Reuses restart_node's plumbing.
-    restart_node(app, state).await?;
+    ensure_binary_inner(&app).await?;
+    let mut node = state.node.lock().await;
+    node.start(&cfg, &validator_keyfile, &resources, lifecycle_lock)
+        .await
+        .map_err(map_err)?;
 
     Ok(ResetPeerStateResult {
         removed_path: peers_path.display().to_string(),
@@ -924,16 +1131,45 @@ pub async fn run_inference_via_coordinator(
     ))
 }
 
-/// Direct single-node inference fallback. Used by the desktop UI when
-/// `/inference/run_consensus` fails on every coordinator (the current
-/// failure mode: retired-but-still-registered SAO+JNB shards cause every
-/// coordinator's pipeline planner to return `Pipeline gap: expected
-/// layer 32 next, got [28, 30)` before any token is generated). Hitting
-/// `/inference/run` directly skips the sharded pipeline entirely — the
-/// coordinator serves the model from its local shards and still emits
-/// an on-chain attestation. We lose the k-of-n cross-replica consensus
-/// (no `consensus` field in the result), but the user gets a real
-/// answer instead of an error.
+fn direct_inference_error_must_not_retry(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("may still settle")
+        || normalized.contains("refusing a second late")
+        || normalized.contains("query its job status")
+        || [400, 401, 403, 409, 413, 422, 504]
+            .iter()
+            .any(|status| normalized.contains(&format!("http {status}")))
+}
+
+#[cfg(test)]
+mod inference_retry_tests {
+    use super::direct_inference_error_must_not_retry;
+
+    #[test]
+    fn claimed_or_terminal_direct_failures_never_retry_elsewhere() {
+        assert!(direct_inference_error_must_not_retry(
+            "HTTP 504: assignment may still settle; query its job status"
+        ));
+        assert!(direct_inference_error_must_not_retry(
+            "HTTP 422: invalid input"
+        ));
+        assert!(!direct_inference_error_must_not_retry(
+            "HTTP 503: no eligible workers or shard topology"
+        ));
+        assert!(!direct_inference_error_must_not_retry(
+            "connection refused before dispatch"
+        ));
+    }
+}
+
+/// Community-first coordinator inference. `/inference/run` dispatches to an
+/// eligible registered community worker before it considers local or sharded
+/// seed execution. The UI calls this before standalone `/run_consensus` so
+/// normal desktop traffic can actually reach community nodes.
+///
+/// Errors proving that a community assignment may still settle, plus terminal
+/// client/request errors, stop immediately. Retrying another coordinator in
+/// those cases could duplicate compute or a reward.
 #[tauri::command]
 pub async fn run_inference_via_coordinator_direct(
     state: State<'_, AppState>,
@@ -960,6 +1196,7 @@ pub async fn run_inference_via_coordinator_direct(
                 r.served_locally = *host == local_prefix;
                 return Ok(r);
             }
+            Err(e) if direct_inference_error_must_not_retry(&e) => return Err(e),
             Err(e) => last_err = e,
         }
     }
@@ -1256,10 +1493,71 @@ pub async fn set_worker_threads(
 /// release tag's workspace version). Mismatch → we have a stale arc-node from
 /// a previous release sitting in ~/.arc/bin and must redownload, otherwise
 /// chain bug fixes never reach existing users on auto-update.
-const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ARC_RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/FerrumVir/arc-chain/releases/download";
+const ARC_RELEASE_REPOSITORY: &str = "FerrumVir/arc-chain";
+const ARC_RELEASE_MANIFEST_NAMESPACE: &str = "arc-release-manifest-v1";
+const ARC_RELEASE_ALLOWED_SIGNERS: &str =
+    include_str!("../../../release/arc-release-allowed-signers");
 const MAX_NODE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHECKSUM_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_MANIFEST_SIGNATURE_BYTES: usize = 128 * 1024;
+const MAX_LOCAL_HEALTH_BYTES: usize = 64 * 1024;
+const BINARY_INSTALL_TRANSACTION_SCHEMA: &str = "arc-node-install-transaction-v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalNodeCompatibility {
+    Absent,
+    Exact,
+    Incompatible(String),
+}
+
+fn classify_local_health(
+    value: &serde_json::Value,
+    expected_version: &str,
+) -> LocalNodeCompatibility {
+    match value.get("version").and_then(serde_json::Value::as_str) {
+        Some(version) if version == expected_version => LocalNodeCompatibility::Exact,
+        Some(version) => LocalNodeCompatibility::Incompatible(format!(
+            "local /health reports arc-node v{version}; desktop requires v{expected_version}"
+        )),
+        None => LocalNodeCompatibility::Incompatible(
+            "local /health has no parseable arc-node version".to_string(),
+        ),
+    }
+}
+
+/// Probe the configured local RPC port before startup adopts a process it did
+/// not spawn. Only an exact matched-pair version is adoptable. Connection
+/// failure means no process is present; any successful but malformed, stale, or
+/// future response is incompatible and the desktop must start its own node.
+pub(crate) async fn probe_local_node_compatibility(
+    http: &reqwest::Client,
+    port: u16,
+) -> LocalNodeCompatibility {
+    let url = format!("{}/health", paths::local_host(port));
+    let response = match http.get(&url).send().await {
+        Ok(response) => response,
+        Err(_) => return LocalNodeCompatibility::Absent,
+    };
+    if !response.status().is_success() {
+        return LocalNodeCompatibility::Incompatible(format!(
+            "local /health returned HTTP {}",
+            response.status()
+        ));
+    }
+    let bytes =
+        match read_bounded_release_body(response, MAX_LOCAL_HEALTH_BYTES, "local /health").await {
+            Ok(bytes) => bytes,
+            Err(error) => return LocalNodeCompatibility::Incompatible(error),
+        };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => classify_local_health(&value, EXPECTED_NODE_VERSION),
+        Err(_) => LocalNodeCompatibility::Incompatible(
+            "local /health did not return a JSON object".to_string(),
+        ),
+    }
+}
 
 fn exact_release_asset_url(asset: &str) -> String {
     format!(
@@ -1294,11 +1592,221 @@ fn expected_release_sha256(manifest: &str, asset: &str) -> Result<[u8; 32], Stri
         .map_err(|_| format!("SHA256SUMS has a non-SHA-256 digest for {}", asset))
 }
 
-fn binary_download_sidecar(target: &Path) -> PathBuf {
-    match target.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) => target.with_extension(format!("download.{}", extension)),
-        None => target.with_extension("download"),
+fn release_manifest_public_key(allowed_signers: &str) -> Result<PublicKey, String> {
+    let mut records = allowed_signers
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let record = records
+        .next()
+        .ok_or_else(|| "embedded ARC release signer list is empty".to_string())?;
+    if records.next().is_some() {
+        return Err("embedded ARC release signer list must contain exactly one key".to_string());
     }
+    let fields: Vec<_> = record.split_whitespace().collect();
+    if fields.len() < 4
+        || fields[0] != "arc-release"
+        || fields[1] != "namespaces=\"arc-release-manifest-v1\""
+        || fields[2] != "ssh-ed25519"
+    {
+        return Err("embedded ARC release signer policy is malformed".to_string());
+    }
+    PublicKey::from_openssh(&format!("{} {}", fields[2], fields[3]))
+        .map_err(|error| format!("embedded ARC release public key is invalid: {error}"))
+}
+
+fn validate_release_manifest_binding(manifest: &str, expected_version: &str) -> Result<(), String> {
+    let mut lines = manifest.lines();
+    if lines.next() != Some("# ARC release manifest v1") {
+        return Err("release checksum manifest has no supported ARC schema header".to_string());
+    }
+    let expected_repository = format!("# repository={ARC_RELEASE_REPOSITORY}");
+    if lines.next() != Some(expected_repository.as_str()) {
+        return Err("release checksum manifest is bound to a different repository".to_string());
+    }
+    let expected_tag = format!("# tag=v{expected_version}");
+    if lines.next() != Some(expected_tag.as_str()) {
+        return Err(format!(
+            "release checksum manifest is not bound to exact tag v{expected_version}"
+        ));
+    }
+    let commit = lines
+        .next()
+        .and_then(|line| line.strip_prefix("# commit="))
+        .ok_or_else(|| "release checksum manifest has no commit binding".to_string())?;
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("release checksum manifest commit is not lowercase 40-byte hex".to_string());
+    }
+    Ok(())
+}
+
+fn verify_release_manifest_signature_with_signers(
+    manifest: &[u8],
+    signature: &[u8],
+    allowed_signers: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    let manifest_text = std::str::from_utf8(manifest)
+        .map_err(|_| "release checksum manifest is not UTF-8".to_string())?;
+    validate_release_manifest_binding(manifest_text, expected_version)?;
+    let public_key = release_manifest_public_key(allowed_signers)?;
+    let ssh_signature = SshSig::from_pem(signature)
+        .map_err(|error| format!("release SHA256SUMS.sig is malformed: {error}"))?;
+    public_key
+        .verify(ARC_RELEASE_MANIFEST_NAMESPACE, manifest, &ssh_signature)
+        .map_err(|_| "release SHA256SUMS signature is invalid or not owner-authorized".to_string())
+}
+
+fn verify_release_manifest_signature(manifest: &[u8], signature: &[u8]) -> Result<(), String> {
+    verify_release_manifest_signature_with_signers(
+        manifest,
+        signature,
+        ARC_RELEASE_ALLOWED_SIGNERS,
+        EXPECTED_NODE_VERSION,
+    )
+}
+
+async fn read_bounded_release_body(
+    mut response: reqwest::Response,
+    maximum: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(format!("{label} exceeds its {}-byte safety limit", maximum));
+    }
+    let capacity = response
+        .content_length()
+        .unwrap_or_default()
+        .min(maximum as u64) as usize;
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await.map_err(map_err)? {
+        if chunk.len() > maximum.saturating_sub(body.len()) {
+            return Err(format!("{label} exceeds its {}-byte safety limit", maximum));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn binary_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
+    let suffix = format!("download-{}-{nonce:016x}", std::process::id());
+    match target.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => target.with_extension(format!("{suffix}.{extension}")),
+        None => target.with_extension(suffix),
+    }
+}
+
+/// One independently created download. `create_new` prevents a concurrent
+/// desktop instance (or a stale symbolic link) from sharing/truncating the
+/// file whose signed digest this invocation is verifying. Drop is a cleanup
+/// backstop for every network, checksum, version, and install error path.
+struct PendingVerifiedDownload {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+}
+
+impl PendingVerifiedDownload {
+    fn file_mut(&mut self) -> Result<&mut tokio::fs::File, String> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| "arc-node download sidecar is already closed".to_string())
+    }
+
+    fn close(&mut self) {
+        self.file.take();
+    }
+}
+
+impl Drop for PendingVerifiedDownload {
+    fn drop(&mut self) {
+        // Close before unlinking: Windows refuses removal of an open file.
+        self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn create_binary_download_sidecar(target: &Path) -> Result<PendingVerifiedDownload, String> {
+    for _ in 0..32 {
+        let path = binary_download_sidecar(target, rand::random::<u64>());
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&path).await {
+            Ok(file) => {
+                return Ok(PendingVerifiedDownload {
+                    path,
+                    file: Some(file),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {}", path.display(), error)),
+        }
+    }
+    Err(format!(
+        "could not allocate an isolated arc-node download beside {}",
+        target.display()
+    ))
+}
+
+fn binary_install_lock_path(target: &Path) -> PathBuf {
+    target.with_extension("install.lock")
+}
+
+fn model_download_lock_path(target: &Path) -> PathBuf {
+    target.with_extension("download.lock")
+}
+
+async fn acquire_exclusive_download_lock(
+    lock_path: PathBuf,
+    label: &'static str,
+) -> Result<std::fs::File, String> {
+    tokio::task::spawn_blocking(move || {
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
+                return Err(format!(
+                    "refusing {label} lock that is not a regular file: {}",
+                    lock_path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect {}: {}", lock_path.display(), error)),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&lock_path)
+            .map_err(|error| format!("open {}: {}", lock_path.display(), error))?;
+        file.lock_exclusive()
+            .map_err(|error| format!("lock {}: {}", lock_path.display(), error))?;
+        Ok(file)
+    })
+    .await
+    .map_err(map_err)?
+}
+
+/// Serialize the complete inspect/download/verify/replace sequence across
+/// both tasks and desktop processes. The OS releases this advisory lock if a
+/// process crashes, so a stale lock file never strands future updates.
+async fn acquire_binary_install_lock(target: &Path) -> Result<std::fs::File, String> {
+    acquire_exclusive_download_lock(binary_install_lock_path(target), "arc-node install").await
+}
+
+async fn acquire_model_download_lock(target: &Path) -> Result<std::fs::File, String> {
+    acquire_exclusive_download_lock(model_download_lock_path(target), "model download").await
 }
 
 /// First-launch readiness check. Confirms the bundled testnet resources are
@@ -1310,7 +1818,31 @@ fn binary_download_sidecar(target: &Path) -> PathBuf {
 /// it on every start so existing users picked up by the desktop auto-updater
 /// always get the matching arc-node binary instead of running a stale one.
 #[tauri::command]
-pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
+pub async fn ensure_binary(app: AppHandle, state: State<'_, AppState>) -> CmdResult<BinaryStatus> {
+    require_data_migration_ready(&state).await?;
+    let configured_data_dir = state
+        .store
+        .lock()
+        .await
+        .config
+        .clone()
+        .unwrap_or_default()
+        .data_dir;
+    let lock_data_dir = configured_data_dir.clone();
+    let _lifecycle_lock = tokio::task::spawn_blocking(move || {
+        crate::node_manager::acquire_managed_lifecycle_lock(&lock_data_dir)
+    })
+    .await
+    .map_err(map_err)?
+    .map_err(map_err)?;
+    if crate::node_manager::managed_shutdown_recovery_required(&configured_data_dir)
+        .map_err(map_err)?
+    {
+        return Err(
+            "cannot replace arc-node while a prior shutdown receipt is unresolved; start the exact installed node and complete one authenticated clean shutdown first"
+                .into(),
+        );
+    }
     ensure_binary_inner(&app).await
 }
 
@@ -1350,6 +1882,28 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
     }
 
     let target = managed_binary_path();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(map_err)?;
+    }
+
+    static ENSURE_BINARY_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _task_guard = ENSURE_BINARY_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _process_guard = acquire_binary_install_lock(&target).await?;
+
+    // Complete or roll back a journaled Windows replacement before deciding
+    // whether the managed binary is missing/stale. This also restores `.old`
+    // files left by pre-journal desktop versions, so a power cut cannot turn
+    // a complete prior executable into an opaque "missing binary" state.
+    let recovery_target = target.clone();
+    tokio::task::spawn_blocking(move || {
+        recover_interrupted_binary_install(&recovery_target, EXPECTED_NODE_VERSION)
+    })
+    .await
+    .map_err(map_err)??;
 
     // 2. A binary already in the managed location. Exact matches are reused;
     //    older copies are replaced, and newer/unparseable copies stop with a
@@ -1441,6 +1995,7 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
     })?;
     let url = exact_release_asset_url(asset);
     let checksum_url = exact_release_asset_url("SHA256SUMS");
+    let checksum_signature_url = exact_release_asset_url("SHA256SUMS.sig");
 
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(map_err)?;
@@ -1460,16 +2015,34 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             EXPECTED_NODE_VERSION
         ));
     }
-    if checksum_resp
-        .content_length()
-        .is_some_and(|length| length > MAX_CHECKSUM_MANIFEST_BYTES as u64)
-    {
-        return Err("release checksum manifest exceeds the 1 MiB safety limit".to_string());
+    let checksum_bytes = read_bounded_release_body(
+        checksum_resp,
+        MAX_CHECKSUM_MANIFEST_BYTES,
+        "release checksum manifest",
+    )
+    .await?;
+    let signature_resp = client
+        .get(&checksum_signature_url)
+        .send()
+        .await
+        .map_err(map_err)?;
+    if !signature_resp.status().is_success() {
+        return Err(format!(
+            "release checksum signature returned HTTP {} for v{}",
+            signature_resp.status(),
+            EXPECTED_NODE_VERSION
+        ));
     }
-    let checksum_bytes = checksum_resp.bytes().await.map_err(map_err)?;
-    if checksum_bytes.len() > MAX_CHECKSUM_MANIFEST_BYTES {
-        return Err("release checksum manifest exceeds the 1 MiB safety limit".to_string());
-    }
+    let signature_bytes = read_bounded_release_body(
+        signature_resp,
+        MAX_MANIFEST_SIGNATURE_BYTES,
+        "release checksum signature",
+    )
+    .await?;
+    // The checksum text is attacker-controlled until this succeeds. Verify the
+    // namespaced owner signature and exact repo/tag/commit header before using
+    // even one digest from it to authenticate an executable child process.
+    verify_release_manifest_signature(&checksum_bytes, &signature_bytes)?;
     let checksum_manifest = std::str::from_utf8(&checksum_bytes)
         .map_err(|_| "release checksum manifest is not UTF-8".to_string())?;
     let expected_sha256 = expected_release_sha256(checksum_manifest, asset)?;
@@ -1491,8 +2064,7 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             asset
         ));
     }
-    let tmp = binary_download_sidecar(target);
-    let mut file = tokio::fs::File::create(&tmp).await.map_err(map_err)?;
+    let mut pending = create_binary_download_sidecar(target).await?;
     let mut hasher = Sha256::new();
     let mut total_bytes = 0u64;
     loop {
@@ -1500,8 +2072,6 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(format!(
                     "release asset {} failed after {} bytes: {}",
                     asset, total_bytes, error
@@ -1510,27 +2080,22 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
         };
         total_bytes = total_bytes.saturating_add(chunk.len() as u64);
         if total_bytes > MAX_NODE_BINARY_BYTES {
-            drop(file);
-            let _ = tokio::fs::remove_file(&tmp).await;
             return Err(format!(
                 "release asset {} exceeds the 512 MiB safety limit",
                 asset
             ));
         }
         hasher.update(&chunk);
-        if let Err(error) = file.write_all(&chunk).await {
-            drop(file);
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(format!("write {}: {}", tmp.display(), error));
+        if let Err(error) = pending.file_mut()?.write_all(&chunk).await {
+            return Err(format!("write {}: {}", pending.path.display(), error));
         }
     }
-    file.flush().await.map_err(map_err)?;
-    file.sync_all().await.map_err(map_err)?;
-    drop(file);
+    pending.file_mut()?.flush().await.map_err(map_err)?;
+    pending.file_mut()?.sync_all().await.map_err(map_err)?;
+    pending.close();
 
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     if actual_sha256 != expected_sha256 {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return Err(format!(
             "checksum verification failed for {} (expected {}, got {})",
             asset,
@@ -1539,25 +2104,36 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
         ));
     }
 
+    // Verify the durable file, not only the network byte stream. The unique
+    // create-new sidecar means this digest belongs solely to this invocation.
+    let persisted_path = pending.path.clone();
+    let persisted_sha256 =
+        tokio::task::spawn_blocking(move || sha256_regular_file(&persisted_path))
+            .await
+            .map_err(map_err)??;
+    if persisted_sha256 != Some(expected_sha256) {
+        return Err(format!(
+            "durable checksum verification failed for {}",
+            asset
+        ));
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&tmp, perms).map_err(map_err)?;
+        std::fs::set_permissions(&pending.path, perms).map_err(map_err)?;
     }
-    let downloaded_version = read_arc_node_version(&tmp).ok_or_else(|| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("downloaded {} did not report a parseable version", asset)
-    })?;
+    let downloaded_version = read_arc_node_version(&pending.path)
+        .ok_or_else(|| format!("downloaded {} did not report a parseable version", asset))?;
     if downloaded_version != EXPECTED_NODE_VERSION {
-        let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "downloaded {} reports v{}, expected v{}",
             asset, downloaded_version, EXPECTED_NODE_VERSION
         ));
     }
 
-    install_over(&tmp, target)?;
+    install_over(&pending.path, target, expected_sha256)?;
 
     #[cfg(unix)]
     {
@@ -1579,37 +2155,418 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
     Ok(total_bytes)
 }
 
-/// Move `tmp` onto `target`, tolerating a locked destination.
-///
-/// Windows refuses to overwrite a running executable's image file, but it
-/// *does* allow renaming one out of the way. So on a failed direct rename,
-/// displace the old binary to `.old` first and retry. The stale `.old` is
-/// cleaned up opportunistically on the next successful install.
-fn install_over(tmp: &Path, target: &Path) -> Result<(), String> {
-    if std::fs::rename(tmp, target).is_ok() {
-        let _ = std::fs::remove_file(target.with_extension("old"));
-        return Ok(());
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct BinaryInstallTransaction {
+    schema: String,
+    version: String,
+    sha256: String,
+    sidecar: String,
+}
+
+fn binary_install_journal_path(target: &Path) -> PathBuf {
+    target.with_extension("install-transaction.json")
+}
+
+fn binary_install_rollback_path(target: &Path) -> PathBuf {
+    target.with_extension("old")
+}
+
+fn sync_parent_best_effort(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
     }
-    let displaced = target.with_extension("old");
-    let _ = std::fs::remove_file(&displaced);
-    if let Err(e) = std::fs::rename(target, &displaced) {
-        let _ = std::fs::remove_file(tmp);
+}
+
+fn sha256_regular_file(path: &Path) -> Result<Option<[u8; 32]>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect {}: {}", path.display(), error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(format!(
-            "could not replace {} (in use, and moving it aside failed: {})",
-            target.display(),
-            e
+            "refusing arc-node install candidate that is not a regular file: {}",
+            path.display()
         ));
     }
-    std::fs::rename(tmp, target).map_err(|e| {
-        // Put the original back rather than leaving the user with nothing.
-        let _ = std::fs::rename(&displaced, target);
-        let _ = std::fs::remove_file(tmp);
+    if metadata.len() > MAX_NODE_BINARY_BYTES {
+        return Err(format!(
+            "arc-node install candidate exceeds the 512 MiB safety limit: {}",
+            path.display()
+        ));
+    }
+
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {}", path.display(), error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {}", path.display(), error))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(Some(hasher.finalize().into()))
+}
+
+fn require_replaceable_binary_target(target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "refusing to replace managed arc-node target that is not a regular file: {}",
+            target.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {}: {}", target.display(), error)),
+    }
+}
+
+fn write_binary_install_transaction(
+    tmp: &Path,
+    target: &Path,
+    expected_sha256: [u8; 32],
+) -> Result<PathBuf, String> {
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| format!("{} has no install directory", target.display()))?;
+    if tmp.parent() != Some(target_parent) {
+        return Err("arc-node install sidecar escaped the managed binary directory".to_string());
+    }
+    let sidecar = tmp
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "arc-node install sidecar name is not UTF-8".to_string())?;
+    let expected_prefix = format!(
+        "{}{}",
+        target
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "managed arc-node filename is not UTF-8".to_string())?,
+        ".download-"
+    );
+    if !sidecar.starts_with(&expected_prefix) {
+        return Err("arc-node install sidecar has an unexpected name".to_string());
+    }
+
+    let transaction = BinaryInstallTransaction {
+        schema: BINARY_INSTALL_TRANSACTION_SCHEMA.to_string(),
+        version: EXPECTED_NODE_VERSION.to_string(),
+        sha256: hex::encode(expected_sha256),
+        sidecar: sidecar.to_string(),
+    };
+    let journal = binary_install_journal_path(target);
+    if std::fs::symlink_metadata(&journal).is_ok() {
+        return Err(format!(
+            "refusing to overwrite unresolved arc-node install transaction {}",
+            journal.display()
+        ));
+    }
+    let journal_tmp = journal.with_extension(format!(
+        "json.tmp-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&journal_tmp)
+        .map_err(|error| format!("create {}: {}", journal_tmp.display(), error))?;
+    let bytes = serde_json::to_vec_pretty(&transaction).map_err(map_err)?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&journal_tmp);
+        return Err(format!("persist {}: {}", journal_tmp.display(), error));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&journal_tmp, &journal) {
+        let _ = std::fs::remove_file(&journal_tmp);
+        return Err(format!("commit {}: {}", journal.display(), error));
+    }
+    sync_parent_best_effort(&journal);
+    Ok(journal)
+}
+
+fn transaction_sidecar(
+    target: &Path,
+    transaction: &BinaryInstallTransaction,
+) -> Result<PathBuf, String> {
+    let sidecar = Path::new(&transaction.sidecar);
+    if sidecar.file_name().and_then(|name| name.to_str()) != Some(transaction.sidecar.as_str()) {
+        return Err("arc-node install transaction contains a non-local sidecar path".to_string());
+    }
+    let target_stem = target
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "managed arc-node filename is not UTF-8".to_string())?;
+    if !transaction
+        .sidecar
+        .starts_with(&format!("{target_stem}.download-"))
+    {
+        return Err("arc-node install transaction names an unrelated sidecar".to_string());
+    }
+    Ok(target
+        .parent()
+        .ok_or_else(|| format!("{} has no install directory", target.display()))?
+        .join(sidecar))
+}
+
+fn decode_transaction_digest(transaction: &BinaryInstallTransaction) -> Result<[u8; 32], String> {
+    let decoded = hex::decode(&transaction.sha256)
+        .map_err(|_| "arc-node install transaction has an invalid digest".to_string())?;
+    decoded
+        .try_into()
+        .map_err(|_| "arc-node install transaction has a non-SHA-256 digest".to_string())
+}
+
+fn restore_binary_rollback_if_missing(target: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => return Ok(false),
+        Ok(_) => {
+            return Err(format!(
+                "refusing arc-node recovery through non-regular target {}",
+                target.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect {}: {}", target.display(), error)),
+    }
+    let rollback = binary_install_rollback_path(target);
+    let metadata = match std::fs::symlink_metadata(&rollback) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("inspect {}: {}", rollback.display(), error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing non-regular arc-node rollback file {}",
+            rollback.display()
+        ));
+    }
+    std::fs::rename(&rollback, target).map_err(|error| {
         format!(
+            "restore interrupted arc-node install from {}: {}",
+            rollback.display(),
+            error
+        )
+    })?;
+    sync_parent_best_effort(target);
+    tracing::warn!(
+        rollback = %rollback.display(),
+        target = %target.display(),
+        "restored the previous arc-node after an interrupted executable replacement"
+    );
+    Ok(true)
+}
+
+fn discard_invalid_binary_transaction(
+    target: &Path,
+    journal: &Path,
+    reason: impl std::fmt::Display,
+) -> Result<(), String> {
+    restore_binary_rollback_if_missing(target)?;
+    let _ = std::fs::remove_file(journal);
+    sync_parent_best_effort(journal);
+    tracing::warn!(
+        %reason,
+        journal = %journal.display(),
+        "discarded an invalid arc-node install transaction after preserving the last complete executable"
+    );
+    Ok(())
+}
+
+/// Complete or roll back the small journaled window required by Windows,
+/// where `rename` cannot atomically replace an existing executable. The old
+/// complete image is never deleted until the signed new image is at `target`.
+fn recover_interrupted_binary_install(target: &Path, expected_version: &str) -> Result<(), String> {
+    let journal = binary_install_journal_path(target);
+    let journal_metadata = match std::fs::symlink_metadata(&journal) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("inspect {}: {}", journal.display(), error)),
+    };
+
+    let Some(metadata) = journal_metadata else {
+        // Compatibility recovery for an interruption in the old, unjournaled
+        // Windows replacement sequence.
+        restore_binary_rollback_if_missing(target)?;
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return discard_invalid_binary_transaction(
+            target,
+            &journal,
+            "transaction path was not a regular file",
+        );
+    }
+    if metadata.len() > 64 * 1024 {
+        return discard_invalid_binary_transaction(
+            target,
+            &journal,
+            "transaction exceeded its 64 KiB safety limit",
+        );
+    }
+
+    let transaction: BinaryInstallTransaction = match std::fs::read(&journal)
+        .map_err(map_err)
+        .and_then(|bytes| serde_json::from_slice(&bytes).map_err(map_err))
+    {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return discard_invalid_binary_transaction(target, &journal, error);
+        }
+    };
+    if transaction.schema != BINARY_INSTALL_TRANSACTION_SCHEMA
+        || transaction.version != expected_version
+    {
+        return discard_invalid_binary_transaction(
+            target,
+            &journal,
+            "transaction schema or release version did not match this desktop",
+        );
+    }
+    let expected_sha256 = match decode_transaction_digest(&transaction) {
+        Ok(digest) => digest,
+        Err(error) => return discard_invalid_binary_transaction(target, &journal, error),
+    };
+    let sidecar = match transaction_sidecar(target, &transaction) {
+        Ok(sidecar) => sidecar,
+        Err(error) => return discard_invalid_binary_transaction(target, &journal, error),
+    };
+
+    if sha256_regular_file(target)? == Some(expected_sha256) {
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(binary_install_rollback_path(target));
+        let _ = std::fs::remove_file(&journal);
+        sync_parent_best_effort(target);
+        return Ok(());
+    }
+
+    let sidecar_sha256 = match sha256_regular_file(&sidecar) {
+        Ok(digest) => digest,
+        Err(error) => return discard_invalid_binary_transaction(target, &journal, error),
+    };
+    if sidecar_sha256 == Some(expected_sha256) {
+        let rollback = binary_install_rollback_path(target);
+        if std::fs::symlink_metadata(target).is_ok() {
+            if std::fs::symlink_metadata(&rollback).is_ok() {
+                std::fs::remove_file(&rollback).map_err(map_err)?;
+            }
+            std::fs::rename(target, &rollback).map_err(|error| {
+                format!(
+                    "preserve {} before resuming install: {}",
+                    target.display(),
+                    error
+                )
+            })?;
+            sync_parent_best_effort(target);
+        }
+        if let Err(error) = std::fs::rename(&sidecar, target) {
+            restore_binary_rollback_if_missing(target)?;
+            return Err(format!(
+                "resume verified arc-node install at {}: {}",
+                target.display(),
+                error
+            ));
+        }
+        sync_parent_best_effort(target);
+        if sha256_regular_file(target)? != Some(expected_sha256) {
+            let _ = std::fs::remove_file(target);
+            restore_binary_rollback_if_missing(target)?;
+            return Err("resumed arc-node install failed its durable digest check".to_string());
+        }
+        let _ = std::fs::remove_file(&rollback);
+        let _ = std::fs::remove_file(&journal);
+        sync_parent_best_effort(target);
+        tracing::warn!(
+            target = %target.display(),
+            "completed a verified arc-node executable replacement after an interrupted update"
+        );
+        return Ok(());
+    }
+
+    // The new image is incomplete or missing. Restore the last complete image
+    // and let normal exact-version logic fetch a fresh signed artifact.
+    restore_binary_rollback_if_missing(target)?;
+    let _ = std::fs::remove_file(&sidecar);
+    let _ = std::fs::remove_file(&journal);
+    sync_parent_best_effort(target);
+    Ok(())
+}
+
+fn install_over_transactional(
+    tmp: &Path,
+    target: &Path,
+    expected_sha256: [u8; 32],
+) -> Result<(), String> {
+    let journal = write_binary_install_transaction(tmp, target, expected_sha256)?;
+    let rollback = binary_install_rollback_path(target);
+    if std::fs::symlink_metadata(&rollback).is_ok() {
+        std::fs::remove_file(&rollback).map_err(map_err)?;
+    }
+    if let Err(error) = std::fs::rename(target, &rollback) {
+        let _ = std::fs::remove_file(&journal);
+        sync_parent_best_effort(target);
+        return Err(format!(
+            "could not preserve {} before replacement: {}",
+            target.display(),
+            error
+        ));
+    }
+    sync_parent_best_effort(target);
+
+    if let Err(error) = std::fs::rename(tmp, target) {
+        let restored = restore_binary_rollback_if_missing(target).unwrap_or(false);
+        if restored {
+            let _ = std::fs::remove_file(&journal);
+            sync_parent_best_effort(target);
+        }
+        return Err(format!(
             "could not install new arc-node at {}: {}",
             target.display(),
-            e
-        )
-    })
+            error
+        ));
+    }
+    sync_parent_best_effort(target);
+    if sha256_regular_file(target)? != Some(expected_sha256) {
+        let _ = std::fs::remove_file(target);
+        restore_binary_rollback_if_missing(target)?;
+        return Err("installed arc-node failed its durable digest check".to_string());
+    }
+
+    let _ = std::fs::remove_file(&rollback);
+    let _ = std::fs::remove_file(&journal);
+    sync_parent_best_effort(target);
+    Ok(())
+}
+
+/// Move `tmp` onto `target`. Unix gets a single atomic rename. Windows cannot
+/// replace an existing executable with `rename`, so its fallback writes and
+/// fsyncs a recovery journal before moving the complete old image aside.
+fn install_over(tmp: &Path, target: &Path, expected_sha256: [u8; 32]) -> Result<(), String> {
+    if sha256_regular_file(tmp)? != Some(expected_sha256) {
+        return Err(format!(
+            "refusing to install arc-node candidate with an unexpected durable digest: {}",
+            tmp.display()
+        ));
+    }
+    require_replaceable_binary_target(target)?;
+    if std::fs::rename(tmp, target).is_ok() {
+        let _ = std::fs::remove_file(binary_install_rollback_path(target));
+        let _ = std::fs::remove_file(binary_install_journal_path(target));
+        sync_parent_best_effort(target);
+        return Ok(());
+    }
+    install_over_transactional(tmp, target, expected_sha256)
 }
 
 /// Run `arc-node --version` and return the version token (e.g. "0.5.7").
@@ -1668,7 +2625,7 @@ fn platform_release_asset() -> Option<&'static str> {
     }
 }
 
-fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
+pub(crate) fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
     let resolver = app.path();
     let seeds = resolver
         .resolve(
@@ -1714,15 +2671,13 @@ struct ModelTierSpec {
     sha256: &'static str,
 }
 
-const MODEL_TIERS: &[ModelTierSpec] = &[
-    ModelTierSpec {
-        id: "standard",
-        display_name: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
-        url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
-        size_bytes: 4_081_004_224,
-        sha256: "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa",
-    },
-];
+const MODEL_TIERS: &[ModelTierSpec] = &[ModelTierSpec {
+    id: "standard",
+    display_name: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
+    url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
+    size_bytes: 4_081_004_224,
+    sha256: "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa",
+}];
 
 fn model_digest(spec: &ModelTierSpec) -> Result<[u8; 32], String> {
     let decoded = hex::decode(spec.sha256)
@@ -1769,6 +2724,73 @@ fn models_dir() -> PathBuf {
 
 fn model_path_for(tier: &str) -> PathBuf {
     models_dir().join(format!("{}.gguf", tier))
+}
+
+fn model_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
+    let suffix = format!("download-{}-{nonce:016x}", std::process::id());
+    match target.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => target.with_extension(format!("{suffix}.{extension}")),
+        None => target.with_extension(suffix),
+    }
+}
+
+async fn create_model_download_sidecar(target: &Path) -> Result<PendingVerifiedDownload, String> {
+    for _ in 0..32 {
+        let path = model_download_sidecar(target, rand::random::<u64>());
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&path).await {
+            Ok(file) => {
+                return Ok(PendingVerifiedDownload {
+                    path,
+                    file: Some(file),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {}", path.display(), error)),
+        }
+    }
+    Err(format!(
+        "could not allocate an isolated model download beside {}",
+        target.display()
+    ))
+}
+
+fn cleanup_model_download_sidecars(target: &Path) -> Result<(), String> {
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    let stem = target
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "model filename is not UTF-8".to_string())?;
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let prefix = format!("{stem}.download-");
+    let suffix = if extension.is_empty() {
+        String::new()
+    } else {
+        format!(".{extension}")
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {}", parent.display(), error)),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(&suffix) {
+            continue;
+        }
+        let path = entry.path();
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 /// List the tiers the desktop knows how to auto-download. Frontend uses this
@@ -1827,6 +2849,16 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     let spec = tier_spec(&tier).ok_or_else(|| format!("unknown model tier: {}", tier))?;
     let target = model_path_for(&tier);
 
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(map_err)?;
+    }
+    // Onboarding and the existing-observer banner can request the same tier
+    // concurrently. Hold one OS-backed per-target lock across recheck,
+    // download, digest verification, fsync, and promotion; a waiter rechecks
+    // the completed target instead of opening/truncating the first stream.
+    let _download_guard = acquire_model_download_lock(&target).await?;
+    cleanup_model_download_sidecars(&target)?;
+
     // Already downloaded and hash-verified → done.
     let verify_path = target.clone();
     if tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
@@ -1843,10 +2875,6 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
             },
         );
         return Ok(target.to_string_lossy().into_owned());
-    }
-
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(map_err)?;
     }
 
     // The production 7B artifact is ~4.1 GB; four hours keeps slow residential
@@ -1878,10 +2906,7 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     }
     let total_bytes = spec.size_bytes;
 
-    let tmp = target.with_extension("download");
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .map_err(|e| format!("create temp file: {}", e))?;
+    let mut pending = create_model_download_sidecar(&target).await?;
 
     let mut stream = resp;
     let mut downloaded: u64 = 0;
@@ -1897,8 +2922,6 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
             Ok(Some(c)) => c,
             Ok(None) => break,
             Err(error) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(format!(
                     "chunk read failed at {} bytes: {}",
                     downloaded, error
@@ -1907,17 +2930,13 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
         };
         downloaded = downloaded.saturating_add(chunk.len() as u64);
         if downloaded > spec.size_bytes {
-            drop(file);
-            let _ = tokio::fs::remove_file(&tmp).await;
             return Err(format!(
                 "model tier {} exceeded its pinned size of {} bytes",
                 tier, spec.size_bytes
             ));
         }
         hasher.update(&chunk);
-        if let Err(error) = file.write_all(&chunk).await {
-            drop(file);
-            let _ = tokio::fs::remove_file(&tmp).await;
+        if let Err(error) = pending.file_mut()?.write_all(&chunk).await {
             return Err(format!("write to temp file: {}", error));
         }
 
@@ -1935,12 +2954,11 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
         }
     }
 
-    file.flush().await.map_err(map_err)?;
-    file.sync_all().await.map_err(map_err)?;
-    drop(file);
+    pending.file_mut()?.flush().await.map_err(map_err)?;
+    pending.file_mut()?.sync_all().await.map_err(map_err)?;
+    pending.close();
 
     if downloaded != spec.size_bytes {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return Err(format!(
             "model tier {} ended at {} bytes, expected {}",
             tier, downloaded, spec.size_bytes
@@ -1949,9 +2967,22 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     let actual_sha256: [u8; 32] = hasher.finalize().into();
     let expected_sha256 = model_digest(spec)?;
     if actual_sha256 != expected_sha256 {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return Err(format!(
             "SHA-256 verification failed for model tier {}",
+            tier
+        ));
+    }
+
+    // Re-read the fsynced unique sidecar and require the same exact
+    // size+digest contract before promotion. This catches disk faults and
+    // proves the file being renamed, not merely the received byte stream.
+    let verify_path = pending.path.clone();
+    if !tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
+        .await
+        .map_err(map_err)??
+    {
+        return Err(format!(
+            "durable model verification failed for tier {}",
             tier
         ));
     }
@@ -1959,12 +2990,9 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     // Atomic rename over any existing target. std::fs::rename uses
     // MoveFileEx(REPLACE_EXISTING) on Windows since Rust 1.62, so this
     // works cross-platform.
-    std::fs::rename(&tmp, &target).map_err(|e| {
-        // Best-effort cleanup of the temp on failure — caller should be able
-        // to retry without a stale ".download" sidecar accumulating.
-        let _ = std::fs::remove_file(&tmp);
-        format!("rename to {}: {}", target.display(), e)
-    })?;
+    std::fs::rename(&pending.path, &target)
+        .map_err(|e| format!("rename to {}: {}", target.display(), e))?;
+    sync_parent_best_effort(&target);
 
     let _ = app.emit(
         "model-download-progress",
@@ -1985,14 +3013,20 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
 #[tauri::command]
 pub async fn remove_model(tier: String) -> CmdResult<()> {
     let p = model_path_for(&tier);
+    if p.parent().is_none_or(|parent| !parent.exists()) {
+        return Ok(());
+    }
+    let _download_guard = acquire_model_download_lock(&p).await?;
     if p.exists() {
         std::fs::remove_file(&p).map_err(map_err)?;
     }
-    // Also clean any stale .download sidecar from a crashed download.
+    // Also clean sidecars from both the legacy deterministic scheme and the
+    // unique create-new scheme after holding the same per-target lock.
     let tmp = p.with_extension("download");
     if tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
     }
+    cleanup_model_download_sidecars(&p)?;
     Ok(())
 }
 
@@ -2018,6 +3052,34 @@ mod release_binary_tests {
         assert!(error.contains("exact model-artifact binding"));
         assert!(error.contains("validator-authenticated authorization"));
         assert!(error.contains("Free/community inference remains available"));
+    }
+
+    #[test]
+    fn unresolved_data_migration_blocks_manual_start_and_restart() {
+        assert!(data_migration_start_gate(None).is_ok());
+        let error = data_migration_start_gate(Some("legacy data directory is a symbolic link"))
+            .expect_err("an unresolved native migration fence must block every start path");
+        assert!(error.contains("refused to start"));
+        assert!(error.contains("migration is not safely resolved"));
+        assert!(error.contains("preserved legacy directory"));
+    }
+
+    #[test]
+    fn generic_config_save_preserves_the_native_data_directory() {
+        let persisted = NodeConfig {
+            data_dir: "/safe/fenced/data-v3".to_string(),
+            ..NodeConfig::default()
+        };
+        let mut webview_candidate = NodeConfig {
+            data_dir: "/preserved/v0.7-history".to_string(),
+            rpc_port: 10_001,
+            ..NodeConfig::default()
+        };
+
+        preserve_authoritative_data_dir(&mut webview_candidate, Some(&persisted));
+
+        assert_eq!(webview_candidate.data_dir, persisted.data_dir);
+        assert_eq!(webview_candidate.rpc_port, 10_001);
     }
 
     #[test]
@@ -2061,6 +3123,29 @@ mod release_binary_tests {
     }
 
     #[test]
+    fn startup_adopts_only_an_exact_node_version() {
+        let exact = serde_json::json!({ "status": "ok", "version": EXPECTED_NODE_VERSION });
+        assert_eq!(
+            classify_local_health(&exact, EXPECTED_NODE_VERSION),
+            LocalNodeCompatibility::Exact
+        );
+
+        let stale = serde_json::json!({ "status": "ok", "version": "0.7.11" });
+        let stale_reason = match classify_local_health(&stale, EXPECTED_NODE_VERSION) {
+            LocalNodeCompatibility::Incompatible(reason) => reason,
+            other => panic!("stale local node was classified as {other:?}"),
+        };
+        assert!(stale_reason.contains("0.7.11"));
+        assert!(stale_reason.contains(EXPECTED_NODE_VERSION));
+
+        let malformed = serde_json::json!({ "status": "ok" });
+        assert!(matches!(
+            classify_local_health(&malformed, EXPECTED_NODE_VERSION),
+            LocalNodeCompatibility::Incompatible(_)
+        ));
+    }
+
+    #[test]
     fn desktop_inference_deadline_outlives_the_server_protocol_budget() {
         assert_eq!(inference_timeout(0).as_secs(), 105);
         assert_eq!(inference_timeout(32).as_secs(), 566);
@@ -2093,16 +3178,280 @@ mod release_binary_tests {
         assert!(expected_release_sha256(manifest, "arc-node-linux-x86_64").is_err());
     }
 
+    fn signed_manifest_fixture() -> (String, String, String) {
+        use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey};
+
+        let mut rng = rand::rngs::OsRng;
+        let private_key = PrivateKey::random(&mut rng, Algorithm::Ed25519)
+            .expect("generate ephemeral release test key");
+        let public_key = private_key
+            .public_key()
+            .to_openssh()
+            .expect("encode ephemeral public key");
+        let allowed_signers = format!(
+            "arc-release namespaces=\"{}\" {} arc-release-test\n",
+            ARC_RELEASE_MANIFEST_NAMESPACE, public_key
+        );
+        let manifest = format!(
+            "# ARC release manifest v1\n# repository={}\n# tag=v{}\n# commit={}\n{}  arc-node-linux-x86_64\n",
+            ARC_RELEASE_REPOSITORY,
+            EXPECTED_NODE_VERSION,
+            "a".repeat(40),
+            "11".repeat(32),
+        );
+        let signature = private_key
+            .sign(
+                ARC_RELEASE_MANIFEST_NAMESPACE,
+                HashAlg::Sha512,
+                manifest.as_bytes(),
+            )
+            .expect("sign manifest")
+            .to_pem(LineEnding::LF)
+            .expect("armor signature");
+        (manifest, signature, allowed_signers)
+    }
+
+    #[test]
+    fn child_node_manifest_requires_owner_signature_and_exact_binding() {
+        let (manifest, signature, allowed_signers) = signed_manifest_fixture();
+        verify_release_manifest_signature_with_signers(
+            manifest.as_bytes(),
+            signature.as_bytes(),
+            &allowed_signers,
+            EXPECTED_NODE_VERSION,
+        )
+        .expect("valid exact-tag owner signature");
+
+        let tampered = manifest.replace(&"11".repeat(32), &"22".repeat(32));
+        assert!(
+            verify_release_manifest_signature_with_signers(
+                tampered.as_bytes(),
+                signature.as_bytes(),
+                &allowed_signers,
+                EXPECTED_NODE_VERSION,
+            )
+            .is_err(),
+            "a checksum edit must invalidate the owner signature"
+        );
+
+        assert!(
+            verify_release_manifest_signature_with_signers(
+                manifest.as_bytes(),
+                signature.as_bytes(),
+                &allowed_signers,
+                "0.8.1",
+            )
+            .is_err(),
+            "a valid signature must not be replayable across release tags"
+        );
+    }
+
     #[test]
     fn download_sidecar_preserves_windows_executable_suffix() {
+        let pid = std::process::id();
         assert_eq!(
-            binary_download_sidecar(Path::new("arc-node.exe")),
-            PathBuf::from("arc-node.download.exe")
+            binary_download_sidecar(Path::new("arc-node.exe"), 1),
+            PathBuf::from(format!("arc-node.download-{pid}-0000000000000001.exe"))
         );
         assert_eq!(
-            binary_download_sidecar(Path::new("arc-node")),
-            PathBuf::from("arc-node.download")
+            binary_download_sidecar(Path::new("arc-node"), 2),
+            PathBuf::from(format!("arc-node.download-{pid}-0000000000000002"))
         );
+    }
+
+    fn binary_install_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "arc-desktop-{label}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_get_exclusive_sidecars() {
+        let dir = binary_install_test_dir("isolated-downloads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let first = create_binary_download_sidecar(&target).await.unwrap();
+        let second = create_binary_download_sidecar(&target).await.unwrap();
+        assert_ne!(first.path, second.path);
+        for path in [&first.path, &second.path] {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("exe")
+            );
+        }
+        drop(first);
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_install_lock_serializes_concurrent_ensure_sequences() {
+        let dir = binary_install_test_dir("binary-install-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let first = acquire_binary_install_lock(&target).await.unwrap();
+        let waiter_target = target.clone();
+        let waiter = tokio::spawn(async move { acquire_binary_install_lock(&waiter_target).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a second ensure sequence must wait for the first install lock"
+        );
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("second ensure sequence should resume after unlock")
+            .expect("install-lock task should not panic")
+            .expect("second install lock");
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_binary_replacement_completes_verified_sidecar() {
+        let dir = binary_install_test_dir("binary-install-resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let rollback = binary_install_rollback_path(&target);
+        let sidecar = binary_download_sidecar(&target, 7);
+        let old = b"complete old executable";
+        let new = b"owner-signed new executable";
+        let digest: [u8; 32] = Sha256::digest(new).into();
+        std::fs::write(&target, old).unwrap();
+        std::fs::write(&sidecar, new).unwrap();
+        let journal = write_binary_install_transaction(&sidecar, &target, digest).unwrap();
+
+        // Power loss after Windows moved the old image aside but before the
+        // verified sidecar reached the canonical path.
+        std::fs::rename(&target, &rollback).unwrap();
+        recover_interrupted_binary_install(&target, EXPECTED_NODE_VERSION).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), new);
+        assert!(!rollback.exists());
+        assert!(!sidecar.exists());
+        assert!(!journal.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_binary_replacement_restores_old_if_sidecar_is_torn() {
+        let dir = binary_install_test_dir("binary-install-rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let rollback = binary_install_rollback_path(&target);
+        let sidecar = binary_download_sidecar(&target, 8);
+        let old = b"last complete executable";
+        let expected_new = b"expected complete executable";
+        let digest: [u8; 32] = Sha256::digest(expected_new).into();
+        std::fs::write(&target, old).unwrap();
+        std::fs::write(&sidecar, expected_new).unwrap();
+        let journal = write_binary_install_transaction(&sidecar, &target, digest).unwrap();
+        std::fs::rename(&target, &rollback).unwrap();
+        std::fs::write(&sidecar, b"torn").unwrap();
+
+        recover_interrupted_binary_install(&target, EXPECTED_NODE_VERSION).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), old);
+        assert!(!rollback.exists());
+        assert!(!sidecar.exists());
+        assert!(!journal.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn torn_install_journal_still_restores_the_complete_old_binary() {
+        let dir = binary_install_test_dir("binary-install-torn-journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let rollback = binary_install_rollback_path(&target);
+        let journal = binary_install_journal_path(&target);
+        let old = b"recoverable pre-update executable";
+        std::fs::write(&rollback, old).unwrap();
+        std::fs::write(&journal, b"{torn").unwrap();
+
+        recover_interrupted_binary_install(&target, EXPECTED_NODE_VERSION).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), old);
+        assert!(!rollback.exists());
+        assert!(!journal.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transactional_binary_replacement_keeps_a_rollback_until_commit() {
+        let dir = binary_install_test_dir("binary-install-transaction");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let sidecar = binary_download_sidecar(&target, 9);
+        let new = b"verified transaction executable";
+        let digest: [u8; 32] = Sha256::digest(new).into();
+        std::fs::write(&target, b"old executable").unwrap();
+        std::fs::write(&sidecar, new).unwrap();
+
+        install_over_transactional(&sidecar, &target, digest).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), new);
+        assert!(!binary_install_rollback_path(&target).exists());
+        assert!(!binary_install_journal_path(&target).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn executable_replacement_never_moves_aside_a_non_regular_target() {
+        let dir = binary_install_test_dir("binary-install-non-regular-target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("arc-node.exe");
+        let sidecar = binary_download_sidecar(&target, 10);
+        let new = b"verified replacement executable";
+        let digest: [u8; 32] = Sha256::digest(new).into();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&sidecar, new).unwrap();
+
+        let error = install_over(&sidecar, &target, digest)
+            .expect_err("a directory at the executable path must fail closed");
+
+        assert!(error.contains("not a regular file"));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), new);
+        assert!(!binary_install_rollback_path(&target).exists());
+        assert!(!binary_install_journal_path(&target).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_replacement_never_follows_or_replaces_a_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = binary_install_test_dir("binary-install-symlink-target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let actual = dir.join("operator-owned-node");
+        let target = dir.join("arc-node");
+        let sidecar = binary_download_sidecar(&target, 11);
+        let original = b"operator-owned executable";
+        let new = b"verified replacement executable";
+        let digest: [u8; 32] = Sha256::digest(new).into();
+        std::fs::write(&actual, original).unwrap();
+        symlink(&actual, &target).unwrap();
+        std::fs::write(&sidecar, new).unwrap();
+
+        let error = install_over(&sidecar, &target, digest)
+            .expect_err("a symlink at the managed executable path must fail closed");
+
+        assert!(error.contains("not a regular file"));
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&actual).unwrap(), original);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), new);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2127,6 +3476,60 @@ mod release_binary_tests {
             production.sha256,
             "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
         );
+        assert!(production
+            .url
+            .contains("/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/"));
+        assert!(!production.url.contains("/resolve/main/"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_model_invocations_get_independent_create_new_sidecars() {
+        let dir = binary_install_test_dir("isolated-model-downloads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("standard.gguf");
+        let mut first = create_model_download_sidecar(&target).await.unwrap();
+        let mut second = create_model_download_sidecar(&target).await.unwrap();
+        assert_ne!(first.path, second.path);
+        first.file_mut().unwrap().write_all(b"first").await.unwrap();
+        second
+            .file_mut()
+            .unwrap()
+            .write_all(b"second")
+            .await
+            .unwrap();
+        let first_path = first.path.clone();
+        let second_path = second.path.clone();
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(
+            second_path.exists(),
+            "one failed/cancelled model download must not remove its concurrent peer"
+        );
+        drop(second);
+        assert!(!second_path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_stale_model_sidecars() {
+        let dir = binary_install_test_dir("stale-model-sidecar-cleanup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("standard.gguf");
+        let lock = model_download_lock_path(&target);
+        let stale = model_download_sidecar(&target, 7);
+        std::fs::write(&target, b"already verified canonical target").unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::write(&stale, b"interrupted stream").unwrap();
+
+        cleanup_model_download_sidecars(&target).unwrap();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"already verified canonical target"
+        );
+        assert!(lock.exists(), "the durable lock inode remains reusable");
+        assert!(!stale.exists(), "an abandoned unique sidecar is removable");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

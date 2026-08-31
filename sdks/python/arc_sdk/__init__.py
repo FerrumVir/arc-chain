@@ -16,10 +16,12 @@ Usage::
     print(f"Address: {kp.address()}")
 
     # Build and sign a transfer
+    transaction_domain = client.get_transaction_domain()
     tx = TransactionBuilder.transfer(
         from_addr=kp.address(),
         to_addr="0" * 64,
         amount=1000,
+        transaction_domain=transaction_domain,
     )
     signed_tx = TransactionBuilder.sign(tx, kp)
 

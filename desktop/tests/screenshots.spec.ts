@@ -99,7 +99,7 @@ test.describe("Screenshot gallery", () => {
     await seedOnboarded(page);
     await page.goto("/");
     await page.getByTestId("nav-inference").click();
-    await page.getByTestId("inference-prompt").fill("Biggest planet?");
+    await page.getByTestId("inference-prompt").fill("The largest planet is");
     await page.getByTestId("btn-run-inference").click();
     await page.waitForSelector('[data-testid="inference-result"]', { timeout: 6000 });
     await page.waitForTimeout(400);

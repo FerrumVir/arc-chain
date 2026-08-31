@@ -156,6 +156,36 @@ test.describe("Projected earnings - populated", () => {
     );
   });
 
+  test("two rollout canary receipts stay collecting data instead of annualizing", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      fetch_earnings_projection: {
+        ...PROJECTION_NO_HISTORY,
+        communityRewardsEnabled: true,
+        attestationsTotal: 2,
+        rewardPerAttestation: 2.5,
+        projectedDailyArc: null,
+        projectedDailyUnavailableReason:
+          "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries",
+        rateUnavailableReason:
+          "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries",
+        observedOverBlocks: 1,
+      },
+    });
+    await gotoEarnings(page);
+
+    const collecting = page.getByTestId("projection-no-rate");
+    await expect(collecting).toContainText("collecting data");
+    await expect(collecting).toContainText("at least 3");
+    await expect(collecting).toContainText("at least 24 hours");
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+    await expect(page.getByTestId("projection-per-week")).toHaveCount(0);
+    await expect(
+      page.getByTestId("projection-funding-label").first(),
+    ).toContainText("Promotional testnet subsidy, not demand or revenue");
+  });
+
   test("shows the host's own caveat about how the rate was derived", async ({
     page,
   }) => {

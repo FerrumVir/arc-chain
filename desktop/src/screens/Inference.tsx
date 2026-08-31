@@ -21,51 +21,50 @@ import { useAppStore } from "../lib/store";
 import type { InferenceResult } from "../lib/types";
 
 const EXAMPLES = [
-  "What is the largest planet in our solar system?",
-  "Explain zero-knowledge proofs in one sentence.",
-  "Write a haiku about blockchains.",
-  "Who invented the transistor?",
+  "The largest planet is",
+  "Water boils at",
+  "The sun is a",
+  "Bitcoin is a",
 ];
 
-/// Milestone A (#35): local node may be an observer with no model loaded
-/// and return 503 / connection error. Silently fall back to a seed
-/// coordinator via /inference/run_consensus so a fresh-install user gets
-/// a real answer without configuring anything.
-///
-/// Second fallback: if /inference/run_consensus reports a service/topology
-/// failure, retry against the same coordinators using /inference/run directly.
-/// This loses k-of-n agreement and does not imply an on-chain attestation or
-/// payment, but the response remains explicitly labelled with its coordinator.
+const ARC_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
+const COMMUNITY_REWARD_ARC = 2.5;
+
+/// Local execution stays first. If this machine cannot serve, call a seed's
+/// `/inference/run` before the standalone consensus route: that endpoint gives
+/// registered community workers first refusal, then safely falls through to
+/// the seed's sharded/local execution. Only when every direct coordinator
+/// fails before completing a job do we use `/inference/run_consensus`.
 async function runInferenceSmart(
   prompt: string,
   maxTokens: number,
 ): Promise<InferenceResult> {
   const fallbackToCoordinator = async (): Promise<InferenceResult> => {
     try {
-      return await api.runInferenceViaCoordinator(prompt, maxTokens);
-    } catch (consensusErr) {
-      const cmsg = String(
-        consensusErr instanceof Error ? consensusErr.message : consensusErr,
+      return await api.runInferenceViaCoordinatorDirect(prompt, maxTokens);
+    } catch (directErr) {
+      const message = String(
+        directErr instanceof Error ? directErr.message : directErr,
       );
+      // The direct command retries every coordinator for service/topology
+      // failures. Reaching this aggregate error means no community assignment
+      // completed, so a sharded-consensus fallback cannot duplicate a reward.
       if (
-        cmsg.includes("Pipeline gap") ||
-        cmsg.includes("503") ||
-        cmsg.includes("all coordinators failed")
+        message.includes("all coordinators failed (direct path)") ||
+        message.includes("no coordinator answered /health")
       ) {
-        return await api.runInferenceViaCoordinatorDirect(prompt, maxTokens);
+        return await api.runInferenceViaCoordinator(prompt, maxTokens);
       }
-      throw consensusErr;
+      // In particular, never fall back after a 504 that says a claimed
+      // community assignment may still settle.
+      throw directErr;
     }
   };
 
   try {
     const r = await api.runInference(prompt, maxTokens);
-    // Even a 200 from the local node can be an empty/placeholder result
-    // (some observer builds short-circuit); fall back on empty output so
-    // the user always sees *something*.
-    if (r.output.trim().length === 0 && !r.coordinator) {
-      return await fallbackToCoordinator();
-    }
+    // An empty successful completion can be a legitimate immediate EOS. Do
+    // not duplicate it on another coordinator merely to manufacture text.
     return r;
   } catch (err) {
     const msg = String(err instanceof Error ? err.message : err);
@@ -77,7 +76,8 @@ async function runInferenceSmart(
       msg.includes("fetch") ||
       msg.includes("error sending request") ||
       msg.toLowerCase().includes("connection") ||
-      msg.includes("No shards")
+      msg.includes("No shards") ||
+      msg.includes("No model loaded")
     ) {
       return await fallbackToCoordinator();
     }
@@ -101,6 +101,26 @@ export function Inference() {
     setCopied(key);
     setTimeout(() => setCopied(null), 1200);
   };
+  const communityWorker = run.data?.routedVia?.startsWith("community:")
+    ? run.data.routedVia.slice("community:".length)
+    : null;
+  const isCommunityRewardTx = Boolean(
+    run.data?.settlement?.txType === "0x25" &&
+    ARC_HASH_RE.test(run.data.settlement.txHash.trim()),
+  );
+  const confirmedCommunityReward = Boolean(
+    isCommunityRewardTx &&
+    run.data?.settlement?.status === "mined_success" &&
+    run.data.settlement.submitted &&
+    run.data?.settlement?.confirmed &&
+    run.data.settlement.included &&
+    run.data.settlement.rewardArc === COMMUNITY_REWARD_ARC &&
+    ARC_HASH_RE.test(run.data.settlement.jobId.trim()),
+  );
+  const confirmedCommunityRewardAmount =
+    run.data?.settlement?.rewardArc == null
+      ? "Amount not reported"
+      : `${run.data.settlement.rewardArc} ARC`;
 
   return (
     <div className="main-inner" data-testid="inference-screen">
@@ -129,9 +149,10 @@ export function Inference() {
                   Your prompt goes to your own node first, at{" "}
                   <code>POST /inference/run</code> on{" "}
                   <code>127.0.0.1</code>. If your node isn&rsquo;t running or
-                  has no compatible model loaded, it falls back to the first
-                  reachable configured coordinator. Either way the response below
-                  says which machine served it.
+                  has no compatible model loaded, it falls back to a reachable
+                  coordinator&rsquo;s community-first <code>/inference/run</code>
+                  route. Either way the response below says where the compute
+                  ran and what the coordinator actually verified.
                 </p>
                 <p>
                   1. Attempts the prompt on the selected execution path. A
@@ -259,11 +280,14 @@ export function Inference() {
           >
             <Coins size={15} style={{ flexShrink: 0, marginTop: 1 }} />
             <span>
-              <strong>Testnet escrow is unavailable.</strong> Exact-artifact
-              binding and validator-authorized settlement are not complete, so
-              this build will not sign or submit a paid request. Unpaid
-              inference remains available, but running it does not earn ARC.
-              VRF or replica selection is not validator payment approval.
+              <strong>Prompts are free; worker rewards are separate.</strong>{" "}
+              This app does not sign or submit a paid requester escrow. A
+              coordinator may still assign the prompt to an eligible community
+              worker and return a validator-authorized <code>0x25</code> reward
+              transaction for that worker. It is pending until the selected
+              chain host reports a successful mined receipt; the person
+              submitting the prompt is neither charged nor rewarded. VRF or
+              replica selection alone is not payment approval.
             </span>
           </div>
           <div style={{ flex: 1, minWidth: "var(--space-3)" }} />
@@ -351,14 +375,33 @@ export function Inference() {
           >
             <Globe size={14} style={{ color: "var(--success)" }} />
             <span>
-              Served by{" "}
-              <strong data-testid="inference-coordinator">
-                {run.data.servedLocally
-                  ? "your node"
-                  : run.data.coordinator
-                    ? hostLabel(run.data.coordinator)
-                    : "the network"}
-              </strong>
+              {communityWorker ? (
+                <>
+                  Computed by{" "}
+                  <strong data-testid="inference-community-worker">
+                    community worker {formatHash(communityWorker, 12)}
+                  </strong>{" "}
+                  via{" "}
+                  <strong data-testid="inference-coordinator">
+                    {run.data.servedLocally
+                      ? "your node"
+                      : run.data.coordinator
+                        ? hostLabel(run.data.coordinator)
+                        : "the network"}
+                  </strong>
+                </>
+              ) : (
+                <>
+                  Served by{" "}
+                  <strong data-testid="inference-coordinator">
+                    {run.data.servedLocally
+                      ? "your node"
+                      : run.data.coordinator
+                        ? hostLabel(run.data.coordinator)
+                        : "the network"}
+                  </strong>
+                </>
+              )}
               {run.data.consensus ? (
                 <>
                   {" "}· coordinator reports k={run.data.consensus.k} ·{" "}
@@ -378,11 +421,55 @@ export function Inference() {
                     </>
                   )}
                 </>
+              ) : run.data.quorumVerified && communityWorker ? (
+                <> · independently checked with authenticated 2-of-3 range quorums</>
               ) : (
                 <> · no independent replica-agreement evidence returned</>
               )}
+              {run.data.profileBound
+                ? " · exact execution profile bound"
+                : " · execution profile not proven"}
+              {run.data.quorumVerified
+                ? " · authenticated quorum verified"
+                : " · quorum not verified"}
             </span>
           </div>
+
+          {run.data.settlement && (
+            <div
+              data-testid="community-settlement"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "var(--space-3)",
+                padding: "var(--space-3) var(--space-4)",
+                marginBottom: "var(--space-4)",
+                border: `1px solid ${
+                  confirmedCommunityReward
+                    ? "rgba(80, 200, 120, 0.3)"
+                    : "var(--border)"
+                }`,
+                borderRadius: "var(--radius-sm)",
+                background: confirmedCommunityReward
+                  ? "var(--success-bg, rgba(80, 200, 120, 0.08))"
+                  : "var(--bg)",
+                fontSize: "var(--text-sm)",
+              }}
+            >
+              <Coins size={14} style={{ color: "var(--accent)" }} />
+              <span>
+                <strong>Community reward:</strong>{" "}
+                {confirmedCommunityReward
+                  ? `${confirmedCommunityRewardAmount} confirmed for the serving worker by a successful mined 0x25 receipt`
+                  : isCommunityRewardTx && run.data.settlement.submitted
+                    ? "0x25 submitted; not earned until a successful mined receipt"
+                    : run.data.settlement.txType &&
+                        run.data.settlement.txType !== "0x25"
+                      ? `unrecognized settlement type ${run.data.settlement.txType}; no community reward credited`
+                    : `no confirmed 0x25 reward (${run.data.settlement.status.replaceAll("_", " ")}); inference verification is separate from payment`}
+              </span>
+            </div>
+          )}
 
           {/* Per-hop pipeline trace. The chain returns `shard_trace` on
               sharded runs and the app was discarding it — this is the
@@ -472,6 +559,15 @@ export function Inference() {
                 icon={Sparkles}
               />
             )}
+            {isCommunityRewardTx && run.data.settlement?.txHash && (
+              <HashRow
+                label="0x25 reward tx"
+                value={run.data.settlement.txHash}
+                copied={copied === "reward"}
+                onCopy={() => copy("reward", run.data!.settlement!.txHash)}
+                icon={Coins}
+              />
+            )}
             <HashRow
               label="Output hash"
               value={run.data.outputHash}
@@ -513,15 +609,26 @@ export function Inference() {
                 the hash against the pinned host, which is the only place it
                 can honestly be confirmed — including telling the user it is
                 not in a block yet. */}
-            {run.data.txHash && (
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => lookupHash(run.data!.txHash)}
-                data-testid="btn-lookup-tx"
-              >
-                Look up this claim <Search size={12} />
-              </button>
-            )}
+            <span style={{ display: "inline-flex", gap: "var(--space-2)" }}>
+              {isCommunityRewardTx && run.data.settlement?.txHash && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => lookupHash(run.data!.settlement!.txHash)}
+                  data-testid="btn-lookup-reward"
+                >
+                  Track reward receipt <Search size={12} />
+                </button>
+              )}
+              {run.data.txHash && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => lookupHash(run.data!.txHash)}
+                  data-testid="btn-lookup-tx"
+                >
+                  Look up this claim <Search size={12} />
+                </button>
+              )}
+            </span>
           </div>
         </Card>
       )}

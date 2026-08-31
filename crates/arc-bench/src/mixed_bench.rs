@@ -26,8 +26,9 @@
 //! Usage:
 //!   arc-bench-mixed [--txs 100000] [--batch-size 10000] [--threads 0]
 
+mod ephemeral_keys;
+
 use arc_crypto::Hash256;
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_node::pipeline::{Pipeline, PipelineBatch};
 use arc_state::StateDB;
 use arc_types::Transaction;
@@ -211,14 +212,13 @@ fn format_gas(gas: f64) -> String {
 
 /// Pre-sign a batch of transfer transactions.
 /// Returns the signed transactions and genesis accounts to prefund.
-fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
-    let sender_count = 10u8;
-    let keypairs: Vec<_> = (0..sender_count)
-        .map(|i| (benchmark_keypair(i), benchmark_address(i)))
-        .collect();
+fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u64)>, Vec<Hash256>) {
+    let sender_count = 10usize;
+    let keypairs = ephemeral_keys::signing_keypairs(sender_count);
 
     // Receiver addresses (don't overlap with senders)
-    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
+    let receivers = ephemeral_keys::addresses(56);
+    let aux_addrs = ephemeral_keys::addresses(100);
 
     // Genesis: fund all senders generously, receivers start at 0
     let mut genesis: Vec<(Hash256, u64)> = keypairs
@@ -230,9 +230,8 @@ fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u6
     }
     // Also prefund "extra" accounts used for simulated state ops.
     // We use addresses 100..199 as auxiliary accounts for extra reads/writes.
-    for i in 100u8..200 {
-        let addr = benchmark_address(i);
-        genesis.push((addr, u64::MAX / 8));
+    for addr in &aux_addrs {
+        genesis.push((*addr, u64::MAX / 8));
     }
 
     let mut transactions = Vec::with_capacity(total_txs);
@@ -246,20 +245,14 @@ fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u6
 
         let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
-        // Real Ed25519 signing
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
+        tx.sign(sk)
+            .expect("ephemeral benchmark signing must succeed");
 
         nonces[kp_idx] += 1;
         transactions.push(tx);
     }
 
-    (transactions, genesis)
+    (transactions, genesis, aux_addrs)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,9 +265,8 @@ fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u6
 ///
 /// Uses auxiliary accounts (addresses 100..199) so we do not interfere
 /// with the pipeline's own balance accounting.
-fn simulate_extra_state_ops(state: &StateDB, tx_types: &[SimTxType]) {
-    let aux_addrs: Vec<Hash256> = (100u8..200).map(benchmark_address).collect();
-    let storage_contract = benchmark_address(100);
+fn simulate_extra_state_ops(state: &StateDB, tx_types: &[SimTxType], aux_addrs: &[Hash256]) {
+    let storage_contract = aux_addrs[0];
 
     for (i, &sim_type) in tx_types.iter().enumerate() {
         let reads = sim_type.extra_reads();
@@ -370,10 +362,10 @@ fn type_name(t: SimTxType) -> &'static str {
 // ---------------------------------------------------------------------------
 
 fn run_transfer_only(total_txs: usize, batch_size: usize) -> (usize, usize, Duration) {
-    let (transactions, genesis) = presign_transactions(total_txs);
+    let (transactions, genesis, _) = presign_transactions(total_txs);
     let state = Arc::new(StateDB::with_genesis(&genesis));
     let pipeline = Pipeline::new(Arc::clone(&state));
-    let producer = benchmark_address(255);
+    let producer = genesis[0].0;
 
     let start = Instant::now();
     let num_batches = transactions.len().div_ceil(batch_size);
@@ -431,10 +423,10 @@ fn run_mixed_workload(
     let tx_types: Vec<SimTxType> = (0..total_txs).map(assign_tx_type).collect();
 
     // Pre-sign all transactions (they go through the pipeline as transfers)
-    let (transactions, genesis) = presign_transactions(total_txs);
+    let (transactions, genesis, aux_addrs) = presign_transactions(total_txs);
     let state = Arc::new(StateDB::with_genesis(&genesis));
     let pipeline = Pipeline::new(Arc::clone(&state));
-    let producer = benchmark_address(255);
+    let producer = genesis[0].0;
 
     let start = Instant::now();
     let num_batches = transactions.len().div_ceil(batch_size);
@@ -461,7 +453,7 @@ fn run_mixed_workload(
         // state operations that heavier tx types would require.
         // This adds real state pressure (DashMap reads + storage writes)
         // concurrent with the pipeline's own execution.
-        simulate_extra_state_ops(&state, batch_types);
+        simulate_extra_state_ops(&state, batch_types, &aux_addrs);
     }
 
     let mut total_processed = 0usize;

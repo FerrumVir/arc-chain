@@ -276,11 +276,11 @@ dependencies = [
  "anyhow",
  "arc-crypto",
  "arc-types",
+ "blake3",
  "clap",
  "ed25519-dalek",
  "hex",
  "k256",
- "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -323,6 +323,7 @@ dependencies = [
  "icicle-m31",
  "icicle-runtime",
  "k256",
+ "libc",
  "num-traits",
  "pqcrypto-falcon",
  "pqcrypto-traits",
@@ -335,6 +336,7 @@ dependencies = [
  "stwo",
  "stwo-constraint-framework",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -452,6 +454,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "k256",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "rand 0.8.8",
@@ -461,6 +464,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml",
@@ -3219,7 +3223,7 @@ dependencies = [
 [[package]]
 name = "icicle-core"
 version = "3.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v3.4.0#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
+source = "git+https://github.com/ingonyama-zk/icicle.git?rev=cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
 dependencies = [
  "hex",
  "icicle-runtime",
@@ -3231,7 +3235,7 @@ dependencies = [
 [[package]]
 name = "icicle-hash"
 version = "3.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v3.4.0#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
+source = "git+https://github.com/ingonyama-zk/icicle.git?rev=cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
 dependencies = [
  "cmake",
  "icicle-core",
@@ -3242,7 +3246,7 @@ dependencies = [
 [[package]]
 name = "icicle-m31"
 version = "3.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v3.4.0#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
+source = "git+https://github.com/ingonyama-zk/icicle.git?rev=cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
 dependencies = [
  "cmake",
  "icicle-core",
@@ -3253,7 +3257,7 @@ dependencies = [
 [[package]]
 name = "icicle-runtime"
 version = "3.4.0"
-source = "git+https://github.com/ingonyama-zk/icicle.git?tag=v3.4.0#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
+source = "git+https://github.com/ingonyama-zk/icicle.git?rev=cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06#cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06"
 dependencies = [
  "cmake",
  "once_cell",

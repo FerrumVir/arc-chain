@@ -652,10 +652,15 @@ pub fn batch_verify_falcon512(
     }
 }
 
-// ── Benchmark keypair derivation ─────────────────────────────────────────────
+// ── Isolated benchmark keypair derivation ────────────────────────────────────
 
 /// Derive a deterministic Ed25519 keypair from a benchmark index.
 /// All nodes derive the same keypairs → same genesis → compatible P2P.
+///
+/// This deliberately predictable signer is unavailable in production/default
+/// builds. Callers must opt into the nondefault `benchmark-tools` feature and
+/// enforce an isolated numeric-loopback runtime boundary before using it.
+#[cfg(feature = "benchmark-tools")]
 pub fn benchmark_keypair(index: u8) -> ed25519_dalek::SigningKey {
     let seed = blake3::derive_key("ARC-chain-benchmark-keypair-v1", &[index]);
     ed25519_dalek::SigningKey::from_bytes(&seed)
@@ -663,6 +668,7 @@ pub fn benchmark_keypair(index: u8) -> ed25519_dalek::SigningKey {
 
 /// ARC address for benchmark keypair at the given index.
 /// `address = BLAKE3(ed25519_public_key)`
+#[cfg(feature = "benchmark-tools")]
 pub fn benchmark_address(index: u8) -> Hash256 {
     address_from_ed25519_pubkey(benchmark_keypair(index).verifying_key().as_bytes())
 }

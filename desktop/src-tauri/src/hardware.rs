@@ -181,7 +181,10 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
     use std::process::Command;
     // Try nvidia-smi first, fall back to lspci
     let out = Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output();
     if let Ok(o) = out {
         if o.status.success() {

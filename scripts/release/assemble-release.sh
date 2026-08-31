@@ -49,10 +49,57 @@ esac
 case "/$OUTPUT_DIR/" in
     *'/../'*|*'/./'*) die "refusing non-canonical OUTPUT_DIR: $OUTPUT_DIR" ;;
 esac
-[ ! -L "${OUTPUT_DIR%/}" ] || die "refusing symlinked OUTPUT_DIR: $OUTPUT_DIR"
 
-rm -rf -- "$OUTPUT_DIR"
-mkdir -p -- "$OUTPUT_DIR"
+# Build beside the requested destination, then publish by directory rename. A
+# non-empty destination may only be replaced when this script left an exact
+# sidecar ownership receipt on a previous successful run. This prevents a typo
+# such as OUTPUT_DIR=/home/alice from recursively deleting unrelated data and
+# keeps the last known-good release intact when assembly fails halfway through.
+OUTPUT_BASENAME="$(basename -- "${OUTPUT_DIR%/}")"
+case "$OUTPUT_BASENAME" in
+    ''|.|..|*[!A-Za-z0-9._-]*) die "unsafe OUTPUT_DIR basename: $OUTPUT_BASENAME" ;;
+esac
+OUTPUT_PARENT="$(CDPATH='' cd -- "$(dirname -- "${OUTPUT_DIR%/}")" && pwd -P)" \
+    || die "OUTPUT_DIR parent does not exist"
+FINAL_OUTPUT_DIR="$OUTPUT_PARENT/$OUTPUT_BASENAME"
+REPOSITORY_ROOT="$(pwd -P)"
+[ "$FINAL_OUTPUT_DIR" != "$REPOSITORY_ROOT" ] \
+    || die "refusing repository root as OUTPUT_DIR"
+[ ! -L "$FINAL_OUTPUT_DIR" ] || die "refusing symlinked OUTPUT_DIR: $OUTPUT_DIR"
+[ ! -e "$FINAL_OUTPUT_DIR" ] || [ -d "$FINAL_OUTPUT_DIR" ] \
+    || die "OUTPUT_DIR exists but is not a directory: $OUTPUT_DIR"
+
+OUTPUT_OWNER_RECEIPT="$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-release-output-owner"
+EXPECTED_OWNER_RECEIPT="arc-release-output-v1:$FINAL_OUTPUT_DIR"
+if [ -e "$OUTPUT_OWNER_RECEIPT" ]; then
+    [ -f "$OUTPUT_OWNER_RECEIPT" ] && [ ! -L "$OUTPUT_OWNER_RECEIPT" ] \
+        || die "invalid OUTPUT_DIR ownership receipt: $OUTPUT_OWNER_RECEIPT"
+    [ "$(cat -- "$OUTPUT_OWNER_RECEIPT")" = "$EXPECTED_OWNER_RECEIPT" ] \
+        || die "OUTPUT_DIR ownership receipt does not match destination"
+fi
+if [ -d "$FINAL_OUTPUT_DIR" ] \
+    && [ -n "$(find "$FINAL_OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    && [ ! -f "$OUTPUT_OWNER_RECEIPT" ]; then
+    die "refusing to replace non-empty OUTPUT_DIR without ARC ownership receipt"
+fi
+
+OUTPUT_STAGE_DIR="$(mktemp -d "$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-release-stage.XXXXXX")" \
+    || die "failed to create release staging directory"
+RETIRED_OUTPUT_DIR=""
+cleanup_output_stage() {
+    if [ -n "${RETIRED_OUTPUT_DIR:-}" ] && [ -d "$RETIRED_OUTPUT_DIR" ]; then
+        if [ ! -e "$FINAL_OUTPUT_DIR" ]; then
+            mv -- "$RETIRED_OUTPUT_DIR" "$FINAL_OUTPUT_DIR" || true
+        elif [ ! -d "${OUTPUT_STAGE_DIR:-}" ]; then
+            rm -rf -- "$RETIRED_OUTPUT_DIR"
+        fi
+    fi
+    if [ -n "${OUTPUT_STAGE_DIR:-}" ] && [ -d "$OUTPUT_STAGE_DIR" ]; then
+        rm -rf -- "$OUTPUT_STAGE_DIR"
+    fi
+}
+trap cleanup_output_stage EXIT
+OUTPUT_DIR="$OUTPUT_STAGE_DIR"
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -215,5 +262,30 @@ PY
 )
 
 [ -s "$OUTPUT_DIR/SHA256SUMS" ] || die "failed to create SHA256SUMS"
+
+OWNER_RECEIPT_STAGE="$(mktemp "$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-release-owner.XXXXXX")" \
+    || die "failed to stage OUTPUT_DIR ownership receipt"
+printf '%s\n' "$EXPECTED_OWNER_RECEIPT" > "$OWNER_RECEIPT_STAGE"
+chmod 600 "$OWNER_RECEIPT_STAGE"
+mv -f -- "$OWNER_RECEIPT_STAGE" "$OUTPUT_OWNER_RECEIPT"
+
+if [ -d "$FINAL_OUTPUT_DIR" ]; then
+    RETIRED_OUTPUT_DIR="$(mktemp -d "$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-release-retired.XXXXXX")" \
+        || die "failed to reserve retired-output path"
+    rmdir -- "$RETIRED_OUTPUT_DIR"
+    mv -- "$FINAL_OUTPUT_DIR" "$RETIRED_OUTPUT_DIR"
+fi
+if ! mv -- "$OUTPUT_DIR" "$FINAL_OUTPUT_DIR"; then
+    if [ -n "$RETIRED_OUTPUT_DIR" ] && [ -d "$RETIRED_OUTPUT_DIR" ]; then
+        mv -- "$RETIRED_OUTPUT_DIR" "$FINAL_OUTPUT_DIR" || true
+    fi
+    die "failed to publish staged release directory"
+fi
+OUTPUT_STAGE_DIR=""
+if [ -n "$RETIRED_OUTPUT_DIR" ] && [ -d "$RETIRED_OUTPUT_DIR" ]; then
+    rm -rf -- "$RETIRED_OUTPUT_DIR"
+fi
+OUTPUT_DIR="$FINAL_OUTPUT_DIR"
+
 printf 'release assembly: validated %s files for %s\n' \
     "$(find "$OUTPUT_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" "$RELEASE_TAG"

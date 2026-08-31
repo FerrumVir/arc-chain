@@ -6,20 +6,23 @@
 // fake-output InferenceAttestation, submit it, and verify
 // /worker/earnings reflects the on-chain credit.
 //
-// Run against a live seed:
-//   ARC_SEED=http://140.82.16.112:9090 \
-//   cargo run --release -p arc-node --example v070_e2e_attestation
-//
-// Default ARC_SEED is the local node at 127.0.0.1:9090.
+// This mutating example accepts only a numeric loopback IP. ARC_SEED may
+// select another local port, but hostnames and non-loopback origins fail
+// before client construction.
 
 use arc_crypto::{Hash256, KeyPair, Signature, hash_bytes};
 use arc_types::{Transaction, TxBody, TxType, transaction::InferenceAttestationBody};
 use serde_json::Value;
 use std::time::Duration;
 
+#[path = "support/local_rpc.rs"]
+mod local_rpc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let seed = std::env::var("ARC_SEED").unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
+    let requested_seed =
+        std::env::var("ARC_SEED").unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
+    let seed = local_rpc::require_loopback_rpc(&requested_seed)?;
 
     println!("=== v0.7.0 end-to-end attestation test ===");
     println!("Seed: {}", seed);

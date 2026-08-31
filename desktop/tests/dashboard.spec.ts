@@ -4,6 +4,7 @@ import { seedOnboarded } from "./helpers";
 async function useLiveEarningsBody(
   page: import("@playwright/test").Page,
   earningsBody: Record<string, unknown>,
+  earningsStatus = 200,
 ) {
   await page.addInitScript(() => {
     (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
@@ -28,7 +29,13 @@ async function useLiveEarningsBody(
         validators: 1,
       });
     }
-    if (path.startsWith("/worker/earnings/")) return json(earningsBody);
+    if (path.startsWith("/worker/earnings/")) {
+      return route.fulfill({
+        status: earningsStatus,
+        contentType: "application/json",
+        body: JSON.stringify(earningsBody),
+      });
+    }
     if (path === "/inference/results") return json({ count: 99, results: [] });
     if (path === "/inference/attestations") {
       return json({ count: 0, attestations: [] });
@@ -72,6 +79,8 @@ function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
     ],
     estimated_total_arc_note:
       "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
+    source: "scan of this node's in-memory full_transactions map",
+    archive_mode: false,
     today_arc: null,
     projected_daily_arc: null,
     projected_daily_unavailable_reason:
@@ -85,6 +94,41 @@ function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
     last_reward_tx_hash: `0x${"ab".repeat(32)}`,
     ...overrides,
   };
+}
+
+function candidateProjectionBody(receiptCount: 0 | 1 | 2 | 3) {
+  const body = candidateEarningsBody();
+  const rows = [...body.confirmed_receipts];
+  rows.push({
+    tx_type: "0x25",
+    tx_hash: `0x${"ac".repeat(32)}`,
+    job_id: `0x${"03".repeat(32)}`,
+    block_height: 123_463,
+    block_hash: `0x${"12".repeat(32)}`,
+    success: true,
+    reward_base: 2_500_000_000,
+    reward_arc: 2.5,
+    recovery_epoch: 1,
+    validator_set_id: 7,
+  });
+  const retained = rows.slice(0, receiptCount);
+  const last = retained.at(-1);
+  return candidateEarningsBody({
+    total_rewards: receiptCount,
+    estimated_total_arc: receiptCount * 2.5,
+    confirmed_receipt_count: receiptCount,
+    confirmed_gross_earnings_base: receiptCount * 2_500_000_000,
+    confirmed_gross_earnings_arc: receiptCount * 2.5,
+    confirmed_receipts: retained,
+    last_reward_block: last?.block_height ?? null,
+    last_reward_tx_hash: last?.tx_hash ?? null,
+    projected_daily_arc: 7.5,
+    projected_daily_unavailable_reason: null,
+    observed_window_first_timestamp_ms: 1_700_000_000_000,
+    observed_window_last_timestamp_ms: 1_700_086_400_000,
+    reward_per_attestation_arc: 2.5,
+    attestations_per_day_observed: 3,
+  });
 }
 
 test.describe("Dashboard", () => {
@@ -137,7 +181,46 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("projection-unavailable")).toContainText(
       "Legacy inference-count arithmetic is not projected as earnings",
     );
-    await expect(page.getByTestId("earnings-empty")).toBeVisible();
+    await expect(page.getByTestId("earnings-unavailable")).toContainText(
+      "Legacy or malformed inference-count arithmetic is not earnings",
+    );
+    await expect(page.getByTestId("earnings-empty")).toHaveCount(0);
+  });
+
+  test("an unavailable earnings RPC is not rendered as a confirmed zero", async ({ page }) => {
+    await useLiveEarningsBody(page, { error: "maintenance" }, 503);
+    await page.goto("/");
+    await expect(page.getByTestId("dashboard-earnings-unavailable")).toContainText(
+      "no zero inferred",
+    );
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("earnings-unavailable")).toContainText("HTTP 503");
+    await expect(page.getByTestId("earnings-unavailable")).toContainText(
+      "No zero balance or zero earnings claim is inferred",
+    );
+    await expect(page.getByTestId("earnings-empty")).toHaveCount(0);
+  });
+
+  test("a valid candidate zero is labelled as a retained-window zero", async ({ page }) => {
+    await useLiveEarningsBody(page, candidateEarningsBody({
+      total_rewards: 0,
+      estimated_total_arc: 0,
+      confirmed_receipt_count: 0,
+      confirmed_gross_earnings_base: 0,
+      confirmed_gross_earnings_arc: 0,
+      confirmed_receipts: [],
+      last_reward_block: null,
+      last_reward_tx_hash: null,
+    }));
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toHaveText(
+      /0\.00\s*ARC confirmed/,
+    );
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("earnings-empty")).toContainText(
+      "confirmed zero in the selected host's current retained receipt window",
+    );
+    await expect(page.getByTestId("earnings-unavailable")).toHaveCount(0);
   });
 
   test("candidate receipt/readiness shape can render confirmed mined rewards", async ({
@@ -148,6 +231,82 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("earnings-total")).toHaveText(
       /5\.00\s*ARC confirmed/,
     );
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("earnings-retained-window-note")).toContainText(
+      "not lifetime earnings",
+    );
+  });
+
+  for (const receiptCount of [0, 1, 2] as const) {
+    test(`a host projection with ${receiptCount} exact receipt(s) fails closed locally`, async ({
+      page,
+    }) => {
+      await useLiveEarningsBody(page, candidateProjectionBody(receiptCount));
+      await page.goto("/");
+      await page.getByTestId("nav-earnings").click();
+      await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+      await expect(page.getByTestId("projection-no-rate")).toContainText(
+        "at least 3 successful mined reward receipts",
+      );
+      await expect(page.getByTestId("projection-no-rate")).toContainText(
+        "at least 24 hours",
+      );
+    });
+  }
+
+  test("an omitted receipt count cannot unlock a numeric host projection", async ({
+    page,
+  }) => {
+    const body = candidateProjectionBody(3) as Record<string, unknown>;
+    delete body.confirmed_receipt_count;
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+    await expect(page.getByTestId("projection-unavailable")).toContainText(
+      "did not provide the candidate mined-0x25 receipt",
+    );
+  });
+
+  test("an optimistic summary count cannot override the exact receipt rows", async ({
+    page,
+  }) => {
+    const body = candidateProjectionBody(2) as Record<string, unknown>;
+    body.total_rewards = 3;
+    body.confirmed_receipt_count = 3;
+    body.confirmed_gross_earnings_base = 7_500_000_000;
+    body.confirmed_gross_earnings_arc = 7.5;
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+    await expect(page.getByTestId("projection-unavailable")).toContainText(
+      "did not provide the candidate mined-0x25 receipt",
+    );
+  });
+
+  test("three exact receipts over less than 24 hours remain unavailable", async ({
+    page,
+  }) => {
+    await useLiveEarningsBody(page, candidateEarningsBody({
+      ...candidateProjectionBody(3),
+      observed_window_last_timestamp_ms: 1_700_003_600_000,
+    }));
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+    await expect(page.getByTestId("projection-no-rate")).toContainText(
+      "valid confirmed-receipt window spanning at least 24 hours",
+    );
+  });
+
+  test("three exact receipts spanning a full day can show the host projection", async ({
+    page,
+  }) => {
+    await useLiveEarningsBody(page, candidateProjectionBody(3));
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-per-day")).toHaveText("7.50");
   });
 
   test("candidate-shaped negative reward totals fail closed", async ({ page }) => {
@@ -165,17 +324,42 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("earnings-total")).not.toContainText("-5.00");
   });
 
+  test("matching sums cannot disguise a non-protocol reward amount", async ({ page }) => {
+    const body = candidateEarningsBody();
+    const rows = body.confirmed_receipts as Array<Record<string, unknown>>;
+    rows[0].reward_base = 2_499_999_999;
+    rows[0].reward_arc = 2.49;
+    body.confirmed_gross_earnings_base = 4_999_999_999;
+    body.confirmed_gross_earnings_arc = 4.99;
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
+  });
+
+  test("malformed receipt identities fail closed", async ({ page }) => {
+    const body = candidateEarningsBody();
+    const rows = body.confirmed_receipts as Array<Record<string, unknown>>;
+    rows[0].job_id = "0xdeadbeef";
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
+  });
+
   test("attestations not credited to this user are not shown as earnings", async ({
     page,
   }) => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    // The mock includes two rows that are not the user's: another
-    // validator's attestation, and one old-seed padding row. Every raw 0x16
-    // row must render as a claim, never as a "+2.50" credit.
-    await expect(feed.getByText("network claim", { exact: true })).toHaveCount(2);
-    await expect(feed.getByText("your claim", { exact: true })).toHaveCount(2);
+    // The other worker's raw 0x16 computation remains explicitly unpaid;
+    // only the two mined 0x25 rows receive the paid label.
+    await expect(
+      feed.getByText("COMPUTED · NOT PAYMENT · network", { exact: true }),
+    ).toHaveCount(1);
+    await expect(
+      feed.getByText("COMPUTED · NOT PAYMENT · yours", { exact: true }),
+    ).toHaveCount(2);
+    await expect(feed.getByText("COMPUTED + PAID", { exact: true })).toHaveCount(2);
     await expect(feed.getByText(/\+2\.50/)).toHaveCount(0);
   });
 
@@ -184,9 +368,9 @@ test.describe("Dashboard", () => {
   }) => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
-    // Two rows carry no tokens, latency or timestamp: the flat-shaped
-    // attestation and the padding row. Neither may invent them.
-    await expect(feed.getByText("recent", { exact: true })).toHaveCount(2);
+    // The other worker's flat-shaped activity carries no timestamp. The
+    // padding row is excluded, and neither may cause invented telemetry.
+    await expect(feed.getByText("recent", { exact: true })).toHaveCount(1);
     await expect(feed.getByText("0 tokens")).toHaveCount(0);
     await expect(feed.getByText("0ms")).toHaveCount(0);
   });
@@ -228,9 +412,9 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    // Four fixtures: two of the user's, one other validator's, one old-seed
-    // padding row (kept so the Network screen's filter is demonstrable).
-    await expect(feed.locator(".feed-item")).toHaveCount(4, { timeout: 8000 });
+    // Five real activities: three computations plus two distinct mined 0x25
+    // reward receipts. The old-seed padding row is excluded.
+    await expect(feed.locator(".feed-item")).toHaveCount(5, { timeout: 8000 });
   });
 
   test("shows the node's compute width", async ({ page }) => {

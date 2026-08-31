@@ -4,6 +4,9 @@
 // block structures, account state, validators, contracts,
 // light client, faucet, and ETH JSON-RPC compatibility.
 
+import type { U64 } from "./u64.js";
+export type { U64 } from "./u64.js";
+
 // ─── Primitives ──────────────────────────────────────────────
 
 /** 64-character hex-encoded BLAKE3 hash (no 0x prefix on the native API). */
@@ -45,7 +48,7 @@ export interface InfoResponse {
 
 export interface NodeInfoResponse {
   validator: string;
-  stake: number;
+  stake: U64;
   tier: string;
   height: number;
   version: string;
@@ -104,7 +107,7 @@ export interface BlockTxEntry {
   index: number;
   hash: Hash256;
   from: Address;
-  nonce: number;
+  nonce: U64;
   tx_type: string;
   body: TransactionBody;
 }
@@ -154,7 +157,7 @@ export interface TxReceipt {
   block_hash: Hash256;
   index: number;
   success: boolean;
-  gas_used: number;
+  gas_used: U64;
   value_commitment: string | null;
   inclusion_proof: string | number[] | null;
   logs?: string[];
@@ -181,16 +184,38 @@ export interface FullTransaction {
   tx_hash: Hash256;
   tx_type: string;
   from: Address;
-  nonce: number;
-  fee: number;
-  gas_limit: number;
+  nonce: U64;
+  fee: U64;
+  gas_limit: U64;
   body: TransactionBody;
   signature?: TxSignature;
   block_height?: number;
   block_hash?: Hash256;
   index?: number;
   success?: boolean;
-  gas_used?: number;
+  gas_used?: U64;
+}
+
+/**
+ * A signed transfer projection that can be normalized to `POST /tx/submit`.
+ *
+ * `FullTransaction` is the broad read model returned by `/tx/{hash}/full` and
+ * is not itself a write contract.  Keeping this transfer-only type separate
+ * prevents callers from accidentally POSTing the nested read projection to
+ * the node's flat transfer adapter.
+ */
+export interface SignedTransferTransaction
+  extends Omit<FullTransaction, "tx_type" | "body" | "signature"> {
+  tx_type: "Transfer";
+  body: TransferBody;
+  signature: {
+    Ed25519: {
+      public_key: string;
+      signature: string;
+    };
+  };
+  /** Exact domain advertised by `/network/info`; null on pre-v3 chains. */
+  transaction_domain: PrefixedHexString | null;
 }
 
 export interface TxSubmitResponse {
@@ -209,7 +234,7 @@ export interface TxSubmitBatchResponse {
 export interface TransferBody {
   type: "Transfer";
   to: Address;
-  amount: number;
+  amount: U64;
   amount_commitment: string | null;
 }
 
@@ -217,15 +242,15 @@ export interface SettleBody {
   type: "Settle";
   agent_id: Address;
   service_hash: Hash256;
-  amount: number;
-  usage_units: number;
+  amount: U64;
+  usage_units: U64;
 }
 
 export interface SwapBody {
   type: "Swap";
   counterparty: Address;
-  offer_amount: number;
-  receive_amount: number;
+  offer_amount: U64;
+  receive_amount: U64;
   offer_asset: string;
   receive_asset: string;
 }
@@ -233,14 +258,14 @@ export interface SwapBody {
 export interface EscrowBody {
   type: "Escrow";
   beneficiary: Address;
-  amount: number;
+  amount: U64;
   conditions_hash: Hash256;
   is_create: boolean;
 }
 
 export interface StakeBody {
   type: "Stake";
-  amount: number;
+  amount: U64;
   is_stake: boolean;
   validator: Address;
 }
@@ -250,8 +275,8 @@ export interface WasmCallBody {
   contract: Address;
   function: string;
   calldata: string;
-  value: number;
-  gas_limit: number;
+  value: U64;
+  gas_limit: U64;
 }
 
 export interface MultiSigBody {
@@ -264,7 +289,7 @@ export interface DeployContractBody {
   type: "DeployContract";
   bytecode_size: number;
   constructor_args_size: number;
-  state_rent_deposit: number;
+  state_rent_deposit: U64;
 }
 
 export interface RegisterAgentBody {
@@ -278,7 +303,7 @@ export interface RegisterAgentBody {
 export interface JoinValidatorBody {
   type: "JoinValidator";
   pubkey: HexString;
-  initial_stake: number;
+  initial_stake: U64;
 }
 
 export interface LeaveValidatorBody {
@@ -291,7 +316,7 @@ export interface ClaimRewardsBody {
 
 export interface UpdateStakeBody {
   type: "UpdateStake";
-  new_stake: number;
+  new_stake: U64;
 }
 
 export interface GovernanceBody {
@@ -304,7 +329,7 @@ export interface BridgeLockBody {
   type: "BridgeLock";
   destination_chain: number;
   destination_address: HexString;
-  amount: number;
+  amount: U64;
 }
 
 export interface BridgeMintBody {
@@ -312,38 +337,38 @@ export interface BridgeMintBody {
   source_chain: number;
   source_tx_hash: Hash256;
   recipient: Address;
-  amount: number;
+  amount: U64;
   merkle_proof_size: number;
 }
 
 export interface BatchSettleBody {
   type: "BatchSettle";
   entries: number;
-  total_amount: number;
+  total_amount: U64;
 }
 
 export interface ChannelOpenBody {
   type: "ChannelOpen";
   channel_id: PrefixedHexString;
   counterparty: PrefixedHexString;
-  deposit: number;
+  deposit: U64;
   timeout_blocks: number;
 }
 
 export interface ChannelCloseBody {
   type: "ChannelClose";
   channel_id: PrefixedHexString;
-  opener_balance: number;
-  counterparty_balance: number;
-  state_nonce: number;
+  opener_balance: U64;
+  counterparty_balance: U64;
+  state_nonce: U64;
 }
 
 export interface ChannelDisputeBody {
   type: "ChannelDispute";
   channel_id: PrefixedHexString;
-  opener_balance: number;
-  counterparty_balance: number;
-  state_nonce: number;
+  opener_balance: U64;
+  counterparty_balance: U64;
+  state_nonce: U64;
   challenge_period: number;
 }
 
@@ -383,7 +408,7 @@ export interface InferenceEscrowOpenBody {
   type: "InferenceEscrowOpen";
   request_id: PrefixedHexString;
   model_id: PrefixedHexString;
-  max_fee: number;
+  max_fee: U64;
   max_tokens: number;
   timeout_blocks: number;
 }
@@ -418,7 +443,7 @@ export interface ModelRegistrationBody {
   n_layers: number;
   d_model: number;
   quantization: string;
-  registration_fee: number;
+  registration_fee: U64;
   royalty_recipient: PrefixedHexString;
 }
 
@@ -450,7 +475,7 @@ export interface CapacityAdvertisementBody {
   vram_bytes: number;
   bandwidth_mbps: number;
   uptime_hint_mins: number;
-  stake: number;
+  stake: U64;
   region: string;
 }
 
@@ -470,7 +495,7 @@ export interface ShardAssignmentProposalBody {
 export interface FaucetClaimBody {
   type: "FaucetClaim";
   recipient: Address;
-  amount: number;
+  amount: U64;
 }
 
 export interface InferenceRequestBody {
@@ -480,7 +505,7 @@ export interface InferenceRequestBody {
   input_hash: Hash256;
   max_tokens: number;
   tier: number;
-  max_reward: number;
+  max_reward: U64;
   deadline_blocks: number;
   committee_size: number;
 }
@@ -557,11 +582,11 @@ export type TransactionType = TransactionBody["type"];
 
 export interface Account {
   address: Address;
-  balance: number;
-  nonce: number;
+  balance: U64;
+  nonce: U64;
   code_hash: Hash256;
   storage_root: Hash256;
-  staked_balance: number;
+  staked_balance: U64;
 }
 
 export interface AccountTxs {
@@ -574,13 +599,13 @@ export interface AccountTxs {
 
 export interface ValidatorInfo {
   address: Address;
-  stake: number;
+  stake: U64;
   tier: string;
 }
 
 export interface ValidatorsResponse {
   validators: ValidatorInfo[];
-  total_stake: number;
+  total_stake: U64;
   count: number;
 }
 
@@ -600,7 +625,7 @@ export interface ContractEvent {
 
 export interface ContractCallResult {
   success: boolean;
-  gas_used?: number;
+  gas_used?: U64;
   return_data?: string;
   logs?: string[];
   events?: ContractEvent[];
@@ -613,7 +638,7 @@ export interface LightSnapshot {
   height: number;
   state_root: Hash256;
   account_count: number;
-  total_supply: number;
+  total_supply: U64;
   latest_block_hash: Hash256;
 }
 
@@ -628,7 +653,7 @@ export interface SyncSnapshotInfo {
 
 export interface FaucetClaimResponse {
   tx_hash: Hash256;
-  amount: number;
+  amount: U64;
   message: string;
 }
 
@@ -636,7 +661,7 @@ export interface FaucetStatus {
   address: Address;
   node_url: string;
   claims_today: number;
-  claim_amount: number;
+  claim_amount: U64;
   rate_limit_secs: number;
 }
 
@@ -683,13 +708,25 @@ export interface BlockTxsQueryOptions {
 export interface ContractCallOptions {
   calldata?: string;
   from?: Address;
-  gasLimit?: number;
+  gasLimit?: U64;
 }
 
 export interface TxSubmitPayload {
   from: Address;
   to: Address;
-  amount: number;
-  nonce: number;
-  tx_type?: string;
+  amount: U64;
+  nonce: U64;
+  fee: U64;
+  tx_type?: "Transfer";
+  signature: string;
+  public_key: string;
+  /** Exact domain used by the signer; checked locally and never sent. */
+  transaction_domain: PrefixedHexString | null;
+}
+
+/** Minimal recovery metadata required to bind transaction signatures. */
+export interface TransactionDomainInfo {
+  protocol_version?: string | null;
+  recovery_active?: boolean;
+  transaction_domain: PrefixedHexString | null;
 }

@@ -1,4 +1,4 @@
-import type { Address, Hash256, HealthResponse, InfoResponse, NodeInfoResponse, StatsResponse, BlockDetail, BlocksResponse, BlocksQueryOptions, BlockTxsResponse, BlockTxsQueryOptions, BlockProofsResponse, TxReceipt, TxProof, FullTransaction, TxSubmitResponse, TxSubmitBatchResponse, TxSubmitPayload, Account, AccountTxs, ValidatorsResponse, ContractInfo, ContractCallResult, ContractCallOptions, LightSnapshot, SyncSnapshotInfo, FaucetClaimResponse, FaucetStatus, FaucetHealth } from "./types.js";
+import type { Address, Hash256, HealthResponse, InfoResponse, NodeInfoResponse, StatsResponse, BlockDetail, BlocksResponse, BlocksQueryOptions, BlockTxsResponse, BlockTxsQueryOptions, BlockProofsResponse, TxReceipt, TxProof, FullTransaction, SignedTransferTransaction, TxSubmitResponse, TxSubmitBatchResponse, TxSubmitPayload, TransactionDomainInfo, Account, AccountTxs, ValidatorsResponse, ContractInfo, ContractCallResult, ContractCallOptions, LightSnapshot, SyncSnapshotInfo, FaucetClaimResponse, FaucetStatus, FaucetHealth, U64 } from "./types.js";
 /**
  * Error thrown when an RPC request fails.
  * Carries the HTTP status code and the response body text.
@@ -127,7 +127,7 @@ export declare class ArcClient {
      *
      * Use this when you have constructed and signed the transaction yourself.
      */
-    submitSignedTx(tx: FullTransaction): Promise<TxSubmitResponse>;
+    submitSignedTx(tx: SignedTransferTransaction): Promise<TxSubmitResponse>;
     /**
      * `POST /tx/submit_batch` - Submit multiple transactions in one request.
      *
@@ -135,6 +135,13 @@ export declare class ArcClient {
      * while others are rejected.
      */
     submitTxBatch(transactions: TxSubmitPayload[]): Promise<TxSubmitBatchResponse>;
+    /**
+     * Fetch the exact transaction-signing domain advertised by the node.
+     * Legacy nodes without `/network/info` use the v1 null domain.
+     */
+    getTransactionDomain(): Promise<TransactionDomainInfo["transaction_domain"]>;
+    private _assertTransactionDomain;
+    private _requireMatchingTransactionDomain;
     /**
      * `GET /account/{address}` - Fetch account state.
      *
@@ -149,14 +156,12 @@ export declare class ArcClient {
      * @param address - 64-character hex address.
      */
     getAccountTxs(address: Address): Promise<AccountTxs>;
-    /**
-     * Convenience: get account balance as a number.
-     */
-    getBalance(address: Address): Promise<number>;
+    /** Convenience: get an exact account balance (`bigint` above 2^53 - 1). */
+    getBalance(address: Address): Promise<U64>;
     /**
      * Convenience: get account nonce.
      */
-    getNonce(address: Address): Promise<number>;
+    getNonce(address: Address): Promise<U64>;
     /** `GET /validators` - List all validators with stake and tier. */
     getValidators(): Promise<ValidatorsResponse>;
     /**

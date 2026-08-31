@@ -628,31 +628,64 @@ impl ArcCheckpoint {
         let path = path.as_ref();
         let mut file = File::open(path)?;
         let metadata_len = file.metadata()?.len();
+        if metadata_len > (ARCCHKPT_MAX_PAYLOAD_BYTES as u64).saturating_add(16) {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint file is {metadata_len} bytes; format-v1 safety limit is {} bytes",
+                ARCCHKPT_MAX_PAYLOAD_BYTES + 16
+            )));
+        }
+        let usize_len = usize::try_from(metadata_len)
+            .map_err(|_| RecoveryError::Invalid("checkpoint is too large for this host".into()))?;
+        let mut bytes = Vec::with_capacity(usize_len);
+        file.read_to_end(&mut bytes)?;
+        Self::read_from_bytes(&bytes)
+    }
+
+    /// Decode one complete ARCCHKPT byte string without reopening a path.
+    ///
+    /// Archive-query callers first open and hash an exact regular inode, then
+    /// pass those same bytes here. Keeping decoding on the already-hashed byte
+    /// string closes the path-replacement race that would exist if validation
+    /// hashed one file and `read_from` reopened another.
+    pub fn read_from_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
+        if bytes.len() > ARCCHKPT_MAX_PAYLOAD_BYTES.saturating_add(16) {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint file is {} bytes; format-v1 safety limit is {} bytes",
+                bytes.len(),
+                ARCCHKPT_MAX_PAYLOAD_BYTES + 16
+            )));
+        }
+        if bytes.len() < 16 {
+            return Err(RecoveryError::Invalid(
+                "checkpoint is shorter than the ARCCHKPT framing header".into(),
+            ));
+        }
         let mut magic = [0u8; 8];
-        file.read_exact(&mut magic)?;
+        magic.copy_from_slice(&bytes[..8]);
         if magic != ARCCHKPT_MAGIC {
             return Err(RecoveryError::Invalid("bad ARCCHKPT file magic".into()));
         }
         let mut len = [0u8; 8];
-        file.read_exact(&mut len)?;
+        len.copy_from_slice(&bytes[8..16]);
         let declared = u64::from_be_bytes(len);
         if declared > ARCCHKPT_MAX_PAYLOAD_BYTES as u64 {
             return Err(RecoveryError::Invalid(format!(
                 "checkpoint payload is {declared} bytes; format-v1 safety limit is {ARCCHKPT_MAX_PAYLOAD_BYTES} bytes"
             )));
         }
-        if metadata_len != declared.saturating_add(16) {
+        if bytes.len() as u64 != declared.saturating_add(16) {
             return Err(RecoveryError::Invalid(format!(
-                "file length mismatch: declared {declared} payload bytes, file is {metadata_len} bytes"
+                "file length mismatch: declared {declared} payload bytes, file is {} bytes",
+                bytes.len()
             )));
         }
         let usize_len = usize::try_from(declared)
             .map_err(|_| RecoveryError::Invalid("checkpoint is too large for this host".into()))?;
-        let mut bytes = vec![0u8; usize_len];
-        file.read_exact(&mut bytes)?;
         let checkpoint: Self =
-            bincode::deserialize_limited_exact::<Self, ARCCHKPT_MAX_PAYLOAD_BYTES>(&bytes)
-                .map_err(|error| RecoveryError::Codec(error.to_string()))?;
+            bincode::deserialize_limited_exact::<Self, ARCCHKPT_MAX_PAYLOAD_BYTES>(
+                &bytes[16..16 + usize_len],
+            )
+            .map_err(|error| RecoveryError::Codec(error.to_string()))?;
         if checkpoint.magic != magic {
             return Err(RecoveryError::Invalid(
                 "inner and outer ARCCHKPT magic differ".into(),
@@ -779,7 +812,10 @@ impl RecoveryPayload {
         Ok(accounts)
     }
 
-    fn transition_consensus_state_root(
+    /// Recompute the deterministic H+1 state root for an independently
+    /// supplied recovery validator set. Offline archive/audit tooling uses
+    /// this to validate fixtures without constructing a live [`StateDB`].
+    pub fn transition_consensus_state_root(
         &self,
         context: &RecoveryContext,
         reward_activation_height: Option<u64>,
@@ -2631,7 +2667,7 @@ impl StateDB {
         for entry in &wal_plan.entries {
             staged.apply_wal_op(&entry.op);
         }
-        staged.rebuild_transaction_indexes();
+        staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         staged.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
 
         if wal_plan.report.recovery_wal_quarantined_tail_bytes != 0 {
@@ -2683,7 +2719,7 @@ impl StateDB {
         for entry in &wal_plan.entries {
             state.apply_wal_op(&entry.op);
         }
-        state.rebuild_transaction_indexes();
+        state.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         state.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
         Ok(state)
     }
@@ -2691,6 +2727,16 @@ impl StateDB {
     fn rebuild_transaction_indexes(&self) {
         self.tx_index.clear();
         self.account_txs.clear();
+        let mut receipts: Vec<_> = self
+            .receipts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        receipts.sort_by_key(|(hash, receipt)| (receipt.block_height, receipt.index, hash.0));
+        for (hash, receipt) in receipts {
+            self.tx_index
+                .insert(hash.0, (receipt.block_height, receipt.index));
+        }
         let mut transactions: Vec<_> = self
             .full_transactions
             .iter()
@@ -2703,12 +2749,49 @@ impl StateDB {
                 .unwrap_or((u64::MAX, u32::MAX))
         });
         for transaction in transactions {
-            if let Some(receipt) = self.receipts.get(&transaction.hash.0) {
-                self.tx_index
-                    .insert(transaction.hash.0, (receipt.block_height, receipt.index));
-            }
             self.index_account_tx(&transaction);
         }
+    }
+
+    /// Rebuild every index derivable from replayed receipts/transaction bodies,
+    /// then merge the signed retained indexes from ARCCHKPT. Legacy sources may
+    /// have pruned a body and/or receipt while still retaining its block hash
+    /// occurrence and account-history index; those signed entries are evidence,
+    /// not disposable caches. A replayed receipt for the same hash must name the
+    /// same canonical position or startup fails closed.
+    fn rebuild_recovery_transaction_indexes(
+        &self,
+        payload: &RecoveryPayload,
+    ) -> Result<(), RecoveryError> {
+        self.rebuild_transaction_indexes();
+
+        for (hash, signed_location) in &payload.tx_index {
+            if let Some(replayed_location) = self.tx_index.get(&hash.0).map(|entry| *entry)
+                && replayed_location != *signed_location
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "replayed transaction index {hash} at {}:{} conflicts with signed retained location {}:{}",
+                    replayed_location.0, replayed_location.1, signed_location.0, signed_location.1,
+                )));
+            }
+            self.tx_index.insert(hash.0, *signed_location);
+        }
+
+        for (address, signed_hashes) in &payload.account_txs {
+            let derived_hashes = self
+                .account_txs
+                .remove(&address.0)
+                .map(|(_, hashes)| hashes)
+                .unwrap_or_default();
+            let mut merged = signed_hashes.clone();
+            for hash in derived_hashes {
+                if !merged.contains(&hash) {
+                    merged.push(hash);
+                }
+            }
+            self.account_txs.insert(address.0, merged);
+        }
+        Ok(())
     }
 
     fn verify_recovery_restart(
@@ -3077,6 +3160,70 @@ mod tests {
         payload.tx_index = vec![(transaction_hash, (0, 0))];
         payload.validate_canonical().unwrap();
         payload
+    }
+
+    fn checkpoint_with_pruned_and_retained_history() -> (
+        ArcCheckpoint,
+        Vec<KeyPair>,
+        RecoveryNetworkPolicy,
+        Hash256,
+        Transaction,
+        Address,
+        Address,
+    ) {
+        let (mut checkpoint, keys, policy) = checkpoint();
+        checkpoint.signatures.clear();
+        let indexed_account = checkpoint.payload.accounts[0].0;
+        let recipient = checkpoint.payload.accounts[1].0;
+        let pruned_hash = hash_bytes(b"signed-pruned-history-transaction");
+        let retained = Transaction::new_transfer(indexed_account, recipient, 7, 0);
+        let (_, block) = &mut checkpoint.payload.blocks[0];
+        block.tx_hashes = vec![pruned_hash, retained.hash];
+        block.header.tx_count = 2;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        let source_block_hash = block.hash;
+        checkpoint.payload.receipts = vec![(
+            retained.hash,
+            TxReceipt {
+                tx_hash: retained.hash,
+                block_height: 0,
+                block_hash: source_block_hash,
+                index: 1,
+                success: true,
+                gas_used: 1,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        )];
+        checkpoint.payload.full_transactions = vec![(retained.hash, retained.clone())];
+        // The stopped source retained this block occurrence/account index but
+        // pruned both the transaction body and receipt. The signed checkpoint
+        // must remain sufficient to query and prove its block inclusion.
+        checkpoint.payload.tx_index = vec![(pruned_hash, (0, 0))];
+        checkpoint.payload.account_txs = vec![(indexed_account, vec![pruned_hash])];
+        checkpoint.payload.validate_canonical().unwrap();
+        checkpoint.manifest.source_block_hash = source_block_hash;
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy.clone(),
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            })
+            .unwrap();
+        (
+            checkpoint,
+            keys,
+            policy,
+            pruned_hash,
+            retained,
+            indexed_account,
+            recipient,
+        )
     }
 
     #[test]
@@ -3752,6 +3899,83 @@ mod tests {
 
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn activation_and_restart_preserve_signed_pruned_indexes_and_rebuild_retained_bodies() {
+        let (checkpoint, _, policy, pruned_hash, retained, indexed_account, recipient) =
+            checkpoint_with_pruned_and_retained_history();
+        let source_dir = temp_dir("indexed-history-source");
+        let active_dir = temp_dir("indexed-history-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.get_tx_location(&pruned_hash.0), Some((0, 0)));
+        assert_eq!(state.get_tx_location(&retained.hash.0), Some((0, 1)));
+        assert_eq!(
+            state.get_account_txs(&indexed_account.0),
+            vec![pruned_hash, retained.hash]
+        );
+        assert_eq!(state.get_account_txs(&recipient.0), vec![retained.hash]);
+        state.generate_tx_inclusion_proof(&pruned_hash).unwrap();
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.get_tx_location(&pruned_hash.0), Some((0, 0)));
+        assert_eq!(restarted.get_tx_location(&retained.hash.0), Some((0, 1)));
+        assert_eq!(
+            restarted.get_account_txs(&indexed_account.0),
+            vec![pruned_hash, retained.hash]
+        );
+        assert_eq!(restarted.get_account_txs(&recipient.0), vec![retained.hash]);
+        restarted.generate_tx_inclusion_proof(&pruned_hash).unwrap();
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn replayed_receipt_cannot_override_a_signed_retained_location() {
+        let (checkpoint, _, _, pruned_hash, _, _, _) =
+            checkpoint_with_pruned_and_retained_history();
+        let state = StateDB::new();
+        state.install_verified_checkpoint(&checkpoint).unwrap();
+        let source_block_hash = checkpoint.payload.blocks[0].1.hash;
+        state.receipts.insert(
+            pruned_hash.0,
+            TxReceipt {
+                tx_hash: pruned_hash,
+                block_height: 0,
+                block_hash: source_block_hash,
+                index: 1,
+                success: true,
+                gas_used: 1,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        );
+        let error = state
+            .rebuild_recovery_transaction_indexes(&checkpoint.payload)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with signed retained location 0:0"),
+            "{error}"
+        );
     }
 
     #[test]

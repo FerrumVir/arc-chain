@@ -15,8 +15,28 @@ import blake3
 from .crypto import KeyPair
 from .errors import ArcValidationError
 
-# Domain separation key matching the Rust implementation
+# Domain separation keys matching the Rust implementation.
 _TX_DOMAIN = "ARC-chain-tx-v1"
+_TX_DOMAIN_V3 = "ARC-chain-tx-v3"
+
+
+def _normalize_transaction_domain(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    raw = value[2:] if value.lower().startswith("0x") else value
+    try:
+        encoded = bytes.fromhex(raw)
+    except ValueError as error:
+        raise ArcValidationError(
+            "transaction_domain must be a non-zero 32-byte hex value",
+            field="transaction_domain",
+        ) from error
+    if len(encoded) != 32 or not any(encoded):
+        raise ArcValidationError(
+            "transaction_domain must be a non-zero 32-byte hex value",
+            field="transaction_domain",
+        )
+    return f"0x{raw.lower()}"
 
 
 def _encode_body(body: Dict[str, Any]) -> bytes:
@@ -31,7 +51,7 @@ def _encode_body(body: Dict[str, Any]) -> bytes:
     tx_body_type = body.get("type", "")
 
     if tx_body_type == "Transfer":
-        parts.append(b"\x00")  # variant tag
+        parts.append(struct.pack("<I", 0))  # bincode enum variant index
         parts.append(bytes.fromhex(body["to"]))
         parts.append(struct.pack("<Q", body["amount"]))
         # amount_commitment: Option<[u8;32]>
@@ -42,7 +62,7 @@ def _encode_body(body: Dict[str, Any]) -> bytes:
             parts.append(b"\x00")
 
     elif tx_body_type == "DeployContract":
-        parts.append(b"\x07")  # variant tag for DeployContract
+        parts.append(struct.pack("<I", 7))
         code = body.get("bytecode", b"")
         if isinstance(code, str):
             code = bytes.fromhex(code)
@@ -56,7 +76,7 @@ def _encode_body(body: Dict[str, Any]) -> bytes:
         parts.append(struct.pack("<Q", body.get("state_rent_deposit", 0)))
 
     elif tx_body_type == "WasmCall":
-        parts.append(b"\x05")  # variant tag for WasmCall
+        parts.append(struct.pack("<I", 5))
         parts.append(bytes.fromhex(body["contract"]))
         func = body["function"].encode("utf-8")
         parts.append(struct.pack("<Q", len(func)))
@@ -70,13 +90,13 @@ def _encode_body(body: Dict[str, Any]) -> bytes:
         parts.append(struct.pack("<Q", body.get("gas_limit", 1_000_000)))
 
     elif tx_body_type == "Stake":
-        parts.append(b"\x04")  # variant tag for Stake
+        parts.append(struct.pack("<I", 4))
         parts.append(struct.pack("<Q", body["amount"]))
         parts.append(b"\x01" if body.get("is_stake", True) else b"\x00")
         parts.append(bytes.fromhex(body["validator"]))
 
     elif tx_body_type == "Settle":
-        parts.append(b"\x01")  # variant tag for Settle
+        parts.append(struct.pack("<I", 1))
         parts.append(bytes.fromhex(body["agent_id"]))
         parts.append(bytes.fromhex(body["service_hash"]))
         parts.append(struct.pack("<Q", body["amount"]))
@@ -103,6 +123,7 @@ def _compute_hash(
     body: Dict[str, Any],
     fee: int,
     gas_limit: int,
+    transaction_domain: Optional[str] = None,
 ) -> str:
     """
     Compute the BLAKE3 signing hash for a transaction.
@@ -110,7 +131,12 @@ def _compute_hash(
     Matches the Rust ``Transaction::compute_hash()`` method:
     ``tx_type || from || nonce || body || fee || gas_limit``
     """
-    h = blake3.blake3(derive_key_context=_TX_DOMAIN)
+    normalized_domain = _normalize_transaction_domain(transaction_domain)
+    h = blake3.blake3(
+        derive_key_context=_TX_DOMAIN_V3 if normalized_domain is not None else _TX_DOMAIN
+    )
+    if normalized_domain is not None:
+        h.update(bytes.fromhex(normalized_domain[2:]))
     h.update(bytes([tx_type_byte]))
     h.update(bytes.fromhex(from_addr))
     h.update(struct.pack("<Q", nonce))
@@ -138,6 +164,7 @@ class TransactionBuilder:
         amount: int,
         fee: int = 1,
         nonce: int = 0,
+        transaction_domain: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Build an unsigned transfer transaction.
@@ -148,6 +175,8 @@ class TransactionBuilder:
             amount: Amount in ARC tokens (smallest unit).
             fee: Transaction fee (default 1).
             nonce: Sender nonce for replay protection.
+            transaction_domain: Exact value advertised by ``/network/info``;
+                ``None`` only for pre-v3 chains.
 
         Returns:
             Unsigned transaction dict.
@@ -163,7 +192,16 @@ class TransactionBuilder:
             "amount": amount,
             "amount_commitment": None,
         }
-        tx_hash = _compute_hash(0x01, from_addr, nonce, body, fee, 0)
+        normalized_domain = _normalize_transaction_domain(transaction_domain)
+        tx_hash = _compute_hash(
+            0x01,
+            from_addr,
+            nonce,
+            body,
+            fee,
+            0,
+            normalized_domain,
+        )
 
         return {
             "tx_type": "Transfer",
@@ -176,6 +214,7 @@ class TransactionBuilder:
             "body": body,
             "hash": tx_hash,
             "signature": None,
+            "transaction_domain": normalized_domain,
         }
 
     # -- Deploy Contract --
@@ -226,6 +265,7 @@ class TransactionBuilder:
             "body": body,
             "hash": tx_hash,
             "signature": None,
+            "transaction_domain": None,
         }
 
     # -- Call Contract --
@@ -279,6 +319,7 @@ class TransactionBuilder:
             "body": body,
             "hash": tx_hash,
             "signature": None,
+            "transaction_domain": None,
         }
 
     # -- Stake --
@@ -330,6 +371,7 @@ class TransactionBuilder:
             "body": body,
             "hash": tx_hash,
             "signature": None,
+            "transaction_domain": None,
         }
 
     # -- Settle --
@@ -379,6 +421,7 @@ class TransactionBuilder:
             "body": body,
             "hash": tx_hash,
             "signature": None,
+            "transaction_domain": None,
         }
 
     # -- Signing --
@@ -409,10 +452,33 @@ class TransactionBuilder:
                 field="from",
             )
 
-        tx_hash_bytes = bytes.fromhex(tx["hash"])
+        tx_type_bytes = {
+            "Transfer": 0x01,
+            "Settle": 0x02,
+            "Stake": 0x05,
+            "WasmCall": 0x06,
+            "DeployContract": 0x08,
+        }
+        tx_type = tx.get("tx_type")
+        if tx_type not in tx_type_bytes:
+            raise ArcValidationError(
+                f"canonical signing codec is unavailable for {tx_type}",
+                field="tx_type",
+            )
+        tx_hash = _compute_hash(
+            tx_type_bytes[tx_type],
+            sender,
+            tx.get("nonce", 0),
+            tx["body"],
+            tx.get("fee", 0),
+            tx.get("gas_limit", 0),
+            tx.get("transaction_domain"),
+        )
+        tx_hash_bytes = bytes.fromhex(tx_hash)
         signature = keypair.sign(tx_hash_bytes)
 
         signed = dict(tx)
+        signed["hash"] = tx_hash
         signed["signature"] = {
             "Ed25519": {
                 "public_key": keypair.public_key_hex(),

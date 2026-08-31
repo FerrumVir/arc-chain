@@ -21,8 +21,18 @@ import type {
   Receipt,
   SubmitResult,
   SyncSnapshotInfo,
-  Transaction,
+  SignedTransferTransaction,
+  SignedTransferSubmitPayload,
+  U64,
 } from "./types";
+import {
+  assertU64,
+  parseJsonWithBigInts,
+  stringifyJsonWithBigInts,
+  u64ToBigInt,
+} from "./u64";
+
+const MAX_TX_SUBMIT_BATCH_SIZE = 64;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -140,18 +150,19 @@ export class ArcClient {
       );
     }
 
-    return resp.json() as Promise<T>;
+    return parseJsonWithBigInts<T>(await resp.text());
   }
 
   private async _post<T = unknown>(path: string, body: unknown): Promise<T> {
     const url = `${this.rpcUrl}${path}`;
+    const serializedBody = stringifyJsonWithBigInts(body);
 
     let resp: Response;
     try {
       resp = await fetch(url, {
         method: "POST",
         headers: this.headers,
-        body: JSON.stringify(body),
+        body: serializedBody,
         signal: AbortSignal.timeout(this.timeout),
       });
     } catch (e) {
@@ -178,7 +189,7 @@ export class ArcClient {
       );
     }
 
-    return resp.json() as Promise<T>;
+    return parseJsonWithBigInts<T>(await resp.text());
   }
 
   // -- Block endpoints --
@@ -249,23 +260,11 @@ export class ArcClient {
    *
    * @returns Transaction hash string.
    */
-  async submitTransaction(tx: Record<string, unknown> | Transaction): Promise<string> {
-    let payload: Record<string, unknown>;
-
-    // Normalize TransactionBuilder-style tx
-    if ("body" in tx && "tx_type" in tx) {
-      const body = tx.body as Record<string, unknown>;
-      payload = {
-        from: tx.from,
-        to: (body.to as string) ?? "0".repeat(64),
-        amount: (body.amount as number) ?? 0,
-        nonce: tx.nonce ?? 0,
-        tx_type: tx.tx_type,
-      };
-    } else {
-      payload = tx as Record<string, unknown>;
-    }
-
+  async submitTransaction(
+    tx: SignedTransferSubmitPayload | SignedTransferTransaction,
+  ): Promise<string> {
+    const payload = this._normalizeSignedTransfer(tx);
+    await this._assertTransactionDomain(tx.transaction_domain);
     const data = await this._post<SubmitResult>("/tx/submit", payload);
     return data.tx_hash;
   }
@@ -294,23 +293,122 @@ export class ArcClient {
   /**
    * POST /tx/submit_batch -- Submit multiple transactions.
    */
-  async submitBatch(txs: Array<Record<string, unknown>>): Promise<BatchResult> {
+  async submitBatch(
+    txs: Array<SignedTransferSubmitPayload | SignedTransferTransaction>,
+  ): Promise<BatchResult> {
+    if (txs.length > MAX_TX_SUBMIT_BATCH_SIZE) {
+      throw new RangeError(
+        `transaction batch exceeds the maximum of ${MAX_TX_SUBMIT_BATCH_SIZE} items`,
+      );
+    }
+    for (const tx of txs) this._assertSignedTransferU64Fields(tx);
+    const advertised = await this.getTransactionDomain();
     const normalized = txs.map((tx) => {
-      if ("body" in tx && "tx_type" in tx) {
-        const body = tx.body as Record<string, unknown>;
-        return {
-          from: tx.from,
-          to: (body.to as string) ?? "0".repeat(64),
-          amount: (body.amount as number) ?? 0,
-          nonce: tx.nonce ?? 0,
-        };
-      }
-      return tx;
+      this._requireMatchingTransactionDomain(tx.transaction_domain, advertised);
+      return this._normalizeSignedTransfer(tx);
     });
 
     return this._post<BatchResult>("/tx/submit_batch", {
       transactions: normalized,
     });
+  }
+
+  /** Return the current v3 signing domain, or null for a pre-v3 node. */
+  async getTransactionDomain(): Promise<string | null> {
+    let value: Record<string, unknown>;
+    try {
+      value = await this._get<Record<string, unknown>>("/network/info");
+    } catch (error) {
+      if (error instanceof ArcError && error.statusCode === 404) return null;
+      throw error;
+    }
+    const raw = value.transaction_domain;
+    const protocolMajor = Number.parseInt(
+      String(value.protocol_version ?? "0").split(".")[0] ?? "0",
+      10,
+    );
+    if (raw == null) {
+      if (value.recovery_active === true || protocolMajor >= 3) {
+        throw new ArcError(
+          "Node requires recovery-domain signatures but omitted transaction_domain",
+        );
+      }
+      return null;
+    }
+    if (typeof raw !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+      throw new ArcError("Node returned a malformed 32-byte transaction_domain");
+    }
+    if (/^0x0{64}$/i.test(raw)) {
+      throw new ArcError("Node returned an all-zero transaction_domain");
+    }
+    return raw.toLowerCase();
+  }
+
+  private _normalizeSignedTransfer(
+    tx: SignedTransferSubmitPayload | SignedTransferTransaction,
+  ): Record<string, unknown> {
+    this._assertSignedTransferU64Fields(tx);
+    if ("body" in tx) {
+      if (tx.tx_type !== "Transfer" || tx.body.type !== "Transfer") {
+        throw new ArcTransactionError(
+          "POST /tx/submit only accepts signed Transfer transactions",
+        );
+      }
+      assertU64(tx.gas_limit, "gas_limit");
+      if (u64ToBigInt(tx.gas_limit, "gas_limit") !== 0n) {
+        throw new ArcTransactionError(
+          "gas_limit must be zero for the flat transfer RPC",
+        );
+      }
+      return {
+        from: tx.from,
+        to: tx.body.to,
+        amount: tx.body.amount,
+        nonce: tx.nonce,
+        fee: tx.fee,
+        tx_type: "Transfer",
+        signature: tx.signature.Ed25519.signature,
+        public_key: tx.signature.Ed25519.public_key,
+      };
+    }
+    const { transaction_domain: _domain, ...wire } = tx;
+    return wire;
+  }
+
+  private _assertSignedTransferU64Fields(
+    tx: SignedTransferSubmitPayload | SignedTransferTransaction,
+  ): void {
+    const amount = "body" in tx ? tx.body.amount : tx.amount;
+    assertU64(amount, "amount");
+    assertU64(tx.nonce, "nonce");
+    assertU64(tx.fee, "fee");
+  }
+
+  private async _assertTransactionDomain(signedDomain: string | null): Promise<void> {
+    const advertised = await this.getTransactionDomain();
+    this._requireMatchingTransactionDomain(signedDomain, advertised);
+  }
+
+  private _requireMatchingTransactionDomain(
+    signedDomain: string | null,
+    advertised: string | null,
+  ): void {
+    let normalized: string | null = null;
+    if (signedDomain !== null) {
+      const raw = signedDomain.replace(/^0x/i, "");
+      if (!/^[0-9a-fA-F]{64}$/.test(raw) || /^0{64}$/.test(raw)) {
+        throw new ArcTransactionError(
+          "Transaction signature domain must be a non-zero 32-byte hex value",
+        );
+      }
+      normalized = `0x${raw.toLowerCase()}`;
+    }
+    if (normalized !== advertised) {
+      throw new ArcTransactionError(
+        `Transaction signature domain mismatch: signed for ${normalized ?? "legacy-v1"}, ` +
+          `node requires ${advertised ?? "legacy-v1"}`,
+      );
+    }
   }
 
   // -- Chain info & stats --
@@ -360,8 +458,9 @@ export class ArcClient {
     func: string,
     calldata?: string,
     fromAddr?: string,
-    gasLimit: number = 1_000_000
+    gasLimit: U64 = 1_000_000
   ): Promise<ContractCallResult> {
+    assertU64(gasLimit, "gas_limit");
     const body: Record<string, unknown> = {
       function: func,
       gas_limit: gasLimit,

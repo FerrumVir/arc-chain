@@ -7,6 +7,9 @@ license.workspace = true
 
 [features]
 default = []
+# Predictable signing keys exist only for isolated, explicitly enabled
+# benchmark tooling. Production/default builds must not expose them.
+benchmark-tools = []
 stwo-prover = ["dep:stwo", "dep:stwo-constraint-framework", "dep:num-traits"]
 stwo-icicle = ["stwo-prover", "dep:icicle-runtime", "dep:icicle-core", "dep:icicle-m31", "dep:icicle-hash"]
 
@@ -28,6 +31,7 @@ hex.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+libc = "0.2"
 # Stwo STARK prover (optional - requires nightly Rust)
 stwo = { workspace = true, optional = true }
 stwo-constraint-framework = { workspace = true, optional = true }
@@ -40,6 +44,16 @@ icicle-hash = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [[bench]]
 name = "crypto_bench"

@@ -57,19 +57,358 @@ all_six_exact_writers_stop_before_content_capture() {
     python3 - "$ORCHESTRATOR" <<'PY' || return 1
 import pathlib,sys
 t=pathlib.Path(sys.argv[1]).read_text(); b=t[t.index("capture_phase()"):t.index("manifest_field()")]
-assert b.index('ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" nyc')<b.index('for node in "${REMAINING[@]}"')
-assert b.index('for node in "${REMAINING[@]}"')<b.index('ensure_offline_capture "$capture_id" "$node"')
+assert b.index('run_drive_prefreeze_gate execute') < b.index('capture_all_live_observations')
+quarantine=b.index('run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id"')
+stop=b.index('ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" "$node"')
+capture=b.index('ensure_offline_capture "$capture_id" "$node"')
+persisted=b.index('run_persisted_head_exact "$freeze_plan"')
+boundary=b.index('create_legacy_maintenance_boundary')
+offline=b.index('create_offline_stop_evidence')
+assert b.index('capture_all_live_observations') < quarantine < stop < capture < persisted < boundary < offline
 assert 'ALL SIX CONTROLLED WRITERS HALTED' in b and 'no global halt is claimed' in b
 PY
     ! grep -Eq 'pkill[[:space:]]|killall[[:space:]]|kill[[:space:]]+-9' "$NODE_HELPER"
 }
 
+offline_stop_roots_are_remote_derived_and_archive_bound() {
+    python3 - "$ORCHESTRATOR" "$NODE_HELPER" <<'PY' || return 1
+import pathlib, re, sys
+fleet = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+helper = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+text = fleet
+capture = fleet[fleet.index("capture_phase()"):fleet.index("manifest_field()")]
+seal = fleet[fleet.index("seal_phase()") :]
+assert "arc.recovery.offline-stop-status.v1" in helper
+assert "arc.recovery.offline-stop.v4" in helper
+assert "stop_complete_sha256" in helper and "stop_files_sha256" in helper
+assert "arc.validator-vault.offline-stop-evidence.v2" in fleet
+assert "stopped_status_argv_sha256" in fleet and "stopped_status_sha256" in fleet
+assert capture.index("ensure_offline_capture") < capture.index("run_persisted_head_exact")
+assert capture.index("run_persisted_head_exact") < capture.index("create_legacy_maintenance_boundary")
+assert capture.index("create_legacy_maintenance_boundary") < capture.index("create_offline_stop_evidence")
+assert seal.index("verify_offline_stop_evidence_remote") < seal.index("PLAN ONLY")
+assert 'offline-stop-evidence.json' in seal
+for name in (
+    'offline-stop-evidence.json.sha256',
+    'legacy-maintenance-evidence-bundle.json',
+    'legacy-maintenance-evidence-bundle.json.sha256',
+    'legacy-maintenance-boundary.json',
+    'legacy-maintenance-boundary.json.sha256',
+    'legacy-late-fork-source-set.json',
+    'legacy-late-fork-source-set.json.sha256',
+    'legacy-late-fork-interlock.py',
+    'drive-archive-seal-attempt.json',
+):
+    assert name in seal, name
+assert 'arc.recovery.drive-archive-seal-attempt.v1' in text
+for function in ('reserve_stop_boundary_timestamp', 'publish_canonical_maintenance_input',
+                 'reserve_quarantine_challenge', 'create_legacy_maintenance_boundary',
+                 'create_offline_stop_evidence', 'seal_archive_finalization_intent',
+                 'write_gist_anchor_receipt'):
+    start=text.index(function+'()')
+    search_from=text.index('\n',start)+1
+    next_function=re.search(r'(?m)^[_a-zA-Z][_a-zA-Z0-9]*\(\) [({]\s*$',text[search_from:])
+    end=(search_from+next_function.start()) if next_function else len(text)
+    body=text[start:end]
+    assert '.partial' in body and 'os.rename' in body, function
+PY
+}
+
+offline_stop_receipt_is_canonical_private_and_adversarial() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f freeze_sha capture receipt_sha
+    f="$(mktemp -d "$REPO_ROOT/.offline-stop-test.XXXXXX")"
+    trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
+    mkdir -p "$f/status"
+    python3 - "$f" <<'PY' || return 1
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+fleet = (
+    ("nyc", "149.28.32.76"), ("lax", "140.82.16.112"),
+    ("ams", "136.244.109.1"), ("lhr", "104.238.171.11"),
+    ("nrt", "202.182.107.41"), ("sgp", "149.28.153.31"),
+)
+
+canonical = lambda value: (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+nodes = []
+for index, (name, host) in enumerate(fleet):
+    nodes.append({
+        "name": name, "host": host, "validator_address": f"{index + 1:064x}",
+        "stake": 5_000_000, "writer_pid": 100 + index,
+        "writer_start_ticks": 200 + index, "boot_id": f"00000000-0000-0000-0000-{index + 1:012x}",
+        "writer_cgroup_sha256": "1" * 64, "writer_supervision_mode": "systemd-unit",
+        "supervisor_unit": "arc-node.service", "supervisor_main_pid": 100 + index,
+        "supervisor_start_ticks": 200 + index, "supervisor_executable_path": "/usr/bin/systemd",
+        "supervisor_executable_sha256": "2" * 64, "supervisor_argv_sha256": "3" * 64,
+        "supervisor_context_sha256": "4" * 64, "executable_path": "/usr/local/bin/arc-node",
+        "executable_sha256": "5" * 64, "argv_sha256": "6" * 64,
+        "data_dir": "/var/lib/arc-data", "rpc_origin": "http://127.0.0.1:9090",
+    })
+plan = {"schema": "arc.recovery.freeze-plan.v5", "source_commit": "7" * 40,
+        "remote_helper_sha256": "8" * 64, "nodes": nodes}
+payload = canonical(plan); freeze_sha = hashlib.sha256(payload).hexdigest()
+(root / "freeze.json").write_bytes(payload)
+(root / "freeze.json.sha256").write_text(f"{freeze_sha}  freeze.json\n", encoding="ascii")
+capture = hashlib.sha256(b"ARC recovery capture v2\0" + bytes.fromhex(freeze_sha)).hexdigest()
+for index, node in enumerate(nodes):
+    status = {"schema": "arc.recovery.offline-stop-status.v1", "capture_id": capture,
+              "node": node["name"], "freeze_plan_sha256": freeze_sha,
+              "validator_address": node["validator_address"], "stake": node["stake"],
+              "stopped": True, "restart_fenced": True,
+              "stop_schema": "arc.recovery.offline-stop.v4",
+              "stop_complete_sha256": f"{index + 20:064x}",
+              "stop_files_sha256": f"{index + 40:064x}"}
+    (root / "status" / f"{node['name']}-stopped-status.json").write_bytes(canonical(status))
+cross_rows = []
+for index, (name, host) in enumerate(fleet):
+    proof = {"schema": "arc.recovery.authenticated-legacy-height-bracket.v1",
+             "node": name, "conservative_height_floor": 100 + index}
+    cross_rows.append({"node": name, "host": host, "proof": proof,
+                       "proof_sha256": hashlib.sha256(canonical(proof)).hexdigest()})
+cross = {"schema": "arc.recovery.authenticated-legacy-height-fleet.v1",
+         "source_main_commit": "7" * 40, "freeze_plan_sha256": freeze_sha,
+         "capture_id": capture, "conservative_height_floor": 105,
+         "nodes": cross_rows}
+(root / "legacy-height-cross-proof.json").write_bytes(canonical(cross))
+boundary = {
+    "schema":"arc.recovery.legacy-maintenance-boundary.v1",
+    "source_main_commit":"7"*40,"freeze_plan_sha256":freeze_sha,"capture_id":capture,
+    "first_quarantine_started_at":"2026-08-28T12:00:00Z",
+    "all_controlled_stopped_at":"2026-08-28T12:00:01Z","created_at":"2026-08-28T12:00:02Z",
+    "official_origin_scope":{"global_absence_claimed":False,"origins":[]},
+    "legacy_public_height_receipt":{},"authenticated_prefence_height_cross_proof_sha256":"9"*64,
+    "legacy_maintenance_evidence_bundle_sha256":"0"*64,
+    "network_quarantine_challenge":"a"*64,
+    "network_quarantine_stability_proof_sha256":"b"*64,"tools":{},
+    "nodes":[{"node":name,"host":host} for name,host in fleet],"evidence_heights":[],
+    "observed_cutoff_height":105,"continuity_safety_margin":128,
+    "continuity_safety_margin_policy":{},"legacy_public_max_height":233,
+    "global_absence_claimed":False,"reopening_policy":{},"late_fork_circuit":{},"threat_model":{},
+}
+bundle={"schema":"arc.recovery.legacy-maintenance-evidence-bundle.v1",
+        "source_main_commit":"7"*40,"freeze_plan_sha256":freeze_sha,"capture_id":capture,
+        "first_quarantine_started_at":"2026-08-28T12:00:00Z",
+        "all_controlled_stopped_at":"2026-08-28T12:00:01Z","challenge":"a"*64,
+        "authenticated_prefence_height_cross_proof":{},"network_quarantine_challenge":{},
+        "quarantine_stability_proof":{"value":{},"sha256":"b"*64},
+        "nodes":[],"object_inventory":[],"aggregate_root_sha256":"1"*64}
+bundle_raw=canonical(bundle);bundle_sha=hashlib.sha256(bundle_raw).hexdigest()
+boundary["legacy_maintenance_evidence_bundle_sha256"]=bundle_sha
+(root/"legacy-maintenance-evidence-bundle.json").write_bytes(bundle_raw)
+(root/"legacy-maintenance-evidence-bundle.json.sha256").write_text(
+    f"{bundle_sha}  legacy-maintenance-evidence-bundle.json\n",encoding="ascii")
+boundary_raw=canonical(boundary);(root/"legacy-maintenance-boundary.json").write_bytes(boundary_raw)
+(root/"legacy-maintenance-boundary.json.sha256").write_text(
+    f"{hashlib.sha256(boundary_raw).hexdigest()}  legacy-maintenance-boundary.json\n",encoding="ascii")
+for path in root.rglob("*"):
+    if path.is_file(): path.chmod(0o400)
+(root / "fixture.txt").write_text(f"{freeze_sha}\n{capture}\n", encoding="ascii")
+PY
+    read -r freeze_sha < "$f/fixture.txt"
+    capture="$(sed -n '2p' "$f/fixture.txt")"
+    receipt_sha="$(create_offline_stop_evidence "$f/freeze.json" "$freeze_sha" \
+        "$capture" "$f/status" "$f/offline-stop.json" \
+        2026-08-28T12:00:00Z 2026-08-28T12:00:01Z \
+        "$f/legacy-height-cross-proof.json" "$f/legacy-maintenance-boundary.json" \
+        "$f/legacy-maintenance-evidence-bundle.json")" || return 1
+    python3 - "$f/offline-stop.json" "$receipt_sha" <<'PY' || return 1
+import hashlib, json, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1]); expected = sys.argv[2]
+raw = path.read_bytes(); value = json.loads(raw)
+assert raw == (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+assert value["schema"] == "arc.validator-vault.offline-stop-evidence.v2"
+assert value["first_quarantine_started_at"] == "2026-08-28T12:00:00Z"
+assert value["all_controlled_stopped_at"] == "2026-08-28T12:00:01Z"
+assert value["legacy_height_cross_proof"]["conservative_height_floor"] == 105
+assert [row["node"] for row in value["nodes"]] == ["nyc", "lax", "ams", "lhr", "nrt", "sgp"]
+assert hashlib.sha256(raw).hexdigest() == expected
+assert stat.S_IMODE(path.stat().st_mode) == 0o400
+assert stat.S_IMODE(path.with_name(path.name + ".sha256").stat().st_mode) == 0o400
+PY
+    python3 - "$f" <<'PY' || return 1
+import base64, json, pathlib, struct, sys
+root = pathlib.Path(sys.argv[1])
+fleet = (
+    ("nyc", "149.28.32.76"), ("lax", "140.82.16.112"),
+    ("ams", "136.244.109.1"), ("lhr", "104.238.171.11"),
+    ("nrt", "202.182.107.41"), ("sgp", "149.28.153.31"),
+)
+known = []
+challenged = root / "challenged"; challenged.mkdir()
+challenge = "c" * 64
+for index, (node, host) in enumerate(fleet):
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + bytes([index + 1]) * 32
+    known.append(f"{host} ssh-ed25519 {base64.b64encode(blob).decode()}\n")
+    status = json.loads((root / "status" / f"{node}-stopped-status.json").read_text())
+    status.update(schema="arc.recovery.offline-stop-challenged-status.v1", host=host, challenge=challenge)
+    (challenged / f"{node}-challenged-status.json").write_text(
+        json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+(root / "known_hosts").write_text("".join(known), encoding="ascii")
+(root / "id_ed25519").write_text("test-only-private-key\n", encoding="ascii")
+for path in (root / "known_hosts", root / "id_ed25519"):
+    path.chmod(0o400)
+PY
+    local known_sha verification python_path python_sha ssh_sha phase_verification
+    local expected_fixture_freeze_sha
+    known_sha="$(hash_file "$f/known_hosts")"
+    verify_offline_stop_inputs "$f/freeze.json" "$freeze_sha" "$f/offline-stop.json" \
+        "$receipt_sha" "$f/known_hosts" "$known_sha" "$f/id_ed25519" || return 1
+    verification="$(build_offline_stop_remote_verification \
+        "$f/freeze.json" "$freeze_sha" "$f/offline-stop.json" "$receipt_sha" \
+        "$known_sha" "$(printf 'c%.0s' {1..64})" 2026-08-28T12:00:00Z \
+        2026-08-28T12:00:01Z 1001 "$f/challenged" "$(printf 'd%.0s' {1..64})")" || return 1
+    python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["schema"]=="arc.recovery.offline-stop-remote-verification.v1" and len(value["nodes"])==6 and value["nodes"][0]["status"]["challenge"]=="c"*64 and value["nodes"][5]["host"]=="149.28.153.31"' \
+        "$verification" || return 1
+    python_path="$(python3 -c 'import os; print(os.path.realpath("/usr/bin/python3"))')" || return 1
+    python_sha="$(python3 - "$python_path" <<'PY'
+import hashlib, pathlib, sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)" || return 1
+    ssh_sha="$(python3 - <<'PY'
+import hashlib, pathlib
+print(hashlib.sha256(pathlib.Path("/usr/bin/ssh").read_bytes()).hexdigest())
+PY
+)" || return 1
+    # Exercise the real protected macOS/Linux tool path.  On macOS this proves
+    # the signed-system Python's legitimate nlink>1 shape works even though
+    # `/usr/bin/stat -c` is rejected by BSD stat.  The static assertion keeps
+    # the Linux regression from accidentally reintroducing either GNU-only call.
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+phase = text[text.index("verify_offline_stop_phase()") : text.index("create_offline_stop_evidence()")]
+assert "/usr/bin/stat -c" not in phase
+assert "/usr/bin/readlink -f" not in phase
+assert "verify_offline_stop_transport_tools" in phase
+PY
+    ( verify_offline_stop_transport_tools "$python_path" "$(printf '0%.0s' {1..64})" "$ssh_sha" ) \
+        >/dev/null 2>&1 && return 1
+    ( verify_offline_stop_transport_tools /tmp/python3 "$python_sha" "$ssh_sha" ) \
+        >/dev/null 2>&1 && return 1
+    expected_fixture_freeze_sha="$freeze_sha"
+    freeze_plan_hash() { printf '%s\n' "$expected_fixture_freeze_sha"; }
+    run_stopped_status_challenged_exact() {
+        local node="$4"
+        /bin/cat "$f/challenged/$node-challenged-status.json"
+    }
+    phase_verification="$(verify_offline_stop_phase \
+        --freeze-plan "$f/freeze.json" \
+        --offline-stop-evidence "$f/offline-stop.json" \
+        --offline-stop-evidence-sha256 "$receipt_sha" \
+        --ssh-known-hosts "$f/known_hosts" \
+        --ssh-known-hosts-sha256 "$known_sha" \
+        --ssh-identity "$f/id_ed25519" \
+        --python-path "$python_path" --python-sha256 "$python_sha" \
+        --ssh-sha256 "$ssh_sha" --challenge "$(printf 'c%.0s' {1..64})")" || return 1
+    python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert value["schema"]=="arc.recovery.offline-stop-remote-verification.v1" and len(value["nodes"])==6 and value["ssh_sha256"]==sys.argv[2]' \
+        "$phase_verification" "$ssh_sha" || return 1
+    local resumed_sha
+    resumed_sha="$(create_offline_stop_evidence "$f/freeze.json" "$freeze_sha" "$capture" \
+        "$f/status" "$f/offline-stop.json" 2026-08-28T12:00:00Z \
+        2026-08-28T12:00:01Z "$f/legacy-height-cross-proof.json" \
+        "$f/legacy-maintenance-boundary.json" \
+        "$f/legacy-maintenance-evidence-bundle.json")" || return 1
+    [ "$resumed_sha" = "$receipt_sha" ] || return 1
+    # A crash after a complete partial fsync but before rename, and a crash
+    # after the primary rename but before the ordered sidecar, are both
+    # resumable without resampling any irreversible maintenance input.
+    mv "$f/offline-stop.json" "$f/offline-stop.json.partial"
+    rm -f -- "$f/offline-stop.json.sha256"
+    resumed_sha="$(create_offline_stop_evidence "$f/freeze.json" "$freeze_sha" "$capture" \
+        "$f/status" "$f/offline-stop.json" 2026-08-28T12:00:00Z \
+        2026-08-28T12:00:01Z "$f/legacy-height-cross-proof.json" \
+        "$f/legacy-maintenance-boundary.json" \
+        "$f/legacy-maintenance-evidence-bundle.json")" || return 1
+    [ "$resumed_sha" = "$receipt_sha" ] || return 1
+    printf '{"schema":' > "$f/truncated.json.partial"
+    chmod 400 "$f/truncated.json.partial"
+    create_offline_stop_evidence "$f/freeze.json" "$freeze_sha" "$capture" \
+        "$f/status" "$f/truncated.json" 2026-08-28T12:00:00Z \
+        2026-08-28T12:00:01Z "$f/legacy-height-cross-proof.json" \
+        "$f/legacy-maintenance-boundary.json" \
+        "$f/legacy-maintenance-evidence-bundle.json" >/dev/null || return 1
+    [ -s "$f/truncated.json" ] && [ ! -e "$f/truncated.json.partial" ] || return 1
+    chmod 600 "$f/status/nyc-stopped-status.json"
+    python3 - "$f/status/nyc-stopped-status.json" "$f/status/lax-stopped-status.json" <<'PY'
+import json, pathlib, sys
+left, right = map(pathlib.Path, sys.argv[1:])
+value = json.loads(left.read_text()); value["stop_complete_sha256"] = json.loads(right.read_text())["stop_complete_sha256"]
+left.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    chmod 400 "$f/status/nyc-stopped-status.json"
+    ( create_offline_stop_evidence "$f/freeze.json" "$freeze_sha" "$capture" \
+        "$f/status" "$f/duplicate.json" 2026-08-28T12:00:00Z \
+        2026-08-28T12:00:01Z "$f/legacy-height-cross-proof.json" \
+        "$f/legacy-maintenance-boundary.json" \
+        "$f/legacy-maintenance-evidence-bundle.json" ) >/dev/null 2>&1 && return 1
+    return 0
+)
+
+ordinary_and_challenged_stopped_status_execute() (
+    # shellcheck source=/dev/null
+    . "$NODE_HELPER" >/dev/null
+    local f capture freeze challenge validator root base challenged
+    f="$(mktemp -d)"; trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
+    capture="$(printf 'a%.0s' {1..64})"; freeze="$(printf 'b%.0s' {1..64})"
+    challenge="$(printf 'c%.0s' {1..64})"; validator="$(printf 'd%.0s' {1..64})"
+    STOP_BASE="$f/stops"; root="$STOP_BASE/$capture/nyc"; mkdir -p "$root/evidence"
+    python3 - "$root/evidence/writer-contract.json" "$freeze" "$validator" <<'PY' || return 1
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = {
+    "schema": "arc.recovery.exact-writer.v3",
+    "freeze_plan_sha256": sys.argv[2],
+    "validator_address": sys.argv[3],
+    "stake": 5_000_000,
+}
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+PY
+    verify_tree_index() { :; }
+    verify_stop_identity() { :; }
+    verify_sealed_stop_contract() { :; }
+    verify_stop_journal_semantics() { :; }
+    verify_legacy_restart_fence() { :; }
+    pgrep() { return 1; }
+    hash_file() {
+        case "$1" in
+            */stop.complete) printf '%064d\n' 1 ;;
+            */stop.files.sha256) printf '%064d\n' 2 ;;
+            *) return 1 ;;
+        esac
+    }
+    base="$(stopped_status "$capture" nyc)" || return 1
+    challenged="$(stopped_status_challenged \
+        "$capture" nyc "$freeze" "$validator" 5000000 101 202 \
+        00000000-0000-0000-0000-000000000001 "$(printf '3%.0s' {1..64})" \
+        systemd-unit arc-node.service 101 202 /usr/bin/systemd \
+        "$(printf '4%.0s' {1..64})" "$(printf '5%.0s' {1..64})" \
+        "$(printf '6%.0s' {1..64})" /usr/local/bin/arc-node \
+        "$(printf '7%.0s' {1..64})" "$(printf '8%.0s' {1..64})" \
+        /var/lib/arc-data 149.28.32.76 "$challenge")" || return 1
+    python3 -c 'import json,sys; base=json.loads(sys.argv[1]); challenged=json.loads(sys.argv[2]); assert base["schema"]=="arc.recovery.offline-stop-status.v1" and base["stopped"] is True and base["restart_fenced"] is True and base["capture_id"]==sys.argv[3] and base["freeze_plan_sha256"]==sys.argv[4] and base["validator_address"]==sys.argv[5]; assert challenged==dict(base,schema="arc.recovery.offline-stop-challenged-status.v1",host="149.28.32.76",challenge=sys.argv[6])' \
+        "$base" "$challenged" "$capture" "$freeze" "$validator" "$challenge" || return 1
+    ( stopped_status_challenged \
+        "$capture" nyc "$freeze" "$validator" 5000000 101 202 \
+        00000000-0000-0000-0000-000000000001 "$(printf '3%.0s' {1..64})" \
+        systemd-unit arc-node.service 101 202 /usr/bin/systemd \
+        "$(printf '4%.0s' {1..64})" "$(printf '5%.0s' {1..64})" \
+        "$(printf '6%.0s' {1..64})" /usr/local/bin/arc-node \
+        "$(printf '7%.0s' {1..64})" "$(printf '8%.0s' {1..64})" \
+        /var/lib/arc-data 192.0.2.99 "$challenge" ) >/dev/null 2>&1 && return 1
+    return 0
+)
+
 content_capture_fixture_detects_source_tamper() (
     # shellcheck source=/dev/null
     . "$NODE_HELPER" >/dev/null
-    local f c d id n; f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
-    c="$f/capture"; d="$f/legacy-data"; id="$(printf 'a%.0s' {1..64})"; n=nyc
-    mkdir -p "$c" "$d"; printf sealed-wal > "$d/state.wal"; printf state > "$d/state.bin"
+    local f c d id n freeze live; f="$(mktemp -d)"; trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
+    c="$f/capture"; d="$f/legacy-data"; id="$(printf 'a%.0s' {1..64})"; freeze="$(printf 'b%.0s' {1..64})"; n=nyc
+    LIVE_OBSERVATION_BASE="$f/live"; live="$LIVE_OBSERVATION_BASE/$id/$n"
+    mkdir -p "$c" "$d" "${live%/*}"; printf sealed-wal > "$d/state.wal"; printf state > "$d/state.bin"
+    capture_live_observation_receipt_at "$f/.live.partial" "$live" "$id" "$n" "$freeze" http://127.0.0.1:1 || return 1
     write_regular_tree_inventory "$d" "$c/source-data.files.sha256" || return 1
     python3 - "$d" "$c/capture-source.json" <<'PY' || return 1
 import hashlib,json,pathlib,sys
@@ -77,7 +416,9 @@ r,o=map(pathlib.Path,sys.argv[1:]); w=r/"state.wal"; files=[p for p in r.rglob("
 v={"schema":"arc.recovery.capture-source.v1","data_dir":str(r),"data_device":r.stat().st_dev,"data_inode":r.stat().st_ino,"data_bytes":sum(p.stat().st_size for p in files),"data_files":len(files),"state_wal_bytes":w.stat().st_size,"state_wal_sha256":hashlib.sha256(w.read_bytes()).hexdigest(),"external_snapshots":[]}
 o.write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n")
 PY
-    printf 'capture_id=%s\nnode=%s\n' "$id" "$n" > "$c/capture.inventory"
+    printf 'capture_id=%s\nnode=%s\nfreeze_plan_sha256=%s\nlegacy_live_observations_schema=arc.recovery.legacy-live-observations.v1\nlegacy_live_observations_root_sha256=%s\nlegacy_live_observations_receipt_sha256=%s\nlegacy_live_observations_labels=diagnostic,noncanonical,nonreward\n' \
+        "$id" "$n" "$freeze" "$(hash_file "$live/live-observations.files.sha256")" \
+        "$(hash_file "$live/receipt.json")" > "$c/capture.inventory"
     write_tree_index "$c" capture.files.sha256 capture.complete || return 1
     write_complete_marker "$c" capture.files.sha256 capture.complete arc.recovery.capture.v4 "capture_id=$id" "node=$n" || return 1
     verify_capture_source "$c" "$id" "$n" || return 1
@@ -95,6 +436,110 @@ partial_retry_ownership_rejects_symlink_and_foreign_marker() (
     printf 'exact\n' > "$p/.arc-recovery-partial-owner"; printf x > "$p/stale"
     prepare_owned_partial_directory "$p" exact || return 1
     [ ! -e "$p/stale" ] && [ "$(cat "$p/.arc-recovery-partial-owner")" = exact ]
+)
+
+live_observations_are_bounded_create_only_and_resumable() (
+    # shellcheck source=/dev/null
+    . "$NODE_HELPER" >/dev/null
+    local f port server id freeze first_count
+    f="$(mktemp -d)"; server=""
+    trap '[ -z "$server" ] || { kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; }; chmod -R u+w "$f" 2>/dev/null || true; find "$f" -depth -delete' EXIT
+    cat > "$f/server.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import pathlib, sys
+log, port_file = map(pathlib.Path, sys.argv[1:])
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(self.path + "\n")
+        if self.path == "/inference/results":
+            status, body = 200, b'{"results":[1]}'
+        elif self.path == "/workers/scoreboard":
+            status, body = 200, b'x' * (8 * 1024 * 1024 + 1)
+        elif self.path == "/inference/attestations":
+            status, body = 404, b'{"error":"legacy endpoint absent"}'
+        else:
+            status, body = 500, b'unexpected endpoint'
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try: self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError): pass
+    def log_message(self, *_): pass
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+port_file.write_text(str(server.server_port), encoding="ascii")
+server.serve_forever()
+PY
+    : > "$f/requests.log"
+    python3 "$f/server.py" "$f/requests.log" "$f/port" & server=$!
+    for _ in $(seq 1 100); do [ -s "$f/port" ] && break; sleep 0.02; done
+    [ -s "$f/port" ] || return 1
+    port="$(cat "$f/port")"; id="$(printf 'a%.0s' {1..64})"; freeze="$(printf 'b%.0s' {1..64})"
+
+    capture_live_observation_receipt_at "$f/.first.partial" "$f/first" "$id" nyc "$freeze" \
+        "http://127.0.0.1:$port" || return 1
+    verify_live_observation_receipt "$f/first" "$id" nyc "$freeze" || return 1
+    python3 - "$f/first/receipt.json" "$f/requests.log" <<'PY' || return 1
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+paths = pathlib.Path(sys.argv[2]).read_text().splitlines()
+assert paths == ["/inference/results", "/workers/scoreboard", "/inference/attestations"]
+assert "/community/list" not in paths
+assert receipt["labels"] == ["diagnostic", "noncanonical", "nonreward"]
+assert receipt["diagnostic"] is True and receipt["canonical"] is False and receipt["reward_evidence"] is False
+rows = receipt["observations"]
+assert rows[0]["http_status"] == 200 and rows[0]["raw_complete"] is True
+assert rows[1]["http_status"] == 200 and rows[1]["error"] == "response_body_limit_exceeded"
+assert rows[1]["raw_bytes"] == 8 * 1024 * 1024 and rows[1]["raw_complete"] is False
+assert rows[2]["http_status"] == 404 and rows[2]["raw_complete"] is True
+PY
+
+    : > "$f/requests.log"
+    python3 - "$f/.resume.partial" "$id" "$freeze" <<'PY' || return 1
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1]); root.mkdir(); (root/"journal").mkdir(); (root/"observations").mkdir(); (root/"raw").mkdir()
+(root/".arc-recovery-partial-owner").write_text(
+    f"schema=arc.recovery.live-observation-partial.v1 capture={sys.argv[2]} node=lax freeze={sys.argv[3]}\n"
+)
+attempt = {"schema":"arc.recovery.legacy-live-observation-attempt.v1","endpoint":"/inference/results","started_at":"2026-08-28T00:00:00.000000Z","node":"lax"}
+(root/"journal/00-inference-results.attempt.json").write_text(json.dumps(attempt,sort_keys=True,separators=(",",":"))+"\n")
+for path in (root/".arc-recovery-partial-owner", root/"journal/00-inference-results.attempt.json"):
+    path.chmod(0o400)
+PY
+    capture_live_observation_receipt_at "$f/.resume.partial" "$f/resumed" "$id" lax "$freeze" \
+        "http://127.0.0.1:$port" || return 1
+    verify_live_observation_receipt "$f/resumed" "$id" lax "$freeze" || return 1
+    python3 - "$f/resumed/receipt.json" "$f/requests.log" <<'PY' || return 1
+import json, pathlib, sys
+receipt=json.loads(pathlib.Path(sys.argv[1]).read_text()); paths=pathlib.Path(sys.argv[2]).read_text().splitlines()
+assert receipt["observations"][0]["error"] == "interrupted_after_durable_attempt_intent"
+assert "/inference/results" not in paths
+assert paths == ["/workers/scoreboard", "/inference/attestations"]
+PY
+
+    ln -s "$f" "$f/.symlink.partial"
+    ( capture_live_observation_receipt_at "$f/.symlink.partial" "$f/never" "$id" ams "$freeze" \
+        "http://127.0.0.1:$port" ) >/dev/null 2>&1 && return 1
+    chmod u+w "$f/first/receipt.json"; printf mutation >> "$f/first/receipt.json"
+    ( verify_live_observation_receipt "$f/first" "$id" nyc "$freeze" ) >/dev/null 2>&1 && return 1
+    python3 - "$NODE_HELPER" "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib, sys
+node, fleet = (pathlib.Path(path).read_text() for path in sys.argv[1:])
+capture = node[node.index("capture_live_observations()") : node.index("verify_merged_legacy_fence_config()")]
+reuse = capture.index('if [ -e "$root" ] || [ -L "$root" ]')
+stop_guard = capture.index('refusing first live-observation receipt after this writer was stopped/fenced')
+network = capture.index('capture_live_observation_receipt_at')
+assert reuse < stop_guard < network
+phase = fleet[fleet.index("capture_phase()") : fleet.index("manifest_field()")]
+assert phase.index('if [ "$execute" != true ]') < phase.index("capture_all_live_observations")
+fleet_capture = fleet[fleet.index("capture_all_live_observations()") : fleet.index("run_sealed_source_status_exact()")]
+assert fleet_capture.index("run_live_observations_eligibility_exact") < fleet_capture.index("run_live_observations_exact")
+assert "complete_count" in fleet_capture and "recapture is forbidden" in fleet_capture
+assert '"${live_root#/}"' in node[node.index("stream_bundle()") : node.index("stream_inventory()")]
+assert 'legacy-live-observations.json' in fleet
+PY
+    first_count="$(wc -l < "$f/requests.log" | tr -d ' ')"
+    [ "$first_count" = 2 ]
 )
 
 disk_peak_allows_growth_and_reserves_v3() {
@@ -252,7 +697,13 @@ assert 'expected_go="STAGE-BARRIERS $orchestrator_sha HELPER $helper_sha"' in or
 assert 'expected_go="FREEZE $freeze_sha CAPTURE $capture_id"' in orchestrator
 assert 'expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"' in orchestrator
 assert orchestrator.index("run_drive_prefreeze_gate execute") < orchestrator.index(
-    'ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" nyc'
+    'capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"'
+)
+assert orchestrator.index('capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"') < orchestrator.index(
+    'run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id"'
+)
+assert orchestrator.index('run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id"') < orchestrator.index(
+    'ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" "$node"'
 )
 PY
 }
@@ -367,6 +818,35 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
         grep -Fq 'lax stopped-status' "$f/actions" && grep -Fq 'lax status' "$f/actions"
 )
 
+fleet_live_observation_retry_rejects_any_stopped_writer() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f; f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    # shellcheck disable=SC2317,SC2329
+    assert_pinned_freeze_bytes() { :; }
+    # shellcheck disable=SC2317,SC2329
+    run_remote() {
+        if [ "$2" = live-observations-status ] && [ "$1" = nyc ]; then
+            printf '{"complete":true}\n'
+            return 0
+        fi
+        return 1
+    }
+    # shellcheck disable=SC2317,SC2329
+    run_live_observations_eligibility_exact() {
+        [ "$4" != nyc ]
+    }
+    # shellcheck disable=SC2317,SC2329
+    run_live_observations_exact() {
+        : > "$f/network-recapture-attempted"
+    }
+    if ( capture_all_live_observations /sealed/freeze "$(printf 'a%.0s' {1..64})" \
+            "$(printf 'b%.0s' {1..64})" "$f" ) >/dev/null 2>&1; then
+        return 1
+    fi
+    [ ! -e "$f/network-recapture-attempted" ]
+)
+
 reference_pair_is_independent_of_final_capture_classes() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
@@ -396,24 +876,61 @@ SH
 remote_complete_rejects_missing_tampered_extra() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
-    local f remote archive_sha complete_sha sums_sha; f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
-    remote="$f/remote"; mkdir -p "$f/shared" "$f/meta" "$f/complete" "$remote" "$f/bin"; printf alpha > "$f/shared/a.txt"
+    local f remote archive_sha complete_sha sums_sha freeze_sha rollout_sha; f="$(realpath "$(mktemp -d)")"; trap 'rm -rf -- "$f"' EXIT
+    remote="$f/remote"; mkdir -p "$f/shared" "$f/meta" "$f/complete" "$remote" "$f/bin"; mkdir -m 700 "$f/catalog"; printf alpha > "$f/shared/a.txt"
     python3 - "$f" <<'PY' || return 1
 import hashlib,json,pathlib,sys
-r=pathlib.Path(sys.argv[1]); d=r/"remote"; s=r/"shared"; rows=[]; cs=["valid_noncanonical_fork"]*3+["preserved_unclassified"]*3
+r=pathlib.Path(sys.argv[1]); d=r/"remote"; s=r/"shared"; rows=[]; live_rows=[]; cs=["valid_noncanonical_fork"]*3+["preserved_unclassified"]*3
 h=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
 for name in ("arc-node","genesis.toml","validator-public-keys.json","legacy-validator-set-40m.json","source.snapshot.lz4","source.state.wal","recovery.arcchkpt","archive-fleet-to-drive.sh","archive-node.sh","recovery_rollout.py","recovery-manifest.schema.json"):
  (s/name).write_bytes((name+"-bytes").encode())
+(s/"freeze-plan.json").write_bytes(b"freeze-plan-bytes\n");freeze_sha=h(s/"freeze-plan.json")
+(s/"rollout-manifest.json").write_bytes(b"rollout-manifest-bytes\n");rollout_sha=h(s/"rollout-manifest.json")
+(s/"freeze-plan.json.sha256").write_text(f"{freeze_sha}  freeze-plan.json\n")
+(s/"rollout-manifest.json.sha256").write_text(f"{rollout_sha}  rollout-manifest.json\n")
+(s/"source-commit.txt").write_text("1"*40+"\n");(s/"capture-id.txt").write_text("b"*64+"\n")
 obj=lambda name:{"name":name,"size":(s/name).stat().st_size,"sha256":h(s/name)}
 ref={"schema":"arc.recovery.canonical-reference.v1","independently_verified":True,"allow_unbound_legacy_wal":False,"verifier_binary":obj("arc-node"),"genesis":obj("genesis.toml"),"validator_public_keys":obj("validator-public-keys.json"),"legacy_validator_set":obj("legacy-validator-set-40m.json"),"source_snapshot":obj("source.snapshot.lz4"),"source_wal":obj("source.state.wal"),"selected_checkpoint":obj("recovery.arcchkpt"),"source_height":137145,"source_block_hash":"1"*64,"source_state_root":"2"*64,"transition_state_root":"3"*64,"checkpoint_manifest_hash":"4"*64,"source_consensus_round":7,"created_at_unix_ms":8,"recovery_epoch":9,"validator_set_id":10}
 (s/"canonical-reference.json").write_text(json.dumps(ref,sort_keys=True,separators=(",",":"))+"\n")
 (s/"archive-seal-options.json").write_text('{"allow_unbound_legacy_wal":false}\n')
 for n,c in zip(("nyc","lax","ams","lhr","nrt","sgp"),cs):
- b=d/f"legacy-{n}.tar.zst"; b.write_bytes((n+"-bundle").encode()); i=d/f"legacy-{n}.inventory"; i.write_text(n+"-inventory\n"); bs=d/(b.name+".sha256"); bs.write_text(f"{h(b)}  {b.name}\n"); ins=d/(i.name+".sha256"); ins.write_text(f"{h(i)}  {i.name}\n"); rows.append({"schema":"arc.recovery.bundle-status.v1","capture_id":"b"*64,"node":n,"rollout_manifest_sha256":"c"*64,"classification":c,"bundle":{"name":b.name,"size":b.stat().st_size,"sha256":h(b),"sidecar_name":bs.name,"sidecar_sha256":h(bs)},"inventory":{"name":i.name,"size":i.stat().st_size,"sha256":h(i),"sidecar_name":ins.name,"sidecar_sha256":h(ins)}})
+ root_hash=hashlib.sha256((n+"-observation-root").encode()).hexdigest(); receipt_hash=hashlib.sha256((n+"-observation-receipt").encode()).hexdigest()
+ live_rows.append({"node":n,"root_sha256":root_hash,"receipt_sha256":receipt_hash})
+ b=d/f"legacy-{n}.tar.zst"; b.write_bytes((n+"-bundle").encode()); i=d/f"legacy-{n}.inventory"; i.write_text(n+"-inventory\n"); bs=d/(b.name+".sha256"); bs.write_text(f"{h(b)}  {b.name}\n"); ins=d/(i.name+".sha256"); ins.write_text(f"{h(i)}  {i.name}\n"); rows.append({"schema":"arc.recovery.bundle-status.v1","capture_id":"b"*64,"node":n,"rollout_manifest_sha256":rollout_sha,"classification":c,"bundle":{"name":b.name,"size":b.stat().st_size,"sha256":h(b),"sidecar_name":bs.name,"sidecar_sha256":h(bs)},"inventory":{"name":i.name,"size":i.stat().st_size,"sha256":h(i),"sidecar_name":ins.name,"sidecar_sha256":h(ins)}})
+(s/"legacy-live-observations.json").write_text(json.dumps({"schema":"arc.recovery.legacy-live-observations-fleet.v1","capture_id":"b"*64,"freeze_plan_sha256":freeze_sha,"receipt_schema":"arc.recovery.legacy-live-observations.v1","labels":["diagnostic","noncanonical","nonreward"],"nodes":live_rows},sort_keys=True,separators=(",",":"))+"\n")
 (r/"statuses.jsonl").write_text("".join(json.dumps(x,sort_keys=True,separators=(",",":"))+"\n" for x in rows))
+(r/"roots").write_text(f"{freeze_sha} {rollout_sha}\n")
 PY
-    archive_sha="$(build_archive_metadata "$f/shared" "$f/statuses.jsonl" "$f/meta" "$f/complete" "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" "$(printf 'c%.0s' {1..64})" "$(printf '1%.0s' {1..40})" "$(hash_file "$f/shared/archive-fleet-to-drive.sh")" "$(hash_file "$f/shared/archive-node.sh")" "$(hash_file "$f/shared/recovery_rollout.py")" "$(hash_file "$f/shared/recovery-manifest.schema.json")" 0 3 3)" || return 1
+    read -r freeze_sha rollout_sha < "$f/roots"
+    chmod 400 "$f/shared/"*
+    local shared_input
+    for shared_input in "$f/shared/"*; do
+        register_shared_input "$shared_input" "$(hash_file "$shared_input")" \
+            "$f/catalog" "${shared_input##*/}" || return 1
+    done
+    archive_sha="$(build_archive_metadata "$f/catalog" "$f/statuses.jsonl" "$f/meta" "$freeze_sha" "$(printf 'b%.0s' {1..64})" "$rollout_sha" "$(printf '1%.0s' {1..40})" "$(hash_file "$f/shared/archive-fleet-to-drive.sh")" "$(hash_file "$f/shared/archive-node.sh")" "$(hash_file "$f/shared/recovery_rollout.py")" "$(hash_file "$f/shared/recovery-manifest.schema.json")" 0 3 3)" || return 1
+    local intent_sha
+    intent_sha="$(seal_archive_finalization_intent \
+        "$f/finalization.json" "$f/catalog" "$f/statuses.jsonl" \
+        "$f/meta/SHA256SUMS" "$f/meta/ARCHIVE-MANIFEST.json" \
+        "$f/meta/ARCHIVE-MANIFEST.json.sha256" "$freeze_sha" \
+        "$(printf 'b%.0s' {1..64})" "$rollout_sha" "$(printf '1%.0s' {1..40})" \
+        "local:$remote" FerrumVir)" || return 1
+    archive_finalization_intent_roots "$f/finalization.json" "$f/catalog" \
+        "$freeze_sha" "$(printf 'b%.0s' {1..64})" "$rollout_sha" \
+        "$(printf '1%.0s' {1..40})" "local:$remote" >/dev/null || return 1
+    python3 - "$f/finalization.json.gist-anchor.json" "$intent_sha" <<'PY' || return 1
+import json,os,pathlib,sys
+p=pathlib.Path(sys.argv[1]); h=sys.argv[2]
+v={"schema":"arc.recovery.archive-finalization-gist-anchor.v1","provider":"github.com","owner_login":"FerrumVir","visibility":"secret","gist_id":"d"*32,"gist_revision":"e"*40,"gist_filename":"arc-recovery-"+"b"*64+".finalization-intent.json","gist_file_sha256":h,"intent_sha256":h,"created_at":"2026-08-31T00:00:00Z"}
+fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o400)
+with os.fdopen(fd,"wb") as f:f.write((json.dumps(v,sort_keys=True,separators=(",",":"))+"\n").encode());f.flush();os.fsync(f.fileno())
+PY
+    build_archive_complete "$f/complete/COMPLETE.json" "$f/finalization.json" \
+        "$f/finalization.json.gist-anchor.json" || return 1
+    fetch_verify_or_recover_complete_gist_anchor() { :; }
     cp "$f/shared/"* "$remote/"; cp "$f/meta/"* "$remote/"; cp "$f/complete/COMPLETE.json" "$remote/"
+    chmod 600 "$remote/"*
     cat > "$f/bin/rclone" <<'SH'
 #!/bin/sh
 c=$1; shift
@@ -430,7 +947,10 @@ case "$c" in
 esac
 SH
     chmod 700 "$f/bin/rclone"; complete_sha="$(hash_file "$remote/COMPLETE.json")"; sums_sha="$(hash_file "$remote/SHA256SUMS")"
-    PATH="$f/bin:$PATH" verify_remote_complete "local:$remote" "" "" "" "$complete_sha" "$archive_sha" "$sums_sha" "$(printf 'c%.0s' {1..64})" >/dev/null || return 1
+    PATH="$f/bin:$PATH" verify_remote_complete "local:$remote" "" "" "" "$complete_sha" "$archive_sha" "$sums_sha" "$rollout_sha" >/dev/null || return 1
+    cp "$remote/legacy-live-observations.json" "$f/legacy-live-observations.json"; printf mutation >> "$remote/legacy-live-observations.json"
+    ( PATH="$f/bin:$PATH" verify_remote_complete "local:$remote" ) >/dev/null 2>&1 && return 1
+    cp "$f/legacy-live-observations.json" "$remote/legacy-live-observations.json"
     printf x >> "$remote/canonical-reference.json"; ( PATH="$f/bin:$PATH" verify_remote_complete "local:$remote" ) >/dev/null 2>&1 && return 1
     cp "$f/shared/canonical-reference.json" "$remote/canonical-reference.json"
     mv "$remote/legacy-nyc.tar.zst" "$f/missing"; ( PATH="$f/bin:$PATH" verify_remote_complete "local:$remote" ) >/dev/null 2>&1 && return 1
@@ -444,8 +964,43 @@ complete_is_last_and_fully_verified() {
 import pathlib,sys
 t=pathlib.Path(sys.argv[1]).read_text(); t=t[t.index("seal_phase()"):]
 m=['stream_bundle_to_drive "$node"','build_archive_metadata \\','rclone copy "$metadata_root"','rclone check "$metadata_root"','upload_immutable "$complete_root/COMPLETE.json"','verify_remote_complete "$destination"']; p=[t.index(x) for x in m[:-1]]+[t.rindex(m[-1])]; assert p==sorted(p); assert 'existing COMPLETE.json fully verified; verification-only resume' in t
+assert t.index('run_github_gist_anchor_canary') < t.index('install_helpers')
+assert 'arc.recovery.archive-complete.v2' in pathlib.Path(sys.argv[1]).read_text()
+assert '"/gists/$gist_id/$gist_revision"' in pathlib.Path(sys.argv[1]).read_text()
+assert 'fetch_verify_or_recover_complete_gist_anchor' in t
 PY
 }
+
+gist_revision_recovers_lost_local_intent_after_latest_edit() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f; f="$(realpath "$(mktemp -d)")"; trap 'rm -rf -- "$f"' EXIT
+    mkdir -m 700 "$f/protected"
+    python3 - "$f" <<'PY' || return 1
+import hashlib,json,pathlib,sys
+r=pathlib.Path(sys.argv[1]);h=lambda b:hashlib.sha256(b).hexdigest();c=lambda v:(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n").encode()
+freeze="a"*64;capture="b"*64;rollout="c"*64;manifest="d"*64;gid="e"*32;revision="f"*40
+intent={"schema":"arc.recovery.archive-finalization-intent.v2","source_commit":"1"*40,"freeze_plan_sha256":freeze,"capture_id":capture,"prearchive_rollout_sha256":rollout,"destination":"local:archive","destination_sha256":h(b"local:archive"),"archive_manifest":{"name":"ARCHIVE-MANIFEST.json","size":1,"sha256":manifest},"archive_manifest_sidecar":{"name":"ARCHIVE-MANIFEST.json.sha256","size":1,"sha256":"2"*64},"sha256sums":{"name":"SHA256SUMS","size":1,"sha256":"3"*64},"shared_inputs":[],"validator_bundles":[],"capture_classification_counts":{},"github_anchor_policy":{"provider":"github.com","owner_login":"FerrumVir","visibility":"secret","filename":f"arc-recovery-{capture}.finalization-intent.json"}}
+raw=c(intent);intent_sha=h(raw);(r/"expected-intent.json").write_bytes(raw)
+anchor={"intent_sha256":intent_sha,"gist_id":gid,"gist_revision":revision,"gist_file_sha256":intent_sha}
+complete={"schema":"arc.recovery.archive-complete.v2","freeze_plan_sha256":freeze,"capture_id":capture,"rollout_manifest_sha256":rollout,"source_commit":"1"*40,"archive_manifest_sha256":manifest,"object_count_before_complete":27,"validator_bundle_count":6,"finalization_anchor":anchor}
+(r/"COMPLETE.json").write_bytes(c(complete))
+response={"id":gid,"public":False,"owner":{"login":"FerrumVir"},"history":[{"version":revision}],"files":{intent["github_anchor_policy"]["filename"]:{"truncated":False,"content":raw.decode()}},"created_at":"2026-08-31T00:00:00Z"}
+(r/"historical.json").write_bytes(c(response))
+PY
+    export ARC_OPERATOR_GH_LOGIN=FerrumVir
+    configure_github_anchor_transport() { :; }
+    gh_api() {
+        [ "$#" -eq 1 ] || return 91
+        [ "$1" = "/gists/$(printf 'e%.0s' {1..32})/$(printf 'f%.0s' {1..40})" ] || return 92
+        cat "$f/historical.json"
+    }
+    fetch_verify_or_recover_complete_gist_anchor "$f/COMPLETE.json" \
+        "$f/protected/finalization.json" "$f/protected/finalization.json.gist-anchor.json" || return 1
+    cmp -s "$f/expected-intent.json" "$f/protected/finalization.json" || return 1
+    [ -f "$f/protected/finalization.json.sha256" ] || return 1
+    [ -f "$f/protected/finalization.json.gist-anchor.json" ] || return 1
+)
 
 new_v3_paths_and_post_cutover_source_are_verified() {
     for required in '--new-node-paths' 'os.path.commonpath((old, new))' \
@@ -457,14 +1012,511 @@ new_v3_paths_and_post_cutover_source_are_verified() {
     ! grep -Fq 'source_tree_immutable_in_place' "$NODE_HELPER" "$ORCHESTRATOR"
 }
 
+legacy_network_quarantine_is_durable_exact_and_precedes_freeze() {
+    python3 - "$NODE_HELPER" <<'PY' || return 1
+import pathlib, sys
+t = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert 'table_name = "arc_legacy_maintenance_v1"' in t
+assert 'priority = -310' in t
+phase = t[t.index("pre_fence_quiesce()") : t.index("verify_exact_writer()")]
+runtime = phase.index('stage_prefreeze_runtime_safety')
+install = phase.index('install_legacy_network_quarantine')
+quarantine_return = phase.index('ARC_RECOVERY_QUARANTINE_ONLY')
+freeze = phase.index('fast_cgroup_freeze "$@"')
+assert runtime < install < quarantine_return < freeze
+stop = t[t.index("stop_node_cleanly()") : t.index("def canonical(value):", t.index("stop_node_cleanly()"))]
+assert stop.index('verify_legacy_network_quarantine') < stop.index('commit_restart_barrier')
+assert 'network_quarantine_sha256' in t
+intent_start = t.index("verify_or_arm_stop_journal()")
+intent = t[intent_start : t.index("\narm_stop_journal()", intent_start)]
+assert '"network_quarantine_sha256": network_quarantine_sha' in intent
+for exact in (
+    'iifname != "lo" counter drop', 'oifname != "lo" counter drop',
+    'tcp dport 22 counter accept', 'tcp sport 22 counter accept',
+    'udp sport 67 udp dport 68', 'udp sport 68 udp dport 67',
+    'udp sport 547 udp dport 546', 'udp sport 546 udp dport 547',
+    'icmpv6 type {{ 2, 133, 134, 135, 136 }}',
+    'After=local-fs.target firewalld.service',
+    'Wants=network-pre.target',
+    'Before=network-pre.target network.target network-online.target ',
+    'arc-self-heal.service arc-node.service arc-node-update.service arc-node-update.timer',
+    'f"ExecStartPre={ensure_path}\\n"',
+    'DefaultDependencies=no', 'automatic_unfence": False',
+):
+    assert exact in t, exact
+verify = t[t.index("verify_legacy_network_quarantine()") : t.index("quarantine_status()")]
+for exact in ('owned_rule_ast_sha256', 'preexisting_firewall_structural_sha256',
+              'live network-quarantine normalized AST hash differs from receipt',
+              'nonowned firewall changed under network quarantine',
+              'network-quarantine nft tool hash differs',
+              'rule has unknown attributes', 'expr order/shape differs',
+              'exact stateless ruleset hash differs from receipt'):
+    assert exact in verify, exact
+status = t[t.index("quarantine_status()") : t.index("quarantine_public_cross_proof()")]
+for exact in ('listener_inventory', 'loopback_head', 'quarantine_policy', 'rule_counters'):
+    assert exact in status
+for exact in ('status snapshot contains an unknown AST object',
+              'status expr order/shape differs',
+              'status semantic AST differs from receipt'):
+    assert exact in status
+cross = t[t.index("quarantine_public_cross_proof()") : t.index("pre_fence_quiesce()")]
+for exact in ('public_info_after_block', 'public_latest_block', 'fenced_head',
+              'state_root', 'public_latest_hash_matches', 'after_status="$(quarantine_status',
+              'proof["quarantine_status"]=status'):
+    assert exact in cross
+dispatch = t[t.index('ACTION="${1:-}"'):]
+assert 'quarantine)' in dispatch and '[ "$#" -eq 22 ]' in dispatch
+assert 'quarantine-status)' in dispatch and '[ "$#" -eq 4 ]' in dispatch
+assert 'quarantine-restart-arm)' in dispatch and 'quarantine_restart_arm "$2" "$3" "$4"' in dispatch
+assert 'quarantine-restart-status)' in dispatch and 'quarantine_restart_status "$2" "$3" "$4"' in dispatch
+assert 'quarantine-monitor-receipt)' in dispatch and 'quarantine_monitor_receipt "$2" "$3" "$4"' in dispatch
+assert 'quarantine-public-cross-proof)' in dispatch and '[ "$#" -eq 8 ]' in dispatch
+for exact in (
+    'arc.recovery.legacy-network-quarantine-monitor.v1',
+    'arc.recovery.legacy-network-fence-monitor-contract.v1',
+    'arc.recovery.legacy-network-fence-incident-intent.v1',
+    'arc.recovery.quarantine-live-restart-arm.v1',
+    'arc.recovery.quarantine-detached-supervisor-frozen.v1',
+    'arc.recovery.quarantine-live-restart-committed.v1',
+    'arc.recovery.quarantine-live-restart-status.v1',
+    'ExecStartPre=/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C',
+    'continuous_poll_interval_milliseconds',
+    'unreviewed enabled firewall loader/mutator',
+):
+    assert exact in t, exact
+arm = t[t.index("quarantine_restart_arm()") : t.index("quarantine_restart_status()")]
+assert arm.index('publish(arm_path,arm)') < arm.index('os.unlink(marker.name,dir_fd=parent)')
+assert arm.index('os.write(freezer,b"1")') < arm.index('os.unlink(marker.name,dir_fd=parent)')
+assert arm.index('os.write(freezer,b"1")') < arm.index('publish(arm_path,arm)')
+assert 'Restart":"no"' in arm and 'ConditionPathExists=/etc/arc-recovery/legacy-start-allowed' in arm
+assert 'zzzx-arc-recovery-quarantine-arm.conf' in arm and 'ConditionPathExists=!' in arm
+assert 'sealed-boot runtime Restart=no drop-in survived reboot' in arm
+assert 'historical runtime Restart=no safety hash differs' in arm
+monitor = t[t.index("harden_legacy_network_quarantine()") : t.index("verify_legacy_network_quarantine()")]
+assert monitor.index('intent_raw=create(intent_path,intent)') < monitor.index('freeze(target)')
+assert monitor.index('freeze(target)') < monitor.index('os.unlink(marker.name,dir_fd=parent)')
+assert 'RestartPreventExitStatus=77' in t
+assert 'delete table inet arc_legacy_maintenance_v1' not in t
+controller=t[t.index("def thaw(entry, intent_path):"):t.index("def term_progress(prefix):")]
+assert controller.index('check_network_fence()') < controller.index('directory = os.open(')
+assert controller.index('check_network_fence()', controller.index('details.st_dev')) < controller.index('os.write(freezer, b"0")')
+internal=t[t.index("def check_network_fence():"):t.index("def fsync_dir(path):", t.index("def check_network_fence():"))]
+for exact in ('owned_ruleset_stateless_sha256','preexisting_firewall_structural_sha256',
+              'network quarantine exact ruleset changed inside stop controller'):
+    assert exact in internal
+PY
+}
+
+persisted_head_is_reexecuted_hash_bound_and_capture_exact() {
+    python3 - "$NODE_HELPER" <<'PY' || return 1
+import pathlib,sys
+t=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+body=t[t.index("persisted_head()") : t.index("stage_input()")]
+ordered=[
+    'verify_stop_journal_semantics', 'verify_legacy_restart_fence',
+    'verify_legacy_network_quarantine', 'verify_capture_source',
+    'exec 8<"$binary"', '/proc/self/fd/8 recovery export',
+    '[ "$(hash_file /proc/self/fd/14)" = "$wal_before" ]',
+]
+positions=[body.index(item) for item in ordered]
+assert positions==sorted(positions)
+assert body.index('verify_capture_source "$capture_root"', positions[-1]) > positions[-1]
+for exact in (
+    'schema":"arc.recovery.persisted-legacy-head.v1',
+    'source_main_commit', 'inspector_binary_sha256',
+    'network_quarantine_receipt_sha256', 'capture_source_sha256',
+    'source_data_index_sha256', 'state_wal_size', 'snapshot_size',
+    'export_status":"EXPORTED_UNSIGNED"',
+    '"head":{"height":height,"block_hash":block_hash,"state_root":state_root}',
+    'rerun differs from its create-only receipt', 'rerun_reexecutes_export',
+    'details.st_nlink!=1', 'stat.S_IMODE(details.st_mode)!=0o400',
+    'openat/O_NOFOLLOW FD identity differs', 'export-source/state.wal',
+    'candidate.inspect.json', 'inspect_summary_sha256', 'wal_boundary_sha256',
+    'os.dup(13)', 'os.dup(12)', 'export summary exact key set differs',
+    'snapshot pathname changed after held-FD open',
+    'offline-wal-recovery.v2', 'source_file_identity', 'staged_file_contract',
+    'complete publication partial differs from re-executed receipt',
+    'except (UnicodeError,json.JSONDecodeError): parsed_existing=None',
+    'ARC_RECOVERY_PERSISTED_HEAD_FAIL_AT")=="after-write"',
+    'ARC_RECOVERY_PERSISTED_HEAD_FAIL_AT',
+): assert exact in body, exact
+assert 'os.open("/proc/self/fd/13"' not in body
+assert 'os.open("/proc/self/fd/12"' not in body
+assert body.index('/proc/self/fd/8 recovery export') < body.index('if output.exists()')
+dispatch=t[t.index('ACTION="${1:-}"'):]
+assert 'persisted-head)' in dispatch and '[ "$#" -eq 9 ]' in dispatch
+PY
+}
+
+linux_held_fd_openat_is_executable() (
+    [ "$(uname -s)" = Linux ] || return 0
+    local root
+    root="$(mktemp -d)"; trap 'rm -rf -- "$root"' EXIT
+    mkdir "$root/data"
+    printf 'wal-bytes' > "$root/data/state.wal"
+    printf 'snapshot-bytes' > "$root/state.snapshot.lz4"
+    exec 12<"$root/state.snapshot.lz4" 13<"$root/data" 14<"$root/data/state.wal"
+    python3 - <<'PY'
+import os,stat
+directory=os.dup(13)
+try:
+    wal=os.open("state.wal",os.O_RDONLY|getattr(os,"O_NOFOLLOW",0),dir_fd=directory)
+    assert (os.fstat(wal).st_dev,os.fstat(wal).st_ino)==(os.fstat(14).st_dev,os.fstat(14).st_ino)
+finally:
+    os.close(directory)
+snapshot=os.dup(12)
+try:
+    assert stat.S_ISREG(os.fstat(snapshot).st_mode)
+    assert os.read(snapshot,100)==b"snapshot-bytes"
+finally:
+    os.close(snapshot);os.close(wal)
+try:
+    os.open("/proc/self/fd/13",os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+except OSError:
+    pass
+else:
+    raise SystemExit("Linux unexpectedly allowed the unsafe proc-fd O_NOFOLLOW reopen")
+PY
+    printf 'replacement' > "$root/replacement"
+    rm "$root/state.snapshot.lz4"
+    ln -s "$root/replacement" "$root/state.snapshot.lz4"
+    if python3 - "$root/state.snapshot.lz4" 2>/dev/null <<'PY'
+import os,pathlib,sys
+path=pathlib.Path(sys.argv[1]); parent=os.open(path.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+try: os.open(path.name,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0),dir_fd=parent)
+finally: os.close(parent)
+PY
+    then
+        return 1
+    fi
+    rm "$root/state.snapshot.lz4"
+    cp "$root/replacement" "$root/state.snapshot.lz4"
+    if python3 - "$root/state.snapshot.lz4" 2>/dev/null <<'PY'
+import os,pathlib,sys
+path=pathlib.Path(sys.argv[1]); parent=os.open(path.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+try:
+    fresh=os.open(path.name,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0),dir_fd=parent)
+    assert (os.fstat(12).st_dev,os.fstat(12).st_ino)==(os.fstat(fresh).st_dev,os.fstat(fresh).st_ino)
+finally:
+    os.close(parent)
+    if 'fresh' in locals(): os.close(fresh)
+PY
+    then
+        return 1
+    fi
+)
+
+persisted_head_partial_truncations_are_resumable() {
+    python3 - <<'PY'
+import json
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+payload=canonical({"schema":"arc.recovery.persisted-legacy-head.v1",
+                   "completed_at":"2026-08-31T12:34:56Z","head":{"height":99}})
+completed=payload.index(b"completed_at")
+for cut in (0,1,completed-1,completed+3,completed+30,len(payload)-1):
+    partial=payload[:cut]
+    try: parsed=json.loads(partial)
+    except (UnicodeError,json.JSONDecodeError): parsed=None
+    assert parsed is None or canonical(parsed)!=partial
+    # Production discards this exact root-owned fixed-name incomplete inode,
+    # fsyncs the parent, and publishes the re-executed payload.
+    partial=b""
+    assert partial==b""
+assert json.loads(payload)["completed_at"]=="2026-08-31T12:34:56Z"
+PY
+}
+
+stateful_fake_nft_systemctl_quarantine_contract() {
+    python3 - <<'PY'
+import copy
+EXACT={"family":"inet","name":"arc_legacy_maintenance_v1","priority":-310,
+       "chains":["prerouting","input","forward","output"],
+       "rules":["loopback","ssh22","dhcp4","dhcp6","icmpv6-control","deny-all-nonloopback"]}
+STEPS=("files","dropins","baseline","enable","apply","receipt")
+class FakeHost:
+    def __init__(self):
+        self.durable=set();self.table=None;self.enabled=False;self.unit_ok=True;self.receipt=False
+    def validate(self): return self.table==EXACT
+    def install(self,crash=None):
+        for step in STEPS:
+            if step=="files": self.durable.add("files")
+            elif step=="dropins": self.durable.add("dropins")
+            elif step=="baseline": self.durable.add("baseline")
+            elif step=="enable": self.enabled=True;self.durable.add("enable")
+            elif step=="apply":
+                if self.table is not None and self.table!=EXACT: raise RuntimeError("conflicting table")
+                self.table=copy.deepcopy(EXACT)
+            elif step=="receipt":
+                if not self.validate(): raise RuntimeError("cannot receipt drift")
+                self.receipt=True
+            if crash==step: raise InterruptedError(step)
+    def reboot(self):
+        self.table=None
+        if self.enabled and self.unit_ok:self.table=copy.deepcopy(EXACT)
+    def legacy_start_allowed(self):
+        return "dropins" in self.durable and self.enabled and self.unit_ok and self.validate()
+for crash in STEPS:
+    host=FakeHost()
+    try: host.install(crash)
+    except InterruptedError: pass
+    host.install()
+    assert host.receipt and host.validate() and host.legacy_start_allowed()
+host=FakeHost();host.table={"foreign":True}
+try:host.install()
+except RuntimeError:pass
+else:raise AssertionError("foreign nft table was clobbered")
+host=FakeHost();host.install();host.reboot();assert host.validate() and host.legacy_start_allowed()
+host=FakeHost();host.install();host.unit_ok=False;host.reboot();assert not host.legacy_start_allowed()
+host=FakeHost();host.install();host.table["rules"].append("source-match-escape")
+assert not host.validate() and not host.legacy_start_allowed()
+host=FakeHost();host.install();stateless=copy.deepcopy(host.table)
+for packets in (0,1,999):
+    counters={"deny":{"packets":packets,"bytes":packets*64}}
+    assert host.table==stateless and counters["deny"]["packets"]==packets
+def verdict(family,direction,loopback,protocol,sport,dport,icmp_type=None):
+    assert family in {"ipv4","ipv6"} and direction in {"input","output","forward"}
+    if loopback:return "accept"
+    if direction=="forward":return "drop"
+    if protocol=="tcp" and ((direction=="input" and dport==22) or (direction=="output" and sport==22)):return "accept"
+    if protocol=="udp" and ((direction=="input" and (sport,dport) in {(67,68),(547,546)})
+                            or (direction=="output" and (sport,dport) in {(68,67),(546,547)})):return "accept"
+    if family=="ipv6" and protocol=="icmpv6" and icmp_type in {2,133,134,135,136}:return "accept"
+    return "drop"
+for family in ("ipv4","ipv6"):
+    for direction in ("input","output","forward"):
+        assert verdict(family,direction,False,"tcp",9090,9090)=="drop"
+        assert verdict(family,direction,False,"udp",9091,9091)=="drop"
+        assert verdict(family,direction,False,"udp",443,443)=="drop"
+
+class LiveGuard:
+    def __init__(self,detached):
+        self.table=copy.deepcopy(EXACT);self.marker=True;self.writer_live=True
+        self.writer_frozen=False;self.supervisor_frozen=False;self.incident=False
+        self.detached=detached;self.restart_no=True;self.conditions=True
+        self.monitor=True;self.arm_barrier=False;self.interpreter=("root-owned",123,456,"a"*64)
+    def validator(self):
+        return self.monitor and self.table==EXACT and not self.incident and self.interpreter==("root-owned",123,456,"a"*64)
+    def arm(self,crash=None):
+        assert self.validator() and self.restart_no and self.conditions and self.writer_live
+        if self.detached:self.supervisor_frozen=True
+        durable_arm=True;self.arm_barrier=True
+        if crash=="before-unlink":raise InterruptedError
+        self.marker=False
+        assert durable_arm and (self.supervisor_frozen if self.detached else True)
+    def drift(self):
+        self.incident=True
+        self.writer_frozen=True
+        if self.detached:self.supervisor_frozen=True
+        self.marker=False;self.monitor=False
+    def manual_start(self):
+        return self.marker and not self.arm_barrier and self.conditions and self.validator()
+    def reboot(self):
+        self.writer_live=False;self.writer_frozen=False;self.supervisor_frozen=False
+        self.table=None
+        if self.monitor and not self.incident:self.table=copy.deepcopy(EXACT)
+for detached in (False,True):
+    guard=LiveGuard(detached)
+    try:guard.arm("before-unlink")
+    except InterruptedError:pass
+    assert guard.marker and not guard.manual_start() and (guard.supervisor_frozen if detached else True)
+    guard.arm();assert not guard.marker and not guard.manual_start()
+    guard.reboot();assert not guard.writer_live and not guard.manual_start()
+    guard=LiveGuard(detached);guard.table["rules"].append("runtime-reload-drift");guard.drift()
+    assert guard.incident and guard.writer_frozen and not guard.marker and not guard.manual_start()
+guard=LiveGuard(False);guard.interpreter=("swapped",123,456,"b"*64)
+assert not guard.validator() and not guard.manual_start()
+PY
+}
+
+quarantine_retirement_is_one_way_resumable_and_exact() {
+    python3 - "$NODE_HELPER" <<'PY' || return 1
+import copy,pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+body=text[text.index("quarantine_retire()") : text.index('ACTION="${1:-}"')]
+for exact in (
+    'arc.recovery.legacy-network-quarantine-retirement-intent.v1',
+    'PHASE-01-LEGACY-PUBLIC-RETIRED.json',
+    'PHASE-02-FENCE-SERVICE-RETIRED.json',
+    'PHASE-03-FENCE-DEPENDENCIES-REMOVED.json',
+    'PHASE-04-OWNED-TABLE-REMOVED.json',
+    'arc.recovery.legacy-network-quarantine-retirement.v1',
+    'rollback_policy": "maintenance-only-no-legacy-restart"',
+    'zzzz-arc-recovery-freeze.conf',
+    'zzzx-arc-recovery-quarantine-arm.conf',
+    'zzzy-arc-recovery-network-fence.conf',
+    'subprocess.run([str(pinned_nft), "delete", "table", "inet", table]',
+    'if mode == "status":',
+    'Status is deliberately read-only',
+):
+    assert exact in body, exact
+positions=[body.index(value) for value in (
+    'journal / "INTENT.json"',
+    'journal / "PHASE-01-LEGACY-PUBLIC-RETIRED.json"',
+    'journal / "PHASE-02-FENCE-SERVICE-RETIRED.json"',
+    'journal / "PHASE-03-FENCE-DEPENDENCIES-REMOVED.json"',
+    'subprocess.run([str(pinned_nft), "delete", "table", "inet", table]',
+    'journal / "PHASE-04-OWNED-TABLE-REMOVED.json"',
+)]
+positions.append(body.rindex('receipt_path = journal / "RECEIPT.json"'))
+assert positions==sorted(positions)
+assert 'flush ruleset' not in body
+assert 'iptables-restore' not in body
+status=body[body.index('if mode == "status":') : body.index('intent_fixed = {')]
+for forbidden in ('systemctl("stop"', 'systemctl("disable"', 'os.unlink(',
+                  '"delete", "table"', 'stable_publish('):
+    assert forbidden not in status, forbidden
+
+PHASES=("intent","nginx","monitor","dependencies","table","receipt")
+UNITS=("self-heal","node","update","timer")
+EXACT_TABLE={"family":"inet","name":"arc_legacy_maintenance_v1",
+             "stateless_sha":"a"*64}
+class Host:
+    def __init__(self):
+        self.table=copy.deepcopy(EXACT_TABLE);self.nonowned="b"*64
+        self.monitor_active=True;self.monitor_enabled=True;self.nginx=True
+        self.dependencies=set(UNITS);self.legacy_barriers=set(UNITS)
+        self.arm_barriers=set(UNITS);self.marker=False;self.records=[]
+        self.receipt=False;self.legacy_started=False
+    def validate_sources(self):
+        if self.table!=EXACT_TABLE or self.nonowned!="b"*64:
+            raise RuntimeError("drift")
+        assert not self.marker and self.legacy_barriers==set(UNITS)
+        assert self.arm_barriers==set(UNITS)
+    def retire(self,crash=None):
+        if "intent" not in self.records:self.validate_sources()
+        for step in PHASES:
+            if step in self.records:continue
+            if step=="intent":pass
+            elif step=="nginx":self.nginx=False
+            elif step=="monitor":self.monitor_active=False;self.monitor_enabled=False
+            elif step=="dependencies":self.dependencies.clear()
+            elif step=="table":
+                if self.table is not None:
+                    if self.table!=EXACT_TABLE or self.nonowned!="b"*64:
+                        raise RuntimeError("refuse foreign state")
+                    self.table=None
+            elif step=="receipt":
+                assert self.safe();self.receipt=True
+            if crash==step:raise InterruptedError(step)
+            self.records.append(step)
+    def safe(self):
+        return (not self.nginx and not self.monitor_active and not self.monitor_enabled
+                and not self.dependencies and self.table is None and not self.marker
+                and self.legacy_barriers==set(UNITS) and self.arm_barriers==set(UNITS))
+    def status(self):
+        snapshot=copy.deepcopy(self.__dict__)
+        if not self.receipt or not self.safe() or self.nonowned!="b"*64:
+            raise RuntimeError("status failed")
+        assert snapshot==self.__dict__
+        return snapshot
+    def manual_legacy_start(self):
+        self.legacy_started=self.marker
+        return self.legacy_started
+
+for crash in PHASES:
+    host=Host()
+    try:host.retire(crash)
+    except InterruptedError:pass
+    host.retire();assert host.receipt and host.safe() and not host.manual_legacy_start()
+    before=copy.deepcopy(host.__dict__);host.status();assert before==host.__dict__
+host=Host();host.table={"foreign":True}
+try:host.retire()
+except RuntimeError:pass
+else:raise AssertionError("foreign table was deleted")
+host=Host();host.nonowned="c"*64
+try:host.retire()
+except RuntimeError:pass
+else:raise AssertionError("nonowned firewall drift was accepted")
+host=Host();host.retire();host.marker=True
+try:host.status()
+except RuntimeError:pass
+else:raise AssertionError("legacy restart marker was accepted after retirement")
+PY
+}
+
+shared_inputs_stream_without_work_root_materialization() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local root source catalog status expected required available source_size
+    # Keep the mutable sparse-file fixture outside the watched Git worktree.
+    # Codex/editor/indexer processes are entitled to inspect that worktree and
+    # can attach metadata/xattrs to newly discovered large files; the
+    # production streaming contract correctly treats the resulting ctime
+    # change as source mutation.  This fixture tests our own writes, so use a
+    # private temporary directory instead of racing unrelated repo watchers.
+    root="$(mktemp -d "${TMPDIR:-/tmp}/arc-archive-stream-test.XXXXXX")"
+    trap 'chmod -R u+w "$root" 2>/dev/null || true; rm -rf -- "$root"' EXIT
+    chmod 700 "$root"
+    mkdir -m 700 "$root/catalog" "$root/work"
+    source="$root/sizable-sparse.bin"
+    python3 - "$source" <<'PY' || return 1
+import os,sys
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+try:
+    os.ftruncate(fd,64*1024*1024)
+    os.fsync(fd)
+finally:os.close(fd)
+PY
+    expected="$(hash_file "$source")"
+    register_shared_input "$source" "$expected" "$root/catalog" sizable-sparse.bin || return 1
+    catalog="$root/catalog/sizable-sparse.bin"
+    [ "$(stat -f %z "$catalog" 2>/dev/null || stat -c %s "$catalog")" -lt 4096 ] || return 1
+    status="$root/work/stream.hash-size"
+    stream_shared_input_descriptor "$catalog" "$status" >/dev/null || return 1
+    [ "$(cat "$status")" = "$expected 67108864" ] || return 1
+    printf X | dd of="$source" bs=1 seek=0 conv=notrunc status=none
+    local changed_status
+    set +e
+    stream_shared_input_descriptor "$catalog" "$root/work/changed.hash-size" >/dev/null 2>&1
+    changed_status=$?
+    set -e
+    [ "$changed_status" -ne 0 ] || return 1
+
+    # Capacity depends only on bounded metadata scratch, not apparent source
+    # size. This sparse input is deliberately larger than current free space,
+    # which the former total+8GiB reservation could never admit.
+    python3 - "$source" "$root" <<'PY' || return 1
+import json,os,pathlib,sys
+source=pathlib.Path(sys.argv[1]);root=pathlib.Path(sys.argv[2])
+fs=os.statvfs(root);available=fs.f_bavail*fs.f_frsize
+os.truncate(source,available+16*1024**3)
+manifest=root/"manifest.json"
+manifest.write_text(json.dumps({"artifacts":{"sparse":{"path":str(source)}}})+"\n")
+(root/"manifest.json.sha256").write_text("sidecar\n")
+print(available,source.stat().st_size)
+PY
+    read -r available source_size < <(python3 - "$root" "$source" <<'PY'
+import os,pathlib,sys
+root=pathlib.Path(sys.argv[1]);source=pathlib.Path(sys.argv[2]);fs=os.statvfs(root)
+print(fs.f_bavail*fs.f_frsize,source.stat().st_size)
+PY
+    )
+    [ "$source_size" -gt "$available" ] || return 1
+    required="$(verify_archive_work_root_capacity "$root" "$root/manifest.json")" || return 1
+    [ "$required" -lt "$available" ] && [ "$required" -lt "$source_size" ] || return 1
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib,sys
+t=pathlib.Path(sys.argv[1]).read_text();seal=t[t.index("seal_phase()"):]
+assert 'cp -- "$source"' not in t
+assert 'rclone copy "$shared_root"' not in seal
+assert 'stream_shared_input_to_drive "$shared_descriptor"' in seal
+assert 'required = total + 8 * 1024**3' not in t
+assert 'arc.recovery.shared-input-source.v1' in t
+PY
+)
+
 archive_scripts_are_lintable() { bash -n "$NODE_HELPER" "$ORCHESTRATOR" && PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$ROLLOUT" "$FREEZE_MODULE" "$FREEZE_MODULE_TEST" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "$REPO_ROOT/scripts/recovery/test_recovery_rollout.py" >/dev/null && PYTHONDONTWRITEBYTECODE=1 python3 "$FREEZE_MODULE_TEST" >/dev/null && python3 -m json.tool "$SCHEMA" >/dev/null && shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"; }
 
 run_test 'exact authorizations bind every domain' exact_authorizations_bind_every_domain
 run_test 'capture id and destination fail closed' capture_id_and_destination_fail_closed
 run_test 'sealed stake proof never claims global halt' sealed_stake_quorum_never_claims_global_halt
 run_test 'all six exact writers stop before capture' all_six_exact_writers_stop_before_content_capture
+run_test 'offline-stop roots are remote-derived and archive-bound' offline_stop_roots_are_remote_derived_and_archive_bound
+run_test 'offline-stop receipt is canonical, private, and adversarial' offline_stop_receipt_is_canonical_private_and_adversarial
+run_test 'ordinary and challenged stopped-status execute' ordinary_and_challenged_stopped_status_execute
 run_test 'in-place capture detects source tamper' content_capture_fixture_detects_source_tamper
 run_test 'partial retry ownership rejects attacks' partial_retry_ownership_rejects_symlink_and_foreign_marker
+run_test 'live observations are bounded and immutable' live_observations_are_bounded_create_only_and_resumable
 run_test 'disk peak allows growth and reserves v3' disk_peak_allows_growth_and_reserves_v3
 run_test 'WAL boundary hashes without duplicates' wal_boundary_hashes_without_duplicate_files
 run_test 'model bytes and shards are bound' model_size_hash_and_shards_are_bound
@@ -473,9 +1525,18 @@ run_test 'v5 freeze transaction is fault-closed' v5_freeze_transaction_is_fault_
 run_test 'v5 stop journal semantics are fault-closed' v5_stop_journal_semantics_are_fault_closed
 run_test 'classification requires each node once' classification_requires_each_node_once
 run_test 'capture readiness resumes exact stopped state' capture_readiness_resumes_stopped_and_indexed_nodes
+run_test 'fleet observation retry rejects any stopped writer' fleet_live_observation_retry_rejects_any_stopped_writer
 run_test 'canonical reference is independently required' reference_pair_is_independent_of_final_capture_classes
 run_test 'remote COMPLETE rejects object attacks' remote_complete_rejects_missing_tampered_extra
 run_test 'COMPLETE is last and fully verified' complete_is_last_and_fully_verified
+run_test 'immutable Gist revision recovers a lost local intent after latest edit' gist_revision_recovers_lost_local_intent_after_latest_edit
 run_test 'new v3 paths preserve frozen source' new_v3_paths_and_post_cutover_source_are_verified
+run_test 'legacy network quarantine is durable, exact, and pre-freeze' legacy_network_quarantine_is_durable_exact_and_precedes_freeze
+run_test 'persisted head is reexecuted, hash-bound, and capture-exact' persisted_head_is_reexecuted_hash_bound_and_capture_exact
+run_test 'Linux held FDs use executable dup and openat semantics' linux_held_fd_openat_is_executable
+run_test 'persisted-head truncated partials resume at every completed-at offset' persisted_head_partial_truncations_are_resumable
+run_test 'stateful fake nft/systemctl quarantine crash matrix is fail-closed' stateful_fake_nft_systemctl_quarantine_contract
+run_test 'quarantine retirement is exact, one-way, read-only on status, and crash-resumable' quarantine_retirement_is_one_way_resumable_and_exact
+run_test 'shared archive inputs stream without work-root materialization' shared_inputs_stream_without_work_root_materialization
 run_test 'archive scripts pass syntax and lint' archive_scripts_are_lintable
 finish_tests

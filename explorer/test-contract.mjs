@@ -17,6 +17,49 @@ const legacyHtml = readFileSync(join(here, "index-live.html"), "utf8");
 
 const H = 88;
 const hex = (char) => char.repeat(64);
+const forkArchive = {
+  schema: "arc.legacy-archive.source.v1",
+  readOnly: true,
+  classification: "valid_noncanonical_fork",
+  captureId: hex("1"),
+  node: "nyc",
+  rolloutManifestSha256: hex("2"),
+  archiveManifestSha256: hex("3"),
+  completeSha256: hex("4"),
+  bundleSha256: hex("5"),
+  inventorySha256: hex("6"),
+  bindingIndexSha256: hex("7"),
+  bindingSha256: hex("8"),
+  checkpointSha256: hex("9"),
+  checkpointManifestHash: hex("a"),
+  checkpointPayloadHash: hex("b"),
+  canonicalCheckpointHeight: H,
+  sourceHeight: H + 10,
+  sourceBlockHash: hex("c"),
+  sourceStateRoot: hex("d"),
+  provenancePath: "/provenance",
+};
+const forkProvenance = {
+  schema: "arc.legacy-archive.query.v1",
+  read_only: true,
+  classification: forkArchive.classification,
+  capture_id: forkArchive.captureId,
+  node: forkArchive.node,
+  rollout_manifest_sha256: forkArchive.rolloutManifestSha256,
+  archive_manifest_sha256: forkArchive.archiveManifestSha256,
+  complete_sha256: forkArchive.completeSha256,
+  bundle_sha256: forkArchive.bundleSha256,
+  inventory_sha256: forkArchive.inventorySha256,
+  binding_index_sha256: forkArchive.bindingIndexSha256,
+  binding_sha256: forkArchive.bindingSha256,
+  checkpoint_sha256: forkArchive.checkpointSha256,
+  checkpoint_manifest_hash: forkArchive.checkpointManifestHash,
+  checkpoint_payload_hash: forkArchive.checkpointPayloadHash,
+  canonical_checkpoint_height: forkArchive.canonicalCheckpointHeight,
+  source_height: forkArchive.sourceHeight,
+  source_block_hash: forkArchive.sourceBlockHash,
+  source_state_root: forkArchive.sourceStateRoot,
+};
 const resolver = network.createCanonicalResolver({
   schema: "arc.frontend.network.v1",
   state: "recovered",
@@ -40,7 +83,7 @@ const resolver = network.createCanonicalResolver({
   sources: [
     { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
     { id: "v3", name: "v3", kind: "v3", baseUrl: "https://v3.example.test" },
-    { id: "fork", name: "Fork", kind: "legacy-fork", baseUrl: "https://fork.example.test" },
+    { id: "fork", name: "Fork", kind: "legacy-fork", baseUrl: "https://fork.example.test", archive: forkArchive },
   ],
 });
 
@@ -80,6 +123,7 @@ const verifiedAudit = { state: "verified" };
 
 await test("classifies decimal block heights", () => {
   assert.deepEqual(app.classifyLookup("00089", "auto"), { kind: "block", value: "89" });
+  assert.match(app.classifyLookup("9007199254740992", "block").error, /outside the supported range/);
 });
 
 await test("rejects malformed transaction and address input", () => {
@@ -96,8 +140,60 @@ await test("extracts and sorts block collections without mutating input", () => 
   assert.deepEqual(blocks.map(network.blockHeight), [2, 9, 4]);
 });
 
+await test("inference activity consumes v3 0x25 activity rows before legacy attestations", () => {
+  const paid = { record_kind: "mined_community_inference_reward", tx_type: "CommunityInferenceReward", tx_hash: hex("6") };
+  assert.deepEqual(app.extractRows({ activities: [paid], attestations: [{ tx_hash: hex("7") }] }), [paid]);
+  const classification = network.classifyReceipt({
+    schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward",
+    source: "chain_receipt", mined: true, receipt_status: "success", success: true,
+    computed: true, paid: true, earned: true,
+    tx_type: "CommunityInferenceReward", tx_type_code: "0x25",
+    block_height: H + 2, tx_hash: hex("6"),
+  });
+  assert.equal(classification.inferenceConfirmed, true);
+  assert.equal(classification.paymentConfirmed, true);
+  assert.equal(classification.rewardEarned, true);
+});
+
+await test("explorer activity rejects fuzzy reward names and absent or invalid transaction hashes", () => {
+  const common = {
+    schema: "arc.inference.activity.v1",
+    record_kind: "mined_community_inference_reward",
+    source: "chain_receipt",
+    mined: true,
+    receipt_status: "success",
+    success: true,
+    computed: true,
+    paid: true,
+    earned: true,
+    tx_type: "CommunityInferenceReward",
+    tx_type_code: "0x25",
+    block_height: H + 2,
+    tx_hash: hex("6"),
+  };
+  for (const overrides of [
+    { tx_type: "InferenceRewardBogus" },
+    { tx_type: "CommunityRewardPreview" },
+    { tx_hash: undefined },
+    { tx_hash: "not-a-hash" },
+  ]) {
+    const classification = network.classifyReceipt({ ...common, ...overrides });
+    assert.equal(classification.inferenceConfirmed, false);
+    assert.equal(classification.paymentConfirmed, false);
+    assert.equal(classification.rewardEarned, false);
+  }
+});
+
 await test("reports the highest evidence within one source snapshot", () => {
   assert.equal(app.reportedHeight({ health: { height: 4 }, info: { block_height: 7 }, stats: { block_height: 6 } }), 7);
+  assert.equal(app.reportedHeight({ health: { height: Number.MAX_SAFE_INTEGER + 1 }, info: { block_height: 7 } }), 7);
+  assert.equal(app.reportedHeight({ health: { height: "9007199254740992" } }), null);
+});
+
+await test("raw u64 strings format exactly while unsafe JSON numbers fail closed", () => {
+  assert.equal(app.formatExactInteger("18446744073709551615").replace(/\D/g, ""), "18446744073709551615");
+  assert.equal(app.formatExactInteger(Number.MAX_SAFE_INTEGER + 1), "Unavailable");
+  assert.equal(app.integerOrNull("9007199254740992"), null);
 });
 
 await test("canonical block lookup routes H to legacy", async () => {
@@ -124,11 +220,24 @@ await test("canonical block lookup verifies the H+1 parent link on v3", async ()
 
 await test("explicit fork block lookup stays non-canonical", async () => {
   const fetchImpl = mockFetch({
+    "https://fork.example.test/provenance": { body: forkProvenance },
     "https://fork.example.test/block/80": { body: { header: { height: 80, hash: hex("f"), state_root: hex("1") } } },
   });
   const result = await app.queryBlock({ resolver, fetchImpl, height: 80, sourceId: "fork" });
   assert.equal(result.route.canonical, false);
   assert.equal(result.route.expectedCanonicalSourceId, "legacy");
+  assert.equal(result.archiveVerification.state, "verified");
+});
+
+await test("explicit fork queries fail closed on archive provenance mismatch", async () => {
+  const fetchImpl = mockFetch({
+    "https://fork.example.test/provenance": { body: { ...forkProvenance, checkpoint_sha256: hex("f") } },
+    "https://fork.example.test/block/80": { body: { header: { height: 80, hash: hex("f"), state_root: hex("1") } } },
+  });
+  await assert.rejects(
+    app.queryBlock({ resolver, fetchImpl, height: 80, sourceId: "fork" }),
+    /provenance rejected/,
+  );
 });
 
 await test("canonical labels fail closed without a complete checkpoint audit", async () => {
@@ -173,6 +282,29 @@ await test("a legacy source occurrence above H is shown as non-canonical", async
   const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "legacy", checkpointAudit: verifiedAudit });
   assert.equal(result.occurrences[0].provenance.canonical, false);
   assert.equal(result.occurrences[0].provenance.expectedCanonicalSourceId, "v3");
+});
+
+await test("a preserved fork exposes block inclusion when transaction details were pruned", async () => {
+  const hash = hex("7");
+  const fetchImpl = mockFetch({
+    "https://fork.example.test/provenance": { body: forkProvenance },
+    [`https://fork.example.test/tx/${hash}/occurrences`]: {
+      body: {
+        schema: "arc.legacy-archive.transaction-occurrences.v1",
+        tx_hash: hash,
+        unique_occurrence: true,
+        receipt_retained: false,
+        full_transaction_retained: false,
+        occurrences: [{ block_height: H + 5, block_hash: hex("e"), index: 0 }],
+      },
+    },
+  });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "fork", checkpointAudit: verifiedAudit });
+  assert.equal(result.occurrences.length, 1);
+  assert.equal(result.occurrences[0].classification.receiptBacked, false);
+  assert.equal(result.occurrences[0].classification.rewardEarned, false);
+  assert.equal(result.occurrences[0].occurrence.occurrences[0].block_height, H + 5);
+  assert.equal(result.occurrences[0].provenance.canonical, false);
 });
 
 await test("pending reward submissions never appear earned", async () => {
@@ -238,6 +370,8 @@ await test("retired and raw seed endpoints are absent", () => {
 
 await test("UI explicitly discloses canonical, boundary, fork, receipt, and reward semantics", () => {
   for (const phrase of ["H+1 recovery link", "non-canonical views", "Receipt-backed only", "not an earning", "No fork blending"]) assert.ok(html.toLowerCase().includes(phrase.toLowerCase()), `missing disclosure: ${phrase}`);
+  assert.match(source, /at least 3 exact successful mined 0x25 receipts spanning 24 hours/);
+  assert.doesNotMatch(source, /numberOrNull\(payload\?\.projected_daily_arc\)/);
 });
 
 await test("remote values are rendered without HTML injection sinks", () => {

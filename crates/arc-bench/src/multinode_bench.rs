@@ -5,7 +5,7 @@
 //! the full stack:
 //!
 //!   1. Start N nodes with shared genesis, QUIC transport, DAG consensus
-//!   2. Pre-sign M transactions (Ed25519, deterministic keypairs)
+//!   2. Pre-sign M transactions (fresh process-local Ed25519 keypairs)
 //!   3. Inject transactions into each node's mempool (partitioned by sender)
 //!   4. Wait for consensus to commit all transactions to state
 //!   5. Report real TPS = committed transactions / wall-clock time
@@ -19,7 +19,8 @@
 
 #![allow(dead_code)]
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
+mod ephemeral_keys;
+
 use arc_crypto::{Hash256, KeyPair};
 use arc_mempool::Mempool;
 use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
@@ -33,6 +34,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+fn require_loopback_benchmark_network(
+    listen_addr: SocketAddr,
+    bootstrap_peers: &[SocketAddr],
+) -> Result<(), &'static str> {
+    if !listen_addr.ip().is_loopback()
+        || bootstrap_peers.iter().any(|peer| !peer.ip().is_loopback())
+    {
+        return Err("multi-node signing benchmark networking must remain numeric-loopback only");
+    }
+    Ok(())
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -103,28 +116,12 @@ struct BenchmarkResult {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Derive a deterministic validator keypair from a seed string.
-/// Same logic as main.rs and multi_node.rs.
-fn make_validator_keypair(seed: &str) -> KeyPair {
-    let seed_bytes = blake3::derive_key("ARC-chain-validator-keypair-v1", seed.as_bytes());
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
-    KeyPair::Ed25519(signing_key)
-}
-
 /// Standard genesis accounts funded for the benchmark.
 /// All nodes MUST use the same genesis for identical genesis hash (QUIC handshake).
-fn genesis_accounts(senders_per_node: usize, num_nodes: usize) -> Vec<(Hash256, u64)> {
-    let total_senders = senders_per_node * num_nodes;
-    let mut accounts = Vec::with_capacity(total_senders + 56);
-
-    // Fund all sender accounts (using benchmark_address for deterministic keys)
-    for i in 0..total_senders {
-        accounts.push((benchmark_address(i as u8), 1_000_000_000_000));
-    }
-    // Fund receiver accounts (200..255)
-    for i in 200u8..=255u8 {
-        accounts.push((benchmark_address(i), 0));
-    }
+fn genesis_accounts(senders: &[Hash256], receivers: &[Hash256]) -> Vec<(Hash256, u64)> {
+    let mut accounts = Vec::with_capacity(senders.len() + receivers.len());
+    accounts.extend(senders.iter().map(|address| (*address, 1_000_000_000_000)));
+    accounts.extend(receivers.iter().map(|address| (*address, 0)));
 
     accounts
 }
@@ -152,22 +149,10 @@ fn format_num(n: usize) -> String {
 /// Pre-sign transactions for a given node's sender partition.
 /// Node `node_id` gets senders [node_id*senders_per_node .. (node_id+1)*senders_per_node).
 fn presign_partition(
-    node_id: usize,
-    senders_per_node: usize,
+    keypairs: Vec<(KeyPair, Hash256)>,
+    receivers: Vec<Hash256>,
     total_txs: usize,
 ) -> Vec<Transaction> {
-    let sender_start = (node_id * senders_per_node) as u8;
-    let sender_count = senders_per_node;
-
-    let keypairs: Vec<_> = (0..sender_count)
-        .map(|i| {
-            let idx = sender_start + i as u8;
-            (benchmark_keypair(idx), benchmark_address(idx))
-        })
-        .collect();
-
-    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
-
     let mut transactions = Vec::with_capacity(total_txs);
     let mut nonces = vec![0u64; keypairs.len()];
 
@@ -179,14 +164,8 @@ fn presign_partition(
 
         let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
-        // Real Ed25519 signing
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
+        tx.sign(sk)
+            .expect("ephemeral benchmark signing must succeed");
 
         nonces[kp_idx] += 1;
         transactions.push(tx);
@@ -216,14 +195,16 @@ impl BenchNode {
     /// Start a full node stack: Transport + ConsensusManager.
     /// Mirrors TestNode::start from multi_node.rs integration tests.
     async fn start(
-        seed: &str,
+        keypair: KeyPair,
         stake: u64,
         port: u16,
         bootstrap_peers: Vec<SocketAddr>,
         genesis: &[(Hash256, u64)],
         validators: &[(Hash256, u64)],
     ) -> Self {
-        let keypair = make_validator_keypair(seed);
+        let listen_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        require_loopback_benchmark_network(listen_addr, &bootstrap_peers)
+            .expect("refusing non-loopback multi-node benchmark network");
         let address = keypair.address();
 
         let state = Arc::new(StateDB::with_genesis(genesis));
@@ -235,7 +216,6 @@ impl BenchNode {
         let peer_count = Arc::new(AtomicU32::new(0));
 
         let genesis_hash = Block::genesis().hash;
-        let listen_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let transport_allowlist = Arc::new(
             validators
                 .iter()
@@ -397,7 +377,15 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
 
     // ── Phase 1: Genesis Setup ──────────────────────────────────────────
     print!("  Phase 1: Genesis Setup ........................ ");
-    let genesis = genesis_accounts(args.senders_per_node, args.nodes);
+    let sender_partitions: Vec<Vec<(KeyPair, Hash256)>> = (0..args.nodes)
+        .map(|_| ephemeral_keys::signing_keypairs(args.senders_per_node))
+        .collect();
+    let sender_addresses: Vec<Hash256> = sender_partitions
+        .iter()
+        .flat_map(|partition| partition.iter().map(|(_, address)| *address))
+        .collect();
+    let receivers = ephemeral_keys::addresses(56);
+    let genesis = genesis_accounts(&sender_addresses, &receivers);
     println!("OK ({} accounts)", genesis.len());
 
     // ── Phase 2: Start Nodes with QUIC Transport ────────────────────────
@@ -414,16 +402,20 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
 
     // Start Node 0 (seed node, no bootstrap)
     let mut nodes = Vec::with_capacity(args.nodes);
-    let validators: Vec<_> = (0..args.nodes)
-        .map(|index| {
+    let mut validator_keypairs: Vec<Option<KeyPair>> = (0..args.nodes)
+        .map(|_| Some(KeyPair::generate_ed25519()))
+        .collect();
+    let validators: Vec<_> = validator_keypairs
+        .iter()
+        .map(|keypair| {
             (
-                make_validator_keypair(&format!("bench-validator-{index}")).address(),
+                keypair.as_ref().expect("validator key exists").address(),
                 stake,
             )
         })
         .collect();
     let node_0 = BenchNode::start(
-        "bench-validator-0",
+        validator_keypairs[0].take().expect("validator key exists"),
         stake,
         ports[0],
         vec![],
@@ -439,12 +431,19 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     // Start remaining nodes, each bootstrapping to all previously started nodes
     let addr_0: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     for i in 1..args.nodes {
-        let seed = format!("bench-validator-{}", i);
         let mut bootstrap: Vec<SocketAddr> = vec![addr_0];
         for port in ports.iter().take(i).skip(1) {
             bootstrap.push(format!("127.0.0.1:{}", port).parse().unwrap());
         }
-        let node = BenchNode::start(&seed, stake, ports[i], bootstrap, &genesis, &validators).await;
+        let node = BenchNode::start(
+            validator_keypairs[i].take().expect("validator key exists"),
+            stake,
+            ports[i],
+            bootstrap,
+            &genesis,
+            &validators,
+        )
+        .await;
         nodes.push(node);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -480,11 +479,12 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     let sign_start = Instant::now();
 
     // Pre-sign in parallel threads (one per node partition)
-    let sign_handles: Vec<_> = (0..args.nodes)
-        .map(|node_id| {
-            let senders = args.senders_per_node;
+    let sign_handles: Vec<_> = sender_partitions
+        .into_iter()
+        .map(|keypairs| {
+            let partition_receivers = receivers.clone();
             let txs = txs_per_node;
-            std::thread::spawn(move || presign_partition(node_id, senders, txs))
+            std::thread::spawn(move || presign_partition(keypairs, partition_receivers, txs))
         })
         .collect();
 
@@ -759,4 +759,25 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     std::fs::write(&args.output, &json).expect("failed to write results JSON");
     println!("  Results written to: {}", args.output);
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_loopback_benchmark_network;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn multi_node_benchmark_network_is_numeric_loopback_only() {
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9945);
+        let peers = [SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9946)];
+        require_loopback_benchmark_network(listen, &peers).unwrap();
+
+        for unsafe_addr in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9945),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(140, 82, 16, 112)), 9945),
+        ] {
+            assert!(require_loopback_benchmark_network(unsafe_addr, &[]).is_err());
+            assert!(require_loopback_benchmark_network(listen, &[unsafe_addr]).is_err());
+        }
+    }
 }

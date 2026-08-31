@@ -22,13 +22,9 @@ Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the acti
 
 ## Try it from your terminal in 5 seconds
 
-```bash
-# Auto-picks the first healthy coordinator from the 6 testnet seeds
-COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
-curl -X POST "$COORDINATOR/inference/run_sharded" \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"The largest planet is","max_tokens":15}'
-```
+The original terminal snippet executed a mutable default-branch coordinator
+picker and is intentionally omitted. This archived draft is not an operator
+runbook; use a reviewed local checkout and the current documentation.
 
 Returns the answer (`Jupiter, which is more than 1,31...`) plus the full per-hop trace showing every node that contributed compute.
 
@@ -36,9 +32,8 @@ Returns the answer (`Jupiter, which is more than 1,31...`) plus the full per-hop
 
 ## Run the full demo (one command, prints everything)
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
-```
+The original mutable network-to-shell demo command is retired and
+intentionally omitted.
 
 This single command:
 1. Discovers the live shard pipeline (6 seeds × 3× replication, 32 layers, NYC · LAX · AMS · LHR · NRT · SGP)
@@ -53,10 +48,9 @@ This single command:
 
 Anyone with an attestation `tx_hash` can independently audit it:
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
-  | bash -s -- <tx_hash>
-```
+The original mutable network-to-shell verifier command is retired and
+intentionally omitted. Run a verifier only from a reviewed local checkout at
+an exact source revision.
 
 Prints `✓ VERIFIED` if the re-derivation matches the on-chain claim. The model and the network are auditable by anyone, on any machine, at any time after the fact.
 
@@ -64,13 +58,20 @@ Prints `✓ VERIFIED` if the re-derivation matches the on-chain claim. The model
 
 ## Join the network in one command
 
-Anyone can run a node and contribute compute. Persistent service, daily auto-update, ~3 minutes from curl to running:
+The historical one-command installer is retired and intentionally omitted.
+The only supported replacement is the version-pinned, checksum-verifying flow
+in [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md), after the named release exists.
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-```
-
-The installer auto-detects your platform (macOS arm64/x86, Linux x86_64), pulls the newest pre-built binary that actually ships an `arc-node` CLI asset for it, generates a unique validator seed, and installs as a launchd / systemd service that auto-starts and auto-restarts. It joins with `--stake 0 --community-mode`, which takes no consensus role. A daily timer checks for new releases. **No model download is required to join** — pass `--model /path/to.gguf` if you also want to serve inference. (ARM Linux is not covered: `arc-node-linux-aarch64` has never been published, so it must build from source.)
+The v0.8 installer auto-detects macOS arm64/x86_64 and Linux
+x86_64/aarch64, resolves one explicitly selected immutable `vX.Y.Z` release,
+and verifies its signed manifest, checksum, exact asset set, and binary version.
+It generates a persistent mode-0600 Ed25519 validator keyfile without placing
+seed or phrase material in argv, environment, or logs, then installs a launchd
+or systemd service that auto-starts and auto-restarts. It joins with
+`--stake 0 --community-mode`, which takes no consensus role. The daily updater
+accepts only immutable signed/checksummed releases. **No model download is
+required to join** — pass a reviewed local `--model /path/to.gguf` to serve
+inference. Linux arm64/aarch64 uses the normalized `arc-node-linux-arm64` v0.8 asset.
 
 After install your node is running, joined to the testnet, and visible at the live dashboard above.
 

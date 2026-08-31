@@ -3,13 +3,20 @@
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 HARD_DAILY_UPLOAD_LIMIT_BYTES=$((750 * 1024 * 1024 * 1024))
 GOOGLE_DRIVE_OBJECT_LIMIT_BYTES=5000000000000
 CANARY_BYTES=$((8 * 1024 * 1024))
+REVIEWED_RCLONE_VERSION="v1.75.0"
+DRIVE_ACCOUNT_HELPER="$SCRIPT_DIR/drive-account-identity.py"
+DRIVE_ACCOUNT_HELPER_SHA256="c2dcff0b64690a52560011cb4f465c3b4d8a684843cd6b275d62347a1db7f4b1"
 TEMP_ROOT=""
 CANARY_REMOTE=""
 CANARY_PRESENT=false
 RCLONE_CALL_INDEX=0
+RCLONE_BIN=""
+PINNED_PYTHON_PATH=""
+PINNED_PYTHON_SHA256=""
 
 die() {
     printf 'drive prefreeze: %s\n' "$*" >&2
@@ -20,7 +27,7 @@ cleanup() {
     if [ "$CANARY_PRESENT" = true ] && [ -n "$CANARY_REMOTE" ]; then
         # This is a create-unique canary owned by this invocation. Cleanup is
         # best effort on an already-failing path and never targets a directory.
-        rclone deletefile "$CANARY_REMOTE" --drive-use-trash=false \
+        "$RCLONE_BIN" deletefile "$CANARY_REMOTE" --drive-use-trash=false \
             >/dev/null 2>&1 || true
     fi
     if [ -n "$TEMP_ROOT" ] && [ -d "$TEMP_ROOT" ] && [ ! -L "$TEMP_ROOT" ]; then
@@ -53,6 +60,12 @@ expected account hash is SHA256(lowercase stripped account email UTF-8 bytes).
 The expected root hash is SHA256(exact remote-root UTF-8 bytes). These values
 are identifiers, not OAuth client secrets or tokens.
 
+The gate requires the reviewed rclone v1.75.0. It refreshes the selected
+remote with a read-only `rclone about`, then pipes `rclone config show` only to
+a hash-pinned local helper. That helper calls the fixed Google Drive v3
+`about?fields=user(emailAddress,permissionId,me)` endpoint with verified TLS.
+OAuth material and raw account fields are never written to a receipt or file.
+
 `--daily-upload-budget-bytes` is the independently reviewed *remaining* budget
 for this dedicated ARC uploader in its current Google quota window, capped here
 at 750 GiB. Google Drive does not expose the remaining daily-upload counter;
@@ -68,6 +81,64 @@ require_hash() {
 require_uint() {
     printf '%s\n' "$1" | grep -Eq '^(0|[1-9][0-9]*)$' || \
         die "$2 must be an unsigned integer"
+}
+
+bootstrap_python_hash() {
+    local output digest
+    if [ -x /usr/bin/sha256sum ]; then
+        output="$(/usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+            /usr/bin/sha256sum -- "$1")" || die "cannot hash pinned Python"
+    elif [ -x /usr/bin/shasum ]; then
+        output="$(/usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+            /usr/bin/shasum -a 256 -- "$1")" || die "cannot hash pinned Python"
+    else
+        die "absolute system SHA-256 utility is unavailable"
+    fi
+    digest="${output%% *}"
+    require_hash "$digest" "pinned Python observed hash"
+    printf '%s\n' "$digest"
+}
+
+configure_pinned_python() {
+    PINNED_PYTHON_PATH="${ARC_RECOVERY_PYTHON_PATH:-}"
+    PINNED_PYTHON_SHA256="${ARC_RECOVERY_PYTHON_SHA256:-}"
+    case "$PINNED_PYTHON_PATH" in
+        /usr/bin/python3|/usr/bin/python3.[0-9]*) ;;
+        *) die "ARC_RECOVERY_PYTHON_PATH must be /usr/bin/python3[.VERSION]" ;;
+    esac
+    require_hash "$PINNED_PYTHON_SHA256" "pinned Python expected hash"
+    [ -f "$PINNED_PYTHON_PATH" ] && [ ! -L "$PINNED_PYTHON_PATH" ] && [ -x "$PINNED_PYTHON_PATH" ] || \
+        die "pinned Python must be one executable regular non-symlink file"
+    [ "$(bootstrap_python_hash "$PINNED_PYTHON_PATH")" = "$PINNED_PYTHON_SHA256" ] || \
+        die "pinned Python differs from its reviewed hash"
+    /usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+        "$PINNED_PYTHON_PATH" -I - "$PINNED_PYTHON_PATH" "$PINNED_PYTHON_SHA256" <<'PY'
+import hashlib, os, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1]); expected = sys.argv[2]
+fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+try:
+    before = os.fstat(fd); visible = os.lstat(path)
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                              value.st_gid, value.st_nlink, value.st_size,
+                              value.st_mtime_ns, value.st_ctime_ns)
+    if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(visible.st_mode)
+            or identity(before) != identity(visible) or before.st_uid != 0
+            or stat.S_IMODE(before.st_mode) & 0o022 or before.st_nlink < 1):
+        raise SystemExit("pinned Python owner/mode/type/link identity differs")
+    digest = hashlib.sha256()
+    while chunk := os.read(fd, 1024 * 1024): digest.update(chunk)
+    if identity(before) != identity(os.fstat(fd)) or digest.hexdigest() != expected:
+        raise SystemExit("pinned Python changed or differs from its reviewed hash")
+finally: os.close(fd)
+PY
+}
+
+python3() {
+    [ -n "$PINNED_PYTHON_PATH" ] || die "pinned Python is not initialized"
+    [ "$(bootstrap_python_hash "$PINNED_PYTHON_PATH")" = "$PINNED_PYTHON_SHA256" ] || \
+        die "pinned Python changed during Drive prefreeze"
+    /usr/bin/env -i HOME="${TEMP_ROOT:-/var/empty}" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+        "$PINNED_PYTHON_PATH" -I "$@"
 }
 
 hash_file() {
@@ -122,17 +193,16 @@ PY
 reject_effective_client_overrides() {
     local remote_name="$1" remote_env variable
     remote_env="$(printf '%s' "$remote_name" | tr '[:lower:]-' '[:upper:]_')"
-    for variable in \
-        RCLONE_DRIVE_CLIENT_ID \
-        RCLONE_DRIVE_CLIENT_SECRET \
-        RCLONE_DRIVE_SERVICE_ACCOUNT_FILE \
-        "RCLONE_CONFIG_${remote_env}_CLIENT_ID" \
-        "RCLONE_CONFIG_${remote_env}_CLIENT_SECRET" \
-        "RCLONE_CONFIG_${remote_env}_TYPE" \
-        "RCLONE_CONFIG_${remote_env}_SERVICE_ACCOUNT_FILE" \
-        "RCLONE_CONFIG_${remote_env}_SERVICE_ACCOUNT_CREDENTIALS"; do
+    while IFS= read -r variable; do
+        case "$variable" in
+            RCLONE_DRIVE_*|"RCLONE_CONFIG_${remote_env}_"*)
+                die "ambient rclone Drive/selected-remote override is forbidden: $variable"
+                ;;
+        esac
+    done < <(compgen -e)
+    for variable in SSL_CERT_FILE SSL_CERT_DIR SSLKEYLOGFILE PYTHONHTTPSVERIFY; do
         if printenv "$variable" >/dev/null 2>&1; then
-            die "ambient rclone client/backend override is forbidden: $variable"
+            die "ambient TLS behavior override is forbidden: $variable"
         fi
     done
 }
@@ -143,11 +213,45 @@ run_rclone_clean() {
     RCLONE_CALL_INDEX=$((RCLONE_CALL_INDEX + 1))
     stderr_path="$TEMP_ROOT/rclone-stderr-$RCLONE_CALL_INDEX"
     : > "$stderr_path"
-    if ! rclone "$@" > "$output" 2> "$stderr_path"; then
+    if ! "$RCLONE_BIN" "$@" > "$output" 2> "$stderr_path"; then
         die "rclone $label failed"
     fi
     [ ! -s "$stderr_path" ] || \
         die "rclone $label emitted stderr; warnings are fatal before fleet freeze"
+}
+
+inspect_rclone_version() {
+    local version_path="$1"
+    python3 - "$version_path" "$REVIEWED_RCLONE_VERSION" <<'PY'
+import pathlib
+import sys
+
+try:
+    lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+except (OSError, UnicodeError):
+    raise SystemExit("rclone version output is invalid")
+expected = "rclone " + sys.argv[2]
+if not lines or lines[0] != expected:
+    raise SystemExit("rclone version is not the exact reviewed release")
+print(sys.argv[2])
+PY
+}
+
+inspect_config_show_capability() {
+    local help_path="$1"
+    python3 - "$help_path" <<'PY'
+import pathlib
+import sys
+
+try:
+    value = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+except (OSError, UnicodeError):
+    raise SystemExit("rclone config-show help is invalid")
+if "Print (decrypted) config file, or the config for a single remote." not in value:
+    raise SystemExit("rclone lacks the reviewed selected-remote config-show capability")
+if "rclone config show [<remote>] [flags]" not in value:
+    raise SystemExit("rclone config-show command shape differs from the reviewed release")
+PY
 }
 
 inspect_custom_client() {
@@ -183,38 +287,31 @@ print(hashlib.sha256(client_id.encode("utf-8")).hexdigest())
 PY
 }
 
-inspect_account() {
-    local userinfo_path="$1"
-    python3 - "$userinfo_path" <<'PY'
-import hashlib
-import json
-import pathlib
-import re
-import sys
-
-try:
-    value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise SystemExit(f"rclone account response is invalid: {error}")
-
-emails = set()
-def visit(item):
-    if isinstance(item, dict):
-        for child in item.values():
-            visit(child)
-    elif isinstance(item, list):
-        for child in item:
-            visit(child)
-    elif isinstance(item, str):
-        candidate = item.strip().casefold()
-        if re.fullmatch(r"[^@\s]+@[^@\s]+", candidate):
-            emails.add(candidate)
-visit(value)
-if len(emails) != 1:
-    raise SystemExit("rclone account response does not identify exactly one email account")
-email = next(iter(emails))
-print(hashlib.sha256(email.encode("utf-8")).hexdigest())
-PY
+inspect_drive_account() {
+    local label="$1" result rclone_stderr helper_stderr
+    [ -f "$DRIVE_ACCOUNT_HELPER" ] && [ ! -L "$DRIVE_ACCOUNT_HELPER" ] || \
+        die "Drive account identity helper is missing, non-regular, or a symlink"
+    [ "$(hash_file "$DRIVE_ACCOUNT_HELPER")" = "$DRIVE_ACCOUNT_HELPER_SHA256" ] || \
+        die "Drive account identity helper differs from the reviewed bytes"
+    RCLONE_CALL_INDEX=$((RCLONE_CALL_INDEX + 1))
+    rclone_stderr="$TEMP_ROOT/rclone-stderr-$RCLONE_CALL_INDEX"
+    helper_stderr="$TEMP_ROOT/drive-identity-stderr-$RCLONE_CALL_INDEX"
+    : > "$rclone_stderr"
+    : > "$helper_stderr"
+    if ! result="$(
+        set -o pipefail
+        "$RCLONE_BIN" config show "$REMOTE_NAME" 2> "$rclone_stderr" | \
+            python3 -I "$DRIVE_ACCOUNT_HELPER" "$REMOTE_NAME" 2> "$helper_stderr"
+    )"; then
+        die "Drive account identity $label failed"
+    fi
+    [ ! -s "$rclone_stderr" ] || \
+        die "rclone account configuration stream emitted stderr; warnings are fatal before fleet freeze"
+    [ ! -s "$helper_stderr" ] || \
+        die "Drive account identity helper emitted stderr"
+    printf '%s\n' "$result" | grep -Eq '^[0-9a-f]{64} [0-9a-f]{64}$' || \
+        die "Drive account identity helper returned an invalid result"
+    printf '%s\n' "$result"
 }
 
 inspect_free_bytes() {
@@ -299,7 +396,7 @@ emit_receipt() {
 import json
 import sys
 
-(mode, freeze_sha, capture_id, root_sha, client_sha, account_sha,
+(mode, freeze_sha, capture_id, root_sha, client_sha, account_sha, permission_sha, rclone_version,
  total_source, reservation, largest_object, budget, free_before, free_after,
  canary_verified, canary_deleted) = sys.argv[1:]
 value = {
@@ -310,6 +407,8 @@ value = {
     "remote_root_sha256": root_sha,
     "client_id_sha256": client_sha,
     "account_sha256": account_sha,
+    "permission_id_sha256": permission_sha,
+    "rclone_version": rclone_version,
     "source_bytes": int(total_source),
     "archive_reservation_bytes": int(reservation),
     "largest_object_reservation_bytes": int(largest_object),
@@ -355,11 +454,27 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+configure_pinned_python
 command -v python3 >/dev/null 2>&1 || die "required command is missing: python3"
 command -v rclone >/dev/null 2>&1 || die "required command is missing: rclone"
 command -v grep >/dev/null 2>&1 || die "required command is missing: grep"
 command -v mktemp >/dev/null 2>&1 || die "required command is missing: mktemp"
 command -v tr >/dev/null 2>&1 || die "required command is missing: tr"
+
+RCLONE_COMMAND="$(command -v rclone)"
+case "$RCLONE_COMMAND" in /*) ;; *) die "rclone must resolve to an absolute executable path" ;; esac
+RCLONE_BIN="$(python3 - "$RCLONE_COMMAND" <<'PY'
+import os
+import pathlib
+import sys
+
+candidate = pathlib.Path(os.path.realpath(sys.argv[1]))
+if not candidate.is_file() or not os.access(candidate, os.X_OK):
+    raise SystemExit("rclone is not a regular executable")
+print(candidate)
+PY
+)"
+[ -n "$RCLONE_BIN" ] || die "cannot resolve the rclone executable"
 
 case "$FREEZE_PLAN" in /*) ;; *) die "freeze plan must be an absolute path" ;; esac
 [ -f "$FREEZE_PLAN" ] && [ ! -L "$FREEZE_PLAN" ] || \
@@ -402,6 +517,14 @@ require_uint "$LARGEST_OBJECT_RESERVATION_BYTES" "largest object reservation"
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-drive-prefreeze.XXXXXX")"
 [ -d "$TEMP_ROOT" ] && [ ! -L "$TEMP_ROOT" ] || die "cannot create private temporary root"
 
+run_rclone_clean "version inspection" "$TEMP_ROOT/rclone-version" version
+ACTUAL_RCLONE_VERSION="$(inspect_rclone_version "$TEMP_ROOT/rclone-version")"
+[ "$ACTUAL_RCLONE_VERSION" = "$REVIEWED_RCLONE_VERSION" ] || \
+    die "rclone version differs from the reviewed release"
+run_rclone_clean "config-show capability inspection" "$TEMP_ROOT/config-show-help" \
+    config show --help
+inspect_config_show_capability "$TEMP_ROOT/config-show-help"
+
 run_rclone_clean "configuration inspection" "$TEMP_ROOT/config.redacted" \
     config redacted "$REMOTE_NAME"
 ACTUAL_CLIENT_SHA="$(inspect_custom_client "$TEMP_ROOT/config.redacted" "$REMOTE_NAME")"
@@ -409,17 +532,23 @@ require_hash "$ACTUAL_CLIENT_SHA" "effective OAuth client-id hash"
 [ "$ACTUAL_CLIENT_SHA" = "$EXPECTED_CLIENT_SHA" ] || \
     die "effective OAuth client differs from the reviewed ARC client"
 
-run_rclone_clean "account inspection" "$TEMP_ROOT/userinfo.json" \
-    config userinfo "$REMOTE_NAME:" --json
-ACTUAL_ACCOUNT_SHA="$(inspect_account "$TEMP_ROOT/userinfo.json")"
+# This benign read is deliberately first: rclone refreshes an expired OAuth
+# access token and persists the refreshed selected-remote token before the
+# credential bytes are streamed in memory to the fixed Drive API helper.
+run_rclone_clean "capacity inspection" "$TEMP_ROOT/about-before.json" \
+    about "$REMOTE_ROOT" --json --contimeout 10s --timeout 20s \
+    --retries 2 --low-level-retries 2
+FREE_BEFORE="$(inspect_free_bytes "$TEMP_ROOT/about-before.json")"
+require_uint "$FREE_BEFORE" "Drive free-byte capacity"
+
+ACTUAL_IDENTITY="$(inspect_drive_account "inspection")"
+ACTUAL_ACCOUNT_SHA="${ACTUAL_IDENTITY%% *}"
+ACTUAL_PERMISSION_SHA="${ACTUAL_IDENTITY#* }"
 require_hash "$ACTUAL_ACCOUNT_SHA" "effective Drive account hash"
+require_hash "$ACTUAL_PERMISSION_SHA" "effective Drive permission-id hash"
 [ "$ACTUAL_ACCOUNT_SHA" = "$EXPECTED_ACCOUNT_SHA" ] || \
     die "effective Drive account differs from the reviewed ARC account"
 
-run_rclone_clean "capacity inspection" "$TEMP_ROOT/about-before.json" \
-    about "$REMOTE_ROOT" --json
-FREE_BEFORE="$(inspect_free_bytes "$TEMP_ROOT/about-before.json")"
-require_uint "$FREE_BEFORE" "Drive free-byte capacity"
 REQUIRED_WITH_CANARY=$((ARCHIVE_RESERVATION_BYTES + CANARY_BYTES))
 [ "$FREE_BEFORE" -ge "$REQUIRED_WITH_CANARY" ] || \
     die "Drive free-byte capacity is below the archive reservation plus canary"
@@ -458,27 +587,38 @@ if [ "$MODE" = execute ]; then
     CANARY_PRESENT=false
     CANARY_DELETED=true
 
+    # Narrow the credential/configuration TOCTOU window: the exact effective
+    # tool, OAuth client, account, and Drive permission identity must still
+    # match after the mutating canary.
+    run_rclone_clean "post-canary version inspection" \
+        "$TEMP_ROOT/rclone-version-after" version
+    [ "$(inspect_rclone_version "$TEMP_ROOT/rclone-version-after")" = "$ACTUAL_RCLONE_VERSION" ] || \
+        die "rclone version changed during Drive prefreeze execution"
+    run_rclone_clean "post-canary configuration inspection" \
+        "$TEMP_ROOT/config-after.redacted" config redacted "$REMOTE_NAME"
+    [ "$(inspect_custom_client "$TEMP_ROOT/config-after.redacted" "$REMOTE_NAME")" = "$ACTUAL_CLIENT_SHA" ] || \
+        die "effective OAuth client changed during Drive prefreeze execution"
+
     run_rclone_clean "post-canary capacity inspection" "$TEMP_ROOT/about-after.json" \
-        about "$REMOTE_ROOT" --json
+        about "$REMOTE_ROOT" --json --contimeout 10s --timeout 20s \
+        --retries 2 --low-level-retries 2
     FREE_AFTER="$(inspect_free_bytes "$TEMP_ROOT/about-after.json")"
     require_uint "$FREE_AFTER" "post-canary Drive free-byte capacity"
     [ "$FREE_AFTER" -ge "$ARCHIVE_RESERVATION_BYTES" ] || \
         die "Drive free-byte capacity fell below the archive reservation after canary"
 
-    # Narrow the credential/configuration TOCTOU window: the exact effective
-    # OAuth client and account must still match after the mutating canary.
-    run_rclone_clean "post-canary configuration inspection" \
-        "$TEMP_ROOT/config-after.redacted" config redacted "$REMOTE_NAME"
-    [ "$(inspect_custom_client "$TEMP_ROOT/config-after.redacted" "$REMOTE_NAME")" = "$ACTUAL_CLIENT_SHA" ] || \
-        die "effective OAuth client changed during Drive prefreeze execution"
-    run_rclone_clean "post-canary account inspection" "$TEMP_ROOT/userinfo-after.json" \
-        config userinfo "$REMOTE_NAME:" --json
-    [ "$(inspect_account "$TEMP_ROOT/userinfo-after.json")" = "$ACTUAL_ACCOUNT_SHA" ] || \
+    POST_IDENTITY="$(inspect_drive_account "post-canary inspection")"
+    POST_ACCOUNT_SHA="${POST_IDENTITY%% *}"
+    POST_PERMISSION_SHA="${POST_IDENTITY#* }"
+    [ "$POST_ACCOUNT_SHA" = "$ACTUAL_ACCOUNT_SHA" ] || \
         die "effective Drive account changed during Drive prefreeze execution"
+    [ "$POST_PERMISSION_SHA" = "$ACTUAL_PERMISSION_SHA" ] || \
+        die "effective Drive permission identity changed during Drive prefreeze execution"
 fi
 
 emit_receipt "$MODE" "$ACTUAL_FREEZE_SHA" "$CAPTURE_ID" "$EXPECTED_ROOT_SHA" \
-    "$ACTUAL_CLIENT_SHA" "$ACTUAL_ACCOUNT_SHA" "$TOTAL_SOURCE_BYTES" \
+    "$ACTUAL_CLIENT_SHA" "$ACTUAL_ACCOUNT_SHA" "$ACTUAL_PERMISSION_SHA" \
+    "$ACTUAL_RCLONE_VERSION" "$TOTAL_SOURCE_BYTES" \
     "$ARCHIVE_RESERVATION_BYTES" "$LARGEST_OBJECT_RESERVATION_BYTES" \
     "$DAILY_BUDGET" "$FREE_BEFORE" "$FREE_AFTER" \
     "$CANARY_VERIFIED" "$CANARY_DELETED"

@@ -312,6 +312,8 @@ def plan_value() -> dict[str, object]:
         "orchestrator_sha256": digest("3"),
         "rollout_tool_sha256": digest("4"),
         "rollout_schema_sha256": digest("5"),
+        "operator_python_path": "/usr/bin/python3",
+        "operator_python_sha256": digest("0"),
         "source_commit": "6" * 40,
         "legacy_validator_set_sha256": digest("7"),
         "writer_contracts_sha256": digest("8"),

@@ -8,6 +8,10 @@
 > [`../README.md`](../README.md), and
 > [`../docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](../docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
 > for current status.
+>
+> **Do not use any command, path, secret-storage statement, or release claim
+> below as current operational guidance. The remainder is preserved verbatim
+> only as an alpha-era historical record.**
 
 Status: **closed-alpha ready** (v0.2 pass addressed #4, #6, #7, #8, #13).
 Public beta still gated on code-signing + key derivation.

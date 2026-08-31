@@ -28,6 +28,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Deliberately NOT setting `RUSTFLAGS: -D warnings` here. It would apply to
@@ -48,6 +51,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Shell syntax and offline contract tests
         run: bash tests/release/run.sh
       - name: ShellCheck release/install scripts
@@ -81,6 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
       - run: bash tests/release/current_tree_secret_scan.sh
 
   # ------------------------------------------------ workflow syntax -------
@@ -93,6 +99,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Actionlint
         env:
           ACTIONLINT_VERSION: 1.7.12
@@ -124,6 +132,8 @@ jobs:
         working-directory: dashboard
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -138,6 +148,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -152,6 +164,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # Keep this dated toolchain aligned with rust-toolchain.toml. Custom
       # toolchain inputs use the action's master revision by design.
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -164,9 +178,11 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-03-16
@@ -176,8 +192,56 @@ jobs:
           shared-key: clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # The production node is built with Candle even though arc-inference keeps
+  # that backend nondefault. Give this shipped feature its own protected status
+  # instead of hiding it inside the generic test/clippy jobs.
+  release-candle:
+    name: release Candle feature
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: release-candle
+      - name: Deny warnings across every Candle target
+        run: cargo clippy -p arc-inference -p arc-node --all-targets --features candle --locked -- -D warnings
+      - name: Exercise inference, admission, cancellation, and shutdown paths
+        run: cargo test -p arc-inference -p arc-node --lib --features candle --locked
+
+  # Deterministic benchmark signers and transaction reconstruction are
+  # intentionally excluded from default builds. This distinct protected check
+  # prevents that dormant security boundary from silently rotting.
+  benchmark-tools:
+    name: benchmark-tools feature
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: benchmark-tools
+      - name: Deny warnings across every benchmark-tools target
+        run: cargo clippy -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked -- -D warnings
+      - name: Compile nondefault examples and benches
+        run: cargo check -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked
+      - name: Exercise feature-gated libraries and binaries
+        run: cargo test -p arc-crypto -p arc-state -p arc-node -p arc-bench --lib --bins --tests --features benchmark-tools --locked
+
   # --------------------------------------------------------------- test ----
-  # The merge gate. macos-14 is Apple Silicon, so this matrix is the only
+  # The merge gate. macos-15 is Apple Silicon, so this matrix is the only
   # place in the repo where the ARM half of the "bit-identical across
   # ARM/x86" claim is exercised at all. Note that an OS matrix alone does
   # NOT prove cross-platform determinism — every determinism test in the
@@ -186,16 +250,22 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # The Windows all-targets + library leg reached the former 45-minute
+    # ceiling and GitHub cancelled an otherwise progressing required check.
+    # Keep one bounded ceiling for the matrix, but leave enough headroom for a
+    # cold Windows runner and the expanded protocol-v3 regression suite.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         # v0.8 treats every shipped server OS as a blocking workspace target.
         # Platform-specific compile or unit failures must be repaired before
         # merge; a green Linux leg cannot mask a broken Mac or Windows binary.
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-03-16
@@ -212,6 +282,10 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: cargo test (lib)
         run: cargo test --workspace --lib --locked
+      - name: ARC node binary shutdown and startup tests
+        run: cargo test -p arc-node --bin arc-node --locked -- --test-threads=1
+      - name: Desktop-managed node graceful shutdown integration
+        run: cargo test -p arc-node --test desktop_shutdown_lifecycle --locked -- --test-threads=1
 
   # -------------------------------------------------------- integration ----
   # Separate job so a slow multi-node run neither serializes behind nor
@@ -224,6 +298,8 @@ jobs:
     # ignored; every integration test that actually runs is a required gate.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-03-16
@@ -251,6 +327,8 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -267,14 +345,21 @@ jobs:
     name: desktop Tauri Rust tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      # The repository root pins nightly for Stwo. `--manifest-path` does not
+      # override that directory toolchain, so merely installing stable below
+      # still ran these tests on nightly. Keep PR and release builds identical.
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 is Apple Silicon; macos-15-intel covers the Intel package
+        # macos-15 is Apple Silicon; macos-15-intel covers the Intel package
         # that regressed for community users and is still released.
-        os: [ubuntu-latest, macos-14, macos-15-intel, windows-latest]
+        os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -312,6 +397,8 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -336,6 +423,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Enforce advisory, license, source, and dependency policy
         run: |
           set -euo pipefail
@@ -355,6 +444,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: bash -n every shell script
         run: |
           set -euo pipefail
@@ -378,6 +469,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # shellcheck is preinstalled on ubuntu-latest runners; no third-party
       # action needed for a one-line invocation.
       - name: shellcheck
@@ -401,6 +494,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           # Keep formatter/compiler behavior reproducible instead of following
@@ -440,6 +535,8 @@ jobs:
         working-directory: sdk/typescript
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -464,6 +561,8 @@ jobs:
         working-directory: sdks/typescript
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -495,6 +594,8 @@ jobs:
         working-directory: sdks/python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}

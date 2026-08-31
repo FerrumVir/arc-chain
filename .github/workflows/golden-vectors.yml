@@ -31,9 +31,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 is Apple Silicon; macos-15-intel directly covers the Intel
+        # macos-15 is Apple Silicon; macos-15-intel directly covers the Intel
         # Mac artifact that community members reported as broken.
-        os: [ubuntu-latest, macos-14, macos-15-intel, windows-latest]
+        os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

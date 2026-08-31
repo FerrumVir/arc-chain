@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create one real ARC community inference job and emit reward evidence.
+"""Create one of two real ARC community inference jobs and emit reward evidence.
 
 The recovery orchestrator hash-pins this executable and supplies the six
 reviewed validator RPC origins through ``ARC_RECOVERY_RPC_URLS``.  Success is
@@ -11,10 +11,12 @@ mined successfully and checks receipt-backed earnings on every validator.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +25,9 @@ from typing import Any, NoReturn
 
 HASH_RE = re.compile(r"^(?:0x)?[0-9a-f]{64}$")
 CANONICAL_PROFILE = "INT8 integer (per-row, cross-platform deterministic)"
+RECOVERY_PROBE_PREFIX = b"ARC-RCV-PROBE1\0\0"
+PROBE_ID_DOMAIN = b"ARC-recovery-reward-probe-id-v1\0"
+COORDINATOR_DOMAIN = b"ARC-recovery-reward-probe-coordinator-v1\0"
 
 
 class ProbeError(RuntimeError):
@@ -146,10 +151,30 @@ def eligible_coordinators(origins: list[str], timeout: float) -> list[str]:
     return eligible
 
 
-def evidence_from_inference(value: Any, origin: str) -> dict[str, str]:
+def recovery_probe_id(rollout_sha256: str, ordinal: int) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", rollout_sha256):
+        fail("ARC_RECOVERY_ROLLOUT_MANIFEST_SHA256 must be 64 lowercase hexadecimal characters")
+    digest = hashlib.sha256(
+        PROBE_ID_DOMAIN + bytes.fromhex(rollout_sha256) + bytes([ordinal])
+    ).digest()
+    return "0x" + (RECOVERY_PROBE_PREFIX + digest[:16]).hex()
+
+
+def sealed_coordinator(origins: list[str], rollout_sha256: str) -> str:
+    digest = hashlib.sha256(
+        COORDINATOR_DOMAIN + bytes.fromhex(rollout_sha256)
+    ).digest()
+    return origins[int.from_bytes(digest[:8], "big") % len(origins)]
+
+
+def evidence_from_inference(
+    value: Any, origin: str, expected_probe_id: str
+) -> dict[str, str]:
     body = require_object(value, f"{origin} inference response")
     if body.get("success") is not True:
         fail(f"{origin} inference did not succeed: {body.get('error')!r}")
+    if require_hash(body.get("recovery_probe_id"), "recovery_probe_id") != expected_probe_id:
+        fail(f"{origin} returned a different recovery probe identity")
 
     worker = require_object(body.get("worker"), f"{origin} worker evidence")
     worker_id = require_hash(worker.get("worker_id"), "worker.worker_id")
@@ -200,11 +225,66 @@ def evidence_from_inference(value: Any, origin: str) -> dict[str, str]:
     }
 
 
+def evidence_from_replay(
+    value: Any,
+    origin: str,
+    expected_probe_id: str,
+    timeout: float,
+) -> dict[str, str]:
+    body = require_object(value, f"{origin} recovery replay response")
+    if body.get("success") is not True or body.get("idempotent_replay") is not True:
+        fail(f"{origin} did not return a canonical recovery replay response")
+    if require_hash(body.get("recovery_probe_id"), "recovery_probe_id") != expected_probe_id:
+        fail(f"{origin} replay is bound to a different recovery probe identity")
+    job_id = require_hash(body.get("job_id"), "job_id")
+    deadline = time.monotonic() + timeout
+    latest: Any = body.get("settlement")
+    last_error = "settlement has not exposed a transaction"
+    while time.monotonic() < deadline:
+        try:
+            settlement = require_object(latest, f"{origin} recovery settlement")
+            if require_hash(settlement.get("job_id"), "settlement.job_id") != job_id:
+                fail(f"{origin} replay settlement changed job identity")
+            if settlement.get("status") == "mined_failed":
+                fail(f"{origin} recovery reward transaction mined unsuccessfully")
+            if settlement.get("status") in {"pending_mined_receipt", "mined_success"}:
+                return {
+                    "tx_hash": require_hash(settlement.get("tx_hash"), "settlement.tx_hash"),
+                    "job_id": job_id,
+                    "worker": require_hash(settlement.get("worker"), "settlement.worker"),
+                }
+            last_error = f"status is {settlement.get('status')!r}"
+        except ProbeError as error:
+            last_error = str(error)
+        time.sleep(1.0)
+        try:
+            latest = request_json(
+                origin,
+                f"/community/reward_job/{job_id}",
+                min(timeout, 30.0),
+            )
+        except ProbeError as error:
+            last_error = str(error)
+    fail(f"{origin} recovery replay did not expose its exact transaction before timeout: {last_error}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rpc-url", action="append", default=[], help="validator RPC origin (repeat exactly six times)")
     parser.add_argument("--input", default=None, help="short deterministic probe prompt")
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--probe-ordinal",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="distinct receipt in the required two-receipt rollout proof",
+    )
+    parser.add_argument(
+        "--recovery-probe-id",
+        default=None,
+        help="optional exact derived identity; any mismatch is rejected",
+    )
     parser.add_argument("--http-timeout-seconds", type=float, default=700.0)
     return parser.parse_args()
 
@@ -216,27 +296,42 @@ def main() -> int:
     if not 1 <= args.http_timeout_seconds <= 7200:
         fail("--http-timeout-seconds must be in 1..=7200")
     origins = rpc_origins(args.rpc_url)
-    manifest = os.environ.get("ARC_RECOVERY_ROLLOUT_MANIFEST_SHA256", "unsealed")
-    checkpoint = os.environ.get("ARC_RECOVERY_CHECKPOINT_MANIFEST_HASH", "unbound")
-    prompt = args.input or f"ARC receipt probe {manifest[:12]} {checkpoint[:12]}"
+    manifest = os.environ.get("ARC_RECOVERY_ROLLOUT_MANIFEST_SHA256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest):
+        fail("ARC_RECOVERY_ROLLOUT_MANIFEST_SHA256 is missing or invalid")
+    checkpoint = os.environ.get("ARC_RECOVERY_CHECKPOINT_MANIFEST_HASH", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", checkpoint):
+        fail("ARC_RECOVERY_CHECKPOINT_MANIFEST_HASH is missing or invalid")
+    probe_id = recovery_probe_id(manifest, args.probe_ordinal)
+    if args.recovery_probe_id is not None:
+        supplied = require_hash(args.recovery_probe_id, "--recovery-probe-id")
+        if supplied != probe_id:
+            fail("--recovery-probe-id does not match the rollout/ordinal-derived identity")
+    base_prompt = args.input or f"ARC receipt probe {manifest[:12]} {checkpoint[:12]}"
+    prompt = f"{base_prompt} receipt {args.probe_ordinal}/2"
     if not prompt or len(prompt.encode("utf-8")) > 512 or "\0" in prompt:
         fail("probe input must be 1..512 UTF-8 bytes without NUL")
 
-    errors: list[str] = []
-    for origin in eligible_coordinators(origins, min(args.http_timeout_seconds, 30.0)):
-        try:
-            response = request_json(
-                origin,
-                "/inference/run",
-                args.http_timeout_seconds,
-                {"input": prompt, "max_tokens": args.max_tokens},
-            )
-            evidence = evidence_from_inference(response, origin)
-            sys.stdout.write(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
-            return 0
-        except ProbeError as error:
-            errors.append(str(error))
-    fail("every eligible coordinator rejected or failed the real inference probe: " + "; ".join(errors))
+    origin = sealed_coordinator(origins, manifest)
+    eligible_coordinators([origin], min(args.http_timeout_seconds, 30.0))
+    response = request_json(
+        origin,
+        "/inference/run",
+        args.http_timeout_seconds,
+        {
+            "input": prompt,
+            "max_tokens": args.max_tokens,
+            "recovery_probe_id": probe_id,
+        },
+    )
+    body = require_object(response, f"{origin} inference response")
+    evidence = (
+        evidence_from_replay(response, origin, probe_id, args.http_timeout_seconds)
+        if body.get("idempotent_replay") is True
+        else evidence_from_inference(response, origin, probe_id)
+    )
+    sys.stdout.write(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
+    return 0
 
 
 if __name__ == "__main__":

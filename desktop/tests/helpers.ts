@@ -25,7 +25,7 @@ export async function seedOnboarded(page: Page) {
           p2pPort: 9091,
           autoStart: true,
           autoUpdate: true,
-          dataDir: "~/.arc",
+          dataDir: "~/.arc/data-v3",
           workerThreads: null,
         },
         inferenceMode: "coordinator",
@@ -59,7 +59,7 @@ export async function seedOnboardedLegacy(page: Page) {
           p2pPort: 9091,
           autoStart: true,
           autoUpdate: true,
-          dataDir: "~/.arc",
+          dataDir: "~/.arc/data-v3",
           workerThreads: null,
         },
         // The removed on-chain mode, to exercise the coercion on load.

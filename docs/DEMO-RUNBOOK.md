@@ -277,14 +277,15 @@ consensus.
   --p2p-port 9945 \
   --seeds-file ~/.arc/seeds.txt \
   --genesis ~/.arc/genesis.toml \
-  --validator-seed "community-demo-$(openssl rand -hex 4)" \
+  --validator-key-file ~/.arc/identity/validator-key.json \
   --stake 0 --min-stake 0 \
   --community-mode
 ```
 
-`scripts/install-community-node.sh` generates exactly these flags in the
-launchd plist and the systemd unit, so "what the installer does" and "what I am
-typing" are the same thing. `--community` is the shorthand: it forces
+The reviewed installer creates that private persistent keyfile once and emits
+exactly these flags in the launchd plist or systemd unit; do not substitute a
+phrase, seed, environment variable, or process-ephemeral identity.
+`--community` is the shorthand: it forces
 `stake = 0` and `community_mode = true` in one flag.
 
 ### What the audience sees
@@ -506,12 +507,13 @@ workers are paid. In the recovery candidate:
 - earnings count only a **successful mined `0x25` receipt** retained by the
   selected host.
 
-Approval collection is intentionally unavailable in this candidate, so the RPC
-fails closed and reports the effective reward gate disabled. It neither
-synthesizes validator approvals from shard signatures nor exposes a signing
-oracle. Therefore there is no valid income recording to make before the
-approved v3 genesis, validator key rotation, peer-authenticated approval
-aggregation, and coordinated fleet cutover all complete.
+Authenticated approval collection is implemented and tested in this source
+candidate, but it is not deployed on the public v2 fleet. Public-v2 readiness
+therefore remains false. The candidate neither synthesizes validator approvals
+from shard signatures nor exposes a signing oracle. There is no valid income
+recording to make before the approved v3 genesis, validator key rotation,
+peer-authenticated approval aggregation, and coordinated fleet cutover all
+complete.
 
 After those gates are complete, use
 [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md). The only
@@ -577,10 +579,19 @@ Be precise about the public response:
 - Numbers are **per-seed**, because chain state is per-seed.
 
 The defensible framing: *“The public endpoint is legacy accounting and does not
-prove payment. The candidate has a separate 0x25 reward transaction and mined-
-receipt index, but issuance is deliberately disabled until validator approval
-collection and the coordinated v3 cutover are ready.”* Anything stronger is
-not supported by current evidence.
+prove payment. The candidate implements authenticated validator approval
+collection, a separate 0x25 reward transaction, and a mined-receipt index, but
+none is deployed on the public v2 fleet. Issuance stays fail-closed until the
+approved coordinated v3 cutover and every readiness gate pass.”* Anything
+stronger is not supported by current evidence.
+
+Even after v3 cutover, call the candidate total the **selected host's retained
+receipt window**, never “Lifetime.” The endpoint scans an in-memory map; a
+non-archive host may prune older rows and may expose an empty index after a
+restart. The desktop must show a failed, missing, legacy, or malformed RPC as
+**Reward receipt index unavailable**. Only a valid v3 response with an explicit
+zero may say no receipts are retained, and that zero is not proof the address
+never earned a reward.
 
 ### ⛔ DO-NOT-SHOW LIST
 

@@ -50,8 +50,10 @@ chmod +x arc-desktop-linux-x86_64.AppImage
    on-chain address from it. The phrase is shown on the Identity step of
    onboarding - **save it somewhere safe**.
 3. **Starts** arc-node, pointed at the 6 testnet seeds bundled with the
-   app, using your recovery phrase as the validator seed so your node's
-   address matches the one you just saw.
+   app, using an app-owned private Ed25519 keyfile derived once from your
+   recovery phrase. The keyfile preserves the address you just saw; the app
+   never places the phrase or secret key in node arguments, environment, or
+   logs and reuses the same protected keyfile across restarts.
 4. **Attempts community-worker registration** (if you picked the Worker role).
    Registration alone does not prove that the worker is eligible, reachable,
    receiving jobs, or earning rewards; those states must be visible in the app.
@@ -77,9 +79,15 @@ and paste the log output from the `Logs` screen.
 ## Where your data lives
 
 - macOS: `~/Library/Application Support/network.arc.desktop/store.json`
-  (identity + config) and `~/.arc/` (arc-node WAL + state)
-- Linux: `~/.local/share/network.arc.desktop/` and `~/.arc/`
-- Windows: `%APPDATA%\network.arc.desktop\` and `%USERPROFILE%\.arc\`
+  (identity + config) and `~/.arc/data-v3/` (current arc-node WAL + state)
+- Linux: `~/.local/share/network.arc.desktop/` and `~/.arc/data-v3/`
+- Windows: `%APPDATA%\network.arc.desktop\` and
+  `%USERPROFILE%\.arc\data-v3\`
+
+When v0.8 first opens a v0.7 store that points at an unbound WAL in `~/.arc`,
+it leaves those old block/WAL bytes untouched, preserves identity and model
+selection, switches only the persisted data-directory pointer to a fresh
+`~/.arc/data-v3*` child, and shows both paths in a dismissible migration notice.
 
 Deleting the app-data directory removes the locally stored recovery phrase.
 Deleting the ARC data directory removes local chain state. Back up the phrase

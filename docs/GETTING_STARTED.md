@@ -1,11 +1,12 @@
 # Getting Started with ARC Node
 
-> **Recovery notice (2026-08-26):** v0.8.0 is an unreleased recovery
-> candidate; the public v0.7.11 release is desktop-only, and the public seeds
-> still run older split/stalled chain state. This guide predates that recovery
-> and is not proof that community work or rewards are live. For an SSH/VPS
-> node use [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md), and do not record an
-> earnings walkthrough until
+> **Source-freeze recovery notice (2026-08-31; tag-stable):** At this review
+> cutoff, v0.8.0 was an unreleased recovery candidate, public v0.7.11 was
+> desktop-only, and the public seeds still ran older split/stalled chain state.
+> This is historical status, not a live probe. This guide predates that
+> recovery and is not proof that community work or rewards are live. For an
+> SSH/VPS node use [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md), and do not
+> record an earnings walkthrough unless signed evidence proves
 > [`VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) is complete.
 
 You downloaded a published ARC desktop package. Now what?
@@ -41,7 +42,11 @@ earned token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
 > starts with “Apple,” use the Apple Silicon `.dmg`; if it says “Intel,” use the
 > Intel `.dmg`.
 
-### Windows 10 / 11
+### Windows x86_64 candidate package
+
+The release gate builds and packages on GitHub's `windows-latest` runner. It
+does not yet establish a Windows 10/11 compatibility floor; claim a specific
+Windows version only after a release-blocking runtime test covers it.
 
 1. Run the `.exe` you downloaded.
 2. Windows SmartScreen may say *"Windows protected your PC"*. That's normal for early releases.
@@ -57,14 +62,14 @@ asset name:
 
 ```bash
 sudo apt install ./arc-desktop-linux-x86_64.deb
-arc-node-desktop
+arc-desktop
 ```
 
 ### Linux (Fedora / RHEL)
 
 ```bash
 sudo rpm -i ./arc-desktop-linux-x86_64.rpm
-arc-node-desktop
+arc-desktop
 ```
 
 ### Linux (any distro, AppImage)
@@ -93,10 +98,14 @@ ARC Node generates a fresh **BIP-39 seed phrase** (12 words) and the current
 > a screenshot, paste it into chat, or store it in an unencrypted note. You'll
 > need it if you ever reinstall or move to a new machine.
 
-The seed phrase is stored in the native app's private local `store.json` so the
-node can sign after restart; it is excluded from frontend `localStorage` and is
-never sent to a server by the identity flow. On Unix the directory/file modes
-are `0700`/`0600`, but v0.8.0 does not yet use an OS keychain. Save a separate
+The seed phrase is stored in the native app's private local `store.json` for
+backup/restoration and to verify or recreate the persistent Ed25519 keyfile.
+The node receives only that keyfile path—never the phrase in argv,
+environment, or logs. The phrase is excluded from frontend `localStorage` and
+is never sent to a server by the identity flow. The app-data directory and
+store are owner-validated through open handles (`0700`/`0600` on Unix; a
+protected current-user/SYSTEM/Administrators DACL on Windows), and writes are
+atomic/no-follow. v0.8.0 does not yet use an OS keychain. Save a separate
 offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.
@@ -164,11 +173,11 @@ Millisecond figures in the README are single-node local measurements. A fast
 repeat can be a cache hit rather than recomputation; inspect the returned
 evidence instead of inferring it from timing.
 
-**About that `tx_hash`.** It is real, and the attestation genuinely enters the
-mempool — but four of the six seeds have not sealed a block in about six days,
-so it will most likely **not be mined**. Looking it up returns
-`block_height: null`. That is the current state of the testnet, not a bug in
-your node.
+**About that `tx_hash`.** In the legacy public-fleet snapshot observed on
+2026-08-17 and rechecked during the 2026-08-26 recovery audit, the attestation
+entered the mempool while four of six seeds had not sealed a block in about six
+days. Looking it up returned `block_height: null`. That is dated public-v2
+evidence, not a promise about the recovery candidate or a bug in your node.
 
 **Prompt quality.** The INT16 engine on this build degrades badly on some
 prompts. Prompts phrased as `Explain <topic>` reliably return newline spam.
@@ -194,8 +203,8 @@ curl http://140.82.16.112:9090/faucet/status
 
 This is testnet ARC — no real-world value.
 
-> **Read your balance from one seed only.** The six seeds are independent
-> chains today, not replicas. A faucet credit on one seed does not appear on
+> **Read your balance from one seed only.** In that public-v2 snapshot, the six
+> seeds were independent chains, not replicas. A faucet credit on one seed does not appear on
 > another, so a balance that "disappears" is almost always a different seed
 > answering, not a lost transaction.
 
@@ -268,9 +277,10 @@ to measure an address-specific rate. Hardware size is not a reward multiplier.
 
 Measure this on your own machine; the app does not promise a universal CPU or
 RAM figure. An observer needs no model. The current full-model worker target is
-about 4 GB on disk; use at least 16 GB system RAM for expanded integer weights
-plus OS and chain headroom. **Settings → Compute contribution** controls the
-worker thread ceiling, not a reward multiplier.
+about 4 GB on disk. The release has not established a minimum-RAM figure; prove
+a complete model load and inference on the target host while leaving OS and
+chain headroom. **Settings → Compute contribution** controls the worker thread
+ceiling, not a reward multiplier.
 
 **How do I update?**
 
@@ -289,12 +299,14 @@ package-managed files. Headless/server updates are separate and documented in
 
 - **macOS**: drag ARC Node from Applications to Trash. Then `~/Library/LaunchAgents/ARC Node.plist` and `~/Library/Application Support/network.arc.desktop/`.
 - **Windows**: Settings → Apps → ARC Node → Uninstall.
-- **Linux**: `sudo apt remove arc-node-desktop` (or rpm equivalent), then `~/.config/network.arc.desktop/`.
+- **Linux**: `sudo apt remove arc-desktop` (or rpm equivalent), then `~/.config/network.arc.desktop/`.
 
 Keep the recovery phrase you saved during setup. The native app retains it in
-its private local store so the node can restart, but that local copy is not a
-substitute for an offline backup and is removed if you delete the app-data
-directory. Do not reset or uninstall until you have verified your backup.
+its private local store for backup/restoration and keyfile verification; the
+node restarts from its persistent private Ed25519 keyfile and never receives
+the phrase. The local phrase copy is not a substitute for an offline backup
+and is removed if you delete the app-data directory. Do not reset or uninstall
+until you have verified your backup.
 
 **Where do I report bugs?**
 

@@ -12,7 +12,17 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# PEP 517 installs these in an isolated environment before executing the
+# backend, so every executable build-time dependency is pinned by exact
+# reviewed version rather than resolved from a mutable range.
+requires = [
+    "hatchling==1.27.0",
+    "packaging==24.2",
+    "pathspec==0.12.1",
+    "pluggy==1.5.0",
+    "tomli==2.2.1; python_version < '3.11'",
+    "trove-classifiers==2024.10.21.16",
+]
 build-backend = "hatchling.build"
 
 [tool.ruff]

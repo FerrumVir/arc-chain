@@ -5,7 +5,7 @@ import { EmptyState } from "../components/EmptyState";
 import { NumberTicker } from "../components/NumberTicker";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { api } from "../lib/tauri";
-import { formatHash, formatInt, formatRelativeTime } from "../lib/format";
+import { formatArc, formatHash, formatInt, formatRelativeTime } from "../lib/format";
 import { useAppStore } from "../lib/store";
 
 export function Earnings() {
@@ -21,7 +21,18 @@ export function Earnings() {
     refetchInterval: 5000,
   });
 
-  const mineCount = (attestations ?? []).filter((a) => a.mine).length;
+  const activity = (attestations ?? []).filter((row) =>
+    row.txType == null
+    || row.txType === "Inference"
+    || row.txType === "InferenceAttestation"
+    || row.txType === "CommunityInferenceReward");
+  const mineCount = activity.filter((a) => a.mine).length;
+  const rewardByTx = new Map(
+    (earnings?.confirmedReceipts ?? []).map((receipt) => [
+      receipt.txHash.toLowerCase(),
+      receipt.rewardArc,
+    ]),
+  );
   // The legacy attestation feed is 0x16 computation claims. It must never
   // make the reward screen look funded. Only the selected host's mined reward
   // receipt index can establish that a receipt exists; a zero-valued receipt
@@ -41,19 +52,35 @@ export function Earnings() {
         </div>
       </div>
 
-      {/* Primary home for the projection. Placed above lifetime totals
+      {/* Primary home for the projection. Placed above retained-window totals
           because "what will this earn me" is the question people arrive with,
           and it is the one figure that must never be guessed. */}
       <div style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-projection">
         <ProjectedEarnings />
       </div>
 
-      {/* When nothing has been earned, three cards reading "0.00 ARC" next
-          to a "Last 7 days" chart of empty bars told the user nothing and
-          implied something had gone wrong. Explain the mechanism instead. */}
-      {!hasConfirmedRewards ? (
+      {/* An unavailable/malformed receipt index is not a confirmed zero. Keep
+          it separate from the valid candidate response whose retained row
+          count is exactly zero. */}
+      {earnings == null ? (
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading">
+          <CardHeader title="Checking retained reward receipts…" />
+        </Card>
+      ) : !earnings.fromChain ? (
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-unavailable">
+          <CardHeader title="Reward receipt index unavailable" />
+          <p style={{ margin: 0, color: "var(--text-secondary)", lineHeight: 1.7 }}>
+            {earnings.unavailableReason
+              ?? "The selected chain host did not provide a usable mined-reward receipt index."}
+          </p>
+          <p style={{ marginBottom: 0, color: "var(--text-muted)", lineHeight: 1.7 }}>
+            No zero balance or zero earnings claim is inferred from this failure.
+            Try another healthy v3 host or retry after connectivity is restored.
+          </p>
+        </Card>
+      ) : !hasConfirmedRewards ? (
         <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-empty">
-          <CardHeader title="No mined reward receipts yet" />
+          <CardHeader title="No reward receipts retained by this host" />
           <div
             style={{
               color: "var(--text-secondary)",
@@ -62,6 +89,12 @@ export function Earnings() {
             }}
           >
             <p style={{ marginTop: 0 }}>
+              This is a confirmed zero in the selected host&apos;s current
+              retained receipt window—not proof that this address has never
+              earned a reward. Older rows can be pruned, and a non-archive
+              host&apos;s in-memory index can be empty after restart.
+            </p>
+            <p>
               A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
               computation claim and pays nothing. Any policy-reported ARC reward
               applies only when a separate <code>CommunityInferenceReward</code>{" "}
@@ -130,13 +163,28 @@ export function Earnings() {
             </div>
           </Card>
           <Card>
-            <div className="stat-label">Lifetime</div>
+            <div className="stat-label">Retained by selected host</div>
             <div
               className="big-number gradient"
               style={{ marginTop: "var(--space-2)" }}
             >
               <NumberTicker value={earnings?.totalArc ?? 0} digits={2} />
               <span className="unit">ARC</span>
+            </div>
+            <div
+              data-testid="earnings-retained-window-note"
+              title={earnings.receiptSource ?? undefined}
+              style={{
+                marginTop: "var(--space-2)",
+                color: "var(--text-muted)",
+                fontSize: "var(--text-xs)",
+                lineHeight: 1.5,
+              }}
+            >
+              Current in-memory receipt window, not lifetime earnings.
+              {earnings.archiveMode === false
+                ? " This selected host is non-archive; older rows may be pruned or absent after restart."
+                : " Archive mode does not make this host-local view a wallet lifetime ledger."}
             </div>
           </Card>
           <Card>
@@ -163,7 +211,7 @@ export function Earnings() {
 
       <Card>
         <CardHeader
-          title="Inference claims (not payments)"
+          title="Inference activity"
           action={
             <span
               style={{
@@ -171,22 +219,20 @@ export function Earnings() {
                 color: "var(--text-muted)",
               }}
             >
-              {/* Only address attribution is claimed. These 0x16 records are
-                  never converted into income. */}
               {formatInt(mineCount)} yours ·{" "}
-              {formatInt(attestations?.length ?? 0)} shown
+              {formatInt(activity.length)} shown
             </span>
           }
         />
         <div className="feed" data-testid="all-attestations">
-          {!attestations || attestations.length === 0 ? (
+          {activity.length === 0 ? (
             <EmptyState
               icon={FileSignature}
               title="No inference claims on this host"
               description="Running a prompt can test the selected inference path, but it does not guarantee worker assignment or payment."
             />
           ) : (
-            attestations.map((a) => (
+            activity.map((a) => (
               <div key={a.txHash} className="feed-item">
                 <div className="feed-item-icon">
                   <FileSignature />
@@ -195,7 +241,7 @@ export function Earnings() {
                   <div className="feed-item-title">
                     {a.inputPreview || (
                       <span style={{ color: "var(--text-muted)" }}>
-                        Inference attestation
+                        Inference activity
                       </span>
                     )}
                   </div>
@@ -222,13 +268,16 @@ export function Earnings() {
                     flexShrink: 0,
                     whiteSpace: "nowrap",
                   }}
-                  title={
-                    a.mine
-                      ? "Submitted by your address. A raw 0x16 claim is not payment."
-                      : "Submitted by another address. A raw 0x16 claim is not payment."
-                  }
+                  data-testid={`activity-status-${a.txHash.slice(0, 10)}`}
+                  title={a.paid
+                    ? "Successful mined CommunityInferenceReward (0x25) receipt."
+                    : "Successful computation claim; no payment receipt is represented by this row."}
                 >
-                  {a.mine ? "your claim" : "network claim"}
+                  {a.paid
+                    ? `${rewardByTx.has(a.txHash.toLowerCase())
+                      ? `+${formatArc(rewardByTx.get(a.txHash.toLowerCase())!)} ARC · `
+                      : ""}COMPUTED + PAID`
+                    : `COMPUTED · NOT PAYMENT · ${a.mine ? "yours" : "network"}`}
                 </div>
                 {/* Was openExternal to a hardcoded LAX :3200 URL — the wrong
                     host for this session and not a block explorer. Resolves

@@ -9,18 +9,25 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.TransactionBuilder = void 0;
 const blake3_1 = require("@noble/hashes/blake3");
 const utils_1 = require("@noble/hashes/utils");
+const u64_1 = require("./u64");
 /** Domain separation context matching the Rust implementation. */
 const TX_DOMAIN = "ARC-chain-tx-v1";
+const TX_DOMAIN_V3 = "ARC-chain-tx-v3";
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-/** Encode a u64 as 8 little-endian bytes. */
-function encodeU64(value) {
+/** Encode a u64 as 8 little-endian bytes without passing through float math. */
+function encodeU64(value, fieldName) {
+    const exact = (0, u64_1.u64ToBigInt)(value, fieldName);
     const buf = new ArrayBuffer(8);
     const view = new DataView(buf);
-    // JS numbers are safe up to 2^53; for blockchain amounts this is fine.
-    view.setUint32(0, value & 0xffffffff, true);
-    view.setUint32(4, Math.floor(value / 0x100000000) & 0xffffffff, true);
+    view.setBigUint64(0, exact, true);
+    return new Uint8Array(buf);
+}
+/** Encode a bincode enum discriminant as a 32-bit little-endian integer. */
+function encodeU32(value) {
+    const buf = new ArrayBuffer(4);
+    new DataView(buf).setUint32(0, value, true);
     return new Uint8Array(buf);
 }
 /** Concatenate multiple Uint8Arrays. */
@@ -36,14 +43,39 @@ function concat(...arrays) {
     }
     return result;
 }
+function normalizeTransactionDomain(value) {
+    if (value === null)
+        return null;
+    const normalized = value.replace(/^0x/i, "");
+    if (!/^[0-9a-fA-F]{64}$/.test(normalized) || /^0{64}$/.test(normalized)) {
+        throw new Error("transactionDomain must be a non-zero 32-byte hex value");
+    }
+    return `0x${normalized.toLowerCase()}`;
+}
+function txTypeByteForSigning(txType) {
+    switch (txType) {
+        case "Transfer":
+            return 0x01;
+        case "Settle":
+            return 0x02;
+        case "Stake":
+            return 0x05;
+        case "WasmCall":
+            return 0x06;
+        case "DeployContract":
+            return 0x08;
+        default:
+            throw new Error(`canonical signing codec is unavailable for ${txType}`);
+    }
+}
 /** Encode a transaction body to bytes for hashing. */
 function encodeBody(body) {
     const parts = [];
     switch (body.type) {
         case "Transfer": {
-            parts.push(new Uint8Array([0x00])); // variant tag
+            parts.push(encodeU32(0)); // bincode TxBody::Transfer variant index
             parts.push((0, utils_1.hexToBytes)(body.to));
-            parts.push(encodeU64(body.amount));
+            parts.push(encodeU64(body.amount, "amount"));
             // amount_commitment: Option<[u8;32]>
             if (body.amount_commitment) {
                 parts.push(new Uint8Array([0x01]));
@@ -55,42 +87,42 @@ function encodeBody(body) {
             break;
         }
         case "DeployContract": {
-            parts.push(new Uint8Array([0x07]));
+            parts.push(encodeU32(7));
             const code = (0, utils_1.hexToBytes)(body.bytecode);
-            parts.push(encodeU64(code.length));
+            parts.push(encodeU64(code.length, "bytecode length"));
             parts.push(code);
             const ctor = (0, utils_1.hexToBytes)(body.constructor_args);
-            parts.push(encodeU64(ctor.length));
+            parts.push(encodeU64(ctor.length, "constructor_args length"));
             parts.push(ctor);
-            parts.push(encodeU64(body.state_rent_deposit));
+            parts.push(encodeU64(body.state_rent_deposit, "state_rent_deposit"));
             break;
         }
         case "WasmCall": {
-            parts.push(new Uint8Array([0x05]));
+            parts.push(encodeU32(5));
             parts.push((0, utils_1.hexToBytes)(body.contract));
             const func = new TextEncoder().encode(body.function);
-            parts.push(encodeU64(func.length));
+            parts.push(encodeU64(func.length, "function length"));
             parts.push(func);
             const calldata = (0, utils_1.hexToBytes)(body.calldata);
-            parts.push(encodeU64(calldata.length));
+            parts.push(encodeU64(calldata.length, "calldata length"));
             parts.push(calldata);
-            parts.push(encodeU64(body.value));
-            parts.push(encodeU64(body.gas_limit));
+            parts.push(encodeU64(body.value, "value"));
+            parts.push(encodeU64(body.gas_limit, "body.gas_limit"));
             break;
         }
         case "Stake": {
-            parts.push(new Uint8Array([0x04]));
-            parts.push(encodeU64(body.amount));
+            parts.push(encodeU32(4));
+            parts.push(encodeU64(body.amount, "amount"));
             parts.push(new Uint8Array([body.is_stake ? 0x01 : 0x00]));
             parts.push((0, utils_1.hexToBytes)(body.validator));
             break;
         }
         case "Settle": {
-            parts.push(new Uint8Array([0x01]));
+            parts.push(encodeU32(1));
             parts.push((0, utils_1.hexToBytes)(body.agent_id));
             parts.push((0, utils_1.hexToBytes)(body.service_hash));
-            parts.push(encodeU64(body.amount));
-            parts.push(encodeU64(body.usage_units));
+            parts.push(encodeU64(body.amount, "amount"));
+            parts.push(encodeU64(body.usage_units, "usage_units"));
             if (body.amount_commitment) {
                 parts.push(new Uint8Array([0x01]));
                 parts.push((0, utils_1.hexToBytes)(body.amount_commitment));
@@ -114,10 +146,17 @@ function encodeBody(body) {
  * Matches the Rust `Transaction::compute_hash()`:
  * `tx_type || from || nonce || body || fee || gas_limit`
  */
-function computeHash(txTypeByte, fromAddr, nonce, body, fee, gasLimit) {
-    const data = concat(new Uint8Array([txTypeByte]), (0, utils_1.hexToBytes)(fromAddr), encodeU64(nonce), encodeBody(body), encodeU64(fee), encodeU64(gasLimit));
+function computeHash(txTypeByte, fromAddr, nonce, body, fee, gasLimit, transactionDomain = null) {
+    let context = TX_DOMAIN;
+    const prefix = [];
+    if (transactionDomain !== null) {
+        const normalized = normalizeTransactionDomain(transactionDomain).slice(2);
+        context = TX_DOMAIN_V3;
+        prefix.push((0, utils_1.hexToBytes)(normalized));
+    }
+    const data = concat(...prefix, new Uint8Array([txTypeByte]), (0, utils_1.hexToBytes)(fromAddr), encodeU64(nonce, "nonce"), encodeBody(body), encodeU64(fee, "fee"), encodeU64(gasLimit, "gas_limit"));
     // BLAKE3 with derive_key context
-    const digest = (0, blake3_1.blake3)(data, { context: TX_DOMAIN });
+    const digest = (0, blake3_1.blake3)(data, { context });
     return (0, utils_1.bytesToHex)(digest);
 }
 /** Validate that an address is a 64-character hex string. */
@@ -153,18 +192,19 @@ class TransactionBuilder {
      * @param fee - Transaction fee (default 1)
      * @param nonce - Sender nonce for replay protection
      */
-    static transfer(fromAddr, toAddr, amount, fee = 1, nonce = 0) {
+    static transfer(fromAddr, toAddr, amount, fee = 1, nonce = 0, transactionDomain = null) {
         validateAddress(fromAddr, "fromAddr");
         validateAddress(toAddr, "toAddr");
-        if (amount <= 0)
+        if ((0, u64_1.u64ToBigInt)(amount, "amount") === 0n) {
             throw new Error("Amount must be positive");
+        }
         const body = {
             type: "Transfer",
             to: toAddr,
             amount,
             amount_commitment: null,
         };
-        const hash = computeHash(0x01, fromAddr, nonce, body, fee, 0);
+        const hash = computeHash(0x01, fromAddr, nonce, body, fee, 0, transactionDomain);
         return {
             tx_type: "Transfer",
             from: fromAddr,
@@ -176,6 +216,7 @@ class TransactionBuilder {
             body,
             hash,
             signature: null,
+            transaction_domain: normalizeTransactionDomain(transactionDomain),
         };
     }
     // -- Deploy Contract --
@@ -210,6 +251,7 @@ class TransactionBuilder {
             body,
             hash,
             signature: null,
+            transaction_domain: null,
         };
     }
     // -- Call Contract --
@@ -246,6 +288,7 @@ class TransactionBuilder {
             body,
             hash,
             signature: null,
+            transaction_domain: null,
         };
     }
     // -- Stake --
@@ -261,8 +304,9 @@ class TransactionBuilder {
      */
     static stake(fromAddr, amount, isStake = true, validator, fee = 1, nonce = 0) {
         validateAddress(fromAddr, "fromAddr");
-        if (amount <= 0)
+        if ((0, u64_1.u64ToBigInt)(amount, "amount") === 0n) {
             throw new Error("Stake amount must be positive");
+        }
         const validatorAddr = validator ?? fromAddr;
         validateAddress(validatorAddr, "validator");
         const body = {
@@ -281,6 +325,7 @@ class TransactionBuilder {
             body,
             hash,
             signature: null,
+            transaction_domain: null,
         };
     }
     // -- Settle --
@@ -315,25 +360,21 @@ class TransactionBuilder {
             body,
             hash,
             signature: null,
+            transaction_domain: null,
         };
     }
-    // -- Signing --
-    /**
-     * Sign a transaction with the given key pair.
-     *
-     * @param tx - Unsigned transaction from any build method
-     * @param keypair - Ed25519 key pair whose address matches tx.from
-     * @returns A new signed transaction (original is not modified)
-     */
     static async sign(tx, keypair) {
         const kpAddr = keypair.address();
         if (tx.from && tx.from !== kpAddr) {
             throw new Error(`KeyPair address ${kpAddr.slice(0, 16)}... does not match tx sender ${tx.from.slice(0, 16)}...`);
         }
-        const hashBytes = (0, utils_1.hexToBytes)(tx.hash);
+        const txTypeByte = txTypeByteForSigning(tx.tx_type);
+        const hash = computeHash(txTypeByte, tx.from, tx.nonce, tx.body, tx.fee, tx.gas_limit, tx.transaction_domain);
+        const hashBytes = (0, utils_1.hexToBytes)(hash);
         const signature = await keypair.sign(hashBytes);
         return {
             ...tx,
+            hash,
             signature: {
                 Ed25519: {
                     public_key: keypair.publicKeyHex(),

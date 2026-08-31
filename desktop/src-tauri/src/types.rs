@@ -85,10 +85,26 @@ impl Default for NodeConfig {
             p2p_port: 9091,
             auto_start: true,
             auto_update: true,
-            data_dir: "~/.arc".into(),
+            // Keep protocol-v3 state separate from the managed binary, models,
+            // and any v0.7 WAL that older desktop builds wrote in ~/.arc.
+            data_dir: "~/.arc/data-v3".into(),
             worker_threads: None,
         }
     }
+}
+
+/// Persistent, dismissible evidence that the desktop fenced chain data that
+/// cannot be safely replayed after the updater/relaunch boundary (an unbound
+/// v0.7 WAL or a malformed v3 binding). The old path is never deleted or
+/// rewritten; only NodeConfig::data_dir is switched to a fresh v3 child before
+/// arc-node can auto-start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DataMigrationNotice {
+    pub legacy_data_dir: String,
+    pub active_data_dir: String,
+    pub migrated_at: i64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +127,7 @@ pub struct NodeStatus {
     pub rpc_port: u16,
     pub last_error: Option<String>,
     /// HTTPS RPC origin of a reachable public seed coordinator (e.g.
-    /// `https://140-82-16-112.nip.io`). Set whenever any `COORDINATOR_HOSTS`
+    /// `https://140.82.16.112`). Set whenever any `COORDINATOR_HOSTS`
     /// entry returned 200 on `/health` during the last poll. Lets the UI
     /// show "Lite mode (via NYC)" instead of a hard "offline" when local
     /// P2P fails — common on residential ISPs that drop outbound UDP on
@@ -166,6 +182,9 @@ pub struct ConfirmedRewardReceipt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Earnings {
+    /// Gross rewards visible in the selected host's current retained receipt
+    /// window. This is deliberately not a lifetime ledger: a non-archive host
+    /// can prune old rows and restart with an empty in-memory index.
     pub total_arc: f64,
     /// Earned since 00:00 UTC. `None` when the chain does not report it —
     /// which is not the same as zero, and must not be rendered as "0.00".
@@ -189,6 +208,15 @@ pub struct Earnings {
     pub projected_daily_unavailable_reason: Option<String>,
     pub recovery_epoch: Option<u64>,
     pub validator_set_id: Option<u64>,
+    /// Exact reason the selected host's receipt index could not be used.
+    /// `None` for both a positive result and a confirmed zero; populated only
+    /// when `from_chain` is false so an outage or malformed response never
+    /// becomes "you earned zero."
+    pub unavailable_reason: Option<String>,
+    /// Backend-declared source of the retained receipt window.
+    pub receipt_source: Option<String>,
+    /// Whether the selected host reports archival state.
+    pub archive_mode: Option<bool>,
     /// True when these numbers came from the chain's `/worker/earnings`
     /// endpoint. False means they were synthesized locally and should be
     /// labelled as an estimate.
@@ -219,6 +247,14 @@ pub struct Attestation {
     /// 500 padding rows and zero real ones. The Network screen filters on this
     /// so a chain view is not half transfers presented as inference evidence.
     pub tx_type: Option<String>,
+    /// Protocol-v3 discriminator from the typed inference activity contract.
+    pub record_kind: Option<String>,
+    /// Successful computation evidence (0x16 or 0x25).
+    pub computed: bool,
+    /// Successful mined 0x25 payment evidence only.
+    pub paid: bool,
+    /// Receipt-backed earning evidence only; never inferred from raw 0x16.
+    pub earned: bool,
     /// Submitting address, when present.
     pub from: Option<String>,
     /// `from` matches the user's address.
@@ -337,6 +373,31 @@ pub struct InferenceHop {
     pub is_terminal: bool,
 }
 
+/// Reward-settlement state returned alongside a community-routed inference.
+/// A transaction hash here is a CommunityInferenceReward (0x25), not the
+/// unpaid InferenceAttestation (0x16) carried by `InferenceResult::tx_hash`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceSettlement {
+    pub status: String,
+    #[serde(default)]
+    pub tx_type: String,
+    #[serde(default)]
+    pub tx_hash: String,
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub submitted: bool,
+    #[serde(default)]
+    pub included: bool,
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub reward_arc: Option<f64>,
+    #[serde(default)]
+    pub receipt_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceResult {
@@ -348,8 +409,25 @@ pub struct InferenceResult {
     pub inference_ms: u32,
     pub tx_hash: String,
     pub deterministic: bool,
+    /// True only when every shard hop was selected under one exact execution
+    /// profile identity.
+    #[serde(default)]
+    pub profile_bound: bool,
+    /// True only when the serving coordinator reports a complete authenticated
+    /// same-profile quorum grid for the generated positions.
+    #[serde(default)]
+    pub quorum_verified: bool,
+    #[serde(default)]
+    pub execution_profile: String,
     pub engine: String,
     pub explorer_url: String,
+    /// Exact server routing declaration (`community:<worker>`, `local`, ...).
+    #[serde(default)]
+    pub routed_via: String,
+    /// Present only when the server reported community reward settlement.
+    /// Pending submission is deliberately distinct from a confirmed receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<InferenceSettlement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus: Option<InferenceConsensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,9 +587,9 @@ pub struct RewardEconomics {
 
 /// `GET /worker/earnings/{addr}` — the inputs a projection needs.
 ///
-/// Kept apart from [`Earnings`] (lifetime-to-date) because a projection has a
-/// different honesty burden: it is the only number in the app describing
-/// something that has not happened yet.
+/// Kept apart from [`Earnings`] (the selected host's retained receipt window)
+/// because a projection has a different honesty burden: it is the only number
+/// in the app describing something that has not happened yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EarningsProjection {

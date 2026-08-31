@@ -11,7 +11,7 @@ test.describe("InfoPopover (in-context explainers)", () => {
     page,
   }) => {
     // There are multiple info-btn on the dashboard - the attestation one
-    // is inside "Recent inference claims" card header.
+    // is inside the "Recent inference activity" card header.
     const infoButtons = page.getByTestId("info-btn");
     await expect(infoButtons.first()).toBeVisible();
 
@@ -28,7 +28,7 @@ test.describe("InfoPopover (in-context explainers)", () => {
     page,
   }) => {
     const attestHeading = page
-      .locator(".card-title", { hasText: /Recent inference claims/i })
+      .locator(".card-title", { hasText: /Recent inference activity/i })
       .first();
     await attestHeading.getByTestId("info-btn").click();
     const popover = page.getByTestId("info-popover");

@@ -69,6 +69,19 @@ render_fake_binary() {
         printf '    exit 0\n'
         printf 'fi\n'
         if [ "$program" = arc-cli ]; then
+            # Offline identity behavior used by installer migration tests.
+            # The mock never needs the secret; it preserves a deterministic
+            # public address for a protected legacy seed and emits the exact
+            # JSON shape consumed by the installer contract.
+            printf 'if [ "${1:-}" = "keygen" ]; then\n'
+            printf '    shift; output=""; legacy=""; verify=""\n'
+            printf '    while [ "$#" -gt 0 ]; do case "$1" in --output) output="$2"; shift 2 ;; --legacy-seed-file) legacy="$2"; shift 2 ;; --verify-keyfile) verify="$2"; shift 2 ;; --scheme) shift 2 ;; *) shift ;; esac; done\n'
+            printf '    if [ -n "$verify" ]; then address="$(sed -n '\''s/^[[:space:]]*"address": "\\([0-9a-f]*\\)".*/\\1/p'\'' "$verify")"; printf "%%s\\n" "$address"; [ "${#address}" -eq 64 ]; exit; fi\n'
+            printf '    [ -n "$output" ] || exit 2\n'
+            printf '    if [ -n "$legacy" ]; then if command -v sha256sum >/dev/null 2>&1; then address="$(sed -n '\''1p'\'' "$legacy" | sha256sum | awk '\''{print $1}'\'')"; else address="$(sed -n '\''1p'\'' "$legacy" | shasum -a 256 | awk '\''{print $1}'\'')"; fi; else address=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi\n'
+            printf '    (umask 077; printf '\''{\\n  "scheme": "ed25519",\\n  "secret_key": "%%064d",\\n  "public_key": "%%064d",\\n  "address": "%%s"\\n}\\n'\'' 0 0 "$address" >"$output") || exit 1\n'
+            printf '    exit 0\n'
+            printf 'fi\n'
             # shellcheck disable=SC2016 # Expansion belongs to the generated executable.
             printf 'if [ "${3:-}" = "health" ]; then\n'
             # shellcheck disable=SC2016 # Expansion belongs to the generated executable.

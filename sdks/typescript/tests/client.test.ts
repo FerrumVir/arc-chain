@@ -12,6 +12,8 @@ import {
 } from "../src/client";
 import { KeyPair } from "../src/crypto";
 import { TransactionBuilder } from "../src/transaction";
+import { Channel } from "../src/channel";
+import { parseJsonWithBigInts } from "../src/u64";
 
 // ---------------------------------------------------------------------------
 // Mock fetch helper
@@ -79,6 +81,17 @@ describe("ArcClient.getBlock", () => {
 
     await expect(client.getBlock(1)).rejects.toThrow(ArcConnectionError);
   });
+
+  it("fails closed instead of rounding an untyped unsafe integer", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      status: 200,
+      text: async () =>
+        `{"hash":"${"ab".repeat(32)}","header":{"height":9007199254740993},"tx_hashes":[]}`,
+    });
+    const client = new ArcClient("http://localhost:9000");
+
+    await expect(client.getBlock(1)).rejects.toThrow("safe-integer range");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -101,6 +114,40 @@ describe("ArcClient.getAccount", () => {
     expect(result.balance).toBe(1000000);
     expect(result.nonce).toBe(5);
   });
+
+  it("parses consensus u64 fields above 2^53 without rounding", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      status: 200,
+      text: async () =>
+        `{"address":"${"ab".repeat(32)}","balance":9007199254740993,"nonce":9007199254740995}`,
+    });
+
+    const client = new ArcClient("http://localhost:9000");
+    const result = await client.getAccount("ab".repeat(32));
+
+    expect(result.balance).toBe(9_007_199_254_740_993n);
+    expect(result.nonce).toBe(9_007_199_254_740_995n);
+  });
+
+  it("stays lossless on old runtimes without JSON.parse source context", () => {
+    const nativeParse = JSON.parse;
+    jest.spyOn(JSON, "parse").mockImplementation(((text, reviver) =>
+      nativeParse(
+        text,
+        reviver === undefined
+          ? undefined
+          : function (this: unknown, key: string, value: unknown) {
+              return (reviver as (this: unknown, key: string, value: unknown) => unknown)
+                .call(this, key, value);
+            },
+      )) as typeof JSON.parse);
+
+    expect(
+      parseJsonWithBigInts<{ amount: bigint }>(
+        '{"amount":9007199254740993}',
+      ).amount,
+    ).toBe(9_007_199_254_740_993n);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -121,9 +168,71 @@ describe("ArcClient.submitTransaction", () => {
       to: "bb".repeat(32),
       amount: 100,
       nonce: 0,
+      fee: 1,
+      signature: "cc".repeat(64),
+      public_key: "dd".repeat(32),
+      transaction_domain: null,
     });
 
     expect(txHash).toBe(expectedHash);
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      2,
+      "http://localhost:9000/tx/submit",
+      expect.objectContaining({
+        body: JSON.stringify({
+          from: "aa".repeat(32),
+          to: "bb".repeat(32),
+          amount: 100,
+          nonce: 0,
+          fee: 1,
+          signature: "cc".repeat(64),
+          public_key: "dd".repeat(32),
+        }),
+      }),
+    );
+  });
+
+  it("serializes bigint u64 transfer fields as exact Rust JSON numbers", async () => {
+    global.fetch = mockFetchResponse({
+      tx_hash: "de".repeat(32),
+      status: "pending",
+    });
+    const client = new ArcClient("http://localhost:9000");
+
+    await client.submitTransaction({
+      from: "aa".repeat(32),
+      to: "bb".repeat(32),
+      amount: 9_007_199_254_740_993n,
+      nonce: 9_007_199_254_740_995n,
+      fee: 9_007_199_254_740_997n,
+      signature: "cc".repeat(64),
+      public_key: "dd".repeat(32),
+      transaction_domain: null,
+    });
+
+    const wire = (global.fetch as jest.Mock).mock.calls[1][1].body as string;
+    expect(wire).toContain('"amount":9007199254740993');
+    expect(wire).toContain('"nonce":9007199254740995');
+    expect(wire).toContain('"fee":9007199254740997');
+  });
+
+  it("rejects an unsafe number before any network request", async () => {
+    global.fetch = mockFetchResponse({});
+    const client = new ArcClient("http://localhost:9000");
+
+    await expect(
+      client.submitTransaction({
+        from: "aa".repeat(32),
+        to: "bb".repeat(32),
+        amount: Number.MAX_SAFE_INTEGER + 1,
+        nonce: 0,
+        fee: 1,
+        signature: "cc".repeat(64),
+        public_key: "dd".repeat(32),
+        transaction_domain: null,
+      }),
+    ).rejects.toThrow("safe integer");
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 
   it("submits a TransactionBuilder tx and returns hash", async () => {
@@ -145,10 +254,36 @@ describe("ArcClient.submitTransaction", () => {
     const txHash = await client.submitTransaction(signed);
 
     expect(txHash).toBe(expectedHash);
+    const wire = JSON.parse(
+      (global.fetch as jest.Mock).mock.calls[1][1].body as string,
+    );
+    expect(wire).toEqual({
+      from: signed.from,
+      to: signed.body.to,
+      amount: signed.body.amount,
+      nonce: signed.nonce,
+      fee: signed.fee,
+      tx_type: "Transfer",
+      signature: signed.signature.Ed25519.signature,
+      public_key: signed.signature.Ed25519.public_key,
+    });
+    expect(wire).not.toHaveProperty("body");
+    expect(wire).not.toHaveProperty("transaction_domain");
   });
 
   it("throws ArcTransactionError on 409 conflict", async () => {
-    global.fetch = mockFetchResponse({}, 409);
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce({
+        status: 200,
+        json: async () => ({ transaction_domain: null }),
+        text: async () => '{"transaction_domain":null}',
+      })
+      .mockResolvedValueOnce({
+        status: 409,
+        json: async () => ({}),
+        text: async () => "{}",
+      });
     const client = new ArcClient("http://localhost:9000");
 
     await expect(
@@ -157,8 +292,35 @@ describe("ArcClient.submitTransaction", () => {
         to: "bb".repeat(32),
         amount: 100,
         nonce: 0,
+        fee: 1,
+        signature: "cc".repeat(64),
+        public_key: "dd".repeat(32),
+        transaction_domain: null,
       })
     ).rejects.toThrow(ArcTransactionError);
+  });
+
+  it("fails closed when the signature domain differs from the node", async () => {
+    global.fetch = mockFetchResponse({
+      protocol_version: "3.0.0",
+      recovery_active: true,
+      transaction_domain: `0x${"11".repeat(32)}`,
+    });
+    const client = new ArcClient("http://localhost:9000");
+
+    await expect(
+      client.submitTransaction({
+        from: "aa".repeat(32),
+        to: "bb".repeat(32),
+        amount: 100,
+        nonce: 0,
+        fee: 1,
+        signature: "cc".repeat(64),
+        public_key: "dd".repeat(32),
+        transaction_domain: `0x${"22".repeat(32)}`,
+      }),
+    ).rejects.toThrow("signature domain mismatch");
+    expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -176,12 +338,49 @@ describe("ArcClient.submitBatch", () => {
 
     const client = new ArcClient("http://localhost:9000");
     const result = await client.submitBatch([
-      { from: "11".repeat(32), to: "22".repeat(32), amount: 10, nonce: 0 },
-      { from: "33".repeat(32), to: "44".repeat(32), amount: 20, nonce: 0 },
+      {
+        from: "11".repeat(32),
+        to: "22".repeat(32),
+        amount: 10,
+        nonce: 0,
+        fee: 1,
+        signature: "55".repeat(64),
+        public_key: "66".repeat(32),
+        transaction_domain: null,
+      },
+      {
+        from: "33".repeat(32),
+        to: "44".repeat(32),
+        amount: 20,
+        nonce: 0,
+        fee: 1,
+        signature: "77".repeat(64),
+        public_key: "88".repeat(32),
+        transaction_domain: null,
+      },
     ]);
 
     expect(result.accepted).toBe(2);
     expect(result.tx_hashes).toHaveLength(2);
+  });
+
+  it("rejects more than the server's 64-item cap before network I/O", async () => {
+    global.fetch = mockFetchResponse({});
+    const client = new ArcClient("http://localhost:9000");
+    const tx = {
+      from: "11".repeat(32),
+      to: "22".repeat(32),
+      amount: 1,
+      nonce: 0,
+      fee: 1,
+      signature: "55".repeat(64),
+      public_key: "66".repeat(32),
+      transaction_domain: null,
+    } as const;
+
+    await expect(client.submitBatch(Array.from({ length: 65 }, () => tx))).rejects
+      .toThrow("maximum of 64 items");
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -394,6 +593,88 @@ describe("TransactionBuilder", () => {
     expect(tx1.hash).not.toBe(tx2.hash);
   });
 
+  it("matches the Rust v1 and v3 transfer hash contract", () => {
+    const from = "11".repeat(32);
+    const to = "22".repeat(32);
+    const v1 = TransactionBuilder.transfer(from, to, 7, 1, 4);
+    const v3 = TransactionBuilder.transfer(
+      from,
+      to,
+      7,
+      1,
+      4,
+      `0x${"33".repeat(32)}`,
+    );
+
+    expect(v1.hash).toBe(
+      "267d4e0c25020d50ae17ce254a28f9556cc086814304902a499916993cb8f05b",
+    );
+    expect(v3.hash).toBe(
+      "5accadc1f889e29e95d2fdac38b3b0db2f76e727c8593bdddb6598c04172f522",
+    );
+  });
+
+  it("matches Rust on both sides of the 2^53 boundary", () => {
+    const from = "11".repeat(32);
+    const to = "22".repeat(32);
+    const maxSafe = TransactionBuilder.transfer(
+      from,
+      to,
+      Number.MAX_SAFE_INTEGER,
+      1,
+      4,
+    );
+    const exactBigint = TransactionBuilder.transfer(
+      from,
+      to,
+      9_007_199_254_740_993n,
+      1n,
+      4n,
+    );
+
+    expect(maxSafe.hash).toBe(
+      "89243800e36a725c72c633a4955e86938e0a94b9321e2a1349f3d24ccd165e35",
+    );
+    expect(exactBigint.hash).toBe(
+      "caef4f5305f968dd0b5b8f23a12d85644ba1b80328a0907e764aa59723e8146c",
+    );
+
+    const allTransferFields = TransactionBuilder.transfer(
+      from,
+      to,
+      9_007_199_254_740_993n,
+      9_007_199_254_740_997n,
+      9_007_199_254_740_995n,
+    );
+    expect(allTransferFields.hash).toBe(
+      "6218ebf83c6e14e18216c33cdfaa70ad189ffbb8cb78ffb35a187efef9e51261",
+    );
+
+    const deploy = TransactionBuilder.deployContract(
+      from,
+      new Uint8Array([0, 97, 115, 109]),
+      9_007_199_254_740_999n,
+      9_007_199_254_740_997n,
+      9_007_199_254_740_995n,
+      new Uint8Array([1, 2]),
+      9_007_199_254_740_993n,
+    );
+    expect(deploy.hash).toBe(
+      "3f3e08f8525892e8564bb488bb7867637444af9c926b950a7ef3b9f4d02253da",
+    );
+  });
+
+  it.each([
+    ["amount", () => TransactionBuilder.transfer("aa".repeat(32), "bb".repeat(32), Number.MAX_SAFE_INTEGER + 1)],
+    ["amount", () => TransactionBuilder.transfer("aa".repeat(32), "bb".repeat(32), (1n << 64n))],
+    ["amount", () => TransactionBuilder.transfer("aa".repeat(32), "bb".repeat(32), "100" as any)],
+    ["fee", () => TransactionBuilder.transfer("aa".repeat(32), "bb".repeat(32), 1, 1.5)],
+    ["nonce", () => TransactionBuilder.transfer("aa".repeat(32), "bb".repeat(32), 1, 1, -1)],
+    ["gas_limit", () => TransactionBuilder.deployContract("aa".repeat(32), new Uint8Array([1]), Number.MAX_SAFE_INTEGER + 1)],
+  ])("rejects an inexact or invalid %s", (_field, build) => {
+    expect(build).toThrow(/safe integer|non-negative|u64 range|number or bigint/);
+  });
+
   it("rejects invalid addresses", () => {
     expect(() =>
       TransactionBuilder.transfer("short", "bb".repeat(32), 1000)
@@ -508,5 +789,38 @@ describe("TransactionBuilder.sign", () => {
     const originalSig = tx.signature;
     await TransactionBuilder.sign(tx, kp);
     expect(tx.signature).toEqual(originalSig);
+  });
+
+  it("recomputes the canonical hash before signing", async () => {
+    const kp = await KeyPair.generate();
+    const tx = TransactionBuilder.transfer(kp.address(), "bb".repeat(32), 1000);
+    const originalHash = tx.hash;
+    tx.nonce = 7;
+
+    const signed = await TransactionBuilder.sign(tx, kp);
+
+    expect(signed.hash).not.toBe(originalHash);
+    const { hexToBytes } = await import("@noble/hashes/utils");
+    expect(
+      await kp.verify(
+        hexToBytes(signed.hash),
+        hexToBytes(signed.signature.Ed25519.signature),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("Channel u64 safety", () => {
+  it("rejects unsafe deposits, payments, and nonce increments", () => {
+    expect(
+      () => new Channel("aa".repeat(32), "opener", Number.MAX_SAFE_INTEGER + 1),
+    ).toThrow("safe integer");
+
+    const channel = new Channel("aa".repeat(32), "opener", 100);
+    channel.confirmOpen();
+    expect(() => channel.pay(Number.MAX_SAFE_INTEGER + 1)).toThrow("safe integer");
+
+    channel.nonce = Number.MAX_SAFE_INTEGER;
+    expect(() => channel.proposeState(100, 0)).toThrow("safe integer");
   });
 });

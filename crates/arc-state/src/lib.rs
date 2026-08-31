@@ -229,7 +229,9 @@ fn below_policy_minimum(value: u64, minimum: u64) -> bool {
     value < minimum
 }
 
-fn is_reserved_system_account(address: &Address) -> bool {
+/// Historical fixed reserves used by legacy faucet collision checks. Keep
+/// this exact set stable so archived v2 blocks retain their execution rules.
+pub fn is_legacy_reserved_system_account(address: &Address) -> bool {
     // The first three content-derived accounts are finite protocol reserves:
     // public faucet, community-reward treasury, and recovery validator-funding
     // reserve. The legacy bridge/model treasuries are also state-machine-owned.
@@ -243,29 +245,52 @@ fn is_reserved_system_account(address: &Address) -> bool {
     .contains(address)
 }
 
+/// Whether protocol-v3 admission must prevent externally authorized state
+/// writes to this fixed or dynamically namespaced state-machine account.
+pub fn is_reserved_system_account(address: &Address) -> bool {
+    is_legacy_reserved_system_account(address)
+        || *address == hash_bytes(b"arc-treasury")
+        || arc_types::transaction::is_v3_system_account(address)
+}
+
 fn community_reward_budget_address(
-    kind: &'static str,
+    namespace: arc_types::transaction::V3SystemAccountKind,
+    derivation_key: &'static str,
     height_or_epoch: u64,
     identity: Option<&Address>,
 ) -> Address {
-    let mut hasher = blake3::Hasher::new_derive_key(kind);
+    let mut hasher = blake3::Hasher::new_derive_key(derivation_key);
     hasher.update(&height_or_epoch.to_le_bytes());
     if let Some(identity) = identity {
         hasher.update(identity.as_ref());
     }
-    Hash256(*hasher.finalize().as_bytes())
+    arc_types::transaction::v3_system_account_address(
+        namespace,
+        &Hash256(*hasher.finalize().as_bytes()),
+    )
 }
 
 fn community_reward_block_budget_address(height: u64) -> Address {
-    community_reward_budget_address("ARC-community-reward-block-budget-v3", height, None)
+    community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardBlockBudget,
+        "ARC-community-reward-block-budget-v3",
+        height,
+        None,
+    )
 }
 
 fn community_reward_epoch_budget_address(epoch: u64) -> Address {
-    community_reward_budget_address("ARC-community-reward-epoch-budget-v3", epoch, None)
+    community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardEpochBudget,
+        "ARC-community-reward-epoch-budget-v3",
+        epoch,
+        None,
+    )
 }
 
 fn community_reward_worker_budget_address(epoch: u64, worker: &Address) -> Address {
     community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardWorkerBudget,
         "ARC-community-reward-worker-epoch-budget-v3",
         epoch,
         Some(worker),
@@ -274,6 +299,7 @@ fn community_reward_worker_budget_address(epoch: u64, worker: &Address) -> Addre
 
 fn community_reward_coordinator_budget_address(epoch: u64, coordinator: &Address) -> Address {
     community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardCoordinatorBudget,
         "ARC-community-reward-coordinator-epoch-budget-v3",
         epoch,
         Some(coordinator),
@@ -363,6 +389,7 @@ fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
 /// A batch of benchmark transactions to be indexed asynchronously.
 /// Contains metadata for the indexer to lazily reconstruct Transaction objects,
 /// avoiding 2GB+ heap allocation in the hot execution path.
+#[cfg(feature = "benchmark-tools")]
 pub struct IndexerBatch {
     pub block_hash: Hash256,
     pub height: u64,
@@ -402,14 +429,19 @@ pub struct StateDB {
     /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
     /// Async indexer channel - sends batches to background threads.
+    #[cfg(feature = "benchmark-tools")]
     indexer_tx: Option<crossbeam::channel::Sender<IndexerBatch>>,
     /// Benchmark block nonce bases: height → nonce_base for deterministic tx reconstruction.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_nonces: DashMap<u64, u64>,
     /// Cached sender array for benchmark tx reconstruction.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_senders: parking_lot::RwLock<Option<Arc<Vec<Hash256>>>>,
     /// Cached receiver array for benchmark tx reconstruction.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_receivers: parking_lot::RwLock<Option<Arc<Vec<Hash256>>>>,
     /// Transactions per sender in benchmark blocks.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_txs_per_sender: AtomicU64,
     /// Signed benchmark block data: height → (transactions, success_flags, block_hash).
     /// Stored for blocks produced by execute_block_signed_benchmark()
@@ -510,10 +542,15 @@ impl StateDB {
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
+            #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
+            #[cfg(feature = "benchmark-tools")]
             benchmark_nonces: DashMap::new(),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_senders: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_receivers: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_txs_per_sender: AtomicU64::new(0),
             signed_block_data: DashMap::new(),
             incremental_merkle: parking_lot::Mutex::new(IncrementalMerkle::new()),
@@ -551,10 +588,15 @@ impl StateDB {
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
+            #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
+            #[cfg(feature = "benchmark-tools")]
             benchmark_nonces: DashMap::new(),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_senders: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_receivers: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_txs_per_sender: AtomicU64::new(0),
             signed_block_data: DashMap::new(),
             incremental_merkle: parking_lot::Mutex::new(IncrementalMerkle::new()),
@@ -1554,7 +1596,9 @@ impl StateDB {
             )));
         }
         let pool = arc_types::transaction::faucet_pool_address();
-        let marker = arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+        let marker = arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient);
+        let legacy_marker =
+            arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
         let recipient_is_existing_faucet_marker =
             self.get_account(&body.recipient).is_some_and(|account| {
                 account.balance == 0
@@ -1575,6 +1619,18 @@ impl StateDB {
         if self.accounts.contains_key(&marker.0) {
             return Err(StateError::ExecutionError(format!(
                 "faucet claim: recipient {} has already claimed",
+                body.recipient
+            )));
+        }
+        if self.get_account(&legacy_marker).is_some_and(|account| {
+            account.balance == 0
+                && account.staked_balance == 0
+                && account.nonce == 1
+                && account.code_hash == body.recipient
+                && account.storage_root != Hash256::ZERO
+        }) {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: recipient {} already claimed under legacy marker semantics",
                 body.recipient
             )));
         }
@@ -1662,24 +1718,32 @@ impl StateDB {
         ];
         let unique: HashSet<_> = addresses.iter().map(|address| address.0).collect();
         let treasury = arc_types::transaction::inference_reward_treasury_address();
-        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
             &body.chain_domain,
             &body.job_id,
         );
         let certificate_marker =
-            arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
                 &body.chain_domain,
                 &body.worker,
                 &body.worker_certificate.attestation_hash,
             );
+        let recovery_probe_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
+            );
         if unique.len() != addresses.len()
+            || addresses
+                .iter()
+                .any(|address| !arc_types::transaction::is_v3_system_account(address))
             || addresses.iter().any(|address| {
                 *address == treasury
                     || *address == body.worker
                     || *address == body.coordinator
                     || *address == job_marker
                     || *address == certificate_marker
-                    || is_reserved_system_account(address)
+                    || recovery_probe_marker == Some(*address)
             })
         {
             return Err(StateError::ExecutionError(
@@ -1880,26 +1944,42 @@ impl StateDB {
                 arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE
             )));
         }
-        if body.worker == treasury {
+        if body.worker == treasury
+            || is_reserved_system_account(&body.worker)
+            || is_reserved_system_account(&body.coordinator)
+        {
             return Err(StateError::ExecutionError(
-                "community inference reward: treasury cannot be the worker".to_string(),
+                "community inference reward: worker/coordinator cannot be a system account"
+                    .to_string(),
             ));
         }
-        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
             &body.chain_domain,
             &body.job_id,
         );
         let certificate_marker =
-            arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
                 &body.chain_domain,
                 &body.worker,
                 &body.worker_certificate.attestation_hash,
+            );
+        let recovery_probe_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
             );
         if job_marker == certificate_marker
             || job_marker == body.worker
             || certificate_marker == body.worker
             || job_marker == treasury
             || certificate_marker == treasury
+            || recovery_probe_marker.is_some_and(|marker| {
+                marker == job_marker
+                    || marker == certificate_marker
+                    || marker == body.worker
+                    || marker == body.coordinator
+                    || marker == treasury
+            })
         {
             return Err(StateError::ExecutionError(
                 "community inference reward: marker address collision".to_string(),
@@ -1915,6 +1995,72 @@ impl StateDB {
             return Err(StateError::ExecutionError(format!(
                 "community inference reward: worker certificate {} already paid",
                 body.worker_certificate.attestation_hash.to_hex()
+            )));
+        }
+        if let Some(marker) = recovery_probe_marker
+            && self.accounts.contains_key(&marker.0)
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: recovery probe {} already paid",
+                body.assignment_epoch.to_hex()
+            )));
+        }
+        // Historical v2 marker keys remain valid replay evidence after the
+        // upgrade, but an arbitrary transfer to a predictable legacy hash is
+        // not. Only the exact state-machine marker shape blocks v3 issuance.
+        let legacy_job_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                &body.chain_domain,
+                &body.job_id,
+            );
+        if self.get_account(&legacy_job_marker).is_some_and(|account| {
+            account.balance == 0
+                && account.staked_balance == 0
+                && account.nonce == 1
+                && account.code_hash != Hash256::ZERO
+        }) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: job {} already paid under legacy marker semantics",
+                body.job_id.to_hex()
+            )));
+        }
+        let legacy_certificate_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                &body.chain_domain,
+                &body.worker,
+                &body.worker_certificate.attestation_hash,
+            );
+        if self
+            .get_account(&legacy_certificate_marker)
+            .is_some_and(|account| {
+                account.balance == 0
+                    && account.staked_balance == 0
+                    && account.nonce == 1
+                    && account.code_hash != Hash256::ZERO
+            })
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: worker certificate {} already paid under legacy marker semantics",
+                body.worker_certificate.attestation_hash.to_hex()
+            )));
+        }
+        if let Some(legacy_probe_marker) =
+            arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
+            )
+            && self
+                .get_account(&legacy_probe_marker)
+                .is_some_and(|account| {
+                    account.balance == 0
+                        && account.staked_balance == 0
+                        && account.nonce == 1
+                        && account.code_hash != Hash256::ZERO
+                })
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: recovery probe {} already paid under legacy marker semantics",
+                body.assignment_epoch.to_hex()
             )));
         }
         self.verify_community_reward_validator_approvals(body)?;
@@ -3311,6 +3457,7 @@ impl StateDB {
 
     /// Start background indexer threads for async hash→(height, index) mapping.
     /// Call once before benchmark execution begins.
+    #[cfg(feature = "benchmark-tools")]
     pub fn start_benchmark_indexer(self: &Arc<Self>) {
         let (tx, rx) = crossbeam::channel::unbounded::<IndexerBatch>();
 
@@ -3371,6 +3518,7 @@ impl StateDB {
     /// Block state_root is computed from all account states.
     /// Every tx is reconstructable on-demand from deterministic parameters.
     /// Merkle inclusion proofs are generated on-demand when queried.
+    #[cfg(feature = "benchmark-tools")]
     pub fn execute_block_benchmark(
         &self,
         tx_per_block: u64,
@@ -3733,6 +3881,7 @@ impl StateDB {
 
     /// Reconstruct a benchmark transaction on-demand from (height, tx_index).
     /// Returns the full Transaction object with correct hash and real ed25519 signature.
+    #[cfg(feature = "benchmark-tools")]
     pub fn reconstruct_benchmark_tx(&self, height: u64, tx_index: u32) -> Option<Transaction> {
         let nonce_base = self.benchmark_nonces.get(&height)?;
         let nonce_base = *nonce_base;
@@ -3770,6 +3919,13 @@ impl StateDB {
         Some(tx)
     }
 
+    /// Deterministic transaction reconstruction is deliberately unavailable
+    /// in production/default builds.
+    #[cfg(not(feature = "benchmark-tools"))]
+    pub fn reconstruct_benchmark_tx(&self, _height: u64, _tx_index: u32) -> Option<Transaction> {
+        None
+    }
+
     /// Reconstruct a benchmark receipt on-demand from (height, tx_index).
     pub fn reconstruct_benchmark_receipt(&self, height: u64, tx_index: u32) -> Option<TxReceipt> {
         let tx = self.reconstruct_benchmark_tx(height, tx_index)?;
@@ -3790,6 +3946,7 @@ impl StateDB {
 
     /// Reconstruct a Merkle inclusion proof for a benchmark transaction.
     /// This is expensive (~130ms for 10M txs) - only called on-demand for /tx/{hash}/proof.
+    #[cfg(feature = "benchmark-tools")]
     pub fn reconstruct_benchmark_proof(
         &self,
         height: u64,
@@ -3838,6 +3995,16 @@ impl StateDB {
         // Build full Merkle tree and extract proof
         let tree = MerkleTree::from_leaves(all_hashes);
         tree.proof(tx_index as usize)
+    }
+
+    /// Deterministic benchmark proofs depend on the gated reconstruction path.
+    #[cfg(not(feature = "benchmark-tools"))]
+    pub fn reconstruct_benchmark_proof(
+        &self,
+        _height: u64,
+        _tx_index: u32,
+    ) -> Option<arc_crypto::MerkleProof> {
+        None
     }
 
     /// Reconstruct a benchmark transaction by looking up its hash in tx_index,
@@ -5950,26 +6117,60 @@ impl StateDB {
                         "community inference reward: treasury cannot be the worker".to_string(),
                     ));
                 }
-                let job_marker_addr =
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                let job_marker_addr = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                } else {
                     arc_types::transaction::CommunityInferenceRewardBody::marker_address(
                         &body.chain_domain,
                         &body.job_id,
-                    );
+                    )
+                };
                 if self.accounts.contains_key(&job_marker_addr.0) {
                     return Err(StateError::ExecutionError(format!(
                         "community inference reward: job {} already paid",
                         body.job_id.to_hex()
                     )));
                 }
-                let certificate_marker_addr = arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
-                    &body.chain_domain,
-                    &body.worker,
-                    &body.worker_certificate.attestation_hash,
-                );
+                let certificate_marker_addr = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                };
                 if self.accounts.contains_key(&certificate_marker_addr.0) {
                     return Err(StateError::ExecutionError(format!(
                         "community inference reward: worker certificate {} already paid",
                         body.worker_certificate.attestation_hash.to_hex()
+                    )));
+                }
+                let recovery_probe_marker_addr = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                };
+                if let Some(marker) = recovery_probe_marker_addr
+                    && self.accounts.contains_key(&marker.0)
+                {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: recovery probe {} already paid",
+                        body.assignment_epoch.to_hex()
                     )));
                 }
 
@@ -6022,6 +6223,13 @@ impl StateDB {
                     || certificate_marker_addr == body.worker
                     || job_marker_addr == treasury_addr
                     || certificate_marker_addr == treasury_addr
+                    || recovery_probe_marker_addr.is_some_and(|marker| {
+                        marker == job_marker_addr
+                            || marker == certificate_marker_addr
+                            || marker == body.worker
+                            || marker == body.coordinator
+                            || marker == treasury_addr
+                    })
                 {
                     return Err(StateError::ExecutionError(
                         "community inference reward: marker address collision".to_string(),
@@ -6035,7 +6243,14 @@ impl StateDB {
                 certificate_marker.nonce = 1;
                 certificate_marker.code_hash = body.worker;
                 certificate_marker.storage_root = body.job_id;
-                let budget_candidates = if self.active_protocol_version().major == 3 {
+                let recovery_probe_marker = recovery_probe_marker_addr.map(|address| {
+                    let mut marker = Account::new(address, 0);
+                    marker.nonce = 1;
+                    marker.code_hash = body.coordinator;
+                    marker.storage_root = body.job_id;
+                    (address, marker)
+                });
+                let budget_candidates = if protocol_v3 {
                     Some(self.community_reward_budget_candidates_at(body, self.height())?)
                 } else {
                     None
@@ -6046,6 +6261,9 @@ impl StateDB {
                 self.accounts.insert(job_marker_addr.0, job_marker.clone());
                 self.accounts
                     .insert(certificate_marker_addr.0, certificate_marker.clone());
+                if let Some((address, marker)) = &recovery_probe_marker {
+                    self.accounts.insert(address.0, marker.clone());
+                }
                 if let Some(budget) = &budget_candidates {
                     for (address, account) in [
                         &budget.block,
@@ -6065,6 +6283,10 @@ impl StateDB {
                         (certificate_marker_addr, &certificate_marker),
                     ] {
                         let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
+                    }
+                    if let Some((address, marker)) = &recovery_probe_marker {
+                        let value = hash_bytes(&bincode::serialize(marker).unwrap_or_default());
                         jmt.update_leaf(address.0, value);
                     }
                     if let Some(budget) = &budget_candidates {
@@ -6092,6 +6314,10 @@ impl StateDB {
                     WalOp::SetAccount(certificate_marker_addr, certificate_marker),
                     self.height(),
                 );
+                if let Some((address, marker)) = recovery_probe_marker {
+                    self.wal
+                        .append(WalOp::SetAccount(address, marker), self.height());
+                }
                 if let Some(budget) = budget_candidates {
                     for (address, account) in [
                         budget.block,
@@ -7228,8 +7454,12 @@ impl StateDB {
                 // not touched: the pool is the shared source.
 
                 let pool_addr = arc_types::transaction::faucet_pool_address();
-                let marker_addr =
-                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                let marker_addr = if protocol_v3 {
+                    arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient)
+                } else {
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient)
+                };
                 let recipient_is_existing_faucet_marker =
                     self.get_account(&body.recipient).is_some_and(|account| {
                         account.balance == 0
@@ -7239,7 +7469,12 @@ impl StateDB {
                                 &account.code_hash,
                             ) == body.recipient
                     });
-                if is_reserved_system_account(&body.recipient)
+                let recipient_is_reserved = if protocol_v3 {
+                    is_reserved_system_account(&body.recipient)
+                } else {
+                    is_legacy_reserved_system_account(&body.recipient)
+                };
+                if recipient_is_reserved
                     || marker_addr == pool_addr
                     || marker_addr == body.recipient
                     || recipient_is_existing_faucet_marker
@@ -7850,16 +8085,31 @@ impl StateDB {
                     .push(tx.hash);
             }
             TxBody::CommunityInferenceReward(body) => {
-                let job_marker =
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                let job_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                } else {
                     arc_types::transaction::CommunityInferenceRewardBody::marker_address(
                         &body.chain_domain,
                         &body.job_id,
-                    );
-                let certificate_marker = arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
-                    &body.chain_domain,
-                    &body.worker,
-                    &body.worker_certificate.attestation_hash,
-                );
+                    )
+                };
+                let certificate_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                };
                 self.account_txs
                     .entry(body.worker.0)
                     .or_default()
@@ -7872,11 +8122,25 @@ impl StateDB {
                     .entry(certificate_marker.0)
                     .or_default()
                     .push(tx.hash);
+                let recovery_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                };
+                if let Some(marker) = recovery_marker {
+                    self.account_txs.entry(marker.0).or_default().push(tx.hash);
+                }
                 self.account_txs
                     .entry(arc_types::transaction::inference_reward_treasury_address().0)
                     .or_default()
                     .push(tx.hash);
-                if self.active_protocol_version().major == 3 {
+                if protocol_v3 {
                     let epoch = self.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
                     for address in [
                         community_reward_block_budget_address(self.height()),
@@ -7969,8 +8233,11 @@ impl StateDB {
                     .entry(pool_addr.0)
                     .or_default()
                     .push(tx.hash);
-                let marker_addr =
-                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+                let marker_addr = if self.active_protocol_version().major == 3 {
+                    arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient)
+                } else {
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient)
+                };
                 self.account_txs
                     .entry(marker_addr.0)
                     .or_default()
@@ -8084,25 +8351,51 @@ impl StateDB {
                 self.dirty_accounts.insert(escrow_addr.0);
             }
             TxBody::CommunityInferenceReward(body) => {
+                let protocol_v3 = self.active_protocol_version().major == 3;
                 self.dirty_accounts.insert(body.worker.0);
                 self.dirty_accounts
                     .insert(arc_types::transaction::inference_reward_treasury_address().0);
-                self.dirty_accounts.insert(
+                let job_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                } else {
                     arc_types::transaction::CommunityInferenceRewardBody::marker_address(
                         &body.chain_domain,
                         &body.job_id,
                     )
-                    .0,
-                );
-                self.dirty_accounts.insert(
+                };
+                self.dirty_accounts.insert(job_marker.0);
+                let certificate_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                } else {
                     arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
                         &body.chain_domain,
                         &body.worker,
                         &body.worker_certificate.attestation_hash,
                     )
-                    .0,
-                );
-                if self.active_protocol_version().major == 3 {
+                };
+                self.dirty_accounts.insert(certificate_marker.0);
+                let recovery_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                };
+                if let Some(marker) = recovery_marker {
+                    self.dirty_accounts.insert(marker.0);
+                }
+                if protocol_v3 {
                     let epoch = self.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
                     for address in [
                         community_reward_block_budget_address(self.height()),
@@ -8170,9 +8463,12 @@ impl StateDB {
                 self.dirty_accounts.insert(body.recipient.0);
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(pool_addr.0);
-                self.dirty_accounts.insert(
-                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient).0,
-                );
+                let marker = if self.active_protocol_version().major == 3 {
+                    arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient)
+                } else {
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient)
+                };
+                self.dirty_accounts.insert(marker.0);
             }
             TxBody::InferenceRequest(body) => {
                 // Request: signer balance debited + escrow created.
@@ -9142,6 +9438,7 @@ impl Default for StateDB {
 /// Uses the exact same algorithm as Transaction::compute_hash() but with
 /// a precomputed base hasher (tx_type + from already hashed) and body_bytes.
 /// Only the nonce varies per call - enables massive parallelism.
+#[cfg(feature = "benchmark-tools")]
 #[inline]
 fn compute_benchmark_tx_hash(
     base_hasher: &blake3::Hasher,
@@ -11357,6 +11654,56 @@ mod tests {
         ));
         state.wal.sync().unwrap();
 
+        let chain_domain =
+            arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+        let digest = hash_bytes(b"v3-transfer-dust-target");
+        let mut probe_id = [0u8; 32];
+        probe_id[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_id[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(4);
+        let reserved_targets = [
+            arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                &chain_domain,
+                &digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                &chain_domain,
+                &receiver.address(),
+                &digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &chain_domain,
+                &Hash256(probe_id),
+            )
+            .unwrap(),
+            community_reward_block_budget_address(7),
+            community_reward_epoch_budget_address(8),
+            community_reward_worker_budget_address(8, &receiver.address()),
+            community_reward_coordinator_budget_address(8, &sender.address()),
+            arc_types::transaction::FaucetClaimBody::v3_marker_address(&receiver.address()),
+        ];
+        for target in reserved_targets {
+            assert!(is_reserved_system_account(&target));
+            let mut dust = make_channel_tx(
+                sender.address(),
+                0,
+                TxBody::Transfer(TransferBody {
+                    to: target,
+                    amount: 1,
+                    amount_commitment: None,
+                }),
+                TxType::Transfer,
+            );
+            dust.fee = V3_MIN_TRANSFER_FEE;
+            state.sign_transaction(&mut dust, &sender).unwrap();
+            let error = state.validate_v3_transaction_admission(&dust).unwrap_err();
+            assert!(error.to_string().contains("collision"), "{error}");
+            assert!(state.execute_tx(&dust).is_err());
+            assert!(state.get_account(&target).is_none());
+        }
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 100);
+        assert_eq!(state.get_account(&sender.address()).unwrap().nonce, 0);
+
         let mut zero_fee = make_channel_tx(
             sender.address(),
             0,
@@ -11676,6 +12023,38 @@ mod tests {
         let recovery_reserve = hash_bytes(&[2u8]);
         let legacy_bridge = hash_bytes(b"ARC-bridge-escrow");
         let legacy_model_treasury = hash_bytes(b"arc-treasury");
+        let chain_domain =
+            arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+        let namespace_digest = hash_bytes(b"v3-reserved-namespace-admission-test");
+        let mut probe_id = [0u8; 32];
+        probe_id[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_id[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(3);
+        let dynamic_reserved = [
+            arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                &chain_domain,
+                &namespace_digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                &chain_domain,
+                &ordinary_recipient,
+                &namespace_digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &chain_domain,
+                &Hash256(probe_id),
+            )
+            .unwrap(),
+            community_reward_block_budget_address(42),
+            community_reward_epoch_budget_address(9),
+            community_reward_worker_budget_address(9, &ordinary_recipient),
+            community_reward_coordinator_budget_address(9, &validator.address()),
+            FaucetClaimBody::v3_marker_address(&ordinary_recipient),
+        ];
+        assert!(
+            dynamic_reserved.iter().all(is_reserved_system_account),
+            "every dynamic state-owned v3 family must be admission-recognizable"
+        );
         let mut genesis = vec![
             (pool, 10 * arc_types::transaction::FAUCET_CLAIM_MAX),
             (reward_treasury, 20),
@@ -11699,13 +12078,15 @@ mod tests {
         ));
         let initial_supply = sum_all_balances(&state);
 
-        for recipient in [
+        let mut forbidden_recipients = vec![
             pool,
             reward_treasury,
             recovery_reserve,
             legacy_bridge,
             legacy_model_treasury,
-        ] {
+        ];
+        forbidden_recipients.extend(dynamic_reserved);
+        for recipient in forbidden_recipients {
             let mut claim = make_channel_tx(
                 validator.address(),
                 0,
@@ -11738,8 +12119,33 @@ mod tests {
             TxType::FaucetClaim,
         );
         state.sign_transaction(&mut valid, validator).unwrap();
+        let legacy_marker = FaucetClaimBody::marker_address(&ordinary_recipient);
+        let mut genuine_legacy_marker = Account::new(legacy_marker, 0);
+        genuine_legacy_marker.nonce = 1;
+        genuine_legacy_marker.code_hash = ordinary_recipient;
+        genuine_legacy_marker.storage_root = hash_bytes(&1u64.to_be_bytes());
+        state
+            .accounts
+            .insert(legacy_marker.0, genuine_legacy_marker);
+        let legacy_replay = state.execute_tx(&valid).unwrap_err();
+        assert!(
+            legacy_replay
+                .to_string()
+                .contains("legacy marker semantics")
+        );
+
+        // Simulate a pre-v3 transfer to the old predictable marker without
+        // inflating supply. Its ordinary EOA shape cannot suppress the new
+        // protected marker and must remain untouched.
+        let mut pool_for_dust = state.get_account(&pool).unwrap();
+        pool_for_dust.balance -= 1;
+        state.accounts.insert(pool.0, pool_for_dust);
+        state
+            .accounts
+            .insert(legacy_marker.0, Account::new(legacy_marker, 1));
         state.execute_tx(&valid).unwrap();
-        let marker = FaucetClaimBody::marker_address(&ordinary_recipient);
+        let marker = FaucetClaimBody::v3_marker_address(&ordinary_recipient);
+        assert_eq!(state.get_account(&legacy_marker).unwrap().balance, 1);
         let supply_after_valid = sum_all_balances(&state);
         assert_eq!(supply_after_valid, initial_supply);
         let pool_after_valid = state.get_account(&pool).unwrap().balance;
@@ -13190,6 +13596,110 @@ mod tests {
     }
 
     #[test]
+    fn recovery_probe_marker_blocks_cross_coordinator_payment_and_outer_nonce_is_not_account_nonce()
+    {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let first_validator = arc_crypto::KeyPair::generate_ed25519();
+        let second_validator = arc_crypto::KeyPair::generate_ed25519();
+        let first_worker = arc_crypto::KeyPair::generate_ed25519();
+        let second_worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD)]);
+        seed_validator(&state, first_validator.address());
+        activate_community_rewards(&state);
+
+        let mut probe_bytes = [0u8; 32];
+        probe_bytes[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_bytes[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(9);
+        let probe_id = Hash256(probe_bytes);
+
+        let bind_probe = |mut tx: Transaction,
+                          validator: &arc_crypto::KeyPair,
+                          outer_nonce: u64|
+         -> Transaction {
+            let TxBody::CommunityInferenceReward(body) = &mut tx.body else {
+                unreachable!();
+            };
+            body.assignment_epoch = probe_id;
+            body.job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+                &body.coordinator,
+                &body.assignment_epoch,
+                body.job_nonce,
+                &body.model_id,
+                &body.input_hash,
+                body.max_tokens,
+            );
+            body.validator_approvals.clear();
+            let commitment = body.validator_approval_commitment();
+            body.validator_approvals.push(
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    validator.address(),
+                    validator.sign(&commitment).unwrap(),
+                )
+                .unwrap(),
+            );
+            tx.nonce = outer_nonce;
+            tx.sign(validator).unwrap();
+            tx
+        };
+
+        let first = bind_probe(
+            make_signed_community_reward(
+                &first_validator,
+                &first_worker,
+                17,
+                b"recovery-probe-first",
+                100,
+            ),
+            &first_validator,
+            u64::MAX - 1,
+        );
+        let coordinator_nonce_before = state
+            .get_account(&first_validator.address())
+            .map(|account| account.nonce)
+            .unwrap_or(0);
+        let (_, first_receipts) = state
+            .execute_block(&[first], first_validator.address())
+            .unwrap();
+        assert!(first_receipts[0].success);
+        assert_eq!(
+            state
+                .get_account(&first_validator.address())
+                .map(|account| account.nonce)
+                .unwrap_or(0),
+            coordinator_nonce_before,
+            "0x25 outer nonce is a deterministic envelope salt, not an account nonce"
+        );
+        seed_validator(&state, second_validator.address());
+
+        let second = bind_probe(
+            make_signed_community_reward(
+                &second_validator,
+                &second_worker,
+                23,
+                b"recovery-probe-second",
+                100,
+            ),
+            &second_validator,
+            1,
+        );
+        let replay_error = state.execute_tx(&second).unwrap_err();
+        assert!(replay_error.to_string().contains("recovery probe"));
+        assert!(replay_error.to_string().contains("already paid"));
+        assert_eq!(
+            state.get_account(&first_worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(
+            state
+                .get_account(&second_worker.address())
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
     fn recovery_v3_reward_accepts_embedded_domain_certificate_while_raw_tx_is_denied() {
         let validators: Vec<_> = (0..6)
             .map(|_| arc_crypto::KeyPair::generate_ed25519())
@@ -13280,17 +13790,70 @@ mod tests {
                 .unwrap()
             })
             .collect();
+        let coordinator_nonce_before = state
+            .get_account(&validators[0].address())
+            .expect("genesis validator account")
+            .nonce;
         let mut reward =
-            Transaction::new_community_inference_reward(validators[0].address(), job_nonce, body);
+            Transaction::new_community_inference_reward(validators[0].address(), u64::MAX, body);
         state.sign_transaction(&mut reward, &validators[0]).unwrap();
+        let TxBody::CommunityInferenceReward(reward_body) = &reward.body else {
+            unreachable!();
+        };
+        let legacy_job_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                &reward_body.chain_domain,
+                &reward_body.job_id,
+            );
+        let mut genuine_legacy_marker = Account::new(legacy_job_marker, 0);
+        genuine_legacy_marker.nonce = 1;
+        genuine_legacy_marker.code_hash = hash_bytes(b"historical-worker");
+        genuine_legacy_marker.storage_root = hash_bytes(b"historical-output");
+        state
+            .accounts
+            .insert(legacy_job_marker.0, genuine_legacy_marker);
+        let legacy_replay = state
+            .validate_v3_transaction_admission(&reward)
+            .unwrap_err();
+        assert!(
+            legacy_replay
+                .to_string()
+                .contains("legacy marker semantics")
+        );
+
+        // A pre-upgrade ordinary transfer could only create a balance-bearing
+        // EOA at the old predictable hash. It must not permanently suppress
+        // the protected v3 marker and cannot be overwritten by reward state.
+        state
+            .accounts
+            .insert(legacy_job_marker.0, Account::new(legacy_job_marker, 1));
+        state
+            .validate_v3_transaction_admission(&reward)
+            .expect("0x25 outer nonce is not account-nonce admission");
 
         let supply_before = sum_all_balances(&state);
         state.execute_tx(&reward).unwrap();
+        let v3_job_marker = arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+            &reward_body.chain_domain,
+            &reward_body.job_id,
+        );
+        assert!(is_reserved_system_account(&v3_job_marker));
+        assert!(state.get_account(&v3_job_marker).is_some());
+        assert_eq!(
+            state.get_account(&legacy_job_marker).unwrap().balance,
+            1,
+            "v3 must neither trust nor overwrite a pre-dusted legacy marker key"
+        );
         assert_eq!(
             state.get_account(&worker.address()).unwrap().balance,
             REWARD
         );
         assert_eq!(state.get_account(&treasury).unwrap().balance, REWARD);
+        assert_eq!(
+            state.get_account(&validators[0].address()).unwrap().nonce,
+            coordinator_nonce_before,
+            "0x25 execution must not consume the coordinator account nonce"
+        );
         assert_eq!(sum_all_balances(&state), supply_before);
 
         let status = state.community_reward_budget_status(
