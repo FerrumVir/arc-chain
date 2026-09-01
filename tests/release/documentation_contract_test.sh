@@ -612,6 +612,17 @@ factual_candidate_copy_matches_source_and_release_gates() {
 
 hardened_canary_and_vault_commands_match_current_parsers() {
     local file help option
+    for literal in \
+        'FileVault-protected directory' \
+        'dedicated AES-256 encrypted APFS image' \
+        'Encryption = AES-256' \
+        'Properties.Encrypted = 1' \
+        'An unencrypted host must never stage the artifact outside that mounted volume'
+    do
+        require_literal "$ROLLOUT" "$literal" \
+            'signing-key backup runbook omits its encrypted-at-rest staging boundary' \
+            || return 1
+    done
     help="$(python3 "$CANARY_HELPER" plan --help)" || return 1
     for option in \
         --raw-actions-zip --model --expected-commit --expected-run-id \
@@ -1203,7 +1214,8 @@ PY
         for literal in \
             'export PATH=/secure/operator/tools:/usr/bin:/bin' \
             '/etc/ssl/certs/ca-certificates.crt' \
-            '6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238' \
+            'ecd9dc38bc3efb7dbd6431f57e29d2f8d6a0f0d211e1464b3fef2cbfe266fcd2' \
+            '74b4ce8f74b377f18ef1b3df7279c26cb3cd14c49e39ab1498575b209dc3f70f' \
             '/secure/operator/tools/openssl-3.0.13' \
             '724acbe911513d13f52bae0b8969b20336cd8618fc67898a6bf7847bf1a270ad' \
             '/secure/operator/tools/libssl.so.3' \
@@ -1215,7 +1227,7 @@ PY
             '/secure/operator/tools/scp' \
             '92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144' \
             '/usr/bin/python3.12' \
-            '8295ee25cfdb239f3e165afceda7f46de73e2b606ff0e2e3d8623e3facd30acc' \
+            '1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118' \
             '.artifacts["linux-x86_64"].headless.id' \
             '/secure/operator/arc-v0.8-validator-restore/validator-public-keys.json'
         do
@@ -1242,7 +1254,16 @@ PY
         '750000000000-byte (750 GB decimal)' \
         'https://developers.google.com/workspace/drive/api/guides/limits' \
         'I ATTEST 700000000000 BYTES REMAIN AND ARC IS THE ONLY DRIVE UPLOAD WRITER THIS QUOTA WINDOW' \
-        '51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb' \
+        'a23c8863860669003dc4660039fe642f5795c8c2195898ebc5d01afa1ac3d11c' \
+        '3b0701113d8982d71c8cc74e5a1949f03c6f71da804cf4f3507315afbf07042c' \
+        '27421348ac188f7381634ce1d521fe9fe774c75cab0d0d2086a052c9bac2da4b' \
+        '74b4ce8f74b377f18ef1b3df7279c26cb3cd14c49e39ab1498575b209dc3f70f' \
+        'systemctl mask --runtime --now' \
+        '3.12.3-1ubuntu0.15' \
+        '1:9.6p1-3ubuntu13.18' \
+        '8.5.0-2ubuntu10.13' \
+        '20260601~24.04.1' \
+        '2.39.3-9ubuntu6.6' \
         'checkout --detach "$protected_main_sha"' \
         'status --porcelain=v1 --untracked-files=all' \
         '.github/workflows/validator-vault-rewrap.yml' \

@@ -4519,6 +4519,7 @@ const DESKTOP_SHUTDOWN_FILE_MAX_BYTES: u64 = 256;
 struct DesktopShutdownControl {
     request_file: PathBuf,
     expected_token: [u8; 32],
+    armed_receipt_nonce: [u8; 32],
     data_dir: PathBuf,
     executable: PathBuf,
     genesis: PathBuf,
@@ -4556,6 +4557,7 @@ impl Drop for DesktopShutdownReceiptIdentity {
 impl Drop for DesktopShutdownControl {
     fn drop(&mut self) {
         self.expected_token.zeroize();
+        self.armed_receipt_nonce.zeroize();
     }
 }
 
@@ -4633,20 +4635,20 @@ fn prepare_desktop_shutdown_control(
         .context("failed to resolve the running node executable for shutdown receipt binding")?
         .canonicalize()
         .context("failed to canonicalize the running node executable")?;
-    ensure!(
-        arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
-            &canonical_data_dir,
-            &expected_token,
-            &executable,
-            &genesis,
-        )
-        .context("failed to validate the supervisor's desktop shutdown receipt")?
-        .is_some(),
-        "desktop-managed node startup requires a prearmed durable shutdown receipt"
-    );
+    let armed_receipt_nonce = arc_crypto::secret_file::load_desktop_shutdown_receipt_nonce(
+        &canonical_data_dir,
+        &expected_token,
+        &executable,
+        &genesis,
+    )
+    .context("failed to validate the supervisor's desktop shutdown receipt")?
+    .ok_or_else(|| {
+        anyhow::anyhow!("desktop-managed node startup requires a prearmed durable shutdown receipt")
+    })?;
     Ok(Some(DesktopShutdownControl {
         request_file: control_dir.join(DESKTOP_SHUTDOWN_REQUEST_FILE_NAME),
         expected_token,
+        armed_receipt_nonce,
         data_dir: canonical_data_dir,
         executable,
         genesis,
@@ -4749,15 +4751,16 @@ fn take_authenticated_desktop_shutdown_request(
             receipt_nonce.zeroize();
             return Ok(None);
         }
+        // `prepare_desktop_shutdown_control` already validated that this
+        // exact nonce binds the private capability, executable bytes, genesis
+        // bytes, and canonical data directory before the watcher was armed.
+        // Compare against that validated nonce here instead of synchronously
+        // re-hashing a large executable on the lifecycle worker: otherwise a
+        // shutdown request waiting at the startup lock can lose the race to
+        // network admission on slow disks. The final WAL-safe acknowledgement
+        // independently revalidates the durable receipt before it is written.
         ensure!(
-            arc_crypto::secret_file::validate_desktop_shutdown_receipt(
-                &control.data_dir,
-                &control.expected_token,
-                &receipt_nonce,
-                &control.executable,
-                &control.genesis,
-            )
-            .context("desktop shutdown request does not bind a valid durable receipt")?,
+            constant_time_token_eq(&control.armed_receipt_nonce, &receipt_nonce),
             "desktop shutdown request has no armed durable receipt"
         );
         Ok(Some(DesktopShutdownReceiptIdentity {
@@ -7849,6 +7852,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(!control.request_file.exists());
+
+        let mut wrong_nonce = arm.nonce;
+        wrong_nonce[31] ^= 1;
+        write_test_desktop_shutdown_request(
+            &control.request_file,
+            std::process::id(),
+            &token,
+            &wrong_nonce,
+        );
+        assert!(take_authenticated_desktop_shutdown_request(&control).is_err());
         assert!(!control.request_file.exists());
 
         write_test_desktop_shutdown_request(

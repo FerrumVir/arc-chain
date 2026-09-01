@@ -1615,6 +1615,29 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_private_directory_keeps_owned_chain_descendants_accessible() {
+        let root = TestDir::new("windows-private-descendant-inheritance");
+        let private_directory = root.0.join("private-app-data");
+        create_new_private_directory(&private_directory).unwrap();
+
+        // Chain directories are intentionally ordinary filesystem objects,
+        // not secret-file primitives. They must inherit the same narrow trust
+        // set so a hardened app-data parent cannot strand preserved WAL bytes
+        // behind an empty/non-inheritable DACL.
+        let chain_directory = private_directory.join("data-v3");
+        std::fs::create_dir(&chain_directory).unwrap();
+        let wal = chain_directory.join("state.wal");
+        std::fs::write(&wal, b"preserved ARC chain history").unwrap();
+        assert_eq!(std::fs::read(&wal).unwrap(), b"preserved ARC chain history");
+        assert!(
+            std::fs::symlink_metadata(&chain_directory)
+                .unwrap()
+                .is_dir()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_owner_policy_rejects_every_sid_outside_the_explicit_trust_set() {
         let user = "S-1-5-21-111-222-333-1001";
         assert!(platform::owner_policy_accepts_for_test(user, user).unwrap());
@@ -1809,7 +1832,17 @@ mod platform {
         // built-in Administrators group, not its TOKEN_USER SID. Pin the owner
         // explicitly so every newly created ARC secret remains owned by the
         // exact account even when the process is elevated.
-        let sddl = format!("O:{user_text}D:P(A;;FA;;;{user_text})(A;;FA;;;SY)(A;;FA;;;BA)");
+        // Keep the private trust boundary inheritable inside app-owned
+        // directories. Without OI/CI, tightening an existing Windows app
+        // data directory leaves subsequently created ordinary descendants
+        // (for example `data-v3` and its WAL) with no usable inherited ACEs;
+        // the creating account can then receive ERROR_ACCESS_DENIED when it
+        // reopens its own chain history. Inheritance does not widen trust:
+        // only the exact user, LocalSystem, and Administrators receive the
+        // full-control ACEs, and every secret file/directory created by this
+        // module is still born with its own protected DACL and revalidated.
+        let sddl =
+            format!("O:{user_text}D:P(A;OICI;FA;;;{user_text})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
         let sddl = wide(std::ffi::OsStr::new(&sddl))?;
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         // SAFETY: input is NUL-terminated and output receives a LocalAlloc

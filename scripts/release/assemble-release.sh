@@ -72,8 +72,9 @@ REPOSITORY_ROOT="$(pwd -P)"
 OUTPUT_OWNER_RECEIPT="$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-release-output-owner"
 EXPECTED_OWNER_RECEIPT="arc-release-output-v1:$FINAL_OUTPUT_DIR"
 if [ -e "$OUTPUT_OWNER_RECEIPT" ]; then
-    [ -f "$OUTPUT_OWNER_RECEIPT" ] && [ ! -L "$OUTPUT_OWNER_RECEIPT" ] \
-        || die "invalid OUTPUT_DIR ownership receipt: $OUTPUT_OWNER_RECEIPT"
+    if [ ! -f "$OUTPUT_OWNER_RECEIPT" ] || [ -L "$OUTPUT_OWNER_RECEIPT" ]; then
+        die "invalid OUTPUT_DIR ownership receipt: $OUTPUT_OWNER_RECEIPT"
+    fi
     [ "$(cat -- "$OUTPUT_OWNER_RECEIPT")" = "$EXPECTED_OWNER_RECEIPT" ] \
         || die "OUTPUT_DIR ownership receipt does not match destination"
 fi

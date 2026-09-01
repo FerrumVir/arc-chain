@@ -331,6 +331,31 @@ test "$(uname -m)" = x86_64
 test "$(id -u)" = 0
 umask 077
 export PATH=/secure/operator/tools:/usr/bin:/bin
+
+# Keep the reviewed Ubuntu package/runtime bytes stable for the complete
+# recovery window. These are runtime-only masks: a reboot clears them, after
+# which every hash check below must be repeated before work resumes.
+if /usr/bin/pgrep -a -f '(^|/)(apt|apt-get|dpkg|unattended-upgrade)( |$)'; then
+  echo 'package mutation is already running; preserve state and stop' >&2
+  exit 1
+fi
+operator_package_units=(
+  apt-daily.service apt-daily-upgrade.service
+  apt-daily.timer apt-daily-upgrade.timer
+  unattended-upgrades.service
+)
+/usr/bin/systemctl mask --runtime --now "${operator_package_units[@]}"
+/usr/bin/systemctl reset-failed apt-daily.timer apt-daily-upgrade.timer
+for unit in "${operator_package_units[@]}"; do
+  test "$(/usr/bin/systemctl show --value --property=LoadState "$unit")" = masked
+  test "$(/usr/bin/systemctl show --value --property=ActiveState "$unit")" = inactive
+  test "$(/usr/bin/systemctl show --value --property=UnitFileState "$unit")" = masked-runtime
+done
+test "$(/usr/bin/dpkg-query -W python3.12-minimal | /usr/bin/cut -f 2)" = 3.12.3-1ubuntu0.15
+test "$(/usr/bin/dpkg-query -W openssh-client | /usr/bin/cut -f 2)" = 1:9.6p1-3ubuntu13.18
+test "$(/usr/bin/dpkg-query -W curl | /usr/bin/cut -f 2)" = 8.5.0-2ubuntu10.13
+test "$(/usr/bin/dpkg-query -W ca-certificates | /usr/bin/cut -f 2)" = 20260601~24.04.1
+test "$(/usr/bin/dpkg-query -W util-linux | /usr/bin/cut -f 2)" = 2.39.3-9ubuntu6.6
 protected_main_sha='<exact 40-character protected-main SHA after merge>'
 pretag_run_id='<exact successful release-signing-preflight run ID>'
 pretag_run_attempt='<exact successful run attempt>'
@@ -347,14 +372,20 @@ arc_sha256() {
 }
 export ARC_RECOVERY_SSH_USER=root
 export ARC_RECOVERY_PYTHON_PATH=/usr/bin/python3.12
-export ARC_RECOVERY_PYTHON_SHA256=8295ee25cfdb239f3e165afceda7f46de73e2b606ff0e2e3d8623e3facd30acc
+export ARC_RECOVERY_PYTHON_SHA256=1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118
 test -f "$ARC_RECOVERY_PYTHON_PATH" && test ! -L "$ARC_RECOVERY_PYTHON_PATH"
 export ARC_RECOVERY_SSH_KNOWN_HOSTS=/secure/operator/arc-validator-known-hosts
 export ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256=97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d
 export ARC_RECOVERY_SSH_IDENTITY=/secure/operator/arc-validator-maintenance-ed25519
 export ARC_RECOVERY_SSH_IDENTITY_SHA256=9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a
-export ARC_RECOVERY_SSH_SHA256=47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6
-export ARC_RECOVERY_SCP_SHA256=92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144
+# Capture and fresh stopped-status proofs deliberately use the current
+# package-verified /usr/bin transport. Validator-vault installation retains
+# the separately reviewed immutable copies under /secure/operator/tools; do
+# not reuse one hash for these now-distinct byte identities.
+export ARC_RECOVERY_SSH_SHA256=3b0701113d8982d71c8cc74e5a1949f03c6f71da804cf4f3507315afbf07042c
+export ARC_RECOVERY_SCP_SHA256=27421348ac188f7381634ce1d521fe9fe774c75cab0d0d2086a052c9bac2da4b
+export ARC_RESTORE_SSH_SHA256=47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6
+export ARC_RESTORE_SCP_SHA256=92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144
 export ARC_RECOVERY_RCLONE_PATH=/secure/operator/tools/rclone
 export ARC_RECOVERY_RCLONE_SHA256=f3f9aff817f9766029e50adf9a7963c169e475b8f10c7927823568a0d9443db7
 export ARC_RECOVERY_RCLONE_CONFIG=/secure/operator/rclone-arc.conf
@@ -495,9 +526,9 @@ printf '%s  %s\n' "$ARC_RECOVERY_SSH_SHA256" /usr/bin/ssh \
   | /usr/bin/sha256sum --check --strict
 printf '%s  %s\n' "$ARC_RECOVERY_SCP_SHA256" /usr/bin/scp \
   | /usr/bin/sha256sum --check --strict
-printf '%s  %s\n' "$ARC_RECOVERY_SSH_SHA256" /secure/operator/tools/ssh \
+printf '%s  %s\n' "$ARC_RESTORE_SSH_SHA256" /secure/operator/tools/ssh \
   | /usr/bin/sha256sum --check --strict
-printf '%s  %s\n' "$ARC_RECOVERY_SCP_SHA256" /secure/operator/tools/scp \
+printf '%s  %s\n' "$ARC_RESTORE_SCP_SHA256" /secure/operator/tools/scp \
   | /usr/bin/sha256sum --check --strict
 printf '%s  %s\n' "$ARC_RECOVERY_RCLONE_SHA256" "$ARC_RECOVERY_RCLONE_PATH" \
   | /usr/bin/sha256sum --check --strict
@@ -890,8 +921,8 @@ enclave. Any digest mismatch stops before CMS decryption.
 ```bash
 ARC_PROOF_CURL=/usr/bin/curl
 ARC_PROOF_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-ARC_PROOF_CURL_SHA256=da9cc597d6473e31d7e3f4d5e2198509010164b48be96e97b87b788655146631
-ARC_PROOF_CA_BUNDLE_SHA256=6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238
+ARC_PROOF_CURL_SHA256=74b4ce8f74b377f18ef1b3df7279c26cb3cd14c49e39ab1498575b209dc3f70f
+ARC_PROOF_CA_BUNDLE_SHA256=ecd9dc38bc3efb7dbd6431f57e29d2f8d6a0f0d211e1464b3fef2cbfe266fcd2
 printf '%s  %s\n' "$ARC_PROOF_CURL_SHA256" "$ARC_PROOF_CURL" \
   | /usr/bin/sha256sum --check --strict
 printf '%s  %s\n' "$ARC_PROOF_CA_BUNDLE_SHA256" "$ARC_PROOF_CA_BUNDLE" \
@@ -1144,9 +1175,9 @@ printf '%s  %s\n' "$ssh_identity_sha256" "$ssh_identity" \
   --ssh-identity "$ssh_identity" \
   --ssh-identity-sha256 "$ssh_identity_sha256" \
   --ssh /secure/operator/tools/ssh \
-  --ssh-sha256 47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6 \
+  --ssh-sha256 "$ARC_RESTORE_SSH_SHA256" \
   --scp /secure/operator/tools/scp \
-  --scp-sha256 92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144 \
+  --scp-sha256 "$ARC_RESTORE_SCP_SHA256" \
   --receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json
 ```
 
@@ -1372,8 +1403,8 @@ directory until final archive verification completes.
 ```bash
 system_curl=/usr/bin/curl
 system_ca_bundle=/etc/ssl/certs/ca-certificates.crt
-system_curl_sha256=da9cc597d6473e31d7e3f4d5e2198509010164b48be96e97b87b788655146631
-system_ca_bundle_sha256=6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238
+system_curl_sha256=74b4ce8f74b377f18ef1b3df7279c26cb3cd14c49e39ab1498575b209dc3f70f
+system_ca_bundle_sha256=ecd9dc38bc3efb7dbd6431f57e29d2f8d6a0f0d211e1464b3fef2cbfe266fcd2
 printf '%s  %s\n' "$system_curl_sha256" "$system_curl" \
   | /usr/bin/sha256sum --check --strict
 printf '%s  %s\n' "$system_ca_bundle_sha256" "$system_ca_bundle" \
@@ -1616,7 +1647,7 @@ set -Eeuo pipefail
 umask 077
 unset GH_TOKEN
 signing_unshare=/usr/bin/unshare
-signing_unshare_sha256=51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb
+signing_unshare_sha256=a23c8863860669003dc4660039fe642f5795c8c2195898ebc5d01afa1ac3d11c
 test -f "$signing_unshare" && test ! -L "$signing_unshare"
 printf '%s  %s\n' "$signing_unshare_sha256" "$signing_unshare" \
   | /usr/bin/sha256sum --check --strict
@@ -2287,6 +2318,27 @@ frontend_config=/secure/operator/arc-network.recovered.json
 ```
 
 <!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->
+
+Keep the runtime package-mutation masks in place through the immutable tag,
+six-validator restart proof, public frontend hash proof, and installer/update
+canaries. Only after all of those gates are green, restore the operator VM's
+normal security-update schedule and prove the three enabled units are active:
+
+```bash
+/usr/bin/systemctl unmask --runtime "${operator_package_units[@]}"
+/usr/bin/systemctl reset-failed "${operator_package_units[@]}"
+/usr/bin/systemctl start apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service
+for unit in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+  test "$(/usr/bin/systemctl show --value --property=LoadState "$unit")" = loaded
+  test "$(/usr/bin/systemctl show --value --property=ActiveState "$unit")" = active
+  test "$(/usr/bin/systemctl show --value --property=UnitFileState "$unit")" = enabled
+done
+```
+
+If the enclave reboots before that point, the runtime masks disappear by
+design. Do not recreate them and continue from remembered values: rerun every
+preceding read-only package-version, file-hash, artifact, and remote-state
+proof first.
 
 An air-gapped review may instead supply both `--archive-manifest` and
 `--archive-complete`; they must be canonical mode-read-only files matching the

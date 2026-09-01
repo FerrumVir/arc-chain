@@ -271,14 +271,14 @@ set -Eeuo pipefail
 umask 077
 export PATH=/secure/operator/tools:/usr/bin:/bin
 export ARC_RECOVERY_PYTHON_PATH=/usr/bin/python3.12
-export ARC_RECOVERY_PYTHON_SHA256=8295ee25cfdb239f3e165afceda7f46de73e2b606ff0e2e3d8623e3facd30acc
+export ARC_RECOVERY_PYTHON_SHA256=1643dacd9feaedc58f3cc581e4d22577dfe25c09b10282936186ccf0f2e61118
 test -f "$ARC_RECOVERY_PYTHON_PATH" && test ! -L "$ARC_RECOVERY_PYTHON_PATH"
 printf '%s  %s\n' "$ARC_RECOVERY_PYTHON_SHA256" "$ARC_RECOVERY_PYTHON_PATH" \
   | /usr/bin/sha256sum --check --strict
 export ARC_PROOF_CURL='/usr/bin/curl'
 export ARC_PROOF_CA_BUNDLE='/etc/ssl/certs/ca-certificates.crt'
-export ARC_PROOF_CURL_SHA256=da9cc597d6473e31d7e3f4d5e2198509010164b48be96e97b87b788655146631
-export ARC_PROOF_CA_BUNDLE_SHA256=6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238
+export ARC_PROOF_CURL_SHA256=74b4ce8f74b377f18ef1b3df7279c26cb3cd14c49e39ab1498575b209dc3f70f
+export ARC_PROOF_CA_BUNDLE_SHA256=ecd9dc38bc3efb7dbd6431f57e29d2f8d6a0f0d211e1464b3fef2cbfe266fcd2
 printf '%s  %s\n' "$ARC_PROOF_CURL_SHA256" "$ARC_PROOF_CURL" \
   | /usr/bin/sha256sum --check --strict
 printf '%s  %s\n' "$ARC_PROOF_CA_BUNDLE_SHA256" "$ARC_PROOF_CA_BUNDLE" \
@@ -530,11 +530,15 @@ setting is repaired.
   is permitted. Before dispatch,
   disable administrator bypass and self-review on the `release` environment
   and require a distinct trusted reviewer. The artifact name binds protected
-  `main`, run/attempt, and its ciphertext SHA-256. Download it into a
-  FileVault-protected directory, set it mode 0600, and verify the published
-  exact-main/run/attempt identity, ciphertext SHA-256, and public-key
-  fingerprints. Operators must not run a repository backup/restore script or
-  expose the passphrase to a checkout. The protected job clears the passphrase,
+  `main`, run/attempt, and its ciphertext SHA-256. Download it into either a
+  FileVault-protected directory or a dedicated AES-256 encrypted APFS image
+  whose distinct unlock secret is held in macOS Keychain separately from the
+  image, set the ciphertext mode 0600, and verify the mounted image reports
+  `Encryption = AES-256` and `Properties.Encrypted = 1` before accepting the
+  published exact-main/run/attempt identity, ciphertext SHA-256, and public-key
+  fingerprints. An unencrypted host must never stage the artifact outside that mounted volume.
+  Operators must not run a repository backup/restore script or
+  expose either passphrase to a checkout. The protected job clears the passphrase,
   shreds both plaintext key files, and only then allows repository verification
   code to run against public outputs. Copy only the
   ciphertext to ARC Drive and a second independent recovery medium, then
