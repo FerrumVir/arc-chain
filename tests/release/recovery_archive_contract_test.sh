@@ -1180,7 +1180,9 @@ readiness_without_dispatch_does_not_bind_stale_selection() (
     local f attempt
     f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
     attempt="$f/round-1/attempt.crash-before-dispatch"
-    mkdir -m 700 -p "$attempt/authorization-acceptances" \
+    mkdir -p -- "$attempt/authorization-acceptances" \
+        "$attempt/node-transitions"
+    chmod 700 "$attempt/authorization-acceptances" \
         "$attempt/node-transitions"
     printf '{}\n' > "$attempt/authorization.json"
     printf '{}\n' > "$attempt/authorization-acceptances/nyc.json"
@@ -1232,7 +1234,10 @@ local_create_only_post_link_crashes_are_reconciled_before_resume() (
     maintenance="$f/maintenance-inputs"
     rounds="$maintenance/quarantine-rounds"
     quarantine="$maintenance/network-quarantine"
-    mkdir -m 700 -p \
+    mkdir -p -- \
+        "$rounds/round-1/attempt.crash/authorization-acceptances" \
+        "$rounds/round-1/attempt.crash/node-transitions" "$quarantine"
+    chmod 700 \
         "$rounds/round-1/attempt.crash/authorization-acceptances" \
         "$rounds/round-1/attempt.crash/node-transitions" "$quarantine"
     for path in \
@@ -1301,7 +1306,8 @@ positive_round_result_resume_is_byte_identical() (
     rounds="$maintenance/quarantine-rounds"
     attempt="$rounds/round-1/attempt.positive"
     result="$attempt/result.json"
-    mkdir -m 700 -p "$attempt/node-transitions"
+    mkdir -p -- "$attempt/node-transitions"
+    chmod 700 "$attempt/node-transitions"
     first="$(PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
         "$attempt" "$rounds" <<'PY'
 import pathlib,sys,types
@@ -1391,7 +1397,8 @@ positive_partial_waits_for_late_transition_before_sealing() (
     f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
     rounds="$f/quarantine-rounds"
     attempt="$rounds/round-1/attempt.late-sixth"
-    mkdir -m 700 -p "$attempt/node-transitions"
+    mkdir -p -- "$attempt/node-transitions"
+    chmod 700 "$attempt/node-transitions"
     PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
         "$attempt" "$rounds" <<'PY' || return 1
 import pathlib
@@ -1513,7 +1520,8 @@ sealed_partial_resume_skips_old_attempt_status() (
     attempt="$rounds/round-1/attempt.partial"
     log_root="$f/logs"
     marker="$f/old-attempt-status-called"
-    mkdir -m 700 -p "$attempt/node-transitions" "$log_root"
+    mkdir -p -- "$attempt/node-transitions" "$log_root"
+    chmod 700 "$attempt/node-transitions" "$log_root"
     read -r freeze capture sealed_sha < <(
         PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
             "$attempt" "$rounds" "$f/late-sixth.json" <<'PY'
@@ -1613,7 +1621,8 @@ zero_progress_result_never_enters_immutable_prefix() (
     attempt="$rounds/round-1/attempt.zero"
     log_root="$f/logs"
     marker="$f/remote-called"
-    mkdir -m 700 -p "$attempt/node-transitions" "$log_root"
+    mkdir -p -- "$attempt/node-transitions" "$log_root"
+    chmod 700 "$attempt/node-transitions" "$log_root"
     read -r freeze capture < <(
         PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
             "$attempt" "$rounds" <<'PY'
@@ -1663,8 +1672,9 @@ released_zero_progress_attempt_does_not_bind_rotated_selection() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
     local f attempt freeze capture
-    f="$(mktemp -d)";trap "rm -rf -- '$f'" EXIT
-    attempt="$f/round-1/attempt.released";mkdir -m 700 -p "$attempt/node-transitions"
+    f="$(mktemp -d)";trap 'rm -rf -- "$f"' EXIT
+    attempt="$f/round-1/attempt.released";mkdir -p -- "$attempt/node-transitions"
+    chmod 700 "$attempt/node-transitions"
     freeze="$(printf '0%.0s' {1..63})2";capture="$(printf '0%.0s' {1..63})1"
     PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - "$attempt" <<'PY' || return 1
 import datetime,hashlib,json,pathlib,sys
