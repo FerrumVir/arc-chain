@@ -2628,6 +2628,10 @@ if not isinstance(receipt, dict) or set(receipt) != set(expected_top) | {
     "legacy_height_cross_proof", "legacy_maintenance_boundary",
     "legacy_maintenance_boundary_sha256",
     "legacy_maintenance_evidence_bundle_sha256",
+    "legacy_live_observation_selection_sha256",
+    "legacy_live_observation_generation",
+    "observation_generation_receipt_sha256",
+    "drive_prefreeze_receipt_sha256",
     "quarantine_generation_ledger_sha256", "nodes"
 }:
     raise SystemExit("offline-stop evidence fields differ")
@@ -2692,6 +2696,14 @@ if (not isinstance(boundary, dict)
             != receipt.get("legacy_maintenance_evidence_bundle_sha256")
         or boundary.get("quarantine_generation_ledger_sha256")
             != receipt.get("quarantine_generation_ledger_sha256")
+        or boundary.get("legacy_live_observation_selection_sha256")
+            != receipt.get("legacy_live_observation_selection_sha256")
+        or boundary.get("legacy_live_observation_generation")
+            != receipt.get("legacy_live_observation_generation")
+        or boundary.get("observation_generation_receipt_sha256")
+            != receipt.get("observation_generation_receipt_sha256")
+        or boundary.get("drive_prefreeze_receipt_sha256")
+            != receipt.get("drive_prefreeze_receipt_sha256")
         or boundary.get("source_main_commit") != plan.get("source_commit")
         or boundary.get("freeze_plan_sha256") != freeze_sha
         or boundary.get("capture_id") != capture
@@ -3259,6 +3271,8 @@ boundary_fields = {
     "first_quarantine_started_at", "all_controlled_stopped_at", "created_at",
     "official_origin_scope", "legacy_public_height_receipt",
     "authenticated_prefence_height_cross_proof_sha256",
+    "legacy_live_observation_selection_sha256", "legacy_live_observation_generation",
+    "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
     "quarantine_generation_ledger_sha256",
     "legacy_maintenance_evidence_bundle_sha256", "network_quarantine_challenge",
     "network_quarantine_stability_proof_sha256",
@@ -3297,6 +3311,18 @@ if (boundary_sidecar.is_symlink() or not stat.S_ISREG(boundary_sidecar_details.s
     raise SystemExit("offline-stop maintenance-boundary sidecar differs")
 
 bundle_sha = digest(bundle_payload)
+selection_sealed = bundle.get("live_observation_selection")
+if (not isinstance(selection_sealed, dict) or set(selection_sealed) != {"value", "sha256"}
+        or not isinstance(selection_sealed.get("value"), dict)
+        or digest(canonical(selection_sealed["value"])) != selection_sealed.get("sha256")
+        or boundary.get("legacy_live_observation_selection_sha256") != selection_sealed["sha256"]
+        or boundary.get("legacy_live_observation_generation")
+            != selection_sealed["value"].get("observation_generation")
+        or boundary.get("observation_generation_receipt_sha256")
+            != selection_sealed["value"].get("observation_generation_receipt_sha256")
+        or boundary.get("drive_prefreeze_receipt_sha256")
+            != selection_sealed["value"].get("drive_prefreeze_receipt_sha256")):
+    raise SystemExit("offline-stop live-observation selection differs")
 bundle_sidecar = maintenance_evidence_bundle_path.with_name(
     maintenance_evidence_bundle_path.name + ".sha256"
 )
@@ -3333,6 +3359,12 @@ value = {
     "legacy_maintenance_boundary": boundary,
     "legacy_maintenance_boundary_sha256": boundary_sha,
     "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
+    "legacy_live_observation_selection_sha256": selection_sealed["sha256"],
+    "legacy_live_observation_generation": selection_sealed["value"]["observation_generation"],
+    "observation_generation_receipt_sha256":
+        selection_sealed["value"]["observation_generation_receipt_sha256"],
+    "drive_prefreeze_receipt_sha256":
+        selection_sealed["value"]["drive_prefreeze_receipt_sha256"],
     "quarantine_generation_ledger_sha256":
         bundle["quarantine_generation_ledger"]["sha256"],
     "nodes": receipt_nodes,
@@ -3413,7 +3445,15 @@ if (raw!=canonical(bundle) or bundle.get("schema")!="arc.recovery.legacy-mainten
         or evidence.get("legacy_maintenance_boundary",{}).get("legacy_maintenance_evidence_bundle_sha256")
             !=evidence.get("legacy_maintenance_evidence_bundle_sha256")
         or bundle.get("quarantine_generation_ledger",{}).get("sha256")
-            !=evidence.get("quarantine_generation_ledger_sha256")):
+            !=evidence.get("quarantine_generation_ledger_sha256")
+        or bundle.get("live_observation_selection",{}).get("sha256")
+            !=evidence.get("legacy_live_observation_selection_sha256")
+        or bundle.get("live_observation_selection",{}).get("value",{}).get("observation_generation")
+            !=evidence.get("legacy_live_observation_generation")
+        or bundle.get("live_observation_selection",{}).get("value",{}).get("observation_generation_receipt_sha256")
+            !=evidence.get("observation_generation_receipt_sha256")
+        or bundle.get("live_observation_selection",{}).get("value",{}).get("drive_prefreeze_receipt_sha256")
+            !=evidence.get("drive_prefreeze_receipt_sha256")):
     raise SystemExit("fresh remote verification maintenance evidence bundle differs")
 PY
     local persisted_binary_sha persisted_genesis_sha persisted_validators_sha persisted_legacy_sha
@@ -3537,9 +3577,1176 @@ PY
         "$expected_sha"
 )
 
+reserve_live_observation_generation() {
+    local root="$1" selected="$2" drive_receipt="$3" freeze_plan="$4"
+    local freeze_sha="$5" capture_id="$6" resume_state="$7"
+    python3 - "$root" "$selected" "$drive_receipt" "$freeze_plan" \
+        "$freeze_sha" "$capture_id" "$resume_state" <<'PY'
+import datetime, fcntl, hashlib, json, os, pathlib, re, secrets, stat, sys
+
+root, selected, drive_path, plan_path = map(pathlib.Path, sys.argv[1:5])
+freeze_sha, capture_id, resume_state = sys.argv[5:]
+canonical = lambda value: (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+digest = lambda raw: hashlib.sha256(raw).hexdigest()
+hash_re = re.compile(r"[0-9a-f]{64}")
+utc_format = "%Y-%m-%dT%H:%M:%S.%fZ"
+maximum_age = 300
+
+def locked(path, label, modes={0o400}, maximum=4 * 1024 * 1024, links={1}):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or pathlib.Path(path).is_symlink()
+                or before.st_uid != os.geteuid() or before.st_nlink not in links
+                or stat.S_IMODE(before.st_mode) not in modes
+                or not 0 < before.st_size <= maximum):
+            raise SystemExit(f"live-observation {label} is unsafe")
+        raw = os.read(fd, maximum + 1)
+        if len(raw) != before.st_size:
+            raise SystemExit(f"live-observation {label} changed while read")
+        return raw
+    finally:
+        os.close(fd)
+
+if (any(hash_re.fullmatch(value) is None for value in (freeze_sha, capture_id))
+        or resume_state not in {"bound", "unbound"}):
+    raise SystemExit("live-observation generation capture identity is malformed")
+plan_raw = locked(plan_path, "freeze plan", {0o400, 0o600}, 16 * 1024 * 1024)
+plan = json.loads(plan_raw)
+if (digest(plan_raw) != freeze_sha or canonical(plan) != plan_raw
+        or plan.get("schema") != "arc.recovery.freeze-plan.v5"):
+    raise SystemExit("live-observation generation freeze plan differs")
+source_commit = plan.get("source_commit")
+if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+    raise SystemExit("live-observation generation source commit differs")
+
+parent = root.parent
+details = parent.lstat()
+if (parent.is_symlink() or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid() or details.st_mode & 0o022):
+    raise SystemExit("live-observation generation parent is unsafe")
+if root.exists() or root.is_symlink():
+    details = root.lstat()
+    if root.is_symlink() or not stat.S_ISDIR(details.st_mode) \
+            or details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o700:
+        raise SystemExit("live-observation generation root is unsafe")
+else:
+    os.mkdir(root, 0o700)
+    dfd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+
+lock_path = root / ".generation.lock"
+lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+def validate_generation(path):
+    partial_match = re.fullmatch(r"\.([0-9a-f]{64})\.json\.partial", path.name)
+    raw = locked(path, "generation receipt", {0o400, 0o600}, links={1, 2})
+    value = json.loads(raw)
+    expected = {
+        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+        "observation_generation", "created_at", "max_selection_age_seconds",
+        "drive_prefreeze_receipt",
+    }
+    if (raw != canonical(value) or set(value) != expected
+            or value.get("schema") != "arc.recovery.legacy-live-observation-generation.v1"
+            or (value.get("source_main_commit"), value.get("freeze_plan_sha256"), value.get("capture_id"))
+                != (source_commit, freeze_sha, capture_id)
+            or hash_re.fullmatch(str(value.get("observation_generation"))) is None
+            or value.get("max_selection_age_seconds") != maximum_age
+            or path.name not in {value["observation_generation"] + ".json",
+                                 "." + value["observation_generation"] + ".json.partial"}
+            or (partial_match is not None
+                and partial_match.group(1) != value["observation_generation"])):
+        raise SystemExit("live-observation generation receipt identity differs")
+    datetime.datetime.strptime(value["created_at"], utc_format)
+    drive = value.get("drive_prefreeze_receipt")
+    if (not isinstance(drive, dict) or set(drive) != {"path", "sha256", "value"}
+            or not isinstance(drive.get("path"), str) or not drive["path"].startswith("/")
+            or hash_re.fullmatch(str(drive.get("sha256"))) is None
+            or digest(canonical(drive.get("value"))) != drive["sha256"]):
+        raise SystemExit("live-observation generation Drive binding differs")
+    return value, raw
+
+# Complete an interrupted durable partial -> no-replace hard-link publish.
+# A crash after link but before unlink leaves one inode with nlink=2; that is
+# an explicit recoverable intermediate, never a malformed final receipt.
+for partial in sorted(root.glob(".*.json.partial")):
+    try:
+        partial_value, partial_raw = validate_generation(partial)
+    except (OSError, ValueError, json.JSONDecodeError, SystemExit):
+        try: details = partial.lstat()
+        except OSError: continue
+        if (not partial.is_symlink() and stat.S_ISREG(details.st_mode)
+                and details.st_uid == os.geteuid() and details.st_nlink == 1
+                and stat.S_IMODE(details.st_mode) == 0o600):
+            os.unlink(partial)
+            dfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+        continue
+    final = root / f"{partial_value['observation_generation']}.json"
+    if final.exists() or final.is_symlink():
+        final_value, final_raw = validate_generation(final)
+        if final_value != partial_value or final_raw != partial_raw:
+            raise SystemExit("live-observation generation interrupted publication differs")
+    else:
+        os.chmod(partial, 0o400, follow_symlinks=False)
+        os.link(partial, final, follow_symlinks=False)
+        dfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    os.unlink(partial)
+    dfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+
+drive_raw = locked(drive_path, "Drive execute receipt")
+drive = json.loads(drive_raw)
+if (drive_raw != canonical(drive) or drive.get("schema") != "arc.recovery.drive-prefreeze.v1"
+        or drive.get("mode") != "execute" or drive.get("freeze_plan_sha256") != freeze_sha
+        or drive.get("capture_id") != capture_id or drive.get("canary_verified") is not True
+        or drive.get("canary_deleted") is not True):
+    raise SystemExit("live-observation generation Drive execute receipt differs")
+drive_sha = digest(drive_raw)
+
+if selected.exists() or selected.is_symlink():
+    selected_raw = locked(selected, "selected generation", {0o400}, 16 * 1024 * 1024)
+    selected_value = json.loads(selected_raw)
+    if (selected_raw != canonical(selected_value)
+            or selected_value.get("schema") != "arc.recovery.legacy-live-observation-selection.v1"
+            or (selected_value.get("source_main_commit"), selected_value.get("freeze_plan_sha256"),
+                selected_value.get("capture_id")) != (source_commit, freeze_sha, capture_id)):
+        raise SystemExit("selected live-observation generation differs")
+    generation = selected_value.get("observation_generation")
+    generation_path = root / f"{generation}.json"
+    generation_value, generation_raw = validate_generation(generation_path)
+    if (selected_value.get("observation_generation_receipt") != generation_value
+            or selected_value.get("observation_generation_receipt_sha256") != digest(generation_raw)
+            or selected_value.get("drive_prefreeze_receipt_sha256")
+                != generation_value["drive_prefreeze_receipt"]["sha256"]):
+        raise SystemExit("selected live-observation generation root differs")
+    selected_at = datetime.datetime.strptime(
+        selected_value["selected_at"], utc_format
+    ).replace(tzinfo=datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if resume_state == "unbound" and (
+        generation_value["drive_prefreeze_receipt"]["sha256"] != drive_sha
+        or selected_at > now
+        or (now - selected_at).total_seconds() > maximum_age
+    ):
+        raise SystemExit("unbound selected live-observation generation is stale or uses another Drive canary")
+    print(generation, generation_path, digest(generation_raw),
+          generation_value["drive_prefreeze_receipt"]["sha256"])
+    raise SystemExit(0)
+
+now = datetime.datetime.now(datetime.timezone.utc)
+# No unselected generation crosses a capture invocation boundary.  A crash
+# before selection is powerless and the next invocation gets a new nonce even
+# when the capacity receipt bytes happen to be identical.
+generation = secrets.token_hex(32)
+created_at = now.strftime(utc_format)
+value = {
+    "schema": "arc.recovery.legacy-live-observation-generation.v1",
+    "source_main_commit": source_commit,
+    "freeze_plan_sha256": freeze_sha,
+    "capture_id": capture_id,
+    "observation_generation": generation,
+    "created_at": created_at,
+    "max_selection_age_seconds": maximum_age,
+    "drive_prefreeze_receipt": {"path": str(drive_path), "sha256": drive_sha, "value": drive},
+}
+raw = canonical(value)
+path = root / f"{generation}.json"
+partial = root / f".{generation}.json.partial"
+fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+with os.fdopen(fd, "wb") as handle:
+    handle.write(raw); handle.flush(); os.fsync(handle.fileno()); os.fchmod(handle.fileno(), 0o400)
+os.link(partial, path, follow_symlinks=False)
+dfd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dfd)
+    os.unlink(partial)
+    os.fsync(dfd)
+finally: os.close(dfd)
+print(generation, path, digest(raw), drive_sha)
+PY
+}
+
+reconcile_local_create_only_resume_links() {
+    local selection="$1" maintenance_root="$2"
+    # The capture-wide lock is held by the caller.  Every local create-only
+    # publisher links `name.partial` to `name` before unlinking the partial.
+    # Heal the complete protected maintenance-input tree before any resume
+    # reader or dynamic re-probe opens it.  Otherwise a sealed final-absent
+    # partial in a sibling evidence directory could conflict with newly
+    # sampled timestamp/counter bytes and wedge an already-quarantined capture.
+    python3 - "$selection" "$maintenance_root" <<'PY'
+import os,pathlib,stat,sys
+selection=pathlib.Path(sys.argv[1]);maintenance_root=pathlib.Path(sys.argv[2])
+candidates=[selection.with_name(selection.name+".partial")]
+if maintenance_root.exists() or maintenance_root.is_symlink():
+    root_details=maintenance_root.lstat()
+    if (maintenance_root.is_symlink() or not stat.S_ISDIR(root_details.st_mode)
+            or root_details.st_uid!=os.geteuid()
+            or stat.S_IMODE(root_details.st_mode)!=0o700):
+        raise SystemExit("create-only resume maintenance root is unsafe")
+    for directory,names,files in os.walk(maintenance_root,followlinks=False):
+        directory_path=pathlib.Path(directory);details=directory_path.lstat()
+        if (directory_path.is_symlink() or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid!=os.geteuid()
+                or stat.S_IMODE(details.st_mode)!=0o700):
+            raise SystemExit("create-only resume directory is unsafe")
+        for name in names:
+            child=directory_path/name
+            if child.is_symlink():
+                raise SystemExit("create-only resume directory symlink is unsafe")
+        candidates.extend(directory_path/name for name in files if name.endswith(".partial"))
+for partial in candidates:
+    if not (partial.exists() or partial.is_symlink()):continue
+    terminal=partial.with_name(partial.name[:-len(".partial")])
+    partial_details=partial.lstat()
+    if not (terminal.exists() or terminal.is_symlink()):
+        if (partial.is_symlink() or not stat.S_ISREG(partial_details.st_mode)
+                or partial_details.st_uid!=os.geteuid() or partial_details.st_nlink!=1
+                or stat.S_IMODE(partial_details.st_mode) not in {0o400,0o600}):
+            raise SystemExit("create-only unlinked partial identity differs")
+        mode=stat.S_IMODE(partial_details.st_mode)
+        if terminal.suffix!=".json" or not 0<=partial_details.st_size<=32*1024*1024:
+            raise SystemExit("create-only sealed partial destination differs")
+        fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+        try:
+            raw=os.read(fd,32*1024*1024+1)
+            if len(raw)!=partial_details.st_size:
+                raise SystemExit("create-only sealed partial changed")
+            try:value=__import__("json").loads(raw)
+            except (UnicodeDecodeError,__import__("json").JSONDecodeError):value=None
+            canonical=(__import__("json").dumps(
+                value,sort_keys=True,separators=(",",":"))+"\n").encode() \
+                if isinstance(value,dict) else None
+        finally:os.close(fd)
+        if not isinstance(value,dict) or raw!=canonical:
+            if mode!=0o600:
+                raise SystemExit("create-only sealed partial is noncanonical")
+            os.unlink(partial)
+            descriptor=os.open(partial.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+            try:os.fsync(descriptor)
+            finally:os.close(descriptor)
+            continue
+        if mode==0o600:
+            os.chmod(partial,0o400,follow_symlinks=False)
+            fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+            try:os.fsync(fd)
+            finally:os.close(fd)
+        try:os.link(partial,terminal,follow_symlinks=False)
+        except FileExistsError:
+            raise SystemExit("create-only sealed partial raced with resume")
+        descriptor=os.open(partial.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+        try:
+            os.fsync(descriptor);os.unlink(partial);os.fsync(descriptor)
+        finally:os.close(descriptor)
+        continue
+    terminal_details=terminal.lstat()
+    same=(partial_details.st_dev,partial_details.st_ino)==(
+        terminal_details.st_dev,terminal_details.st_ino)
+    if not same:
+        # A separate nlink=1 partial is producer-owned recovery state and does
+        # not make the already-terminal artifact unsafe for a resume reader.
+        if terminal_details.st_nlink!=1:
+            raise SystemExit("create-only terminal has an unexplained link")
+        continue
+    if (partial.is_symlink() or terminal.is_symlink()
+            or not stat.S_ISREG(partial_details.st_mode)
+            or not stat.S_ISREG(terminal_details.st_mode)
+            or partial_details.st_uid!=os.geteuid()
+            or terminal_details.st_uid!=os.geteuid()
+            or stat.S_IMODE(partial_details.st_mode)!=0o400
+            or stat.S_IMODE(terminal_details.st_mode)!=0o400
+            or partial_details.st_nlink!=2 or terminal_details.st_nlink!=2):
+        raise SystemExit("create-only linked publication identity differs")
+    os.unlink(partial)
+    descriptor=os.open(partial.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+PY
+}
+
+live_observation_selection_resume_state() {
+    local selection="$1" round_root="$2" current_drive_sha="$3"
+    local freeze_sha="$4" capture_id="$5"
+    python3 - "$selection" "$round_root" "$current_drive_sha" "$freeze_sha" "$capture_id" <<'PY'
+import datetime,hashlib,json,os,pathlib,re,stat,sys
+selection=pathlib.Path(sys.argv[1]);round_root=pathlib.Path(sys.argv[2])
+drive_sha,freeze,capture=sys.argv[3:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+digest=lambda raw:hashlib.sha256(raw).hexdigest()
+hash_re=re.compile(r"[0-9a-f]{64}");utc_format="%Y-%m-%dT%H:%M:%S.%fZ"
+if any(hash_re.fullmatch(value) is None for value in (drive_sha,freeze,capture)):
+    raise SystemExit("live-observation resume identity is malformed")
+def locked(path,label,maximum=32*1024*1024,links={1},modes={0o400}):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink not in links
+                or stat.S_IMODE(details.st_mode) not in modes
+                or not 0<details.st_size<=maximum):
+            raise SystemExit(f"live-observation resume {label} is unsafe")
+        raw=os.read(fd,maximum+1)
+        if len(raw)!=details.st_size:raise SystemExit(f"live-observation resume {label} changed")
+        value=json.loads(raw)
+        if raw!=canonical(value):raise SystemExit(f"live-observation resume {label} is noncanonical")
+        return value,raw
+    finally:os.close(fd)
+def fsync_parent():
+    descriptor=os.open(selection.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+partial=selection.with_name(selection.name+".partial")
+selection_present=selection.exists() or selection.is_symlink()
+partial_present=partial.exists() or partial.is_symlink()
+if selection_present and partial_present:
+    final_details=selection.lstat();partial_details=partial.lstat()
+    if (selection.is_symlink() or partial.is_symlink()
+            or not stat.S_ISREG(final_details.st_mode)
+            or not stat.S_ISREG(partial_details.st_mode)
+            or final_details.st_uid!=os.geteuid() or partial_details.st_uid!=os.geteuid()
+            or stat.S_IMODE(final_details.st_mode)!=0o400
+            or stat.S_IMODE(partial_details.st_mode)!=0o400
+            or (final_details.st_dev,final_details.st_ino)
+                !=(partial_details.st_dev,partial_details.st_ino)
+            or final_details.st_nlink!=2 or partial_details.st_nlink!=2):
+        raise SystemExit("live-observation resume linked selection publication differs")
+    _final_value,final_raw=locked(selection,"linked selection",links={2})
+    _partial_value,partial_raw=locked(partial,"linked selection partial",links={2})
+    if final_raw!=partial_raw:
+        raise SystemExit("live-observation resume linked selection bytes differ")
+    os.unlink(partial);fsync_parent()
+elif not selection_present and partial_present:
+    details=partial.lstat()
+    if (partial.is_symlink() or not stat.S_ISREG(details.st_mode)
+            or details.st_uid!=os.geteuid() or details.st_nlink!=1
+            or stat.S_IMODE(details.st_mode) not in {0o400,0o600}):
+        raise SystemExit("live-observation resume selection partial is unsafe")
+    try:
+        _partial_value,partial_raw=locked(
+            partial,"selection partial",links={1},modes={0o400,0o600})
+    except (ValueError,json.JSONDecodeError,UnicodeDecodeError):
+        if stat.S_IMODE(details.st_mode)!=0o600:
+            raise SystemExit("live-observation resume sealed selection partial is malformed")
+        os.unlink(partial);fsync_parent()
+    else:
+        os.chmod(partial,0o400,follow_symlinks=False)
+        try:os.link(partial,selection,follow_symlinks=False)
+        except FileExistsError:
+            _racing_value,racing_raw=locked(selection,"racing selection",links={1,2})
+            if racing_raw!=partial_raw:
+                raise SystemExit("live-observation resume racing selection differs")
+        fsync_parent()
+        os.unlink(partial);fsync_parent()
+if not (selection.exists() or selection.is_symlink()):
+    print("absent -");raise SystemExit(0)
+def zero_progress_released(attempt,authorization_raw,readiness_raw,dispatch_raw):
+    path=attempt/"zero-progress-release.json"
+    if not (path.exists() or path.is_symlink()):return False
+    release,_release_raw=locked(path,"zero-progress release")
+    fields={"schema","capture_id","freeze_plan_sha256","round_number",
+        "round_authorization_sha256","round_readiness_sha256",
+        "mutation_dispatch_sha256","live_observation_selection_sha256",
+        "live_observation_generation","observation_generation_receipt_sha256",
+        "drive_prefreeze_receipt_sha256","challenge","released_at","nodes"}
+    nodes=release.get("nodes");challenge=release.get("challenge")
+    authorization=json.loads(authorization_raw)
+    targets=authorization.get("targets")
+    try:datetime.datetime.strptime(release.get("released_at"),"%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError,ValueError):
+        raise SystemExit("live-observation zero-progress release time differs")
+    if (set(release)!=fields
+            or release.get("schema")!="arc.recovery.quarantine-round-zero-progress-release.v1"
+            or release.get("round_number")!=1
+            or (release.get("capture_id"),release.get("freeze_plan_sha256"),
+                release.get("round_authorization_sha256"),release.get("round_readiness_sha256"),
+                release.get("mutation_dispatch_sha256"),
+                release.get("live_observation_selection_sha256"),
+                release.get("live_observation_generation"),
+                release.get("observation_generation_receipt_sha256"),
+                release.get("drive_prefreeze_receipt_sha256"))
+                !=(capture,freeze,digest(authorization_raw),digest(readiness_raw),
+                   digest(dispatch_raw),selection_sha,generation,generation_sha,
+                   selection_drive_sha)
+            or hash_re.fullmatch(str(challenge)) is None or not isinstance(nodes,list)
+            or not isinstance(targets,list)
+            or [row.get("node") for row in targets]
+                !=["nyc","lax","ams","lhr","nrt","sgp"]
+            or [row.get("value",{}).get("node") for row in nodes]
+                !=["nyc","lax","ams","lhr","nrt","sgp"]):
+        raise SystemExit("live-observation zero-progress release differs")
+    target_by_node={row["node"]:row for row in targets}
+    proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation",
+        "round_number","round_authorization_sha256","round_readiness_sha256",
+        "mutation_dispatch_sha256","challenge","node","boot_id","writer_live_unfenced",
+        "apply_state_present","restart_effective_mutation_absent","active_selector_absent",
+        "quarantine_nft_absent","authorization_accepted","readiness_present",
+        "accepted_boottime_ns","elapsed_since_acceptance_ns","observed_boottime_ns","observed_at"}
+    for wrapper in nodes:
+        proof=wrapper.get("value") if isinstance(wrapper,dict) else None
+        if isinstance(proof,dict):
+            accepted_ns=proof.get("accepted_boottime_ns")
+            observed_ns=proof.get("observed_boottime_ns")
+            elapsed_ns=proof.get("elapsed_since_acceptance_ns")
+            try:datetime.datetime.strptime(proof.get("observed_at"),"%Y-%m-%dT%H:%M:%SZ")
+            except (TypeError,ValueError):observed_at_valid=False
+            else:observed_at_valid=True
+        else:
+            accepted_ns=observed_ns=elapsed_ns=None;observed_at_valid=False
+        if (not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}
+                or not isinstance(wrapper.get("value"),dict)
+                or set(proof)!=proof_fields
+                or digest(canonical(proof))!=wrapper.get("sha256")
+                or proof.get("schema")!="arc.recovery.quarantine-round-zero-progress-node-proof.v1"
+                or (proof.get("capture_id"),proof.get("freeze_plan_sha256"),
+                    proof.get("observation_generation"),proof.get("round_number"),
+                    proof.get("round_authorization_sha256"),proof.get("round_readiness_sha256"),
+                    proof.get("mutation_dispatch_sha256"),proof.get("challenge"))
+                    !=(capture,freeze,generation,1,digest(authorization_raw),
+                       digest(readiness_raw),digest(dispatch_raw),challenge)
+                or proof.get("boot_id")!=target_by_node.get(proof.get("node"),{}).get("boot_id")
+                or proof.get("writer_live_unfenced") is not True
+                or proof.get("restart_effective_mutation_absent") is not True
+                or proof.get("active_selector_absent") is not True
+                or proof.get("quarantine_nft_absent") is not True
+                or proof.get("authorization_accepted") is not True
+                or not isinstance(proof.get("apply_state_present"),bool)
+                or not isinstance(proof.get("readiness_present"),bool)
+                or any(isinstance(number,bool) or not isinstance(number,int) or number<=0
+                       for number in (accepted_ns,elapsed_ns,observed_ns))
+                or observed_ns<=accepted_ns+300_000_000_000
+                or elapsed_ns!=observed_ns-accepted_ns or not observed_at_valid):
+            raise SystemExit("live-observation zero-progress node proof differs")
+    return True
+value,raw=locked(selection,"selection")
+fields={"schema","source_main_commit","freeze_plan_sha256","capture_id",
+    "observation_generation","observation_generation_receipt",
+    "observation_generation_receipt_path","observation_generation_receipt_sha256",
+    "drive_prefreeze_receipt_path","drive_prefreeze_receipt_sha256",
+    "generation_created_at","selected_at","max_selection_age_seconds","labels","nodes"}
+generation=value.get("observation_generation");selection_sha=digest(raw)
+generation_sha=value.get("observation_generation_receipt_sha256")
+selection_drive_sha=value.get("drive_prefreeze_receipt_sha256")
+if (set(value)!=fields or value.get("schema")!="arc.recovery.legacy-live-observation-selection.v1"
+        or (value.get("freeze_plan_sha256"),value.get("capture_id"))!=(freeze,capture)
+        or hash_re.fullmatch(str(generation)) is None
+        or value.get("max_selection_age_seconds")!=300):
+    raise SystemExit("live-observation resume selection differs")
+bound=False
+if round_root.exists() or round_root.is_symlink():
+    details=round_root.lstat()
+    if (round_root.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit("live-observation resume quarantine-round root is unsafe")
+    dispatches=sorted(round_root.glob("round-*/attempt.*/mutation-dispatch.json"))
+    readinesses=sorted(round_root.glob("round-*/attempt.*/readiness.json"))
+    for path in readinesses:
+        authorization,authorization_raw=locked(
+            path.with_name("authorization.json"),"readiness authorization")
+        if ((authorization.get("capture_id"),authorization.get("freeze_plan_sha256"),
+             authorization.get("live_observation_selection_sha256"),
+             authorization.get("live_observation_generation"),
+             authorization.get("observation_generation_receipt_sha256"),
+             authorization.get("drive_prefreeze_receipt_sha256"))
+                !=(capture,freeze,selection_sha,generation,generation_sha,
+                   selection_drive_sha)):
+            raise SystemExit("live-observation resume readiness authorization differs")
+        _readiness,readiness_raw=locked(path,"quarantine readiness")
+        dispatch_path=path.with_name("mutation-dispatch.json")
+        if not (dispatch_path.exists() or dispatch_path.is_symlink()):
+            # Local readiness is built before dispatch publication and before
+            # any remote readiness send; alone it is a powerless crash prefix.
+            continue
+        _dispatch,dispatch_raw=locked(dispatch_path,"mutation dispatch")
+        if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
+            continue
+        bound=True
+    for path in dispatches:
+        dispatch,dispatch_raw=locked(path,"mutation dispatch")
+        if (dispatch.get("schema")!="arc.recovery.quarantine-mutation-dispatch.v1"
+                or (dispatch.get("capture_id"),dispatch.get("freeze_plan_sha256"),
+                    dispatch.get("live_observation_selection_sha256"),
+                    dispatch.get("live_observation_generation"),
+                    dispatch.get("observation_generation_receipt_sha256"),
+                    dispatch.get("drive_prefreeze_receipt_sha256"))
+                    !=(capture,freeze,selection_sha,generation,generation_sha,
+                       selection_drive_sha)):
+            raise SystemExit("live-observation resume mutation dispatch differs")
+        authorization,authorization_raw=locked(path.with_name("authorization.json"),
+                                                "dispatch authorization")
+        _readiness,readiness_raw=locked(path.with_name("readiness.json"),
+                                        "dispatch readiness")
+        if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
+            continue
+        bound=True
+    for result_path in sorted(round_root.glob("round-*/result.json")):
+        result,_result_raw=locked(result_path,"quarantine result")
+        if result.get("transitions"):
+            authorization,_authorization_raw=locked(
+                result_path.with_name("authorization.json"),"quarantine authorization")
+            if ((authorization.get("live_observation_selection_sha256"),
+                 authorization.get("live_observation_generation"),
+                 authorization.get("observation_generation_receipt_sha256"),
+                 authorization.get("drive_prefreeze_receipt_sha256"))
+                    !=(selection_sha,generation,generation_sha,selection_drive_sha)):
+                raise SystemExit("live-observation resume quarantine result differs")
+            bound=True
+if bound:
+    print("bound",generation);raise SystemExit(0)
+# Every unbound selection is invocation-local.  Even a wall-fresh selection is
+# rotated after the exact six-writer live/unfenced proof on a new invocation;
+# only a dispatch-bound selection may resume across an operator crash.
+print("rotate",generation)
+PY
+}
+
+release_stale_zero_progress_dispatches() {
+    local freeze_plan="$1" selection="$2" round_root="$3" current_drive_sha="$4"
+    local freeze_sha="$5" capture_id="$6" log_root="$7"
+    [ -f "$selection" ] && [ ! -L "$selection" ] || return 0
+    [ -d "$round_root" ] && [ ! -L "$round_root" ] || return 0
+    local attempt authorization readiness dispatch auth_sha readiness_sha dispatch_sha
+    local round generation challenge proof_root node temporary release_temporary proof_failed
+    while IFS= read -r attempt; do
+        [ -n "$attempt" ] || continue
+        authorization="$attempt/authorization.json"
+        readiness="$attempt/readiness.json"
+        dispatch="$attempt/mutation-dispatch.json"
+        auth_sha="$(round_artifact_sha "$authorization")"
+        readiness_sha="$(round_artifact_sha "$readiness")"
+        dispatch_sha="$(round_artifact_sha "$dispatch")"
+        read -r round generation < <(python3 - "$authorization" "$selection" <<'PY'
+import json,pathlib,sys
+authorization=json.loads(pathlib.Path(sys.argv[1]).read_text())
+selection=json.loads(pathlib.Path(sys.argv[2]).read_text())
+print(authorization["round_number"],selection["observation_generation"])
+PY
+        )
+        challenge="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+        )"
+        proof_root="$(prepare_protected_maintenance_directory \
+            "$attempt/zero-progress-proofs-$challenge")"
+        proof_failed=0
+        for node in nyc lax ams lhr nrt sgp; do
+            temporary="$log_root/$node-zero-progress-$challenge.new.json"
+            if ! run_remote "$node" quarantine-round-zero-progress-proof \
+                "$capture_id" "$generation" "$node" "$freeze_sha" "$round" \
+                "$auth_sha" "$readiness_sha" "$dispatch_sha" "$challenge" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
+                "$(freeze_node_field "$freeze_plan" "$node" boot_id)" > "$temporary"; then
+                proof_failed=1
+                break
+            fi
+            chmod 400 -- "$temporary"
+            publish_canonical_maintenance_input "$temporary" "$proof_root/$node.json"
+        done
+        if [ "$proof_failed" -ne 0 ]; then
+            printf 'archive fleet: quarantine dispatch is not yet eligible for exact zero-progress release; resuming its node BOOTTIME lease\n'
+            continue
+        fi
+        release_temporary="$log_root/zero-progress-release-$challenge.new.json"
+        python3 - "$authorization" "$readiness" "$dispatch" "$selection" \
+            "$proof_root" "$challenge" "$release_temporary" <<'PY'
+import datetime,hashlib,json,os,pathlib,stat,sys
+authorization_path,readiness_path,dispatch_path,selection_path,proof_root,challenge,output=sys.argv[1:]
+authorization_path=pathlib.Path(authorization_path);readiness_path=pathlib.Path(readiness_path)
+dispatch_path=pathlib.Path(dispatch_path);selection_path=pathlib.Path(selection_path)
+proof_root=pathlib.Path(proof_root);output=pathlib.Path(output)
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+digest=lambda raw:hashlib.sha256(raw).hexdigest()
+def locked(path,label):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode)!=0o400
+                or not 0<details.st_size<=32*1024*1024):
+            raise SystemExit(f"zero-progress release {label} is unsafe")
+        raw=os.read(fd,32*1024*1024+1);value=json.loads(raw)
+        if len(raw)!=details.st_size or raw!=canonical(value):
+            raise SystemExit(f"zero-progress release {label} differs")
+        return value,raw
+    finally:os.close(fd)
+authorization,authorization_raw=locked(authorization_path,"authorization")
+readiness,readiness_raw=locked(readiness_path,"readiness")
+dispatch,dispatch_raw=locked(dispatch_path,"dispatch")
+selection,selection_raw=locked(selection_path,"selection")
+identity=(authorization["capture_id"],authorization["freeze_plan_sha256"],
+          authorization["round_number"],digest(authorization_raw),digest(readiness_raw),
+          digest(dispatch_raw),digest(selection_raw),selection["observation_generation"],
+          selection["observation_generation_receipt_sha256"],
+          selection["drive_prefreeze_receipt_sha256"])
+if identity[2]!=1:
+    raise SystemExit("zero-progress release is only valid for the first all-live round")
+if ((readiness.get("round_authorization_sha256"),dispatch.get("round_authorization_sha256"),
+     dispatch.get("round_readiness_sha256"))!=(identity[3],identity[3],identity[4])
+        or (authorization.get("live_observation_selection_sha256"),
+            authorization.get("live_observation_generation"),
+            authorization.get("observation_generation_receipt_sha256"),
+            authorization.get("drive_prefreeze_receipt_sha256"))!=identity[6:]):
+    raise SystemExit("zero-progress release attempt/selection binding differs")
+nodes=[]
+targets=authorization.get("targets")
+if (not isinstance(targets,list) or [row.get("node") for row in targets]
+        !=["nyc","lax","ams","lhr","nrt","sgp"]):
+    raise SystemExit("zero-progress release authorization topology differs")
+target_by_node={row["node"]:row for row in targets}
+proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation",
+ "round_number","round_authorization_sha256","round_readiness_sha256",
+ "mutation_dispatch_sha256","challenge","node","boot_id","writer_live_unfenced",
+ "apply_state_present","restart_effective_mutation_absent","active_selector_absent",
+ "quarantine_nft_absent","authorization_accepted","readiness_present",
+ "accepted_boottime_ns","elapsed_since_acceptance_ns","observed_boottime_ns","observed_at"}
+for node in ("nyc","lax","ams","lhr","nrt","sgp"):
+    value,raw=locked(proof_root/f"{node}.json",f"{node} proof")
+    accepted_ns=value.get("accepted_boottime_ns");observed_ns=value.get("observed_boottime_ns")
+    elapsed_ns=value.get("elapsed_since_acceptance_ns")
+    try:
+        observed_at=datetime.datetime.strptime(value.get("observed_at"),"%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError,ValueError):
+        raise SystemExit(f"zero-progress release node proof time differs: {node}")
+    if (set(value)!=proof_fields
+            or value.get("schema")!="arc.recovery.quarantine-round-zero-progress-node-proof.v1"
+            or (value.get("capture_id"),value.get("freeze_plan_sha256"),
+                value.get("observation_generation"),value.get("round_number"),
+                value.get("round_authorization_sha256"),value.get("round_readiness_sha256"),
+                value.get("mutation_dispatch_sha256"),value.get("challenge"),value.get("node"))
+                !=(identity[0],identity[1],identity[7],identity[2],identity[3],identity[4],
+                   identity[5],challenge,node)
+            or value.get("boot_id")!=target_by_node[node].get("boot_id")
+            or any(value.get(field) is not True for field in
+                   ("writer_live_unfenced","restart_effective_mutation_absent","active_selector_absent",
+                    "quarantine_nft_absent","authorization_accepted"))
+            or not isinstance(value.get("apply_state_present"),bool)
+            or not isinstance(value.get("readiness_present"),bool)
+            or any(isinstance(number,bool) or not isinstance(number,int) or number<=0
+                   for number in (accepted_ns,elapsed_ns,observed_ns))
+            or observed_ns<=accepted_ns+300_000_000_000
+            or elapsed_ns!=observed_ns-accepted_ns):
+        raise SystemExit(f"zero-progress release node proof differs: {node}")
+    nodes.append({"value":value,"sha256":digest(raw)})
+release={"schema":"arc.recovery.quarantine-round-zero-progress-release.v1",
+ "capture_id":identity[0],"freeze_plan_sha256":identity[1],"round_number":identity[2],
+ "round_authorization_sha256":identity[3],"round_readiness_sha256":identity[4],
+ "mutation_dispatch_sha256":identity[5],"live_observation_selection_sha256":identity[6],
+ "live_observation_generation":identity[7],"observation_generation_receipt_sha256":identity[8],
+ "drive_prefreeze_receipt_sha256":identity[9],"challenge":challenge,
+ "released_at":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+ "nodes":nodes}
+raw=canonical(release)
+fd=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+with os.fdopen(fd,"wb") as handle:
+    handle.write(raw);handle.flush();os.fsync(handle.fileno());os.fchmod(handle.fileno(),0o400)
+PY
+        publish_canonical_maintenance_input "$release_temporary" \
+            "$attempt/zero-progress-release.json"
+        printf 'archive fleet: released expired zero-progress quarantine dispatch after six challenged live/unfenced proofs\n'
+    done < <(python3 - "$selection" "$round_root" "$current_drive_sha" <<'PY'
+import hashlib,json,pathlib,sys
+selection_path=pathlib.Path(sys.argv[1]);root=pathlib.Path(sys.argv[2]);_drive=sys.argv[3]
+selection=json.loads(selection_path.read_text())
+selection_sha=hashlib.sha256((json.dumps(
+    selection,sort_keys=True,separators=(",",":"))+"\n").encode()).hexdigest()
+for readiness in sorted(root.glob("round-*/attempt.*/readiness.json")):
+    attempt=readiness.parent;dispatch=attempt/"mutation-dispatch.json"
+    if not dispatch.is_file() or dispatch.is_symlink() or (attempt/"zero-progress-release.json").exists():continue
+    authorization=json.loads((attempt/"authorization.json").read_text())
+    if ((authorization.get("live_observation_selection_sha256"),
+         authorization.get("live_observation_generation"),
+         authorization.get("observation_generation_receipt_sha256"),
+         authorization.get("drive_prefreeze_receipt_sha256"))
+            !=(selection_sha,selection.get("observation_generation"),
+               selection.get("observation_generation_receipt_sha256"),
+               selection.get("drive_prefreeze_receipt_sha256"))):continue
+    if (authorization.get("round_number")!=1 or authorization.get("prior_fenced")
+            or authorization.get("prior_round_result_sha256s")):continue
+    result=attempt/"result.json"
+    if result.exists():
+        value=json.loads(result.read_text())
+        if value.get("transitions"):continue
+    transitions=attempt/"node-transitions"
+    if transitions.exists() and any(path.is_file() for path in transitions.iterdir()):continue
+    print(attempt)
+PY
+    )
+}
+
+capture_remaining_target_inert_proofs() {
+    local freeze_plan="$1" attempt_root="$2" targets_csv="$3" log_root="$4"
+    local authorization="$attempt_root/authorization.json"
+    local readiness="$attempt_root/readiness.json"
+    local dispatch="$attempt_root/mutation-dispatch.json"
+    local auth_sha readiness_sha dispatch_sha round generation capture freeze challenge proof_root
+    local node temporary failed=0
+    local names=()
+    [ -n "$targets_csv" ] || die "remaining-target inert proof set is empty"
+    auth_sha="$(round_artifact_sha "$authorization")"
+    readiness_sha="$(round_artifact_sha "$readiness")"
+    dispatch_sha="$(round_artifact_sha "$dispatch")"
+    read -r round generation capture freeze < <(python3 - "$authorization" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(value["round_number"],value["live_observation_generation"],
+      value["capture_id"],value["freeze_plan_sha256"])
+PY
+    )
+    require_uint "$round" "remaining-target inert proof round"
+    require_hash "$generation" "remaining-target live-observation generation"
+    require_hash "$capture" "remaining-target capture"
+    require_hash "$freeze" "remaining-target freeze plan"
+    challenge="$(python3 -I - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+    )"
+    require_hash "$challenge" "remaining-target inert proof challenge"
+    proof_root="$(prepare_protected_maintenance_directory \
+        "$attempt_root/remaining-target-inert-proofs-$challenge")"
+    IFS=',' read -r -a names <<< "$targets_csv"
+    [ "${#names[@]}" -gt 0 ] || die "remaining-target inert proof topology is empty"
+    for node in "${names[@]}"; do
+        require_node "$node"
+        temporary="$log_root/$node-remaining-inert-$challenge.new.json"
+        if ! run_remote "$node" quarantine-round-zero-progress-proof \
+                "$capture" "$generation" "$node" "$freeze" \
+                "$round" "$auth_sha" "$readiness_sha" "$dispatch_sha" "$challenge" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
+                "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+                > "$temporary" 2> "$temporary.stderr"; then
+            sed -n '1,80p' "$temporary.stderr" >&2
+            failed=1
+            break
+        fi
+        chmod 400 -- "$temporary"
+        publish_canonical_maintenance_input "$temporary" "$proof_root/$node.json"
+    done
+    [ "$failed" -eq 0 ] || return 1
+    printf '%s\n' "$proof_root"
+}
+
+archive_stale_live_observation_selection() {
+    local selection="$1" archive_root="$2" generation="$3"
+    python3 - "$selection" "$archive_root" "$generation" <<'PY'
+import os,pathlib,re,stat,sys
+selection=pathlib.Path(sys.argv[1]);root=pathlib.Path(sys.argv[2]);generation=sys.argv[3]
+if re.fullmatch(r"[0-9a-f]{64}",generation) is None:
+    raise SystemExit("stale live-observation generation is malformed")
+parent=root.parent;details=parent.lstat()
+if (parent.is_symlink() or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid!=os.geteuid() or details.st_mode&0o022):
+    raise SystemExit("live-observation selection archive parent is unsafe")
+if root.exists() or root.is_symlink():
+    details=root.lstat()
+    if (root.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit("live-observation selection archive is unsafe")
+else:
+    os.mkdir(root,0o700)
+    dfd=os.open(parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:os.fsync(dfd)
+    finally:os.close(dfd)
+def read_regular(path,label,modes={0o400},links={1}):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink not in links
+                or stat.S_IMODE(details.st_mode) not in modes
+                or not 0<details.st_size<=16*1024*1024):
+            raise SystemExit(f"{label} is unsafe")
+        source=os.read(fd,16*1024*1024+1)
+        if len(source)!=details.st_size:raise SystemExit(f"{label} changed while read")
+        return source
+    finally:os.close(fd)
+target=root/f"{generation}.json"
+partial=root/f".{generation}.json.partial"
+source=read_regular(selection,"stale live-observation selection")
+if (target.exists() or target.is_symlink()) and (partial.exists() or partial.is_symlink()):
+    target_details=target.lstat();partial_details=partial.lstat()
+    if (target.is_symlink() or partial.is_symlink()
+            or (target_details.st_dev,target_details.st_ino)
+                !=(partial_details.st_dev,partial_details.st_ino)
+            or target_details.st_nlink!=2 or partial_details.st_nlink!=2
+            or read_regular(target,"linked archived selection",links={2})!=source
+            or read_regular(partial,"linked archived selection partial",
+                            {0o400,0o600},{2})!=source):
+        raise SystemExit("archived live-observation selection interrupted publication differs")
+    os.unlink(partial)
+    dfd=os.open(root,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:os.fsync(dfd)
+    finally:os.close(dfd)
+if target.exists() or target.is_symlink():
+    if read_regular(target,"archived live-observation selection")!=source:
+        raise SystemExit("archived live-observation selection differs")
+else:
+    if partial.exists() or partial.is_symlink():
+        details=partial.lstat()
+        if (partial.is_symlink() or not stat.S_ISREG(details.st_mode)
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode) not in {0o400,0o600}):
+            raise SystemExit("archived live-observation selection partial is unsafe")
+        if stat.S_IMODE(details.st_mode)==0o600:
+            try:partial_source=read_regular(
+                partial,"archived live-observation selection partial",{0o600})
+            except SystemExit:partial_source=None
+            if partial_source!=source:
+                os.unlink(partial)
+                dfd=os.open(root,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+                try:os.fsync(dfd)
+                finally:os.close(dfd)
+        elif read_regular(partial,"archived live-observation selection partial")!=source:
+            raise SystemExit("archived live-observation selection partial differs")
+    if not (partial.exists() or partial.is_symlink()):
+        fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+        with os.fdopen(fd,"wb") as handle:
+            handle.write(source);handle.flush();os.fsync(handle.fileno());os.fchmod(handle.fileno(),0o400)
+    else:
+        os.chmod(partial,0o400,follow_symlinks=False)
+    os.link(partial,target,follow_symlinks=False)
+    dfd=os.open(root,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:
+        os.fsync(dfd)
+        os.unlink(partial)
+        os.fsync(dfd)
+    finally:os.close(dfd)
+os.unlink(selection)
+dfd=os.open(parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try:os.fsync(dfd)
+finally:os.close(dfd)
+details=target.lstat()
+if (target.is_symlink() or not stat.S_ISREG(details.st_mode)
+        or details.st_uid!=os.geteuid() or details.st_nlink!=1
+        or stat.S_IMODE(details.st_mode)!=0o400):
+    raise SystemExit("archived live-observation selection identity differs")
+PY
+}
+
+seal_live_observation_selection() {
+    local output="$1" generation_receipt="$2" statuses="$3" freeze_sha="$4" capture_id="$5"
+    python3 - "$output" "$generation_receipt" "$statuses" "$freeze_sha" "$capture_id" <<'PY'
+import datetime, hashlib, json, os, pathlib, re, stat, sys
+output, generation_path, statuses_path = map(pathlib.Path, sys.argv[1:4])
+freeze_sha, capture_id = sys.argv[4:]
+canonical = lambda value: (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+digest = lambda raw: hashlib.sha256(raw).hexdigest()
+hash_re = re.compile(r"[0-9a-f]{64}")
+utc_format = "%Y-%m-%dT%H:%M:%S.%fZ"
+nodes = ("nyc", "lax", "ams", "lhr", "nrt", "sgp")
+
+def read_locked(path, label, maximum=16 * 1024 * 1024, links={1}):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        details = os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid != os.geteuid() or details.st_nlink not in links
+                or stat.S_IMODE(details.st_mode) not in {0o400, 0o600}
+                or not 0 < details.st_size <= maximum):
+            raise SystemExit(f"live-observation selection {label} is unsafe")
+        raw = os.read(fd, maximum + 1)
+        if len(raw) != details.st_size:
+            raise SystemExit(f"live-observation selection {label} changed")
+        return raw
+    finally: os.close(fd)
+
+generation_raw = read_locked(generation_path, "generation receipt")
+generation_value = json.loads(generation_raw)
+generation = generation_value.get("observation_generation")
+drive = generation_value.get("drive_prefreeze_receipt", {})
+if (generation_raw != canonical(generation_value)
+        or generation_value.get("schema") != "arc.recovery.legacy-live-observation-generation.v1"
+        or (generation_value.get("freeze_plan_sha256"), generation_value.get("capture_id"))
+            != (freeze_sha, capture_id)
+        or hash_re.fullmatch(str(generation)) is None
+        or generation_path.name != f"{generation}.json"
+        or not isinstance(drive, dict) or hash_re.fullmatch(str(drive.get("sha256"))) is None):
+    raise SystemExit("live-observation selection generation receipt differs")
+generation_sha = digest(generation_raw)
+statuses_raw = read_locked(statuses_path, "status set")
+rows = [json.loads(line) for line in statuses_raw.decode("utf-8").splitlines() if line]
+if len(rows) != 6 or [row.get("node") for row in rows] != list(nodes):
+    raise SystemExit("live-observation selection status set is not the ordered fleet")
+status_fields = {"schema", "capture_id", "observation_generation",
+    "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+    "node", "freeze_plan_sha256", "created_at", "completed_at", "root_sha256",
+    "receipt_sha256", "labels"}
+created_at = datetime.datetime.strptime(generation_value["created_at"], utc_format).replace(tzinfo=datetime.timezone.utc)
+selected_at = None
+existing = None
+partial = output.with_name(output.name + ".partial")
+if (output.exists() or output.is_symlink()) and (partial.exists() or partial.is_symlink()):
+    output_details=output.lstat();partial_details=partial.lstat()
+    if (output.is_symlink() or partial.is_symlink()
+            or (output_details.st_dev,output_details.st_ino)!=(partial_details.st_dev,partial_details.st_ino)
+            or output_details.st_nlink!=2 or partial_details.st_nlink!=2
+            or read_locked(output,"linked selection",links={2})
+                !=read_locked(partial,"linked selection partial",links={2})):
+        raise SystemExit("live-observation selection interrupted publication differs")
+    os.unlink(partial)
+    dfd=os.open(output.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:os.fsync(dfd)
+    finally:os.close(dfd)
+if output.exists() or output.is_symlink():
+    existing_raw = read_locked(output, "existing selection")
+    existing = json.loads(existing_raw)
+    selected_at = datetime.datetime.strptime(existing["selected_at"], utc_format).replace(tzinfo=datetime.timezone.utc)
+else:
+    if partial.exists() or partial.is_symlink():
+        details=partial.lstat()
+        if (partial.is_symlink() or not stat.S_ISREG(details.st_mode)
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode) not in {0o400,0o600}):
+            raise SystemExit("live-observation selection partial identity differs")
+        try:
+            partial_raw=read_locked(partial,"selection partial")
+            partial_value=json.loads(partial_raw)
+            if partial_raw!=canonical(partial_value):raise ValueError("noncanonical")
+        except (SystemExit,ValueError,json.JSONDecodeError,UnicodeDecodeError):
+            if stat.S_IMODE(details.st_mode)!=0o600:
+                raise SystemExit("sealed live-observation selection partial is malformed")
+            os.unlink(partial)
+            dfd=os.open(output.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+            try:os.fsync(dfd)
+            finally:os.close(dfd)
+            selected_at=datetime.datetime.now(datetime.timezone.utc)
+        else:
+            selected_at=datetime.datetime.strptime(
+                partial_value["selected_at"],utc_format
+            ).replace(tzinfo=datetime.timezone.utc)
+    else:
+        selected_at = datetime.datetime.now(datetime.timezone.utc)
+normalized = []
+for node, row in zip(nodes, rows):
+    if (set(row) != status_fields or row.get("schema") != "arc.recovery.legacy-live-observations-status.v1"
+            or (row.get("capture_id"), row.get("observation_generation"),
+                row.get("observation_generation_receipt_sha256"),
+                row.get("drive_prefreeze_receipt_sha256"), row.get("node"),
+                row.get("freeze_plan_sha256")) != (
+                capture_id, generation, generation_sha, drive["sha256"], node, freeze_sha)
+            or row.get("labels") != ["diagnostic", "noncanonical", "nonreward"]
+            or any(hash_re.fullmatch(str(row.get(key))) is None for key in ("root_sha256", "receipt_sha256"))):
+        raise SystemExit(f"live-observation selection status differs for {node}")
+    started = datetime.datetime.strptime(row["created_at"], utc_format).replace(tzinfo=datetime.timezone.utc)
+    completed = datetime.datetime.strptime(row["completed_at"], utc_format).replace(tzinfo=datetime.timezone.utc)
+    # Node UTC is audit-only; exact status roots and the generation nonce bind
+    # causality.  Only a node's own start/completion pair must not regress.
+    if started > completed:
+        raise SystemExit(f"live-observation selection node timeline regressed for {node}")
+    normalized.append({key: row[key] for key in (
+        "node", "created_at", "completed_at", "root_sha256", "receipt_sha256")})
+if (selected_at - created_at).total_seconds() > generation_value["max_selection_age_seconds"]:
+    raise SystemExit("live-observation generation exceeded its selection freshness window")
+value = {
+    "schema": "arc.recovery.legacy-live-observation-selection.v1",
+    "source_main_commit": generation_value["source_main_commit"],
+    "freeze_plan_sha256": freeze_sha,
+    "capture_id": capture_id,
+    "observation_generation": generation,
+    "observation_generation_receipt": generation_value,
+    "observation_generation_receipt_path": str(generation_path),
+    "observation_generation_receipt_sha256": generation_sha,
+    "drive_prefreeze_receipt_path": drive["path"],
+    "drive_prefreeze_receipt_sha256": drive["sha256"],
+    "generation_created_at": generation_value["created_at"],
+    "selected_at": selected_at.strftime(utc_format),
+    "max_selection_age_seconds": generation_value["max_selection_age_seconds"],
+    "labels": ["diagnostic", "noncanonical", "nonreward"],
+    "nodes": normalized,
+}
+payload = canonical(value)
+if existing is not None:
+    if canonical(existing) != payload:
+        raise SystemExit("existing live-observation selection differs")
+else:
+    if partial.exists() or partial.is_symlink():
+        partial_raw = read_locked(partial, "selection partial")
+        if partial_raw != payload:
+            raise SystemExit("live-observation selection partial differs")
+        os.chmod(partial, 0o400, follow_symlinks=False)
+    else:
+        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload); handle.flush(); os.fsync(handle.fileno()); os.fchmod(handle.fileno(), 0o400)
+    try:
+        os.link(partial,output,follow_symlinks=False)
+    except FileExistsError:
+        if read_locked(output,"racing selection",links={1,2})!=payload:
+            raise SystemExit("racing live-observation selection differs")
+    dfd = os.open(output.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dfd)
+        os.unlink(partial)
+        os.fsync(dfd)
+    finally: os.close(dfd)
+    if read_locked(output,"published selection")!=payload:
+        raise SystemExit("published live-observation selection differs")
+print(digest(payload))
+PY
+}
+
+verify_live_observation_generation_receipt_exact() {
+    local path="$1" observation_generation="$2" expected_sha="$3"
+    local drive_receipt_sha="$4" freeze_sha="$5" capture_id="$6"
+    python3 - "$path" "$observation_generation" "$expected_sha" \
+        "$drive_receipt_sha" "$freeze_sha" "$capture_id" <<'PY'
+import datetime,hashlib,json,os,pathlib,re,stat,sys
+path=pathlib.Path(sys.argv[1]);generation,expected,drive_sha,freeze_sha,capture_id=sys.argv[2:]
+hash_re=re.compile(r"[0-9a-f]{64}")
+if any(hash_re.fullmatch(value) is None for value in (generation,expected,drive_sha,freeze_sha,capture_id)):
+    raise SystemExit("live-observation generation verification identity is malformed")
+fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+try:
+    details=os.fstat(fd)
+    if (not stat.S_ISREG(details.st_mode) or path.is_symlink() or details.st_uid!=os.geteuid()
+            or details.st_nlink!=1 or stat.S_IMODE(details.st_mode)!=0o400
+            or not 0<details.st_size<=4*1024*1024):
+        raise SystemExit("live-observation generation receipt is unsafe")
+    raw=os.read(fd,4*1024*1024+1)
+    if len(raw)!=details.st_size:raise SystemExit("live-observation generation receipt changed")
+finally:os.close(fd)
+value=json.loads(raw);canonical=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+drive=value.get("drive_prefreeze_receipt")
+generation_fields={"schema","source_main_commit","freeze_plan_sha256","capture_id",
+    "observation_generation","created_at","max_selection_age_seconds","drive_prefreeze_receipt"}
+drive_wrapper_fields={"path","sha256","value"}
+drive_fields={"schema","mode","freeze_plan_sha256","capture_id","remote_root_sha256",
+    "client_id_sha256","account_sha256","permission_id_sha256","rclone_version",
+    "source_bytes","archive_reservation_bytes","largest_object_reservation_bytes",
+    "daily_upload_budget_bytes","daily_upload_budget_basis","available_bytes_before",
+    "available_bytes_after","canary_bytes","canary_verified","canary_deleted"}
+drive_value=drive.get("value") if isinstance(drive,dict) else None
+try:
+    created=datetime.datetime.strptime(value.get("created_at"),"%Y-%m-%dT%H:%M:%S.%fZ")
+except (TypeError,ValueError):
+    raise SystemExit("live-observation generation timestamp differs")
+drive_path=drive.get("path") if isinstance(drive,dict) else None
+numbers=(drive_value.get(field) for field in ("source_bytes","archive_reservation_bytes",
+    "largest_object_reservation_bytes","daily_upload_budget_bytes","available_bytes_before",
+    "available_bytes_after","canary_bytes")) if isinstance(drive_value,dict) else ()
+if (set(value)!=generation_fields or raw!=canonical or hashlib.sha256(raw).hexdigest()!=expected
+        or value.get("schema")!="arc.recovery.legacy-live-observation-generation.v1"
+        or re.fullmatch(r"[0-9a-f]{40}",str(value.get("source_main_commit"))) is None
+        or (value.get("observation_generation"),value.get("freeze_plan_sha256"),value.get("capture_id"))
+            !=(generation,freeze_sha,capture_id)
+        or value.get("max_selection_age_seconds")!=300
+        or path.name!=generation+".json" or not isinstance(drive,dict)
+        or set(drive)!=drive_wrapper_fields or not isinstance(drive_path,str)
+        or not pathlib.Path(drive_path).is_absolute() or os.path.normpath(drive_path)!=drive_path
+        or drive.get("sha256")!=drive_sha
+        or not isinstance(drive_value,dict) or set(drive_value)!=drive_fields
+        or hashlib.sha256((json.dumps(drive_value,sort_keys=True,separators=(",",":"))+"\n").encode()).hexdigest()!=drive_sha
+        or (drive_value.get("schema"),drive_value.get("mode"),drive_value.get("freeze_plan_sha256"),
+            drive_value.get("capture_id"),drive_value.get("canary_verified"),
+            drive_value.get("canary_deleted"))
+            !=("arc.recovery.drive-prefreeze.v1","execute",freeze_sha,capture_id,True,True)
+        or drive_value.get("rclone_version")!="v1.75.0"
+        or drive_value.get("daily_upload_budget_basis")
+            !="operator-reviewed-remaining-dedicated-account"
+        or drive_value.get("canary_bytes")!=8*1024*1024
+        or any(hash_re.fullmatch(str(drive_value.get(field))) is None
+               or drive_value.get(field)=="0"*64 for field in
+               ("remote_root_sha256","client_id_sha256","account_sha256","permission_id_sha256"))
+        or any(isinstance(number,bool) or not isinstance(number,int) or number<=0 for number in numbers)
+        or drive_value.get("available_bytes_before")
+            <drive_value.get("archive_reservation_bytes")+drive_value.get("canary_bytes")
+        or drive_value.get("available_bytes_after")<drive_value.get("archive_reservation_bytes")
+        or drive_value.get("daily_upload_budget_bytes")<drive_value.get("archive_reservation_bytes")):
+    raise SystemExit("live-observation generation receipt bytes or bindings differ")
+PY
+}
+
+verify_live_observation_selection_exact() {
+    local path="$1" expected_sha="$2" generation_receipt="$3"
+    local generation="$4" generation_sha="$5" drive_sha="$6"
+    local freeze_sha="$7" capture_id="$8"
+    verify_live_observation_generation_receipt_exact "$generation_receipt" \
+        "$generation" "$generation_sha" "$drive_sha" "$freeze_sha" "$capture_id"
+    python3 - "$path" "$expected_sha" "$generation_receipt" "$generation" \
+        "$generation_sha" "$drive_sha" "$freeze_sha" "$capture_id" <<'PY'
+import datetime,hashlib,json,os,pathlib,re,stat,sys
+path=pathlib.Path(sys.argv[1]);expected,gen_path_raw,generation,gen_sha,drive_sha,freeze,capture=sys.argv[2:]
+gen_path=pathlib.Path(gen_path_raw);hash_re=re.compile(r"[0-9a-f]{64}")
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+def locked(item,label):
+    fd=os.open(item,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or item.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode)!=0o400
+                or not 0<details.st_size<=16*1024*1024):
+            raise SystemExit(f"live-observation {label} is unsafe")
+        raw=os.read(fd,16*1024*1024+1)
+        if len(raw)!=details.st_size:raise SystemExit(f"live-observation {label} changed")
+        value=json.loads(raw)
+        if raw!=canonical(value):raise SystemExit(f"live-observation {label} is noncanonical")
+        return value,raw
+    finally:os.close(fd)
+if any(hash_re.fullmatch(value) is None for value in
+       (expected,generation,gen_sha,drive_sha,freeze,capture)):
+    raise SystemExit("live-observation selection verification identity is malformed")
+value,raw=locked(path,"selection");gen_value,gen_raw=locked(gen_path,"generation receipt")
+fields={"schema","source_main_commit","freeze_plan_sha256","capture_id",
+    "observation_generation","observation_generation_receipt",
+    "observation_generation_receipt_path","observation_generation_receipt_sha256",
+    "drive_prefreeze_receipt_path","drive_prefreeze_receipt_sha256",
+    "generation_created_at","selected_at","max_selection_age_seconds","labels","nodes"}
+try:
+    created=datetime.datetime.strptime(value.get("generation_created_at"),"%Y-%m-%dT%H:%M:%S.%fZ")
+    selected=datetime.datetime.strptime(value.get("selected_at"),"%Y-%m-%dT%H:%M:%S.%fZ")
+except (TypeError,ValueError):
+    raise SystemExit("live-observation selection timestamp differs")
+drive_wrapper=gen_value.get("drive_prefreeze_receipt",{})
+nodes=value.get("nodes")
+if (set(value)!=fields or hashlib.sha256(raw).hexdigest()!=expected
+        or value.get("schema")!="arc.recovery.legacy-live-observation-selection.v1"
+        or value.get("source_main_commit")!=gen_value.get("source_main_commit")
+        or (value.get("observation_generation"),value.get("freeze_plan_sha256"),value.get("capture_id"))
+            !=(generation,freeze,capture)
+        or value.get("observation_generation_receipt")!=gen_value
+        or value.get("observation_generation_receipt_path")!=str(gen_path)
+        or value.get("observation_generation_receipt_sha256")!=gen_sha
+        or hashlib.sha256(gen_raw).hexdigest()!=gen_sha
+        or value.get("generation_created_at")!=gen_value.get("created_at")
+        or value.get("max_selection_age_seconds")!=300
+        or not 0<=(selected-created).total_seconds()<=300
+        or value.get("drive_prefreeze_receipt_path")!=drive_wrapper.get("path")
+        or value.get("drive_prefreeze_receipt_sha256")!=drive_sha
+        or value.get("labels")!=["diagnostic","noncanonical","nonreward"]
+        or not isinstance(nodes,list) or len(nodes)!=6
+        or [row.get("node") for row in nodes]!=["nyc","lax","ams","lhr","nrt","sgp"]):
+    raise SystemExit("live-observation selection bytes or bindings differ")
+node_fields={"node","created_at","completed_at","root_sha256","receipt_sha256"}
+for row in nodes:
+    try:
+        started=datetime.datetime.strptime(row.get("created_at"),"%Y-%m-%dT%H:%M:%S.%fZ")
+        completed=datetime.datetime.strptime(row.get("completed_at"),"%Y-%m-%dT%H:%M:%S.%fZ")
+    except (AttributeError,TypeError,ValueError):
+        raise SystemExit("live-observation selection node timestamp differs")
+    if (set(row)!=node_fields or started>completed
+            or hash_re.fullmatch(str(row.get("root_sha256"))) is None
+            or hash_re.fullmatch(str(row.get("receipt_sha256"))) is None):
+        raise SystemExit("live-observation selection node row differs")
+PY
+}
+
 run_live_observations_exact() {
-    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" node="$4"
-    run_remote "$node" capture-live-observations "$capture_id" "$node" "$freeze_sha" \
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" observation_generation="$4"
+    local generation_receipt_sha="$5" drive_receipt_sha="$6" node="$7"
+    run_remote "$node" capture-live-observations "$capture_id" "$observation_generation" \
+        "$generation_receipt_sha" "$drive_receipt_sha" "$node" "$freeze_sha" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
         "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
@@ -3550,20 +4757,26 @@ run_live_observations_exact() {
 }
 
 run_live_observations_eligibility_exact() {
-    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" node="$4"
-    run_remote "$node" live-observations-eligible "$capture_id" "$node" "$freeze_sha" \
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" observation_generation="$4" node="$5"
+    run_remote "$node" live-observations-eligible "$capture_id" "$observation_generation" "$node" "$freeze_sha" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
         "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
         "$(freeze_node_field "$freeze_plan" "$node" boot_id)"
 }
 
 capture_all_live_observations() {
-    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" log_root="$4"
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" observation_generation="$4"
+    local generation_receipt="$5" generation_receipt_sha="$6" drive_receipt_sha="$7"
+    local log_root="$8" statuses="$9"
     local node index failed=0 complete_count=0
     local pids=() names=()
     assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
+    verify_live_observation_generation_receipt_exact "$generation_receipt" \
+        "$observation_generation" "$generation_receipt_sha" "$drive_receipt_sha" \
+        "$freeze_sha" "$capture_id"
     for node in nyc lax ams lhr nrt sgp; do
-        if run_remote "$node" live-observations-status "$capture_id" "$node" "$freeze_sha" \
+        if run_remote "$node" live-observations-status "$capture_id" "$observation_generation" \
+                "$generation_receipt_sha" "$drive_receipt_sha" "$node" "$freeze_sha" \
                 >/dev/null 2>&1; then
             complete_count=$((complete_count + 1))
         fi
@@ -3575,7 +4788,7 @@ capture_all_live_observations() {
         for node in nyc lax ams lhr nrt sgp; do
             (
                 run_live_observations_eligibility_exact \
-                    "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
+                    "$freeze_plan" "$freeze_sha" "$capture_id" "$observation_generation" "$node"
             ) > "$log_root/$node-live-observations-eligibility.log" 2>&1 &
             pids+=("$!")
             names+=("$node")
@@ -3596,7 +4809,8 @@ capture_all_live_observations() {
     failed=0
     for node in nyc lax ams lhr nrt sgp; do
         (
-            run_live_observations_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
+            run_live_observations_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
+                "$observation_generation" "$generation_receipt_sha" "$drive_receipt_sha" "$node"
         ) > "$log_root/$node-live-observations.log" 2>&1 &
         pids+=("$!")
         names+=("$node")
@@ -3613,8 +4827,11 @@ capture_all_live_observations() {
     done
     [ "$failed" -eq 0 ] || \
         die "live-observation receipt set is incomplete; this execution sent no writer freeze/stop signal"
+    : > "$statuses"
+    chmod 600 -- "$statuses"
     for node in nyc lax ams lhr nrt sgp; do
-        run_remote "$node" live-observations-status "$capture_id" "$node" "$freeze_sha" >/dev/null
+        run_remote "$node" live-observations-status "$capture_id" "$observation_generation" \
+            "$generation_receipt_sha" "$drive_receipt_sha" "$node" "$freeze_sha" >> "$statuses"
     done
     printf 'archive fleet: all six durable diagnostic/noncanonical/nonreward live-observation receipts verified\n'
 }
@@ -3758,7 +4975,7 @@ plan=json.loads(pathlib.Path(plan_raw).read_text(encoding="utf-8"));source=plan.
 if plan.get("schema")!="arc.recovery.freeze-plan.v5" or not isinstance(source,str):
     raise SystemExit("quarantine stability freeze plan differs")
 ledger_path=pathlib.Path(ledger_raw);ledger_bytes=ledger_path.read_bytes();ledger=json.loads(ledger_bytes)
-if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v1"
+if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v2"
         or (ledger.get("freeze_plan_sha256"),ledger.get("capture_id"))!=(freeze,capture)
         or [(row.get("node"),row.get("host")) for row in ledger.get("fleet",[])]!=fleet):
     raise SystemExit("quarantine stability generation ledger differs")
@@ -3865,7 +5082,7 @@ fields={"schema","source_main_commit","freeze_plan_sha256","capture_id","challen
         "fleet_heads","nodes","global_absence_claimed",
         "quarantine_generation_ledger_sha256","active_transition_sha256s"}
 ledger_path=pathlib.Path(ledger_raw);ledger_bytes=ledger_path.read_bytes();ledger=json.loads(ledger_bytes)
-if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v1"
+if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v2"
         or (ledger.get("freeze_plan_sha256"),ledger.get("capture_id"))!=(freeze,capture)):
     raise SystemExit("network-quarantine stability ledger differs")
 transitions=[]
@@ -4207,12 +5424,10 @@ PY
 }
 
 ensure_offline_capture() {
-    local capture_id="$1" node="$2"
-    if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
-        run_remote "$node" status "$capture_id" "$node"
-        return 0
-    fi
-    run_remote "$node" capture-offline "$capture_id" "$node"
+    local capture_id="$1" node="$2" observation_generation="$3"
+    local generation_receipt_sha="$4" drive_receipt_sha="$5"
+    run_remote "$node" capture-offline "$capture_id" "$node" "$observation_generation" \
+        "$generation_receipt_sha" "$drive_receipt_sha"
     run_remote "$node" status "$capture_id" "$node"
 }
 
@@ -4230,18 +5445,21 @@ create_legacy_maintenance_evidence_bundle() {
     local stability_proof="$8" output="$9"
     local first_quarantine_started_at="${10}" all_controlled_stopped_at="${11}"
     local quarantine_generation_ledger="${12}"
+    local live_observation_selection="${13}"
     python3 - "$freeze_plan" "$freeze_sha" "$capture_id" "$status_root" \
         "$authenticated_cross" "$quarantine_root" "$persisted_root" "$stability_proof" "$output" \
         "$first_quarantine_started_at" "$all_controlled_stopped_at" \
-        "$quarantine_generation_ledger" "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
+        "$quarantine_generation_ledger" "$live_observation_selection" \
+        "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
 (plan_raw,freeze_sha,capture_id,status_root_raw,authenticated_raw,quarantine_raw,
  persisted_raw,stability_raw,output_raw,first_started,all_stopped,ledger_raw,
- rounds_module_raw,*fleet_raw)=sys.argv[1:]
+ observation_selection_raw,rounds_module_raw,*fleet_raw)=sys.argv[1:]
 plan_path=pathlib.Path(plan_raw);status_root=pathlib.Path(status_root_raw)
 authenticated_path=pathlib.Path(authenticated_raw);quarantine_root=pathlib.Path(quarantine_raw)
 persisted_root=pathlib.Path(persisted_raw);stability_path=pathlib.Path(stability_raw)
 ledger_path=pathlib.Path(ledger_raw)
+observation_selection_path=pathlib.Path(observation_selection_raw)
 output=pathlib.Path(output_raw)
 sidecar=output.with_name(output.name+".sha256")
 fleet=[tuple(row.split("=",1)) for row in fleet_raw]
@@ -4295,6 +5513,31 @@ if (authenticated.get("schema")!="arc.recovery.authenticated-legacy-height-fleet
         or (authenticated.get("source_main_commit"),authenticated.get("freeze_plan_sha256"),
             authenticated.get("capture_id"))!=(source_commit,freeze_sha,capture_id)):
     raise SystemExit("maintenance evidence bundle authenticated proof differs")
+observation_selection,observation_selection_bytes=locked(
+    observation_selection_path,"live-observation selection")
+selection_fields={"schema","source_main_commit","freeze_plan_sha256","capture_id",
+    "observation_generation","observation_generation_receipt",
+    "observation_generation_receipt_path","observation_generation_receipt_sha256",
+    "drive_prefreeze_receipt_path","drive_prefreeze_receipt_sha256",
+    "generation_created_at","selected_at","max_selection_age_seconds","labels","nodes"}
+generation_receipt=observation_selection.get("observation_generation_receipt")
+if (set(observation_selection)!=selection_fields
+        or observation_selection.get("schema")!="arc.recovery.legacy-live-observation-selection.v1"
+        or (observation_selection.get("source_main_commit"),
+            observation_selection.get("freeze_plan_sha256"),observation_selection.get("capture_id"))
+            !=(source_commit,freeze_sha,capture_id)
+        or not isinstance(generation_receipt,dict)
+        or digest(canonical(generation_receipt))
+            !=observation_selection.get("observation_generation_receipt_sha256")
+        or generation_receipt.get("observation_generation")
+            !=observation_selection.get("observation_generation")
+        or generation_receipt.get("drive_prefreeze_receipt",{}).get("sha256")
+            !=observation_selection.get("drive_prefreeze_receipt_sha256")
+        or observation_selection.get("labels")!=["diagnostic","noncanonical","nonreward"]):
+    raise SystemExit("maintenance evidence bundle live-observation selection differs")
+datetime.datetime.strptime(observation_selection["selected_at"],"%Y-%m-%dT%H:%M:%S.%fZ")
+# Selection UTC and node transition UTC are audit-only across hosts.  The
+# authorization/readiness/dispatch/ledger hash chain is the causal boundary.
 ledger,ledger_bytes=locked(ledger_path,"quarantine generation ledger")
 import importlib.util
 spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",rounds_module_raw)
@@ -4306,6 +5549,14 @@ except rounds.QuarantineRoundError as error:
     raise SystemExit(f"maintenance evidence bundle generation ledger differs: {error}") from error
 if ((ledger_state["freeze_plan_sha256"],ledger_state["capture_id"])
         !=(freeze_sha,capture_id)
+        or (ledger_state["live_observation_selection_sha256"],
+            ledger_state["live_observation_generation"],
+            ledger_state["observation_generation_receipt_sha256"],
+            ledger_state["drive_prefreeze_receipt_sha256"])
+            !=(digest(observation_selection_bytes),
+               observation_selection["observation_generation"],
+               observation_selection["observation_generation_receipt_sha256"],
+               observation_selection["drive_prefreeze_receipt_sha256"])
         or ledger.get("first_secured_at")!=first_started
         or ledger_state["all_nodes_secured_at"]
             >datetime.datetime.strptime(all_stopped,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)):
@@ -4391,6 +5642,8 @@ def sealed(value,raw,node,role):
     root=digest(raw);inventory.append({"node":node,"role":role,"sha256":root,"size":len(raw)})
     return {"value":value,"sha256":root}
 authenticated_sealed=sealed(authenticated,authenticated_bytes,"fleet","authenticated-prefence-height-cross-proof")
+observation_selection_sealed=sealed(
+    observation_selection,observation_selection_bytes,"fleet","live-observation-selection")
 ledger_sealed=sealed(ledger,ledger_bytes,"fleet","quarantine-generation-ledger")
 challenge_sealed=sealed(challenge_value,challenge_bytes,"fleet","network-quarantine-challenge")
 stability_sealed=sealed(stability,stability_bytes,"fleet","network-quarantine-stability-proof")
@@ -4535,6 +5788,7 @@ value={"schema":"arc.recovery.legacy-maintenance-evidence-bundle.v1",
        "source_main_commit":source_commit,"freeze_plan_sha256":freeze_sha,"capture_id":capture_id,
        "first_quarantine_started_at":first_started,"all_controlled_stopped_at":all_stopped,
        "challenge":challenge,
+       "live_observation_selection":observation_selection_sealed,
        "authenticated_prefence_height_cross_proof":authenticated_sealed,
        "quarantine_generation_ledger":ledger_sealed,
        "network_quarantine_challenge":challenge_sealed,
@@ -4717,6 +5971,19 @@ if (evidence_bundle.get("schema")!="arc.recovery.legacy-maintenance-evidence-bun
         or evidence_bundle.get("authenticated_prefence_height_cross_proof",{}).get("value")!=authenticated
         or evidence_bundle.get("authenticated_prefence_height_cross_proof",{}).get("sha256")!=digest(authenticated_bytes)):
     raise SystemExit("maintenance-boundary evidence bundle identity differs")
+observation_selection_sealed=evidence_bundle.get("live_observation_selection")
+if (not isinstance(observation_selection_sealed,dict)
+        or set(observation_selection_sealed)!={"value","sha256"}
+        or not isinstance(observation_selection_sealed.get("value"),dict)
+        or digest(canonical(observation_selection_sealed["value"]))
+            !=observation_selection_sealed.get("sha256")
+        or observation_selection_sealed["value"].get("schema")
+            !="arc.recovery.legacy-live-observation-selection.v1"
+        or (observation_selection_sealed["value"].get("source_main_commit"),
+            observation_selection_sealed["value"].get("freeze_plan_sha256"),
+            observation_selection_sealed["value"].get("capture_id"))
+            !=(source_commit,freeze_sha,capture_id)):
+    raise SystemExit("maintenance-boundary live-observation selection seal differs")
 stability_sealed=evidence_bundle.get("quarantine_stability_proof")
 if (not isinstance(stability_sealed,dict) or set(stability_sealed)!={"value","sha256"}
         or not isinstance(stability_sealed.get("value"),dict)
@@ -4737,6 +6004,16 @@ except rounds.QuarantineRoundError as error:
     raise SystemExit(f"maintenance-boundary generation ledger differs: {error}") from error
 if ((ledger_state["freeze_plan_sha256"],ledger_state["capture_id"])
         !=(freeze_sha,capture_id)
+        or (ledger_state["live_observation_selection_sha256"],
+            ledger_state["live_observation_generation"],
+            ledger_state["observation_generation_receipt_sha256"],
+            ledger_state["drive_prefreeze_receipt_sha256"])
+            !=(observation_selection_sealed["sha256"],
+               observation_selection_sealed["value"].get("observation_generation"),
+               observation_selection_sealed["value"].get(
+                   "observation_generation_receipt_sha256"),
+               observation_selection_sealed["value"].get(
+                   "drive_prefreeze_receipt_sha256"))
         or ledger_sealed["value"].get("first_secured_at")
             !=first_quarantine_started_at):
     raise SystemExit("maintenance-boundary generation ledger identity differs")
@@ -5052,6 +6329,12 @@ value={
     "legacy_public_height_receipt":{"schema":public["schema"],"sha256":public_sha,
         "completed_at":public["completed_at"],"observed_max_height":public["legacy_public_max_height"]},
     "authenticated_prefence_height_cross_proof_sha256":digest(authenticated_bytes),
+    "legacy_live_observation_selection_sha256":observation_selection_sealed["sha256"],
+    "legacy_live_observation_generation":observation_selection_sealed["value"]["observation_generation"],
+    "observation_generation_receipt_sha256":
+        observation_selection_sealed["value"]["observation_generation_receipt_sha256"],
+    "drive_prefreeze_receipt_sha256":
+        observation_selection_sealed["value"]["drive_prefreeze_receipt_sha256"],
     "quarantine_generation_ledger_sha256":ledger_sealed["sha256"],
     "legacy_maintenance_evidence_bundle_sha256":digest(evidence_bundle_bytes),
     "network_quarantine_stability_proof_sha256":stability_sealed["sha256"],
@@ -5765,6 +7048,21 @@ raise SystemExit(0 if datetime.datetime.now(datetime.timezone.utc)<=deadline els
 PY
 }
 
+operator_selection_window_is_live() {
+    local selected_monotonic_ns="$1" selected_realtime_ns="$2"
+    python3 - "$selected_monotonic_ns" "$selected_realtime_ns" \
+        "$QUARANTINE_ROUND_DRIVER" <<'PY'
+import importlib.util,sys
+try:selected_monotonic=int(sys.argv[1]);selected_realtime=int(sys.argv[2])
+except ValueError:raise SystemExit(1)
+spec=importlib.util.spec_from_file_location("arc_quarantine_round_driver",sys.argv[3])
+if spec is None or spec.loader is None:raise SystemExit(1)
+module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+try:module.operator_selection_remaining_ns(selected_monotonic,selected_realtime)
+except (ValueError,OSError):raise SystemExit(1)
+PY
+}
+
 quarantine_round_prefix_ref() {
     local round_root="$1" through="$2" node="$3"
     python3 -I "$QUARANTINE_ROUND_DRIVER" prefix-ref \
@@ -5935,6 +7233,114 @@ capture_quarantine_round_live_sources() {
         "one or more live targets failed exact snapshot/WAL-prefix capture"
 }
 
+seal_quarantine_mutation_dispatch() {
+    local authorization="$1" readiness="$2" output="$3"
+    python3 - "$authorization" "$readiness" "$output" <<'PY'
+import datetime,hashlib,json,os,pathlib,stat,sys
+authorization_path,readiness_path,output=map(pathlib.Path,sys.argv[1:])
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+digest=lambda raw:hashlib.sha256(raw).hexdigest()
+def locked(path,label,modes={0o400},links={1}):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink not in links
+                or stat.S_IMODE(details.st_mode) not in modes
+                or not 0<details.st_size<=32*1024*1024):
+            raise SystemExit(f"quarantine mutation dispatch {label} is unsafe")
+        raw=os.read(fd,32*1024*1024+1)
+        if len(raw)!=details.st_size:raise SystemExit(f"quarantine mutation dispatch {label} changed")
+        value=json.loads(raw)
+        if raw!=canonical(value):raise SystemExit(f"quarantine mutation dispatch {label} is noncanonical")
+        return value,raw
+    finally:os.close(fd)
+authorization,authorization_raw=locked(authorization_path,"authorization")
+readiness,readiness_raw=locked(readiness_path,"readiness")
+identity={
+    "schema":"arc.recovery.quarantine-mutation-dispatch.v1",
+    "capture_id":authorization.get("capture_id"),
+    "freeze_plan_sha256":authorization.get("freeze_plan_sha256"),
+    "round_number":authorization.get("round_number"),
+    "round_authorization_sha256":digest(authorization_raw),
+    "round_readiness_sha256":digest(readiness_raw),
+    "live_observation_selection_sha256":authorization.get("live_observation_selection_sha256"),
+    "live_observation_generation":authorization.get("live_observation_generation"),
+    "observation_generation_receipt_sha256":authorization.get("observation_generation_receipt_sha256"),
+    "drive_prefreeze_receipt_sha256":authorization.get("drive_prefreeze_receipt_sha256"),
+    "targets":[{"node":row.get("node"),"host":row.get("host")} for row in authorization.get("targets",[])],
+}
+if (readiness.get("round_authorization_sha256")!=identity["round_authorization_sha256"]
+        or readiness.get("round_number")!=identity["round_number"]):
+    raise SystemExit("quarantine mutation dispatch readiness differs")
+partial=output.with_name(output.name+".partial")
+if (output.exists() or output.is_symlink()) and (partial.exists() or partial.is_symlink()):
+    output_details=output.lstat();partial_details=partial.lstat()
+    if (output.is_symlink() or partial.is_symlink()
+            or (output_details.st_dev,output_details.st_ino)!=(partial_details.st_dev,partial_details.st_ino)
+            or output_details.st_nlink!=2 or partial_details.st_nlink!=2
+            or locked(output,"linked receipt",links={2})[1]
+                !=locked(partial,"linked partial receipt",{0o400,0o600},{2})[1]):
+        raise SystemExit("quarantine mutation dispatch interrupted publication differs")
+    os.unlink(partial)
+    dfd=os.open(output.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:os.fsync(dfd)
+    finally:os.close(dfd)
+if output.exists() or output.is_symlink():
+    existing,_raw=locked(output,"existing receipt")
+    dispatched_at=existing.get("dispatched_at")
+else:
+    if partial.exists() or partial.is_symlink():
+        details=partial.lstat()
+        if (partial.is_symlink() or not stat.S_ISREG(details.st_mode)
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode) not in {0o400,0o600}):
+            raise SystemExit("quarantine mutation dispatch partial identity differs")
+        try:
+            partial_value,partial_raw=locked(partial,"partial receipt",{0o400,0o600})
+            dispatched_at=partial_value["dispatched_at"]
+            datetime.datetime.strptime(dispatched_at,"%Y-%m-%dT%H:%M:%SZ")
+        except (SystemExit,KeyError,TypeError,ValueError,json.JSONDecodeError,UnicodeDecodeError):
+            if stat.S_IMODE(details.st_mode)!=0o600:
+                raise SystemExit("sealed quarantine mutation dispatch partial is malformed")
+            os.unlink(partial)
+            dfd=os.open(output.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+            try:os.fsync(dfd)
+            finally:os.close(dfd)
+            dispatched_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        dispatched_at=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+value={**identity,"dispatched_at":dispatched_at}
+payload=canonical(value)
+if output.exists() or output.is_symlink():
+    if existing!=value:raise SystemExit("existing quarantine mutation dispatch differs")
+else:
+    if partial.exists() or partial.is_symlink():
+        partial_value,partial_raw=locked(partial,"partial receipt",{0o400,0o600})
+        if partial_value!=value or partial_raw!=payload:
+            raise SystemExit("partial quarantine mutation dispatch differs")
+        os.chmod(partial,0o400,follow_symlinks=False)
+    else:
+        fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+        with os.fdopen(fd,"wb") as handle:
+            handle.write(payload);handle.flush();os.fsync(handle.fileno());os.fchmod(handle.fileno(),0o400)
+    try:
+        os.link(partial,output,follow_symlinks=False)
+    except FileExistsError:
+        if locked(output,"racing receipt",links={1,2})[1]!=payload:
+            raise SystemExit("racing quarantine mutation dispatch differs")
+    dfd=os.open(output.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+    try:
+        os.fsync(dfd)
+        os.unlink(partial)
+        os.fsync(dfd)
+    finally:os.close(dfd)
+    if locked(output,"published receipt")[1]!=payload:
+        raise SystemExit("published quarantine mutation dispatch differs")
+print(digest(payload))
+PY
+}
+
 capture_post_quarantine_final_sources() {
     local freeze_plan="$1" freeze_sha="$2" capture_id="$3" ledger="$4"
     local stability_proof="$5" status_root="$6" output_root="$7" log_root="$8"
@@ -6047,19 +7453,250 @@ PY
         "one or more active nodes lack an exact post-stability source pair; no writer stop is authorized"
 }
 
+quarantine_authorization_matches_live_observation() {
+    local authorization="$1" selection="$2" selection_sha="$3"
+    local generation_receipt="$4" generation="$5" generation_sha="$6"
+    local drive_sha="$7" freeze_sha="$8" capture_id="$9"
+    verify_live_observation_selection_exact "$selection" "$selection_sha" \
+        "$generation_receipt" "$generation" "$generation_sha" "$drive_sha" \
+        "$freeze_sha" "$capture_id" || return 1
+    python3 - "$authorization" "$selection" "$selection_sha" "$generation" \
+        "$generation_sha" "$drive_sha" "$freeze_sha" "$capture_id" <<'PY'
+import hashlib,json,os,pathlib,stat,sys
+authorization_path,selection_path=map(pathlib.Path,sys.argv[1:3])
+selection_sha,generation,generation_sha,drive_sha,freeze,capture=sys.argv[3:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+def locked(path,label):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode)!=0o400
+                or not 0<details.st_size<=32*1024*1024):
+            raise SystemExit(f"quarantine observation {label} is unsafe")
+        raw=os.read(fd,32*1024*1024+1)
+        if len(raw)!=details.st_size:raise SystemExit(f"quarantine observation {label} changed")
+        value=json.loads(raw)
+        if raw!=canonical(value):raise SystemExit(f"quarantine observation {label} is noncanonical")
+        return value,raw
+    finally:os.close(fd)
+authorization,_authorization_raw=locked(authorization_path,"authorization")
+selection,selection_raw=locked(selection_path,"selection")
+expected=(selection_sha,generation,generation_sha,drive_sha,selection.get("selected_at"))
+actual=(authorization.get("live_observation_selection_sha256"),
+        authorization.get("live_observation_generation"),
+        authorization.get("observation_generation_receipt_sha256"),
+        authorization.get("drive_prefreeze_receipt_sha256"),
+        authorization.get("live_observation_selected_at"))
+if (hashlib.sha256(selection_raw).hexdigest()!=selection_sha
+        or (authorization.get("capture_id"),authorization.get("freeze_plan_sha256"))
+            !=(capture,freeze) or actual!=expected):
+    raise SystemExit("quarantine authorization uses another live-observation selection")
+PY
+}
+
+quarantine_attempt_has_valid_zero_progress_release() {
+    local attempt_root="$1" freeze_sha="$2" capture_id="$3"
+    local release="$attempt_root/zero-progress-release.json"
+    [ -f "$release" ] && [ ! -L "$release" ] || return 1
+    python3 -I - "$attempt_root" "$freeze_sha" "$capture_id" \
+        "$QUARANTINE_ROUND_MODULE" <<'PY'
+import datetime,hashlib,importlib.util,json,os,pathlib,re,stat,sys
+attempt=pathlib.Path(sys.argv[1]);freeze,capture,module_path=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+digest=lambda raw:hashlib.sha256(raw).hexdigest()
+hash_re=re.compile(r"[0-9a-f]{64}")
+if any(hash_re.fullmatch(value) is None for value in (freeze,capture)):
+    raise SystemExit("zero-progress resume identity is malformed")
+spec=importlib.util.spec_from_file_location("arc_zero_progress_rounds",module_path)
+if spec is None or spec.loader is None:raise SystemExit("cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);sys.modules[spec.name]=rounds;spec.loader.exec_module(rounds)
+def locked(path,label):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode)!=0o400
+                or not 0<details.st_size<=32*1024*1024):
+            raise SystemExit(f"zero-progress resume {label} is unsafe")
+        raw=os.read(fd,32*1024*1024+1)
+        if len(raw)!=details.st_size:raise SystemExit(f"zero-progress resume {label} changed")
+        value=json.loads(raw)
+        if raw!=canonical(value):raise SystemExit(f"zero-progress resume {label} is noncanonical")
+        return value,raw
+    finally:os.close(fd)
+authorization,authorization_raw=locked(attempt/"authorization.json","authorization")
+readiness,readiness_raw=locked(attempt/"readiness.json","readiness")
+dispatch,dispatch_raw=locked(attempt/"mutation-dispatch.json","dispatch")
+release,_release_raw=locked(attempt/"zero-progress-release.json","release")
+state=rounds.validate_round_authorization(authorization,prior_results=[])
+auth_sha=digest(authorization_raw);readiness_sha=digest(readiness_raw);dispatch_sha=digest(dispatch_raw)
+targets=authorization.get("targets")
+names=[row.get("node") for row in targets] if isinstance(targets,list) else []
+if (state.get("round_number")!=1 or state.get("capture_id")!=capture
+        or state.get("freeze_plan_sha256")!=freeze
+        or names!=["nyc","lax","ams","lhr","nrt","sgp"]):
+    raise SystemExit("zero-progress resume authorization differs")
+probe={"schema":rounds.ROUND_RESULT_SCHEMA,"capture_id":capture,
+    "freeze_plan_sha256":freeze,"round_number":1,
+    "round_authorization_sha256":auth_sha,"target_readiness":rounds.wrap(readiness),
+    "transitions":[],"mutation_dispatch":rounds.wrap(dispatch),
+    "remaining_target_inert_proofs":[],"remaining_targets":names,
+    "completed_at":authorization["authorization_deadline"]}
+rounds.validate_round_result(
+    probe,authorization=authorization,prior_results=[],transition_receipts=[]
+)
+dispatch_fields={"schema","capture_id","freeze_plan_sha256","round_number",
+    "round_authorization_sha256","round_readiness_sha256",
+    "live_observation_selection_sha256","live_observation_generation",
+    "observation_generation_receipt_sha256","drive_prefreeze_receipt_sha256",
+    "targets","dispatched_at"}
+try:
+    dispatched=datetime.datetime.strptime(dispatch.get("dispatched_at"),"%Y-%m-%dT%H:%M:%SZ")
+except (TypeError,ValueError):
+    raise SystemExit("zero-progress resume dispatch time differs")
+del dispatched
+observation_identity=(authorization.get("live_observation_selection_sha256"),
+    authorization.get("live_observation_generation"),
+    authorization.get("observation_generation_receipt_sha256"),
+    authorization.get("drive_prefreeze_receipt_sha256"))
+if (set(dispatch)!=dispatch_fields
+        or dispatch.get("schema")!="arc.recovery.quarantine-mutation-dispatch.v1"
+        or (dispatch.get("capture_id"),dispatch.get("freeze_plan_sha256"),
+            dispatch.get("round_number"),dispatch.get("round_authorization_sha256"),
+            dispatch.get("round_readiness_sha256"))
+            !=(capture,freeze,1,auth_sha,readiness_sha)
+        or (dispatch.get("live_observation_selection_sha256"),
+            dispatch.get("live_observation_generation"),
+            dispatch.get("observation_generation_receipt_sha256"),
+            dispatch.get("drive_prefreeze_receipt_sha256"))!=observation_identity
+        or dispatch.get("targets")!=[
+            {"node":row.get("node"),"host":row.get("host")} for row in targets]):
+    raise SystemExit("zero-progress resume dispatch differs")
+release_fields={"schema","capture_id","freeze_plan_sha256","round_number",
+    "round_authorization_sha256","round_readiness_sha256","mutation_dispatch_sha256",
+    "live_observation_selection_sha256","live_observation_generation",
+    "observation_generation_receipt_sha256","drive_prefreeze_receipt_sha256",
+    "challenge","released_at","nodes"}
+challenge=release.get("challenge");nodes=release.get("nodes")
+try:
+    released=datetime.datetime.strptime(release.get("released_at"),"%Y-%m-%dT%H:%M:%SZ")
+except (TypeError,ValueError):
+    raise SystemExit("zero-progress resume release time differs")
+del released
+if (set(release)!=release_fields
+        or release.get("schema")!="arc.recovery.quarantine-round-zero-progress-release.v1"
+        or (release.get("capture_id"),release.get("freeze_plan_sha256"),
+            release.get("round_number"),release.get("round_authorization_sha256"),
+            release.get("round_readiness_sha256"),release.get("mutation_dispatch_sha256"))
+            !=(capture,freeze,1,auth_sha,readiness_sha,dispatch_sha)
+        or (release.get("live_observation_selection_sha256"),
+            release.get("live_observation_generation"),
+            release.get("observation_generation_receipt_sha256"),
+            release.get("drive_prefreeze_receipt_sha256"))!=observation_identity
+        or hash_re.fullmatch(str(challenge)) is None
+        or not isinstance(nodes,list) or len(nodes)!=6):
+    raise SystemExit("zero-progress resume release differs")
+target_by_node={row["node"]:row for row in targets}
+proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation",
+    "round_number","round_authorization_sha256","round_readiness_sha256",
+    "mutation_dispatch_sha256","challenge","node","boot_id","writer_live_unfenced",
+    "apply_state_present","restart_effective_mutation_absent","active_selector_absent",
+    "quarantine_nft_absent","authorization_accepted","readiness_present",
+    "accepted_boottime_ns","elapsed_since_acceptance_ns","observed_boottime_ns","observed_at"}
+for expected_node,wrapper in zip(names,nodes):
+    proof=wrapper.get("value") if isinstance(wrapper,dict) else None
+    if isinstance(proof,dict):
+        accepted=proof.get("accepted_boottime_ns");elapsed=proof.get("elapsed_since_acceptance_ns")
+        observed=proof.get("observed_boottime_ns")
+        try:seen=datetime.datetime.strptime(proof.get("observed_at"),"%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError,ValueError):seen=None
+    else:accepted=elapsed=observed=seen=None
+    if (not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}
+            or not isinstance(proof,dict) or set(proof)!=proof_fields
+            or wrapper.get("sha256")!=digest(canonical(proof))
+            or proof.get("schema")!="arc.recovery.quarantine-round-zero-progress-node-proof.v1"
+            or (proof.get("capture_id"),proof.get("freeze_plan_sha256"),
+                proof.get("observation_generation"),proof.get("round_number"),
+                proof.get("round_authorization_sha256"),proof.get("round_readiness_sha256"),
+                proof.get("mutation_dispatch_sha256"),proof.get("challenge"),proof.get("node"))
+                !=(capture,freeze,observation_identity[1],1,auth_sha,readiness_sha,
+                   dispatch_sha,challenge,expected_node)
+            or proof.get("boot_id")!=target_by_node[expected_node].get("boot_id")
+            or any(proof.get(field) is not True for field in
+                   ("writer_live_unfenced","restart_effective_mutation_absent",
+                    "active_selector_absent","quarantine_nft_absent","authorization_accepted"))
+            or not isinstance(proof.get("apply_state_present"),bool)
+            or not isinstance(proof.get("readiness_present"),bool)
+            or any(isinstance(number,bool) or not isinstance(number,int) or number<=0
+                   for number in (accepted,elapsed,observed))
+            or observed<=accepted+300_000_000_000 or elapsed!=observed-accepted
+            or seen is None):
+        raise SystemExit(f"zero-progress resume node proof differs: {expected_node}")
+transitions=attempt/"node-transitions"
+if transitions.exists() or transitions.is_symlink():
+    details=transitions.lstat()
+    if transitions.is_symlink() or not stat.S_ISDIR(details.st_mode):
+        raise SystemExit("zero-progress resume transition root is unsafe")
+    if any(transitions.iterdir()):raise SystemExit("zero-progress resume has a node transition")
+result_path=attempt/"result.json"
+if result_path.exists() or result_path.is_symlink():
+    result,_result_raw=locked(result_path,"result")
+    if result.get("transitions")!=[]:raise SystemExit("zero-progress resume result transitioned")
+    rounds.validate_round_result(
+        result,authorization=authorization,prior_results=[],transition_receipts=[]
+    )
+PY
+}
+
+quarantine_attempt_binds_live_observation_selection() {
+    local attempt_root="$1" freeze_sha="$2" capture_id="$3"
+    # Authorization, acceptances, and a locally sealed readiness are all
+    # powerless crash prefixes: dispatch is published before readiness is sent
+    # to any node.  Only dispatch/result/transition evidence can bind a stale
+    # attempt to its observation selection.  A complete exact six-node
+    # zero-progress release proves an otherwise-binding dispatch was inert.
+    if quarantine_attempt_has_valid_zero_progress_release "$attempt_root" \
+            "$freeze_sha" "$capture_id"; then
+        return 1
+    fi
+    if [ -e "$attempt_root/mutation-dispatch.json" ] || \
+            [ -L "$attempt_root/mutation-dispatch.json" ] || \
+            [ -e "$attempt_root/result.json" ] || \
+            [ -L "$attempt_root/result.json" ] || \
+            find "$attempt_root/node-transitions" \
+                \( -type f -o -type l \) -print -quit 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
 complete_quarantine_round_attempt() {
-    local freeze_sha="$1" capture_id="$2" round_number="$3"
-    local round_root="$4" attempt_root="$5" log_root="$6"
-    local inspector_binary_sha="$7" inspector_genesis_sha="$8"
-    local inspector_validators_sha="$9" inspector_legacy_validators_sha="${10}"
-    local allow_unbound_legacy_wal="${11}"
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" round_number="$4"
+    local round_root="$5" attempt_root="$6" log_root="$7"
+    local inspector_binary_sha="$8" inspector_genesis_sha="$9"
+    local inspector_validators_sha="${10}" inspector_legacy_validators_sha="${11}"
+    local allow_unbound_legacy_wal="${12}"
+    local observation_selection="${13}" observation_selection_sha="${14}"
+    local observation_generation_receipt="${15}" observation_generation="${16}"
+    local observation_generation_receipt_sha="${17}" drive_prefreeze_receipt_sha="${18}"
+    local operator_selection_monotonic_ns="${19}" operator_selection_realtime_ns="${20}"
     local authorization="$attempt_root/authorization.json"
     local acceptance_root="$attempt_root/authorization-acceptances"
     local readiness="$attempt_root/readiness.json"
     local applied_root="$attempt_root/node-transitions"
+    local mutation_dispatch="$attempt_root/mutation-dispatch.json"
     local result="$attempt_root/result.json"
     local auth_sha readiness_sha temporary targets node index failed applied_count
-    local pids=() names=()
+    local remaining_targets remaining_proof_root final_round_root
+    local pids=() names=() remaining_names=() result_args=()
+    quarantine_authorization_matches_live_observation "$authorization" \
+        "$observation_selection" "$observation_selection_sha" \
+        "$observation_generation_receipt" "$observation_generation" \
+        "$observation_generation_receipt_sha" "$drive_prefreeze_receipt_sha" \
+        "$freeze_sha" "$capture_id" || return 3
     auth_sha="$(round_artifact_sha "$authorization")"
     targets="$(python3 - "$authorization" <<'PY'
 import json,pathlib,sys
@@ -6070,10 +7707,57 @@ print(",".join(names))
 PY
 )"
     IFS=',' read -r -a names <<< "$targets"
+    # A durable positive result is the terminal closure for this attempt.  Its
+    # embedded BOOTTIME-expired proofs make an old nft apply impossible, but a
+    # remaining live writer may legitimately stop later.  Never run another
+    # old-attempt applied/stopped status probe after the result is sealed: that
+    # could append a stopped transition and make the immutable result disagree
+    # with its own crash-resume closure.  Validate the exact existing bytes,
+    # finish the prefix copy, and let a later round own every remaining node.
+    if [ -f "$result" ] && [ ! -L "$result" ]; then
+        python3 -I "$QUARANTINE_ROUND_DRIVER" build-result \
+            --round-number "$round_number" --round-root "$round_root" \
+            --authorization "$authorization" --readiness "$readiness" \
+            --dispatch "$mutation_dispatch" --applied-root "$applied_root" \
+            --output "$result" >/dev/null
+        if ! python3 - "$result" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+raise SystemExit(0 if isinstance(value.get("transitions"),list) and value["transitions"] else 1)
+PY
+        then
+            # Historical/diagnostic zero-progress results remain attempt-local.
+            # They are never transition-ledger members and cannot authorize an
+            # immutable positive prefix, even before their challenged release.
+            return 2
+        fi
+        final_round_root="$round_root/round-$round_number"
+        if [ ! -e "$final_round_root" ]; then
+            mkdir -m 700 -- "$final_round_root"
+        fi
+        publish_canonical_maintenance_input "$authorization" \
+            "$final_round_root/authorization.json"
+        publish_canonical_maintenance_input "$result" \
+            "$final_round_root/result.json"
+        return 0
+    fi
+    [ ! -e "$result" ] && [ ! -L "$result" ] || \
+        die "quarantine round result is unsafe"
     [ -e "$acceptance_root" ] || mkdir -m 700 -- "$acceptance_root"
     [ -e "$applied_root" ] || mkdir -m 700 -- "$applied_root"
     if [ -f "$readiness" ] && [ ! -L "$readiness" ]; then
         readiness_sha="$(round_artifact_sha "$readiness")"
+        if [ -f "$mutation_dispatch" ] && [ ! -L "$mutation_dispatch" ]; then
+            seal_quarantine_mutation_dispatch "$authorization" "$readiness" \
+                "$mutation_dispatch" >/dev/null
+        elif round_authorization_is_live "$authorization" && \
+                { [ "$round_number" -ne 1 ] || \
+                  operator_selection_window_is_live \
+                    "$operator_selection_monotonic_ns" \
+                    "$operator_selection_realtime_ns"; }; then
+            seal_quarantine_mutation_dispatch "$authorization" "$readiness" \
+                "$mutation_dispatch" >/dev/null
+        fi
         for node in "${names[@]}"; do
             [ ! -f "$applied_root/$node.json" ] || continue
             temporary="$log_root/$node-round-$round_number-applied-status.new.json"
@@ -6084,7 +7768,8 @@ PY
                 publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
             else
                 temporary="$log_root/$node-round-$round_number-stopped-precommit.new.json"
-                if run_remote "$node" quarantine-round-stopped-precommit \
+                if [ -f "$mutation_dispatch" ] && \
+                        run_remote "$node" quarantine-round-stopped-precommit \
                         "$capture_id" "$node" "$freeze_sha" "$round_number" \
                         "$auth_sha" "$readiness_sha" "$inspector_binary_sha" \
                         "$inspector_genesis_sha" "$inspector_validators_sha" \
@@ -6100,7 +7785,11 @@ PY
     applied_count=0
     for node in "${names[@]}"; do [ ! -f "$applied_root/$node.json" ] || applied_count=$((applied_count + 1)); done
     if [ "$applied_count" -lt "${#names[@]}" ]; then
-        if ! round_authorization_is_live "$authorization"; then
+        if ! round_authorization_is_live "$authorization" || \
+                { [ ! -f "$mutation_dispatch" ] && [ "$round_number" -eq 1 ] && \
+                  ! operator_selection_window_is_live \
+                    "$operator_selection_monotonic_ns" \
+                    "$operator_selection_realtime_ns"; }; then
             if [ "$applied_count" -eq 0 ]; then
                 return 2
             fi
@@ -6129,12 +7818,25 @@ PY
             [ "$failed" -eq 0 ] || die \
                 "not every still-live target accepted the exact quarantine-round authorization"
             if [ ! -f "$readiness" ]; then
-                python3 -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
-                    --round-number "$round_number" --round-root "$round_root" \
-                    --authorization "$authorization" --acceptance-root "$acceptance_root" \
-                    --output "$readiness" >/dev/null
+                if [ "$round_number" -eq 1 ]; then
+                    python3 -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
+                        --round-number "$round_number" --round-root "$round_root" \
+                        --authorization "$authorization" --acceptance-root "$acceptance_root" \
+                        --operator-selection-monotonic-ns \
+                            "$operator_selection_monotonic_ns" \
+                        --operator-selection-realtime-ns \
+                            "$operator_selection_realtime_ns" \
+                        --output "$readiness" >/dev/null
+                else
+                    python3 -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
+                        --round-number "$round_number" --round-root "$round_root" \
+                        --authorization "$authorization" --acceptance-root "$acceptance_root" \
+                        --output "$readiness" >/dev/null
+                fi
             fi
             readiness_sha="$(round_artifact_sha "$readiness")"
+            seal_quarantine_mutation_dispatch "$authorization" "$readiness" \
+                "$mutation_dispatch" >/dev/null
             pids=(); failed=0
             for node in "${names[@]}"; do
                 (
@@ -6175,17 +7877,10 @@ PY
     applied_count=0
     for node in "${names[@]}"; do [ ! -f "$applied_root/$node.json" ] || applied_count=$((applied_count + 1)); done
     if [ "$applied_count" -lt "${#names[@]}" ]; then
-        local wait_seconds
-        wait_seconds="$(python3 - "$authorization" <<'PY'
-import datetime,json,pathlib,sys
-value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-deadline=datetime.datetime.strptime(value["authorization_deadline"],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-remaining=(deadline-datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-print(max(0,int(remaining)+1))
-PY
-)"
-        require_uint "$wait_seconds" "quarantine-round deadline wait"
-        [ "$wait_seconds" -eq 0 ] || /bin/sleep "$wait_seconds"
+        # Do not sleep against the operator wall-clock deadline: a backward
+        # step could turn a bounded node BOOTTIME lease into an unbounded local
+        # wait.  Query immediately; an incomplete attempt is re-challenged for
+        # zero progress on the next capture invocation.
         for node in "${names[@]}"; do
             [ ! -f "$applied_root/$node.json" ] || continue
             temporary="$log_root/$node-round-$round_number-final-applied-status.new.json"
@@ -6209,19 +7904,40 @@ PY
             fi
         done
     fi
-    python3 -I "$QUARANTINE_ROUND_DRIVER" build-result \
-        --round-number "$round_number" --round-root "$round_root" \
-        --authorization "$authorization" --readiness "$readiness" \
-        --applied-root "$applied_root" --output "$result" >/dev/null
-    applied_count="$(python3 - "$result" <<'PY'
-import json,pathlib,sys
-print(len(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["transitions"]))
-PY
-)"
+    applied_count=0
+    remaining_names=()
+    for node in "${names[@]}"; do
+        if [ -f "$applied_root/$node.json" ] && [ ! -L "$applied_root/$node.json" ]; then
+            applied_count=$((applied_count + 1))
+        else
+            remaining_names+=("$node")
+        fi
+    done
     if [ "$applied_count" -eq 0 ]; then
         return 2
     fi
-    local final_round_root="$round_root/round-$round_number"
+    remaining_proof_root=""
+    if [ "$applied_count" -lt "${#names[@]}" ] \
+            && [ ! -f "$result" ] && [ ! -L "$result" ]; then
+        remaining_targets="$(IFS=,; printf '%s' "${remaining_names[*]}")"
+        if ! remaining_proof_root="$(capture_remaining_target_inert_proofs \
+                "$freeze_plan" "$attempt_root" "$remaining_targets" "$log_root")"; then
+            printf 'archive fleet: positive quarantine round %s remains open; at least one old-dispatch target is live, ambiguous, or inside its BOOTTIME lease\n' \
+                "$round_number" >&2
+            return 4
+        fi
+    fi
+    result_args=(
+        build-result --round-number "$round_number" --round-root "$round_root"
+        --authorization "$authorization" --readiness "$readiness"
+        --dispatch "$mutation_dispatch" --applied-root "$applied_root"
+        --output "$result"
+    )
+    if [ -n "$remaining_proof_root" ]; then
+        result_args+=(--remaining-proof-root "$remaining_proof_root")
+    fi
+    python3 -I "$QUARANTINE_ROUND_DRIVER" "${result_args[@]}" >/dev/null
+    final_round_root="$round_root/round-$round_number"
     if [ ! -e "$final_round_root" ]; then
         mkdir -m 700 -- "$final_round_root"
     fi
@@ -6237,6 +7953,10 @@ run_quarantine_generation_rounds() {
     local inspector_binary_sha="$7" inspector_genesis_sha="$8"
     local inspector_validators_sha="$9" inspector_legacy_validators_sha="${10}"
     local allow_unbound_legacy_wal="${11}"
+    local observation_selection="${12}" observation_selection_sha="${13}"
+    local observation_generation_receipt="${14}" observation_generation="${15}"
+    local observation_generation_receipt_sha="${16}" drive_prefreeze_receipt_sha="${17}"
+    local operator_selection_monotonic_ns="${18}" operator_selection_realtime_ns="${19}"
     local source_main round_number round_dir attempt_root authorization
     local prior_status_root public_receipt status targets
     source_main="$(manifest_field "$freeze_plan" source_commit)"
@@ -6246,6 +7966,13 @@ run_quarantine_generation_rounds() {
         die "quarantine round validator is missing or unsafe"
     tracked_source_hash "$QUARANTINE_ROUND_DRIVER" >/dev/null
     tracked_source_hash "$QUARANTINE_ROUND_MODULE" >/dev/null
+    # Re-read the immutable operator receipts immediately before the first
+    # command that can quarantine a writer.  Supplied hashes alone are not an
+    # observation provenance boundary.
+    verify_live_observation_selection_exact "$observation_selection" \
+        "$observation_selection_sha" "$observation_generation_receipt" \
+        "$observation_generation" "$observation_generation_receipt_sha" \
+        "$drive_prefreeze_receipt_sha" "$freeze_sha" "$capture_id"
     local round_root
     round_root="$(prepare_protected_maintenance_directory \
         "$maintenance_input_root/quarantine-rounds")"
@@ -6262,16 +7989,35 @@ run_quarantine_generation_rounds() {
         for authorization in "$round_dir"/attempt.*/authorization.json; do
             [ -f "$authorization" ] && [ ! -L "$authorization" ] || continue
             attempt_root="${authorization%/authorization.json}"
-            if complete_quarantine_round_attempt "$freeze_sha" "$capture_id" \
+            if ! quarantine_authorization_matches_live_observation "$authorization" \
+                    "$observation_selection" "$observation_selection_sha" \
+                    "$observation_generation_receipt" "$observation_generation" \
+                    "$observation_generation_receipt_sha" "$drive_prefreeze_receipt_sha" \
+                    "$freeze_sha" "$capture_id"; then
+                if quarantine_attempt_binds_live_observation_selection \
+                        "$attempt_root" "$freeze_sha" "$capture_id"; then
+                    die "quarantine attempt progressed under another live-observation selection"
+                fi
+                printf 'archive fleet: ignoring unissued quarantine authorization from another live-observation selection\n'
+                continue
+            fi
+            if complete_quarantine_round_attempt "$freeze_plan" "$freeze_sha" "$capture_id" \
                     "$round_number" "$round_root" "$attempt_root" "$log_root" \
                     "$inspector_binary_sha" "$inspector_genesis_sha" \
                     "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
-                    "$allow_unbound_legacy_wal"; then
+                    "$allow_unbound_legacy_wal" "$observation_selection" \
+                    "$observation_selection_sha" "$observation_generation_receipt" \
+                    "$observation_generation" "$observation_generation_receipt_sha" \
+                    "$drive_prefreeze_receipt_sha" \
+                    "$operator_selection_monotonic_ns" \
+                    "$operator_selection_realtime_ns"; then
                 break
             else
                 status=$?
-                [ "$status" -eq 2 ] || die \
-                    "quarantine round $round_number recovery failed"
+                if [ "$status" -eq 4 ]; then
+                    die "positive quarantine round $round_number is awaiting exact remaining-target BOOTTIME closure"
+                fi
+                [ "$status" -eq 2 ] || die "quarantine round $round_number recovery failed"
             fi
         done
         if [ -f "$round_dir/result.json" ] && [ ! -L "$round_dir/result.json" ]; then
@@ -6307,17 +8053,27 @@ run_quarantine_generation_rounds() {
             --cross "$attempt_root/authenticated-target-cross.json" \
             --prior-status-root "$prior_status_root" \
             --source-capture-root "$attempt_root/live-source-captures" \
+            --live-observation-selection "$observation_selection" \
+            --live-observation-selection-sha256 "$observation_selection_sha" \
             --output "$attempt_root/authorization.json" >/dev/null
-        if complete_quarantine_round_attempt "$freeze_sha" "$capture_id" \
+        if complete_quarantine_round_attempt "$freeze_plan" "$freeze_sha" "$capture_id" \
                 "$round_number" "$round_root" "$attempt_root" "$log_root" \
                 "$inspector_binary_sha" "$inspector_genesis_sha" \
                 "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
-                "$allow_unbound_legacy_wal"; then
+                "$allow_unbound_legacy_wal" "$observation_selection" \
+                "$observation_selection_sha" "$observation_generation_receipt" \
+                "$observation_generation" "$observation_generation_receipt_sha" \
+                "$drive_prefreeze_receipt_sha" \
+                "$operator_selection_monotonic_ns" \
+                "$operator_selection_realtime_ns"; then
             printf 'archive fleet: sealed positive quarantine transition round %s\n' \
                 "$round_number"
             round_number=$((round_number + 1))
         else
             status=$?
+            if [ "$status" -eq 4 ]; then
+                die "positive quarantine round $round_number is awaiting exact remaining-target BOOTTIME closure"
+            fi
             [ "$status" -eq 2 ] || die "fresh quarantine round failed"
             printf 'archive fleet: preserved zero-progress round attempt %s; resampling still-live targets\n' \
                 "$round_number"
@@ -6419,7 +8175,7 @@ origins=public.get("origins")
 if not isinstance(origins,list) or [row.get("name") for row in origins]!=[row[0] for row in fleet]:
     raise SystemExit("maintenance quarantine public topology differs")
 ledger_path=pathlib.Path(ledger_raw);ledger_bytes=ledger_path.read_bytes();ledger=json.loads(ledger_bytes)
-if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v1"
+if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v2"
         or (ledger.get("freeze_plan_sha256"),ledger.get("capture_id"))!=(freeze,capture)):
     raise SystemExit("maintenance quarantine generation ledger differs")
 transitions=[]
@@ -6648,7 +8404,11 @@ capture_phase() {
     find "$inspector_stage_root" -depth -delete
     printf 'archive fleet: staged exact hash-bound v0.8 recovery exporter inputs on all six writers\n'
     printf 'archive fleet: running exact ARC Drive identity/capacity/write-read-delete gate\n'
-    run_drive_prefreeze_gate execute "$freeze_plan" "$freeze_sha" "$capture_id"
+    local drive_execute_output drive_prefreeze_receipt
+    drive_execute_output="$(run_drive_prefreeze_gate execute "$freeze_plan" "$freeze_sha" "$capture_id")"
+    printf '%s\n' "$drive_execute_output"
+    drive_prefreeze_receipt="$(printf '%s\n' "$drive_execute_output" | tail -n 1)"
+    require_absolute_file "$drive_prefreeze_receipt" "Drive prefreeze execute receipt"
     local log_root
     log_root="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
@@ -6656,8 +8416,104 @@ capture_phase() {
     local maintenance_input_root
     maintenance_input_root="$(prepare_protected_maintenance_directory \
         "${offline_stop_output}.maintenance-inputs")"
-    printf 'archive fleet: capturing exactly three bounded loopback live-observation endpoints on every legacy writer\n'
-    capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"
+    # Serialize the complete capture-wide selection -> authorization boundary
+    # independently of caller-selected output paths.  The fixed, uid-scoped
+    # /tmp root is owner-only beneath the root-owned sticky directory; the
+    # capture-id child is the lock inode on both Darwin and Linux.
+    local capture_state_lock_dir
+    capture_state_lock_dir="$(python3 - "$capture_id" <<'PY'
+import os,pathlib,re,stat,sys
+capture=sys.argv[1]
+if re.fullmatch(r"[0-9a-f]{64}",capture) is None:raise SystemExit("capture lock id is malformed")
+tmp_entry=pathlib.Path("/tmp")
+tmp=pathlib.Path(os.path.realpath(tmp_entry));details=tmp.lstat()
+if (not tmp.is_absolute() or tmp.is_symlink() or not stat.S_ISDIR(details.st_mode) or details.st_uid!=0
+        or not details.st_mode&stat.S_ISVTX):
+    raise SystemExit("fixed capture-lock parent is unsafe")
+base=tmp/f"arc-recovery-capture-locks-{os.geteuid()}"
+for path in (base,base/capture):
+    try:os.mkdir(path,0o700)
+    except FileExistsError:pass
+    details=path.lstat()
+    if (path.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit("capture-lock directory identity differs")
+print(base/capture)
+PY
+)"
+    # FD 8 is unused by the orchestrator (FD 9 is reserved inside the remote
+    # helper wrapper) and is compatible with the operator's macOS Bash 3.2.
+    exec 8<"$capture_state_lock_dir"
+    python3 - 8 <<'PY'
+import errno,fcntl,sys
+descriptor=int(sys.argv[1])
+try:fcntl.flock(descriptor,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError as error:
+    if error.errno in {errno.EACCES,errno.EAGAIN}:
+        raise SystemExit("another capture/quarantine process owns this recovery boundary")
+    raise
+PY
+    local observation_generation_root="${offline_stop_output}.live-observation-generations"
+    local observation_selection="${offline_stop_output}.live-observation-selection.json"
+    local observation_selection_archive="${offline_stop_output}.live-observation-selections"
+    local quarantine_round_root="$maintenance_input_root/quarantine-rounds"
+    local observation_generation observation_generation_receipt
+    local observation_generation_receipt_sha drive_prefreeze_receipt_sha
+    local observation_resume_state prior_observation_generation selection_state
+    drive_prefreeze_receipt_sha="$(hash_file "$drive_prefreeze_receipt")"
+    reconcile_local_create_only_resume_links "$observation_selection" \
+        "$maintenance_input_root"
+    release_stale_zero_progress_dispatches "$freeze_plan" "$observation_selection" \
+        "$quarantine_round_root" "$drive_prefreeze_receipt_sha" "$freeze_sha" \
+        "$capture_id" "$log_root"
+    read -r selection_state prior_observation_generation < <(
+        live_observation_selection_resume_state "$observation_selection" \
+            "$quarantine_round_root" "$drive_prefreeze_receipt_sha" \
+            "$freeze_sha" "$capture_id"
+    )
+    case "$selection_state" in
+        bound)
+            observation_resume_state=bound
+            printf 'archive fleet: resuming immutable live-observation selection already bound to quarantine dispatch\n'
+            ;;
+        absent)
+            observation_resume_state=unbound
+            ;;
+        rotate)
+            # Selection replacement is allowed only before any mutation intent
+            # and only while every exact sealed writer remains live/unfenced.
+            for observation_node in nyc lax ams lhr nrt sgp; do
+                run_live_observations_eligibility_exact "$freeze_plan" "$freeze_sha" \
+                    "$capture_id" "$prior_observation_generation" "$observation_node" \
+                    >/dev/null || die \
+                    "stale live-observation selection cannot rotate after a writer stopped/fenced"
+            done
+            archive_stale_live_observation_selection "$observation_selection" \
+                "$observation_selection_archive" "$prior_observation_generation"
+            observation_resume_state=unbound
+            printf 'archive fleet: versioned stale unbound live-observation selection; all writers re-proved live/unfenced\n'
+            ;;
+        *) die "unknown live-observation selection resume state: $selection_state" ;;
+    esac
+    read -r observation_generation observation_generation_receipt \
+        observation_generation_receipt_sha drive_prefreeze_receipt_sha < <(
+        reserve_live_observation_generation "$observation_generation_root" \
+            "$observation_selection" "$drive_prefreeze_receipt" "$freeze_plan" \
+            "$freeze_sha" "$capture_id" "$observation_resume_state"
+    )
+    require_hash "$observation_generation" "live-observation generation"
+    require_absolute_file "$observation_generation_receipt" "live-observation generation receipt"
+    require_hash "$observation_generation_receipt_sha" "live-observation generation receipt hash"
+    require_hash "$drive_prefreeze_receipt_sha" "Drive prefreeze receipt hash"
+    [ "$(hash_file "$observation_generation_receipt")" = "$observation_generation_receipt_sha" ] || \
+        die "live-observation generation receipt changed before capture"
+    local live_observation_statuses="$log_root/live-observation-statuses.jsonl"
+    printf 'archive fleet: capturing exactly three bounded loopback live-observation endpoints on every legacy writer generation=%s\n' \
+        "$observation_generation"
+    capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" \
+        "$observation_generation" "$observation_generation_receipt" \
+        "$observation_generation_receipt_sha" \
+        "$drive_prefreeze_receipt_sha" "$log_root" "$live_observation_statuses"
     assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
     local legacy_height_cross_proof="${offline_stop_output}.authenticated-height-cross-proof.json"
     local first_quarantine_started_at all_controlled_stopped_at
@@ -6692,11 +8548,39 @@ PY
         "$maintenance_input_root/network-quarantine")"
     local quarantine_generation_ledger="$maintenance_input_root/quarantine-generation-ledger.json"
     local quarantine_generation_ledger_sha
+    local observation_selection_sha operator_selection_monotonic_ns
+    local operator_selection_realtime_ns
+    observation_selection_sha="$(seal_live_observation_selection "$observation_selection" \
+        "$observation_generation_receipt" "$live_observation_statuses" \
+        "$freeze_sha" "$capture_id")"
+    require_hash "$observation_selection_sha" "live-observation selection hash"
+    if [ "$observation_resume_state" = unbound ]; then
+        read -r operator_selection_monotonic_ns operator_selection_realtime_ns < <(
+            python3 - <<'PY'
+import time
+print(time.monotonic_ns(),time.time_ns())
+PY
+        )
+        require_uint "$operator_selection_monotonic_ns" \
+            "operator live-observation monotonic marker"
+        require_uint "$operator_selection_realtime_ns" \
+            "operator live-observation realtime marker"
+    else
+        operator_selection_monotonic_ns=-
+        operator_selection_realtime_ns=-
+    fi
+    printf 'archive fleet: selected fresh canary-bound live-observation generation %s root=%s\n' \
+        "$observation_generation" "$observation_selection_sha"
     quarantine_generation_ledger_sha="$(run_quarantine_generation_rounds \
         "$freeze_plan" "$freeze_sha" "$capture_id" "$maintenance_input_root" \
         "$log_root" "$quarantine_generation_ledger" "$inspector_binary_sha" \
         "$inspector_genesis_sha" "$inspector_validators_sha" \
-        "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal")"
+        "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal" \
+        "$observation_selection" "$observation_selection_sha" \
+        "$observation_generation_receipt" "$observation_generation" \
+        "$observation_generation_receipt_sha" "$drive_prefreeze_receipt_sha" \
+        "$operator_selection_monotonic_ns" \
+        "$operator_selection_realtime_ns")"
     require_hash "$quarantine_generation_ledger_sha" "quarantine generation ledger root"
     local active_quarantine_nodes=() stopped_quarantine_nodes=() transition_kind
     for quarantine_node in nyc lax ams lhr nrt sgp; do
@@ -6712,7 +8596,10 @@ PY
         fi
     done
     python3 -I "$QUARANTINE_ROUND_DRIVER" build-first-boundary \
-        --ledger "$quarantine_generation_ledger" --output "$first_boundary_path" >/dev/null
+        --ledger "$quarantine_generation_ledger" \
+        --live-observation-selection "$observation_selection" \
+        --live-observation-selection-sha256 "$observation_selection_sha" \
+        --output "$first_boundary_path" >/dev/null
     first_quarantine_started_at="$(python3 - "$first_boundary_path" <<'PY'
 import json,pathlib,sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["timestamp"])
@@ -6972,7 +8859,9 @@ PY
 
     pids=() names=()
     for node in nyc lax ams lhr nrt sgp; do
-        ensure_offline_capture "$capture_id" "$node" > "$log_root/$node-capture.log" 2>&1 &
+        ensure_offline_capture "$capture_id" "$node" "$observation_generation" \
+            "$observation_generation_receipt_sha" "$drive_prefreeze_receipt_sha" \
+            > "$log_root/$node-capture.log" 2>&1 &
         pids+=("$!")
         names+=("$node")
     done
@@ -7066,7 +8955,8 @@ PY
         "$legacy_height_cross_proof" "$quarantine_root" "$persisted_root" \
         "$quarantine_stability_proof" "$maintenance_evidence_bundle" \
         "$first_quarantine_started_at" \
-        "$all_controlled_stopped_at" "$quarantine_generation_ledger")"
+        "$all_controlled_stopped_at" "$quarantine_generation_ledger" \
+        "$observation_selection")"
     local maintenance_boundary="${offline_stop_output}.legacy-maintenance-boundary.json"
     local maintenance_boundary_sha
     maintenance_boundary_sha="$(create_legacy_maintenance_boundary \
@@ -7917,13 +9807,19 @@ print(*counts)
 }
 
 create_live_observation_fleet_binding() {
-    local output="$1" capture_id="$2" freeze_sha="$3" statuses="$4"
+    local output="$1" capture_id="$2" freeze_sha="$3" observation_generation="$4"
+    local generation_receipt_sha="$5" drive_receipt_sha="$6" selection_sha="$7"
+    local statuses="$8"
     local node
     : > "$statuses"
+    chmod 600 -- "$statuses"
     for node in nyc lax ams lhr nrt sgp; do
-        run_remote "$node" live-observations-status "$capture_id" "$node" "$freeze_sha" >> "$statuses"
+        run_remote "$node" live-observations-status "$capture_id" "$observation_generation" \
+            "$generation_receipt_sha" "$drive_receipt_sha" "$node" "$freeze_sha" >> "$statuses"
     done
-    python3 - "$output" "$statuses" "$capture_id" "$freeze_sha" <<'PY'
+    python3 - "$output" "$statuses" "$capture_id" "$freeze_sha" \
+        "$observation_generation" "$generation_receipt_sha" "$drive_receipt_sha" \
+        "$selection_sha" <<'PY'
 import json
 import os
 import pathlib
@@ -7932,7 +9828,7 @@ import stat
 import sys
 
 output, statuses = map(pathlib.Path, sys.argv[1:3])
-capture_id, freeze_sha = sys.argv[3:]
+capture_id, freeze_sha, generation, generation_receipt_sha, drive_receipt_sha, selection_sha = sys.argv[3:]
 nodes = ("nyc", "lax", "ams", "lhr", "nrt", "sgp")
 hash_re = re.compile(r"[0-9a-f]{64}")
 rows = [json.loads(line) for line in statuses.read_text(encoding="utf-8").splitlines() if line]
@@ -7941,10 +9837,15 @@ if len(rows) != 6 or [row.get("node") for row in rows] != list(nodes):
 normalized = []
 for node, row in zip(nodes, rows):
     if (not isinstance(row, dict) or set(row) != {
-            "schema", "capture_id", "node", "freeze_plan_sha256",
+            "schema", "capture_id", "observation_generation",
+            "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+            "node", "freeze_plan_sha256", "created_at", "completed_at",
             "root_sha256", "receipt_sha256", "labels",
         } or row.get("schema") != "arc.recovery.legacy-live-observations-status.v1"
             or row.get("capture_id") != capture_id or row.get("node") != node
+            or row.get("observation_generation") != generation
+            or row.get("observation_generation_receipt_sha256") != generation_receipt_sha
+            or row.get("drive_prefreeze_receipt_sha256") != drive_receipt_sha
             or row.get("freeze_plan_sha256") != freeze_sha
             or row.get("labels") != ["diagnostic", "noncanonical", "nonreward"]
             or not hash_re.fullmatch(row.get("root_sha256", ""))
@@ -7959,6 +9860,10 @@ value = {
     "schema": "arc.recovery.legacy-live-observations-fleet.v1",
     "capture_id": capture_id,
     "freeze_plan_sha256": freeze_sha,
+    "observation_generation": generation,
+    "observation_generation_receipt_sha256": generation_receipt_sha,
+    "drive_prefreeze_receipt_sha256": drive_receipt_sha,
+    "live_observation_selection_sha256": selection_sha,
     "receipt_schema": "arc.recovery.legacy-live-observations.v1",
     "labels": ["diagnostic", "noncanonical", "nonreward"],
     "nodes": normalized,
@@ -8217,7 +10122,7 @@ def read_descriptor(path):
             raise SystemExit("shared input descriptor changed while read")
         return before,raw
     finally:os.close(fd)
-semantic_names={"legacy-live-observations.json","canonical-reference.json"}
+semantic_names={"legacy-live-observations.json","canonical-reference.json","offline-stop-evidence.json"}
 semantic_payloads={};shared_inputs=[]
 for descriptor_path in sorted(catalog_root.iterdir(),key=lambda item:item.name):
     details,raw=read_descriptor(descriptor_path);descriptor=json.loads(raw)
@@ -8273,13 +10178,29 @@ except (UnicodeDecodeError, json.JSONDecodeError) as error:
 if observations_payload != canonical(live_observations):
     raise SystemExit("fleet live-observation binding is not canonical JSON")
 if (not isinstance(live_observations, dict) or set(live_observations) != {
-        "schema", "capture_id", "freeze_plan_sha256", "receipt_schema", "labels", "nodes",
+        "schema", "capture_id", "freeze_plan_sha256", "observation_generation",
+        "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+        "live_observation_selection_sha256", "receipt_schema", "labels", "nodes",
     } or live_observations.get("schema") != "arc.recovery.legacy-live-observations-fleet.v1"
         or live_observations.get("capture_id") != capture_id
         or live_observations.get("freeze_plan_sha256") != freeze_sha
         or live_observations.get("receipt_schema") != "arc.recovery.legacy-live-observations.v1"
         or live_observations.get("labels") != ["diagnostic", "noncanonical", "nonreward"]):
     raise SystemExit("fleet live-observation binding fields/identity differ")
+offline_payload=semantic_payloads.get("offline-stop-evidence.json")
+try:offline=json.loads(offline_payload.decode("utf-8"))
+except (AttributeError,UnicodeDecodeError,json.JSONDecodeError) as error:
+    raise SystemExit(f"offline-stop observation provenance is unreadable: {error}")
+if (offline_payload!=canonical(offline)
+        or (live_observations.get("live_observation_selection_sha256"),
+            live_observations.get("observation_generation"),
+            live_observations.get("observation_generation_receipt_sha256"),
+            live_observations.get("drive_prefreeze_receipt_sha256"))
+           !=(offline.get("legacy_live_observation_selection_sha256"),
+              offline.get("legacy_live_observation_generation"),
+              offline.get("observation_generation_receipt_sha256"),
+              offline.get("drive_prefreeze_receipt_sha256"))):
+    raise SystemExit("archive live-observation binding differs from offline-stop provenance")
 live_rows = live_observations.get("nodes")
 if not isinstance(live_rows, list) or [row.get("node") for row in live_rows] != list(nodes):
     raise SystemExit("fleet live-observation binding does not contain the ordered six validators")
@@ -9462,23 +11383,41 @@ print(digest.hexdigest(), size)')" || die "cannot hash remote archive object: $n
     rclone cat "$destination/legacy-live-observations.json" \
         > "$temporary/legacy-live-observations.json" || \
         die "cannot read remote fleet live-observation binding"
+    rclone cat "$destination/offline-stop-evidence.json" \
+        > "$temporary/offline-stop-evidence.json" || \
+        die "cannot read remote offline-stop observation provenance"
     python3 - "$temporary/legacy-live-observations.json" \
-        "$temporary/ARCHIVE-MANIFEST.json" "$temporary/live-observation-bindings.tsv" <<'PY'
+        "$temporary/ARCHIVE-MANIFEST.json" "$temporary/live-observation-bindings.tsv" \
+        "$temporary/offline-stop-evidence.json" <<'PY'
 import hashlib, json, pathlib, re, sys
-path, manifest_path, output = map(pathlib.Path, sys.argv[1:])
+path, manifest_path, output, offline_path = map(pathlib.Path, sys.argv[1:])
 value = json.loads(path.read_text(encoding="utf-8"))
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 if path.read_bytes() != canonical:
     raise SystemExit("remote fleet live-observation binding is not canonical JSON")
 if (not isinstance(value, dict) or set(value) != {
-        "schema", "capture_id", "freeze_plan_sha256", "receipt_schema", "labels", "nodes",
+        "schema", "capture_id", "freeze_plan_sha256", "observation_generation",
+        "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+        "live_observation_selection_sha256", "receipt_schema", "labels", "nodes",
     } or value.get("schema") != "arc.recovery.legacy-live-observations-fleet.v1"
         or value.get("capture_id") != manifest.get("capture_id")
         or value.get("freeze_plan_sha256") != manifest.get("freeze_plan_sha256")
         or value.get("receipt_schema") != "arc.recovery.legacy-live-observations.v1"
         or value.get("labels") != ["diagnostic", "noncanonical", "nonreward"]):
     raise SystemExit("remote fleet live-observation binding identity/labels differ")
+offline=json.loads(offline_path.read_text(encoding="utf-8"))
+offline_canonical=(json.dumps(offline,sort_keys=True,separators=(",",":"))+"\n").encode()
+if (offline_path.read_bytes()!=offline_canonical
+        or (value.get("live_observation_selection_sha256"),
+            value.get("observation_generation"),
+            value.get("observation_generation_receipt_sha256"),
+            value.get("drive_prefreeze_receipt_sha256"))
+           !=(offline.get("legacy_live_observation_selection_sha256"),
+              offline.get("legacy_live_observation_generation"),
+              offline.get("observation_generation_receipt_sha256"),
+              offline.get("drive_prefreeze_receipt_sha256"))):
+    raise SystemExit("remote archive observation provenance differs from offline-stop evidence")
 nodes = ("nyc", "lax", "ams", "lhr", "nrt", "sgp")
 rows = value.get("nodes")
 if not isinstance(rows, list) or [row.get("node") for row in rows] != list(nodes):
@@ -9863,6 +11802,21 @@ seal_phase() {
     created_at_unix_ms="$(manifest_field "$manifest" chain.created_at_unix_ms)"
     recovery_epoch="$(manifest_field "$manifest" chain.recovery_epoch)"
     validator_set_id="$(manifest_field "$manifest" chain.validator_set_id)"
+    local observation_generation observation_generation_receipt_sha
+    local observation_drive_receipt_sha observation_selection_sha
+    read -r observation_generation observation_generation_receipt_sha \
+        observation_drive_receipt_sha observation_selection_sha < <(
+        python3 - "$offline_stop_evidence" <<'PY'
+import json,pathlib,re,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+fields=("legacy_live_observation_generation","observation_generation_receipt_sha256",
+        "drive_prefreeze_receipt_sha256","legacy_live_observation_selection_sha256")
+items=[value.get(field) for field in fields]
+if any(not isinstance(item,str) or re.fullmatch(r"[0-9a-f]{64}",item) is None for item in items):
+    raise SystemExit("offline-stop live-observation archive provenance is malformed")
+print(*items)
+PY
+    )
 
     [ "$validators" = "$validators_manifest" ] || \
         die "--validator-public-keys path differs from the sealed rollout artifact"
@@ -10150,6 +12104,8 @@ PY
         "$shared_root" canonical-reference.json
     create_live_observation_fleet_binding \
         "$shared_generated/legacy-live-observations.json" "$capture_id" "$freeze_sha" \
+        "$observation_generation" "$observation_generation_receipt_sha" \
+        "$observation_drive_receipt_sha" "$observation_selection_sha" \
         "$log_root/live-observation-statuses.jsonl"
     register_shared_input "$shared_generated/legacy-live-observations.json" \
         "$(hash_file "$shared_generated/legacy-live-observations.json")" \

@@ -536,6 +536,79 @@ print(json.dumps(value,sort_keys=True))
         all_stopped = all_stopped_value.isoformat().replace("+00:00", "Z")
         boundary_created = boundary_created_value.isoformat().replace("+00:00", "Z")
         challenge = "d" * 64
+        observation_generation = "6" * 64
+        operator_public_completed = dt.datetime.strptime(
+            public_receipt["completed_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        observation_selected_at = operator_public_completed.strftime(
+            "%Y-%m-%dT%H:%M:%S.000000Z"
+        )
+        generation_created_at = (
+            operator_public_completed - dt.timedelta(seconds=10)
+        ).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        drive_receipt_value = {
+            "schema": "arc.recovery.drive-prefreeze.v1",
+            "mode": "execute", "freeze_plan_sha256": self.freeze_sha,
+            "capture_id": capture, "remote_root_sha256": "1" * 64,
+            "client_id_sha256": "2" * 64, "account_sha256": "3" * 64,
+            "permission_id_sha256": "4" * 64, "rclone_version": "v1.75.0",
+            "source_bytes": 1, "archive_reservation_bytes": 2,
+            "largest_object_reservation_bytes": 1,
+            "daily_upload_budget_bytes": 2,
+            "daily_upload_budget_basis": "operator-reviewed-remaining-dedicated-account",
+            "available_bytes_before": 8 * 1024 * 1024 + 2,
+            "available_bytes_after": 2, "canary_bytes": 8 * 1024 * 1024,
+            "canary_verified": True, "canary_deleted": True,
+        }
+        drive_receipt_sha = sha(canonical(drive_receipt_value))
+        observation_generation_receipt = {
+            "schema": "arc.recovery.legacy-live-observation-generation.v1",
+            "source_main_commit": self.commit,
+            "freeze_plan_sha256": self.freeze_sha,
+            "capture_id": capture,
+            "observation_generation": observation_generation,
+            "created_at": generation_created_at,
+            "max_selection_age_seconds": 300,
+            "drive_prefreeze_receipt": {
+                "path": "/private/drive-prefreeze.json",
+                "sha256": drive_receipt_sha,
+                "value": drive_receipt_value,
+            },
+        }
+        observation_generation_receipt_sha = sha(
+            canonical(observation_generation_receipt)
+        )
+        observation_selection = {
+            "schema": "arc.recovery.legacy-live-observation-selection.v1",
+            "source_main_commit": self.commit,
+            "freeze_plan_sha256": self.freeze_sha,
+            "capture_id": capture,
+            "observation_generation": observation_generation,
+            "observation_generation_receipt": observation_generation_receipt,
+            "observation_generation_receipt_path": (
+                f"/private/live-observation-generations/{observation_generation}.json"
+            ),
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_path": "/private/drive-prefreeze.json",
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
+            "generation_created_at": generation_created_at,
+            "selected_at": observation_selected_at,
+            "max_selection_age_seconds": 300,
+            "labels": ["diagnostic", "noncanonical", "nonreward"],
+            "nodes": [
+                {
+                    "node": name,
+                    "created_at": generation_created_at,
+                    "completed_at": observation_selected_at,
+                    "root_sha256": f"{index + 7000:064x}",
+                    "receipt_sha256": f"{index + 7100:064x}",
+                }
+                for index, (name, _host) in enumerate(builder.FLEET)
+            ],
+        }
+        observation_selection_sha = sha(canonical(observation_selection))
         status_fields = (
             "validator_address", "stake", "writer_pid", "writer_start_ticks", "boot_id",
             "writer_cgroup_sha256", "writer_supervision_mode", "supervisor_unit",
@@ -604,6 +677,13 @@ print(json.dumps(value,sort_keys=True))
             "schema": builder.quarantine_rounds.ROUND_AUTH_SCHEMA,
             "source_main_commit": self.commit,
             "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "live_observation_selection_sha256": observation_selection_sha,
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
+            "live_observation_selected_at": observation_selected_at,
             "round_number": 1, "prior_round_result_sha256s": [], "prior_fenced": [],
             "targets": [{
                 "node": name, "host": host, "boot_id": frozen["boot_id"],
@@ -656,6 +736,11 @@ print(json.dumps(value,sort_keys=True))
                     "round_number": 1,
                     "round_authorization_sha256": generation_authorization_sha_early,
                     "node": name, "host": host, "accepted_at": fleet_completed,
+                    "accepted_monotonic_ns": 1_000_000_000,
+                    "accepted_boot_id": next(
+                        row["boot_id"] for row in generation_authorization_early["targets"]
+                        if row["node"] == name
+                    ),
                     "authorization_deadline": generation_authorization_early[
                         "authorization_deadline"
                     ],
@@ -665,6 +750,7 @@ print(json.dumps(value,sort_keys=True))
             "authorization_deadline": generation_authorization_early[
                 "authorization_deadline"
             ],
+            "max_elapsed_since_acceptance_ns": 300_000_000_000,
         }
         generation_readiness_sha_early = builder.quarantine_rounds.digest(
             generation_readiness_early
@@ -1440,6 +1526,13 @@ print(json.dumps(value,sort_keys=True))
             "schema": builder.quarantine_rounds.ROUND_AUTH_SCHEMA,
             "source_main_commit": self.commit,
             "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "live_observation_selection_sha256": observation_selection_sha,
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
+            "live_observation_selected_at": observation_selected_at,
             "round_number": 1, "prior_round_result_sha256s": [], "prior_fenced": [],
             "targets": [{
                 "node": name, "host": host, "boot_id": frozen["boot_id"],
@@ -1493,6 +1586,11 @@ print(json.dumps(value,sort_keys=True))
                         "round_authorization_sha256": generation_authorization_sha,
                         "node": name, "host": host,
                         "accepted_at": fleet_completed,
+                        "accepted_monotonic_ns": 1_000_000_000,
+                        "accepted_boot_id": next(
+                            row["boot_id"] for row in generation_authorization["targets"]
+                            if row["node"] == name
+                        ),
                         "authorization_deadline": generation_authorization[
                             "authorization_deadline"
                         ],
@@ -1504,6 +1602,7 @@ print(json.dumps(value,sort_keys=True))
             "authorization_deadline": generation_authorization[
                 "authorization_deadline"
             ],
+            "max_elapsed_since_acceptance_ns": 300_000_000_000,
         }
         generation_readiness_sha = builder.quarantine_rounds.digest(
             generation_readiness
@@ -1585,6 +1684,29 @@ print(json.dumps(value,sort_keys=True))
                 "persistent_restart_fence_sha256": evidence["network_quarantine_receipt"]
                     ["file_sha256"]["persistent-restart-fence.json"],
             })
+        generation_dispatch = {
+            "schema": "arc.recovery.quarantine-mutation-dispatch.v1",
+            "capture_id": capture,
+            "freeze_plan_sha256": self.freeze_sha,
+            "round_number": 1,
+            "round_authorization_sha256": builder.quarantine_rounds.digest(
+                generation_authorization
+            ),
+            "round_readiness_sha256": builder.quarantine_rounds.digest(
+                generation_readiness
+            ),
+            "live_observation_selection_sha256": observation_selection_sha,
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
+            "targets": [
+                {"node": row["node"], "host": row["host"]}
+                for row in generation_authorization["targets"]
+            ],
+            "dispatched_at": generation_authorization["authorized_at"],
+        }
         generation_result = {
             "schema": builder.quarantine_rounds.ROUND_RESULT_SCHEMA,
             "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
@@ -1598,11 +1720,21 @@ print(json.dumps(value,sort_keys=True))
             "transitions": [
                 builder.quarantine_rounds.wrap(item) for item in applied_values
             ],
+            "mutation_dispatch": builder.quarantine_rounds.wrap(
+                generation_dispatch
+            ),
+            "remaining_target_inert_proofs": [],
             "remaining_targets": [], "completed_at": all_stopped,
         }
         generation_ledger = {
             "schema": builder.quarantine_rounds.LEDGER_SCHEMA,
             "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "live_observation_selection_sha256": observation_selection_sha,
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
             "fleet": [{"node": name, "host": host} for name, host in builder.FLEET],
             "rounds": [{
                 "authorization": builder.quarantine_rounds.wrap(generation_authorization),
@@ -1637,6 +1769,9 @@ print(json.dumps(value,sort_keys=True))
 
         authenticated_wrapper = sealed(
             cross_proof, "fleet", "authenticated-prefence-height-cross-proof"
+        )
+        observation_selection_wrapper = sealed(
+            observation_selection, "fleet", "live-observation-selection"
         )
         generation_wrapper = sealed(
             generation_ledger, "fleet", "quarantine-generation-ledger"
@@ -1703,6 +1838,7 @@ print(json.dumps(value,sort_keys=True))
             "all_controlled_stopped_at": all_stopped,
             "challenge": challenge,
             "authenticated_prefence_height_cross_proof": authenticated_wrapper,
+            "live_observation_selection": observation_selection_wrapper,
             "quarantine_generation_ledger": generation_wrapper,
             "network_quarantine_challenge": challenge_wrapper,
             "quarantine_stability_proof": stability_wrapper,
@@ -1741,6 +1877,14 @@ print(json.dumps(value,sort_keys=True))
                 "observed_max_height": public_receipt["legacy_public_max_height"],
             },
             "authenticated_prefence_height_cross_proof_sha256": sha(canonical(cross_proof)),
+            "legacy_live_observation_selection_sha256": (
+                observation_selection_wrapper["sha256"]
+            ),
+            "legacy_live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
             "quarantine_generation_ledger_sha256": generation_wrapper["sha256"],
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "network_quarantine_stability_proof_sha256": stability_wrapper["sha256"],
@@ -1804,6 +1948,14 @@ print(json.dumps(value,sort_keys=True))
             "legacy_maintenance_boundary_sha256": sha(boundary_payload),
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "quarantine_generation_ledger_sha256": generation_wrapper["sha256"],
+            "legacy_live_observation_selection_sha256": (
+                observation_selection_wrapper["sha256"]
+            ),
+            "legacy_live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": (
+                observation_generation_receipt_sha
+            ),
+            "drive_prefreeze_receipt_sha256": drive_receipt_sha,
             "nodes": nodes,
             "remote_helper_path": f"/root/.arc-recovery-helpers/{freeze['remote_helper_sha256']}/archive-node.sh",
             "remote_helper_sha256": freeze["remote_helper_sha256"],
@@ -2001,6 +2153,7 @@ print(json.dumps(value,sort_keys=True))
 
         for field, role in (
             ("authenticated_prefence_height_cross_proof", "authenticated-prefence-height-cross-proof"),
+            ("live_observation_selection", "live-observation-selection"),
             ("quarantine_generation_ledger", "quarantine-generation-ledger"),
             ("network_quarantine_challenge", "network-quarantine-challenge"),
             ("quarantine_stability_proof", "network-quarantine-stability-proof"),
@@ -3064,6 +3217,8 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         all_stopped = dt.datetime.strptime(
             boundary["all_controlled_stopped_at"], "%Y-%m-%dT%H:%M:%SZ"
         ).replace(tzinfo=dt.timezone.utc)
+        bundle = json.loads(self.fixture.bundle.read_text())
+        selection = bundle["live_observation_selection"]
         state = {
             "capture_id": builder.rollout.capture_id_for_freeze_plan_hash(
                 self.fixture.freeze_sha
@@ -3072,6 +3227,16 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             "first_secured_at": first,
             "all_nodes_secured_at": first,
             "legacy_cutoff_height": 0,
+            "live_observation_selection_sha256": selection["sha256"],
+            "live_observation_generation": selection["value"][
+                "observation_generation"
+            ],
+            "observation_generation_receipt_sha256": selection["value"][
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": selection["value"][
+                "drive_prefreeze_receipt_sha256"
+            ],
         }
         with (
             mock.patch.object(
@@ -3155,6 +3320,85 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuilderError, "already exists"):
             builder.stage_prearchive_inputs(args)
 
+    def test_private_stage_copy_ignores_ctime_only_noise_but_rejects_security_identity_change(
+        self,
+    ) -> None:
+        source = self.fixture.root / "stage-copy-source.bin"
+        payload = b"stable-stage-copy-source\n"
+        write(source, payload, 0o600)
+        destination = self.fixture.root / "stage-copy-destination"
+        destination.mkdir(mode=0o700)
+        source_details = source.stat()
+        real_fstat = builder.os.fstat
+
+        def staged_fstat(changed_field: str):
+            source_calls = 0
+
+            def inspect(descriptor: int):
+                nonlocal source_calls
+                details = real_fstat(descriptor)
+                if (
+                    details.st_dev == source_details.st_dev
+                    and details.st_ino == source_details.st_ino
+                ):
+                    source_calls += 1
+                    if source_calls == 2:
+                        fields = {
+                            name: getattr(details, name)
+                            for name in (
+                                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
+                                "st_nlink", "st_size", "st_atime_ns", "st_mtime_ns",
+                                "st_ctime_ns",
+                            )
+                        }
+                        if changed_field == "ctime":
+                            fields["st_ctime_ns"] += 1
+                        elif changed_field == "mode":
+                            fields["st_mode"] ^= stat.S_IWUSR
+                        return types.SimpleNamespace(**fields)
+                return details
+
+            return inspect
+
+        destination_fd = os.open(
+            destination,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            with mock.patch.object(
+                builder.os, "fstat", side_effect=staged_fstat("ctime")
+            ), mock.patch.object(
+                builder.os, "lseek", wraps=builder.os.lseek
+            ) as ctime_recheck:
+                copied = builder._stage_copy(
+                    source,
+                    destination_fd,
+                    "ctime-noise.bin",
+                    label="ctime-noise private stage source",
+                    maximum_bytes=1024,
+                    mode=0o400,
+                )
+            ctime_recheck.assert_called_once()
+            self.assertEqual(copied["sha256"], sha(payload))
+            self.assertEqual((destination / "ctime-noise.bin").read_bytes(), payload)
+
+            with mock.patch.object(
+                builder.os, "fstat", side_effect=staged_fstat("mode")
+            ):
+                with self.assertRaisesRegex(
+                    builder.BuilderError, "changed identity: mode"
+                ):
+                    builder._stage_copy(
+                        source,
+                        destination_fd,
+                        "mode-change.bin",
+                        label="mode-change private stage source",
+                        maximum_bytes=1024,
+                        mode=0o400,
+                    )
+        finally:
+            os.close(destination_fd)
+
     def test_maintenance_boundary_is_standalone_exact_and_cutoff_complete(self) -> None:
         def move_created(value: dict) -> None:
             created = dt.datetime.strptime(value["created_at"], "%Y-%m-%dT%H:%M:%SZ")
@@ -3232,15 +3476,14 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             value["chain"]["legacy_public_max_height"], 137635
         )
 
-    def test_post_freeze_builder_rejects_301_seconds_with_recomputed_seals(self) -> None:
+    def test_post_freeze_builder_does_not_cross_order_remote_utc_at_301_seconds(self) -> None:
         public_completed = (
             dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
             - dt.timedelta(hours=2)
         )
         self.fixture.write_height(completed_at=public_completed)
-        # Rebuild every dependent cross-proof, bundle wrapper, inventory root,
-        # boundary, embedded boundary, sidecar, and late-fork root.  Rehashing
-        # an internally coherent stale timeline must not bypass the 300s gate.
+        # Remote UTC is audit-only: the operator-authored dispatch and each
+        # node's same-boot CLOCK_BOOTTIME lease are the mutation safety gate.
         self.fixture.write_offline_stop(
             fleet_started_at=public_completed + dt.timedelta(seconds=1),
             fleet_completed_at=public_completed + dt.timedelta(seconds=2),
@@ -3251,8 +3494,8 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         self.fixture.rebuild_late_fork_source_set()
         self.fixture.write_validator_receipts()
 
-        with self.assertRaisesRegex(builder.BuilderError, "outside its authorized deadline"):
-            builder.prearchive(self.fixture.args())
+        value, _digest = self.fixture.build()
+        self.assertEqual(value["chain"]["legacy_public_max_height"], 137635)
 
     def test_post_freeze_builder_rejects_after_quarantine_and_reordered_brackets(self) -> None:
         base = (

@@ -296,6 +296,13 @@ def authorization(number: int, results: list[dict], targets: list[str], offset: 
     return {
         "schema": qr.ROUND_AUTH_SCHEMA, "source_main_commit": SOURCE, "capture_id": CAPTURE,
         "freeze_plan_sha256": FREEZE, "round_number": number,
+        "live_observation_selection_sha256": H["91"],
+        "live_observation_generation": H["92"],
+        "observation_generation_receipt_sha256": H["93"],
+        "drive_prefreeze_receipt_sha256": H["94"],
+        "live_observation_selected_at": (
+            BASE + dt.timedelta(seconds=offset + 2)
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "prior_round_result_sha256s": [qr.digest(result) for result in results],
         "prior_fenced": prior_rows(results, utc(offset + 5)),
         "targets": [target_row(name) for name in targets],
@@ -328,6 +335,8 @@ def target_readiness(auth: dict) -> dict:
             "round_authorization_sha256": auth_sha,
             "node": target["node"], "host": target["host"],
             "accepted_at": auth["authorized_at"],
+            "accepted_monotonic_ns": 1_000_000_000,
+            "accepted_boot_id": target["boot_id"],
             "authorization_deadline": auth["authorization_deadline"],
         }
         rows.append({
@@ -340,6 +349,69 @@ def target_readiness(auth: dict) -> dict:
         "round_authorization_sha256": auth_sha,
         "targets": rows, "completed_at": auth["authorized_at"],
         "authorization_deadline": auth["authorization_deadline"],
+        "max_elapsed_since_acceptance_ns": 300_000_000_000,
+    }
+
+
+def mutation_dispatch(auth: dict, readiness: dict | None = None) -> dict:
+    if readiness is None:
+        readiness = target_readiness(auth)
+    return {
+        "schema": "arc.recovery.quarantine-mutation-dispatch.v1",
+        "capture_id": CAPTURE,
+        "freeze_plan_sha256": FREEZE,
+        "round_number": auth["round_number"],
+        "round_authorization_sha256": qr.digest(auth),
+        "round_readiness_sha256": qr.digest(readiness),
+        "live_observation_selection_sha256": auth[
+            "live_observation_selection_sha256"
+        ],
+        "live_observation_generation": auth["live_observation_generation"],
+        "observation_generation_receipt_sha256": auth[
+            "observation_generation_receipt_sha256"
+        ],
+        "drive_prefreeze_receipt_sha256": auth["drive_prefreeze_receipt_sha256"],
+        "targets": [
+            {"node": row["node"], "host": row["host"]} for row in auth["targets"]
+        ],
+        "dispatched_at": auth["authorized_at"],
+    }
+
+
+def remaining_target_inert_proof(
+    auth: dict,
+    readiness: dict,
+    dispatch: dict,
+    name: str,
+    *,
+    challenge: str = H["96"],
+) -> dict:
+    target = next(row for row in auth["targets"] if row["node"] == name)
+    accepted = 1_000_000_000
+    elapsed = 300_000_000_001
+    return {
+        "schema": qr.INERT_NODE_PROOF_SCHEMA,
+        "capture_id": CAPTURE,
+        "freeze_plan_sha256": FREEZE,
+        "observation_generation": auth["live_observation_generation"],
+        "round_number": auth["round_number"],
+        "round_authorization_sha256": qr.digest(auth),
+        "round_readiness_sha256": qr.digest(readiness),
+        "mutation_dispatch_sha256": qr.digest(dispatch),
+        "challenge": challenge,
+        "node": name,
+        "boot_id": target["boot_id"],
+        "writer_live_unfenced": True,
+        "apply_state_present": False,
+        "restart_effective_mutation_absent": True,
+        "active_selector_absent": True,
+        "quarantine_nft_absent": True,
+        "authorization_accepted": True,
+        "readiness_present": True,
+        "accepted_boottime_ns": accepted,
+        "elapsed_since_acceptance_ns": elapsed,
+        "observed_boottime_ns": accepted + elapsed,
+        "observed_at": utc(400),
     }
 
 
@@ -545,14 +617,24 @@ def applied(auth: dict, name: str, second: int, height: int) -> dict:
 
 def result(auth: dict, items: list[dict], completed: int) -> dict:
     transitioned_names = {item["node"] for item in items}
+    readiness = target_readiness(auth)
+    dispatch = mutation_dispatch(auth, readiness)
+    remaining = [
+        row["node"] for row in auth["targets"]
+        if row["node"] not in transitioned_names
+    ]
     return {
         "schema": qr.ROUND_RESULT_SCHEMA, "capture_id": CAPTURE,
         "freeze_plan_sha256": FREEZE, "round_number": auth["round_number"],
         "round_authorization_sha256": qr.digest(auth),
-        "target_readiness": qr.wrap(target_readiness(auth)),
+        "target_readiness": qr.wrap(readiness),
         "transitions": [qr.wrap(item) for item in items],
-        "remaining_targets": [row["node"] for row in auth["targets"]
-                              if row["node"] not in transitioned_names],
+        "mutation_dispatch": qr.wrap(dispatch),
+        "remaining_target_inert_proofs": [
+            qr.wrap(remaining_target_inert_proof(auth, readiness, dispatch, name))
+            for name in remaining
+        ] if items else [],
+        "remaining_targets": remaining,
         "completed_at": utc(completed),
     }
 
@@ -597,6 +679,10 @@ def ledger_for_first_successes(count: int) -> dict:
                      ["legacy_public_max_height"] for row in round_rows]
     return {
         "schema": qr.LEDGER_SCHEMA, "capture_id": CAPTURE, "freeze_plan_sha256": FREEZE,
+        "live_observation_selection_sha256": H["91"],
+        "live_observation_generation": H["92"],
+        "observation_generation_receipt_sha256": H["93"],
+        "drive_prefreeze_receipt_sha256": H["94"],
         "fleet": [{"node": name, "host": host} for name, host in qr.FLEET],
         "rounds": round_rows,
         "first_secured_at": min(
@@ -690,30 +776,14 @@ class QuarantineRoundTests(unittest.TestCase):
         with self.assertRaisesRegex(qr.QuarantineRoundError, "re-prove|derive"):
             qr.validate_generation_ledger(value)
 
-    def test_apply_after_round_deadline_rejected(self) -> None:
+    def test_oversized_monotonic_mutation_lease_rejected(self) -> None:
         value = ledger_for_first_successes(1)
         first = value["rounds"][0]
-        item = first["result"]["value"]["transitions"][0]["value"]
-        item["nft_applied_at"] = utc(303)
-        gate = item["nft_deadline_gate"]["value"]
-        gate["invoked_at"] = utc(303)
-        item["nft_deadline_gate"] = qr.wrap(gate)
-        network = item["network_quarantine_receipt"]["value"]
-        network["installed_at"] = utc(304)
-        network["nft_deadline_gate_sha256"] = qr.digest(gate)
-        network["nft_deadline_gate"] = qr.wrap(gate)
-        network["file_sha256"]["nft-deadline-gate.json"] = qr.digest(gate)
-        commit = network["applied_commit"]["value"]
-        commit["nft_deadline_gate_sha256"] = qr.digest(gate)
-        commit["nft_applied_at"] = utc(303)
-        network["applied_commit"] = qr.wrap(commit)
-        network["applied_commit_sha256"] = qr.digest(commit)
-        network["file_sha256"]["applied.commit.json"] = qr.digest(commit)
-        item["network_quarantine_receipt"] = qr.wrap(network)
-        item["network_quarantine_receipt_sha256"] = qr.digest(network)
-        first["result"]["value"]["transitions"][0] = qr.wrap(item)
+        readiness = first["result"]["value"]["target_readiness"]["value"]
+        readiness["max_elapsed_since_acceptance_ns"] = 300_000_000_001
+        first["result"]["value"]["target_readiness"] = qr.wrap(readiness)
         first["result"] = qr.wrap(first["result"]["value"])
-        with self.assertRaisesRegex(qr.QuarantineRoundError, "deadline"):
+        with self.assertRaisesRegex(qr.QuarantineRoundError, "monotonic mutation lease"):
             qr.validate_generation_ledger(value)
 
     def test_reboot_or_writer_identity_drift_rejected(self) -> None:
@@ -740,14 +810,31 @@ class QuarantineRoundTests(unittest.TestCase):
         state = qr.validate_generation_ledger(value)
         self.assertEqual(state["round_count"], 1)
 
-    def test_partial_result_cannot_close_while_old_helpers_remain_authorized(self) -> None:
+    def test_partial_result_requires_expired_inert_proof_for_every_remaining_target(self) -> None:
         names = [name for name, _host in qr.FLEET]
         auth = authorization(1, [], names, 0)
         one = applied(auth, names[0], 20, authorized_height(auth, names[0]))
-        premature = result(auth, [one], 100)
-        with self.assertRaisesRegex(qr.QuarantineRoundError, "before.*expired"):
+        valid = result(auth, [one], 100)
+        state = qr.validate_round_result(
+            valid, authorization=auth, prior_results=[], transition_receipts=[one]
+        )
+        self.assertEqual(state["remaining_names"], names[1:])
+
+        missing = copy.deepcopy(valid)
+        missing["remaining_target_inert_proofs"].pop()
+        with self.assertRaisesRegex(qr.QuarantineRoundError, "lacks every"):
             qr.validate_round_result(
-                premature, authorization=auth, prior_results=[], transition_receipts=[one]
+                missing, authorization=auth, prior_results=[], transition_receipts=[one]
+            )
+
+        unexpired = copy.deepcopy(valid)
+        proof = unexpired["remaining_target_inert_proofs"][0]["value"]
+        proof["elapsed_since_acceptance_ns"] = 300_000_000_000
+        proof["observed_boottime_ns"] = 301_000_000_000
+        unexpired["remaining_target_inert_proofs"][0] = qr.wrap(proof)
+        with self.assertRaisesRegex(qr.QuarantineRoundError, "inert proof differs"):
+            qr.validate_round_result(
+                unexpired, authorization=auth, prior_results=[], transition_receipts=[one]
             )
 
     def test_extra_prior_fenced_row_is_rejected_before_mutation(self) -> None:

@@ -392,6 +392,141 @@ def require_keys(value: Any, field: str, required: Iterable[str], optional: Iter
     return value
 
 
+def validate_live_observation_selection(
+    value: Any,
+    *,
+    source_main_commit: str,
+    freeze_plan_sha256: str,
+    capture_id: str,
+) -> dict[str, Any]:
+    """Validate the complete canary-bound live-observation provenance object."""
+
+    label = "legacy maintenance live-observation selection"
+    def one_hash(raw: Any, field: str) -> str:
+        if not isinstance(raw, str) or LOWER_HEX_32_RE.fullmatch(raw) is None:
+            fail(f"{field} must be one lowercase SHA-256")
+        return raw
+    selection = require_keys(value, label, (
+        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+        "observation_generation", "observation_generation_receipt",
+        "observation_generation_receipt_path", "observation_generation_receipt_sha256",
+        "drive_prefreeze_receipt_path", "drive_prefreeze_receipt_sha256",
+        "generation_created_at", "selected_at", "max_selection_age_seconds", "labels", "nodes",
+    ))
+    generation = one_hash(selection["observation_generation"], f"{label} generation")
+    generation_receipt = require_keys(
+        selection["observation_generation_receipt"],
+        f"{label} generation receipt",
+        ("schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+         "observation_generation", "created_at", "max_selection_age_seconds",
+         "drive_prefreeze_receipt"),
+    )
+    drive_wrapper = require_keys(
+        generation_receipt["drive_prefreeze_receipt"],
+        f"{label} Drive receipt wrapper", ("path", "sha256", "value"),
+    )
+    drive = require_keys(
+        drive_wrapper["value"], f"{label} Drive receipt", (
+            "schema", "mode", "freeze_plan_sha256", "capture_id",
+            "remote_root_sha256", "client_id_sha256", "account_sha256",
+            "permission_id_sha256", "rclone_version", "source_bytes",
+            "archive_reservation_bytes", "largest_object_reservation_bytes",
+            "daily_upload_budget_bytes", "daily_upload_budget_basis",
+            "available_bytes_before", "available_bytes_after", "canary_bytes",
+            "canary_verified", "canary_deleted",
+        ),
+    )
+    expected_identity = (source_main_commit, freeze_plan_sha256, capture_id)
+    if (
+        selection["schema"] != "arc.recovery.legacy-live-observation-selection.v1"
+        or generation_receipt["schema"]
+            != "arc.recovery.legacy-live-observation-generation.v1"
+        or (selection["source_main_commit"], selection["freeze_plan_sha256"],
+            selection["capture_id"]) != expected_identity
+        or (generation_receipt["source_main_commit"],
+            generation_receipt["freeze_plan_sha256"],
+            generation_receipt["capture_id"]) != expected_identity
+        or generation_receipt["observation_generation"] != generation
+        or selection["observation_generation_receipt_sha256"]
+            != sha256_bytes(canonical_bytes(generation_receipt))
+        or selection["generation_created_at"] != generation_receipt["created_at"]
+        or selection["max_selection_age_seconds"] != 300
+        or generation_receipt["max_selection_age_seconds"] != 300
+        or selection["labels"] != ["diagnostic", "noncanonical", "nonreward"]
+    ):
+        fail(f"{label} generation provenance differs")
+    generation_path = absolute_path(
+        selection["observation_generation_receipt_path"],
+        f"{label} generation receipt path",
+    )
+    if Path(generation_path).name != f"{generation}.json":
+        fail(f"{label} generation receipt path differs")
+    drive_path = absolute_path(drive_wrapper["path"], f"{label} Drive receipt path")
+    if (selection["drive_prefreeze_receipt_path"] != drive_path
+            or selection["drive_prefreeze_receipt_sha256"]
+                != one_hash(drive_wrapper["sha256"], f"{label} Drive receipt root")
+            or drive_wrapper["sha256"] != sha256_bytes(canonical_bytes(drive))):
+        fail(f"{label} Drive receipt wrapper differs")
+    if (
+        drive["schema"] != "arc.recovery.drive-prefreeze.v1"
+        or drive["mode"] != "execute"
+        or drive["freeze_plan_sha256"] != freeze_plan_sha256
+        or drive["capture_id"] != capture_id
+        or drive["rclone_version"] != "v1.75.0"
+        or drive["daily_upload_budget_basis"]
+            != "operator-reviewed-remaining-dedicated-account"
+        or drive["canary_bytes"] != 8 * 1024 * 1024
+        or drive["canary_verified"] is not True
+        or drive["canary_deleted"] is not True
+    ):
+        fail(f"{label} Drive execute canary identity differs")
+    for field in ("remote_root_sha256", "client_id_sha256", "account_sha256",
+                  "permission_id_sha256"):
+        if one_hash(drive[field], f"{label} Drive {field}") == "0" * 64:
+            fail(f"{label} Drive {field} must be nonzero")
+    numeric = {field: required_int(drive[field], f"{label} Drive {field}", minimum=1)
+               for field in ("source_bytes", "archive_reservation_bytes",
+                             "largest_object_reservation_bytes", "daily_upload_budget_bytes",
+                             "available_bytes_before", "available_bytes_after", "canary_bytes")}
+    if (numeric["available_bytes_before"]
+            < numeric["archive_reservation_bytes"] + numeric["canary_bytes"]
+            or numeric["available_bytes_after"] < numeric["archive_reservation_bytes"]
+            or numeric["daily_upload_budget_bytes"] < numeric["archive_reservation_bytes"]
+            or numeric["largest_object_reservation_bytes"]
+                > numeric["archive_reservation_bytes"]):
+        fail(f"{label} Drive execute canary capacity differs")
+    def micro(raw: Any, field: str) -> dt.datetime:
+        if not isinstance(raw, str):
+            fail(f"{field} must be canonical UTC with microseconds")
+        try: parsed = dt.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=dt.timezone.utc
+        )
+        except ValueError:
+            fail(f"{field} must be canonical UTC with microseconds")
+        if parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ") != raw:
+            fail(f"{field} must be canonical UTC with microseconds")
+        return parsed
+    created = micro(generation_receipt["created_at"], f"{label} generation created_at")
+    selected = micro(selection["selected_at"], f"{label} selected_at")
+    if not 0 <= (selected - created).total_seconds() <= 300:
+        fail(f"{label} selection age differs")
+    nodes = selection["nodes"]
+    if not isinstance(nodes, list) or len(nodes) != len(PRODUCTION_FLEET):
+        fail(f"{label} node set differs")
+    for (node, _host), row in zip(PRODUCTION_FLEET, nodes):
+        row = require_keys(row, f"{label} {node} row",
+                           ("node", "created_at", "completed_at", "root_sha256", "receipt_sha256"))
+        if row["node"] != node:
+            fail(f"{label} node order differs")
+        started = micro(row["created_at"], f"{label} {node} created_at")
+        completed = micro(row["completed_at"], f"{label} {node} completed_at")
+        if started > completed:
+            fail(f"{label} {node} timeline regressed")
+        one_hash(row["root_sha256"], f"{label} {node} root")
+        one_hash(row["receipt_sha256"], f"{label} {node} receipt")
+    return selection
+
+
 def validate_public_tls_evidence(
     value: Any,
     *,
@@ -1876,7 +2011,8 @@ def verify_legacy_maintenance_stage_payloads(
         (
             "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
             "first_quarantine_started_at", "all_controlled_stopped_at", "challenge",
-            "authenticated_prefence_height_cross_proof", "quarantine_generation_ledger",
+            "authenticated_prefence_height_cross_proof", "live_observation_selection",
+            "quarantine_generation_ledger",
             "network_quarantine_challenge",
             "quarantine_stability_proof", "nodes", "object_inventory",
             "aggregate_root_sha256",
@@ -1921,6 +2057,17 @@ def verify_legacy_maintenance_stage_payloads(
         node="fleet",
         role="authenticated-prefence-height-cross-proof",
         label="legacy maintenance authenticated pre-fence proof",
+    )
+    observation_selection, observation_selection_sha = sealed(
+        bundle["live_observation_selection"],
+        node="fleet", role="live-observation-selection",
+        label="legacy maintenance live-observation selection",
+    )
+    observation_selection = validate_live_observation_selection(
+        observation_selection,
+        source_main_commit=source_commit,
+        freeze_plan_sha256=freeze_sha,
+        capture_id=capture_id,
     )
     generation_ledger, generation_ledger_sha = sealed(
         bundle["quarantine_generation_ledger"],
@@ -2388,6 +2535,10 @@ def verify_legacy_maintenance_stage_payloads(
             "first_quarantine_started_at", "all_controlled_stopped_at", "created_at",
             "official_origin_scope", "legacy_public_height_receipt",
             "authenticated_prefence_height_cross_proof_sha256",
+            "legacy_live_observation_selection_sha256",
+            "legacy_live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
             "quarantine_generation_ledger_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
             "network_quarantine_stability_proof_sha256",
@@ -2415,6 +2566,24 @@ def verify_legacy_maintenance_stage_payloads(
         fail("legacy maintenance boundary does not bind the exact evidence bundle")
     if boundary["authenticated_prefence_height_cross_proof_sha256"] != authenticated_sha:
         fail("legacy maintenance boundary authenticated proof root differs from the bundle")
+    if (
+        boundary["legacy_live_observation_selection_sha256"] != observation_selection_sha
+        or boundary["legacy_live_observation_generation"]
+            != observation_selection["observation_generation"]
+        or boundary["observation_generation_receipt_sha256"]
+            != observation_selection["observation_generation_receipt_sha256"]
+        or boundary["drive_prefreeze_receipt_sha256"]
+            != observation_selection["drive_prefreeze_receipt_sha256"]
+        or generation_state["live_observation_selection_sha256"]
+            != observation_selection_sha
+        or generation_state["live_observation_generation"]
+            != observation_selection["observation_generation"]
+        or generation_state["observation_generation_receipt_sha256"]
+            != observation_selection["observation_generation_receipt_sha256"]
+        or generation_state["drive_prefreeze_receipt_sha256"]
+            != observation_selection["drive_prefreeze_receipt_sha256"]
+    ):
+        fail("legacy maintenance boundary live-observation provenance differs")
     if boundary["quarantine_generation_ledger_sha256"] != generation_ledger_sha:
         fail("legacy maintenance boundary generation-ledger root differs from the bundle")
     if (exact_utc(boundary["first_quarantine_started_at"], "legacy first secured transition")
@@ -3186,6 +3355,10 @@ def verify_legacy_maintenance_stage_payloads(
             "legacy_maintenance_boundary", "legacy_maintenance_boundary_sha256",
             "legacy_maintenance_evidence_bundle_sha256", "nodes",
             "quarantine_generation_ledger_sha256",
+            "legacy_live_observation_selection_sha256",
+            "legacy_live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
         ),
     )
     if offline["schema"] != "arc.validator-vault.offline-stop-evidence.v2":
@@ -3199,6 +3372,13 @@ def verify_legacy_maintenance_stage_payloads(
         or offline["legacy_maintenance_boundary"] != boundary
         or offline["legacy_maintenance_evidence_bundle_sha256"] != bundle_sha
         or offline["quarantine_generation_ledger_sha256"] != generation_ledger_sha
+        or offline["legacy_live_observation_selection_sha256"] != observation_selection_sha
+        or offline["legacy_live_observation_generation"]
+            != observation_selection["observation_generation"]
+        or offline["observation_generation_receipt_sha256"]
+            != observation_selection["observation_generation_receipt_sha256"]
+        or offline["drive_prefreeze_receipt_sha256"]
+            != observation_selection["drive_prefreeze_receipt_sha256"]
         or offline["legacy_height_cross_proof"] != authenticated
     ):
         fail("offline-stop evidence does not embed the exact maintenance bundle/boundary")

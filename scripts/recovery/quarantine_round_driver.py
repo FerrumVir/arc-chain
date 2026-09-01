@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import time
 from typing import Any, Mapping, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -46,6 +47,42 @@ def digest_bytes(value: bytes) -> str:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def operator_selection_remaining_ns(
+    selected_monotonic_ns: int,
+    selected_realtime_ns: int,
+    *,
+    now_monotonic_ns: int | None = None,
+    now_realtime_ns: int | None = None,
+) -> int:
+    """Return a conservative same-invocation selection lease.
+
+    Python's portable monotonic clock does not include suspend on every
+    operator OS.  Realtime does, but may be stepped.  Requiring both elapsed
+    values to agree within one second makes either suspend or a wall-clock
+    step fail closed instead of extending the first-mutation window.
+    """
+    for value, label in (
+        (selected_monotonic_ns, "selection monotonic marker"),
+        (selected_realtime_ns, "selection realtime marker"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            fail(f"{label} differs")
+    monotonic_now = time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
+    realtime_now = time.time_ns() if now_realtime_ns is None else now_realtime_ns
+    elapsed_monotonic = monotonic_now - selected_monotonic_ns
+    elapsed_realtime = realtime_now - selected_realtime_ns
+    if elapsed_monotonic < 0 or elapsed_realtime < 0:
+        fail("operator selection clock regressed")
+    if abs(elapsed_monotonic - elapsed_realtime) > 1_000_000_000:
+        fail("operator selection clocks diverged")
+    remaining = rounds.MAX_WINDOW_SECONDS * 1_000_000_000 - max(
+        elapsed_monotonic, elapsed_realtime
+    )
+    if remaining <= 0:
+        fail("operator selection monotonic mutation window expired")
+    return remaining
 
 
 def read_canonical(path: Path, label: str, *, mode: int = 0o400) -> dict[str, Any]:
@@ -367,8 +404,39 @@ def build_authorization(args: argparse.Namespace) -> dict[str, Any]:
         )
         for target in targets
     ]
+    selection = read_canonical(
+        args.live_observation_selection, "live-observation selection"
+    )
+    generation_receipt = selection.get("observation_generation_receipt")
+    if (
+        selection.get("schema")
+            != "arc.recovery.legacy-live-observation-selection.v1"
+        or (selection.get("freeze_plan_sha256"), selection.get("capture_id"))
+            != (args.freeze_plan_sha256, args.capture_id)
+        or digest_bytes(canonical(selection))
+            != args.live_observation_selection_sha256
+        or not isinstance(generation_receipt, dict)
+        or digest_bytes(canonical(generation_receipt))
+            != selection.get("observation_generation_receipt_sha256")
+        or generation_receipt.get("observation_generation")
+            != selection.get("observation_generation")
+        or generation_receipt.get("drive_prefreeze_receipt", {}).get("sha256")
+            != selection.get("drive_prefreeze_receipt_sha256")
+    ):
+        fail("quarantine authorization live-observation selection differs")
     authorized_at = utc_now()
     deadline = public_completed + dt.timedelta(seconds=rounds.MAX_WINDOW_SECONDS)
+    if args.round_number == 1:
+        try:
+            selected_at = dt.datetime.strptime(
+                selection["selected_at"], "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=dt.timezone.utc)
+        except (KeyError, TypeError, ValueError) as error:
+            raise DriverError("live-observation selection timestamp differs") from error
+        selection_deadline = selected_at + dt.timedelta(seconds=rounds.MAX_WINDOW_SECONDS)
+        deadline = min(deadline, selection_deadline.replace(microsecond=0))
+        if rounds.parse_utc(authorized_at, "authorization now") < selected_at:
+            fail("quarantine authorization predates live-observation selection")
     if rounds.parse_utc(authorized_at, "authorization now") > deadline:
         fail("target public receipt expired before round authorization")
     value = {
@@ -377,6 +445,15 @@ def build_authorization(args: argparse.Namespace) -> dict[str, Any]:
         "freeze_plan_sha256": args.freeze_plan_sha256,
         "round_number": args.round_number,
         "source_main_commit": freeze["source_commit"],
+        "live_observation_selection_sha256": args.live_observation_selection_sha256,
+        "live_observation_generation": selection["observation_generation"],
+        "observation_generation_receipt_sha256": selection[
+            "observation_generation_receipt_sha256"
+        ],
+        "drive_prefreeze_receipt_sha256": selection[
+            "drive_prefreeze_receipt_sha256"
+        ],
+        "live_observation_selected_at": selection["selected_at"],
         "prior_round_result_sha256s": [rounds.digest(value) for value in previous_results],
         "prior_fenced": prior_rows,
         "targets": [
@@ -410,6 +487,25 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
         )
         for name in targets
     }
+    completed_now = dt.datetime.now(dt.timezone.utc)
+    remaining_ns = int((state["deadline"] - completed_now).total_seconds() * 1_000_000_000)
+    max_elapsed_since_acceptance_ns = min(
+        rounds.MAX_WINDOW_SECONDS * 1_000_000_000,
+        remaining_ns,
+    )
+    selected_monotonic_ns = getattr(args, "operator_selection_monotonic_ns", None)
+    selected_realtime_ns = getattr(args, "operator_selection_realtime_ns", None)
+    if state["round_number"] == 1:
+        if selected_monotonic_ns is None or selected_realtime_ns is None:
+            fail("first-round readiness requires live operator selection clocks")
+        max_elapsed_since_acceptance_ns = min(
+            max_elapsed_since_acceptance_ns,
+            operator_selection_remaining_ns(
+                selected_monotonic_ns, selected_realtime_ns
+            ),
+        )
+    if max_elapsed_since_acceptance_ns <= 0:
+        fail("quarantine readiness has no remaining monotonic mutation lease")
     value = {
         "schema": rounds.READINESS_SCHEMA,
         "capture_id": state["capture_id"], "freeze_plan_sha256": state["freeze_plan_sha256"],
@@ -422,8 +518,33 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
             }
             for name in targets
         ],
-        "completed_at": utc_now(),
+        "completed_at": completed_now.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "authorization_deadline": authorization["authorization_deadline"],
+        "max_elapsed_since_acceptance_ns": max_elapsed_since_acceptance_ns,
+    }
+    probe_dispatch = {
+        "schema": "arc.recovery.quarantine-mutation-dispatch.v1",
+        "capture_id": state["capture_id"],
+        "freeze_plan_sha256": state["freeze_plan_sha256"],
+        "round_number": state["round_number"],
+        "round_authorization_sha256": rounds.digest(authorization),
+        "round_readiness_sha256": rounds.digest(value),
+        "live_observation_selection_sha256": authorization[
+            "live_observation_selection_sha256"
+        ],
+        "live_observation_generation": authorization[
+            "live_observation_generation"
+        ],
+        "observation_generation_receipt_sha256": authorization[
+            "observation_generation_receipt_sha256"
+        ],
+        "drive_prefreeze_receipt_sha256": authorization[
+            "drive_prefreeze_receipt_sha256"
+        ],
+        "targets": [
+            {"node": name, "host": rounds.FLEET_MAP[name]} for name in targets
+        ],
+        "dispatched_at": authorization["authorized_at"],
     }
     probe = {
         "schema": rounds.ROUND_RESULT_SCHEMA,
@@ -431,6 +552,8 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
         "round_number": state["round_number"],
         "round_authorization_sha256": rounds.digest(authorization),
         "target_readiness": rounds.wrap(value), "transitions": [],
+        "mutation_dispatch": rounds.wrap(probe_dispatch),
+        "remaining_target_inert_proofs": [],
         "remaining_targets": targets,
         "completed_at": authorization["authorization_deadline"],
     }
@@ -444,16 +567,86 @@ def build_readiness(args: argparse.Namespace) -> dict[str, Any]:
 def build_result(args: argparse.Namespace) -> dict[str, Any]:
     authorization = read_canonical(args.authorization, "round authorization")
     readiness = read_canonical(args.readiness, "round readiness")
+    dispatch = read_canonical(args.dispatch, "round mutation dispatch")
     _previous_auth, previous_results = load_prefix(args.round_root, args.round_number - 1)
     state = rounds.validate_round_authorization(
         authorization, prior_results=previous_results
     )
+    dispatch_fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "round_number",
+        "round_authorization_sha256", "round_readiness_sha256",
+        "live_observation_selection_sha256", "live_observation_generation",
+        "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+        "targets", "dispatched_at",
+    }
+    expected_dispatch_identity = (
+        authorization["capture_id"], authorization["freeze_plan_sha256"],
+        args.round_number, rounds.digest(authorization), rounds.digest(readiness),
+        authorization["live_observation_selection_sha256"],
+        authorization["live_observation_generation"],
+        authorization["observation_generation_receipt_sha256"],
+        authorization["drive_prefreeze_receipt_sha256"],
+    )
+    if (
+        set(dispatch) != dispatch_fields
+        or dispatch.get("schema") != "arc.recovery.quarantine-mutation-dispatch.v1"
+        or (
+            dispatch.get("capture_id"), dispatch.get("freeze_plan_sha256"),
+            dispatch.get("round_number"), dispatch.get("round_authorization_sha256"),
+            dispatch.get("round_readiness_sha256"),
+            dispatch.get("live_observation_selection_sha256"),
+            dispatch.get("live_observation_generation"),
+            dispatch.get("observation_generation_receipt_sha256"),
+            dispatch.get("drive_prefreeze_receipt_sha256"),
+        ) != expected_dispatch_identity
+        or dispatch.get("targets") != [
+            {"node": row["node"], "host": row["host"]}
+            for row in authorization["targets"]
+        ]
+    ):
+        fail("round mutation dispatch closure differs")
+    rounds.parse_utc(dispatch.get("dispatched_at"), "round mutation dispatch time")
     transitions = []
     for name in state["target_names"]:
         path = args.applied_root / f"{name}.json"
         if path.exists() and not path.is_symlink():
             transitions.append(read_canonical(path, f"{name} round transition receipt"))
     transitioned_names = {item["node"] for item in transitions}
+    remaining_targets = [
+        name for name in state["target_names"] if name not in transitioned_names
+    ]
+    # A positive attempt result is create-only and may already be durable when
+    # the operator crashes before copying it into the immutable round prefix.
+    # Preserve its completion timestamp, then reconstruct and validate every
+    # other field from the current authorization/readiness/transition closure.
+    # Recomputing utc_now() here would make an otherwise exact crash resume
+    # conflict with its own terminal bytes forever.
+    existing = None
+    if args.output.exists() or args.output.is_symlink():
+        existing = read_canonical(args.output, "existing round result")
+    completed_at = existing.get("completed_at") if existing is not None else utc_now()
+    if existing is not None:
+        inert_proofs = existing.get("remaining_target_inert_proofs")
+    elif transitions and remaining_targets:
+        proof_root = args.remaining_proof_root
+        if proof_root is None or not proof_root.is_absolute():
+            fail("partial round result requires an absolute inert-proof root")
+        details = proof_root.lstat()
+        if (
+            proof_root.is_symlink()
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.geteuid()
+            or stat.S_IMODE(details.st_mode) != 0o700
+        ):
+            fail("partial round inert-proof root is unsafe")
+        inert_proofs = [
+            rounds.wrap(read_canonical(
+                proof_root / f"{name}.json", f"{name} remaining-target inert proof"
+            ))
+            for name in remaining_targets
+        ]
+    else:
+        inert_proofs = []
     value = {
         "schema": rounds.ROUND_RESULT_SCHEMA,
         "capture_id": authorization["capture_id"],
@@ -462,15 +655,17 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
         "round_authorization_sha256": rounds.digest(authorization),
         "target_readiness": rounds.wrap(readiness),
         "transitions": [rounds.wrap(item) for item in transitions],
-        "remaining_targets": [
-            name for name in state["target_names"] if name not in transitioned_names
-        ],
-        "completed_at": utc_now(),
+        "mutation_dispatch": rounds.wrap(dispatch),
+        "remaining_target_inert_proofs": inert_proofs,
+        "remaining_targets": remaining_targets,
+        "completed_at": completed_at,
     }
     rounds.validate_round_result(
         value, authorization=authorization, prior_results=previous_results,
         transition_receipts=transitions,
     )
+    if existing is not None and existing != value:
+        fail("existing round result differs from current transition closure")
     return value
 
 
@@ -501,6 +696,18 @@ def build_ledger(args: argparse.Namespace) -> dict[str, Any]:
     value = {
         "schema": rounds.LEDGER_SCHEMA,
         "capture_id": args.capture_id, "freeze_plan_sha256": args.freeze_plan_sha256,
+        "live_observation_selection_sha256": authorizations[0][
+            "live_observation_selection_sha256"
+        ],
+        "live_observation_generation": authorizations[0][
+            "live_observation_generation"
+        ],
+        "observation_generation_receipt_sha256": authorizations[0][
+            "observation_generation_receipt_sha256"
+        ],
+        "drive_prefreeze_receipt_sha256": authorizations[0][
+            "drive_prefreeze_receipt_sha256"
+        ],
         "fleet": [{"node": name, "host": host} for name, host in rounds.FLEET],
         "rounds": [
             {"authorization": rounds.wrap(authorization), "result": rounds.wrap(result)}
@@ -568,6 +775,65 @@ def command_prefix_ref(args: argparse.Namespace) -> int:
 def build_first_boundary(args: argparse.Namespace) -> dict[str, Any]:
     ledger = read_canonical(args.ledger, "quarantine generation ledger")
     state = rounds.validate_generation_ledger(ledger)
+    selection = read_canonical(
+        args.live_observation_selection, "live-observation selection"
+    )
+    selection_fields = {
+        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+        "observation_generation", "observation_generation_receipt",
+        "observation_generation_receipt_path",
+        "observation_generation_receipt_sha256",
+        "drive_prefreeze_receipt_path", "drive_prefreeze_receipt_sha256",
+        "generation_created_at", "selected_at", "max_selection_age_seconds",
+        "labels", "nodes",
+    }
+    generation_receipt = selection.get("observation_generation_receipt")
+    if (
+        set(selection) != selection_fields
+        or selection.get("schema")
+            != "arc.recovery.legacy-live-observation-selection.v1"
+        or (selection.get("freeze_plan_sha256"), selection.get("capture_id"))
+            != (state["freeze_plan_sha256"], state["capture_id"])
+        or not isinstance(generation_receipt, dict)
+        or digest_bytes(canonical(generation_receipt))
+            != selection.get("observation_generation_receipt_sha256")
+        or generation_receipt.get("observation_generation")
+            != selection.get("observation_generation")
+        or generation_receipt.get("drive_prefreeze_receipt", {}).get("sha256")
+            != selection.get("drive_prefreeze_receipt_sha256")
+        or selection.get("labels") != ["diagnostic", "noncanonical", "nonreward"]
+        or not isinstance(selection.get("nodes"), list)
+        or [row.get("node") for row in selection["nodes"]]
+            != [name for name, _host in rounds.FLEET]
+    ):
+        fail("first quarantine boundary live-observation selection differs")
+    selection_sha = digest_bytes(canonical(selection))
+    if selection_sha != args.live_observation_selection_sha256:
+        fail("first quarantine boundary live-observation selection root differs")
+    if (
+        ledger.get("live_observation_selection_sha256") != selection_sha
+        or ledger.get("live_observation_generation")
+            != selection.get("observation_generation")
+        or ledger.get("observation_generation_receipt_sha256")
+            != selection.get("observation_generation_receipt_sha256")
+        or ledger.get("drive_prefreeze_receipt_sha256")
+            != selection.get("drive_prefreeze_receipt_sha256")
+    ):
+        fail("first quarantine boundary ledger observation binding differs")
+    try:
+        dt.datetime.strptime(
+            selection["selected_at"], "%Y-%m-%dT%H:%M:%S.%fZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        dt.datetime.strptime(
+            ledger["first_secured_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+    except (KeyError, TypeError, ValueError) as error:
+        raise DriverError(
+            "first quarantine boundary observation timeline differs"
+        ) from error
+    # These UTC values originate on different hosts and are audit metadata.
+    # Causality is established by the exact selection root carried in the
+    # authorization, readiness, dispatch, transition and generation ledger.
     all_wrappers = [
         wrapper for row in ledger["rounds"]
         for wrapper in row["result"]["value"]["transitions"]
@@ -588,6 +854,14 @@ def build_first_boundary(args: argparse.Namespace) -> dict[str, Any]:
         "timestamp": ledger["first_secured_at"],
         "quarantine_generation_ledger_sha256": rounds.digest(ledger),
         "first_node_transition_sha256": first_wrapper["sha256"],
+        "live_observation_selection_sha256": selection_sha,
+        "live_observation_generation": selection["observation_generation"],
+        "observation_generation_receipt_sha256": selection[
+            "observation_generation_receipt_sha256"
+        ],
+        "drive_prefreeze_receipt_sha256": selection[
+            "drive_prefreeze_receipt_sha256"
+        ],
     }
 
 
@@ -613,6 +887,8 @@ def parser() -> argparse.ArgumentParser:
     authorization.add_argument("--cross", type=Path, required=True)
     authorization.add_argument("--prior-status-root", type=Path, required=True)
     authorization.add_argument("--source-capture-root", type=Path, required=True)
+    authorization.add_argument("--live-observation-selection", type=Path, required=True)
+    authorization.add_argument("--live-observation-selection-sha256", required=True)
     authorization.add_argument("--output", type=Path, required=True)
 
     readiness = commands.add_parser("build-readiness")
@@ -620,6 +896,8 @@ def parser() -> argparse.ArgumentParser:
     readiness.add_argument("--round-root", type=Path, required=True)
     readiness.add_argument("--authorization", type=Path, required=True)
     readiness.add_argument("--acceptance-root", type=Path, required=True)
+    readiness.add_argument("--operator-selection-monotonic-ns", type=int)
+    readiness.add_argument("--operator-selection-realtime-ns", type=int)
     readiness.add_argument("--output", type=Path, required=True)
 
     result = commands.add_parser("build-result")
@@ -627,7 +905,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--round-root", type=Path, required=True)
     result.add_argument("--authorization", type=Path, required=True)
     result.add_argument("--readiness", type=Path, required=True)
+    result.add_argument("--dispatch", type=Path, required=True)
     result.add_argument("--applied-root", type=Path, required=True)
+    result.add_argument("--remaining-proof-root", type=Path)
     result.add_argument("--output", type=Path, required=True)
 
     ledger = commands.add_parser("build-ledger")
@@ -651,6 +931,8 @@ def parser() -> argparse.ArgumentParser:
 
     boundary = commands.add_parser("build-first-boundary")
     boundary.add_argument("--ledger", type=Path, required=True)
+    boundary.add_argument("--live-observation-selection", type=Path, required=True)
+    boundary.add_argument("--live-observation-selection-sha256", required=True)
     boundary.add_argument("--output", type=Path, required=True)
     return root
 

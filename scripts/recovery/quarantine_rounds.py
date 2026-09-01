@@ -36,7 +36,8 @@ NODE_APPLIED_SCHEMA = "arc.recovery.quarantine-node-nft-applied.v1"
 NODE_STOPPED_PRECOMMIT_SCHEMA = (
     "arc.recovery.quarantine-node-persistently-stopped-precommit.v1"
 )
-ROUND_RESULT_SCHEMA = "arc.recovery.quarantine-round-result.v2"
+ROUND_RESULT_SCHEMA = "arc.recovery.quarantine-round-result.v3"
+INERT_NODE_PROOF_SCHEMA = "arc.recovery.quarantine-round-zero-progress-node-proof.v1"
 LEDGER_SCHEMA = "arc.recovery.quarantine-generation-ledger.v2"
 TARGET_HEIGHT_SCHEMA = "arc.recovery.legacy-public-height-targets.v1"
 TARGET_CROSS_SCHEMA = "arc.recovery.authenticated-legacy-height-targets.v1"
@@ -1117,8 +1118,6 @@ def validate_node_stopped_precommit(
     intent_prepared = parse_utc(
         intent.get("prepared_at"), "persistently-stopped apply-intent preparation"
     )
-    if intent_prepared > deadline:
-        fail("persistently-stopped nft apply intent missed its deadline")
 
     gate_wrapper = value.get("nft_deadline_gate")
     if gate_wrapper is not None:
@@ -1153,7 +1152,7 @@ def validate_node_stopped_precommit(
         gate_invoked = parse_utc(
             gate.get("invoked_at"), "persistently-stopped nft gate invocation"
         )
-        if not intent_prepared <= gate_invoked <= deadline:
+        if not intent_prepared <= gate_invoked:
             fail("persistently-stopped nft gate chronology differs")
 
     commit_wrapper = value.get("applied_commit")
@@ -1238,7 +1237,7 @@ def validate_node_stopped_precommit(
     plan_prepared = parse_utc(
         plan.get("prepared_at"), "persistently-stopped persistence-plan preparation"
     )
-    if not intent_prepared <= plan_prepared <= deadline:
+    if not intent_prepared <= plan_prepared:
         fail("persistently-stopped persistence-plan chronology differs")
     supervisor = plan.get("authorized_supervisor")
     supervisor_fields = {
@@ -1345,20 +1344,18 @@ def validate_node_stopped_precommit(
         fail("persistently-stopped restart-fence binding differs")
     armed_at = parse_utc(barrier.get("armed_at"), "persistently-stopped restart-fence arm")
     if barrier.get("arming_mode") == "initial-live-window":
-        if barrier.get("armed_boot_id") != authorized_writer["boot_id"] or armed_at > deadline:
+        if barrier.get("armed_boot_id") != authorized_writer["boot_id"]:
             fail("persistently-stopped initial restart-fence chronology differs")
     elif barrier.get("arming_mode") == "post-reboot-fail-closed-reconciliation":
         if (
             not reboot_after_intent
             or barrier.get("armed_boot_id") != current_boot
-            or armed_at <= deadline
         ):
             fail("persistently-stopped reconciled restart-fence chronology differs")
     elif barrier.get("arming_mode") == "same-boot-fail-closed-reconciliation":
         if (
             reboot_after_intent
             or barrier.get("armed_boot_id") != authorized_writer["boot_id"]
-            or armed_at <= deadline
         ):
             fail("persistently-stopped same-boot restart-fence chronology differs")
     else:
@@ -1477,10 +1474,8 @@ def validate_node_stopped_precommit(
         validate_absence_sample(sample, "persistently-stopped precommit")
         for sample in samples
     ]
-    if not (
-        deadline < reconciliation_started <= sample_times[0] < sample_times[1]
-        <= precommit_observed
-    ):
+    if not (reconciliation_started <= sample_times[0] < sample_times[1]
+            <= precommit_observed):
         fail("persistently-stopped reconciliation chronology differs")
 
     persisted, persisted_sha = validate_wrapper(
@@ -1886,6 +1881,9 @@ def validate_round_authorization(
     fields = {
         "schema", "capture_id", "freeze_plan_sha256", "round_number",
         "source_main_commit",
+        "live_observation_selection_sha256", "live_observation_generation",
+        "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+        "live_observation_selected_at",
         "prior_round_result_sha256s", "prior_fenced", "targets",
         "public_height_receipt", "authenticated_height_cross_proof",
         "live_source_captures",
@@ -1896,6 +1894,31 @@ def validate_round_authorization(
     capture = require_hash(value.get("capture_id"), "round capture")
     freeze = require_hash(value.get("freeze_plan_sha256"), "round freeze")
     source = require_commit(value.get("source_main_commit"), "round source commit")
+    selection_sha = require_hash(
+        value.get("live_observation_selection_sha256"),
+        "round live-observation selection",
+    )
+    observation_generation = require_hash(
+        value.get("live_observation_generation"),
+        "round live-observation generation",
+    )
+    generation_receipt_sha = require_hash(
+        value.get("observation_generation_receipt_sha256"),
+        "round observation-generation receipt",
+    )
+    drive_receipt_sha = require_hash(
+        value.get("drive_prefreeze_receipt_sha256"),
+        "round Drive prefreeze receipt",
+    )
+    try:
+        observation_selected_at = dt.datetime.strptime(
+            str(value.get("live_observation_selected_at")),
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        ).replace(tzinfo=dt.timezone.utc)
+    except ValueError as error:
+        raise QuarantineRoundError(
+            "round live-observation selection timestamp differs"
+        ) from error
     number = require_uint(value.get("round_number"), "round number", positive=True)
     if number > MAX_ROUNDS:
         fail("quarantine round exceeds the six-node bound")
@@ -1985,8 +2008,6 @@ def validate_round_authorization(
             transition_sha256=row["node_transition_receipt_sha256"],
         )
         prior_observed_times.append(observed)
-        if observed > parse_utc(value.get("authorized_at"), "round authorization time"):
-            fail("prior-fenced current status was observed after authorization")
         expected["current_status"] = {"sha256": status_sha, "value": status}
         if row != expected:
             fail("prior-fenced rows do not derive from prior applied receipts/current status")
@@ -2050,23 +2071,27 @@ def validate_round_authorization(
         }
     authorized = parse_utc(value.get("authorized_at"), "round authorization time")
     deadline = parse_utc(value.get("authorization_deadline"), "round deadline")
-    if not (
-        public_started <= public_completed <= cross_started <= cross_completed
-        <= min(capture_completed) <= max(capture_completed) <= authorized <= deadline
+    # UTC across the operator and remote nodes is audit-only.  Exact wrapper
+    # roots establish public -> cross -> source-capture causality; each source
+    # only has to be internally non-regressing.
+    if (public_started > public_completed or cross_started > cross_completed
+            or min(capture_completed) > max(capture_completed) or authorized > deadline):
+        fail("quarantine-round authorization audit timeline differs")
+    if number == 1 and (
+        authorized < observation_selected_at
+        or deadline > observation_selected_at + dt.timedelta(seconds=MAX_WINDOW_SECONDS)
     ):
-        fail("quarantine-round authorization timeline is not ordered")
-    if deadline - public_completed != dt.timedelta(seconds=MAX_WINDOW_SECONDS):
-        fail("quarantine-round deadline is not exactly 300 seconds after public completion")
-    if any(
-        observed < public_started
-        or observed > authorized
-        or authorized - observed > dt.timedelta(seconds=MAX_WINDOW_SECONDS)
-        for observed in prior_observed_times
-    ):
-        fail("prior-fenced current status is outside the fresh round observation bracket")
+        fail("first quarantine mutation exceeds the live-observation selection window")
+    # Prior remote UTC observations are not compared to operator UTC; their
+    # exact transition/status roots bind the causal predecessor.
     return {
         "capture_id": capture, "freeze_plan_sha256": freeze, "round_number": number,
         "source_main_commit": source,
+        "live_observation_selection_sha256": selection_sha,
+        "live_observation_generation": observation_generation,
+        "observation_generation_receipt_sha256": generation_receipt_sha,
+        "drive_prefreeze_receipt_sha256": drive_receipt_sha,
+        "live_observation_selected_at": observation_selected_at,
         "prior_names": prior_names, "target_names": target_names,
         "target_rows": {row["node"]: row for row in targets},
         "public_rows": {row["name"]: row for row in public["origins"]},
@@ -2086,6 +2111,7 @@ def validate_round_result(
     fields = {
         "schema", "capture_id", "freeze_plan_sha256", "round_number",
         "round_authorization_sha256", "target_readiness", "transitions",
+        "mutation_dispatch", "remaining_target_inert_proofs",
         "remaining_targets", "completed_at",
     }
     if not isinstance(value, dict) or set(value) != fields or value.get("schema") != ROUND_RESULT_SCHEMA:
@@ -2103,7 +2129,7 @@ def validate_round_result(
         set(readiness) != {
             "schema", "capture_id", "freeze_plan_sha256", "round_number",
             "round_authorization_sha256", "targets", "completed_at",
-            "authorization_deadline",
+            "authorization_deadline", "max_elapsed_since_acceptance_ns",
         }
         or readiness.get("schema") != READINESS_SCHEMA
         or (
@@ -2120,7 +2146,14 @@ def validate_round_result(
     readiness_rows = readiness.get("targets")
     if not isinstance(readiness_rows, list) or len(readiness_rows) != len(auth["target_names"]):
         fail("quarantine-round target readiness count differs")
-    accepted_times: list[dt.datetime] = []
+    max_elapsed_since_acceptance_ns = require_uint(
+        readiness.get("max_elapsed_since_acceptance_ns"),
+        "quarantine-round monotonic mutation lease",
+        positive=True,
+    )
+    if max_elapsed_since_acceptance_ns > MAX_WINDOW_SECONDS * 1_000_000_000:
+        fail("quarantine-round monotonic mutation lease exceeds its bound")
+    readiness_acceptances: dict[str, Mapping[str, Any]] = {}
     for row, name in zip(readiness_rows, auth["target_names"]):
         if not isinstance(row, dict) or set(row) != {
             "node", "host", "authorization_acceptance",
@@ -2134,7 +2167,7 @@ def validate_round_result(
             set(acceptance) != {
                 "schema", "capture_id", "freeze_plan_sha256", "round_number",
                 "round_authorization_sha256", "node", "host", "accepted_at",
-                "authorization_deadline",
+                "authorization_deadline", "accepted_monotonic_ns", "accepted_boot_id",
             }
             or acceptance.get("schema") != AUTH_ACCEPTANCE_SCHEMA
             or (
@@ -2149,15 +2182,23 @@ def validate_round_result(
             )
         ):
             fail("quarantine-round authorization acceptance differs")
-        accepted_times.append(parse_utc(
+        parse_utc(
             acceptance.get("accepted_at"), f"{name} round authorization acceptance time"
-        ))
+        )
+        require_uint(
+            acceptance.get("accepted_monotonic_ns"),
+            f"{name} round authorization acceptance monotonic time",
+            positive=True,
+        )
+        expected_boot = auth["target_rows"][name]["boot_id"]
+        if acceptance.get("accepted_boot_id") != expected_boot:
+            fail("quarantine-round authorization acceptance boot differs")
+        readiness_acceptances[name] = acceptance
     readiness_completed = parse_utc(
         readiness.get("completed_at"), "quarantine-round readiness completion"
     )
     if (
-        any(not auth["authorized_at"] <= accepted <= auth["deadline"] for accepted in accepted_times)
-        or readiness_completed < max(accepted_times)
+        readiness_completed < auth["authorized_at"]
         or readiness_completed > auth["deadline"]
     ):
         fail("quarantine-round target readiness timeline differs")
@@ -2182,13 +2223,7 @@ def validate_round_result(
         if name not in auth["target_names"] or name in transitioned_names:
             fail("quarantine-round node transition is outside target set or duplicated")
         if projection["kind"] == ACTIVE_TRANSITION_KIND:
-            if not auth["authorized_at"] <= secured_at <= auth["deadline"]:
-                fail("active quarantine transition is outside its authorized deadline")
-        elif secured_at < auth["authorized_at"]:
-            # The stopped-precommit terminal may be completed after expiry.  Its
-            # exact validator proves that every nft-capable intent/gate was
-            # sealed within the lease and that the later boot stayed fail-closed.
-            fail("persistently-stopped transition predates its authorization")
+            pass
         if projection["authorization_deadline"] != auth["deadline"].strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ):
@@ -2242,10 +2277,111 @@ def validate_round_result(
         name for name in auth["target_names"] if name not in set(transitioned_names)
     ]:
         fail("quarantine-round remaining target set differs")
+    dispatch, dispatch_sha = validate_wrapper(
+        value.get("mutation_dispatch"), "quarantine-round mutation dispatch"
+    )
+    dispatch_fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "round_number",
+        "round_authorization_sha256", "round_readiness_sha256",
+        "live_observation_selection_sha256", "live_observation_generation",
+        "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+        "targets", "dispatched_at",
+    }
+    if (
+        set(dispatch) != dispatch_fields
+        or dispatch.get("schema") != "arc.recovery.quarantine-mutation-dispatch.v1"
+        or (
+            dispatch.get("capture_id"), dispatch.get("freeze_plan_sha256"),
+            dispatch.get("round_number"), dispatch.get("round_authorization_sha256"),
+            dispatch.get("round_readiness_sha256"),
+            dispatch.get("live_observation_selection_sha256"),
+            dispatch.get("live_observation_generation"),
+            dispatch.get("observation_generation_receipt_sha256"),
+            dispatch.get("drive_prefreeze_receipt_sha256"),
+        ) != (
+            auth["capture_id"], auth["freeze_plan_sha256"], auth["round_number"],
+            digest(authorization), readiness_sha,
+            auth["live_observation_selection_sha256"],
+            auth["live_observation_generation"],
+            auth["observation_generation_receipt_sha256"],
+            auth["drive_prefreeze_receipt_sha256"],
+        )
+        or dispatch.get("targets") != [
+            {"node": name, "host": FLEET_MAP[name]} for name in auth["target_names"]
+        ]
+    ):
+        fail("quarantine-round mutation dispatch differs")
+    parse_utc(dispatch.get("dispatched_at"), "quarantine-round mutation dispatch time")
+    inert_wrappers = value.get("remaining_target_inert_proofs")
+    if not isinstance(inert_wrappers, list):
+        fail("quarantine-round remaining-target inert proof set differs")
+    if remaining and transitioned_names:
+        if len(inert_wrappers) != len(remaining):
+            fail("partial quarantine-round result lacks every remaining-target inert proof")
+        proof_fields = {
+            "schema", "capture_id", "freeze_plan_sha256", "observation_generation",
+            "round_number", "round_authorization_sha256", "round_readiness_sha256",
+            "mutation_dispatch_sha256", "challenge", "node", "boot_id",
+            "writer_live_unfenced", "apply_state_present",
+            "restart_effective_mutation_absent", "active_selector_absent",
+            "quarantine_nft_absent", "authorization_accepted", "readiness_present",
+            "accepted_boottime_ns", "elapsed_since_acceptance_ns",
+            "observed_boottime_ns", "observed_at",
+        }
+        challenges: set[str] = set()
+        for wrapper, name in zip(inert_wrappers, remaining):
+            proof, _proof_sha = validate_wrapper(
+                wrapper, f"{name} remaining-target inert proof"
+            )
+            accepted = proof.get("accepted_boottime_ns")
+            elapsed = proof.get("elapsed_since_acceptance_ns")
+            observed = proof.get("observed_boottime_ns")
+            challenge = require_hash(
+                proof.get("challenge"), f"{name} remaining-target inert challenge"
+            )
+            acceptance = readiness_acceptances[name]
+            target = auth["target_rows"][name]
+            if (
+                set(proof) != proof_fields
+                or proof.get("schema") != INERT_NODE_PROOF_SCHEMA
+                or (
+                    proof.get("capture_id"), proof.get("freeze_plan_sha256"),
+                    proof.get("observation_generation"), proof.get("round_number"),
+                    proof.get("round_authorization_sha256"),
+                    proof.get("round_readiness_sha256"),
+                    proof.get("mutation_dispatch_sha256"), proof.get("node"),
+                    proof.get("boot_id"),
+                ) != (
+                    auth["capture_id"], auth["freeze_plan_sha256"],
+                    auth["live_observation_generation"], auth["round_number"],
+                    digest(authorization), readiness_sha, dispatch_sha, name,
+                    target["boot_id"],
+                )
+                or proof.get("authorization_accepted") is not True
+                or proof.get("writer_live_unfenced") is not True
+                or proof.get("restart_effective_mutation_absent") is not True
+                or proof.get("active_selector_absent") is not True
+                or proof.get("quarantine_nft_absent") is not True
+                or not isinstance(proof.get("apply_state_present"), bool)
+                or not isinstance(proof.get("readiness_present"), bool)
+                or any(
+                    isinstance(number, bool) or not isinstance(number, int) or number <= 0
+                    for number in (accepted, elapsed, observed)
+                )
+                or accepted != acceptance.get("accepted_monotonic_ns")
+                or proof.get("boot_id") != acceptance.get("accepted_boot_id")
+                or observed - accepted != elapsed
+                or elapsed <= MAX_WINDOW_SECONDS * 1_000_000_000
+            ):
+                fail(f"{name} remaining-target inert proof differs")
+            parse_utc(proof.get("observed_at"), f"{name} inert-proof observation")
+            challenges.add(challenge)
+        if len(challenges) != 1:
+            fail("partial quarantine-round inert proofs do not share one challenge")
+    elif inert_wrappers:
+        fail("quarantine-round result has unexpected remaining-target inert proofs")
     completed = parse_utc(value.get("completed_at"), "quarantine-round result completion")
-    if secured_times and completed < max(secured_times):
-        fail("quarantine-round result predates a secured transition")
-    if remaining and completed < auth["deadline"]:
+    if remaining and not transitioned_names and completed < auth["deadline"]:
         fail("partial quarantine-round result closed before its authorization expired")
     return {
         **auth,
@@ -2258,6 +2394,8 @@ def validate_generation_ledger(value: Any) -> dict[str, Any]:
     fields = {
         "schema", "capture_id", "freeze_plan_sha256", "fleet", "rounds",
         "first_secured_at", "all_nodes_secured_at", "legacy_cutoff_height",
+        "live_observation_selection_sha256", "live_observation_generation",
+        "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
     }
     if not isinstance(value, dict) or set(value) != fields or value.get("schema") != LEDGER_SCHEMA:
         fail("quarantine generation-ledger fields/schema differ")
@@ -2274,6 +2412,7 @@ def validate_generation_ledger(value: Any) -> dict[str, Any]:
     verified_times: list[dt.datetime] = []
     heights: list[int] = []
     source_commit: str | None = None
+    observation_identity: tuple[str, str, str, str] | None = None
     for index, row in enumerate(rounds, start=1):
         if not isinstance(row, dict) or set(row) != {"authorization", "result"}:
             fail("quarantine generation-ledger round wrapper differs")
@@ -2296,6 +2435,15 @@ def validate_generation_ledger(value: Any) -> dict[str, Any]:
         ):
             fail("quarantine generation-ledger round identity/source differs")
         source_commit = state["source_main_commit"]
+        current_observation_identity = (
+            state["live_observation_selection_sha256"],
+            state["live_observation_generation"],
+            state["observation_generation_receipt_sha256"],
+            state["drive_prefreeze_receipt_sha256"],
+        )
+        if observation_identity is not None and current_observation_identity != observation_identity:
+            fail("quarantine generation-ledger live-observation identity changed")
+        observation_identity = current_observation_identity
         if not state["transitioned_names"]:
             fail("zero-progress quarantine attempts must remain outside the transition ledger")
         expected_prior = [name for name, _host in FLEET if name in secured]
@@ -2313,6 +2461,18 @@ def validate_generation_ledger(value: Any) -> dict[str, Any]:
         prior_results.append(result)
     if set(secured) != set(FLEET_MAP):
         fail("quarantine generation-ledger does not secure all six nodes")
+    expected_observation_identity = (
+        require_hash(value.get("live_observation_selection_sha256"),
+                     "ledger live-observation selection"),
+        require_hash(value.get("live_observation_generation"),
+                     "ledger live-observation generation"),
+        require_hash(value.get("observation_generation_receipt_sha256"),
+                     "ledger observation-generation receipt"),
+        require_hash(value.get("drive_prefreeze_receipt_sha256"),
+                     "ledger Drive prefreeze receipt"),
+    )
+    if observation_identity != expected_observation_identity:
+        fail("quarantine generation-ledger live-observation root differs")
     first = parse_utc(value.get("first_secured_at"), "ledger first secured transition")
     all_secured = parse_utc(value.get("all_nodes_secured_at"), "ledger all-secured time")
     if first != min(secured_times) or all_secured != max(verified_times):
@@ -2329,4 +2489,8 @@ def validate_generation_ledger(value: Any) -> dict[str, Any]:
         "capture_id": capture, "freeze_plan_sha256": freeze,
         "round_count": len(rounds), "first_secured_at": first,
         "all_nodes_secured_at": all_secured, "legacy_cutoff_height": cutoff,
+        "live_observation_selection_sha256": expected_observation_identity[0],
+        "live_observation_generation": expected_observation_identity[1],
+        "observation_generation_receipt_sha256": expected_observation_identity[2],
+        "drive_prefreeze_receipt_sha256": expected_observation_identity[3],
     }

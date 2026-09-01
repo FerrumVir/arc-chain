@@ -122,6 +122,17 @@ unreachable, timeout, and oversize outcomes are recorded faithfully with UTC
 time, node, endpoint, raw captured byte count, and SHA-256 rather than treated
 as canonical state or reward evidence.
 
+The deterministic capture ID is not the freshness challenge. Immediately
+after that exact Drive execute receipt is durably written, the controller
+creates a cryptographically random 256-bit observation generation and a
+create-only mode-0400 generation receipt. That receipt embeds the canonical
+Drive receipt bytes plus its absolute path and SHA-256; remote observation
+paths are keyed by both capture ID and generation. The six receipts are then
+sealed into one create-only selection whose hash, generation, generation-
+receipt hash, and Drive-receipt hash authorize the first quarantine mutation
+and remain bound through the round ledger, maintenance boundary, offline-stop
+evidence, per-node capture inventory, and final archive manifest.
+
 Each durable request intent is one-way: a crash/resume records an interrupted
 attempt instead of issuing the GET again. A complete receipt is reused exactly;
 if any receipt is missing, a fleet-wide eligibility barrier requires all six
@@ -131,6 +142,32 @@ All six create-only `arc.recovery.legacy-live-observations.v1` trees must be
 fsynced and reverified before any signal. They are labelled `diagnostic`,
 `noncanonical`, and `nonreward`; endpoint failures do not invent data, but
 failure to durably write a receipt aborts before the freeze.
+
+An unbound selection is invocation-local and is never reused after an operator
+crash, even when its UTC timestamp or Drive receipt still appears fresh. The
+next invocation version-archives it and creates a new generation only after all
+six writers are reproved live and unfenced. Within the live invocation, the
+first mutation lease is capped at 300 seconds by paired operator monotonic and
+realtime elapsed clocks; clock regression, suspend divergence, or expiry fails
+closed. Once a create-only mutation dispatch binds the selection, crash resume
+uses each node's durable same-boot `CLOCK_BOOTTIME` acceptance lease rather
+than cross-host UTC. An expired dispatch becomes rotatable only after six exact
+challenged zero-progress proofs show no nft, selector, restart-effective write,
+or node transition. Old generations never satisfy a new status set, and
+generation files are never overwritten.
+
+A positive partial dispatch has the same fail-closed boundary. Before its
+create-only result can be sealed, every remaining target must return one exact,
+shared-challenge proof under the old attempt lock after its durable same-boot
+`CLOCK_BOOTTIME` acceptance lease has strictly expired. Each proof establishes
+that the exact writer is still live and unfenced and that no selector, nft,
+restart-effective mutation, or non-inert apply state exists. The result embeds
+the canonical mutation dispatch, the successful transition receipts, and the
+ordered remaining-target proofs. An in-flight old apply therefore either wins
+the lock and invalidates the proof or runs after lease expiry and is rejected.
+After that result is durable, recovery validates and publishes its exact bytes
+before issuing any status request for the old attempt; a later natural stop is
+owned by the next round and cannot poison the immutable prefix.
 
 Those diagnostic observations are not the recovery source. Before each live
 target's first restart-effective dependency or nft mutation, the quarantine
@@ -200,8 +237,10 @@ a global legacy-network halt.
 After the fence is stable, `capture-offline` records source path/device/inode,
 a complete regular-file content index, final WAL identity, external snapshot
 identity, stop evidence, and the exact live-observation tree/receipt hashes.
-Each bundle retains that immutable observation tree. The final Drive archive
-adds canonical `legacy-live-observations.json`, whose ordered six roots are
+Each bundle retains that immutable, generation-keyed observation tree and its
+generation/selection/Drive provenance. The final Drive archive adds canonical
+`legacy-live-observations.json`, whose ordered six roots and those four
+freshness roots are
 covered by the archive manifest and `SHA256SUMS` and rechecked during restore
 verification. The original legacy data directory stays in place;
 it is content-sealed by repeated hashing, not mounted read-only and not copied
@@ -675,25 +714,30 @@ substitute a hand-copied top-level file for any of those paths.
    a fresh public `/info`, `/block/latest`, `/info` bracket and fresh
    authenticated loopback cross-proof only for those live targets, while each
    already-fenced node supplies a fresh capture-bound status inside the same
-   observation bracket. The authorization deadline is exactly 300 seconds
-   after that round's public sample completes. Immediately before each target's
-   nft apply, the remote helper proves that exact authorization hash, node,
-   writer identity, and deadline and writes a create-only applied receipt.
+   observation bracket. The authorization carries a 300-second UTC deadline as
+   audit evidence, but UTC is not a cross-host safety clock. Immediately before
+   each target's nft apply, the remote helper proves the exact authorization
+   hash, node, writer identity, frozen boot ID, and its own durable
+   `CLOCK_BOOTTIME` acceptance lease, then writes a create-only applied receipt.
    Before the first restart-effective dependency, that authorization also binds
    the exact `preauthorization-boundary` capture described in section 1; this
    explicitly covers production sources with no snapshot in the data directory
    or its sibling. After quarantine stability and before stop, every still-live
    node must complete the distinct `post-quarantine-final-export` capture.
-   A crash may therefore leave a valid mixed state: the immutable round result
-   records whichever target subset crossed nft, and the next round freshly
-   samples only the remaining live nodes. A zero-progress attempt is never
-   appended to the transition ledger and may be resampled. A positive round is
-   never rewritten or reused as authorization for a later target. Each node may
-   cross live-to-fenced exactly once, so at most six positive rounds exist. The
-   final generation ledger must cover all six nodes and sets the legacy cutoff
-   to the maximum public height observed across all authorized rounds. There is
-   no global all-six latch and no assumption that one local commit implies one
-   remote mutation.
+   A crash may therefore leave a valid mixed state. The immutable round result
+   records whichever target subset crossed nft only after every remaining node
+   supplies the exact old-attempt, post-lease inert proof described above; the
+   result also carries the canonical dispatch needed to verify those proof
+   roots independently. The next round freshly samples only those remaining
+   live nodes. Crash recovery reuses a durable positive result byte-for-byte and
+   completes its prefix publication before any old-attempt status probe. A
+   zero-progress attempt is never appended to the transition ledger and may be
+   resampled. A positive round is never rewritten or reused as authorization
+   for a later target. Each node may cross live-to-fenced exactly once, so at
+   most six positive rounds exist. The final generation ledger must cover all
+   six nodes and sets the legacy cutoff to the maximum public height observed
+   across all authorized rounds. There is no global all-six latch and no
+   assumption that one local commit implies one remote mutation.
    The selected supervisor dependency is the first restart-effective persistent
    write. A natural same-boot exit before it remains resample/restart eligible.
    After it, a stopped terminal requires authorization expiry and two stable

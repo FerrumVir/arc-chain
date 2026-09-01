@@ -474,15 +474,59 @@ def _stage_copy(
                 offset += written
             copied += len(chunk)
         after = os.fstat(source_fd)
-        identity = lambda details: (
-            details.st_dev,
-            details.st_ino,
-            details.st_size,
-            details.st_mtime_ns,
-            details.st_ctime_ns,
+        # APFS may publish a delayed ctime after create/chmod or an xattr-only
+        # metadata update.  Compare every security-relevant field directly;
+        # if ctime alone advanced, re-read the held source FD and require its
+        # full digest to equal the bytes just copied.  This accepts harmless
+        # metadata publication without losing the content-mutation guard.
+        identity_fields = (
+            ("device", "st_dev"),
+            ("inode", "st_ino"),
+            ("mode", "st_mode"),
+            ("owner", "st_uid"),
+            ("group", "st_gid"),
+            ("link-count", "st_nlink"),
+            ("size", "st_size"),
+            ("mtime_ns", "st_mtime_ns"),
         )
-        if copied != before.st_size or identity(before) != identity(after):
-            fail(f"{label} changed while its private stage copy was created")
+        before_identity = tuple(getattr(before, field) for _name, field in identity_fields)
+        after_identity = tuple(getattr(after, field) for _name, field in identity_fields)
+        if copied != before.st_size or before_identity != after_identity:
+            changed_fields = ",".join(
+                name
+                for (name, _field), old, new in zip(
+                    identity_fields, before_identity, after_identity, strict=True
+                )
+                if old != new
+            ) or "copied-size"
+            fail(
+                f"{label} changed while its private stage copy was created "
+                f"(changed identity: {changed_fields})"
+            )
+        copied_digest = digest.hexdigest()
+        if before.st_ctime_ns != after.st_ctime_ns:
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            verification_digest = hashlib.sha256()
+            verification_size = 0
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                verification_digest.update(chunk)
+                verification_size += len(chunk)
+            verified = os.fstat(source_fd)
+            verified_identity = tuple(
+                getattr(verified, field) for _name, field in identity_fields
+            )
+            if (
+                verification_size != copied
+                or verified_identity != before_identity
+                or verification_digest.hexdigest() != copied_digest
+            ):
+                fail(
+                    f"{label} content changed during its ctime-only private "
+                    "stage recheck"
+                )
         os.fchmod(destination_fd, mode)
         os.fsync(destination_fd)
         staged = os.fstat(destination_fd)
@@ -495,7 +539,7 @@ def _stage_copy(
         ):
             fail(f"{label} private stage copy failed its file identity contract")
         return {
-            "sha256": digest.hexdigest(),
+            "sha256": copied_digest,
             "size_bytes": copied,
             "mode": f"{mode:04o}",
         }
@@ -1653,6 +1697,7 @@ def validate_legacy_maintenance_evidence_bundle(
             "all_controlled_stopped_at",
             "challenge",
             "authenticated_prefence_height_cross_proof",
+            "live_observation_selection",
             "quarantine_generation_ledger",
             "network_quarantine_challenge",
             "quarantine_stability_proof",
@@ -1706,6 +1751,80 @@ def validate_legacy_maintenance_evidence_bundle(
         "authenticated-prefence-height-cross-proof",
         "maintenance authenticated pre-fence proof",
     )
+    observation_selection, observation_selection_sha = sealed(
+        bundle.get("live_observation_selection"),
+        "fleet",
+        "live-observation-selection",
+        "maintenance live-observation selection",
+    )
+    try:
+        observation_selection = rollout.validate_live_observation_selection(
+            observation_selection,
+            source_main_commit=args.source_main_sha,
+            freeze_plan_sha256=freeze_sha,
+            capture_id=capture_id,
+        )
+    except rollout.RolloutError as error:
+        fail(str(error))
+    observation_selection = require_exact_object(
+        observation_selection,
+        {
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "observation_generation", "observation_generation_receipt",
+            "observation_generation_receipt_path",
+            "observation_generation_receipt_sha256", "drive_prefreeze_receipt_path",
+            "drive_prefreeze_receipt_sha256", "generation_created_at", "selected_at",
+            "max_selection_age_seconds", "labels", "nodes",
+        },
+        "maintenance live-observation selection value",
+    )
+    generation_receipt = require_exact_object(
+        observation_selection.get("observation_generation_receipt"),
+        {
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "observation_generation", "created_at", "max_selection_age_seconds",
+            "drive_prefreeze_receipt",
+        },
+        "maintenance observation-generation receipt",
+    )
+    drive_receipt = require_exact_object(
+        generation_receipt.get("drive_prefreeze_receipt"),
+        {"path", "sha256", "value"},
+        "maintenance observation-generation Drive receipt",
+    )
+    drive_value = drive_receipt.get("value")
+    if not isinstance(drive_value, dict):
+        fail("maintenance observation-generation Drive receipt value differs")
+    if (
+        observation_selection.get("schema")
+            != "arc.recovery.legacy-live-observation-selection.v1"
+        or generation_receipt.get("schema")
+            != "arc.recovery.legacy-live-observation-generation.v1"
+        or any(observation_selection.get(field) != expected
+               for field, expected in expected_identity.items() if field != "schema")
+        or any(generation_receipt.get(field) != expected
+               for field, expected in expected_identity.items() if field != "schema")
+        or observation_selection.get("observation_generation")
+            != generation_receipt.get("observation_generation")
+        or observation_selection.get("observation_generation_receipt_sha256")
+            != sha256_bytes(canonical_bytes(generation_receipt))
+        or observation_selection.get("drive_prefreeze_receipt_path")
+            != drive_receipt.get("path")
+        or observation_selection.get("drive_prefreeze_receipt_sha256")
+            != require_hash(drive_receipt.get("sha256"), "maintenance Drive receipt root")
+        or drive_receipt.get("sha256") != sha256_bytes(canonical_bytes(drive_value))
+        or observation_selection.get("generation_created_at")
+            != generation_receipt.get("created_at")
+        or observation_selection.get("max_selection_age_seconds") != 300
+        or generation_receipt.get("max_selection_age_seconds") != 300
+        or observation_selection.get("labels")
+            != ["diagnostic", "noncanonical", "nonreward"]
+    ):
+        fail("maintenance live-observation selection provenance differs")
+    require_hash(
+        observation_selection.get("observation_generation"),
+        "maintenance live-observation generation",
+    )
     authenticated = require_exact_object(
         authenticated,
         {
@@ -1753,6 +1872,16 @@ def validate_legacy_maintenance_evidence_bundle(
     if (ledger_state["capture_id"] != capture_id
             or ledger_state["freeze_plan_sha256"] != freeze_sha):
         fail("maintenance quarantine generation ledger identity differs")
+    if (
+        ledger_state["live_observation_selection_sha256"] != observation_selection_sha
+        or ledger_state["live_observation_generation"]
+            != observation_selection["observation_generation"]
+        or ledger_state["observation_generation_receipt_sha256"]
+            != observation_selection["observation_generation_receipt_sha256"]
+        or ledger_state["drive_prefreeze_receipt_sha256"]
+            != observation_selection["drive_prefreeze_receipt_sha256"]
+    ):
+        fail("maintenance quarantine generation live-observation provenance differs")
     ledger_transitions_by_node: dict[str, dict[str, Any]] = {}
     ledger_transition_wrappers_by_node: dict[str, dict[str, Any]] = {}
     for round_wrapper in generation_ledger["rounds"]:
@@ -3092,6 +3221,10 @@ def validate_legacy_maintenance_evidence_bundle(
         "value": authenticated,
         "sha256": authenticated_sha,
     }
+    normalized["live_observation_selection"] = {
+        "value": observation_selection,
+        "sha256": observation_selection_sha,
+    }
     normalized["quarantine_generation_ledger"] = {
         "value": generation_ledger,
         "sha256": generation_ledger_sha,
@@ -3149,6 +3282,10 @@ def validate_legacy_maintenance_boundary(
             "official_origin_scope",
             "legacy_public_height_receipt",
             "authenticated_prefence_height_cross_proof_sha256",
+            "legacy_live_observation_selection_sha256",
+            "legacy_live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
             "quarantine_generation_ledger_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
             "network_quarantine_stability_proof_sha256",
@@ -3230,6 +3367,20 @@ def validate_legacy_maintenance_boundary(
     if (
         boundary.get("authenticated_prefence_height_cross_proof_sha256")
         != evidence_bundle["authenticated_prefence_height_cross_proof"]["sha256"]
+        or boundary.get("legacy_live_observation_selection_sha256")
+        != evidence_bundle["live_observation_selection"]["sha256"]
+        or boundary.get("legacy_live_observation_generation")
+        != evidence_bundle["live_observation_selection"]["value"][
+            "observation_generation"
+        ]
+        or boundary.get("observation_generation_receipt_sha256")
+        != evidence_bundle["live_observation_selection"]["value"][
+            "observation_generation_receipt_sha256"
+        ]
+        or boundary.get("drive_prefreeze_receipt_sha256")
+        != evidence_bundle["live_observation_selection"]["value"][
+            "drive_prefreeze_receipt_sha256"
+        ]
         or boundary.get("quarantine_generation_ledger_sha256")
         != evidence_bundle["quarantine_generation_ledger"]["sha256"]
         or boundary.get("network_quarantine_stability_proof_sha256")
@@ -3720,6 +3871,10 @@ def validate_offline_stop_evidence(
             "legacy_maintenance_boundary_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
             "quarantine_generation_ledger_sha256",
+            "legacy_live_observation_selection_sha256",
+            "legacy_live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
             "nodes",
         },
         "offline-stop fleet evidence",
@@ -3763,6 +3918,19 @@ def validate_offline_stop_evidence(
             or receipt.get("quarantine_generation_ledger_sha256")
             != boundary["quarantine_generation_ledger_sha256"]):
         fail("offline-stop evidence does not bind the quarantine generation ledger")
+    if (
+        receipt.get("legacy_live_observation_selection_sha256")
+            != evidence_bundle["live_observation_selection"]["sha256"]
+        or receipt.get("legacy_live_observation_selection_sha256")
+            != boundary["legacy_live_observation_selection_sha256"]
+        or receipt.get("legacy_live_observation_generation")
+            != boundary["legacy_live_observation_generation"]
+        or receipt.get("observation_generation_receipt_sha256")
+            != boundary["observation_generation_receipt_sha256"]
+        or receipt.get("drive_prefreeze_receipt_sha256")
+            != boundary["drive_prefreeze_receipt_sha256"]
+    ):
+        fail("offline-stop evidence live-observation provenance differs")
 
     cross = require_exact_object(
         receipt.get("legacy_height_cross_proof"),
@@ -4465,7 +4633,7 @@ def validate_sealed_legacy_height_capture_timeline(
                 != ledger_wrapper.get("sha256")):
         fail("sealed quarantine generation ledger roots differ")
 
-    public_completed = _parse_utc_seconds(
+    _parse_utc_seconds(
         height_receipt.get("completed_at"), "sealed legacy public-height completed_at"
     )
     fleet_started = _parse_utc_seconds(
@@ -4481,28 +4649,21 @@ def validate_sealed_legacy_height_capture_timeline(
         first_round_public.get("started_at"),
         "sealed first quarantine-round public started_at",
     )
-    original_projection = {
-        **copy.deepcopy(height_receipt),
-        "schema": quarantine_rounds.TARGET_HEIGHT_SCHEMA,
-        "targets": [
-            {
-                "node": name,
-                "host": host,
-                "rpc_origin": next(
-                    row["origin"] for row in height_receipt["origins"]
-                    if row["name"] == name
-                ),
-            }
-            for name, host in quarantine_rounds.FLEET
-        ],
-    }
-    # Existing evidence may atomically authorize all six deadline-gated
-    # helpers from the original full-fleet sample.  Mixed-state recovery must
-    # instead take a new target-only sample after the diagnostic fleet bracket.
-    round_sample_after_fleet = (
-        first_round_public == original_projection
-        or fleet_completed <= first_round_public_started
+    first_round_public_completed = _parse_utc_seconds(
+        first_round_public.get("completed_at"),
+        "sealed first quarantine-round public completed_at",
     )
+    if first_round_public_started > first_round_public_completed:
+        fail("sealed first quarantine-round public receipt timeline regressed")
+    selection = evidence_bundle["live_observation_selection"]["value"]
+    try:
+        selected_at = dt.datetime.strptime(
+            selection["selected_at"], "%Y-%m-%dT%H:%M:%S.%fZ"
+        ).replace(tzinfo=dt.timezone.utc)
+    except (KeyError,TypeError,ValueError) as error:
+        raise BuilderError("sealed live-observation selection timestamp differs") from error
+    if selected_at > first_round_public_started:
+        fail("sealed first quarantine-round sample predates its operator selection")
     first_quarantine = _parse_utc_seconds(
         boundary.get("first_quarantine_started_at"),
         "sealed first-quarantine boundary",
@@ -4516,22 +4677,11 @@ def validate_sealed_legacy_height_capture_timeline(
     boundary_created = _parse_utc_seconds(
         boundary.get("created_at"), "sealed maintenance-boundary created_at"
     )
-    if not (
-        public_completed
-        <= fleet_started
-        <= fleet_completed
-        and round_sample_after_fleet
-        and first_round_public_started
-        <= first_quarantine
-        <= ledger_state["all_nodes_secured_at"]
-        <= all_stopped
-        <= boundary_created
-    ):
-        fail(
-            "sealed legacy public-height capture timeline is not ordered "
-            "receipt<=fleet-start<=fleet-complete<=round-sample<=quarantine"
-            "<=stopped<=boundary"
-        )
+    if fleet_started > fleet_completed:
+        fail("sealed authenticated-height fleet receipt timeline regressed")
+    # Remote transition/stop UTC values and operator UTC are audit-only.  The
+    # exact selection -> authorization -> readiness -> dispatch -> transition
+    # -> ledger roots (plus each node's BOOTTIME lease) establish causality.
     if boundary.get("observed_cutoff_height") < ledger_state["legacy_cutoff_height"]:
         fail("sealed maintenance cutoff precedes a quarantine generation")
 

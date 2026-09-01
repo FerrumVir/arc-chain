@@ -25,6 +25,22 @@ import hashlib, recovery_rollout as rr
 freeze="ab"*32
 assert rr.capture_id_for_freeze_plan_hash(freeze)==hashlib.sha256(b"ARC recovery capture v2\0"+bytes.fromhex(freeze)).hexdigest()
 PY
+    python3 - "$NODE_HELPER" <<'PY' || return 1
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+body=text[text.index("def validate_authorization(raw):"):text.index("def validate_acceptance(")]
+for field in (
+    "live_observation_selection_sha256", "live_observation_generation",
+    "observation_generation_receipt_sha256", "drive_prefreeze_receipt_sha256",
+    "live_observation_selected_at",
+):
+    assert field in body, field
+assert 'HASH_RE.fullmatch(str(value.get(field))) is None' in body
+assert 'deadline > public_completed + datetime.timedelta(seconds=300)' not in body
+assert 'deadline > observation_selected_at + datetime.timedelta(seconds=300)' in body
+assert 'authorized < observation_selected_at' in body
+assert 'CLOCK_BOOTTIME' in text and 'accepted_monotonic_ns' in text
+PY
 }
 
 capture_id_and_destination_fail_closed() {
@@ -263,6 +279,10 @@ boundary = {
     "legacy_public_height_receipt":{},"authenticated_prefence_height_cross_proof_sha256":"9"*64,
     "quarantine_generation_ledger_sha256":"c"*64,
     "legacy_maintenance_evidence_bundle_sha256":"0"*64,
+    "legacy_live_observation_selection_sha256":"0"*64,
+    "legacy_live_observation_generation":"d"*64,
+    "observation_generation_receipt_sha256":"e"*64,
+    "drive_prefreeze_receipt_sha256":"f"*64,
     "network_quarantine_challenge":"a"*64,
     "network_quarantine_stability_proof_sha256":"b"*64,"tools":{},
     "nodes":[{"node":name,"host":host} for name,host in fleet],"evidence_heights":[],
@@ -270,11 +290,18 @@ boundary = {
     "continuity_safety_margin_policy":{},"legacy_public_max_height":233,
     "global_absence_claimed":False,"reopening_policy":{},"late_fork_circuit":{},"threat_model":{},
 }
+selection={"schema":"arc.recovery.legacy-live-observation-selection.v1",
+           "observation_generation":"d"*64,
+           "observation_generation_receipt_sha256":"e"*64,
+           "drive_prefreeze_receipt_sha256":"f"*64}
+selection_sha=hashlib.sha256(canonical(selection)).hexdigest()
+boundary["legacy_live_observation_selection_sha256"]=selection_sha
 bundle={"schema":"arc.recovery.legacy-maintenance-evidence-bundle.v1",
         "source_main_commit":"7"*40,"freeze_plan_sha256":freeze_sha,"capture_id":capture,
         "first_quarantine_started_at":"2026-08-28T12:00:00Z",
         "all_controlled_stopped_at":"2026-08-28T12:00:01Z","challenge":"a"*64,
         "authenticated_prefence_height_cross_proof":{},
+        "live_observation_selection":{"value":selection,"sha256":selection_sha},
         "quarantine_generation_ledger":{"value":{},"sha256":"c"*64},
         "network_quarantine_challenge":{},
         "quarantine_stability_proof":{"value":{},"sha256":"b"*64},
@@ -500,11 +527,13 @@ PY
 content_capture_fixture_detects_source_tamper() (
     # shellcheck source=/dev/null
     . "$NODE_HELPER" >/dev/null
-    local f c d id n freeze live; f="$(mktemp -d)"; trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
+    local f c d id n freeze live generation generation_sha drive_sha; f="$(mktemp -d)"; trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
     c="$f/capture"; d="$f/legacy-data"; id="$(printf 'a%.0s' {1..64})"; freeze="$(printf 'b%.0s' {1..64})"; n=nyc
-    LIVE_OBSERVATION_BASE="$f/live"; live="$LIVE_OBSERVATION_BASE/$id/$n"
+    generation="$(printf 'c%.0s' {1..64})"; generation_sha="$(printf 'd%.0s' {1..64})"; drive_sha="$(printf 'e%.0s' {1..64})"
+    LIVE_OBSERVATION_BASE="$f/live"; live="$LIVE_OBSERVATION_BASE/$id/$generation/$n"
     mkdir -p "$c" "$d" "${live%/*}"; printf sealed-wal > "$d/state.wal"; printf state > "$d/state.bin"
-    capture_live_observation_receipt_at "$f/.live.partial" "$live" "$id" "$n" "$freeze" http://127.0.0.1:1 || return 1
+    capture_live_observation_receipt_at "$f/.live.partial" "$live" "$id" "$generation" \
+        "$generation_sha" "$drive_sha" "$n" "$freeze" http://127.0.0.1:1 || return 1
     write_regular_tree_inventory "$d" "$c/source-data.files.sha256" || return 1
     python3 - "$d" "$c/capture-source.json" <<'PY' || return 1
 import hashlib,json,pathlib,sys
@@ -512,8 +541,9 @@ r,o=map(pathlib.Path,sys.argv[1:]); w=r/"state.wal"; files=[p for p in r.rglob("
 v={"schema":"arc.recovery.capture-source.v1","data_dir":str(r),"data_device":r.stat().st_dev,"data_inode":r.stat().st_ino,"data_bytes":sum(p.stat().st_size for p in files),"data_files":len(files),"state_wal_bytes":w.stat().st_size,"state_wal_sha256":hashlib.sha256(w.read_bytes()).hexdigest(),"external_snapshots":[]}
 o.write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n")
 PY
-    printf 'capture_id=%s\nnode=%s\nfreeze_plan_sha256=%s\nlegacy_live_observations_schema=arc.recovery.legacy-live-observations.v1\nlegacy_live_observations_root_sha256=%s\nlegacy_live_observations_receipt_sha256=%s\nlegacy_live_observations_labels=diagnostic,noncanonical,nonreward\n' \
-        "$id" "$n" "$freeze" "$(hash_file "$live/live-observations.files.sha256")" \
+    printf 'capture_id=%s\nnode=%s\nfreeze_plan_sha256=%s\nlegacy_live_observations_schema=arc.recovery.legacy-live-observations.v1\nlegacy_live_observations_generation=%s\nlegacy_live_observations_generation_receipt_sha256=%s\nlegacy_live_observations_drive_prefreeze_receipt_sha256=%s\nlegacy_live_observations_root_sha256=%s\nlegacy_live_observations_receipt_sha256=%s\nlegacy_live_observations_labels=diagnostic,noncanonical,nonreward\n' \
+        "$id" "$n" "$freeze" "$generation" "$generation_sha" "$drive_sha" \
+        "$(hash_file "$live/live-observations.files.sha256")" \
         "$(hash_file "$live/receipt.json")" > "$c/capture.inventory"
     write_tree_index "$c" capture.files.sha256 capture.complete || return 1
     write_complete_marker "$c" capture.files.sha256 capture.complete arc.recovery.capture.v4 "capture_id=$id" "node=$n" || return 1
@@ -537,7 +567,7 @@ partial_retry_ownership_rejects_symlink_and_foreign_marker() (
 live_observations_are_bounded_create_only_and_resumable() (
     # shellcheck source=/dev/null
     . "$NODE_HELPER" >/dev/null
-    local f port server id freeze first_count
+    local f port server id freeze generation generation_sha drive_sha first first_count first_sha
     f="$(mktemp -d)"; server=""
     trap '[ -z "$server" ] || { kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true; }; chmod -R u+w "$f" 2>/dev/null || true; find "$f" -depth -delete' EXIT
     cat > "$f/server.py" <<'PY'
@@ -571,11 +601,23 @@ PY
     for _ in $(seq 1 100); do [ -s "$f/port" ] && break; sleep 0.02; done
     [ -s "$f/port" ] || return 1
     port="$(cat "$f/port")"; id="$(printf 'a%.0s' {1..64})"; freeze="$(printf 'b%.0s' {1..64})"
+    generation="$(printf 'c%.0s' {1..64})"; generation_sha="$(printf 'd%.0s' {1..64})"; drive_sha="$(printf 'e%.0s' {1..64})"
+    LIVE_OBSERVATION_BASE="$f/live"; first="$LIVE_OBSERVATION_BASE/$id/$generation/nyc"
+    mkdir -p -- "${first%/*}"
 
-    capture_live_observation_receipt_at "$f/.first.partial" "$f/first" "$id" nyc "$freeze" \
+    capture_live_observation_receipt_at "$f/.first.partial" "$first" "$id" "$generation" \
+        "$generation_sha" "$drive_sha" nyc "$freeze" \
         "http://127.0.0.1:$port" || return 1
-    verify_live_observation_receipt "$f/first" "$id" nyc "$freeze" || return 1
-    python3 - "$f/first/receipt.json" "$f/requests.log" <<'PY' || return 1
+    verify_live_observation_receipt "$first" "$id" "$generation" "$generation_sha" \
+        "$drive_sha" nyc "$freeze" || return 1
+    first_sha="$(hash_file "$first/receipt.json")"
+    verify_live_observation_receipt "$first" "$id" "$generation" "$generation_sha" \
+        "$drive_sha" nyc "$freeze" || return 1
+    [ "$(hash_file "$first/receipt.json")" = "$first_sha" ] || return 1
+    live_observations_status "$id" "$generation" "$generation_sha" "$drive_sha" nyc "$freeze" >/dev/null || return 1
+    ( live_observations_status "$id" "$(printf 'f%.0s' {1..64})" "$generation_sha" \
+        "$drive_sha" nyc "$freeze" ) >/dev/null 2>&1 && return 1
+    python3 - "$first/receipt.json" "$f/requests.log" <<'PY' || return 1
 import json, pathlib, sys
 receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
 paths = pathlib.Path(sys.argv[2]).read_text().splitlines()
@@ -591,33 +633,44 @@ assert rows[2]["http_status"] == 404 and rows[2]["raw_complete"] is True
 PY
 
     : > "$f/requests.log"
-    python3 - "$f/.resume.partial" "$id" "$freeze" <<'PY' || return 1
+    python3 - "$f/.resume.partial" "$id" "$generation" "$generation_sha" "$drive_sha" "$freeze" <<'PY' || return 1
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1]); root.mkdir(); (root/"journal").mkdir(); (root/"observations").mkdir(); (root/"raw").mkdir()
 (root/".arc-recovery-partial-owner").write_text(
-    f"schema=arc.recovery.live-observation-partial.v1 capture={sys.argv[2]} node=lax freeze={sys.argv[3]}\n"
+    f"schema=arc.recovery.live-observation-partial.v1 capture={sys.argv[2]} generation={sys.argv[3]} generation_receipt={sys.argv[4]} drive_receipt={sys.argv[5]} node=lax freeze={sys.argv[6]}\n"
 )
-attempt = {"schema":"arc.recovery.legacy-live-observation-attempt.v1","endpoint":"/inference/results","started_at":"2026-08-28T00:00:00.000000Z","node":"lax"}
-(root/"journal/00-inference-results.attempt.json").write_text(json.dumps(attempt,sort_keys=True,separators=(",",":"))+"\n")
-for path in (root/".arc-recovery-partial-owner", root/"journal/00-inference-results.attempt.json"):
+attempt = {"schema":"arc.recovery.legacy-live-observation-attempt.v1","endpoint":"/inference/results","started_at":"2026-08-28T00:00:00.000000Z","node":"lax","observation_generation":sys.argv[3]}
+(root/"journal/00-inference-results.attempt.json.partial").write_text(json.dumps(attempt,sort_keys=True,separators=(",",":"))+"\n")
+(root/"observations/00-inference-results.json.partial").write_text('{"truncated"')
+(root/"raw/00-inference-results.body.partial").write_bytes(b"durable-prefix")
+(root/"receipt.json.partial").write_text('{"truncated"')
+for path in (root/".arc-recovery-partial-owner", root/"journal/00-inference-results.attempt.json.partial"):
     path.chmod(0o400)
+for path in (root/"observations/00-inference-results.json.partial",
+             root/"raw/00-inference-results.body.partial",root/"receipt.json.partial"):
+    path.chmod(0o600)
 PY
-    capture_live_observation_receipt_at "$f/.resume.partial" "$f/resumed" "$id" lax "$freeze" \
+    capture_live_observation_receipt_at "$f/.resume.partial" "$f/resumed" "$id" "$generation" \
+        "$generation_sha" "$drive_sha" lax "$freeze" \
         "http://127.0.0.1:$port" || return 1
-    verify_live_observation_receipt "$f/resumed" "$id" lax "$freeze" || return 1
+    verify_live_observation_receipt "$f/resumed" "$id" "$generation" "$generation_sha" \
+        "$drive_sha" lax "$freeze" || return 1
     python3 - "$f/resumed/receipt.json" "$f/requests.log" <<'PY' || return 1
 import json, pathlib, sys
 receipt=json.loads(pathlib.Path(sys.argv[1]).read_text()); paths=pathlib.Path(sys.argv[2]).read_text().splitlines()
 assert receipt["observations"][0]["error"] == "interrupted_after_durable_attempt_intent"
+assert receipt["observations"][0]["raw_bytes"] == len(b"durable-prefix")
 assert "/inference/results" not in paths
 assert paths == ["/workers/scoreboard", "/inference/attestations"]
 PY
 
     ln -s "$f" "$f/.symlink.partial"
-    ( capture_live_observation_receipt_at "$f/.symlink.partial" "$f/never" "$id" ams "$freeze" \
+    ( capture_live_observation_receipt_at "$f/.symlink.partial" "$f/never" "$id" "$generation" \
+        "$generation_sha" "$drive_sha" ams "$freeze" \
         "http://127.0.0.1:$port" ) >/dev/null 2>&1 && return 1
-    chmod u+w "$f/first/receipt.json"; printf mutation >> "$f/first/receipt.json"
-    ( verify_live_observation_receipt "$f/first" "$id" nyc "$freeze" ) >/dev/null 2>&1 && return 1
+    chmod u+w "$first/receipt.json"; printf mutation >> "$first/receipt.json"
+    ( verify_live_observation_receipt "$first" "$id" "$generation" "$generation_sha" \
+        "$drive_sha" nyc "$freeze" ) >/dev/null 2>&1 && return 1
     python3 - "$NODE_HELPER" "$ORCHESTRATOR" <<'PY' || return 1
 import pathlib, sys
 node, fleet = (pathlib.Path(path).read_text() for path in sys.argv[1:])
@@ -796,9 +849,9 @@ capture = orchestrator[
     orchestrator.index("capture_phase()") : orchestrator.index("manifest_field()")
 ]
 assert capture.index("run_drive_prefreeze_gate execute") < capture.index(
-    'capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"'
+    'capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id"'
 )
-assert capture.index('capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"') < capture.index(
+assert capture.index('capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id"') < capture.index(
     'run_quarantine_generation_rounds'
 )
 assert capture.index('run_quarantine_generation_rounds') < capture.index(
@@ -933,17 +986,866 @@ fleet_live_observation_retry_rejects_any_stopped_writer() (
     }
     # shellcheck disable=SC2317,SC2329
     run_live_observations_eligibility_exact() {
-        [ "$4" != nyc ]
+        [ "$5" != nyc ]
+    }
+    # shellcheck disable=SC2317,SC2329
+    verify_live_observation_generation_receipt_exact() {
+        :
     }
     # shellcheck disable=SC2317,SC2329
     run_live_observations_exact() {
         : > "$f/network-recapture-attempted"
     }
     if ( capture_all_live_observations /sealed/freeze "$(printf 'a%.0s' {1..64})" \
-            "$(printf 'b%.0s' {1..64})" "$f" ) >/dev/null 2>&1; then
+            "$(printf 'b%.0s' {1..64})" "$(printf 'c%.0s' {1..64})" \
+            /sealed/generation.json "$(printf 'd%.0s' {1..64})" \
+            "$(printf 'e%.0s' {1..64})" "$f" "$f/statuses" ) >/dev/null 2>&1; then
         return 1
     fi
     [ ! -e "$f/network-recapture-attempted" ]
+)
+
+live_observation_selection_resume_is_byte_identical() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f generation freeze capture generation_file statuses selection first second
+    f="$(mktemp -d)"; trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
+    generation="$(printf 'c%.0s' {1..64})"; freeze="$(printf 'a%.0s' {1..64})"
+    capture="$(printf 'b%.0s' {1..64})"; generation_file="$f/$generation.json"
+    statuses="$f/statuses.jsonl"; selection="$f/selection.json"
+    python3 - "$generation_file" "$statuses" "$generation" "$freeze" "$capture" <<'PY' || return 1
+import datetime,hashlib,json,pathlib,sys
+generation_path,statuses_path=map(pathlib.Path,sys.argv[1:3]);generation,freeze,capture=sys.argv[3:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+now=datetime.datetime.now(datetime.timezone.utc)
+stamp=lambda value:value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+drive={"schema":"arc.recovery.drive-prefreeze.v1","mode":"execute",
+ "freeze_plan_sha256":freeze,"capture_id":capture,"remote_root_sha256":"1"*64,
+ "client_id_sha256":"2"*64,"account_sha256":"3"*64,"permission_id_sha256":"4"*64,
+ "rclone_version":"v1.75.0","source_bytes":1,"archive_reservation_bytes":2,
+ "largest_object_reservation_bytes":1,"daily_upload_budget_bytes":2,
+ "daily_upload_budget_basis":"operator-reviewed-remaining-dedicated-account",
+ "available_bytes_before":8*1024*1024+2,"available_bytes_after":8*1024*1024+2,
+ "canary_bytes":8*1024*1024,"canary_verified":True,"canary_deleted":True}
+drive_sha=hashlib.sha256(canonical(drive)).hexdigest()
+receipt={"schema":"arc.recovery.legacy-live-observation-generation.v1","source_main_commit":"9"*40,
+    "freeze_plan_sha256":freeze,"capture_id":capture,"observation_generation":generation,
+    "created_at":stamp(now-datetime.timedelta(seconds=2)),"max_selection_age_seconds":300,
+    "drive_prefreeze_receipt":{"path":"/private/drive-prefreeze.json","sha256":drive_sha,"value":drive}}
+generation_path.write_bytes(canonical(receipt));generation_path.chmod(0o400)
+generation_sha=hashlib.sha256(canonical(receipt)).hexdigest()
+rows=[]
+for index,node in enumerate(("nyc","lax","ams","lhr","nrt","sgp")):
+    rows.append({"schema":"arc.recovery.legacy-live-observations-status.v1","capture_id":capture,
+        "observation_generation":generation,"observation_generation_receipt_sha256":generation_sha,
+        "drive_prefreeze_receipt_sha256":drive_sha,"node":node,"freeze_plan_sha256":freeze,
+        "created_at":stamp(now-datetime.timedelta(seconds=1)),"completed_at":stamp(now),
+        "root_sha256":f"{index+1:064x}","receipt_sha256":f"{index+11:064x}",
+        "labels":["diagnostic","noncanonical","nonreward"]})
+statuses_path.write_bytes(b"".join(canonical(row) for row in rows));statuses_path.chmod(0o600)
+PY
+    first="$(seal_live_observation_selection "$selection" "$generation_file" "$statuses" \
+        "$freeze" "$capture")" || return 1
+    ln "$selection" "$selection.partial" || return 1
+    read -r resume_state resume_generation < <(
+        live_observation_selection_resume_state "$selection" "$f/no-rounds" \
+            "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["drive_prefreeze_receipt"]["sha256"])' "$generation_file")" \
+            "$freeze" "$capture"
+    ) || return 1
+    [ "$resume_state" = rotate ] && [ "$resume_generation" = "$generation" ] || return 1
+    [ ! -e "$selection.partial" ] && \
+        [ "$(stat -c %h "$selection" 2>/dev/null || stat -f %l "$selection")" -eq 1 ] || return 1
+
+    # Crash before the create-only link leaves only a complete sealed partial.
+    mv "$selection" "$selection.partial" || return 1
+    read -r resume_state resume_generation < <(
+        live_observation_selection_resume_state "$selection" "$f/no-rounds" \
+            "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["drive_prefreeze_receipt"]["sha256"])' "$generation_file")" \
+            "$freeze" "$capture"
+    ) || return 1
+    [ "$resume_state" = rotate ] && [ "$resume_generation" = "$generation" ] || return 1
+    [ -f "$selection" ] && [ ! -e "$selection.partial" ] && \
+        [ "$(stat -c %h "$selection" 2>/dev/null || stat -f %l "$selection")" -eq 1 ] || return 1
+    second="$(seal_live_observation_selection "$selection" "$generation_file" "$statuses" \
+        "$freeze" "$capture")" || return 1
+    [ "$first" = "$second" ] && [ "$first" = "$(hash_file "$selection")" ] || return 1
+    ln "$selection" "$selection.partial" || return 1
+    [ "$(seal_live_observation_selection "$selection" "$generation_file" "$statuses" \
+        "$freeze" "$capture")" = "$first" ] || return 1
+    [ ! -e "$selection.partial" ] && [ "$(stat -c %h "$selection" 2>/dev/null || stat -f %l "$selection")" -eq 1 ] || return 1
+    cp "$selection" "$f/selection-from-partial.json.partial";chmod 400 "$f/selection-from-partial.json.partial"
+    [ "$(seal_live_observation_selection "$f/selection-from-partial.json" "$generation_file" "$statuses" \
+        "$freeze" "$capture")" = "$first" ] || return 1
+    cmp -s "$selection" "$f/selection-from-partial.json" || return 1
+    printf '{"truncated"' > "$f/selection-from-truncated.json.partial";chmod 600 "$f/selection-from-truncated.json.partial"
+    seal_live_observation_selection "$f/selection-from-truncated.json" "$generation_file" "$statuses" \
+        "$freeze" "$capture" >/dev/null || return 1
+    verify_live_observation_selection_exact "$selection" "$first" "$generation_file" \
+        "$generation" "$(hash_file "$generation_file")" \
+        "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["drive_prefreeze_receipt"]["sha256"])' "$generation_file")" \
+        "$freeze" "$capture" || return 1
+    ( verify_live_observation_selection_exact "$selection" "$first" "$generation_file" \
+        "$(printf 'd%.0s' {1..64})" "$(hash_file "$generation_file")" \
+        "$(printf 'e%.0s' {1..64})" "$freeze" "$capture" ) >/dev/null 2>&1 && return 1
+    local authorization="$f/authorization.json" bad_authorization="$f/bad-authorization.json"
+    python3 - "$selection" "$authorization" "$bad_authorization" <<'PY' || return 1
+import json,pathlib,sys
+selection=json.loads(pathlib.Path(sys.argv[1]).read_text())
+value={"schema":"arc.recovery.quarantine-round-authorization.v1",
+ "capture_id":selection["capture_id"],"freeze_plan_sha256":selection["freeze_plan_sha256"],
+ "live_observation_selection_sha256":__import__("hashlib").sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(),
+ "live_observation_generation":selection["observation_generation"],
+ "observation_generation_receipt_sha256":selection["observation_generation_receipt_sha256"],
+ "drive_prefreeze_receipt_sha256":selection["drive_prefreeze_receipt_sha256"],
+ "live_observation_selected_at":selection["selected_at"]}
+canonical=lambda item:(json.dumps(item,sort_keys=True,separators=(",",":"))+"\n").encode()
+pathlib.Path(sys.argv[2]).write_bytes(canonical(value));pathlib.Path(sys.argv[2]).chmod(0o400)
+value["drive_prefreeze_receipt_sha256"]="e"*64
+pathlib.Path(sys.argv[3]).write_bytes(canonical(value));pathlib.Path(sys.argv[3]).chmod(0o400)
+PY
+    quarantine_authorization_matches_live_observation "$authorization" "$selection" "$first" \
+        "$generation_file" "$generation" "$(hash_file "$generation_file")" \
+        "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["drive_prefreeze_receipt"]["sha256"])' "$generation_file")" \
+        "$freeze" "$capture" || return 1
+    ( quarantine_authorization_matches_live_observation "$bad_authorization" "$selection" "$first" \
+        "$generation_file" "$generation" "$(hash_file "$generation_file")" \
+        "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["drive_prefreeze_receipt"]["sha256"])' "$generation_file")" \
+        "$freeze" "$capture" ) >/dev/null 2>&1 && return 1
+    mkdir -m 700 "$f/selection-archive" "$f/truncated-archive"
+    cp "$selection" "$f/truncated-selection.json";chmod 400 "$f/truncated-selection.json"
+    printf '{"truncated"' > "$f/truncated-archive/.$generation.json.partial"
+    chmod 600 "$f/truncated-archive/.$generation.json.partial"
+    archive_stale_live_observation_selection "$f/truncated-selection.json" \
+        "$f/truncated-archive" "$generation" || return 1
+    [ ! -e "$f/truncated-selection.json" ] && \
+        [ "$(hash_file "$f/truncated-archive/$generation.json")" = "$first" ] || return 1
+    cp "$selection" "$f/selection-archive/$generation.json"
+    chmod 400 "$f/selection-archive/$generation.json"
+    ln "$f/selection-archive/$generation.json" \
+        "$f/selection-archive/.$generation.json.partial"
+    archive_stale_live_observation_selection "$selection" "$f/selection-archive" \
+        "$generation" || return 1
+    [ ! -e "$selection" ] && [ ! -e "$f/selection-archive/.$generation.json.partial" ] && \
+        [ "$(hash_file "$f/selection-archive/$generation.json")" = "$first" ] || return 1
+    return 0
+)
+
+mutation_dispatch_publication_is_no_replace_and_resumable() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f authorization readiness dispatch first second
+    f="$(mktemp -d)"; trap 'chmod -R u+w "$f" 2>/dev/null || true; rm -rf -- "$f"' EXIT
+    authorization="$f/authorization.json";readiness="$f/readiness.json";dispatch="$f/dispatch.json"
+    python3 - "$authorization" "$readiness" <<'PY' || return 1
+import hashlib,json,pathlib,sys
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+auth={"capture_id":"b"*64,"freeze_plan_sha256":"a"*64,"round_number":1,
+ "live_observation_selection_sha256":"c"*64,"live_observation_generation":"d"*64,
+ "observation_generation_receipt_sha256":"e"*64,"drive_prefreeze_receipt_sha256":"f"*64,
+ "targets":[{"node":"nyc","host":"149.28.32.76"}]}
+raw=canonical(auth);pathlib.Path(sys.argv[1]).write_bytes(raw);pathlib.Path(sys.argv[1]).chmod(0o400)
+ready={"round_authorization_sha256":hashlib.sha256(raw).hexdigest(),"round_number":1}
+pathlib.Path(sys.argv[2]).write_bytes(canonical(ready));pathlib.Path(sys.argv[2]).chmod(0o400)
+PY
+    first="$(seal_quarantine_mutation_dispatch "$authorization" "$readiness" "$dispatch")" || return 1
+    ln "$dispatch" "$dispatch.partial" || return 1
+    second="$(seal_quarantine_mutation_dispatch "$authorization" "$readiness" "$dispatch")" || return 1
+    [ "$first" = "$second" ] && [ ! -e "$dispatch.partial" ] && \
+        [ "$(stat -c %h "$dispatch" 2>/dev/null || stat -f %l "$dispatch")" -eq 1 ] || return 1
+    cp "$dispatch" "$f/dispatch-from-partial.json.partial";chmod 400 "$f/dispatch-from-partial.json.partial"
+    [ "$(seal_quarantine_mutation_dispatch "$authorization" "$readiness" \
+        "$f/dispatch-from-partial.json")" = "$first" ] || return 1
+    cmp -s "$dispatch" "$f/dispatch-from-partial.json" || return 1
+    printf '{"truncated"' > "$f/dispatch-from-truncated.json.partial";chmod 600 "$f/dispatch-from-truncated.json.partial"
+    seal_quarantine_mutation_dispatch "$authorization" "$readiness" \
+        "$f/dispatch-from-truncated.json" >/dev/null || return 1
+    python3 - "$ORCHESTRATOR" "$NODE_HELPER" <<'PY' || return 1
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text();node=pathlib.Path(sys.argv[2]).read_text()
+selection=text[text.index("seal_live_observation_selection()"):
+               text.index("verify_live_observation_generation_receipt_exact()")]
+dispatch=text[text.index("seal_quarantine_mutation_dispatch()"):
+              text.index("capture_post_quarantine_final_sources()")]
+assert "os.rename(partial,output)" not in selection+dispatch
+assert "os.link(partial,output,follow_symlinks=False)" in selection
+assert "os.link(partial,output,follow_symlinks=False)" in dispatch
+assert "recover_dynamic_partial" in node
+assert "renameat2" in node
+PY
+)
+
+readiness_without_dispatch_does_not_bind_stale_selection() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f attempt
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    attempt="$f/round-1/attempt.crash-before-dispatch"
+    mkdir -m 700 -p "$attempt/authorization-acceptances" \
+        "$attempt/node-transitions"
+    printf '{}\n' > "$attempt/authorization.json"
+    printf '{}\n' > "$attempt/authorization-acceptances/nyc.json"
+    printf '{}\n' > "$attempt/readiness.json"
+    chmod 400 "$attempt/authorization.json" \
+        "$attempt/authorization-acceptances/nyc.json" "$attempt/readiness.json"
+
+    # Exact crash prefix: authorization and acceptance exist, local readiness
+    # is durable, but dispatch was never published or sent. It must remain
+    # powerless so an expired stale selection can rotate.
+    if quarantine_attempt_binds_live_observation_selection "$attempt" \
+            "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})"; then
+        return 1
+    fi
+
+    printf '{}\n' > "$attempt/mutation-dispatch.json"
+    chmod 400 "$attempt/mutation-dispatch.json"
+    quarantine_attempt_binds_live_observation_selection "$attempt" \
+        "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" || return 1
+    rm "$attempt/mutation-dispatch.json"
+
+    printf '{}\n' > "$attempt/result.json"
+    chmod 400 "$attempt/result.json"
+    quarantine_attempt_binds_live_observation_selection "$attempt" \
+        "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" || return 1
+    rm "$attempt/result.json"
+
+    printf '{}\n' > "$attempt/node-transitions/nyc.json"
+    chmod 400 "$attempt/node-transitions/nyc.json"
+    quarantine_attempt_binds_live_observation_selection "$attempt" \
+        "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" || return 1
+
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+scan=text[text.index("run_quarantine_generation_rounds()"):
+          text.index("capture_phase()")]
+assert 'quarantine_attempt_binds_live_observation_selection' in scan
+assert '[ -e "$attempt_root/readiness.json" ]' not in scan
+PY
+)
+
+local_create_only_post_link_crashes_are_reconciled_before_resume() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f selection maintenance rounds quarantine path
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    selection="$f/live-observation-selection.json"
+    maintenance="$f/maintenance-inputs"
+    rounds="$maintenance/quarantine-rounds"
+    quarantine="$maintenance/network-quarantine"
+    mkdir -m 700 -p \
+        "$rounds/round-1/attempt.crash/authorization-acceptances" \
+        "$rounds/round-1/attempt.crash/node-transitions" "$quarantine"
+    for path in \
+        "$selection" \
+        "$rounds/round-1/attempt.crash/authorization.json" \
+        "$rounds/round-1/attempt.crash/readiness.json" \
+        "$rounds/round-1/attempt.crash/mutation-dispatch.json" \
+        "$rounds/round-1/attempt.crash/authorization-acceptances/nyc.json" \
+        "$rounds/round-1/attempt.crash/node-transitions/nyc.json" \
+        "$rounds/round-1/attempt.crash/result.json" \
+        "$rounds/round-1/attempt.crash/zero-progress-release.json"; do
+        printf '{}\n' > "$path";chmod 400 "$path";ln "$path" "$path.partial" || return 1
+    done
+    # A crash after sealing but before the no-replace link leaves only the
+    # canonical mode-0400 partial. Dynamic readiness/result timestamps must be
+    # recovered from these exact bytes rather than recomputed.
+    for path in \
+        "$rounds/round-1/attempt.crash/readiness-before-link.json" \
+        "$rounds/round-1/attempt.crash/result-before-link.json"; do
+        printf '{"completed_at":"2026-09-01T00:00:00Z"}\n' > "$path.partial"
+        chmod 400 "$path.partial"
+    done
+    printf '{"completed_at":"2026-09-01T00:00:01Z"}\n' > \
+        "$rounds/round-1/attempt.crash/readiness-before-fchmod.json.partial"
+    chmod 600 "$rounds/round-1/attempt.crash/readiness-before-fchmod.json.partial"
+    printf '{"completed_at"' > \
+        "$rounds/round-1/attempt.crash/truncated-before-fchmod.json.partial"
+    chmod 600 "$rounds/round-1/attempt.crash/truncated-before-fchmod.json.partial"
+    # Dynamic sibling proofs are sampled again when their final is absent. A
+    # sealed crash-before-link partial must therefore be promoted before any
+    # fresh timestamp/counter bytes can be collected.
+    for path in external-proof fleet-stability-proof; do
+        printf '{"completed_at":"2026-09-01T00:00:02Z","proof":"%s"}\n' "$path" > \
+            "$quarantine/$path.json.partial"
+        chmod 400 "$quarantine/$path.json.partial"
+    done
+    reconcile_local_create_only_resume_links "$selection" "$maintenance" || return 1
+    for path in \
+        "$selection" \
+        "$rounds/round-1/attempt.crash/authorization.json" \
+        "$rounds/round-1/attempt.crash/readiness.json" \
+        "$rounds/round-1/attempt.crash/mutation-dispatch.json" \
+        "$rounds/round-1/attempt.crash/authorization-acceptances/nyc.json" \
+        "$rounds/round-1/attempt.crash/node-transitions/nyc.json" \
+        "$rounds/round-1/attempt.crash/result.json" \
+        "$rounds/round-1/attempt.crash/zero-progress-release.json" \
+        "$rounds/round-1/attempt.crash/readiness-before-link.json" \
+        "$rounds/round-1/attempt.crash/result-before-link.json" \
+        "$rounds/round-1/attempt.crash/readiness-before-fchmod.json" \
+        "$quarantine/external-proof.json" \
+        "$quarantine/fleet-stability-proof.json"; do
+        [ -f "$path" ] && [ ! -e "$path.partial" ] && \
+            [ "$(stat -c %h "$path" 2>/dev/null || stat -f %l "$path")" -eq 1 ] || return 1
+    done
+    [ ! -e "$rounds/round-1/attempt.crash/truncated-before-fchmod.json" ] && \
+        [ ! -e "$rounds/round-1/attempt.crash/truncated-before-fchmod.json.partial" ] || return 1
+)
+
+positive_round_result_resume_is_byte_identical() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f selection maintenance rounds attempt result first
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    selection="$f/live-observation-selection.json"
+    maintenance="$f/maintenance-inputs"
+    rounds="$maintenance/quarantine-rounds"
+    attempt="$rounds/round-1/attempt.positive"
+    result="$attempt/result.json"
+    mkdir -m 700 -p "$attempt/node-transitions"
+    first="$(PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
+        "$attempt" "$rounds" <<'PY'
+import pathlib,sys,types
+import quarantine_round_driver as driver
+import test_quarantine_rounds as fixture
+
+attempt=pathlib.Path(sys.argv[1]);rounds=pathlib.Path(sys.argv[2])
+canonical=driver.canonical
+names=[name for name,_host in fixture.qr.FLEET]
+authorization=fixture.authorization(1,[],names,0)
+readiness=fixture.target_readiness(authorization)
+dispatch=fixture.mutation_dispatch(authorization,readiness)
+transitions=[
+    fixture.applied(
+        authorization,name,20+index,fixture.authorized_height(authorization,name)
+    )
+    for index,name in enumerate(names)
+]
+for path,value in (
+    (attempt/"authorization.json",authorization),
+    (attempt/"readiness.json",readiness),
+    (attempt/"mutation-dispatch.json",dispatch),
+):
+    path.write_bytes(canonical(value));path.chmod(0o400)
+for transition in transitions:
+    path=attempt/f"node-transitions/{transition['node']}.json"
+    path.write_bytes(canonical(transition));path.chmod(0o400)
+args=types.SimpleNamespace(
+    authorization=attempt/"authorization.json",readiness=attempt/"readiness.json",
+    dispatch=attempt/"mutation-dispatch.json",remaining_proof_root=None,
+    round_root=rounds,round_number=1,applied_root=attempt/"node-transitions",
+    output=attempt/"result.json",
+)
+driver.utc_now=lambda:fixture.utc(330)
+value=driver.build_result(args)
+driver.publish(args.output,value,"round result")
+print(driver.digest_bytes(args.output.read_bytes()))
+PY
+    )" || return 1
+    [ -n "$first" ] || return 1
+
+    # Crash after the no-replace link but before partial unlink.
+    ln "$result" "$result.partial" || return 1
+    reconcile_local_create_only_resume_links "$selection" "$maintenance" || return 1
+    PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - "$attempt" "$rounds" "$first" <<'PY' || return 1
+import pathlib,sys,types
+import quarantine_round_driver as driver
+import test_quarantine_rounds as fixture
+attempt=pathlib.Path(sys.argv[1]);rounds=pathlib.Path(sys.argv[2]);expected=sys.argv[3]
+args=types.SimpleNamespace(
+    authorization=attempt/"authorization.json",readiness=attempt/"readiness.json",
+    dispatch=attempt/"mutation-dispatch.json",remaining_proof_root=None,
+    round_root=rounds,round_number=1,applied_root=attempt/"node-transitions",
+    output=attempt/"result.json",
+)
+driver.utc_now=lambda:fixture.utc(600)
+value=driver.build_result(args)
+assert driver.digest_bytes(driver.canonical(value))==expected
+driver.publish(args.output,value,"round result")
+assert driver.digest_bytes(args.output.read_bytes())==expected
+PY
+
+    # Crash after sealing/fsync but before the no-replace link.
+    mv "$result" "$result.partial" || return 1
+    reconcile_local_create_only_resume_links "$selection" "$maintenance" || return 1
+    PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - "$attempt" "$rounds" "$first" <<'PY' || return 1
+import pathlib,sys,types
+import quarantine_round_driver as driver
+import test_quarantine_rounds as fixture
+attempt=pathlib.Path(sys.argv[1]);rounds=pathlib.Path(sys.argv[2]);expected=sys.argv[3]
+args=types.SimpleNamespace(
+    authorization=attempt/"authorization.json",readiness=attempt/"readiness.json",
+    dispatch=attempt/"mutation-dispatch.json",remaining_proof_root=None,
+    round_root=rounds,round_number=1,applied_root=attempt/"node-transitions",
+    output=attempt/"result.json",
+)
+driver.utc_now=lambda:fixture.utc(900)
+value=driver.build_result(args)
+assert driver.digest_bytes(driver.canonical(value))==expected
+assert driver.digest_bytes(args.output.read_bytes())==expected
+assert not args.output.with_name(args.output.name+".partial").exists()
+PY
+)
+
+positive_partial_waits_for_late_transition_before_sealing() (
+    local f rounds attempt
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    rounds="$f/quarantine-rounds"
+    attempt="$rounds/round-1/attempt.late-sixth"
+    mkdir -m 700 -p "$attempt/node-transitions"
+    PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
+        "$attempt" "$rounds" <<'PY' || return 1
+import pathlib
+import types
+import quarantine_round_driver as driver
+import test_quarantine_rounds as fixture
+
+attempt = pathlib.Path(__import__("sys").argv[1])
+rounds = pathlib.Path(__import__("sys").argv[2])
+for path in (rounds, rounds / "round-1", attempt, attempt / "node-transitions"):
+    path.chmod(0o700)
+names = [name for name, _host in fixture.qr.FLEET]
+authorization = fixture.authorization(1, [], names, 0)
+readiness = fixture.target_readiness(authorization)
+dispatch = fixture.mutation_dispatch(authorization, readiness)
+for path, value in (
+    (attempt / "authorization.json", authorization),
+    (attempt / "readiness.json", readiness),
+    (attempt / "mutation-dispatch.json", dispatch),
+):
+    path.write_bytes(driver.canonical(value))
+    path.chmod(0o400)
+for index, name in enumerate(names[:5]):
+    value = fixture.applied(
+        authorization, name, 20 + index,
+        fixture.authorized_height(authorization, name),
+    )
+    path = attempt / "node-transitions" / f"{name}.json"
+    path.write_bytes(driver.canonical(value))
+    path.chmod(0o400)
+
+args = types.SimpleNamespace(
+    authorization=attempt / "authorization.json",
+    readiness=attempt / "readiness.json",
+    dispatch=attempt / "mutation-dispatch.json",
+    round_root=rounds,
+    round_number=1,
+    applied_root=attempt / "node-transitions",
+    remaining_proof_root=None,
+    output=attempt / "result.json",
+)
+driver.utc_now = lambda: fixture.utc(330)
+try:
+    driver.build_result(args)
+except driver.DriverError as error:
+    assert "inert-proof root" in str(error)
+else:
+    raise AssertionError("five transitions sealed while the sixth remained ambiguous")
+assert not args.output.exists() and not args.output.with_name("result.json.partial").exists()
+
+# A late applied-status receipt arrives while no terminal result exists.  The
+# exact current closure must become all six nodes and therefore need no inert
+# proof; this is the recoverable side of the proof/apply lock ordering race.
+late = fixture.applied(
+    authorization, names[5], 25,
+    fixture.authorized_height(authorization, names[5]),
+)
+late_path = attempt / "node-transitions" / f"{names[5]}.json"
+late_path.write_bytes(driver.canonical(late))
+late_path.chmod(0o400)
+value = driver.build_result(args)
+assert value["remaining_targets"] == []
+assert value["remaining_target_inert_proofs"] == []
+driver.publish(args.output, value, "round result")
+sealed_sha = driver.digest_bytes(args.output.read_bytes())
+
+# Simulate the operator crash after the attempt result became durable but
+# before it was copied into the immutable prefix.  A later wall time must not
+# change the terminal attempt bytes or prevent prefix completion.
+driver.utc_now = lambda: fixture.utc(900)
+resumed = driver.build_result(args)
+assert driver.digest_bytes(driver.canonical(resumed)) == sealed_sha
+final = rounds / "round-1"
+driver.publish(final / "authorization.json", authorization, "round authorization")
+driver.publish(final / "result.json", resumed, "round result")
+ledger = driver.build_ledger(types.SimpleNamespace(
+    round_root=rounds,
+    capture_id=fixture.CAPTURE,
+    freeze_plan_sha256=fixture.FREEZE,
+))
+assert len(ledger["rounds"]) == 1
+assert [
+    wrapper["value"]["node"]
+    for wrapper in ledger["rounds"][0]["result"]["value"]["transitions"]
+] == names
+PY
+    python3 - "$ORCHESTRATOR" "$NODE_HELPER" <<'PY' || return 1
+import pathlib
+import sys
+orchestrator = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+node = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+capture = orchestrator[
+    orchestrator.index("capture_remaining_target_inert_proofs()"):
+    orchestrator.index("archive_stale_live_observation_selection()")
+]
+complete = orchestrator[
+    orchestrator.index("complete_quarantine_round_attempt()"):
+    orchestrator.index("run_quarantine_generation_rounds()")
+]
+proof = node[
+    node.index("quarantine_round_zero_progress_proof()"):
+    node.index("legacy_height_bracket()")
+]
+assert "quarantine-round-zero-progress-proof" in capture
+assert 'exec 5<> "$attempt_root/round.lock"' in proof
+assert "time.CLOCK_BOOTTIME" in proof
+assert "elapsed<=300_000_000_000" in proof
+assert "capture_remaining_target_inert_proofs" in complete
+assert "return 4" in complete
+PY
+)
+
+sealed_partial_resume_skips_old_attempt_status() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f rounds attempt log_root marker sealed_sha freeze capture
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    rounds="$f/quarantine-rounds"
+    attempt="$rounds/round-1/attempt.partial"
+    log_root="$f/logs"
+    marker="$f/old-attempt-status-called"
+    mkdir -m 700 -p "$attempt/node-transitions" "$log_root"
+    read -r freeze capture sealed_sha < <(
+        PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
+            "$attempt" "$rounds" "$f/late-sixth.json" <<'PY'
+import pathlib
+import sys
+import types
+import quarantine_round_driver as driver
+import test_quarantine_rounds as fixture
+
+attempt, rounds, late_path = map(pathlib.Path, sys.argv[1:])
+for path in (rounds, rounds / "round-1", attempt, attempt / "node-transitions"):
+    path.chmod(0o700)
+names = [name for name, _host in fixture.qr.FLEET]
+authorization = fixture.authorization(1, [], names, 0)
+readiness = fixture.target_readiness(authorization)
+dispatch = fixture.mutation_dispatch(authorization, readiness)
+for path, value in (
+    (attempt / "authorization.json", authorization),
+    (attempt / "readiness.json", readiness),
+    (attempt / "mutation-dispatch.json", dispatch),
+):
+    path.write_bytes(driver.canonical(value))
+    path.chmod(0o400)
+for index, name in enumerate(names[:5]):
+    value = fixture.applied(
+        authorization, name, 20 + index,
+        fixture.authorized_height(authorization, name),
+    )
+    path = attempt / "node-transitions" / f"{name}.json"
+    path.write_bytes(driver.canonical(value))
+    path.chmod(0o400)
+proof_root = attempt / f"remaining-target-inert-proofs-{fixture.H['96']}"
+proof_root.mkdir(mode=0o700)
+proof = fixture.remaining_target_inert_proof(
+    authorization, readiness, dispatch, names[5]
+)
+proof_path = proof_root / f"{names[5]}.json"
+proof_path.write_bytes(driver.canonical(proof))
+proof_path.chmod(0o400)
+args = types.SimpleNamespace(
+    authorization=attempt / "authorization.json",
+    readiness=attempt / "readiness.json",
+    dispatch=attempt / "mutation-dispatch.json",
+    round_root=rounds,
+    round_number=1,
+    applied_root=attempt / "node-transitions",
+    remaining_proof_root=proof_root,
+    output=attempt / "result.json",
+)
+driver.utc_now = lambda: fixture.utc(330)
+driver.publish(args.output, driver.build_result(args), "round result")
+late = fixture.applied(
+    authorization, names[5], 25,
+    fixture.authorized_height(authorization, names[5]),
+)
+late_path.write_bytes(driver.canonical(late))
+late_path.chmod(0o400)
+print(
+    fixture.FREEZE,
+    fixture.CAPTURE,
+    driver.digest_bytes(args.output.read_bytes()),
+)
+PY
+    ) || return 1
+    [ -n "$sealed_sha" ] || return 1
+    quarantine_authorization_matches_live_observation() { return 0; }
+    run_remote() {
+        case "${2:-}" in
+            quarantine-round-applied-status|quarantine-round-stopped-precommit)
+                : > "$marker"
+                cat "$f/late-sixth.json"
+                return 0
+                ;;
+        esac
+        return 1
+    }
+    complete_quarantine_round_attempt \
+        "$f/freeze-plan.json" "$freeze" "$capture" 1 "$rounds" "$attempt" \
+        "$log_root" "$(printf '1%.0s' {1..64})" "$(printf '2%.0s' {1..64})" \
+        "$(printf '3%.0s' {1..64})" "$(printf '4%.0s' {1..64})" 0 \
+        "$f/selection.json" "$(printf '5%.0s' {1..64})" \
+        "$f/generation.json" "$(printf '6%.0s' {1..64})" \
+        "$(printf '7%.0s' {1..64})" "$(printf '8%.0s' {1..64})" 1 1 || return 1
+    [ ! -e "$marker" ] || return 1
+    [ "$(hash_file "$attempt/result.json")" = "$sealed_sha" ] || return 1
+    cmp --silent "$attempt/result.json" "$rounds/round-1/result.json" || return 1
+    cmp --silent "$attempt/authorization.json" \
+        "$rounds/round-1/authorization.json" || return 1
+)
+
+zero_progress_result_never_enters_immutable_prefix() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f rounds attempt log_root marker freeze capture status
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    rounds="$f/quarantine-rounds"
+    attempt="$rounds/round-1/attempt.zero"
+    log_root="$f/logs"
+    marker="$f/remote-called"
+    mkdir -m 700 -p "$attempt/node-transitions" "$log_root"
+    read -r freeze capture < <(
+        PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - \
+            "$attempt" "$rounds" <<'PY'
+import pathlib
+import sys
+import quarantine_round_driver as driver
+import test_quarantine_rounds as fixture
+
+attempt, rounds = map(pathlib.Path, sys.argv[1:])
+for path in (rounds, rounds / "round-1", attempt, attempt / "node-transitions"):
+    path.chmod(0o700)
+names = [name for name, _host in fixture.qr.FLEET]
+authorization = fixture.authorization(1, [], names, 0)
+readiness = fixture.target_readiness(authorization)
+dispatch = fixture.mutation_dispatch(authorization, readiness)
+result = fixture.result(authorization, [], 303)
+for path, value in (
+    (attempt / "authorization.json", authorization),
+    (attempt / "readiness.json", readiness),
+    (attempt / "mutation-dispatch.json", dispatch),
+    (attempt / "result.json", result),
+):
+    path.write_bytes(driver.canonical(value))
+    path.chmod(0o400)
+print(fixture.FREEZE, fixture.CAPTURE)
+PY
+    ) || return 1
+    quarantine_authorization_matches_live_observation() { return 0; }
+    run_remote() { : > "$marker"; return 1; }
+    set +e
+    complete_quarantine_round_attempt \
+        "$f/freeze-plan.json" "$freeze" "$capture" 1 "$rounds" "$attempt" \
+        "$log_root" "$(printf '1%.0s' {1..64})" "$(printf '2%.0s' {1..64})" \
+        "$(printf '3%.0s' {1..64})" "$(printf '4%.0s' {1..64})" 0 \
+        "$f/selection.json" "$(printf '5%.0s' {1..64})" \
+        "$f/generation.json" "$(printf '6%.0s' {1..64})" \
+        "$(printf '7%.0s' {1..64})" "$(printf '8%.0s' {1..64})" 1 1
+    status=$?
+    set -e
+    [ "$status" -eq 2 ] || return 1
+    [ ! -e "$marker" ] || return 1
+    [ ! -e "$rounds/round-1/authorization.json" ] || return 1
+    [ ! -e "$rounds/round-1/result.json" ] || return 1
+)
+
+released_zero_progress_attempt_does_not_bind_rotated_selection() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f attempt freeze capture
+    f="$(mktemp -d)";trap "rm -rf -- '$f'" EXIT
+    attempt="$f/round-1/attempt.released";mkdir -m 700 -p "$attempt/node-transitions"
+    freeze="$(printf '0%.0s' {1..63})2";capture="$(printf '0%.0s' {1..63})1"
+    PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - "$attempt" <<'PY' || return 1
+import datetime,hashlib,json,pathlib,sys
+import test_quarantine_rounds as fixture
+root=pathlib.Path(sys.argv[1]);qr=fixture.qr
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+digest=lambda value:hashlib.sha256(canonical(value)).hexdigest()
+names=[name for name,_host in qr.FLEET]
+authorization=fixture.authorization(1,[],names,0)
+readiness=fixture.target_readiness(authorization)
+auth_sha=digest(authorization);readiness_sha=digest(readiness)
+dispatch={"schema":"arc.recovery.quarantine-mutation-dispatch.v1",
+ "capture_id":fixture.CAPTURE,"freeze_plan_sha256":fixture.FREEZE,"round_number":1,
+ "round_authorization_sha256":auth_sha,"round_readiness_sha256":readiness_sha,
+ "live_observation_selection_sha256":authorization["live_observation_selection_sha256"],
+ "live_observation_generation":authorization["live_observation_generation"],
+ "observation_generation_receipt_sha256":authorization["observation_generation_receipt_sha256"],
+ "drive_prefreeze_receipt_sha256":authorization["drive_prefreeze_receipt_sha256"],
+ "targets":[{"node":row["node"],"host":row["host"]} for row in authorization["targets"]],
+ "dispatched_at":fixture.utc(7)}
+dispatch_sha=digest(dispatch);challenge="5"*64
+proofs=[]
+for row in authorization["targets"]:
+    proof={"schema":"arc.recovery.quarantine-round-zero-progress-node-proof.v1",
+      "capture_id":fixture.CAPTURE,"freeze_plan_sha256":fixture.FREEZE,
+      "observation_generation":authorization["live_observation_generation"],
+      "round_number":1,"round_authorization_sha256":auth_sha,
+      "round_readiness_sha256":readiness_sha,"mutation_dispatch_sha256":dispatch_sha,
+      "challenge":challenge,"node":row["node"],"boot_id":row["boot_id"],
+      "writer_live_unfenced":True,"apply_state_present":False,
+      "restart_effective_mutation_absent":True,"active_selector_absent":True,
+      "quarantine_nft_absent":True,"authorization_accepted":True,
+      "readiness_present":False,"accepted_boottime_ns":1_000_000_000,
+      "elapsed_since_acceptance_ns":300_000_000_001,
+      "observed_boottime_ns":301_000_000_001,"observed_at":fixture.utc(400)}
+    proofs.append({"value":proof,"sha256":digest(proof)})
+release={"schema":"arc.recovery.quarantine-round-zero-progress-release.v1",
+ "capture_id":fixture.CAPTURE,"freeze_plan_sha256":fixture.FREEZE,"round_number":1,
+ "round_authorization_sha256":auth_sha,"round_readiness_sha256":readiness_sha,
+ "mutation_dispatch_sha256":dispatch_sha,
+ "live_observation_selection_sha256":authorization["live_observation_selection_sha256"],
+ "live_observation_generation":authorization["live_observation_generation"],
+ "observation_generation_receipt_sha256":authorization["observation_generation_receipt_sha256"],
+ "drive_prefreeze_receipt_sha256":authorization["drive_prefreeze_receipt_sha256"],
+ "challenge":challenge,"released_at":fixture.utc(401),"nodes":proofs}
+result={"schema":qr.ROUND_RESULT_SCHEMA,"capture_id":fixture.CAPTURE,
+ "freeze_plan_sha256":fixture.FREEZE,"round_number":1,
+ "round_authorization_sha256":auth_sha,"target_readiness":qr.wrap(readiness),
+ "transitions":[],"mutation_dispatch":qr.wrap(dispatch),
+ "remaining_target_inert_proofs":[],"remaining_targets":names,
+ "completed_at":authorization["authorization_deadline"]}
+for name,value in (("authorization.json",authorization),("readiness.json",readiness),
+                   ("mutation-dispatch.json",dispatch),("result.json",result),
+                   ("zero-progress-release.json",release)):
+    path=root/name;path.write_bytes(canonical(value));path.chmod(0o400)
+PY
+    # This is the post-release, post-rotation scan of the old attempt.  The
+    # exact release makes its readiness/dispatch/result nonbinding.
+    if quarantine_attempt_binds_live_observation_selection "$attempt" \
+            "$freeze" "$capture"; then
+        return 1
+    fi
+    chmod 600 "$attempt/zero-progress-release.json"
+    set +e
+    quarantine_attempt_has_valid_zero_progress_release "$attempt" \
+        "$freeze" "$capture" >/dev/null 2>&1
+    local invalid_status=$?
+    set -e
+    [ "$invalid_status" -ne 0 ] || return 1
+    chmod 400 "$attempt/zero-progress-release.json"
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+scan=text[text.index("run_quarantine_generation_rounds()"):
+          text.index("capture_phase()")]
+assert 'quarantine_attempt_binds_live_observation_selection' in scan
+assert 'quarantine_attempt_has_valid_zero_progress_release' in text
+PY
+)
+
+remote_zero_progress_heals_only_reviewed_publish_orphans() (
+    python3 - "$NODE_HELPER" <<'PY' || return 1
+import os,pathlib,re,stat,sys,tempfile
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+proof=text[text.index("quarantine_round_zero_progress_proof()"):
+           text.index("legacy_height_bracket()")]
+assert proof.index("partial_re=") < proof.index("for member in state.iterdir():")
+for exact in (
+    "authorization\\.json|readiness\\.json|policy\\.nft|apply|nft|",
+    "table-binding\\.json|nft-apply-intent\\.json|persistence-plan\\.json|",
+    "item.st_size<0 or item.st_size>16*1024*1024",
+    "stat.S_IMODE(item.st_mode) not in {0o600,expected_mode}",
+    "os.unlink(member);cleaned=True",
+):
+    assert exact in proof, exact
+
+# Crash-before-rename model for the exact reviewed random temporary namespace.
+allowed={"authorization.json":0o400,"readiness.json":0o400,"policy.nft":0o400,
+         "apply":0o500,"nft":0o500,"table-binding.json":0o400,
+         "nft-apply-intent.json":0o400,"persistence-plan.json":0o400,
+         "contract.json":0o400}
+pattern=re.compile(r"^\.(authorization\.json|readiness\.json|policy\.nft|apply|nft|"
+                   r"table-binding\.json|nft-apply-intent\.json|persistence-plan\.json|"
+                   r"contract\.json)\.([1-9][0-9]*)\.([0-9a-f]{16})\.partial$")
+with tempfile.TemporaryDirectory() as raw:
+    root=pathlib.Path(raw)
+    safe=[]
+    for index,(name,mode) in enumerate(allowed.items(),1):
+        path=root/f".{name}.{index}.0123456789abcdef.partial"
+        path.write_bytes(b"partial");path.chmod(0o600 if index%2 else mode);safe.append(path)
+    hostile=root/".unreviewed.json.1.0123456789abcdef.partial"
+    hostile.write_bytes(b"hostile");hostile.chmod(0o600)
+    for member in list(root.iterdir()):
+        match=pattern.fullmatch(member.name)
+        if match is None:continue
+        info=member.lstat();expected=allowed[match.group(1)]
+        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) in {0o600,expected}
+        member.unlink()
+    assert all(not path.exists() for path in safe) and hostile.exists()
+PY
+)
+
+capture_lock_and_monotonic_lease_are_portable_and_bound() (
+    local lock_root;lock_root="$(python3 - <<'PY'
+import os,pathlib,stat
+tmp=pathlib.Path(os.path.realpath("/tmp"));assert tmp.is_dir() and tmp.stat().st_uid==0
+root=tmp/f"arc-recovery-lock-smoke-{os.geteuid()}-{os.getpid()}";root.mkdir(mode=0o700)
+print(root)
+PY
+)" || return 1
+    trap 'exec 7<&- 2>/dev/null || true; rmdir "$lock_root" 2>/dev/null || true' EXIT
+    exec 7<"$lock_root"
+    python3 - 7 <<'PY' || return 1
+import fcntl,sys
+fcntl.flock(int(sys.argv[1]),fcntl.LOCK_EX|fcntl.LOCK_NB)
+PY
+    python3 - "$lock_root" <<'PY' || return 1
+import errno,fcntl,os,sys
+fd=os.open(sys.argv[1],os.O_RDONLY)
+try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError as error:
+    if error.errno in {errno.EACCES,errno.EAGAIN}:raise SystemExit(0)
+    raise
+raise SystemExit("second capture acquired the held lock")
+PY
+    python3 - "$ORCHESTRATOR" "$NODE_HELPER" "$REPO_ROOT/scripts/recovery/quarantine_rounds.py" <<'PY' || return 1
+import pathlib,sys
+fleet=pathlib.Path(sys.argv[1]).read_text();node=pathlib.Path(sys.argv[2]).read_text()
+rounds=pathlib.Path(sys.argv[3]).read_text()
+assert 'os.path.realpath(tmp_entry)' in fleet
+assert 'exec 8<"$capture_state_lock_dir"' in fleet
+assert 'fcntl.LOCK_EX|fcntl.LOCK_NB' in fleet
+assert 'quarantine-round-zero-progress-proof' in fleet
+assert 'arc.recovery.quarantine-round-zero-progress-release.v1' in fleet
+assert 'set(value)!=proof_fields' in fleet and 'set(proof)!=proof_fields' in fleet
+assert 'authorization_accepted") is not True' in fleet
+assert 'observed_ns<=accepted_ns+300_000_000_000' in fleet
+assert 'exec 5<> "$attempt_root/round.lock"' in node
+assert 'time.clock_gettime_ns(time.CLOCK_BOOTTIME)' in node
+assert 'time.monotonic_ns()' not in node[node.index('def validate_readiness'):node.index('def input_bytes')]
+assert 'public_started <= public_completed <= cross_started' not in node
+assert 'public_started <= public_completed <= cross_started' not in rounds
+PY
+    PYTHONPATH="$REPO_ROOT/scripts/recovery" python3 - <<'PY' || return 1
+import quarantine_round_driver as driver
+start_mono=10_000_000_000;start_wall=100_000_000_000
+assert driver.operator_selection_remaining_ns(
+    start_mono,start_wall,now_monotonic_ns=start_mono+1_000_000_000,
+    now_realtime_ns=start_wall+1_000_000_000)==299_000_000_000
+for now_mono,now_wall in (
+    (start_mono+2_000_000_000,start_wall-1),       # wall-clock backstep
+    (start_mono+2_000_000_000,start_wall+5_000_000_000), # suspend/divergence
+    (start_mono+301_000_000_000,start_wall+301_000_000_000), # expiry
+):
+    try:
+        driver.operator_selection_remaining_ns(
+            start_mono,start_wall,now_monotonic_ns=now_mono,now_realtime_ns=now_wall
+        )
+    except driver.DriverError:pass
+    else:raise AssertionError((now_mono,now_wall))
+PY
 )
 
 reference_pair_is_independent_of_final_capture_classes() (
@@ -996,7 +1898,12 @@ for n,c in zip(("nyc","lax","ams","lhr","nrt","sgp"),cs):
  root_hash=hashlib.sha256((n+"-observation-root").encode()).hexdigest(); receipt_hash=hashlib.sha256((n+"-observation-receipt").encode()).hexdigest()
  live_rows.append({"node":n,"root_sha256":root_hash,"receipt_sha256":receipt_hash})
  b=d/f"legacy-{n}.tar.zst"; b.write_bytes((n+"-bundle").encode()); i=d/f"legacy-{n}.inventory"; i.write_text(n+"-inventory\n"); bs=d/(b.name+".sha256"); bs.write_text(f"{h(b)}  {b.name}\n"); ins=d/(i.name+".sha256"); ins.write_text(f"{h(i)}  {i.name}\n"); rows.append({"schema":"arc.recovery.bundle-status.v1","capture_id":"b"*64,"node":n,"rollout_manifest_sha256":rollout_sha,"classification":c,"bundle":{"name":b.name,"size":b.stat().st_size,"sha256":h(b),"sidecar_name":bs.name,"sidecar_sha256":h(bs)},"inventory":{"name":i.name,"size":i.stat().st_size,"sha256":h(i),"sidecar_name":ins.name,"sidecar_sha256":h(ins)}})
-(s/"legacy-live-observations.json").write_text(json.dumps({"schema":"arc.recovery.legacy-live-observations-fleet.v1","capture_id":"b"*64,"freeze_plan_sha256":freeze_sha,"receipt_schema":"arc.recovery.legacy-live-observations.v1","labels":["diagnostic","noncanonical","nonreward"],"nodes":live_rows},sort_keys=True,separators=(",",":"))+"\n")
+observation={"legacy_live_observation_selection_sha256":"c"*64,
+             "legacy_live_observation_generation":"d"*64,
+             "observation_generation_receipt_sha256":"e"*64,
+             "drive_prefreeze_receipt_sha256":"f"*64}
+(s/"offline-stop-evidence.json").write_text(json.dumps(observation,sort_keys=True,separators=(",",":"))+"\n")
+(s/"legacy-live-observations.json").write_text(json.dumps({"schema":"arc.recovery.legacy-live-observations-fleet.v1","capture_id":"b"*64,"freeze_plan_sha256":freeze_sha,"observation_generation":observation["legacy_live_observation_generation"],"observation_generation_receipt_sha256":observation["observation_generation_receipt_sha256"],"drive_prefreeze_receipt_sha256":observation["drive_prefreeze_receipt_sha256"],"live_observation_selection_sha256":observation["legacy_live_observation_selection_sha256"],"receipt_schema":"arc.recovery.legacy-live-observations.v1","labels":["diagnostic","noncanonical","nonreward"],"nodes":live_rows},sort_keys=True,separators=(",",":"))+"\n")
 (r/"statuses.jsonl").write_text("".join(json.dumps(x,sort_keys=True,separators=(",",":"))+"\n" for x in rows))
 (r/"roots").write_text(f"{freeze_sha} {rollout_sha}\n")
 PY
@@ -1639,6 +2546,17 @@ run_test 'v5 stop journal semantics are fault-closed' v5_stop_journal_semantics_
 run_test 'classification requires each node once' classification_requires_each_node_once
 run_test 'capture readiness resumes exact stopped state' capture_readiness_resumes_stopped_and_indexed_nodes
 run_test 'fleet observation retry rejects any stopped writer' fleet_live_observation_retry_rejects_any_stopped_writer
+run_test 'same-generation observation selection resume is byte-identical' live_observation_selection_resume_is_byte_identical
+run_test 'mutation dispatch publication is no-replace and crash-resumable' mutation_dispatch_publication_is_no_replace_and_resumable
+run_test 'readiness without dispatch does not bind a stale selection' readiness_without_dispatch_does_not_bind_stale_selection
+run_test 'all local create-only post-link crashes heal before resume' local_create_only_post_link_crashes_are_reconciled_before_resume
+run_test 'positive round result is byte-identical after both publication crash windows' positive_round_result_resume_is_byte_identical
+run_test 'positive partial waits for late sixth status and resumes before prefix copy' positive_partial_waits_for_late_transition_before_sealing
+run_test 'sealed partial resume skips old-attempt status and preserves exact bytes' sealed_partial_resume_skips_old_attempt_status
+run_test 'zero-progress result remains attempt-local and never enters immutable prefix' zero_progress_result_never_enters_immutable_prefix
+run_test 'released zero-progress attempt does not bind rotated selection' released_zero_progress_attempt_does_not_bind_rotated_selection
+run_test 'remote zero-progress heals only reviewed publish orphans' remote_zero_progress_heals_only_reviewed_publish_orphans
+run_test 'capture lock and monotonic lease are portable and bound' capture_lock_and_monotonic_lease_are_portable_and_bound
 run_test 'canonical reference is independently required' reference_pair_is_independent_of_final_capture_classes
 run_test 'remote COMPLETE rejects object attacks' remote_complete_rejects_missing_tampered_extra
 run_test 'COMPLETE is last and fully verified' complete_is_last_and_fully_verified

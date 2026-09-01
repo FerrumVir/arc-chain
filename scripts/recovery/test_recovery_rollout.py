@@ -751,6 +751,69 @@ class RecoveryRolloutTests(unittest.TestCase):
             )
             return {"value": inner, "sha256": root}
 
+        observation_generation = "d" * 64
+        generation_receipt = {
+            "schema": "arc.recovery.legacy-live-observation-generation.v1",
+            "source_main_commit": source_commit,
+            "freeze_plan_sha256": freeze_sha,
+            "capture_id": capture_id,
+            "observation_generation": observation_generation,
+            "created_at": "2026-08-28T11:59:50.000000Z",
+            "max_selection_age_seconds": 300,
+            "drive_prefreeze_receipt": {
+                "path": "/private/drive-prefreeze.json",
+                "sha256": "e" * 64,
+                "value": {
+                    "schema": "arc.recovery.drive-prefreeze.v1",
+                    "mode": "execute", "freeze_plan_sha256": freeze_sha,
+                    "capture_id": capture_id, "remote_root_sha256": "1" * 64,
+                    "client_id_sha256": "2" * 64, "account_sha256": "3" * 64,
+                    "permission_id_sha256": "4" * 64, "rclone_version": "v1.75.0",
+                    "source_bytes": 1, "archive_reservation_bytes": 2,
+                    "largest_object_reservation_bytes": 1,
+                    "daily_upload_budget_bytes": 2,
+                    "daily_upload_budget_basis": "operator-reviewed-remaining-dedicated-account",
+                    "available_bytes_before": 8 * 1024 * 1024 + 2,
+                    "available_bytes_after": 2, "canary_bytes": 8 * 1024 * 1024,
+                    "canary_verified": True, "canary_deleted": True,
+                },
+            },
+        }
+        generation_receipt["drive_prefreeze_receipt"]["sha256"] = sha_value(
+            generation_receipt["drive_prefreeze_receipt"]["value"]
+        )
+        observation_selection = {
+            "schema": "arc.recovery.legacy-live-observation-selection.v1",
+            "source_main_commit": source_commit,
+            "freeze_plan_sha256": freeze_sha,
+            "capture_id": capture_id,
+            "observation_generation": observation_generation,
+            "observation_generation_receipt": generation_receipt,
+            "observation_generation_receipt_path": (
+                f"/private/live-observation-generations/{observation_generation}.json"
+            ),
+            "observation_generation_receipt_sha256": sha_value(generation_receipt),
+            "drive_prefreeze_receipt_path": "/private/drive-prefreeze.json",
+            "drive_prefreeze_receipt_sha256": generation_receipt[
+                "drive_prefreeze_receipt"
+            ]["sha256"],
+            "generation_created_at": generation_receipt["created_at"],
+            "selected_at": "2026-08-28T11:59:54.000000Z",
+            "max_selection_age_seconds": 300,
+            "labels": ["diagnostic", "noncanonical", "nonreward"],
+            "nodes": [
+                {"node": node, "created_at": "2026-08-28T11:59:51.000000Z",
+                 "completed_at": "2026-08-28T11:59:53.000000Z",
+                 "root_sha256": f"{index + 7000:064x}",
+                 "receipt_sha256": f"{index + 7100:064x}"}
+                for index, (node, _host) in enumerate(rollout.PRODUCTION_FLEET)
+            ],
+        }
+        observation_selection_sealed = {
+            "value": observation_selection,
+            "sha256": sha_value(observation_selection),
+        }
+
         target_public_origins = []
         for index, row in enumerate(public_origins):
             target_public_origins.append({
@@ -979,6 +1042,15 @@ class RecoveryRolloutTests(unittest.TestCase):
             "source_main_commit": source_commit,
             "capture_id": capture_id,
             "freeze_plan_sha256": freeze_sha,
+            "live_observation_selection_sha256": observation_selection_sealed["sha256"],
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": observation_selection[
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": observation_selection[
+                "drive_prefreeze_receipt_sha256"
+            ],
+            "live_observation_selected_at": observation_selection["selected_at"],
             "round_number": 1,
             "prior_round_result_sha256s": [],
             "prior_fenced": [],
@@ -1009,6 +1081,8 @@ class RecoveryRolloutTests(unittest.TestCase):
                         "round_authorization_sha256": round_auth_sha,
                         "node": target["node"], "host": target["host"],
                         "accepted_at": round_authorization["authorized_at"],
+                        "accepted_monotonic_ns": 1_000_000_000,
+                        "accepted_boot_id": target["boot_id"],
                         "authorization_deadline": round_authorization[
                             "authorization_deadline"
                         ],
@@ -1018,6 +1092,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             ],
             "completed_at": round_authorization["authorized_at"],
             "authorization_deadline": round_authorization["authorization_deadline"],
+            "max_elapsed_since_acceptance_ns": 300_000_000_000,
         }
         round_readiness_sha = sha_value(round_readiness)
         network_receipts_by_node = {}
@@ -1243,17 +1318,50 @@ class RecoveryRolloutTests(unittest.TestCase):
                 "authorization_ancestry_proof": quarantine_rounds.wrap(ancestry),
                 "persistent_restart_fence_sha256": restart_sha,
             })
+        mutation_dispatch = {
+            "schema": "arc.recovery.quarantine-mutation-dispatch.v1",
+            "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha,
+            "round_number": 1,
+            "round_authorization_sha256": round_auth_sha,
+            "round_readiness_sha256": round_readiness_sha,
+            "live_observation_selection_sha256": observation_selection_sealed[
+                "sha256"
+            ],
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": observation_selection[
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": observation_selection[
+                "drive_prefreeze_receipt_sha256"
+            ],
+            "targets": [
+                {"node": row["node"], "host": row["host"]}
+                for row in round_authorization["targets"]
+            ],
+            "dispatched_at": round_authorization["authorized_at"],
+        }
         round_result = {
             "schema": quarantine_rounds.ROUND_RESULT_SCHEMA,
             "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
             "round_number": 1, "round_authorization_sha256": round_auth_sha,
             "target_readiness": quarantine_rounds.wrap(round_readiness),
             "transitions": [quarantine_rounds.wrap(item) for item in applied_values],
+            "mutation_dispatch": quarantine_rounds.wrap(mutation_dispatch),
+            "remaining_target_inert_proofs": [],
             "remaining_targets": [], "completed_at": stopped_at,
         }
         generation_ledger = {
             "schema": quarantine_rounds.LEDGER_SCHEMA,
             "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "live_observation_selection_sha256": observation_selection_sealed["sha256"],
+            "live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": observation_selection[
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": observation_selection[
+                "drive_prefreeze_receipt_sha256"
+            ],
             "fleet": [
                 {"node": node, "host": host}
                 for node, host in rollout.PRODUCTION_FLEET
@@ -1271,6 +1379,9 @@ class RecoveryRolloutTests(unittest.TestCase):
         }
         authenticated_sealed = sealed(
             authenticated, "fleet", "authenticated-prefence-height-cross-proof"
+        )
+        observation_selection_sealed = sealed(
+            observation_selection, "fleet", "live-observation-selection"
         )
         generation_sealed = sealed(
             generation_ledger, "fleet", "quarantine-generation-ledger"
@@ -1548,6 +1659,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             "all_controlled_stopped_at": stopped_at,
             "challenge": challenge,
             "authenticated_prefence_height_cross_proof": authenticated_sealed,
+            "live_observation_selection": observation_selection_sealed,
             "quarantine_generation_ledger": generation_sealed,
             "network_quarantine_challenge": challenge_sealed,
             "quarantine_stability_proof": stability_sealed,
@@ -1693,6 +1805,14 @@ class RecoveryRolloutTests(unittest.TestCase):
                 "observed_max_height": public["legacy_public_max_height"],
             },
             "authenticated_prefence_height_cross_proof_sha256": sha_value(authenticated),
+            "legacy_live_observation_selection_sha256": observation_selection_sealed["sha256"],
+            "legacy_live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": observation_selection[
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": observation_selection[
+                "drive_prefreeze_receipt_sha256"
+            ],
             "quarantine_generation_ledger_sha256": generation_sealed["sha256"],
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "network_quarantine_stability_proof_sha256": stability_sealed["sha256"],
@@ -1767,6 +1887,16 @@ class RecoveryRolloutTests(unittest.TestCase):
             "legacy_maintenance_boundary_sha256": boundary_sha,
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "quarantine_generation_ledger_sha256": generation_sealed["sha256"],
+            "legacy_live_observation_selection_sha256": observation_selection_sealed[
+                "sha256"
+            ],
+            "legacy_live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": observation_selection[
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": observation_selection[
+                "drive_prefreeze_receipt_sha256"
+            ],
             "nodes": [
                 {
                     "node": node,
@@ -1897,6 +2027,7 @@ class RecoveryRolloutTests(unittest.TestCase):
 
         for field, role in (
             ("authenticated_prefence_height_cross_proof", "authenticated-prefence-height-cross-proof"),
+            ("live_observation_selection", "live-observation-selection"),
             ("quarantine_generation_ledger", "quarantine-generation-ledger"),
             ("network_quarantine_challenge", "network-quarantine-challenge"),
             ("quarantine_stability_proof", "network-quarantine-stability-proof"),
@@ -1927,6 +2058,17 @@ class RecoveryRolloutTests(unittest.TestCase):
         boundary["quarantine_generation_ledger_sha256"] = bundle[
             "quarantine_generation_ledger"
         ]["sha256"]
+        selection = bundle["live_observation_selection"]
+        boundary["legacy_live_observation_selection_sha256"] = selection["sha256"]
+        boundary["legacy_live_observation_generation"] = selection["value"][
+            "observation_generation"
+        ]
+        boundary["observation_generation_receipt_sha256"] = selection["value"][
+            "observation_generation_receipt_sha256"
+        ]
+        boundary["drive_prefreeze_receipt_sha256"] = selection["value"][
+            "drive_prefreeze_receipt_sha256"
+        ]
         boundary["network_quarantine_stability_proof_sha256"] = bundle[
             "quarantine_stability_proof"
         ]["sha256"]
@@ -1953,6 +2095,16 @@ class RecoveryRolloutTests(unittest.TestCase):
         offline["quarantine_generation_ledger_sha256"] = bundle[
             "quarantine_generation_ledger"
         ]["sha256"]
+        offline["legacy_live_observation_selection_sha256"] = selection["sha256"]
+        offline["legacy_live_observation_generation"] = selection["value"][
+            "observation_generation"
+        ]
+        offline["observation_generation_receipt_sha256"] = selection["value"][
+            "observation_generation_receipt_sha256"
+        ]
+        offline["drive_prefreeze_receipt_sha256"] = selection["value"][
+            "drive_prefreeze_receipt_sha256"
+        ]
         offline_sha = sha_value(offline)
 
         payloads = dict(payloads)
@@ -2388,7 +2540,67 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, "exact maintenance bundle/boundary"):
             rollout.verify_legacy_maintenance_stage_payloads(value, rows, hostile_payloads)
 
+    def test_live_observation_selection_rejects_semantically_rehashed_forgery(self) -> None:
+        value, _rows, payloads = self.maintenance_stage_fixture()
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        original = bundle["live_observation_selection"]["value"]
+        expected = {
+            "source_main_commit": original["source_main_commit"],
+            "freeze_plan_sha256": original["freeze_plan_sha256"],
+            "capture_id": original["capture_id"],
+        }
+
+        recovered_capacity = copy.deepcopy(original)
+        recovered_drive = recovered_capacity["observation_generation_receipt"][
+            "drive_prefreeze_receipt"
+        ]
+        recovered_drive["value"]["available_bytes_after"] = recovered_drive["value"][
+            "available_bytes_before"
+        ]
+        recovered_drive["sha256"] = rollout.sha256_bytes(
+            rollout.canonical_bytes(recovered_drive["value"])
+        )
+        recovered_capacity["drive_prefreeze_receipt_sha256"] = recovered_drive[
+            "sha256"
+        ]
+        recovered_capacity["observation_generation_receipt_sha256"] = (
+            rollout.sha256_bytes(
+                rollout.canonical_bytes(
+                    recovered_capacity["observation_generation_receipt"]
+                )
+            )
+        )
+        rollout.validate_live_observation_selection(recovered_capacity, **expected)
+
+        def rejected(mutator) -> None:
+            selection = copy.deepcopy(original)
+            mutator(selection)
+            generation = selection["observation_generation_receipt"]
+            drive = generation["drive_prefreeze_receipt"]
+            drive["sha256"] = rollout.sha256_bytes(rollout.canonical_bytes(drive["value"]))
+            selection["drive_prefreeze_receipt_sha256"] = drive["sha256"]
+            selection["observation_generation_receipt_sha256"] = rollout.sha256_bytes(
+                rollout.canonical_bytes(generation)
+            )
+            with self.assertRaises(rollout.RolloutError):
+                rollout.validate_live_observation_selection(selection, **expected)
+
+        rejected(lambda selection: selection["observation_generation_receipt"].__setitem__(
+            "schema", "arc.recovery.legacy-live-observation-generation.v0"
+        ))
+        rejected(lambda selection: selection["observation_generation_receipt"].__setitem__(
+            "capture_id", "0" * 64
+        ))
+        rejected(lambda selection: selection["observation_generation_receipt"]
+                 ["drive_prefreeze_receipt"]["value"].__setitem__("mode", "preflight"))
+        rejected(lambda selection: selection["observation_generation_receipt"]
+                 ["drive_prefreeze_receipt"]["value"].__setitem__("canary_verified", False))
+        rejected(lambda selection: selection["nodes"].pop())
+        rejected(lambda selection: selection["nodes"][0].__setitem__("root_sha256", "bad"))
+
     def verify_union_maintenance_stage(self, value, rows, payloads) -> None:
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        selection = bundle["live_observation_selection"]
         generation_state = {
             "capture_id": value["archive"]["capture_id"],
             "freeze_plan_sha256": value["archive"]["freeze_plan_sha256"],
@@ -2396,6 +2608,16 @@ class RecoveryRolloutTests(unittest.TestCase):
                 2026, 8, 28, 12, 0, 0, tzinfo=dt.timezone.utc
             ),
             "legacy_cutoff_height": 0,
+            "live_observation_selection_sha256": selection["sha256"],
+            "live_observation_generation": selection["value"][
+                "observation_generation"
+            ],
+            "observation_generation_receipt_sha256": selection["value"][
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": selection["value"][
+                "drive_prefreeze_receipt_sha256"
+            ],
         }
         observed = dt.datetime(
             2026, 8, 28, 12, 2, 2, tzinfo=dt.timezone.utc
