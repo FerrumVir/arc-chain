@@ -563,6 +563,15 @@ fn base_point_table_data() -> [u32; 480] {
 static GPU_CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
 
 fn get_or_init_gpu() -> Option<&'static GpuContext> {
+    // Every public GPU entry point is Apple-Silicon-only, but cache and
+    // diagnostic helpers also reach this shared boundary directly. Keep the
+    // platform admission check here so an unsupported wgpu adapter (notably
+    // Windows' DirectX software adapter) can never compile or dispatch the
+    // Metal verifier shader. Callers then use their existing CPU fallback.
+    if !MetalVerifier::detect_metal_gpu() {
+        return None;
+    }
+
     GPU_CONTEXT
         .get_or_init(|| {
             let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -1222,6 +1231,14 @@ mod tests {
             !verifier.is_gpu_available(),
             "Non-Apple-Silicon should not detect Metal"
         );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn test_low_level_gpu_dispatch_rejects_unsupported_platform() {
+        let error = dispatch_ed25519_verify(&[[0u8; 128]])
+            .expect_err("non-Apple-Silicon targets must reject Metal dispatch");
+        assert_eq!(error, "GPU context initialization failed");
     }
 
     #[test]
