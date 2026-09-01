@@ -44,8 +44,9 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use sha2::{Digest, Sha512};
 use std::borrow::Cow;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, mpsc};
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -134,6 +135,11 @@ impl MetalVerifier {
     /// Returns `true` if a Metal-capable GPU was detected.
     pub fn is_gpu_available(&self) -> bool {
         self.gpu_available
+            && match GPU_CONTEXT.get() {
+                None => true,
+                Some(Some(ctx)) => ctx.is_healthy(),
+                Some(None) => false,
+            }
     }
 
     /// Batch verify signatures, automatically selecting GPU or CPU path.
@@ -153,7 +159,7 @@ impl MetalVerifier {
             };
         }
 
-        if self.gpu_available && tasks.len() >= self.min_batch_for_gpu {
+        if self.is_gpu_available() && tasks.len() >= self.min_batch_for_gpu {
             // GPU path - unwrap is safe because we checked gpu_available
             self.batch_verify_gpu(tasks)
                 .unwrap_or_else(|_| self.batch_verify_cpu(tasks))
@@ -209,20 +215,26 @@ impl MetalVerifier {
     ///    and checks [S]B == R + [k]A in parallel across all GPU cores
     /// 3. Falls back to rayon CPU parallelism if GPU dispatch fails
     pub fn batch_verify_gpu(&mut self, tasks: &[VerifyTask]) -> Result<GpuVerifyResult, String> {
-        if !self.gpu_available {
+        if !self.is_gpu_available() {
             return Err("Metal GPU not available on this platform".to_string());
         }
 
         let start = Instant::now();
 
-        // Process in chunks if batch exceeds GPU memory limit
-        let results: Vec<bool> = if tasks.len() <= self.max_batch_size {
-            gpu_parallel_verify(tasks)
+        // Process in chunks if batch exceeds GPU memory limit. A dispatch
+        // failure is reported as CPU work, including the first call that trips
+        // the circuit breaker and performs the fallback.
+        let (results, used_gpu) = if tasks.len() <= self.max_batch_size {
+            gpu_parallel_verify_with_backend(tasks)
         } else {
-            tasks
-                .chunks(self.max_batch_size)
-                .flat_map(gpu_parallel_verify)
-                .collect()
+            let mut results = Vec::with_capacity(tasks.len());
+            let mut all_chunks_used_gpu = true;
+            for chunk in tasks.chunks(self.max_batch_size) {
+                let (chunk_results, chunk_used_gpu) = gpu_parallel_verify_with_backend(chunk);
+                results.extend(chunk_results);
+                all_chunks_used_gpu &= chunk_used_gpu;
+            }
+            (results, all_chunks_used_gpu)
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -231,15 +243,28 @@ impl MetalVerifier {
         // Update stats
         let count = tasks.len() as u64;
         self.stats.total_verified += count;
-        self.stats.gpu_verified += count;
-        self.stats.gpu_batches += 1;
-        if elapsed_us > 0 {
-            let throughput = (count as f64) / (elapsed_us as f64 / 1_000_000.0);
-            self.stats.avg_gpu_throughput = if self.stats.gpu_batches == 1 {
-                throughput
-            } else {
-                self.stats.avg_gpu_throughput * 0.7 + throughput * 0.3
-            };
+        if used_gpu {
+            self.stats.gpu_verified += count;
+            self.stats.gpu_batches += 1;
+            if elapsed_us > 0 {
+                let throughput = (count as f64) / (elapsed_us as f64 / 1_000_000.0);
+                self.stats.avg_gpu_throughput = if self.stats.gpu_batches == 1 {
+                    throughput
+                } else {
+                    self.stats.avg_gpu_throughput * 0.7 + throughput * 0.3
+                };
+            }
+        } else {
+            self.stats.cpu_verified += count;
+            self.stats.cpu_batches += 1;
+            if elapsed_us > 0 {
+                let throughput = (count as f64) / (elapsed_us as f64 / 1_000_000.0);
+                self.stats.avg_cpu_throughput = if self.stats.cpu_batches == 1 {
+                    throughput
+                } else {
+                    self.stats.avg_cpu_throughput * 0.7 + throughput * 0.3
+                };
+            }
         }
 
         Ok(GpuVerifyResult {
@@ -247,7 +272,7 @@ impl MetalVerifier {
             valid,
             invalid_indices,
             elapsed_us,
-            used_gpu: true,
+            used_gpu,
         })
     }
 
@@ -261,7 +286,7 @@ impl MetalVerifier {
     /// This takes `&self` (not `&mut self`) because stats are not updated
     /// until `wait()` returns. The caller should track stats externally.
     pub fn batch_verify_gpu_async(&self, tasks: &[VerifyTask]) -> Result<GpuVerifyFuture, String> {
-        if !self.gpu_available {
+        if !self.is_gpu_available() {
             return Err("Metal GPU not available on this platform".to_string());
         }
 
@@ -400,6 +425,56 @@ struct BufferPool {
 }
 
 const DEFAULT_POOL_CAPACITY: usize = 65_536;
+const GPU_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
+const GPU_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedPollError<E> {
+    Poll(E),
+    Timeout,
+}
+
+/// Poll a non-blocking operation until it produces a value or the absolute
+/// deadline expires. `now` and `sleep` are injected so timeout behavior can be
+/// tested deterministically without a GPU or wall-clock delays.
+fn bounded_poll_until_with<T, E, P, N, S>(
+    deadline: Instant,
+    poll_interval: Duration,
+    mut poll: P,
+    mut now: N,
+    mut sleep: S,
+) -> Result<T, BoundedPollError<E>>
+where
+    P: FnMut() -> Result<Option<T>, E>,
+    N: FnMut() -> Instant,
+    S: FnMut(Duration),
+{
+    loop {
+        if let Some(value) = poll().map_err(BoundedPollError::Poll)? {
+            return Ok(value);
+        }
+
+        let current = now();
+        if current >= deadline {
+            return Err(BoundedPollError::Timeout);
+        }
+
+        sleep(poll_interval.min(deadline.saturating_duration_since(current)));
+    }
+}
+
+fn bounded_poll_until<T, E, P>(deadline: Instant, poll: P) -> Result<T, BoundedPollError<E>>
+where
+    P: FnMut() -> Result<Option<T>, E>,
+{
+    bounded_poll_until_with(
+        deadline,
+        GPU_POLL_INTERVAL,
+        poll,
+        Instant::now,
+        std::thread::sleep,
+    )
+}
 
 fn create_buffer_pool(
     device: &wgpu::Device,
@@ -473,6 +548,35 @@ fn create_buffer_pool(
 
 /// Cached wgpu device, queue, pipeline, and bind group layout.
 /// Initialized once on first use, reused across all dispatch calls.
+#[derive(Default)]
+struct DispatchCircuit {
+    gate: Mutex<()>,
+    open: AtomicBool,
+}
+
+impl DispatchCircuit {
+    fn is_healthy(&self) -> bool {
+        !self.open.load(Ordering::Acquire)
+    }
+
+    fn ensure_healthy(&self) -> Result<(), String> {
+        if self.is_healthy() {
+            Ok(())
+        } else {
+            Err("GPU Ed25519 verifier disabled after a prior dispatch failure".to_string())
+        }
+    }
+
+    /// Permanently open the circuit while excluding new submissions.
+    /// Returns true only for the first transition.
+    fn trip(&self) -> bool {
+        let _gate = self.gate.lock();
+        self.open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
 struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -484,6 +588,27 @@ struct GpuContext {
     base_table_buffer: wgpu::Buffer,
     /// Pre-allocated buffer pool - eliminates per-dispatch Metal allocations.
     pool: Mutex<BufferPool>,
+    /// Serializes the final health check with submission and circuit breaking.
+    /// A caller that observes a timeout does not return until this gate has
+    /// permanently closed, so no subsequent dispatch can reuse pool buffers
+    /// that may still be referenced by the GPU.
+    dispatch_circuit: DispatchCircuit,
+}
+
+impl GpuContext {
+    fn is_healthy(&self) -> bool {
+        self.dispatch_circuit.is_healthy()
+    }
+
+    fn ensure_healthy(&self) -> Result<(), String> {
+        self.dispatch_circuit.ensure_healthy()
+    }
+
+    fn trip_circuit(&self, reason: &str) {
+        if self.dispatch_circuit.trip() {
+            tracing::error!(reason, "GPU Ed25519 verifier permanently disabled");
+        }
+    }
 }
 
 /// Precomputed base point table: 16 entries × 30 u32s each (x[10], y[10], t[10]).
@@ -751,9 +876,62 @@ fn get_or_init_gpu() -> Option<&'static GpuContext> {
                 bind_group_layout,
                 base_table_buffer,
                 pool: Mutex::new(pool),
+                dispatch_circuit: DispatchCircuit::default(),
             })
         })
         .as_ref()
+}
+
+fn wait_for_gpu_signal<T>(
+    ctx: &GpuContext,
+    receiver: &mpsc::Receiver<T>,
+    deadline: Instant,
+    stage: &'static str,
+) -> Result<T, String> {
+    let result = bounded_poll_until(deadline, || {
+        ctx.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| format!("GPU poll error during {stage}: {error:?}"))?;
+
+        match receiver.try_recv() {
+            Ok(value) => Ok(Some(value)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(format!("GPU callback channel closed during {stage}"))
+            }
+        }
+    });
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(BoundedPollError::Poll(error)) => {
+            ctx.trip_circuit(&error);
+            Err(error)
+        }
+        Err(BoundedPollError::Timeout) => {
+            let error = format!(
+                "GPU {stage} timed out after {} seconds",
+                GPU_DISPATCH_TIMEOUT.as_secs()
+            );
+            ctx.trip_circuit(&error);
+            Err(error)
+        }
+    }
+}
+
+fn wait_for_gpu_mapping(
+    ctx: &GpuContext,
+    receiver: &mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    deadline: Instant,
+) -> Result<(), String> {
+    match wait_for_gpu_signal(ctx, receiver, deadline, "result mapping")? {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let error = format!("GPU result mapping failed: {error:?}");
+            ctx.trip_circuit(&error);
+            Err(error)
+        }
+    }
 }
 
 /// Per-phase timing breakdown from a GPU dispatch.
@@ -807,6 +985,8 @@ fn dispatch_ed25519_verify_timed(
 
     // Lock buffer pool (held through dispatch - GPU serializes anyway)
     let mut pool = ctx.pool.lock();
+    let dispatch_gate = ctx.dispatch_circuit.gate.lock();
+    ctx.ensure_healthy()?;
 
     // Grow pool if batch exceeds capacity
     if n > pool.capacity {
@@ -830,6 +1010,7 @@ fn dispatch_ed25519_verify_timed(
 
     // Phase B: GPU compute (encode + submit + poll)
     let t_compute = Instant::now();
+    let deadline = t_compute + GPU_DISPATCH_TIMEOUT;
 
     let workgroup_size = 64u32;
     let num_workgroups = (n as u32).div_ceil(workgroup_size);
@@ -853,9 +1034,12 @@ fn dispatch_ed25519_verify_timed(
 
     encoder.copy_buffer_to_buffer(&pool.output_buffer, 0, &pool.staging_buffer, 0, output_size);
     ctx.queue.submit(Some(encoder.finish()));
-    ctx.device
-        .poll(wgpu::PollType::wait())
-        .map_err(|e| format!("GPU poll error: {e:?}"))?;
+    let (completion_sender, completion_receiver) = mpsc::channel();
+    ctx.queue.on_submitted_work_done(move || {
+        let _ = completion_sender.send(());
+    });
+    drop(dispatch_gate);
+    wait_for_gpu_signal(ctx, &completion_receiver, deadline, "dispatch completion")?;
 
     let compute_elapsed = t_compute.elapsed();
 
@@ -867,13 +1051,7 @@ fn dispatch_ed25519_verify_timed(
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    ctx.device
-        .poll(wgpu::PollType::wait())
-        .map_err(|e| format!("GPU poll error: {e:?}"))?;
-    receiver
-        .recv()
-        .map_err(|e| format!("Channel error: {e}"))?
-        .map_err(|e| format!("Map error: {e:?}"))?;
+    wait_for_gpu_mapping(ctx, &receiver, deadline)?;
 
     let raw_data = buffer_slice.get_mapped_range();
     let output_u32s: &[u32] = bytemuck::cast_slice(&raw_data);
@@ -901,7 +1079,9 @@ fn dispatch_ed25519_verify_timed(
 /// runs concurrently - call `wait()` to block until results are ready.
 /// This frees CPU cores for execution while the GPU verifies signatures.
 pub struct GpuVerifyFuture {
+    ctx: &'static GpuContext,
     staging_buffer: wgpu::Buffer,
+    completion_receiver: mpsc::Receiver<()>,
     count: usize,
     start: Instant,
 }
@@ -909,7 +1089,13 @@ pub struct GpuVerifyFuture {
 impl GpuVerifyFuture {
     /// Block until GPU results are ready and return verification results.
     pub fn wait(self) -> Result<GpuVerifyResult, String> {
-        let ctx = get_or_init_gpu().ok_or_else(|| "GPU context lost".to_string())?;
+        let deadline = self.start + GPU_DISPATCH_TIMEOUT;
+        wait_for_gpu_signal(
+            self.ctx,
+            &self.completion_receiver,
+            deadline,
+            "dispatch completion",
+        )?;
 
         let output_size = (self.count * 4) as u64;
         let buffer_slice = self.staging_buffer.slice(..output_size);
@@ -917,13 +1103,7 @@ impl GpuVerifyFuture {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        ctx.device
-            .poll(wgpu::PollType::wait())
-            .map_err(|e| format!("GPU poll error: {e:?}"))?;
-        receiver
-            .recv()
-            .map_err(|e| format!("Channel error: {e}"))?
-            .map_err(|e| format!("Map error: {e:?}"))?;
+        wait_for_gpu_mapping(self.ctx, &receiver, deadline)?;
 
         let raw_data = buffer_slice.get_mapped_range();
         let output_u32s: &[u32] = bytemuck::cast_slice(&raw_data);
@@ -962,6 +1142,7 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
     }
 
     let ctx = get_or_init_gpu().ok_or_else(|| "GPU context initialization failed".to_string())?;
+    ctx.ensure_healthy()?;
 
     let start = Instant::now();
 
@@ -983,9 +1164,11 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
         mapped_at_creation: false,
     });
 
-    // Lock pool only for write + encode + submit
-    {
+    // Lock pool only for write + encode + submit.
+    let completion_receiver = {
         let mut pool = ctx.pool.lock();
+        let dispatch_gate = ctx.dispatch_circuit.gate.lock();
+        ctx.ensure_healthy()?;
 
         if n > pool.capacity {
             let new_cap = n.next_power_of_two();
@@ -1025,12 +1208,22 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
         // Copy from pool's output buffer to per-dispatch staging buffer
         encoder.copy_buffer_to_buffer(&pool.output_buffer, 0, &staging_buffer, 0, output_size);
         ctx.queue.submit(Some(encoder.finish()));
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        ctx.queue.on_submitted_work_done(move || {
+            let _ = completion_sender.send(());
+        });
+        drop(dispatch_gate);
 
-        // Pool unlocked here - GPU has captured all commands
-    }
+        completion_receiver
+    };
 
+    // The pool is unlocked here. Queue ordering keeps already-submitted work
+    // ordered, and the per-dispatch staging buffer remains exclusively owned
+    // by this future.
     Ok(GpuVerifyFuture {
+        ctx,
         staging_buffer,
+        completion_receiver,
         count: n,
         start,
     })
@@ -1135,6 +1328,10 @@ impl Default for SigVerifyCache {
 /// 2. GPU: dispatches WGSL Ed25519 verification shader (point decompression + scalar multiply)
 /// 3. Falls back to CPU-parallel verification if GPU dispatch fails
 fn gpu_parallel_verify(tasks: &[VerifyTask]) -> Vec<bool> {
+    gpu_parallel_verify_with_backend(tasks).0
+}
+
+fn gpu_parallel_verify_with_backend(tasks: &[VerifyTask]) -> (Vec<bool>, bool) {
     // Step 1: CPU pre-compute SHA-512 scalars in parallel
     let packed: Vec<[u8; 128]> = tasks
         .par_iter()
@@ -1151,10 +1348,10 @@ fn gpu_parallel_verify(tasks: &[VerifyTask]) -> Vec<bool> {
 
     // Step 2: Dispatch to GPU (convert u32 results to bool: 1=valid, anything else=invalid)
     match dispatch_ed25519_verify(&packed) {
-        Ok(raw) => raw.iter().map(|&v| v == 1).collect(),
+        Ok(raw) => (raw.iter().map(|&v| v == 1).collect(), true),
         Err(e) => {
             tracing::warn!("GPU Ed25519 dispatch failed ({}), falling back to CPU", e);
-            tasks.par_iter().map(verify_single).collect()
+            (tasks.par_iter().map(verify_single).collect(), false)
         }
     }
 }
@@ -1181,6 +1378,79 @@ fn tally_results(results: &[bool]) -> (usize, Vec<usize>) {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use std::cell::Cell;
+
+    #[test]
+    fn bounded_poll_completes_after_pending_iterations() {
+        let origin = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let polls = Cell::new(0usize);
+
+        let result = bounded_poll_until_with(
+            origin + Duration::from_millis(10),
+            Duration::from_millis(1),
+            || {
+                let next = polls.get() + 1;
+                polls.set(next);
+                Ok::<_, &'static str>((next == 3).then_some(42u32))
+            },
+            || origin + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+
+        assert_eq!(result, Ok(42));
+        assert_eq!(polls.get(), 3);
+        assert_eq!(elapsed.get(), Duration::from_millis(2));
+    }
+
+    #[test]
+    fn bounded_poll_times_out_at_injected_deadline() {
+        let origin = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let polls = Cell::new(0usize);
+
+        let result = bounded_poll_until_with(
+            origin + Duration::from_millis(3),
+            Duration::from_millis(1),
+            || {
+                polls.set(polls.get() + 1);
+                Ok::<Option<()>, &'static str>(None)
+            },
+            || origin + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+
+        assert_eq!(result, Err(BoundedPollError::Timeout));
+        assert_eq!(polls.get(), 4);
+        assert_eq!(elapsed.get(), Duration::from_millis(3));
+    }
+
+    #[test]
+    fn bounded_poll_propagates_injected_poll_error() {
+        let origin = Instant::now();
+        let result = bounded_poll_until_with(
+            origin + Duration::from_secs(1),
+            Duration::from_millis(1),
+            || Err::<Option<()>, _>("device lost"),
+            || origin,
+            |_| panic!("poll errors must not sleep"),
+        );
+
+        assert_eq!(result, Err(BoundedPollError::Poll("device lost")));
+    }
+
+    #[test]
+    fn dispatch_circuit_is_permanent_after_first_trip() {
+        let circuit = DispatchCircuit::default();
+        assert!(circuit.is_healthy());
+        assert!(circuit.ensure_healthy().is_ok());
+
+        assert!(circuit.trip(), "first failure must open the circuit");
+        assert!(!circuit.is_healthy());
+        assert!(circuit.ensure_healthy().is_err());
+        assert!(!circuit.trip(), "later failures must not reset the circuit");
+        assert!(!circuit.is_healthy());
+    }
 
     /// Helper: generate `n` valid (keypair, message, signature) tuples.
     fn generate_valid_tasks(n: usize) -> Vec<VerifyTask> {
@@ -1633,76 +1903,15 @@ mod tests {
         assert_eq!(verifier.stats().total_verified, 0);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn test_gpu_diagnostic_codes() {
-        // Diagnostic test: GPU arithmetic tests
-        // idx 0: fe_sq(1) limb 0 - expect 1
-        // idx 1: fe_sq([0,1,0,...]) limb 2 - expect 2 (odd-odd doubling test)
-        // idx 2: ge_frombytes identity check - 0=identity, 99=not identity
-        // idx 3: y^2 limb 0 from R decompression
-        // idx 4: vx2 check result - 100=first pass, 200=sqrt(-1) pass, 300=both fail
-        let tasks = generate_valid_tasks(12);
-
-        // CPU-side: compute decompression intermediates for first R
-        let r_bytes = &tasks[0].signature[0..32];
-
-        // Manual 10-limb conversion (same as shader)
-        let mut y_u32s = [0u32; 8];
-        for i in 0..8 {
-            y_u32s[i] = u32::from_le_bytes([
-                r_bytes[i * 4],
-                r_bytes[i * 4 + 1],
-                r_bytes[i * 4 + 2],
-                r_bytes[i * 4 + 3],
-            ]);
+    fn test_gpu_results_conform_to_cpu_verifier() {
+        let mut tasks = generate_valid_tasks(64);
+        for index in [0, 7, 31, 63] {
+            tasks[index] = generate_invalid_task();
         }
-        y_u32s[7] &= 0x7FFFFFFF;
 
-        let mut y = [0u32; 10];
-        y[0] = y_u32s[0] & 0x3FFFFFF;
-        y[1] = ((y_u32s[0] >> 26) | (y_u32s[1] << 6)) & 0x1FFFFFF;
-        y[2] = ((y_u32s[1] >> 19) | (y_u32s[2] << 13)) & 0x3FFFFFF;
-        y[3] = ((y_u32s[2] >> 13) | (y_u32s[3] << 19)) & 0x1FFFFFF;
-        y[4] = (y_u32s[3] >> 6) & 0x3FFFFFF;
-        y[5] = y_u32s[4] & 0x1FFFFFF;
-        y[6] = ((y_u32s[4] >> 25) | (y_u32s[5] << 7)) & 0x3FFFFFF;
-        y[7] = ((y_u32s[5] >> 19) | (y_u32s[6] << 13)) & 0x1FFFFFF;
-        y[8] = ((y_u32s[6] >> 12) | (y_u32s[7] << 20)) & 0x3FFFFFF;
-        y[9] = (y_u32s[7] >> 6) & 0x1FFFFFF;
-
-        // CPU decompression intermediates
-        let y2 = cpu_fe_mul(&y, &y);
-        let u = cpu_fe_sub(&y2, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // d constant (from the shader)
-        let d_const: [u32; 10] = [
-            0x35978A3, 0x0D37284, 0x3156EBD, 0x06A0A0E, 0x001C029, 0x179E898, 0x3A03CBB, 0x1CE7198,
-            0x2E2B6FF, 0x1480DB3,
-        ];
-        let dy2 = cpu_fe_mul(&d_const, &y2);
-        let v = cpu_fe_add(&dy2, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let v2 = cpu_fe_mul(&v, &v);
-        let v3 = cpu_fe_mul(&v2, &v);
-        let v6 = cpu_fe_mul(&v3, &v3);
-        let v7 = cpu_fe_mul(&v6, &v);
-        let uv7 = cpu_fe_mul(&u, &v7);
-
-        // CPU fe_pow2523 to compare
-        let pow_cpu = cpu_fe_pow2523(&uv7);
-        let uv3 = cpu_fe_mul(&u, &v3);
-        let x_cpu = cpu_fe_mul(&uv3, &pow_cpu);
-        let x2_cpu = cpu_fe_mul(&x_cpu, &x_cpu);
-        let vx2_cpu = cpu_fe_mul(&v, &x2_cpu);
-
-        println!("CPU intermediates [limb 0]:");
-        println!(
-            "  y^2[0]={} u[0]={} dy2[0]={} v[0]={} uv7[0]={}",
-            y2[0], u[0], dy2[0], v[0], uv7[0]
-        );
-        println!(
-            "  pow[0]={} x[0]={} vx2[0]={}",
-            pow_cpu[0], x_cpu[0], vx2_cpu[0]
-        );
-
+        let cpu_results: Vec<bool> = tasks.iter().map(verify_single).collect();
         let packed: Vec<[u8; 128]> = tasks
             .iter()
             .map(|task| {
@@ -1716,66 +1925,17 @@ mod tests {
             })
             .collect();
 
-        match dispatch_ed25519_verify(&packed) {
-            Ok(raw) => {
-                println!("\nGPU diagnostic results:");
-                println!("  [0] fe_sq(1)[0]  = {} (expect 1)", raw[0]);
-                println!("  [1] fe_sq(e1)[2] = {} (expect 2)", raw[1]);
-                println!("  [2] R decomp     = {} (0=identity, 99=valid)", raw[2]);
-                println!(
-                    "  [3] y^2[0]  GPU={} CPU={} {}",
-                    raw[3],
-                    y2[0],
-                    if raw[3] == y2[0] {
-                        "MATCH"
-                    } else {
-                        "MISMATCH!"
-                    }
-                );
-                println!(
-                    "  [4] u[0]    GPU={} CPU={} {}",
-                    raw[4],
-                    u[0],
-                    if raw[4] == u[0] { "MATCH" } else { "MISMATCH!" }
-                );
-                println!(
-                    "  [5] dy2[0]  GPU={} CPU={} {}",
-                    raw[5],
-                    dy2[0],
-                    if raw[5] == dy2[0] {
-                        "MATCH"
-                    } else {
-                        "MISMATCH!"
-                    }
-                );
-                println!(
-                    "  [6] v[0]    GPU={} CPU={} {}",
-                    raw[6],
-                    v[0],
-                    if raw[6] == v[0] { "MATCH" } else { "MISMATCH!" }
-                );
-                println!(
-                    "  [7] uv7[0]  GPU={} CPU={} {}",
-                    raw[7],
-                    uv7[0],
-                    if raw[7] == uv7[0] {
-                        "MATCH"
-                    } else {
-                        "MISMATCH!"
-                    }
-                );
-                println!("  [8] pow[0]  GPU={}", raw[8]);
-                println!("  [9] x[0]    GPU={}", raw[9]);
-                println!("  [10] vx2[0] GPU={}", raw[10]);
-                println!(
-                    "  [11] check  GPU={} (100=pass, 200=sqrtm1, 300=fail)",
-                    raw[11]
-                );
-            }
-            Err(e) => {
-                println!("GPU dispatch failed: {}", e);
-            }
-        }
+        let gpu_raw = dispatch_ed25519_verify(&packed).expect("Metal dispatch must succeed");
+        assert_eq!(gpu_raw.len(), cpu_results.len());
+        assert!(
+            gpu_raw.iter().all(|result| matches!(result, 0 | 1)),
+            "shader results must use the documented boolean encoding"
+        );
+        let gpu_results: Vec<bool> = gpu_raw.into_iter().map(|result| result == 1).collect();
+        assert_eq!(
+            gpu_results, cpu_results,
+            "Metal and CPU verification diverged"
+        );
     }
 
     fn cpu_fe_add(a: &[u32; 10], b: &[u32; 10]) -> [u32; 10] {
