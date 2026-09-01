@@ -43,7 +43,7 @@ lets you inspect the script first.
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=c699b59e0137230ef40d9505a4226d562c8f0d0eda8543de1a42be323d080d37
+ARC_INSTALL_SHA256=355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else

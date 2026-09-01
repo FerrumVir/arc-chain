@@ -658,8 +658,10 @@ validate_owned_nonwritable_path() {
     [ ! -L "$path" ] || die "Legacy $path_label must not be a symlink: $path"
     case "$path_kind" in
         directory) [ -d "$path" ] || die "Legacy $path_label is not a directory: $path" ;;
-        executable) [ -f "$path" ] && [ -x "$path" ] \
-            || die "Legacy $path_label is not an executable regular file: $path" ;;
+        executable)
+            if [ ! -f "$path" ] || [ ! -x "$path" ]; then
+                die "Legacy $path_label is not an executable regular file: $path"
+            fi ;;
         file) [ -f "$path" ] || die "Legacy $path_label is not a regular file: $path" ;;
         *) die "Internal legacy path validation error: $path_kind" ;;
     esac
@@ -1207,8 +1209,9 @@ validate_legacy_detached_process() {
     pid_line="$(sed -n '1p' "$LEGACY_NODE_PID_FILE")"
     line_count="$(awk 'END { print NR + 0 }' "$LEGACY_NODE_PID_FILE")"
     case "$pid_line" in ''|*[!0-9]*) die "Legacy detached node PID is invalid" ;; esac
-    [ "$line_count" -eq 1 ] && [ "$pid_line" -gt 1 ] \
-        || die "Legacy detached node PID file is malformed"
+    if ! { [ "$line_count" -eq 1 ] && [ "$pid_line" -gt 1 ]; }; then
+        die "Legacy detached node PID file is malformed"
+    fi
     kill -0 "$pid_line" 2>/dev/null \
         || die "Legacy detached node PID is stale; stop/clean it explicitly before adoption"
     command_line="$(ps -ww -p "$pid_line" -o command= 2>/dev/null)" \
@@ -1355,9 +1358,11 @@ prepare_legacy_supervisor() {
             elif [ "$linux_updater_artifact" = true ]; then
                 die "Partially retired legacy Linux units do not match the pending marker"
             fi
-            [ "$mac_node_present" = false ] && [ "$mac_updater_artifact" = false ] \
-                && [ "$detached_present" = false ] \
-                || die "Pending Linux adoption acquired a conflicting legacy supervisor"
+            if [ "$mac_node_present" != false ] \
+                || [ "$mac_updater_artifact" != false ] \
+                || [ "$detached_present" != false ]; then
+                die "Pending Linux adoption acquired a conflicting legacy supervisor"
+            fi
             command -v systemctl >/dev/null 2>&1 \
                 || die "systemctl is required to retire the legacy Linux supervisor"
             if [ "$CURRENT_UID" -ne 0 ]; then
@@ -1375,23 +1380,31 @@ prepare_legacy_supervisor() {
             elif [ "$mac_updater_artifact" = true ]; then
                 die "Partially retired legacy macOS agents do not match the pending marker"
             fi
-            [ "$linux_node_present" = false ] && [ "$linux_updater_artifact" = false ] \
-                && [ "$detached_present" = false ] \
-                || die "Pending macOS adoption acquired a conflicting legacy supervisor" ;;
+            if [ "$linux_node_present" != false ] \
+                || [ "$linux_updater_artifact" != false ] \
+                || [ "$detached_present" != false ]; then
+                die "Pending macOS adoption acquired a conflicting legacy supervisor"
+            fi ;;
         detached)
             if [ "$detached_present" = true ]; then
                 validate_legacy_detached_process
             elif [ "$resume_mode" != true ]; then
                 die "Legacy detached process disappeared before adoption was reserved"
             fi
-            [ "$linux_node_present" = false ] && [ "$linux_updater_artifact" = false ] \
-                && [ "$mac_node_present" = false ] && [ "$mac_updater_artifact" = false ] \
-                || die "Pending detached adoption acquired a conflicting legacy supervisor" ;;
+            if [ "$linux_node_present" != false ] \
+                || [ "$linux_updater_artifact" != false ] \
+                || [ "$mac_node_present" != false ] \
+                || [ "$mac_updater_artifact" != false ]; then
+                die "Pending detached adoption acquired a conflicting legacy supervisor"
+            fi ;;
         none)
-            [ "$linux_node_present" = false ] && [ "$linux_updater_artifact" = false ] \
-                && [ "$mac_node_present" = false ] && [ "$mac_updater_artifact" = false ] \
-                && [ "$detached_present" = false ] \
-                || die "Legacy supervisor artifacts do not match a supervisor-free adoption" ;;
+            if [ "$linux_node_present" != false ] \
+                || [ "$linux_updater_artifact" != false ] \
+                || [ "$mac_node_present" != false ] \
+                || [ "$mac_updater_artifact" != false ] \
+                || [ "$detached_present" != false ]; then
+                die "Legacy supervisor artifacts do not match a supervisor-free adoption"
+            fi ;;
     esac
 
     if [ "$SERVICE_SCOPE" = system-user ]; then
@@ -1401,10 +1414,11 @@ prepare_legacy_supervisor() {
             || die "system-user scope requires the exact legacy user-default root"
     fi
     if [ "$resume_mode" = true ]; then
-        [ "$RPC_PORT" = "$LEGACY_MARKER_RPC_PORT" ] \
-            && [ "$P2P_PORT" = "$LEGACY_MARKER_P2P_PORT" ] \
-            && [ "$MODEL_PATH" = "$LEGACY_MARKER_MODEL_PATH" ] \
-            || die "Legacy supervisor configuration changed during pending adoption"
+        if [ "$RPC_PORT" != "$LEGACY_MARKER_RPC_PORT" ] \
+            || [ "$P2P_PORT" != "$LEGACY_MARKER_P2P_PORT" ] \
+            || [ "$MODEL_PATH" != "$LEGACY_MARKER_MODEL_PATH" ]; then
+            die "Legacy supervisor configuration changed during pending adoption"
+        fi
     fi
 }
 
@@ -1573,8 +1587,9 @@ validate_legacy_adoption_marker() {
 
 create_legacy_adoption_marker() {
     local staged_marker marker_mode
-    [ ! -e "$LEGACY_ADOPTION_MARKER" ] && [ ! -L "$LEGACY_ADOPTION_MARKER" ] \
-        || die "Refusing to overwrite an existing legacy-adoption marker"
+    if [ -e "$LEGACY_ADOPTION_MARKER" ] || [ -L "$LEGACY_ADOPTION_MARKER" ]; then
+        die "Refusing to overwrite an existing legacy-adoption marker"
+    fi
     staged_marker="$(install_root_as_owner mktemp "$ARC_DIR/.legacy-adoption.new.XXXXXX")" \
         || die "Could not reserve the legacy-adoption marker"
     if ! legacy_marker_expected \
@@ -1669,7 +1684,9 @@ preserve_legacy_v07_configuration() {
                 "$LEGACY_LINUX_NODE_UNIT" \
                 "$LEGACY_LINUX_UPDATER_SERVICE" \
                 "$LEGACY_LINUX_UPDATER_TIMER"; do
-                [ -f "$source_path" ] && [ ! -L "$source_path" ] || continue
+                if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
+                    continue
+                fi
                 case "$source_path" in
                     "$LEGACY_LINUX_NODE_UNIT") archive_name=legacy-linux-arc-node.service ;;
                     "$LEGACY_LINUX_UPDATER_SERVICE") archive_name=legacy-linux-arc-updater.service ;;
@@ -1683,7 +1700,9 @@ preserve_legacy_v07_configuration() {
             done ;;
         macos-launchd)
             for source_path in "$LEGACY_MAC_NODE_PLIST" "$LEGACY_MAC_UPDATER_PLIST"; do
-                [ -f "$source_path" ] && [ ! -L "$source_path" ] || continue
+                if [ ! -f "$source_path" ] || [ -L "$source_path" ]; then
+                    continue
+                fi
                 if [ "$source_path" = "$LEGACY_MAC_NODE_PLIST" ]; then
                     archive_name=legacy-macos-com.arc.inference.plist
                 else
@@ -1794,10 +1813,12 @@ validate_completed_legacy_adoption() {
     preserved_version="${preserved_version#v}"
     [ "$preserved_version" = "$LEGACY_SOURCE_VERSION" ] \
         || die "Preserved legacy version does not match the pending adoption marker"
-    [ ! -e "$SEED_FILE" ] && [ ! -L "$SEED_FILE" ] \
-        || die "Pending adoption still has an active legacy validator seed"
-    [ ! -e "$ARC_DIR/node.env" ] && [ ! -L "$ARC_DIR/node.env" ] \
-        || die "Pending adoption still has a secret-bearing node.env"
+    if [ -e "$SEED_FILE" ] || [ -L "$SEED_FILE" ]; then
+        die "Pending adoption still has an active legacy validator seed"
+    fi
+    if [ -e "$ARC_DIR/node.env" ] || [ -L "$ARC_DIR/node.env" ]; then
+        die "Pending adoption still has a secret-bearing node.env"
+    fi
     [ "$(sed -n '1p' "$ARC_DIR/install.conf")" = '# ARC installer state v1' ] \
         || die "Pending adoption has an unrecognized v0.8 installer config"
     configured_version="$(sed -n 's/^version=//p' "$ARC_DIR/install.conf")"
@@ -1805,8 +1826,10 @@ validate_completed_legacy_adoption() {
         || die "Pending adoption has an invalid v0.8 configured version"
     node_version="$(read_managed_binary_version "$ARC_DIR/bin/arc-node")"
     cli_version="$(read_managed_binary_version "$ARC_DIR/bin/arc-cli")"
-    [ "$node_version" = "$configured_version" ] && [ "$cli_version" = "$configured_version" ] \
-        || die "Pending adoption binaries do not match install.conf"
+    if [ "$node_version" != "$configured_version" ] \
+        || [ "$cli_version" != "$configured_version" ]; then
+        die "Pending adoption binaries do not match install.conf"
+    fi
     active_address="$(as_target "$ARC_DIR/bin/arc-cli" keygen --verify-keyfile "$KEY_FILE")" \
         || die "Pending adoption validator keyfile failed verification"
     printf '%s\n' "$active_address" | grep -Eq '^[0-9a-f]{64}$' \
@@ -1959,8 +1982,9 @@ if [ "$UNINSTALL" = false ]; then
                 validate_legacy_v07_layout
                 [ "$NODE_DATA_DIR" != "$ARC_DIR/data" ] \
                     || die "Legacy v0.7 data must be preserved; choose a fresh v0.8 data directory"
-                [ ! -e "$NODE_DATA_DIR" ] && [ ! -L "$NODE_DATA_DIR" ] \
-                    || die "Legacy adoption requires a new, unused v0.8 data directory: $NODE_DATA_DIR"
+                if [ -e "$NODE_DATA_DIR" ] || [ -L "$NODE_DATA_DIR" ]; then
+                    die "Legacy adoption requires a new, unused v0.8 data directory: $NODE_DATA_DIR"
+                fi
                 prepare_legacy_supervisor false
                 create_legacy_adoption_marker
                 preserve_legacy_v07_configuration
@@ -2084,8 +2108,9 @@ uninstall_arc() {
             "$ARC_DIR/"*) ;;
             *) warn "External data directory was preserved: $NODE_DATA_DIR" ;;
         esac
-        [ ! -e "$ARC_DIR" ] && [ ! -L "$ARC_DIR" ] \
-            || die "ARC install root could not be completely purged: $ARC_DIR"
+        if [ -e "$ARC_DIR" ] || [ -L "$ARC_DIR" ]; then
+            die "ARC install root could not be completely purged: $ARC_DIR"
+        fi
         ok "Marked ARC install root, identity, and contained chain data removed from $ARC_DIR"
     else
         ok "Programs removed. Identity and chain data remain in $ARC_DIR"
@@ -3061,8 +3086,9 @@ fi
 KEY_FILE_PREEXISTED=false
 if [ -e "$KEY_FILE" ] || [ -L "$KEY_FILE" ]; then
     KEY_FILE_PREEXISTED=true
-    [ -f "$KEY_FILE" ] && [ ! -L "$KEY_FILE" ] \
-        || die "Validator keyfile is not a regular non-symlink file: $KEY_FILE"
+    if [ ! -f "$KEY_FILE" ] || [ -L "$KEY_FILE" ]; then
+        die "Validator keyfile is not a regular non-symlink file: $KEY_FILE"
+    fi
     chmod 600 "$KEY_FILE"
     set_target_owner "$KEY_FILE"
 else
@@ -3089,8 +3115,9 @@ printf '%s\n' "$VALIDATOR_ADDRESS" | grep -Eq '^[0-9a-f]{64}$' \
 # new keyfile preserves the same public identity before retiring the seed.
 if [ -n "$LEGACY_SEED_SOURCE" ] && [ "$KEY_FILE_PREEXISTED" = true ]; then
     IDENTITY_CHECK_FILE="$ARC_DIR/identity/.legacy-validator-key-check.json"
-    [ ! -e "$IDENTITY_CHECK_FILE" ] && [ ! -L "$IDENTITY_CHECK_FILE" ] \
-        || die "Refusing pre-existing legacy identity check path: $IDENTITY_CHECK_FILE"
+    if [ -e "$IDENTITY_CHECK_FILE" ] || [ -L "$IDENTITY_CHECK_FILE" ]; then
+        die "Refusing pre-existing legacy identity check path: $IDENTITY_CHECK_FILE"
+    fi
     as_private_file_owner "$LEGACY_SEED_SOURCE" \
         "$ARC_DIR/bin/arc-cli" keygen --scheme ed25519 \
         --legacy-seed-file "$LEGACY_SEED_SOURCE" \
