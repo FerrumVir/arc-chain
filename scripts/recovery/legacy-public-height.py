@@ -28,6 +28,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from recovery_freeze import FreezeValidationError, validate_pinned_freeze_plan
+from quarantine_rounds import (
+    FLEET_MAP as ROUND_FLEET_MAP,
+    TARGET_HEIGHT_SCHEMA,
+    QuarantineRoundError,
+    validate_target_height_receipt,
+)
 
 
 SCHEMA = "arc.recovery.legacy-public-height.v1"
@@ -307,6 +313,81 @@ def build_receipt(source_main: str, freeze_sha: str, timeout: float) -> dict[str
     }
 
 
+def parse_targets(raw: str) -> tuple[str, ...]:
+    requested = raw.split(",") if raw else []
+    expected_order = [name for name, _host, _origin in FLEET if name in set(requested)]
+    if (not requested or requested != expected_order or len(requested) != len(set(requested))
+            or any(name not in ROUND_FLEET_MAP for name in requested)):
+        fail("targets must be a non-empty, comma-separated subset in fixed fleet order")
+    return tuple(requested)
+
+
+def build_target_receipt(
+    source_main: str, freeze_sha: str, timeout: float, targets: Sequence[str]
+) -> dict[str, Any]:
+    if not (0 < timeout <= 30):
+        fail("timeout must be greater than zero and at most 30 seconds")
+    selected = [(name, host, origin) for name, host, origin in FLEET if name in set(targets)]
+    if [name for name, _host, _origin in selected] != list(targets):
+        fail("target public-height fleet subset differs")
+    started_at = utc_seconds_now();started = time.monotonic_ns()
+    rows_by_name: dict[str, dict[str, Any]] = {};errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected)) as executor:
+        pending = {
+            executor.submit(sample_origin, name, origin, timeout): name
+            for name, _host, origin in selected
+        }
+        for future in concurrent.futures.as_completed(pending):
+            name = pending[future]
+            try: rows_by_name[name] = future.result()
+            except Exception as error: errors.append(f"{name}: {error}")
+    if errors:
+        fail("target legacy public-height sample failed: " + "; ".join(sorted(errors)))
+    rows = [rows_by_name[name] for name in targets]
+    return {
+        "schema": TARGET_HEIGHT_SCHEMA, "source_main_commit": source_main,
+        "freeze_plan_sha256": freeze_sha, "capture_id": capture_id(freeze_sha),
+        "started_at": started_at, "completed_at": utc_seconds_now(),
+        "duration_ms": (time.monotonic_ns() - started) // 1_000_000,
+        "request_policy": {
+            "redirects": "forbidden", "maximum_body_bytes": MAX_BODY_BYTES,
+            "timeout_seconds": timeout, "proxy_environment": "ignored",
+            "sequence": ["/info", "/block/latest", "/info"],
+        },
+        "targets": [
+            {"node": name, "host": host, "rpc_origin": origin}
+            for name, host, origin in selected
+        ],
+        "origins": rows,
+        "legacy_public_max_height": max(row["info_after_height"] for row in rows),
+    }
+
+
+def validate_target_receipt_live(
+    value: Any, *, source_main: str, freeze_sha: str, targets: Sequence[str],
+    now: dt.datetime | None = None, max_age_seconds: int = MAX_RECEIPT_AGE_SECONDS,
+) -> int:
+    if not isinstance(value, dict) or value.get("source_main_commit") != require_commit(
+        source_main, "source main commit"
+    ):
+        fail("target height receipt source binding differs")
+    try:
+        _started, completed, maximum = validate_target_height_receipt(
+            value, capture_id=capture_id(freeze_sha), freeze_sha256=freeze_sha,
+            targets=targets,
+        )
+    except QuarantineRoundError as error:
+        fail(str(error))
+    if (isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, int)
+            or not 1 <= max_age_seconds <= MAX_RECEIPT_AGE_SECONDS):
+        fail("maximum receipt age must be between 1 and 300 seconds")
+    age = ((now or dt.datetime.now(dt.timezone.utc)) - completed).total_seconds()
+    if age < -5: fail("target height receipt completion time is in the future")
+    if age > max_age_seconds:
+        fail(f"target height receipt is stale ({int(age)}s old; maximum {max_age_seconds}s)")
+    return maximum
+
+
 def create_private_receipt(path: Path, value: Mapping[str, Any]) -> None:
     if path.suffix != ".json":
         fail("receipt output must have a .json suffix")
@@ -437,20 +518,39 @@ def load_and_validate_receipt(
     return value, maximum
 
 
+def load_and_validate_target_receipt(
+    path: Path, *, source_main: str, freeze_sha: str, targets: Sequence[str],
+    now: dt.datetime | None = None, max_age_seconds: int = MAX_RECEIPT_AGE_SECONDS,
+) -> tuple[Mapping[str, Any], int]:
+    payload = read_locked(path, expected_mode=0o400)
+    try:value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"target height receipt is invalid JSON: {error}")
+    if not isinstance(value, dict) or canonical_bytes(value) != payload:
+        fail("target height receipt must be canonical JSON")
+    maximum = validate_target_receipt_live(
+        value, source_main=source_main, freeze_sha=freeze_sha, targets=targets,
+        now=now, max_age_seconds=max_age_seconds,
+    )
+    return value, maximum
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    for name in ("sample", "verify"):
+    for name in ("sample", "verify", "sample-targets", "verify-targets"):
         command = commands.add_parser(name)
         command.add_argument("--source-main", required=True)
         command.add_argument("--freeze-plan", required=True, type=Path)
         command.add_argument("--freeze-plan-sha256", required=True)
-        if name == "sample":
+        if name in {"sample", "sample-targets"}:
             command.add_argument("--output", required=True, type=Path)
             command.add_argument("--timeout-seconds", type=float, default=10.0)
         else:
             command.add_argument("--receipt", required=True, type=Path)
             command.add_argument("--max-age-seconds", type=int, default=MAX_RECEIPT_AGE_SECONDS)
+        if name in {"sample-targets", "verify-targets"}:
+            command.add_argument("--targets", required=True)
     return root
 
 
@@ -463,9 +563,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_receipt(receipt, source_main=args.source_main, freeze_sha=args.freeze_plan_sha256)
             create_private_receipt(args.output, receipt)
             print(json.dumps({"receipt_sha256": sha256_bytes(canonical_bytes(receipt)), "legacy_public_max_height": receipt["legacy_public_max_height"]}, sort_keys=True, separators=(",", ":")))
-        else:
+        elif args.command == "verify":
             value, maximum = load_and_validate_receipt(args.receipt, source_main=args.source_main, freeze_sha=args.freeze_plan_sha256, max_age_seconds=args.max_age_seconds)
             print(json.dumps({"receipt_sha256": sha256_bytes(canonical_bytes(value)), "legacy_public_max_height": maximum}, sort_keys=True, separators=(",", ":")))
+        elif args.command == "sample-targets":
+            targets = parse_targets(args.targets)
+            receipt = build_target_receipt(
+                args.source_main, args.freeze_plan_sha256, args.timeout_seconds, targets
+            )
+            validate_target_receipt_live(
+                receipt, source_main=args.source_main, freeze_sha=args.freeze_plan_sha256,
+                targets=targets,
+            )
+            create_private_receipt(args.output, receipt)
+            print(json.dumps({"receipt_sha256": sha256_bytes(canonical_bytes(receipt)),
+                              "legacy_public_max_height": receipt["legacy_public_max_height"],
+                              "targets": list(targets)}, sort_keys=True, separators=(",", ":")))
+        else:
+            targets = parse_targets(args.targets)
+            value, maximum = load_and_validate_target_receipt(
+                args.receipt, source_main=args.source_main, freeze_sha=args.freeze_plan_sha256,
+                targets=targets, max_age_seconds=args.max_age_seconds,
+            )
+            print(json.dumps({"receipt_sha256": sha256_bytes(canonical_bytes(value)),
+                              "legacy_public_max_height": maximum, "targets": list(targets)},
+                             sort_keys=True, separators=(",", ":")))
         return 0
     except (HeightReceiptError, OSError) as error:
         print(f"legacy public height: {error}", file=sys.stderr)

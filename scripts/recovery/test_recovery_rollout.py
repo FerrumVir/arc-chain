@@ -24,6 +24,7 @@ assert SPEC and SPEC.loader
 rollout = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = rollout
 SPEC.loader.exec_module(rollout)
+quarantine_rounds = rollout.quarantine_rounds
 PRODUCTION_CADDY_SHA256 = rollout.CADDY_LINUX_AMD64_SHA256
 
 
@@ -500,6 +501,91 @@ class RecoveryRolloutTests(unittest.TestCase):
         return ManifestFixture(self.root, **kwargs).value
 
     @staticmethod
+    def reward_receipt_row(
+        item,
+        block,
+        *,
+        worker=None,
+        recovery_epoch=1,
+        validator_set_id=1,
+        transaction_domain=None,
+    ):
+        worker = worker or item.worker
+        transaction_domain = transaction_domain or ("0x" + "5" * 64)
+        return {
+            "tx_type": "0x25",
+            "tx_hash": item.tx_hash,
+            "job_id": item.job_id,
+            "worker": worker,
+            "model_id": "0x" + "1" * 64,
+            "input_hash": "0x" + "2" * 64,
+            "output_hash": "0x" + "3" * 64,
+            "assignment_epoch": "0x" + "4" * 64,
+            "recovery_epoch": recovery_epoch,
+            "validator_set_id": validator_set_id,
+            "transaction_domain": transaction_domain,
+            "block_height": block[0],
+            "block_hash": block[1],
+            "index": block[2],
+            "submitted": True,
+            "included": True,
+            "confirmed": True,
+            "success": True,
+            "receipt_url": f"/community/reward_receipt/{item.tx_hash}",
+            "reward_base": 2_500_000_000,
+            "reward_arc": 2.5,
+        }
+
+    @staticmethod
+    def reward_earnings(worker, rows, **overrides):
+        count = len(rows)
+        gross_base = count * 2_500_000_000
+        body = {
+            "address": worker,
+            "archive_mode": True,
+            "history_complete_since_recovery": True,
+            "history_scope": rollout.ARCHIVE_EARNINGS_SCOPE,
+            "history_domain": rollout.EARNINGS_HISTORY_DOMAIN,
+            "confirmed_receipt_count": count,
+            "confirmed_gross_earnings_base": gross_base,
+            "confirmed_gross_earnings_arc": gross_base / 1_000_000_000,
+            "confirmed_receipts": copy.deepcopy(rows),
+            "attestations_per_day_observed": None,
+            "attestations_per_day_unavailable_reason": (
+                rollout.PROJECTION_COLLECTING_REASON
+                if count < 3
+                else rollout.PROJECTION_WINDOW_COLLECTING_REASON
+            ),
+            "projected_daily_arc": None,
+            "projected_daily_unavailable_reason": (
+                rollout.PROJECTION_COLLECTING_REASON
+                if count < 3
+                else rollout.PROJECTION_WINDOW_COLLECTING_REASON
+            ),
+            "observed_window_first_timestamp_ms": None,
+            "observed_window_last_timestamp_ms": None,
+        }
+        body.update(overrides)
+        return body
+
+    @classmethod
+    def install_reward_baseline(cls, harness, worker, rows=()):
+        baseline = rollout.RewardEarningsBaseline.from_earnings(
+            cls.reward_earnings(worker, list(rows)), worker=worker
+        )
+        harness.reward_earnings_baselines = {worker: baseline}
+        harness.reward_earnings_baseline = baseline
+        return baseline
+
+    @classmethod
+    def persist_reward_baseline(cls, harness, worker, rows=()):
+        baseline = rollout.RewardEarningsBaseline.from_earnings(
+            cls.reward_earnings(worker, list(rows)), worker=worker
+        )
+        harness.persist_reward_earnings_baselines([baseline])
+        return baseline
+
+    @staticmethod
     def prime_interlock_interpreters(harness):
         harness.legacy_interlock_interpreters = {
             node["name"]: {
@@ -541,6 +627,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             "caddy_binary_sha256": rollout.CADDY_LINUX_AMD64_SHA256,
             "acme_directory": rollout.LETS_ENCRYPT_PRODUCTION_DIRECTORY,
             "acme_profile": "shortlived",
+            "renewal_window_ratio": rollout.TLS_RENEWAL_WINDOW_RATIO,
             "verification_host": node["host"],
             "san_ip_addresses": [node["host"]],
             "san_dns_names": [],
@@ -581,6 +668,13 @@ class RecoveryRolloutTests(unittest.TestCase):
         value["archive"]["destination"] = (
             f"arc-drive:ARC Chain Recovery/captures/{capture_id}"
         )
+        remote_verification = value["provenance"]["offline_stop_verification"]
+        remote_verification["freeze_plan_sha256"] = freeze_sha
+        remote_verification["capture_id"] = capture_id
+        for row in remote_verification["nodes"]:
+            row["status"]["freeze_plan_sha256"] = freeze_sha
+            row["status"]["capture_id"] = capture_id
+            row["status_sha256"] = sha_value(row["status"])
         challenge = "7" * 64
         public_origins = []
         authenticated_nodes = []
@@ -657,8 +751,529 @@ class RecoveryRolloutTests(unittest.TestCase):
             )
             return {"value": inner, "sha256": root}
 
+        target_public_origins = []
+        for index, row in enumerate(public_origins):
+            target_public_origins.append({
+                **row,
+                "latest_block_hash": f"{index + 2000:064x}",
+                "info_before_body_sha256": f"{index + 2100:064x}",
+                "latest_block_body_sha256": f"{index + 2200:064x}",
+                "info_after_body_sha256": f"{index + 2300:064x}",
+            })
+        target_rows = [
+            {"node": node, "host": host, "rpc_origin": f"http://{host}:9090"}
+            for node, host in rollout.PRODUCTION_FLEET
+        ]
+        target_public = {
+            "schema": quarantine_rounds.TARGET_HEIGHT_SCHEMA,
+            "source_main_commit": source_commit,
+            "freeze_plan_sha256": freeze_sha,
+            "capture_id": capture_id,
+            "started_at": "2026-08-28T11:59:50Z",
+            "completed_at": "2026-08-28T11:59:52Z",
+            "duration_ms": 2000,
+            "request_policy": {
+                "redirects": "forbidden", "maximum_body_bytes": 1048576,
+                "timeout_seconds": 10, "proxy_environment": "ignored",
+                "sequence": ["/info", "/block/latest", "/info"],
+            },
+            "targets": target_rows,
+            "origins": target_public_origins,
+            "legacy_public_max_height": max(
+                row["info_after_height"] for row in target_public_origins
+            ),
+        }
+        target_cross_nodes = []
+        live_targets = []
+        for index, ((node, host), public_row) in enumerate(
+            zip(rollout.PRODUCTION_FLEET, target_public_origins)
+        ):
+            boot_id = f"00000000-0000-0000-0000-{index + 1:012d}"
+            writer = {
+                "node": node, "host": host, "boot_id": boot_id,
+                "writer_pid": 1000 + index, "writer_start_ticks": 2000 + index,
+                "writer_cgroup_sha256": f"{index + 900:064x}",
+            }
+            live_targets.append(writer)
+            target_cross_nodes.append({
+                **writer,
+                "public_info_after_height": public_row["info_after_height"],
+                "public_latest_block_height": public_row["latest_block_height"],
+                "public_latest_block_hash": public_row["latest_block_hash"],
+                "loopback_info_before_height": public_row["info_after_height"] + 3,
+                "loopback_latest_height": public_row["info_after_height"] + 3,
+                "loopback_info_after_height": public_row["info_after_height"] + 3,
+                "loopback_latest_block_hash": public_row["latest_block_hash"],
+                "response_sha256": {
+                    "/info:before": f"{index + 2400:064x}",
+                    "/block/latest": f"{index + 2500:064x}",
+                    "/info:after": f"{index + 2600:064x}",
+                },
+            })
+        target_cross = {
+            "schema": quarantine_rounds.TARGET_CROSS_SCHEMA,
+            "source_main_commit": source_commit,
+            "freeze_plan_sha256": freeze_sha,
+            "capture_id": capture_id,
+            "legacy_public_height_receipt_sha256": sha_value(target_public),
+            "challenge": challenge,
+            "started_at": "2026-08-28T11:59:53Z",
+            "completed_at": "2026-08-28T11:59:54Z",
+            "conservative_height_floor": min(
+                row["loopback_info_before_height"] for row in target_cross_nodes
+            ),
+            "targets": copy.deepcopy(target_rows),
+            "nodes": target_cross_nodes,
+        }
+
+        def preauthorization_capture(index, target, public_row, cross_row):
+            seed = 20_000 + index * 100
+
+            def directory(offset):
+                return {
+                    "device": seed + offset,
+                    "inode": seed + offset + 1,
+                    "mode": 0o40700,
+                    "uid": 0,
+                    "gid": 0,
+                    "nlink": 2,
+                    "mtime_ns": seed + offset + 2,
+                    "ctime_ns": seed + offset + 3,
+                }
+
+            def regular(offset, root, size=8):
+                return {
+                    "device": seed + offset,
+                    "inode": seed + offset + 1,
+                    "mode": 0o100400,
+                    "uid": 0,
+                    "gid": 0,
+                    "nlink": 1,
+                    "mtime_ns": seed + offset + 2,
+                    "ctime_ns": seed + offset + 3,
+                    "sha256": root,
+                    "size": size,
+                }
+
+            public_latest = public_row["latest_block_height"]
+            cross_latest = cross_row["loopback_latest_height"]
+            head = {
+                "height": max(
+                    public_latest,
+                    cross_latest,
+                    public_row["info_after_height"],
+                    cross_row["loopback_info_after_height"],
+                ),
+                "block_hash": cross_row["loopback_latest_block_hash"],
+                "state_root": f"{seed + 10:064x}",
+            }
+            wal_root = f"{seed + 11:064x}"
+            snapshot_root = f"{seed + 12:064x}"
+            genesis_root = f"{seed + 13:064x}"
+            legacy_root = f"{seed + 14:064x}"
+            rust_capture = {
+                "schema": quarantine_rounds.RUST_SOURCE_CAPTURE_SCHEMA,
+                "captured_at_unix_ms": 1_777_000_000_000 + index,
+                "head": head,
+                "source_data_dir": directory(20),
+                "source_wal_prefix": {
+                    "device": seed + 30,
+                    "inode": seed + 31,
+                    "mode": 0o100600,
+                    "uid": 0,
+                    "gid": 0,
+                    "nlink": 1,
+                    "loader_observed_bytes": 8,
+                    "copy_observed_bytes": 8,
+                    "accepted_prefix_bytes": 8,
+                    "accepted_prefix_sha256": wal_root,
+                    "quarantined_suffix_bytes_at_loader": 0,
+                    "loader_tail_reason": "clean-eof",
+                },
+                "source_snapshot": regular(40, snapshot_root),
+                "genesis": regular(50, genesis_root),
+                "legacy_validator_set": regular(60, legacy_root),
+                "fixed_pair": {
+                    "data_dir": directory(70),
+                    "state_wal": regular(80, wal_root),
+                    "snapshot": regular(90, snapshot_root),
+                    "genesis_binding": regular(100, f"{seed + 15:064x}"),
+                    "strict_replay": True,
+                },
+                "allow_unbound_legacy_wal": False,
+            }
+            capture = {
+                "schema": quarantine_rounds.LIVE_SOURCE_CAPTURE_SCHEMA,
+                "capture_id": capture_id,
+                "freeze_plan_sha256": freeze_sha,
+                "source_main_commit": source_commit,
+                "round_number": 1,
+                "node": target["node"],
+                "host": target["host"],
+                "authorized_writer": {
+                    "boot_id": target["boot_id"],
+                    "pid": target["writer_pid"],
+                    "start_ticks": target["writer_start_ticks"],
+                    "cgroup_sha256": target["writer_cgroup_sha256"],
+                },
+                "rpc_origin": "http://127.0.0.1:9090",
+                "public_height_receipt_sha256": sha_value(target_public),
+                "authenticated_height_cross_proof_sha256": sha_value(target_cross),
+                "snapshot_endpoint": "/sync/snapshot",
+                "snapshot_listener": {
+                    "boot_id": target["boot_id"],
+                    "pid": target["writer_pid"],
+                    "start_ticks": target["writer_start_ticks"],
+                    "port": 9090,
+                    "socket_inode": seed + 16,
+                },
+                "capture_attempt_id": f"00000000-0000-4000-8000-{index + 1:012d}",
+                "capture_started_at": "2026-08-28T11:59:54Z",
+                "capture_completed_at": "2026-08-28T11:59:54Z",
+                "inspector_binary_sha256": f"{seed + 17:064x}",
+                "genesis_sha256": genesis_root,
+                "legacy_validator_set_sha256": legacy_root,
+                "fixed_pair_path": (
+                    f"/root/arc-recovery-live-source-captures/{capture_id}/"
+                    f"{target['node']}/round-1/preauthorization-boundary/"
+                    f"attempt-{index + 1}/fixed-source"
+                ),
+                "snapshot_source": "sealed-writer-owned-loopback-/sync/snapshot",
+                "existing_source_snapshot_used": False,
+                "rust_capture": quarantine_rounds.wrap(rust_capture),
+                "head": head,
+                "ancestry_checks": [
+                    {
+                        "label": "public-latest",
+                        "height": public_latest,
+                        "expected_block_hash": public_row["latest_block_hash"],
+                        "observed_block_hash": public_row["latest_block_hash"],
+                        "state_root": f"{seed + 18:064x}",
+                        "inspection_sha256": f"{seed + 19:064x}",
+                    },
+                    {
+                        "label": "authenticated-loopback-latest",
+                        "height": cross_latest,
+                        "expected_block_hash": cross_row["loopback_latest_block_hash"],
+                        "observed_block_hash": cross_row["loopback_latest_block_hash"],
+                        "state_root": f"{seed + 20:064x}",
+                        "inspection_sha256": f"{seed + 21:064x}",
+                    },
+                ],
+                "content_sealed": True,
+                "strict_offline_replay": True,
+                "source_pair_role": "preauthorization-boundary",
+                "minimum_height": max(
+                    public_row["info_after_height"],
+                    cross_row["loopback_info_after_height"],
+                ),
+                "expected_head": None,
+                "boundary_proof_sha256": sha_value(target_cross),
+                "network_quarantine_receipt_sha256": None,
+                "owned_ruleset_stateless_sha256": None,
+            }
+            return quarantine_rounds.wrap(capture)
+
+        round_authorization = {
+            "schema": quarantine_rounds.ROUND_AUTH_SCHEMA,
+            "source_main_commit": source_commit,
+            "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha,
+            "round_number": 1,
+            "prior_round_result_sha256s": [],
+            "prior_fenced": [],
+            "targets": live_targets,
+            "public_height_receipt": quarantine_rounds.wrap(target_public),
+            "authenticated_height_cross_proof": quarantine_rounds.wrap(target_cross),
+            "live_source_captures": [
+                preauthorization_capture(index, target, public_row, cross_row)
+                for index, (target, public_row, cross_row) in enumerate(
+                    zip(live_targets, target_public_origins, target_cross_nodes)
+                )
+            ],
+            "authorized_at": "2026-08-28T11:59:55Z",
+            "authorization_deadline": "2026-08-28T12:04:52Z",
+        }
+        round_auth_sha = sha_value(round_authorization)
+        round_readiness = {
+            "schema": quarantine_rounds.READINESS_SCHEMA,
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "round_number": 1, "round_authorization_sha256": round_auth_sha,
+            "targets": [
+                {
+                    "node": target["node"], "host": target["host"],
+                    "authorization_acceptance": quarantine_rounds.wrap({
+                        "schema": quarantine_rounds.AUTH_ACCEPTANCE_SCHEMA,
+                        "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                        "round_number": 1,
+                        "round_authorization_sha256": round_auth_sha,
+                        "node": target["node"], "host": target["host"],
+                        "accepted_at": round_authorization["authorized_at"],
+                        "authorization_deadline": round_authorization[
+                            "authorization_deadline"
+                        ],
+                    }),
+                }
+                for target in live_targets
+            ],
+            "completed_at": round_authorization["authorized_at"],
+            "authorization_deadline": round_authorization["authorization_deadline"],
+        }
+        round_readiness_sha = sha_value(round_readiness)
+        network_receipts_by_node = {}
+        applied_values = []
+        for index, ((node, host), target, public_row) in enumerate(
+            zip(rollout.PRODUCTION_FLEET, live_targets, target_public_origins)
+        ):
+            head = tuple_at(public_row["info_after_height"] + 3, index + 20)
+            head["block_hash"] = public_row["latest_block_hash"]
+            network_receipt = {
+                "schema": "arc.recovery.legacy-network-quarantine.v1",
+                "capture_id": capture_id, "node": node, "host": host,
+                "freeze_plan_sha256": freeze_sha,
+                "source_main_commit": source_commit,
+                "owned_ruleset_stateless_sha256": f"{index + 600:064x}",
+                "file_sha256": {
+                    "policy.nft": f"{index + 2700:064x}",
+                    "apply": value["archive"]["remote_helper_sha256"],
+                },
+                "installed_at": first,
+                "loopback_head": {
+                    "latest_height": head["height"],
+                    "info_after_height": head["height"],
+                    "block_hash": head["block_hash"],
+                    "state_root": head["state_root"],
+                },
+            }
+            binding = {
+                "schema": quarantine_rounds.TABLE_BINDING_SCHEMA,
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_number": 1, "round_authorization_sha256": round_auth_sha,
+                "round_readiness_sha256": round_readiness_sha,
+                "authorization_deadline": round_authorization[
+                    "authorization_deadline"
+                ],
+                "apply_helper_sha256": value["archive"]["remote_helper_sha256"],
+                "policy_sha256": network_receipt["file_sha256"]["policy.nft"],
+                "node": node, "host": host,
+                "writer": {
+                    "boot_id": target["boot_id"], "pid": target["writer_pid"],
+                    "start_ticks": target["writer_start_ticks"],
+                    "cgroup_sha256": target["writer_cgroup_sha256"],
+                },
+            }
+            binding_sha = sha_value(binding)
+            gate = {
+                "schema": quarantine_rounds.NFT_GATE_SCHEMA,
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_authorization_sha256": round_auth_sha,
+                "round_readiness_sha256": round_readiness_sha,
+                "round_number": 1, "node": node, "host": host,
+                "authorization_deadline": round_authorization["authorization_deadline"],
+                "invoked_at": first,
+                "apply_helper_sha256": value["archive"]["remote_helper_sha256"],
+                "policy_sha256": network_receipt["file_sha256"]["policy.nft"],
+                "table_binding_sha256": binding_sha,
+                "table_comment": (
+                    f"arc-recovery:round=1:bind={binding_sha}:node={node}"
+                ),
+            }
+            cross_row = next(
+                row for row in target_cross_nodes if row["node"] == node
+            )
+            ancestry = {
+                "schema": quarantine_rounds.ANCESTRY_SCHEMA,
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_authorization_sha256": round_auth_sha,
+                "round_number": 1, "node": node, "host": host,
+                "checks": [
+                    {
+                        "label": "public-latest",
+                        "height": public_row["latest_block_height"],
+                        "expected_block_hash": public_row["latest_block_hash"],
+                        "observed_block_hash": public_row["latest_block_hash"],
+                        "response_sha256": f"{index + 2800:064x}",
+                    },
+                    {
+                        "label": "authenticated-loopback-latest",
+                        "height": cross_row["loopback_latest_height"],
+                        "expected_block_hash": cross_row["loopback_latest_block_hash"],
+                        "observed_block_hash": cross_row["loopback_latest_block_hash"],
+                        "response_sha256": f"{index + 2900:064x}",
+                    },
+                ],
+            }
+            applied_commit = {
+                "schema": "arc.recovery.quarantine-nft-applied-commit.v1",
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_number": 1, "round_authorization_sha256": round_auth_sha,
+                "round_readiness_sha256": round_readiness_sha,
+                "node": node, "host": host,
+                "nft_deadline_gate_sha256": sha_value(gate),
+                "table_binding_sha256": binding_sha,
+                "table_comment": gate["table_comment"],
+                "apply_helper_sha256": value["archive"]["remote_helper_sha256"],
+                "nft_policy_source_sha256": network_receipt["file_sha256"]["policy.nft"],
+                "owned_ruleset_stateless_sha256": network_receipt[
+                    "owned_ruleset_stateless_sha256"
+                ],
+                "nft_applied_at": first,
+            }
+            apply_intent = {
+                "schema": quarantine_rounds.NFT_INTENT_SCHEMA,
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "source_main_commit": source_commit, "round_number": 1,
+                "round_authorization_sha256": round_auth_sha,
+                "round_readiness_sha256": round_readiness_sha,
+                "authorization_deadline": round_authorization["authorization_deadline"],
+                "node": node, "host": host, "writer": binding["writer"],
+                "table_binding_sha256": binding_sha,
+                "table_comment": gate["table_comment"],
+                "apply_helper_sha256": value["archive"]["remote_helper_sha256"],
+                "nft_policy_source_sha256": network_receipt["file_sha256"]["policy.nft"],
+                "prepared_at": "2026-08-28T11:59:56Z",
+            }
+            restart_sha = f"{index + 3600:064x}"
+            network_receipt.update({
+                "round_number": 1,
+                "round_authorization_sha256": round_auth_sha,
+                "round_readiness_sha256": round_readiness_sha,
+                "nft_deadline_gate_sha256": sha_value(gate),
+                "nft_apply_intent_sha256": sha_value(apply_intent),
+                "nft_apply_intent": quarantine_rounds.wrap(apply_intent),
+                "nft_table_binding_sha256": binding_sha,
+                "nft_table_binding": binding,
+                "table_comment": gate["table_comment"],
+                "nft_table_comment": gate["table_comment"],
+                "nft_policy_source_sha256": network_receipt["file_sha256"]["policy.nft"],
+                "apply_helper_sha256": value["archive"]["remote_helper_sha256"],
+                "applied_commit_sha256": sha_value(applied_commit),
+                "authorization_ancestry_proof_sha256": sha_value(ancestry),
+                "boot_id": target["boot_id"],
+                "writer": {
+                    "pid": target["writer_pid"], "start_ticks": target["writer_start_ticks"],
+                    "cgroup_sha256": target["writer_cgroup_sha256"],
+                },
+                "table": {
+                    "family": "inet", "name": "arc_legacy_maintenance_v1",
+                    "priority": -310,
+                    "hooks": ["prerouting", "input", "forward", "output"],
+                    "policy": "accept", "comment": gate["table_comment"],
+                    "loopback_retained": True,
+                },
+                "quarantine_policy": {
+                    "mode": "deny-all-nonloopback-except-host-maintenance",
+                    "families": ["ipv4", "ipv6"],
+                    "directions": ["input", "output", "forward"],
+                    "allowed": ["loopback", "ssh-tcp-22", "dhcpv4-67-68",
+                                "dhcpv6-546-547", "icmpv6-ndp-ra-packet-too-big"],
+                    "priority_before_conntrack": True, "established_bypass": False,
+                    "legacy_rpc_p2p_web_dynamic_all_blocked": True,
+                },
+                "persistence": {
+                    "unit_path": "/etc/systemd/system/arc-legacy-maintenance-fence.service",
+                    "unit_enabled": True, "unit_active": True,
+                    "state_path": "/etc/arc-recovery/network-fence-rounds/fixture",
+                    "active_selector_path": "/run/arc-recovery/active-network-fence",
+                    "automatic_unfence": False,
+                },
+                "tool_sha256": {"/usr/sbin/nft": f"{index + 3000:064x}"},
+                "stable_head": head,
+                "authorization_ancestry_proof": quarantine_rounds.wrap(ancestry),
+                "nft_deadline_gate": quarantine_rounds.wrap(gate),
+                "applied_commit": quarantine_rounds.wrap(applied_commit),
+                "global_absence_claimed": False,
+                "threat_model": {
+                    "legacy_binary": "reviewed-non-adversarial-exact-hash",
+                    "legacy_binary_sha256": value["archive"]["remote_helper_sha256"],
+                },
+            })
+            network_receipt["file_sha256"] = {
+                "authorization.json": round_auth_sha,
+                "readiness.json": round_readiness_sha,
+                "contract.json": f"{index + 3700:064x}",
+                "table-binding.json": binding_sha,
+                "nft-apply-intent.json": sha_value(apply_intent),
+                "policy.nft": network_receipt["nft_policy_source_sha256"],
+                "apply": network_receipt["apply_helper_sha256"],
+                "nft": network_receipt["tool_sha256"]["/usr/sbin/nft"],
+                "nft-deadline-gate.json": sha_value(gate),
+                "applied.commit.json": sha_value(applied_commit),
+                "persistent-restart-fence.json": restart_sha,
+                "rendered-policy.nft": f"{index + 3800:064x}",
+                "/usr/local/libexec/arc-legacy-maintenance-fence": f"{index + 3900:064x}",
+                "/etc/systemd/system/arc-legacy-maintenance-fence.service": f"{index + 4000:064x}",
+                "/etc/systemd/system/arc-self-heal.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 4100:064x}",
+                "/etc/systemd/system/arc-node.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 4200:064x}",
+                "/etc/systemd/system/arc-node-update.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 4300:064x}",
+                "/etc/systemd/system/arc-node-update.timer.d/zzzy-arc-recovery-network-fence.conf": f"{index + 4400:064x}",
+            }
+            network_receipt["loopback_head"].update({
+                "rpc_origin": "http://127.0.0.1:9090",
+                "info_before_height": head["height"],
+                "block_height": head["height"],
+                "response_sha256": {
+                    "/info:before": f"{index + 3100:064x}",
+                    "/block/latest": f"{index + 3200:064x}",
+                    f"/block/{head['height']}": f"{index + 3300:064x}",
+                    "/health": f"{index + 3400:064x}",
+                    "/info:after": f"{index + 3500:064x}",
+                },
+                "stable_attempt": 1,
+            })
+            network_receipts_by_node[node] = network_receipt
+            applied_values.append({
+                "schema": quarantine_rounds.NODE_APPLIED_SCHEMA,
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_authorization_sha256": round_auth_sha,
+                "round_readiness_sha256": round_readiness_sha,
+                "round_number": 1, "node": node, "host": host,
+                "boot_id": target["boot_id"], "writer_pid": target["writer_pid"],
+                "writer_start_ticks": target["writer_start_ticks"],
+                "writer_cgroup_sha256": target["writer_cgroup_sha256"],
+                "nft_policy_source_sha256": network_receipt["file_sha256"]["policy.nft"],
+                "owned_ruleset_stateless_sha256": network_receipt[
+                    "owned_ruleset_stateless_sha256"
+                ],
+                "nft_applied_at": first,
+                "nft_deadline_gate": quarantine_rounds.wrap(gate),
+                "network_quarantine_receipt": quarantine_rounds.wrap(network_receipt),
+                "network_quarantine_receipt_sha256": sha_value(network_receipt),
+                "stable_head": head,
+                "authorization_ancestry_proof": quarantine_rounds.wrap(ancestry),
+                "persistent_restart_fence_sha256": restart_sha,
+            })
+        round_result = {
+            "schema": quarantine_rounds.ROUND_RESULT_SCHEMA,
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "round_number": 1, "round_authorization_sha256": round_auth_sha,
+            "target_readiness": quarantine_rounds.wrap(round_readiness),
+            "transitions": [quarantine_rounds.wrap(item) for item in applied_values],
+            "remaining_targets": [], "completed_at": stopped_at,
+        }
+        generation_ledger = {
+            "schema": quarantine_rounds.LEDGER_SCHEMA,
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "fleet": [
+                {"node": node, "host": host}
+                for node, host in rollout.PRODUCTION_FLEET
+            ],
+            "rounds": [{
+                "authorization": quarantine_rounds.wrap(round_authorization),
+                "result": quarantine_rounds.wrap(round_result),
+            }],
+            "first_secured_at": first,
+            "all_nodes_secured_at": first,
+            "legacy_cutoff_height": max(
+                [target_public["legacy_public_max_height"]]
+                + [item["stable_head"]["height"] for item in applied_values]
+            ),
+        }
         authenticated_sealed = sealed(
             authenticated, "fleet", "authenticated-prefence-height-cross-proof"
+        )
+        generation_sealed = sealed(
+            generation_ledger, "fleet", "quarantine-generation-ledger"
         )
         challenge_sealed = sealed(
             challenge_value, "fleet", "network-quarantine-challenge"
@@ -666,7 +1281,7 @@ class RecoveryRolloutTests(unittest.TestCase):
         stability_nodes = []
         stability_heads = []
         for index, (node, host) in enumerate(rollout.PRODUCTION_FLEET):
-            receipt_sha = f"{index + 300:064x}"
+            receipt_sha = sha_value(network_receipts_by_node[node])
             stable_head = tuple_at(public_origins[index]["info_after_height"] + 5, index + 40)
             samples = []
             counters = []
@@ -767,6 +1382,11 @@ class RecoveryRolloutTests(unittest.TestCase):
             "monotonic_elapsed_ns": 120_000_000_000,
             "fleet_heads": stability_heads,
             "nodes": stability_nodes,
+            "quarantine_generation_ledger_sha256": generation_sealed["sha256"],
+            "active_transition_sha256s": [
+                {"node": item["node"], "sha256": sha_value(item)}
+                for item in applied_values
+            ],
             "global_absence_claimed": False,
         }
         stability_sealed = sealed(
@@ -776,6 +1396,7 @@ class RecoveryRolloutTests(unittest.TestCase):
         retained_by_node = {}
         wrapper_specs = (
             ("stopped_status", "stopped-status"),
+            ("network_quarantine_receipt", "network-quarantine-receipt"),
             ("quarantine_status", "quarantine-status"),
             ("quarantine_monitor", "network-quarantine-monitor"),
             ("post_proof_quarantine_status", "post-proof-quarantine-status"),
@@ -789,18 +1410,30 @@ class RecoveryRolloutTests(unittest.TestCase):
                 "node": node,
                 "freeze_plan_sha256": freeze_sha,
             }
-            receipt_sha = f"{index + 300:064x}"
+            receipt_sha = sha_value(network_receipts_by_node[node])
+            persisted_head = tuple_at(
+                public_origins[index]["info_after_height"] + 6, index + 60
+            )
             objects = {
                 "stopped_status": {
                     "schema": "arc.recovery.offline-stop-status.v1",
                     **identity,
+                    "validator_address": value["validators"][index]["address"],
+                    "stake": value["validators"][index]["stake"],
                     "stopped": True,
                     "restart_fenced": True,
+                    "stop_schema": "arc.recovery.offline-stop.v4",
+                    "stop_complete_sha256": f"{index + 20:064x}",
+                    "stop_files_sha256": f"{index + 40:064x}",
                 },
+                "network_quarantine_receipt": network_receipts_by_node[node],
                 "quarantine_status": {
                     "schema": "arc.recovery.legacy-network-quarantine-status.v1",
                     **identity,
                     "receipt_sha256": receipt_sha,
+                    "owned_ruleset_stateless_sha256": network_receipts_by_node[node][
+                        "owned_ruleset_stateless_sha256"
+                    ],
                     "active": True,
                     "enabled": True,
                 },
@@ -862,7 +1495,33 @@ class RecoveryRolloutTests(unittest.TestCase):
                     "schema": "arc.recovery.persisted-legacy-head.v1",
                     **identity,
                     "source_main_commit": source_commit,
+                    "source_pair_role": "post-quarantine-final-export",
+                    "final_source_capture_sha256": f"{index + 5000:064x}",
+                    "selected_source_head": copy.deepcopy(persisted_head),
+                    "stop_after_round_receipt_sha256": f"{index + 5100:064x}",
                     "network_quarantine_receipt_sha256": receipt_sha,
+                    "state_wal_sha256": f"{index + 5200:064x}",
+                    "state_wal_size": 8,
+                    "head": persisted_head,
+                    "archived_final_wal": {
+                        "path": f"/private/archive/{node}/state.wal",
+                        "sha256": f"{index + 5300:064x}",
+                        "size": 8,
+                        "file_identity": {
+                            "device": 500 + index,
+                            "inode": 600 + index,
+                            "size": 8,
+                            "mode": 0o100600,
+                        },
+                        "selected_prefix_bytes": 8,
+                        "selected_prefix_sha256": f"{index + 5200:064x}",
+                        "post_capture_suffix_bytes": 0,
+                        "post_capture_suffix_sha256": None,
+                        "post_capture_suffix_classification": "none",
+                        "preserved_by": (
+                            "complete-content-indexed-stopped-legacy-source-v4"
+                        ),
+                    },
                     "writer_stopped": True,
                     "restart_barrier_active": True,
                     "network_quarantine_active": True,
@@ -889,6 +1548,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             "all_controlled_stopped_at": stopped_at,
             "challenge": challenge,
             "authenticated_prefence_height_cross_proof": authenticated_sealed,
+            "quarantine_generation_ledger": generation_sealed,
             "network_quarantine_challenge": challenge_sealed,
             "quarantine_stability_proof": stability_sealed,
             "nodes": bundle_nodes,
@@ -1033,6 +1693,7 @@ class RecoveryRolloutTests(unittest.TestCase):
                 "observed_max_height": public["legacy_public_max_height"],
             },
             "authenticated_prefence_height_cross_proof_sha256": sha_value(authenticated),
+            "quarantine_generation_ledger_sha256": generation_sealed["sha256"],
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "network_quarantine_stability_proof_sha256": stability_sealed["sha256"],
             "network_quarantine_challenge": challenge,
@@ -1105,9 +1766,21 @@ class RecoveryRolloutTests(unittest.TestCase):
             "legacy_maintenance_boundary": boundary,
             "legacy_maintenance_boundary_sha256": boundary_sha,
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
+            "quarantine_generation_ledger_sha256": generation_sealed["sha256"],
             "nodes": [
-                {"node": node, "host": host}
-                for node, host in rollout.PRODUCTION_FLEET
+                {
+                    "node": node,
+                    "host": host,
+                    "validator_address": value["validators"][index]["address"],
+                    "stake": value["validators"][index]["stake"],
+                    "stop_complete_sha256": f"{index + 20:064x}",
+                    "stop_files_sha256": f"{index + 40:064x}",
+                    "stopped_status_sha256": sha_value(
+                        retained_by_node[node]["stopped_status"]
+                    ),
+                    "stopped_status_argv_sha256": f"{index + 60:064x}",
+                }
+                for index, (node, host) in enumerate(rollout.PRODUCTION_FLEET)
             ],
         }
         payloads = {
@@ -1188,6 +1861,395 @@ class RecoveryRolloutTests(unittest.TestCase):
             }
         )
         return value, stage_rows, payloads
+
+    @staticmethod
+    def repack_maintenance_stage(value, rows, payloads, bundle, boundary):
+        """Recompute every outer seal after a semantic union-fixture rewrite."""
+
+        canonical = rollout.canonical_bytes
+        sha_value = lambda item: hashlib.sha256(canonical(item)).hexdigest()
+
+        wrapper_specs = (
+            ("stopped_status", "stopped-status"),
+            ("network_quarantine_receipt", "network-quarantine-receipt"),
+            ("quarantine_status", "quarantine-status"),
+            ("quarantine_monitor", "network-quarantine-monitor"),
+            ("post_proof_quarantine_status", "post-proof-quarantine-status"),
+            ("external_quarantine_proof", "external-quarantine-proof"),
+            ("public_cross_proof", "public-cross-proof"),
+            ("persisted_head", "persisted-head"),
+        )
+
+        inventory = []
+
+        def reseal(wrapper, node, role):
+            inner = wrapper["value"]
+            root = sha_value(inner)
+            inventory.append(
+                {
+                    "node": node,
+                    "role": role,
+                    "sha256": root,
+                    "size": len(canonical(inner)),
+                }
+            )
+            return {"value": inner, "sha256": root}
+
+        for field, role in (
+            ("authenticated_prefence_height_cross_proof", "authenticated-prefence-height-cross-proof"),
+            ("quarantine_generation_ledger", "quarantine-generation-ledger"),
+            ("network_quarantine_challenge", "network-quarantine-challenge"),
+            ("quarantine_stability_proof", "network-quarantine-stability-proof"),
+        ):
+            bundle[field] = reseal(bundle[field], "fleet", role)
+        for node_row in bundle["nodes"]:
+            node = node_row["node"]
+            specs = (
+                (
+                    ("transition_receipt", "transition-receipt"),
+                    ("current_status", "current-status"),
+                    ("persisted_head", "persisted-head"),
+                )
+                if node_row.get("transition_kind")
+                == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                else wrapper_specs
+            )
+            for field, role in specs:
+                node_row[field] = reseal(node_row[field], node, role)
+        bundle["object_inventory"] = inventory
+        bundle["aggregate_root_sha256"] = sha_value(
+            {
+                "schema": "arc.recovery.legacy-maintenance-evidence-inventory.v1",
+                "objects": inventory,
+            }
+        )
+        bundle_sha = sha_value(bundle)
+        boundary["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        boundary["network_quarantine_stability_proof_sha256"] = bundle[
+            "quarantine_stability_proof"
+        ]["sha256"]
+        boundary["legacy_maintenance_evidence_bundle_sha256"] = bundle_sha
+        boundary["observed_cutoff_height"] = max(
+            row["height"] for row in boundary["evidence_heights"]
+        )
+        boundary["legacy_public_max_height"] = (
+            boundary["observed_cutoff_height"] + 128
+        )
+        boundary_sha = sha_value(boundary)
+
+        late_fork = copy.deepcopy(
+            json.loads(payloads["legacy_late_fork_source_set"])
+        )
+        late_fork["boundary_sha256"] = boundary_sha
+        late_fork["observed_cutoff_height"] = boundary["observed_cutoff_height"]
+        late_fork_sha = sha_value(late_fork)
+
+        offline = copy.deepcopy(json.loads(payloads["offline_stop_evidence"]))
+        offline["legacy_maintenance_boundary"] = boundary
+        offline["legacy_maintenance_boundary_sha256"] = boundary_sha
+        offline["legacy_maintenance_evidence_bundle_sha256"] = bundle_sha
+        offline["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        offline_sha = sha_value(offline)
+
+        payloads = dict(payloads)
+        objects = {
+            "legacy_maintenance_evidence_bundle": (
+                bundle,
+                "legacy-maintenance-evidence-bundle.json",
+            ),
+            "legacy_maintenance_boundary": (
+                boundary,
+                "legacy-maintenance-boundary.json",
+            ),
+            "legacy_late_fork_source_set": (
+                late_fork,
+                "legacy-late-fork-source-set.json",
+            ),
+            "offline_stop_evidence": (offline, "offline-stop-evidence.json"),
+        }
+        object_roots = {
+            "legacy_maintenance_evidence_bundle": bundle_sha,
+            "legacy_maintenance_boundary": boundary_sha,
+            "legacy_late_fork_source_set": late_fork_sha,
+            "offline_stop_evidence": offline_sha,
+        }
+        sidecar_payload_keys = {
+            "legacy_maintenance_evidence_bundle": (
+                "legacy_maintenance_evidence_bundle_sidecar",
+                "legacy_maintenance_evidence_bundle_sidecar",
+            ),
+            "legacy_maintenance_boundary": (
+                "legacy_maintenance_boundary_sidecar",
+                "legacy_maintenance_boundary_sidecar",
+            ),
+            "legacy_late_fork_source_set": (
+                "legacy_late_fork_source_set_sidecar",
+                "legacy_late_fork_source_set_sidecar",
+            ),
+            "offline_stop_evidence": (
+                "offline_stop_sidecar",
+                "offline_stop_evidence_sidecar",
+            ),
+        }
+        rows = copy.deepcopy(rows)
+        for name, (inner, filename) in objects.items():
+            payloads[name] = canonical(inner)
+            root = object_roots[name]
+            rows[name]["sha256"] = root
+            value["artifacts"][name]["sha256"] = root
+            payload_key, artifact_key = sidecar_payload_keys[name]
+            payloads[payload_key] = f"{root}  {filename}\n".encode("ascii")
+            value["artifacts"][artifact_key]["sha256"] = hashlib.sha256(
+                payloads[payload_key]
+            ).hexdigest()
+
+        value["provenance"]["offline_stop_verification"][
+            "offline_stop_evidence_sha256"
+        ] = offline_sha
+        value["chain"].update(
+            {
+                "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
+                "legacy_maintenance_boundary_sha256": boundary_sha,
+                "legacy_late_fork_source_set_sha256": late_fork_sha,
+                "legacy_observed_cutoff_height": boundary[
+                    "observed_cutoff_height"
+                ],
+                "legacy_public_max_height": boundary["legacy_public_max_height"],
+            }
+        )
+        return value, rows, payloads
+
+    def union_maintenance_stage_fixture(self, stopped_names):
+        value, rows, payloads = self.maintenance_stage_fixture()
+        bundle = copy.deepcopy(
+            json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        )
+        boundary = copy.deepcopy(json.loads(payloads["legacy_maintenance_boundary"]))
+        generation = bundle["quarantine_generation_ledger"]["value"]
+        result_wrapper = generation["rounds"][0]["result"]
+        result_value = result_wrapper["value"]
+        stopped_names = set(stopped_names)
+        stopped_artifacts = {}
+
+        for index, transition_wrapper in enumerate(result_value["transitions"]):
+            active_transition = transition_wrapper["value"]
+            node = active_transition["node"]
+            if node not in stopped_names:
+                continue
+            stable_head = copy.deepcopy(active_transition["stable_head"])
+            fence_value = {
+                "schema": "arc.recovery.fixture-persistent-restart-fence.v1",
+                "node": node,
+                "host": active_transition["host"],
+            }
+            fence_wrapper = quarantine_rounds.wrap(fence_value)
+            live_capture_sha = f"{index + 6100:064x}"
+            persisted = {
+                "schema": quarantine_rounds.PERSISTED_STOPPED_SCHEMA,
+                "node": node,
+                "host": active_transition["host"],
+                "head": stable_head,
+                "source_pair_role": "preauthorization-boundary",
+                "live_source_capture_sha256": live_capture_sha,
+                "source_inputs": {
+                    "source_pair_role": "preauthorization-boundary",
+                    "live_source_capture_sha256": live_capture_sha,
+                },
+            }
+            persisted_wrapper = quarantine_rounds.wrap(persisted)
+            transition = {
+                "schema": quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA,
+                "node": node,
+                "host": active_transition["host"],
+                "stable_head": stable_head,
+                "persistent_restart_fence": fence_wrapper,
+                "persisted_head": persisted_wrapper,
+            }
+            transition_wrapper = quarantine_rounds.wrap(transition)
+            result_value["transitions"][index] = transition_wrapper
+            current_status = {
+                "stable_head": stable_head,
+                "persistent_restart_fence_sha256": fence_wrapper["sha256"],
+            }
+            current_wrapper = quarantine_rounds.wrap(current_status)
+            stopped_artifacts[node] = {
+                "transition": transition_wrapper,
+                "current": current_wrapper,
+                "persisted": persisted_wrapper,
+                "fence_sha256": fence_wrapper["sha256"],
+            }
+        generation["rounds"][0]["result"] = quarantine_rounds.wrap(result_value)
+        bundle["quarantine_generation_ledger"] = quarantine_rounds.wrap(generation)
+
+        transition_wrappers = {
+            wrapper["value"]["node"]: wrapper
+            for wrapper in result_value["transitions"]
+        }
+        active_names = [
+            node for node, _host in rollout.PRODUCTION_FLEET
+            if node not in stopped_names
+        ]
+        stability = bundle["quarantine_stability_proof"]["value"]
+        stability["nodes"] = [
+            row for row in stability["nodes"] if row["node"] in active_names
+        ]
+        stability["fleet_heads"] = [
+            row for row in stability["fleet_heads"] if row["node"] in active_names
+        ]
+        stability["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        stability["active_transition_sha256s"] = [
+            {"node": node, "sha256": transition_wrappers[node]["sha256"]}
+            for node in active_names
+        ]
+        if active_names:
+            stability["interval_seconds"] = 120
+            stability["sample_count"] = 2
+            stability["monotonic_elapsed_ns"] = 120_000_000_000
+        else:
+            stability["interval_seconds"] = 0
+            stability["sample_count"] = 0
+            stability["monotonic_elapsed_ns"] = 0
+        bundle["quarantine_stability_proof"] = quarantine_rounds.wrap(stability)
+
+        bundle_nodes = {row["node"]: row for row in bundle["nodes"]}
+        for node in stopped_names:
+            host = dict(rollout.PRODUCTION_FLEET)[node]
+            artifacts = stopped_artifacts[node]
+            bundle_nodes[node] = {
+                "node": node,
+                "host": host,
+                "transition_kind": (
+                    quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "transition_receipt": artifacts["transition"],
+                "current_status": artifacts["current"],
+                "persisted_head": artifacts["persisted"],
+            }
+        bundle["nodes"] = [
+            bundle_nodes[node] for node, _host in rollout.PRODUCTION_FLEET
+        ]
+
+        boundary_nodes = {row["node"]: row for row in boundary["nodes"]}
+        for node in stopped_names:
+            prior = boundary_nodes[node]
+            artifacts = stopped_artifacts[node]
+            transition = artifacts["transition"]
+            persisted = artifacts["persisted"]
+            stable_head = transition["value"]["stable_head"]
+            boundary_nodes[node] = {
+                "node": node,
+                "host": prior["host"],
+                "origin": prior["origin"],
+                "transition_kind": (
+                    quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "authenticated_prefence_proof_sha256": prior[
+                    "authenticated_prefence_proof_sha256"
+                ],
+                "transition_receipt_sha256": transition["sha256"],
+                "current_status_sha256": artifacts["current"]["sha256"],
+                "persistent_restart_fence_sha256": artifacts["fence_sha256"],
+                "stable_head": {
+                    "tuple": stable_head,
+                    "evidence_sha256": transition["sha256"],
+                },
+                "final_persisted_head": {
+                    "tuple": stable_head,
+                    "evidence_sha256": persisted["sha256"],
+                },
+            }
+        boundary["nodes"] = [
+            boundary_nodes[node] for node, _host in rollout.PRODUCTION_FLEET
+        ]
+
+        rows_by_node = {}
+        for row in boundary["evidence_heights"]:
+            rows_by_node.setdefault(row["node"], {})[row["label"]] = row
+        rewritten_heights = []
+        common_labels = (
+            "public_info_before", "public_latest", "public_info_after",
+            "authenticated_info_before", "authenticated_latest",
+            "authenticated_info_after", "authenticated_conservative_floor",
+        )
+        for node, _host in rollout.PRODUCTION_FLEET:
+            if node not in stopped_names:
+                rewritten_heights.extend(rows_by_node[node].values())
+                continue
+            rewritten_heights.extend(
+                copy.deepcopy(rows_by_node[node][label]) for label in common_labels
+            )
+            artifacts = stopped_artifacts[node]
+            stable_height = artifacts["transition"]["value"]["stable_head"]["height"]
+            rewritten_heights.extend(
+                (
+                    {
+                        "node": node,
+                        "label": "transition_stable_head",
+                        "height": stable_height,
+                        "evidence_sha256": artifacts["transition"]["sha256"],
+                    },
+                    {
+                        "node": node,
+                        "label": "final_persisted_head",
+                        "height": stable_height,
+                        "evidence_sha256": artifacts["persisted"]["sha256"],
+                    },
+                )
+            )
+        boundary["evidence_heights"] = rewritten_heights
+        offline = copy.deepcopy(json.loads(payloads["offline_stop_evidence"]))
+        offline_nodes = {row["node"]: row for row in offline["nodes"]}
+        remote_nodes = {
+            row["node"]: row
+            for row in value["provenance"]["offline_stop_verification"]["nodes"]
+        }
+        for node in stopped_names:
+            host = dict(rollout.PRODUCTION_FLEET)[node]
+            artifacts = stopped_artifacts[node]
+            offline_nodes[node] = {
+                "node": node,
+                "host": host,
+                "transition_kind": (
+                    quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "transition_receipt_sha256": artifacts["transition"]["sha256"],
+                "current_status_sha256": artifacts["current"]["sha256"],
+                "persisted_head_sha256": artifacts["persisted"]["sha256"],
+            }
+            challenged = {
+                "schema": (
+                    "arc.recovery.quarantine-persistently-stopped-"
+                    "challenged-status.v1"
+                ),
+                "capture_id": value["archive"]["capture_id"],
+                "freeze_plan_sha256": value["archive"]["freeze_plan_sha256"],
+                "node": node,
+                "host": host,
+                "transition_kind": (
+                    quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "transition_receipt": artifacts["transition"],
+                "current_status": artifacts["current"],
+                "challenge": value["provenance"]["offline_stop_verification"][
+                    "challenge"
+                ],
+            }
+            remote_nodes[node]["status"] = challenged
+            remote_nodes[node]["status_sha256"] = hashlib.sha256(
+                rollout.canonical_bytes(challenged)
+            ).hexdigest()
+        offline["nodes"] = [
+            offline_nodes[node] for node, _host in rollout.PRODUCTION_FLEET
+        ]
+        payloads = dict(payloads)
+        payloads["offline_stop_evidence"] = rollout.canonical_bytes(offline)
+        return self.repack_maintenance_stage(value, rows, payloads, bundle, boundary)
 
     def test_manifest_requires_exactly_six_and_h_plus_one(self) -> None:
         valid = self.fixture()
@@ -1326,6 +2388,112 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, "exact maintenance bundle/boundary"):
             rollout.verify_legacy_maintenance_stage_payloads(value, rows, hostile_payloads)
 
+    def verify_union_maintenance_stage(self, value, rows, payloads) -> None:
+        generation_state = {
+            "capture_id": value["archive"]["capture_id"],
+            "freeze_plan_sha256": value["archive"]["freeze_plan_sha256"],
+            "first_secured_at": dt.datetime(
+                2026, 8, 28, 12, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            "legacy_cutoff_height": 0,
+        }
+        observed = dt.datetime(
+            2026, 8, 28, 12, 2, 2, tzinfo=dt.timezone.utc
+        )
+        with (
+            mock.patch.object(
+                rollout.quarantine_rounds,
+                "validate_generation_ledger",
+                return_value=generation_state,
+            ),
+            mock.patch.object(
+                rollout.quarantine_rounds,
+                "validate_prior_fenced_status",
+                return_value=observed,
+            ),
+        ):
+            rollout.verify_legacy_maintenance_stage_payloads(value, rows, payloads)
+
+    def test_mixed_active_stopped_union_uses_exact_active_subset_and_stopped_evidence(
+        self,
+    ) -> None:
+        stopped = {"lhr", "nrt", "sgp"}
+        value, rows, payloads = self.union_maintenance_stage_fixture(stopped)
+        self.verify_union_maintenance_stage(value, rows, payloads)
+
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        stability = bundle["quarantine_stability_proof"]["value"]
+        self.assertEqual(
+            [row["node"] for row in stability["nodes"]],
+            ["nyc", "lax", "ams"],
+        )
+        self.assertEqual(
+            [row["node"] for row in stability["active_transition_sha256s"]],
+            ["nyc", "lax", "ams"],
+        )
+        by_node = {row["node"]: row for row in bundle["nodes"]}
+        self.assertEqual(
+            set(by_node["lhr"]),
+            {
+                "node", "host", "transition_kind", "transition_receipt",
+                "current_status", "persisted_head",
+            },
+        )
+        self.assertNotIn("transition_kind", by_node["nyc"])
+
+    def test_all_stopped_union_is_explicit_zero_sample_non_stability(self) -> None:
+        stopped = {node for node, _host in rollout.PRODUCTION_FLEET}
+        value, rows, payloads = self.union_maintenance_stage_fixture(stopped)
+        self.verify_union_maintenance_stage(value, rows, payloads)
+
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        stability = bundle["quarantine_stability_proof"]["value"]
+        self.assertEqual(stability["nodes"], [])
+        self.assertEqual(stability["fleet_heads"], [])
+        self.assertEqual(stability["active_transition_sha256s"], [])
+        self.assertEqual(stability["interval_seconds"], 0)
+        self.assertEqual(stability["sample_count"], 0)
+        self.assertEqual(stability["monotonic_elapsed_ns"], 0)
+
+    def test_union_rejects_swapped_transition_evidence_and_stopped_stability_claim(
+        self,
+    ) -> None:
+        value, rows, payloads = self.union_maintenance_stage_fixture(
+            {"lhr", "nrt", "sgp"}
+        )
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        boundary = json.loads(payloads["legacy_maintenance_boundary"])
+        stopped_nodes = [
+            row for row in bundle["nodes"]
+            if row.get("transition_kind")
+            == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+        ]
+        stopped_nodes[0]["transition_receipt"], stopped_nodes[1]["transition_receipt"] = (
+            stopped_nodes[1]["transition_receipt"],
+            stopped_nodes[0]["transition_receipt"],
+        )
+        hostile = self.repack_maintenance_stage(
+            value, rows, payloads, bundle, boundary
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "does not byte-match the generation ledger"
+        ):
+            self.verify_union_maintenance_stage(*hostile)
+
+        value, rows, payloads = self.union_maintenance_stage_fixture(
+            {node for node, _host in rollout.PRODUCTION_FLEET}
+        )
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        boundary = json.loads(payloads["legacy_maintenance_boundary"])
+        bundle["quarantine_stability_proof"]["value"]["interval_seconds"] = 120
+        hostile = self.repack_maintenance_stage(
+            value, rows, payloads, bundle, boundary
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "must not claim an active stability sample"
+        ):
+            self.verify_union_maintenance_stage(*hostile)
+
     def test_legacy_maintenance_stage_rejects_omitted_high_authenticated_height(self) -> None:
         value, rows, payloads = self.maintenance_stage_fixture()
         boundary = copy.deepcopy(json.loads(payloads["legacy_maintenance_boundary"]))
@@ -1380,6 +2548,14 @@ class RecoveryRolloutTests(unittest.TestCase):
         self.assertIn("public-maintenance.v1", harness.maintenance_caddyfile(value["validators"][0]))
         self.assertNotIn("@corsRead", harness.maintenance_caddyfile(value["validators"][0]))
         self.assertIn("@corsRead", harness.caddyfile(value["validators"][0]))
+        self.assertIn(
+            "renewal_window_ratio 0.5",
+            harness.maintenance_caddyfile(value["validators"][0]),
+        )
+        self.assertIn(
+            "renewal_window_ratio 0.5",
+            harness.caddyfile(value["validators"][0]),
+        )
         self.assertIn("admin off", harness.maintenance_caddyfile(value["validators"][0]))
         self.assertIn("admin off", harness.caddyfile(value["validators"][0]))
         gateway_unit = harness.gateway_unit(value["validators"][0])
@@ -2216,6 +3392,7 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
         argv = harness.runtime_argv(value["validators"][0])
         self.assertEqual(argv.count("--community-rpc-url"), 6)
+        self.assertNotIn("--archive", argv)
         self.assertNotIn("--recovery-checkpoint", argv)
         self.assertNotIn("--approved-recovery-manifest-hash", argv)
         imported = harness.recovery_cli("import", value["validators"][0])
@@ -3525,6 +4702,111 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.assertEqual(receipt["schema"], "arc.recovery.production-rollback-receipt.v2")
         self.assertEqual(receipt["rollback_run"], 1)
 
+    def test_lax_nginx_baseline_is_passed_to_installer_and_exactly_restored(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        self.prime_interlock_interpreters(harness)
+        lax = next(node for node in value["validators"] if node["name"] == "lax")
+        baseline = {
+            f"{service}_{state}": False
+            for service in ("validator", "gateway", "filter", "interlock", "archive", "nginx")
+            for state in ("active", "enabled")
+        }
+        baseline.update({"nginx_active": True, "nginx_enabled": True})
+        harness.production_service_baseline = {"lax": baseline}
+        harness.production_public_listener_baseline = {
+            "lax": {"80": 1, "443": 0}
+        }
+        calls = []
+
+        def fake_ssh(node, script, args=(), **_kwargs):
+            args = tuple(args)
+            calls.append((node["name"], script, args))
+            if 'security_receipt="$root/nginx-security-boundary.json"' in script:
+                return rollout.canonical_bytes(
+                    {
+                        "schema": "arc.recovery.gateway-security-boundary.v1",
+                        "rollout_manifest_sha256": args[5],
+                        "node": args[25],
+                        "package": "nginx",
+                        "package_version": rollout.NGINX_PACKAGE_VERSION,
+                        "binary_path": "/usr/sbin/nginx",
+                        "binary_sha256": rollout.NGINX_LINUX_AMD64_SHA256,
+                        "auth_request_module": True,
+                        "certificate_storage_nonempty": True,
+                        "caddy_restart_tls_probe_status": 404,
+                        "filter_config_sha256": args[29],
+                        "filter_unit_sha256": args[30],
+                        "filter_preflight_sha256": args[31],
+                        "filter_user": args[28],
+                        "package_held": False,
+                        "reward_gate_failure_status": 500,
+                        "shard_gate_failure_status": 500,
+                        "filter_socket_path": args[33],
+                        "archive_filter_socket_path": args[34],
+                        "filter_socket_mode": "0770",
+                        "attacker_user": args[35],
+                        "attacker_socket_denied": True,
+                        "attacker_interlock_socket_denied": True,
+                        "direct_tcp_filter_absent": True,
+                        "direct_tcp_interlock_absent": True,
+                        "caddy_identity_healthy_gate_status": 502,
+                        "caddy_interlock_socket_denied": True,
+                        "effective_systemd_inventory_sha256": args[40],
+                        "filter_group_primary_users": [
+                            rollout.CADDY_USER,
+                            rollout.NGINX_FILTER_USER,
+                        ],
+                        "filter_group_supplementary_users": [],
+                        "interlock_group": rollout.LATE_FORK_INTERLOCK_GROUP,
+                        "interlock_group_primary_users": [
+                            rollout.LATE_FORK_INTERLOCK_USER
+                        ],
+                        "interlock_group_supplementary_users": [
+                            rollout.NGINX_FILTER_USER
+                        ],
+                        "interlock_socket_mode": "0660",
+                        "interlock_socket_path": args[42],
+                        "origin_group": rollout.RPC_ORIGIN_GROUP,
+                        "origin_group_primary_users": [],
+                        "origin_group_supplementary_users": [
+                            rollout.NGINX_FILTER_USER
+                        ],
+                    }
+                ).decode("utf-8")
+            if "schema=arc.recovery.production-rollback-host.v1" in script:
+                return "\n".join(
+                    (
+                        "schema=arc.recovery.production-rollback-host.v1",
+                        "node=lax",
+                        *(
+                            f"{field}={'1' if baseline[field] else '0'}"
+                            for field in sorted(baseline)
+                        ),
+                        "public_80_count=1",
+                        "public_443_count=0",
+                    )
+                )
+            raise AssertionError("unexpected LAX service-baseline SSH call")
+
+        harness.ssh = mock.Mock(side_effect=fake_ssh)
+        harness._install_gateway_and_unit(lax)
+        install_call = calls[0]
+        self.assertEqual(install_call[0], "lax")
+        self.assertEqual(install_call[2][15:17], ("1", "1"))
+        self.assertIn("systemctl stop nginx.service", install_call[1])
+        self.assertIn("systemctl disable nginx.service", install_call[1])
+
+        proof = harness._rollback_production_host(lax, baseline)
+        rollback_call = calls[1]
+        self.assertEqual(rollback_call[2][16:18], ("1", "1"))
+        self.assertEqual(rollback_call[2][24:26], ("1", "0"))
+        self.assertIn("systemctl enable nginx.service", rollback_call[1])
+        self.assertIn("systemctl start nginx.service", rollback_call[1])
+        self.assertTrue(proof["states"]["nginx_active"])
+        self.assertTrue(proof["states"]["nginx_enabled"])
+        self.assertEqual(proof["public_listener_counts"], {"80": 1, "443": 0})
+
     def test_unreachable_rollback_is_durable_aggregate_emergency(self) -> None:
         value = self.fixture(production=True)
         rollback_root = self.root / "unreachable-rollback"
@@ -3956,6 +5238,10 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         untrusted["public_trust_verified"] = False
         hostile_cases.append(("untrusted chain", untrusted, "identity/trust"))
 
+        late_renewal = copy.deepcopy(valid)
+        late_renewal["renewal_window_ratio"] = 1 / 3
+        hostile_cases.append(("late renewal window", late_renewal, "identity/trust"))
+
         excessive_lifetime = copy.deepcopy(valid)
         excessive_lifetime["not_after_unix"] = (
             excessive_lifetime["not_before_unix"]
@@ -4041,6 +5327,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.assertEqual(arguments[3], "post-rollout")
         self.assertEqual(arguments[5], rollout.CADDY_LINUX_AMD64_SHA256)
         self.assertEqual(arguments[6], rollout.CADDY_VERSION)
+        self.assertEqual(arguments[7], str(rollout.TLS_RENEWAL_WINDOW_RATIO))
 
         source = MODULE_PATH.read_text(encoding="utf-8")
         before_start = source.index('self._rollback_journal_event(5, "QUORUM-START"')
@@ -4059,6 +5346,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         caddy = harness.caddyfile(node)
         nginx = harness.nginx_filter(node)
         runtime = harness.runtime_argv(node, remote=True)
+        self.assertEqual(runtime.count("--archive"), 1)
         unit = harness.systemd_unit(node)
         self.assertIn(
             f"reverse_proxy unix/{harness.filter_public_socket(node)}", caddy
@@ -4072,6 +5360,9 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.assertIn('Strict-Transport-Security "max-age=31536000', caddy)
         self.assertIn(f"issuer acme {rollout.LETS_ENCRYPT_PRODUCTION_DIRECTORY}", caddy)
         self.assertIn("profile shortlived", caddy)
+        self.assertIn(
+            f"renewal_window_ratio {rollout.TLS_RENEWAL_WINDOW_RATIO}", caddy
+        )
         self.assertIn("disable_tlsalpn_challenge", caddy)
         self.assertIn(f"\n{node['host']} {{\n", caddy)
         self.assertNotIn("nip.io", caddy)
@@ -4444,8 +5735,10 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         assert evidence is not None
         domain = "0x" + "d" * 64
         commitment = "0x" + "e" * 64
+        calls = []
 
         def response(node, path, timeout=10):
+            calls.append((node["name"], path))
             if path == "/community/reward_policy":
                 return {
                     "schema": "arc.community.reward-policy.v1",
@@ -4497,6 +5790,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                     "tx_hash": evidence.tx_hash,
                     "job_id": evidence.job_id,
                     "worker": evidence.worker,
+                    "submitted": True,
                     "included": True,
                     "confirmed": True,
                     "success": True,
@@ -4506,25 +5800,168 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                     "transaction_domain": domain,
                     "validator_approvals": 5,
                     "reward_base": 2_500_000_000,
+                    "reward_arc": 2.5,
                     "block_height": 120,
                     "block_hash": "0x" + "f" * 64,
+                    "index": 0,
+                    "receipt_url": f"/community/reward_receipt/{evidence.tx_hash}",
+                }
+            if path == "/block/120":
+                return {
+                    "header": {"height": 120, "tx_count": 1},
+                    "tx_hashes": [evidence.tx_hash],
+                    "hash": "0x" + "f" * 64,
+                }
+            if path == "/block/120/txs?offset=0&limit=1":
+                return {
+                    "block_height": 120,
+                    "tx_count": 1,
+                    "offset": 0,
+                    "limit": 1,
+                    "returned": 1,
+                    "transactions": [{"index": 0, "hash": evidence.tx_hash}],
                 }
             return {
+                "address": evidence.worker,
+                "archive_mode": True,
+                "history_complete_since_recovery": True,
+                "history_scope": rollout.ARCHIVE_EARNINGS_SCOPE,
+                "history_domain": rollout.EARNINGS_HISTORY_DOMAIN,
                 "confirmed_receipt_count": 1,
                 "confirmed_gross_earnings_base": 2_500_000_000,
                 "confirmed_receipts": [
                     {
+                        "tx_type": "0x25",
                         "tx_hash": evidence.tx_hash,
                         "job_id": evidence.job_id,
                         "block_height": 120,
                         "block_hash": "0x" + "f" * 64,
+                        "index": 0,
+                        "submitted": True,
+                        "included": True,
+                        "confirmed": True,
                         "success": True,
+                        "receipt_url": f"/community/reward_receipt/{evidence.tx_hash}",
+                        "reward_base": 2_500_000_000,
+                        "reward_arc": 2.5,
                     }
                 ],
             }
 
         harness._http_json = response
         harness.prove_reward_receipt(evidence)
+        validator_names = {node["name"] for node in value["validators"]}
+        self.assertEqual(
+            {
+                name
+                for name, path in calls
+                if path == "/block/120"
+            },
+            validator_names,
+        )
+        self.assertEqual(
+            {
+                name
+                for name, path in calls
+                if path == "/block/120/txs?offset=0&limit=1"
+            },
+            validator_names,
+        )
+
+        corruptions = (
+            (
+                "wrong worker",
+                lambda path, body: body.update(address="0x" + "7" * 64)
+                if path.startswith("/worker/earnings/")
+                else None,
+                "address differs from the requested worker",
+            ),
+            (
+                "wrong reward-row transaction type",
+                lambda path, body: body["confirmed_receipts"][0].update(tx_type="0x01")
+                if path.startswith("/worker/earnings/")
+                else None,
+                "lacks the exact successful 0x25 receipt",
+            ),
+            (
+                "wrong reward-row base amount",
+                lambda path, body: body["confirmed_receipts"][0].update(
+                    reward_base=2_500_000_001
+                )
+                if path.startswith("/worker/earnings/")
+                else None,
+                "lacks the exact successful 0x25 receipt",
+            ),
+            (
+                "wrong reward-row ARC amount",
+                lambda path, body: body["confirmed_receipts"][0].update(
+                    reward_arc=2.6
+                )
+                if path.startswith("/worker/earnings/")
+                else None,
+                "lacks the exact successful 0x25 receipt",
+            ),
+            (
+                "wrong reward-row transaction index",
+                lambda path, body: body["confirmed_receipts"][0].update(index=1)
+                if path.startswith("/worker/earnings/")
+                else None,
+                "lacks the exact successful 0x25 receipt",
+            ),
+            (
+                "wrong receipt base amount",
+                lambda path, body: body.update(reward_base=2_500_000_001)
+                if path.startswith("/community/reward_receipt/")
+                else None,
+                "reward receipt reward_base",
+            ),
+            (
+                "wrong receipt ARC amount",
+                lambda path, body: body.update(reward_arc=2.6)
+                if path.startswith("/community/reward_receipt/")
+                else None,
+                "ARC amount differs from its exact base-unit amount",
+            ),
+            (
+                "wrong canonical block hash",
+                lambda path, body: body.update(hash="0x" + "8" * 64)
+                if path == "/block/120"
+                else None,
+                "block hash differs from the canonical block",
+            ),
+            (
+                "wrong canonical block index",
+                lambda path, body: body.update(tx_hashes=["0x" + "8" * 64])
+                if path == "/block/120"
+                else None,
+                "does not contain the transaction at receipt.index",
+            ),
+            (
+                "wrong transaction-page index",
+                lambda path, body: body["transactions"][0].update(index=1)
+                if path == "/block/120/txs?offset=0&limit=1"
+                else None,
+                "does not bind receipt.index to the transaction",
+            ),
+        )
+        for label, corrupt, message in corruptions:
+            with self.subTest(corruption=label):
+                def hostile_response(node, path, timeout=10):
+                    body = copy.deepcopy(response(node, path, timeout))
+                    corrupt(path, body)
+                    return body
+
+                harness._http_json = hostile_response
+                with (
+                    mock.patch.object(
+                        rollout.time,
+                        "monotonic",
+                        side_effect=[0, 0, 11],
+                    ),
+                    mock.patch.object(rollout.time, "sleep"),
+                    self.assertRaisesRegex(rollout.RolloutError, message),
+                ):
+                    harness.prove_reward_receipt(evidence)
 
     def test_two_distinct_receipts_gate_exact_gross_and_null_projection_on_all_six(self) -> None:
         value = self.fixture(reward_receipt=True)
@@ -4535,39 +5972,18 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         ]
         assert all(item is not None for item in evidence)
         evidence = [item for item in evidence if item is not None]
-        blocks = [(120, "f" * 64), (121, "9" * 64)]
+        blocks = [(120, "f" * 64, 0), (121, "9" * 64, 0)]
+        self.install_reward_baseline(harness, evidence[0].worker)
 
         def response(node, path, timeout=10):
             self.assertEqual(path, f"/worker/earnings/{evidence[0].worker}")
-            return {
-                "confirmed_receipt_count": 2,
-                "confirmed_gross_earnings_base": 5_000_000_000,
-                "confirmed_gross_earnings_arc": 5.0,
-                "confirmed_receipts": [
-                    {
-                        "tx_hash": evidence[0].tx_hash,
-                        "job_id": evidence[0].job_id,
-                        "block_height": blocks[0][0],
-                        "block_hash": blocks[0][1],
-                        "success": True,
-                        "reward_base": 2_500_000_000,
-                        "reward_arc": 2.5,
-                    },
-                    {
-                        "tx_hash": evidence[1].tx_hash,
-                        "job_id": evidence[1].job_id,
-                        "block_height": blocks[1][0],
-                        "block_hash": blocks[1][1],
-                        "success": True,
-                        "reward_base": 2_500_000_000,
-                        "reward_arc": 2.5,
-                    },
+            return self.reward_earnings(
+                evidence[0].worker,
+                [
+                    self.reward_receipt_row(item, block)
+                    for item, block in zip(evidence, blocks)
                 ],
-                "attestations_per_day_observed": None,
-                "attestations_per_day_unavailable_reason": rollout.PROJECTION_COLLECTING_REASON,
-                "projected_daily_arc": None,
-                "projected_daily_unavailable_reason": rollout.PROJECTION_COLLECTING_REASON,
-            }
+            )
 
         harness._http_json = response
         harness.prove_reward_projection(evidence, blocks)
@@ -4578,8 +5994,228 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         with self.assertRaisesRegex(rollout.RolloutError, "two distinct blocks"):
             harness.prove_reward_projection(
                 evidence,
-                [(120, "f" * 64), (120, "9" * 64)],
+                [(120, "f" * 64, 0), (120, "9" * 64, 0)],
             )
+
+    def test_nonempty_all_v3_baseline_is_retained_and_projection_uses_full_history(self) -> None:
+        value = self.fixture(reward_receipt=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        evidence = [
+            rollout.ReceiptEvidence.from_value(row)
+            for row in value["checks"]["reward"]["receipts"]
+        ]
+        blocks = [(120, "f" * 64, 0), (121, "9" * 64, 0)]
+        historical = rollout.ReceiptEvidence(
+            "0x" + "6" * 64,
+            "0x" + "7" * 64,
+            evidence[0].worker,
+        )
+        historical_row = self.reward_receipt_row(
+            historical,
+            (20, "8" * 64, 0),
+            recovery_epoch=3,
+            validator_set_id=2,
+            transaction_domain="0x" + "a" * 64,
+        )
+        self.install_reward_baseline(harness, evidence[0].worker, [historical_row])
+        rows = [
+            historical_row,
+            *[
+                self.reward_receipt_row(
+                    item,
+                    block,
+                    recovery_epoch=7,
+                    validator_set_id=9,
+                    transaction_domain="0x" + "b" * 64,
+                )
+                for item, block in zip(evidence, blocks)
+            ],
+        ]
+        numeric = self.reward_earnings(
+            evidence[0].worker,
+            rows,
+            observed_window_first_timestamp_ms=1_700_000_000_000,
+            observed_window_last_timestamp_ms=1_700_086_400_000,
+            attestations_per_day_observed=2.0,
+            attestations_per_day_unavailable_reason=None,
+            projected_daily_arc=5.0,
+            projected_daily_unavailable_reason=None,
+        )
+        harness._http_json = mock.Mock(return_value=numeric)
+        harness.prove_reward_projection(evidence, blocks)
+        self.assertEqual(harness._http_json.call_count, 6)
+
+        short_window = self.reward_earnings(evidence[0].worker, rows)
+        harness._http_json = mock.Mock(return_value=short_window)
+        harness.prove_reward_projection(evidence, blocks)
+
+        changed_history = copy.deepcopy(numeric)
+        changed_history["confirmed_receipts"][0]["block_hash"] = "0x" + "0" * 64
+        harness._http_json = mock.Mock(return_value=changed_history)
+        with self.assertRaisesRegex(rollout.RolloutError, "dropped or changed"):
+            harness.prove_reward_projection(evidence, blocks)
+
+        def fleet_disagreement(node, path, timeout=10):
+            body = copy.deepcopy(numeric)
+            if node == value["validators"][-1]:
+                body["confirmed_receipts"][-1]["output_hash"] = "0x" + "c" * 64
+            return body
+
+        harness._http_json = fleet_disagreement
+        with self.assertRaisesRegex(rollout.RolloutError, "validators disagree"):
+            harness.prove_reward_projection(evidence, blocks)
+
+        extra = rollout.ReceiptEvidence(
+            "0x" + "0" * 63 + "1",
+            "0x" + "0" * 63 + "2",
+            evidence[0].worker,
+        )
+        extra_row = self.reward_receipt_row(extra, (122, "0" * 63 + "3", 0))
+        extra_history = self.reward_earnings(evidence[0].worker, [*rows, extra_row])
+        harness._http_json = mock.Mock(return_value=extra_history)
+        with self.assertRaisesRegex(rollout.RolloutError, "exactly two new"):
+            harness.prove_reward_projection(evidence, blocks)
+
+    def test_pre_canary_baseline_requires_six_node_agreement_and_survives_resume(self) -> None:
+        value = self.fixture(reward_receipt=True)
+        worker = value["checks"]["reward"]["receipts"][0]["worker"]
+        historical = rollout.ReceiptEvidence(
+            "0x" + "6" * 64,
+            "0x" + "7" * 64,
+            worker,
+        )
+        historical_row = self.reward_receipt_row(
+            historical,
+            (20, "8" * 64, 0),
+            recovery_epoch=2,
+            validator_set_id=3,
+            transaction_domain="0x" + "a" * 64,
+        )
+        output = self.root / "pre-canary-baseline.json"
+        first = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            reward_evidence_output=output,
+        )
+        first._http_json = mock.Mock(
+            return_value=self.reward_earnings(worker, [historical_row])
+        )
+        first.capture_reward_earnings_baselines()
+        self.assertEqual(first._http_json.call_count, 6)
+        baseline = first.reward_earnings_baselines[worker]
+        self.assertEqual(baseline.confirmed_receipt_count, 1)
+        self.assertEqual(baseline.confirmed_gross_earnings_base, 2_500_000_000)
+        assert first.reward_evidence_reservation is not None
+        for fd in first.reward_evidence_reservation:
+            os.close(fd)
+        first.reward_evidence_reservation = None
+
+        resumed = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            reward_evidence_output=output,
+        )
+        resumed.reserve_reward_evidence_output()
+        self.assertEqual(resumed.reward_earnings_baselines, {worker: baseline})
+        resumed._http_json = mock.Mock(
+            side_effect=AssertionError("resume must not move the pre-canary baseline")
+        )
+        resumed.capture_reward_earnings_baselines()
+        resumed._http_json.assert_not_called()
+        resumed._http_json = mock.Mock(
+            return_value=self.reward_earnings(worker, [historical_row])
+        )
+        resumed.reprove_reward_earnings_baselines_before_probe()
+        self.assertEqual(resumed._http_json.call_count, 6)
+        resumed._http_json = mock.Mock(
+            return_value=self.reward_earnings(worker, [])
+        )
+        with self.assertRaisesRegex(rollout.RolloutError, "changed before probe"):
+            resumed.reprove_reward_earnings_baselines_before_probe()
+
+        divergent = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            reward_evidence_output=self.root / "divergent-baseline.json",
+        )
+
+        def disagreement(node, path, timeout=10):
+            rows = [] if node == value["validators"][-1] else [historical_row]
+            return self.reward_earnings(worker, rows)
+
+        divergent._http_json = disagreement
+        with self.assertRaisesRegex(rollout.RolloutError, "validators disagree"):
+            divergent.capture_reward_earnings_baselines()
+        self.assertFalse(divergent.reward_earnings_baselines)
+
+    def test_dynamic_probe_snapshots_every_worker_the_sealed_coordinator_can_select(self) -> None:
+        value = self.fixture(reward_receipt=True)
+        value["checks"]["reward"].pop("receipts")
+        value["checks"]["reward"]["probe_argv"] = ["/pinned/reward-probe"]
+        workers = ["0x" + "6" * 64, "0x" + "7" * 64]
+        harness = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            reward_evidence_output=self.root / "dynamic-baselines.json",
+        )
+        include_new_worker = [False]
+
+        def response(node, path, timeout=10):
+            if path == "/workers/scoreboard?limit=500":
+                return {
+                    "eligible_inference_workers": 3 if include_new_worker[0] else 2,
+                    "coordinator_model_id": "0x" + "1" * 64,
+                }
+            if path == "/community/list":
+                return {
+                    "count": 3,
+                    "workers": [
+                        {
+                            "worker_id": workers[0],
+                            "capabilities": ["inference"],
+                            "model_id": "0x" + "1" * 64,
+                            "execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                        },
+                        {
+                            "worker_id": workers[1],
+                            "capabilities": ["inference"],
+                            "model_id": "0x" + "1" * 64,
+                            "execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                        },
+                        {
+                            "worker_id": "0x" + "8" * 64,
+                            "capabilities": ["inference"],
+                            "model_id": "0x" + "1" * 64,
+                            "execution_profile": (
+                                rollout.CANONICAL_EXECUTION_PROFILE
+                                if include_new_worker[0]
+                                else "noncanonical"
+                            ),
+                        },
+                    ],
+                }
+            worker = path.removeprefix("/worker/earnings/")
+            self.assertIn(worker, workers)
+            return self.reward_earnings(worker, [])
+
+        harness._http_json = response
+        harness.capture_reward_earnings_baselines()
+        self.assertEqual(set(harness.reward_earnings_baselines), set(workers))
+        harness.reprove_reward_earnings_baselines_before_probe()
+        include_new_worker[0] = True
+        with self.assertRaisesRegex(rollout.RolloutError, "newly selectable"):
+            harness.reprove_reward_earnings_baselines_before_probe()
+        outsider = rollout.ReceiptEvidence(
+            "0x" + "9" * 64,
+            "0x" + "a" * 64,
+            "0x" + "8" * 64,
+        )
+        with self.assertRaisesRegex(rollout.RolloutError, "was not sealed"):
+            harness._select_reward_earnings_baseline([outsider])
 
     def test_two_canaries_reject_numeric_projection_wrong_reason_or_nonexact_gross(self) -> None:
         value = self.fixture(reward_receipt=True)
@@ -4588,34 +6224,26 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             rollout.ReceiptEvidence.from_value(row)
             for row in value["checks"]["reward"]["receipts"]
         ]
-        blocks = [(120, "f" * 64), (121, "9" * 64)]
+        blocks = [(120, "f" * 64, 0), (121, "9" * 64, 0)]
+        self.install_reward_baseline(harness, evidence[0].worker)
 
         def valid_earnings():
-            return {
-                "confirmed_receipt_count": 2,
-                "confirmed_gross_earnings_base": 5_000_000_000,
-                "confirmed_gross_earnings_arc": 5.0,
-                "confirmed_receipts": [
-                    {
-                        "tx_hash": item.tx_hash,
-                        "job_id": item.job_id,
-                        "block_height": block[0],
-                        "block_hash": block[1],
-                        "success": True,
-                        "reward_base": 2_500_000_000,
-                        "reward_arc": 2.5,
-                    }
+            return self.reward_earnings(
+                evidence[0].worker,
+                [
+                    self.reward_receipt_row(item, block)
                     for item, block in zip(evidence, blocks)
                 ],
-                "attestations_per_day_observed": None,
-                "attestations_per_day_unavailable_reason": rollout.PROJECTION_COLLECTING_REASON,
-                "projected_daily_arc": None,
-                "projected_daily_unavailable_reason": rollout.PROJECTION_COLLECTING_REASON,
-            }
+            )
 
         invalid = (
-            ("attestations_per_day_observed", 2.0, "invents an observed daily rate"),
-            ("projected_daily_arc", 5.0, "invents projected_daily_arc"),
+            ("address", "0x" + "7" * 64, "address differs from the requested worker"),
+            ("archive_mode", False, "durable archive history"),
+            ("history_complete_since_recovery", False, "complete canonical all-v3"),
+            ("history_scope", "retained window", "complete canonical all-v3"),
+            ("history_domain", "current recovery epoch only", "complete canonical all-v3"),
+            ("attestations_per_day_observed", 2.0, "invents a rate or projection"),
+            ("projected_daily_arc", 5.0, "invents a rate or projection"),
             (
                 "attestations_per_day_unavailable_reason",
                 "insufficient observations",
@@ -4626,9 +6254,9 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                 None,
                 "canonical collecting-data reason",
             ),
-            ("confirmed_gross_earnings_base", 5_000_000_001, "exactly 5 ARC gross"),
+            ("confirmed_gross_earnings_base", 5_000_000_001, "differs from its canonical rows"),
             ("confirmed_gross_earnings_arc", 5.1, "exact base-unit total"),
-            ("confirmed_receipt_count", 3, "exactly the two rollout canary receipts"),
+            ("confirmed_receipt_count", 3, "differs from its canonical rows"),
         )
         for field, replacement, message in invalid:
             with self.subTest(field=field):
@@ -4636,6 +6264,24 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                 body[field] = replacement
                 harness._http_json = mock.Mock(return_value=body)
                 with self.assertRaisesRegex(rollout.RolloutError, message):
+                    harness.prove_reward_projection(evidence, blocks)
+
+        for field, replacement in (
+            ("tx_type", "0x01"),
+            ("submitted", False),
+            ("included", False),
+            ("confirmed", False),
+            ("success", False),
+            ("receipt_url", "/community/reward_receipt/0x" + "8" * 64),
+            ("index", 1),
+            ("reward_base", 2_500_000_001),
+            ("reward_arc", 2.6),
+        ):
+            with self.subTest(receipt_field=field):
+                body = valid_earnings()
+                body["confirmed_receipts"][0][field] = replacement
+                harness._http_json = mock.Mock(return_value=body)
+                with self.assertRaises(rollout.RolloutError):
                     harness.prove_reward_projection(evidence, blocks)
 
     def test_reward_probes_are_proved_sequentially_before_projection(self) -> None:
@@ -4648,25 +6294,59 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         )
         first = rollout.ReceiptEvidence.from_value(value["checks"]["reward"]["receipts"][0])
         second = rollout.ReceiptEvidence.from_value(value["checks"]["reward"]["receipts"][1])
+        self.persist_reward_baseline(harness, first.worker)
         manager = mock.Mock()
         manager.obtain.side_effect = [first, second]
-        manager.prove.side_effect = [(120, "f" * 64), (121, "9" * 64)]
+        manager.prove.side_effect = [(120, "f" * 64, 0), (121, "9" * 64, 0)]
         harness.obtain_receipt_evidence = manager.obtain
         harness.prove_reward_receipt = manager.prove
         harness.prove_reward_projection = manager.project
+        harness.capture_reward_earnings_baselines = manager.baseline
+        harness.reprove_reward_earnings_baselines_before_probe = manager.reprove
 
         harness.prove_two_reward_receipts()
 
         self.assertEqual(
             manager.mock_calls,
             [
+                mock.call.baseline(),
+                mock.call.reprove(),
                 mock.call.obtain(1),
                 mock.call.prove(first, 1),
                 mock.call.obtain(2),
                 mock.call.prove(second, 2),
-                mock.call.project([first, second], [(120, "f" * 64), (121, "9" * 64)]),
+                mock.call.project(
+                    [first, second],
+                    [(120, "f" * 64, 0), (121, "9" * 64, 0)],
+                ),
             ],
         )
+
+    def test_production_reward_history_is_reproved_after_all_six_restarts(self) -> None:
+        value = self.fixture(production=True, reward_receipt=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        evidence = [
+            rollout.ReceiptEvidence.from_value(row)
+            for row in value["checks"]["reward"]["receipts"]
+        ]
+        heights = []
+        for index in range(6):
+            heights.extend(((200 + index,), (201 + index,)))
+        harness.wait_convergence = mock.Mock(side_effect=heights)
+        harness.production_service = mock.Mock()
+        harness.wait_nodes_ready = mock.Mock()
+        harness.prove_production_runtime_inventory = mock.Mock()
+        harness._rollback_journal_event = mock.Mock()
+        harness.verify_live = mock.Mock()
+
+        harness.prove_reward_history_survives_production_restarts(evidence)
+
+        self.assertEqual(harness.production_service.call_count, 6)
+        for node, call in zip(value["validators"], harness.production_service.call_args_list):
+            self.assertEqual(call.args, (node, "restart"))
+        self.assertEqual(harness.prove_production_runtime_inventory.call_count, 6)
+        self.assertEqual(harness._rollback_journal_event.call_count, 12)
+        harness.verify_live.assert_called_once_with(evidence)
 
     def test_reward_progress_recovers_chain_accept_before_probe_stdout(self) -> None:
         value = self.fixture(reward_receipt=True)
@@ -4738,6 +6418,8 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             output=io.StringIO(),
             reward_evidence_output=output,
         )
+        self.persist_reward_baseline(first, receipts[0].worker)
+        first.reprove_reward_earnings_baselines_before_probe = mock.Mock()
         first.obtain_receipt_evidence = mock.Mock(
             side_effect=[receipts[0], rollout.RolloutError("crash after ordinal one proof")]
         )
@@ -4778,6 +6460,8 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             output=io.StringIO(),
             reward_evidence_output=output,
         )
+        self.persist_reward_baseline(first, receipts[0].worker)
+        first.reprove_reward_earnings_baselines_before_probe = mock.Mock()
         first.obtain_receipt_evidence = mock.Mock(side_effect=receipts)
         first.prove_reward_receipt = mock.Mock(
             side_effect=[(120, "f" * 64), (121, "9" * 64)]
@@ -4823,6 +6507,8 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             output=io.StringIO(),
             reward_evidence_output=output,
         )
+        self.persist_reward_baseline(first, receipts[0].worker)
+        first.reprove_reward_earnings_baselines_before_probe = mock.Mock()
         first.obtain_receipt_evidence = mock.Mock(side_effect=receipts)
         first.prove_reward_receipt = mock.Mock(
             side_effect=[(120, "f" * 64), (121, "9" * 64)]
@@ -4864,9 +6550,15 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         receipt = rollout.ReceiptEvidence.from_value(
             value["checks"]["reward"]["receipts"][0]
         )
-        payload = rollout.reward_progress_payload("d" * 64, [receipt])
+        baseline = rollout.RewardEarningsBaseline.from_earnings(
+            self.reward_earnings(receipt.worker, []), worker=receipt.worker
+        )
+        payload = rollout.reward_progress_payload(
+            "d" * 64, [receipt], [baseline]
+        )
         self.assertEqual(
-            rollout.parse_reward_progress_payload(payload, "d" * 64), [receipt]
+            rollout.parse_reward_progress_payload(payload, "d" * 64),
+            rollout.RewardProgressState((baseline,), (receipt,)),
         )
         with self.assertRaisesRegex(rollout.RolloutError, "different rollout"):
             rollout.parse_reward_progress_payload(payload, "e" * 64)
@@ -4890,15 +6582,15 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             rollout.ReceiptEvidence.from_value(row)
             for row in value["checks"]["reward"]["receipts"]
         ]
+        baseline = self.persist_reward_baseline(harness, evidence[0].worker)
         harness.persist_reward_evidence_progress(evidence[:1])
         harness.persist_reward_evidence_progress(evidence)
         evidence_digest = harness.persist_reward_evidence(evidence)
         self.assertEqual(evidence_digest, digest(output))
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
-        self.assertEqual(
-            rollout.parse_evidence_file(output, "d" * 64),
-            evidence,
-        )
+        parsed = rollout.parse_evidence_file(output, "d" * 64)
+        self.assertEqual(list(parsed.receipts), evidence)
+        self.assertEqual(parsed.earnings_baseline, baseline)
         with self.assertRaisesRegex(rollout.RolloutError, "different rollout"):
             rollout.parse_evidence_file(output, "e" * 64)
         self.assertEqual(harness.persist_reward_evidence(evidence), evidence_digest)
@@ -4924,11 +6616,13 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             reward_evidence_output=resumed_output,
         )
         resumed.reserve_reward_evidence_output()
+        self.persist_reward_baseline(resumed, evidence[0].worker)
         resumed.persist_reward_evidence_progress(evidence[:1])
         resumed.persist_reward_evidence_progress(evidence)
         resumed.persist_reward_evidence(evidence)
         self.assertEqual(
-            rollout.parse_evidence_file(resumed_output, "d" * 64), evidence
+            list(rollout.parse_evidence_file(resumed_output, "d" * 64).receipts),
+            evidence,
         )
 
     def test_reward_evidence_recovers_after_json_publish_without_reissuing(self) -> None:
@@ -4945,6 +6639,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             for row in value["checks"]["reward"]["receipts"]
         ]
         first.reserve_reward_evidence_output()
+        self.persist_reward_baseline(first, evidence[0].worker)
         first.persist_reward_evidence_progress(evidence[:1])
         first.persist_reward_evidence_progress(evidence)
         assert first.reward_evidence_reservation is not None
@@ -4977,7 +6672,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
 
         manager = mock.Mock()
         manager.obtain.side_effect = AssertionError("must not issue another reward")
-        manager.prove.side_effect = [(120, "f" * 64), (121, "9" * 64)]
+        manager.prove.side_effect = [(120, "f" * 64, 0), (121, "9" * 64, 0)]
         resumed.obtain_receipt_evidence = manager.obtain
         resumed.prove_reward_receipt = manager.prove
         resumed.prove_reward_projection = manager.project
@@ -4998,6 +6693,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             output=io.StringIO(),
             reward_evidence_output=output,
         )
+        self.persist_reward_baseline(first, evidence[0].worker)
         first.persist_reward_evidence_progress(evidence[:1])
         first.persist_reward_evidence_progress(evidence)
         first.persist_reward_evidence(evidence)
@@ -5019,7 +6715,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o444)
         manager = mock.Mock()
         manager.obtain.side_effect = AssertionError("must not issue another reward")
-        manager.prove.side_effect = [(120, "f" * 64), (121, "9" * 64)]
+        manager.prove.side_effect = [(120, "f" * 64, 0), (121, "9" * 64, 0)]
         resumed.obtain_receipt_evidence = manager.obtain
         resumed.prove_reward_receipt = manager.prove
         resumed.prove_reward_projection = manager.project

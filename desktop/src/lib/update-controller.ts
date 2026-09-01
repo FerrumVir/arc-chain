@@ -53,7 +53,9 @@ export interface UpdateRuntime {
   check: () => Promise<UpdateCandidate | null>;
   /** Stop/reap arc-node and retain its cross-process lifecycle fence. */
   prepareRelaunch: () => Promise<void>;
-  /** Release that fence only after the signed installer rejects/cancels. */
+  /** Commit the one-way native boundary immediately before install handoff. */
+  beginHandoff: () => Promise<void>;
+  /** Atomically release or resume after a strictly pre-handoff failure. */
   abortRelaunch: () => Promise<void>;
   relaunch: () => Promise<void>;
   now?: () => number;
@@ -315,7 +317,7 @@ export class UpdateController {
 
     const install = (async () => {
       let prepared = false;
-      let installInvoked = false;
+      let handoffStarted = false;
       try {
         // Establish the native durability boundary before the updater mutates
         // the app bundle. The shutdown receipt binds the exact arc-node and
@@ -350,11 +352,13 @@ export class UpdateController {
           }
         });
 
-        // The pinned Tauri installer can reject after it has already renamed
-        // or replaced bundle paths. From the instant install() is invoked, a
-        // rejection therefore cannot prove that the old bundle is intact and
-        // must never release the native node/update fence.
-        installInvoked = true;
+        // Seal the one-way native boundary before calling the pinned Tauri
+        // installer. IPC itself can disconnect after native code commits, so
+        // mark this irreversible before awaiting the command. From this point
+        // a rejection cannot prove that the old bundle is intact and must
+        // never release the node/update fence or resume the old node.
+        handoffStarted = true;
+        await this.runtime.beginHandoff();
         await candidate.install();
 
         this.candidate = null;
@@ -388,18 +392,19 @@ export class UpdateController {
         }
       } catch (error) {
         let detail = errorMessage(error);
-        if (prepared && !installInvoked) {
-          // Download/signature verification failed before install() was
-          // invoked. Only this pre-mutation failure may release the native
-          // fence, and native code still re-proves that no writer/receipt is
-          // live before doing so.
+        let abortFailed = false;
+        if (prepared && !handoffStarted) {
+          // Download/signature verification failed before the one-way native
+          // handoff. Only this pre-mutation failure may enter abort-and-resume,
+          // and native code still re-proves that no writer/receipt is live.
           try {
             await this.runtime.abortRelaunch();
           } catch (abortError) {
+            abortFailed = true;
             detail = `${detail}; failed-update lifecycle fence remains active: ${errorMessage(abortError)}`;
           }
         }
-        if (installInvoked) {
+        if (handoffStarted) {
           this.candidate = null;
           void candidate.close?.().catch(() => {});
           this.setSnapshot({
@@ -417,9 +422,11 @@ export class UpdateController {
           ...this.snapshot,
           phase: "error",
           version,
-          message: `Update was not installed: ${detail}`,
+          message: abortFailed
+            ? `Update was not installed, and ARC could not safely restore the pre-update node. The node remains stopped; restart it manually after resolving the reported lifecycle error: ${detail}`
+            : `Update was not installed: ${detail}`,
           error: detail,
-          canInstall: candidate.canInstall !== false,
+          canInstall: !abortFailed && candidate.canInstall !== false,
           restartRequired: false,
         });
       } finally {

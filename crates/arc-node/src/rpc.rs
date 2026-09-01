@@ -91,6 +91,7 @@ const MAX_TX_SUBMIT_BATCH_SIZE: usize = 64;
 /// tuning that one constant.
 const REWARD_PER_ATTESTATION_ARC: f64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD as f64
     / arc_types::economics::ARC_BASE_UNITS as f64;
+const EARNINGS_HISTORY_DOMAIN: &str = "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
 
 /// The peer-authenticated approval collector is compiled in. Runtime
 /// readiness still fails closed unless the exact six-validator committee,
@@ -5747,20 +5748,10 @@ fn recovery_probe_status_response(
             "recovery probe identity is already bound to different inference semantics".to_string(),
         );
     }
-    let settlement = if let Some((tx_hash, body)) = mined_reward_for_job(node, existing_job_id) {
-        community_reward_receipt_value(node, tx_hash, &body)
-    } else if let Some(submission) = node.community_reward_submissions.get(&existing_job_id) {
-        json!({
-            "status": "pending_mined_receipt",
-            "tx_type": "0x25",
-            "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
-            "job_id": format!("0x{}", existing_job_id.to_hex()),
-            "worker": format!("0x{}", submission.worker.to_hex()),
-            "validator_approvals": submission.approvals,
-            "submitted": true,
-            "included": false,
-            "confirmed": false,
-        })
+    let settlement = if let Some((tx_hash, _)) = indexed_reward_for_job(node, existing_job_id)? {
+        community_reward_receipt_value(node, tx_hash)?
+    } else if let Some(submission) = live_community_reward_submission(node, existing_job_id) {
+        pending_mined_receipt_value(node, existing_job_id, &submission)
     } else if let Some(record) = node.community_verified_settlements.get(&existing_job_id) {
         pending_settlement_value(node, &record)
     } else if node
@@ -5768,13 +5759,27 @@ fn recovery_probe_status_response(
         .as_ref()
         .is_some_and(|results| results.contains_key(&existing_job_id.to_hex()))
     {
+        let assigned_worker = node
+            .community_active_jobs
+            .iter()
+            .find(|entry| {
+                parse_hash256_hex(entry.value(), "active job id")
+                    .is_ok_and(|job_id| job_id == existing_job_id)
+            })
+            .map(|entry| entry.key().clone());
         json!({
             "status": "assignment_in_progress",
             "tx_type": "0x25",
             "job_id": format!("0x{}", existing_job_id.to_hex()),
+            "worker": assigned_worker,
+            "tx_hash": Value::Null,
             "submitted": false,
             "included": false,
             "confirmed": false,
+            "success": Value::Null,
+            "reward_base": Value::Null,
+            "reward_arc": Value::Null,
+            "receipt_url": Value::Null,
         })
     } else {
         return Err("recovery probe job exists without discoverable coordinator state".to_string());
@@ -6800,7 +6805,8 @@ async fn worker_earnings(
     let mut last_block: Option<u64> = None;
     let mut first_block: Option<u64> = None;
     let mut last_tx_hash: Option<String> = None;
-    let mut confirmed_receipts: Vec<(u64, Value)> = Vec::new();
+    let mut confirmed_receipts: Vec<(u64, u32, [u8; 32], Value)> = Vec::new();
+    let mut successful_job_ids = HashSet::new();
 
     for entry in node.state.full_transactions.iter() {
         let index_hash = *entry.key();
@@ -6809,17 +6815,34 @@ async fn worker_earnings(
             TxBody::CommunityInferenceReward(b) => b,
             _ => continue,
         };
-        if body.worker != want
-            || tx.tx_type != TxType::CommunityInferenceReward
-            || tx.hash.0 != index_hash
-        {
+        if body.worker != want {
             continue;
         }
-        let Some(receipt) = node.state.get_receipt(&index_hash) else {
+        let evidence =
+            canonical_transaction_evidence(&node, Hash256(index_hash)).map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "invalid reward chain evidence for 0x{}: {error}",
+                        hex::encode(index_hash)
+                    ),
+                )
+            })?;
+        let Some(receipt) = evidence.receipt else {
             continue;
         };
-        if receipt.tx_hash.0 != index_hash || !receipt.success {
+        if !receipt.success {
             continue;
+        }
+        if !successful_job_ids.insert(body.job_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "worker 0x{} has multiple successful 0x25 receipts for reward job 0x{}",
+                    want.to_hex(),
+                    body.job_id.to_hex()
+                ),
+            ));
         }
         count += 1;
         let bh = receipt.block_height;
@@ -6832,10 +6855,13 @@ async fn worker_earnings(
         }
         confirmed_receipts.push((
             bh,
+            receipt.index,
+            index_hash,
             json!({
                 "tx_type": "0x25",
                 "tx_hash": format!("0x{}", hex::encode(entry.key())),
                 "job_id": format!("0x{}", body.job_id.to_hex()),
+                "worker": format!("0x{}", body.worker.to_hex()),
                 "model_id": format!("0x{}", body.model_id.to_hex()),
                 "input_hash": format!("0x{}", body.input_hash.to_hex()),
                 "output_hash": format!("0x{}", body.output_hash.to_hex()),
@@ -6845,16 +6871,24 @@ async fn worker_earnings(
                 "transaction_domain": format!("0x{}", body.transaction_domain.to_hex()),
                 "block_height": receipt.block_height,
                 "block_hash": format!("0x{}", receipt.block_hash.to_hex()),
+                "index": receipt.index,
+                "submitted": true,
+                "included": true,
+                "confirmed": true,
                 "success": true,
                 "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
                 "reward_arc": REWARD_PER_ATTESTATION_ARC,
+                "receipt_url": format!(
+                    "/community/reward_receipt/0x{}",
+                    hex::encode(entry.key())
+                ),
             }),
         ));
     }
-    confirmed_receipts.sort_unstable_by_key(|(height, _)| *height);
+    confirmed_receipts.sort_unstable_by_key(|(height, index, hash, _)| (*height, *index, *hash));
     let confirmed_receipts: Vec<Value> = confirmed_receipts
         .into_iter()
-        .map(|(_, receipt)| receipt)
+        .map(|(_, _, _, receipt)| receipt)
         .collect();
 
     // Every successful reward receipt transfers the fixed protocol amount.
@@ -6904,7 +6938,10 @@ async fn worker_earnings(
     let reward_budget = prospective_community_reward_budget(&node, want, node.validator_address);
     let reward_budget_ready = community_reward_budget_has_capacity(&reward_budget, true);
     let issuance_ready = community_reward_issuance_ready_for(&node, want);
-    let projected_daily_arc = if issuance_ready {
+    let history_complete_since_recovery = node
+        .state
+        .archive_reward_history_complete_since_v3_recovery();
+    let projected_daily_arc = if issuance_ready && history_complete_since_recovery {
         rate.as_ref()
             .ok()
             .map(|observed| *observed * REWARD_PER_ATTESTATION_ARC)
@@ -6913,6 +6950,11 @@ async fn worker_earnings(
     };
     let projected_daily_unavailable_reason = if projected_daily_arc.is_some() {
         Value::Null
+    } else if !history_complete_since_recovery {
+        Value::String(
+            "complete transaction and receipt history from the initial v3 recovery boundary has not been proven; projection is unavailable"
+                .to_string(),
+        )
     } else if !community_rewards_v1_effective(&node) {
         Value::String(
             "active reward policy is not issuance-ready on this node; no forward earnings projection is permitted"
@@ -6948,8 +6990,23 @@ async fn worker_earnings(
     // it honestly needs a block_height → timestamp join this endpoint does
     // not have yet, so until then the field says "unknown" by being null and
     // the reason ships alongside it.
+    let earnings_history_note = if history_complete_since_recovery {
+        "archive gross rewards since the v3 recovery boundary = successful \
+         CommunityInferenceReward receipts × reward_per_attestation_arc; this is complete \
+         canonical reward history for this chain segment but does not subtract later wallet spending."
+    } else {
+        "retained-window gross rewards = successful CommunityInferenceReward receipts × \
+         reward_per_attestation_arc; this node may prune older receipts and the value does \
+         not subtract later wallet spending."
+    };
+    let earnings_history_scope = if history_complete_since_recovery {
+        "complete canonical reward history since the v3 recovery boundary"
+    } else {
+        "this node's bounded retained reward-receipt window"
+    };
+
     Ok(Json(json!({
-        "address": format!("0x{}", trimmed),
+        "address": format!("0x{}", want.to_hex()),
         "total_rewards": count,
         "total_attestations": count,
         "confirmed_receipts": confirmed_receipts,
@@ -6962,10 +7019,10 @@ async fn worker_earnings(
         "onchain_balance_arc": onchain_balance_arc,
         // Count-based estimate of gross reward earned (clearly labeled).
         "estimated_total_arc": estimated_total_arc,
-        "estimated_total_arc_note":
-            "retained-window gross rewards = successful CommunityInferenceReward receipts × \
-             reward_per_attestation_arc; this node may prune older receipts and the value does \
-             not subtract later wallet spending.",
+        "estimated_total_arc_note": earnings_history_note,
+        "history_scope": earnings_history_scope,
+        "history_domain": EARNINGS_HISTORY_DOMAIN,
+        "history_complete_since_recovery": history_complete_since_recovery,
         // Back-compat alias for pre-existing clients; same value as the
         // estimate above, and NOT the reconciled balance.
         "total_arc": estimated_total_arc,
@@ -7033,10 +7090,9 @@ async fn worker_earnings(
              hours, not a forecast. It says nothing about future work available, and any \
              projection built on it must also respect /economics/rewards.rewards_remaining — \
              the treasury funding these rewards is finite.",
-        // Be explicit that this is a scan of an in-memory, pruned map: on a
-        // non-archive node `full_transactions` only retains the last ~1000
-        // blocks and is empty after a restart, so a zero here means "not
-        // visible from this node", not "never earned".
+        // The index is rebuilt from the durable WAL on restart. Non-archive
+        // nodes can still prune both the in-memory rows and old WAL segments;
+        // archive nodes retain them as an operator-enforced history contract.
         "source": "scan of this node's in-memory full_transactions map",
         "archive_mode": node.state.archive_mode,
     })))
@@ -7248,14 +7304,21 @@ async fn inference_list_attestations(
     for entry in node.state.full_transactions.iter() {
         let hash = entry.key();
         let tx = entry.value();
-        let Some(receipt) = node.state.get_receipt(hash) else {
-            continue;
-        };
-        if tx.hash.0 != *hash || receipt.tx_hash.0 != *hash {
+        if tx.hash.0 != *hash {
+            if matches!(&tx.body, TxBody::CommunityInferenceReward(_)) {
+                tracing::error!(tx_hash = %hex::encode(hash), "reward transaction hash differs from its index key");
+                return Err(StatusCode::CONFLICT);
+            }
             continue;
         }
         match &tx.body {
             TxBody::InferenceAttestation(body) if tx.tx_type == TxType::InferenceAttestation => {
+                let Some(receipt) = node.state.get_receipt(hash) else {
+                    continue;
+                };
+                if receipt.tx_hash.0 != *hash {
+                    continue;
+                }
                 receipt_backed_local_ids.insert(*hash);
                 let local = local_inference_for_hash(&node, hash);
                 activities.push((
@@ -7278,6 +7341,7 @@ async fn inference_list_attestations(
                         "from": tx.from.to_hex(),
                         "block_height": receipt.block_height,
                         "block_hash": format!("0x{}", receipt.block_hash.to_hex()),
+                        "index": receipt.index,
                         "gas_used": receipt.gas_used,
                         "inference": inference_payload_for_attestation(body, local.as_ref()),
                     }),
@@ -7286,6 +7350,15 @@ async fn inference_list_attestations(
             TxBody::CommunityInferenceReward(body)
                 if tx.tx_type == TxType::CommunityInferenceReward =>
             {
+                let Some(receipt) = canonical_transaction_evidence(&node, Hash256(*hash))
+                    .map_err(|error| {
+                        tracing::error!(tx_hash = %hex::encode(hash), %error, "invalid community reward chain evidence");
+                        StatusCode::CONFLICT
+                    })?
+                    .receipt
+                else {
+                    continue;
+                };
                 receipt_backed_local_ids.extend([
                     *hash,
                     body.job_id.0,
@@ -7324,6 +7397,9 @@ async fn inference_list_attestations(
                         "tx_hash": format!("0x{}", hex::encode(hash)),
                         "tx_type": "CommunityInferenceReward",
                         "tx_type_code": "0x25",
+                        "submitted": true,
+                        "included": true,
+                        "confirmed": receipt.success,
                         "success": receipt.success,
                         "computed": receipt.success,
                         "paid": receipt.success,
@@ -7333,14 +7409,35 @@ async fn inference_list_attestations(
                         "job_id": format!("0x{}", body.job_id.to_hex()),
                         "block_height": receipt.block_height,
                         "block_hash": format!("0x{}", receipt.block_hash.to_hex()),
+                        "index": receipt.index,
                         "gas_used": receipt.gas_used,
-                        "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
-                        "reward_arc": REWARD_PER_ATTESTATION_ARC,
+                        "reward_base": if receipt.success {
+                            Value::from(arc_types::economics::INFERENCE_ATTESTATION_REWARD)
+                        } else {
+                            Value::Null
+                        },
+                        "reward_arc": if receipt.success {
+                            Value::from(REWARD_PER_ATTESTATION_ARC)
+                        } else {
+                            Value::Null
+                        },
+                        "receipt_url": format!(
+                            "/community/reward_receipt/0x{}",
+                            hex::encode(hash)
+                        ),
                         "payment": {
                             "status": if receipt.success { "earned" } else { "failed" },
                             "receipt_backed": true,
-                            "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
-                            "reward_arc": REWARD_PER_ATTESTATION_ARC,
+                            "reward_base": if receipt.success {
+                                Value::from(arc_types::economics::INFERENCE_ATTESTATION_REWARD)
+                            } else {
+                                Value::Null
+                            },
+                            "reward_arc": if receipt.success {
+                                Value::from(REWARD_PER_ATTESTATION_ARC)
+                            } else {
+                                Value::Null
+                            },
                         },
                         "computation": {
                             "status": if receipt.success { "verified_and_paid" } else { "reward_execution_failed" },
@@ -7349,6 +7446,10 @@ async fn inference_list_attestations(
                         "inference": Value::Object(inference),
                     }),
                 ));
+            }
+            TxBody::CommunityInferenceReward(_) => {
+                tracing::error!(tx_hash = %hex::encode(hash), "community reward body has a non-0x25 discriminator");
+                return Err(StatusCode::CONFLICT);
             }
             _ => {}
         }
@@ -13402,7 +13503,7 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
             return Err(format!("settlement journal entry {name:?} is future-dated"));
         }
         let expired = record.payload.reward.expires_at_height < node.state.height();
-        if expired || mined_reward_for_job(node, expected_job).is_some() {
+        if expired || indexed_reward_for_job(node, expected_job)?.is_some() {
             std::fs::remove_file(&path).map_err(|error| {
                 format!("remove expired/mined settlement journal entry {name:?}: {error}")
             })?;
@@ -13471,16 +13572,15 @@ fn retain_verified_settlement(
 
 fn prune_verified_settlements_locked(node: &NodeState) -> Result<usize, String> {
     let height = node.state.height();
-    let removable: Vec<Hash256> = node
-        .community_verified_settlements
-        .iter()
-        .filter_map(|entry| {
-            let job_id = *entry.key();
-            (entry.value().payload.reward.expires_at_height < height
-                || mined_reward_for_job(node, job_id).is_some())
-            .then_some(job_id)
-        })
-        .collect();
+    let mut removable = Vec::new();
+    for entry in node.community_verified_settlements.iter() {
+        let job_id = *entry.key();
+        if entry.value().payload.reward.expires_at_height < height
+            || indexed_reward_for_job(node, job_id)?.is_some()
+        {
+            removable.push(job_id);
+        }
+    }
     for job_id in &removable {
         node.community_verified_settlements.remove(job_id);
         node.community_reward_submissions.remove(job_id);
@@ -13498,6 +13598,7 @@ fn pending_settlement_value(node: &NodeState, record: &VerifiedCommunitySettleme
     json!({
         "status": "verified_pending_approval",
         "tx_type": "0x25",
+        "tx_hash": Value::Null,
         "job_id": format!("0x{}", record.payload.reward.job_id.to_hex()),
         "worker": format!("0x{}", record.payload.reward.worker.to_hex()),
         "output_hash": format!("0x{}", record.payload.reward.output_hash.to_hex()),
@@ -13511,33 +13612,91 @@ fn pending_settlement_value(node: &NodeState, record: &VerifiedCommunitySettleme
         "submitted": false,
         "included": false,
         "confirmed": false,
+        "success": Value::Null,
+        "block_height": Value::Null,
+        "block_hash": Value::Null,
+        "index": Value::Null,
         "reward_base": Value::Null,
         "reward_arc": Value::Null,
+        "receipt_url": Value::Null,
         "evidence_source": "independently verified completion awaiting threshold approval; no mined receipt",
     })
+}
+
+fn pending_mined_receipt_value(
+    node: &NodeState,
+    job_id: Hash256,
+    submission: &CommunityRewardSubmission,
+) -> Value {
+    let assignment_epoch = node
+        .community_verified_settlements
+        .get(&job_id)
+        .map(|record| format!("0x{}", record.payload.reward.assignment_epoch.to_hex()));
+    json!({
+        "status": "pending_mined_receipt",
+        "tx_type": "0x25",
+        "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
+        "job_id": format!("0x{}", job_id.to_hex()),
+        "worker": format!("0x{}", submission.worker.to_hex()),
+        "assignment_epoch": assignment_epoch,
+        "recovery_epoch": reward_recovery_epoch(node),
+        "validator_set_id": reward_recovery_validator_set_id(node),
+        "validator_set_commitment": reward_validator_set_id(node),
+        "transaction_domain": node
+            .state
+            .transaction_domain_hash()
+            .map(|domain| format!("0x{}", domain.to_hex())),
+        "validator_approvals": submission.approvals,
+        "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
+        "submitted": true,
+        "included": false,
+        "confirmed": false,
+        "success": Value::Null,
+        "block_height": Value::Null,
+        "block_hash": Value::Null,
+        "index": Value::Null,
+        "reward_base": Value::Null,
+        "reward_arc": Value::Null,
+        "receipt_url": format!("/community/reward_receipt/0x{}", submission.tx_hash.to_hex()),
+        "evidence_source": "coordinator mempool submission only; no mined receipt",
+    })
+}
+
+/// A coordinator bookkeeping row is not evidence that its transaction is
+/// still submitted. Proposers remove transactions from the mempool before
+/// inclusion, and rejected/drained transactions may never reach a block. Drop
+/// only the exact stale row observed so a concurrent replacement is retained.
+fn live_community_reward_submission(
+    node: &NodeState,
+    job_id: Hash256,
+) -> Option<CommunityRewardSubmission> {
+    loop {
+        let submission = node
+            .community_reward_submissions
+            .get(&job_id)
+            .map(|entry| entry.value().clone())?;
+        if node.mempool.contains(&submission.tx_hash) {
+            return Some(submission);
+        }
+        node.community_reward_submissions
+            .remove_if(&job_id, |_, current| {
+                current.tx_hash == submission.tx_hash && !node.mempool.contains(&submission.tx_hash)
+            });
+    }
 }
 
 async fn attempt_verified_community_reward(
     node: &NodeState,
     job_id: Hash256,
 ) -> Result<Value, String> {
-    if let Some(submission) = node.community_reward_submissions.get(&job_id) {
-        if node.mempool.contains(&submission.tx_hash) {
-            return Ok(json!({
-                "status": "pending_mined_receipt",
-                "tx_type": "0x25",
-                "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
-                "job_id": format!("0x{}", job_id.to_hex()),
-                "validator_approvals": submission.approvals,
-                "submitted": true,
-                "included": false,
-            }));
-        }
-        drop(submission);
-        // The transaction left the mempool without a mined receipt (for
-        // example, a proposer drained then rejected it). Rebuild approvals
-        // and resubmit from the durable verified payload.
-        node.community_reward_submissions.remove(&job_id);
+    // Inclusion can race the retry scheduler's sleep. Always resolve the
+    // chain index before consulting or rebuilding the coordinator's mempool
+    // bookkeeping, otherwise a mined job can be submitted a second time.
+    if let Some((tx_hash, _)) = indexed_reward_for_job(node, job_id)? {
+        return community_reward_receipt_value(node, tx_hash);
+    }
+    if let Some(submission) = live_community_reward_submission(node, job_id) {
+        return Ok(pending_mined_receipt_value(node, job_id, &submission));
     }
     let payload = node
         .community_verified_settlements
@@ -13554,7 +13713,6 @@ async fn attempt_verified_community_reward(
     reward.validator_approvals = approvals;
     let worker = reward.worker;
     let output_hash = reward.output_hash;
-    let assignment_epoch = reward.assignment_epoch;
     let job_nonce = reward.job_nonce;
 
     let key = node
@@ -13578,34 +13736,15 @@ async fn attempt_verified_community_reward(
     node.mempool
         .insert(tx)
         .map_err(|error| format!("submit community reward to mempool: {error}"))?;
-    node.community_reward_submissions.insert(
-        job_id,
-        CommunityRewardSubmission {
-            worker,
-            output_hash,
-            tx_hash,
-            approvals: approval_count,
-        },
-    );
-    Ok(json!({
-        "status": "pending_mined_receipt",
-        "tx_type": "0x25",
-        "tx_hash": format!("0x{}", tx_hash.to_hex()),
-        "job_id": format!("0x{}", job_id.to_hex()),
-        "assignment_epoch": format!("0x{}", assignment_epoch.to_hex()),
-        "recovery_epoch": reward_recovery_epoch(node),
-        "validator_set_id": reward_recovery_validator_set_id(node),
-        "validator_set_commitment": reward_validator_set_id(node),
-        "transaction_domain": node.state.transaction_domain_hash().map(|domain| format!("0x{}", domain.to_hex())),
-        "validator_approvals": approval_count,
-        "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
-        "submitted": true,
-        "included": false,
-        "reward_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
-        "reward_arc": REWARD_PER_ATTESTATION_ARC,
-        "receipt_url": format!("/community/reward_receipt/0x{}", tx_hash.to_hex()),
-        "evidence_note": "payment is not earned until this exact 0x25 transaction has a successful mined receipt",
-    }))
+    let submission = CommunityRewardSubmission {
+        worker,
+        output_hash,
+        tx_hash,
+        approvals: approval_count,
+    };
+    node.community_reward_submissions
+        .insert(job_id, submission.clone());
+    Ok(pending_mined_receipt_value(node, job_id, &submission))
 }
 
 /// Deterministically de-synchronize independently verified jobs competing for
@@ -13659,7 +13798,22 @@ fn schedule_verified_settlement_retry(node: &NodeState, job_id: Hash256) {
             else {
                 return;
             };
-            if mined_reward_for_job(&task_node, job_id).is_some()
+            let indexed_reward = match indexed_reward_for_job(&task_node, job_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(mut record) =
+                        task_node.community_verified_settlements.get_mut(&job_id)
+                    {
+                        record.retry_running = false;
+                        record.last_error = Some(format!(
+                            "reward index identity check failed closed: {error}"
+                        ));
+                    }
+                    tracing::error!(job_id = %job_id, %error, "reward retry stopped on inconsistent chain index");
+                    return;
+                }
+            };
+            if indexed_reward.is_some()
                 || record.payload.reward.expires_at_height < task_node.state.height()
             {
                 if let Some(mut record) = task_node.community_verified_settlements.get_mut(&job_id)
@@ -14075,6 +14229,33 @@ async fn community_submit_work_signed(
     community_submit_work(AxumState(node), Json(result)).await
 }
 
+fn unsubmitted_community_reward_settlement(
+    status: &str,
+    job_id: &str,
+    worker: &str,
+    reason: impl Into<String>,
+) -> Value {
+    json!({
+        "status": status,
+        "tx_type": "0x25",
+        "tx_hash": Value::Null,
+        "job_id": job_id,
+        "worker": worker,
+        "submitted": false,
+        "included": false,
+        "confirmed": false,
+        "success": Value::Null,
+        "block_height": Value::Null,
+        "block_hash": Value::Null,
+        "index": Value::Null,
+        "reward_base": Value::Null,
+        "reward_arc": Value::Null,
+        "receipt_url": Value::Null,
+        "reason": reason.into(),
+        "evidence_source": "no 0x25 transaction was submitted; inference verification is separate from payment",
+    })
+}
+
 pub async fn community_submit_work(
     AxumState(node): AxumState<NodeState>,
     Json(result): Json<WorkResult>,
@@ -14155,55 +14336,50 @@ pub async fn community_submit_work(
         ))?
         .clone();
 
-    // Freshly signed retries are idempotent after a reward entered the
-    // mempool. A retry may retrieve status, but cannot change worker/output.
-    if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id")
-        && let Some(submission) = node.community_reward_submissions.get(&job_hash)
-    {
-        let worker = parse_hash256_hex(&result.worker_id, "worker_id")
-            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-        let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
-            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-        if worker != submission.worker || output_hash != submission.output_hash {
-            return Err((
-                StatusCode::CONFLICT,
-                "job already submitted with different worker or output semantics".to_string(),
-            ));
-        }
-        return Ok(Json(json!({
-            "ok": true,
-            "idempotent_replay": true,
-            "job_id": result.job_id,
-            "settlement": {
-                "status": "pending_mined_receipt",
-                "tx_type": "0x25",
-                "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
-                "validator_approvals": submission.approvals,
-                "included": false,
-                "submitted": true,
-                "receipt_url": format!("/community/reward_receipt/0x{}", submission.tx_hash.to_hex()),
+    // Freshly signed retries are idempotent. Resolve the chain index before
+    // the coordinator's submission map because block inclusion and cleanup
+    // are not atomic; a stale submission entry must never hide a mined result.
+    if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id") {
+        let indexed = indexed_reward_for_job(&node, job_hash)
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+        if let Some((tx_hash, body)) = indexed {
+            let worker = parse_hash256_hex(&result.worker_id, "worker_id")
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            if worker != body.worker || output_hash != body.output_hash {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "mined job has different worker or output semantics".to_string(),
+                ));
             }
-        })));
-    }
-    if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id")
-        && let Some((tx_hash, body)) = mined_reward_for_job(&node, job_hash)
-    {
-        let worker = parse_hash256_hex(&result.worker_id, "worker_id")
-            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-        let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
-            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-        if worker != body.worker || output_hash != body.output_hash {
-            return Err((
-                StatusCode::CONFLICT,
-                "mined job has different worker or output semantics".to_string(),
-            ));
+            let settlement = community_reward_receipt_value(&node, tx_hash)
+                .map_err(|error| (StatusCode::CONFLICT, error))?;
+            return Ok(Json(json!({
+                "ok": true,
+                "idempotent_replay": true,
+                "job_id": result.job_id,
+                "settlement": settlement,
+            })));
         }
-        return Ok(Json(json!({
-            "ok": true,
-            "idempotent_replay": true,
-            "job_id": result.job_id,
-            "settlement": community_reward_receipt_value(&node, tx_hash, &body),
-        })));
+        if let Some(submission) = live_community_reward_submission(&node, job_hash) {
+            let worker = parse_hash256_hex(&result.worker_id, "worker_id")
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            let output_hash = parse_hash256_hex(&result.output_hash, "output_hash")
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+            if worker != submission.worker || output_hash != submission.output_hash {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "job already submitted with different worker or output semantics".to_string(),
+                ));
+            }
+            return Ok(Json(json!({
+                "ok": true,
+                "idempotent_replay": true,
+                "job_id": result.job_id,
+                "settlement": pending_mined_receipt_value(&node, job_hash, &submission),
+            })));
+        }
     }
 
     if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id")
@@ -14393,13 +14569,14 @@ pub async fn community_submit_work(
     let settlement_outcome = if let Some(worker_attestation) = verified_attestation {
         let worker_attestation_hash = format!("0x{}", worker_attestation.hash.to_hex());
         if !community_rewards_v1_protocol_active(&node) {
-            Some(json!({
-                "status": "reward_protocol_not_activated",
-                "worker_attestation_hash": worker_attestation_hash,
-                "reward_arc": REWARD_PER_ATTESTATION_ARC,
-                "included": false,
-                "reason": "result verified, but reward issuance requires both the genesis-committed activation height and the local issuance switch",
-            }))
+            let mut settlement = unsubmitted_community_reward_settlement(
+                "reward_protocol_not_activated",
+                &result.job_id,
+                &result.worker_id,
+                "result verified, but reward issuance requires both the genesis-committed activation height and the local issuance switch",
+            );
+            settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
+            Some(settlement)
         } else {
             match submit_verified_community_reward(
                 &node,
@@ -14415,25 +14592,32 @@ pub async fn community_submit_work(
                     settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
                     Some(settlement)
                 }
-                Err(reason) => Some(json!({
-                    "status": "reward_approval_quorum_unavailable",
-                    "worker_attestation_hash": worker_attestation_hash,
-                    "reward_arc": REWARD_PER_ATTESTATION_ARC,
-                    "included": false,
-                    "submitted": false,
-                    "required_validator_approvals": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
-                    "recovery_epoch": reward_recovery_epoch(&node),
-                    "validator_set_id": reward_recovery_validator_set_id(&node),
-                    "validator_set_commitment": reward_validator_set_id(&node),
-                    "reason": reason,
-                })),
+                Err(reason) => {
+                    let mut settlement = unsubmitted_community_reward_settlement(
+                        "reward_approval_quorum_unavailable",
+                        &result.job_id,
+                        &result.worker_id,
+                        reason,
+                    );
+                    settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
+                    settlement["required_validator_approvals"] =
+                        Value::from(arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED);
+                    settlement["recovery_epoch"] = Value::from(reward_recovery_epoch(&node));
+                    settlement["validator_set_id"] =
+                        Value::from(reward_recovery_validator_set_id(&node));
+                    settlement["validator_set_commitment"] =
+                        Value::String(reward_validator_set_id(&node));
+                    Some(settlement)
+                }
             }
         }
     } else if result.success {
-        Some(json!({
-            "status": "missing_worker_attestation",
-            "reason": "worker did not include signed_attestation_hex",
-        }))
+        Some(unsubmitted_community_reward_settlement(
+            "missing_worker_attestation",
+            &result.job_id,
+            &result.worker_id,
+            "worker did not include signed_attestation_hex",
+        ))
     } else {
         None
     };
@@ -14474,33 +14658,235 @@ pub async fn community_submit_work(
     })))
 }
 
-fn mined_reward_for_job(
-    node: &NodeState,
-    job_id: Hash256,
-) -> Option<(
-    Hash256,
-    arc_types::transaction::CommunityInferenceRewardBody,
-)> {
-    node.state.full_transactions.iter().find_map(|entry| {
-        let arc_types::TxBody::CommunityInferenceReward(body) = &entry.value().body else {
-            return None;
-        };
-        (body.job_id == job_id).then(|| (Hash256(*entry.key()), body.clone()))
+#[derive(Clone, Copy, Debug)]
+struct CanonicalTransactionInclusion {
+    block_height: u64,
+    block_hash: Hash256,
+    index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalTransactionEvidence {
+    transaction: Transaction,
+    inclusion: Option<CanonicalTransactionInclusion>,
+    receipt: Option<TxReceipt>,
+}
+
+/// Prove that a durable transaction-map entry still commits to its complete
+/// envelope and body. The map key and embedded hash are insufficient on their
+/// own: a partially restored or corrupted row could retain both while its
+/// worker, job, amount, or discriminator bytes changed underneath them.
+///
+/// Community rewards carry their own historical recovery domain, so an
+/// archive node can verify rows from every v3 recovery epoch rather than
+/// incorrectly hashing old rows in only the currently active domain.
+fn validate_canonical_transaction_identity(
+    tx: &Transaction,
+    index_hash: Hash256,
+) -> Result<(), String> {
+    if tx.hash != index_hash {
+        return Err("transaction hash differs from its durable index key".to_string());
+    }
+    if tx.tx_type != tx.body.tx_type() {
+        return Err("transaction discriminator differs from its body variant".to_string());
+    }
+    let expected_hash = match &tx.body {
+        TxBody::CommunityInferenceReward(body) if body.transaction_domain != Hash256::ZERO => {
+            tx.compute_hash_in_domain(&body.transaction_domain)
+        }
+        _ => tx.compute_hash(),
+    };
+    if expected_hash != index_hash {
+        return Err(
+            "transaction body and envelope do not reproduce their committed hash".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_canonical_transaction_inclusion(
+    block: &Block,
+    indexed_height: u64,
+    index: u32,
+    tx_hash: Hash256,
+) -> Result<CanonicalTransactionInclusion, String> {
+    if block.header.height != indexed_height {
+        return Err("transaction index height differs from its block header".to_string());
+    }
+    if block.hash != Block::compute_hash(&block.header) {
+        return Err("indexed block hash differs from its serialized header".to_string());
+    }
+    if block.header.tx_count as usize != block.tx_hashes.len() {
+        return Err("block transaction count differs from its transaction body".to_string());
+    }
+    let committed_root = arc_crypto::MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+    if committed_root != block.header.tx_root {
+        return Err("block transaction body differs from its committed Merkle root".to_string());
+    }
+    if index >= block.header.tx_count {
+        return Err("transaction index exceeds the block transaction count".to_string());
+    }
+    if block.tx_hashes.get(index as usize) != Some(&tx_hash) {
+        return Err("transaction index differs from its block body".to_string());
+    }
+    Ok(CanonicalTransactionInclusion {
+        block_height: indexed_height,
+        block_hash: block.hash,
+        index,
     })
 }
 
-fn community_reward_receipt_value(
+/// Bind a transaction and any execution receipt to the canonical block index.
+///
+/// A receipt whose transaction hash matches is still not proof of inclusion:
+/// its height, block hash, and index must identify the exact transaction in a
+/// structurally valid block. Every public payment view uses this helper so a
+/// corrupted or partially recovered index cannot be reported as earned ARC.
+fn canonical_transaction_evidence(
     node: &NodeState,
     tx_hash: Hash256,
-    body: &arc_types::transaction::CommunityInferenceRewardBody,
-) -> Value {
+) -> Result<CanonicalTransactionEvidence, String> {
+    let tx = node
+        .state
+        .full_transactions
+        .get(&tx_hash.0)
+        .ok_or_else(|| "canonical transaction body is unavailable".to_string())?;
+    validate_canonical_transaction_identity(&tx, tx_hash)?;
+    let transaction = tx.clone();
+    drop(tx);
+
+    let indexed = node
+        .state
+        .tx_index
+        .get(&tx_hash.0)
+        .map(|entry| *entry.value());
+    let inclusion = if let Some((block_height, index)) = indexed {
+        let block = node
+            .state
+            .get_block(block_height)
+            .ok_or_else(|| "transaction index names an unavailable block".to_string())?;
+        Some(validate_canonical_transaction_inclusion(
+            &block,
+            block_height,
+            index,
+            tx_hash,
+        )?)
+    } else {
+        None
+    };
+
     let receipt = node.state.get_receipt(&tx_hash.0);
+    if let Some(receipt) = receipt.as_ref() {
+        if receipt.tx_hash != tx_hash {
+            return Err("receipt hash differs from its transaction".to_string());
+        }
+        let inclusion = inclusion
+            .ok_or_else(|| "receipt exists without a canonical transaction index".to_string())?;
+        if receipt.block_height != inclusion.block_height {
+            return Err("receipt block height differs from the canonical index".to_string());
+        }
+        if receipt.block_hash != inclusion.block_hash {
+            return Err("receipt block hash differs from the canonical block".to_string());
+        }
+        if receipt.index != inclusion.index {
+            return Err("receipt transaction index differs from the canonical block".to_string());
+        }
+    }
+
+    Ok(CanonicalTransactionEvidence {
+        transaction,
+        inclusion,
+        receipt,
+    })
+}
+
+fn indexed_reward_for_job(
+    node: &NodeState,
+    job_id: Hash256,
+) -> Result<
+    Option<(
+        Hash256,
+        arc_types::transaction::CommunityInferenceRewardBody,
+    )>,
+    String,
+> {
+    let mut successful = Vec::new();
+    let mut failed = Vec::new();
+    let mut receipt_unavailable = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        let arc_types::TxBody::CommunityInferenceReward(body) = &tx.body else {
+            continue;
+        };
+        if body.job_id != job_id {
+            continue;
+        }
+        let index_hash = Hash256(*entry.key());
+        if tx.tx_type != TxType::CommunityInferenceReward {
+            return Err(format!(
+                "reward job 0x{} has a non-0x25 transaction discriminator",
+                job_id.to_hex()
+            ));
+        }
+        if tx.hash != index_hash {
+            return Err(format!(
+                "reward job 0x{} transaction hash differs from its index key",
+                job_id.to_hex()
+            ));
+        }
+        let evidence = canonical_transaction_evidence(node, index_hash).map_err(|error| {
+            format!(
+                "reward job 0x{} has invalid chain evidence: {error}",
+                job_id.to_hex()
+            )
+        })?;
+        if evidence.inclusion.is_none() {
+            return Err(format!(
+                "reward job 0x{} transaction body has no canonical block index",
+                job_id.to_hex()
+            ));
+        }
+        match evidence.receipt {
+            Some(receipt) if receipt.success => {
+                successful.push((index_hash, body.clone()));
+            }
+            Some(_) => failed.push((index_hash, body.clone())),
+            None => receipt_unavailable.push((index_hash, body.clone())),
+        }
+    }
+    if successful.len() > 1 {
+        return Err(format!(
+            "reward job 0x{} has multiple successful 0x25 receipts",
+            job_id.to_hex()
+        ));
+    }
+    if let Some(candidate) = successful.pop() {
+        return Ok(Some(candidate));
+    }
+    failed.sort_unstable_by_key(|(hash, _)| hash.0);
+    if let Some(candidate) = failed.into_iter().next() {
+        return Ok(Some(candidate));
+    }
+    receipt_unavailable.sort_unstable_by_key(|(hash, _)| hash.0);
+    Ok(receipt_unavailable.into_iter().next())
+}
+
+fn community_reward_receipt_value(node: &NodeState, tx_hash: Hash256) -> Result<Value, String> {
+    let evidence = canonical_transaction_evidence(node, tx_hash)
+        .map_err(|error| format!("invalid reward chain evidence: {error}"))?;
+    let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
+        return Err("canonical transaction is not type 0x25".to_string());
+    };
+    let inclusion = evidence
+        .inclusion
+        .ok_or_else(|| "reward transaction body has no canonical block index".to_string())?;
+    let receipt = evidence.receipt;
     let (status, included, confirmed) = match receipt.as_ref() {
         Some(receipt) if receipt.success => ("mined_success", true, true),
         Some(_) => ("mined_failed", true, false),
-        None => ("pending_mined_receipt", false, false),
+        None => ("receipt_unavailable", true, false),
     };
-    json!({
+    Ok(json!({
         "status": status,
         "tx_type": "0x25",
         "tx_hash": format!("0x{}", tx_hash.to_hex()),
@@ -14515,15 +14901,18 @@ fn community_reward_receipt_value(
         "validator_set_commitment": reward_validator_set_id(node),
         "transaction_domain": format!("0x{}", body.transaction_domain.to_hex()),
         "validator_approvals": body.validator_approvals.len(),
+        "submitted": true,
         "included": included,
         "confirmed": confirmed,
         "success": receipt.as_ref().map(|receipt| receipt.success),
-        "block_height": receipt.as_ref().map(|receipt| receipt.block_height),
-        "block_hash": receipt.as_ref().map(|receipt| format!("0x{}", receipt.block_hash.to_hex())),
+        "block_height": inclusion.block_height,
+        "block_hash": format!("0x{}", inclusion.block_hash.to_hex()),
+        "index": inclusion.index,
         "reward_base": if confirmed { Value::from(arc_types::economics::INFERENCE_ATTESTATION_REWARD) } else { Value::Null },
         "reward_arc": if confirmed { Value::from(REWARD_PER_ATTESTATION_ARC) } else { Value::Null },
+        "receipt_url": format!("/community/reward_receipt/0x{}", tx_hash.to_hex()),
         "evidence_source": if confirmed { "successful mined CommunityInferenceReward receipt" } else { "no successful mined receipt" },
-    })
+    }))
 }
 
 async fn community_reward_receipt(
@@ -14533,36 +14922,51 @@ async fn community_reward_receipt(
     let tx_hash = parse_hash256_hex(&hash, "reward tx hash")
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     if let Some(tx) = node.state.full_transactions.get(&tx_hash.0) {
-        let arc_types::TxBody::CommunityInferenceReward(body) = &tx.body else {
+        if tx.tx_type != TxType::CommunityInferenceReward || tx.hash != tx_hash {
+            return Err((
+                StatusCode::CONFLICT,
+                "reward transaction identity differs from its index key".to_string(),
+            ));
+        }
+        let arc_types::TxBody::CommunityInferenceReward(_) = &tx.body else {
             return Err((
                 StatusCode::CONFLICT,
                 "transaction is not type 0x25".to_string(),
             ));
         };
-        return Ok(Json(community_reward_receipt_value(&node, tx_hash, body)));
+        let value = community_reward_receipt_value(&node, tx_hash)
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+        return Ok(Json(value));
     }
     let pending = node
         .community_reward_submissions
         .iter()
         .find(|entry| entry.value().tx_hash == tx_hash)
         .map(|entry| (*entry.key(), entry.value().clone()));
-    if let Some((job_id, submission)) = pending {
-        return Ok(Json(json!({
-            "status": "pending_mined_receipt",
-            "tx_type": "0x25",
-            "tx_hash": format!("0x{}", tx_hash.to_hex()),
-            "job_id": format!("0x{}", job_id.to_hex()),
-            "worker": format!("0x{}", submission.worker.to_hex()),
-            "validator_approvals": submission.approvals,
-            "recovery_epoch": reward_recovery_epoch(&node),
-            "validator_set_id": reward_recovery_validator_set_id(&node),
-            "validator_set_commitment": reward_validator_set_id(&node),
-            "included": false,
-            "confirmed": false,
-            "reward_base": Value::Null,
-            "reward_arc": Value::Null,
-            "evidence_source": "coordinator mempool submission only; no mined receipt",
-        })));
+    if let Some((job_id, _)) = pending {
+        if let Some(submission) = live_community_reward_submission(&node, job_id)
+            && submission.tx_hash == tx_hash
+        {
+            return Ok(Json(pending_mined_receipt_value(
+                &node,
+                job_id,
+                &submission,
+            )));
+        }
+        if let Some((mined_hash, _)) =
+            indexed_reward_for_job(&node, job_id).map_err(|error| (StatusCode::CONFLICT, error))?
+        {
+            let value = community_reward_receipt_value(&node, mined_hash)
+                .map_err(|error| (StatusCode::CONFLICT, error))?;
+            return Ok(Json(value));
+        }
+        if let Some(record) = node.community_verified_settlements.get(&job_id) {
+            let mut value = pending_settlement_value(&node, &record);
+            value["previous_tx_hash"] = Value::String(format!("0x{}", tx_hash.to_hex()));
+            drop(record);
+            schedule_verified_settlement_retry(&node, job_id);
+            return Ok(Json(value));
+        }
     }
     Err((
         StatusCode::NOT_FOUND,
@@ -14576,23 +14980,19 @@ async fn community_reward_job(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let job_id =
         parse_hash256_hex(&job_id, "job_id").map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    if let Some((tx_hash, body)) = mined_reward_for_job(&node, job_id) {
-        return Ok(Json(community_reward_receipt_value(&node, tx_hash, &body)));
+    if let Some((tx_hash, _)) =
+        indexed_reward_for_job(&node, job_id).map_err(|error| (StatusCode::CONFLICT, error))?
+    {
+        let value = community_reward_receipt_value(&node, tx_hash)
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+        return Ok(Json(value));
     }
-    if let Some(submission) = node.community_reward_submissions.get(&job_id) {
-        return Ok(Json(json!({
-            "status": "pending_mined_receipt",
-            "tx_type": "0x25",
-            "job_id": format!("0x{}", job_id.to_hex()),
-            "tx_hash": format!("0x{}", submission.tx_hash.to_hex()),
-            "worker": format!("0x{}", submission.worker.to_hex()),
-            "validator_approvals": submission.approvals,
-            "recovery_epoch": reward_recovery_epoch(&node),
-            "validator_set_id": reward_recovery_validator_set_id(&node),
-            "validator_set_commitment": reward_validator_set_id(&node),
-            "included": false,
-            "confirmed": false,
-        })));
+    if let Some(submission) = live_community_reward_submission(&node, job_id) {
+        return Ok(Json(pending_mined_receipt_value(
+            &node,
+            job_id,
+            &submission,
+        )));
     }
     if let Some(record) = node.community_verified_settlements.get(&job_id) {
         let pending = pending_settlement_value(&node, &record);
@@ -14616,11 +15016,12 @@ async fn community_reward_approval_status(
         .community_reward_approval_jobs
         .get(&job_id)
         .map(|entry| *entry.value());
+    let submitted = live_community_reward_submission(&node, job_id).is_some();
     Ok(Json(json!({
         "job_id": format!("0x{}", job_id.to_hex()),
         "locally_approved": commitment.is_some(),
         "approval_commitment": commitment.map(|value| format!("0x{}", value.to_hex())),
-        "submitted": node.community_reward_submissions.contains_key(&job_id),
+        "submitted": submitted,
         "validator_set_id": reward_recovery_validator_set_id(&node),
         "validator_set_commitment": reward_validator_set_id(&node),
         "recovery_epoch": reward_recovery_epoch(&node),
@@ -17770,7 +18171,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receipt["status"], "mined_success");
+        assert_eq!(receipt["submitted"], true);
+        assert_eq!(receipt["included"], true);
         assert_eq!(receipt["confirmed"], true);
+        assert_eq!(receipt["success"], true);
+        assert_eq!(
+            receipt["receipt_url"],
+            format!("/community/reward_receipt/0x{}", tx_hash.to_hex())
+        );
         assert_eq!(receipt["reward_base"], reward_amount);
         assert_eq!(receipt["recovery_epoch"], 0);
         assert_eq!(receipt["validator_set_id"], 0);
@@ -17797,6 +18205,19 @@ mod tests {
         assert_eq!(paid["record_kind"], "mined_community_inference_reward");
         assert_eq!(paid["tx_type_code"], "0x25");
         assert_eq!(paid["worker"], format!("0x{}", worker.address().to_hex()));
+        assert_eq!(paid["submitted"], true);
+        assert_eq!(paid["included"], true);
+        assert_eq!(paid["confirmed"], true);
+        assert_eq!(paid["success"], true);
+        assert_eq!(paid["block_height"], receipt["block_height"]);
+        assert_eq!(paid["block_hash"], receipt["block_hash"]);
+        assert_eq!(paid["index"], receipt["index"]);
+        assert_eq!(
+            paid["receipt_url"],
+            format!("/community/reward_receipt/0x{}", tx_hash.to_hex())
+        );
+        assert_eq!(paid["reward_base"], reward_amount);
+        assert_eq!(paid["reward_arc"], REWARD_PER_ATTESTATION_ARC);
         assert_eq!(paid["computed"], true);
         assert_eq!(paid["paid"], true);
         assert_eq!(paid["earned"], true);
@@ -17813,6 +18234,35 @@ mod tests {
                 .any(|row| row["tx_hash"] == paid["tx_hash"])
         );
 
+        node.state.receipts.get_mut(&tx_hash.0).unwrap().success = false;
+        let Json(failed_activity) = inference_list_attestations(
+            AxumState(node.clone()),
+            Query(HashMap::from([("limit".to_string(), "20".to_string())])),
+        )
+        .await
+        .unwrap();
+        let failed_paid = failed_activity["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["tx_hash"] == format!("0x{}", tx_hash.to_hex()))
+            .expect("failed 0x25 receipt remains visible without being called earned");
+        assert_eq!(failed_paid["submitted"], true);
+        assert_eq!(failed_paid["included"], true);
+        assert_eq!(failed_paid["confirmed"], false);
+        assert_eq!(failed_paid["success"], false);
+        assert_eq!(failed_paid["paid"], false);
+        assert_eq!(failed_paid["earned"], false);
+        assert_eq!(
+            failed_paid["receipt_url"],
+            format!("/community/reward_receipt/0x{}", tx_hash.to_hex())
+        );
+        assert!(failed_paid["reward_base"].is_null());
+        assert!(failed_paid["reward_arc"].is_null());
+        assert!(failed_paid["payment"]["reward_base"].is_null());
+        assert!(failed_paid["payment"]["reward_arc"].is_null());
+        node.state.receipts.get_mut(&tx_hash.0).unwrap().success = true;
+
         let Json(by_job) = community_reward_job(
             AxumState(node),
             axum::extract::Path(format!("0x{}", job_id.to_hex())),
@@ -17820,7 +18270,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(by_job["tx_hash"], format!("0x{}", tx_hash.to_hex()));
+        assert_eq!(by_job["submitted"], true);
+        assert_eq!(by_job["included"], true);
         assert_eq!(by_job["confirmed"], true);
+        assert_eq!(by_job["success"], true);
+        assert_eq!(
+            by_job["receipt_url"],
+            format!("/community/reward_receipt/0x{}", tx_hash.to_hex())
+        );
     }
 
     #[tokio::test]
@@ -18537,6 +18994,507 @@ mod tests {
             sum_total_ms_success: 0,
             last_total_ms: 0,
         }
+    }
+
+    #[test]
+    fn unsubmitted_reward_states_share_the_exact_no_transaction_matrix() {
+        let job_id = format!("0x{}", Hash256([19; 32]).to_hex());
+        let worker = format!("0x{}", Hash256([20; 32]).to_hex());
+        for status in [
+            "reward_protocol_not_activated",
+            "reward_approval_quorum_unavailable",
+            "missing_worker_attestation",
+        ] {
+            let settlement =
+                unsubmitted_community_reward_settlement(status, &job_id, &worker, "blocked");
+            assert_eq!(settlement["status"], status);
+            assert_eq!(settlement["tx_type"], "0x25");
+            assert!(settlement["tx_hash"].is_null());
+            assert_eq!(settlement["job_id"], job_id);
+            assert_eq!(settlement["worker"], worker);
+            assert_eq!(settlement["submitted"], false);
+            assert_eq!(settlement["included"], false);
+            assert_eq!(settlement["confirmed"], false);
+            assert!(settlement["success"].is_null());
+            assert!(settlement["reward_base"].is_null());
+            assert!(settlement["reward_arc"].is_null());
+            assert!(settlement["receipt_url"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn reward_status_contract_distinguishes_submitted_pending_failed_and_confirmed() {
+        let job_id = Hash256([21; 32]);
+        let worker_key = arc_crypto::KeyPair::generate_ed25519();
+        let worker_hash = worker_key.address();
+        let worker_id = format!("0x{}", worker_hash.to_hex());
+        let node = fake_node_with_workers(vec![(
+            worker(&worker_id, &["inference"]),
+            std::time::Instant::now(),
+        )]);
+        let output_hash = Hash256([23; 32]);
+        let signer = arc_crypto::KeyPair::generate_ed25519();
+        let mut mempool_tx = Transaction::new_transfer(signer.address(), Hash256([24; 32]), 1, 0);
+        mempool_tx.sign(&signer).unwrap();
+        let tx_hash = mempool_tx.hash;
+        node.mempool.insert(mempool_tx).unwrap();
+
+        let mut payload = test_verified_settlement_payload(job_id, 100);
+        payload.reward.worker = worker_hash;
+        payload.reward.output_hash = output_hash;
+        let recovery_probe_id = payload.reward.assignment_epoch;
+        node.community_verified_settlements.insert(
+            job_id,
+            VerifiedCommunitySettlement {
+                payload: payload.clone(),
+                verified_at_unix_ms: 1,
+                attempts: 1,
+                retry_running: false,
+                last_error: None,
+            },
+        );
+        let pending_submission = CommunityRewardSubmission {
+            worker: worker_hash,
+            output_hash,
+            tx_hash,
+            approvals: 5,
+        };
+        node.community_reward_submissions
+            .insert(job_id, pending_submission.clone());
+
+        let expected_receipt_url = format!("/community/reward_receipt/0x{}", tx_hash.to_hex());
+        let pending_from_retry = attempt_verified_community_reward(&node, job_id)
+            .await
+            .expect("an existing mempool submission is discoverable");
+        assert_eq!(pending_from_retry["status"], "pending_mined_receipt");
+        assert_eq!(pending_from_retry["submitted"], true);
+        assert_eq!(pending_from_retry["included"], false);
+        assert_eq!(pending_from_retry["confirmed"], false);
+        assert!(pending_from_retry["success"].is_null());
+        assert_eq!(pending_from_retry["receipt_url"], expected_receipt_url);
+
+        let Json(pending_by_hash) = community_reward_receipt(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", tx_hash.to_hex())),
+        )
+        .await
+        .unwrap();
+        let Json(pending_by_job) = community_reward_job(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", job_id.to_hex())),
+        )
+        .await
+        .unwrap();
+        let recovery_replay = recovery_probe_status_response(&node, recovery_probe_id, job_id)
+            .unwrap()
+            .expect("the recovery replay discovers the same pending submission");
+        for pending in [
+            &pending_by_hash,
+            &pending_by_job,
+            &recovery_replay["settlement"],
+        ] {
+            assert_eq!(pending["status"], "pending_mined_receipt");
+            assert_eq!(pending["submitted"], true);
+            assert_eq!(pending["included"], false);
+            assert_eq!(pending["confirmed"], false);
+            assert!(pending["success"].is_null());
+            assert_eq!(pending["receipt_url"], expected_receipt_url);
+        }
+
+        let pending_result = WorkResult {
+            job_id: format!("0x{}", job_id.to_hex()),
+            worker_id: worker_id.clone(),
+            success: true,
+            declined: false,
+            output: "pending output".to_string(),
+            output_hash: format!("0x{}", output_hash.to_hex()),
+            tokens_generated: 1,
+            total_ms: 1,
+            ms_per_token: 1,
+            engine: canonical_profile(),
+            error: None,
+            signed_attestation_hex: None,
+        };
+        let Json(pending_submit_replay) =
+            community_submit_work(AxumState(node.clone()), Json(pending_result.clone()))
+                .await
+                .expect("an identical submitted job returns its pending settlement");
+        assert_eq!(pending_submit_replay["idempotent_replay"], true);
+        assert_eq!(
+            pending_submit_replay["settlement"]["job_id"],
+            format!("0x{}", job_id.to_hex())
+        );
+        assert_eq!(pending_submit_replay["settlement"]["worker"], worker_id);
+        assert_eq!(pending_submit_replay["settlement"]["submitted"], true);
+        assert_eq!(pending_submit_replay["settlement"]["included"], false);
+        assert_eq!(pending_submit_replay["settlement"]["confirmed"], false);
+        assert!(pending_submit_replay["settlement"]["success"].is_null());
+        assert!(pending_submit_replay["settlement"]["reward_base"].is_null());
+        assert!(pending_submit_replay["settlement"]["reward_arc"].is_null());
+        assert_eq!(
+            pending_submit_replay["settlement"]["receipt_url"],
+            expected_receipt_url
+        );
+
+        // A process-local submission row survives longer than a mempool row.
+        // Every public replay/read path must stop calling the old hash
+        // submitted once it has neither mempool presence nor chain inclusion,
+        // while retaining the durable independently verified job for retry.
+        node.mempool.clear();
+        let stale_recovery = recovery_probe_status_response(&node, recovery_probe_id, job_id)
+            .unwrap()
+            .expect("durable verified recovery work remains discoverable");
+        let stale_recovery = &stale_recovery["settlement"];
+        assert_eq!(stale_recovery["status"], "verified_pending_approval");
+        assert_eq!(stale_recovery["submitted"], false);
+        assert!(stale_recovery["tx_hash"].is_null());
+        assert!(stale_recovery["receipt_url"].is_null());
+        assert!(!node.community_reward_submissions.contains_key(&job_id));
+
+        node.community_reward_submissions
+            .insert(job_id, pending_submission.clone());
+        let Json(stale_submit) =
+            community_submit_work(AxumState(node.clone()), Json(pending_result))
+                .await
+                .expect("idempotent submit falls back to durable verified state");
+        assert_eq!(
+            stale_submit["settlement"]["status"],
+            "verified_pending_approval"
+        );
+        assert_eq!(stale_submit["settlement"]["submitted"], false);
+        assert!(stale_submit["settlement"]["tx_hash"].is_null());
+
+        node.community_reward_submissions
+            .insert(job_id, pending_submission.clone());
+        let Json(stale_by_hash) = community_reward_receipt(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", tx_hash.to_hex())),
+        )
+        .await
+        .expect("a dropped hash points back to durable verified retry state");
+        assert_eq!(stale_by_hash["status"], "verified_pending_approval");
+        assert_eq!(stale_by_hash["submitted"], false);
+        assert!(stale_by_hash["tx_hash"].is_null());
+        assert_eq!(
+            stale_by_hash["previous_tx_hash"],
+            format!("0x{}", tx_hash.to_hex())
+        );
+
+        node.community_reward_submissions
+            .insert(job_id, pending_submission);
+        let Json(stale_by_job) = community_reward_job(
+            AxumState(node.clone()),
+            axum::extract::Path(format!("0x{}", job_id.to_hex())),
+        )
+        .await
+        .expect("job lookup retains verified retry state without a fake pending hash");
+        assert_eq!(stale_by_job["status"], "verified_pending_approval");
+        assert_eq!(stale_by_job["submitted"], false);
+        assert!(stale_by_job["tx_hash"].is_null());
+
+        let mut failed_body = payload.reward.clone();
+        failed_body.job_id = Hash256([25; 32]);
+        let failed_tx = Transaction::new_community_inference_reward(
+            failed_body.coordinator,
+            failed_body.job_nonce,
+            failed_body.clone(),
+        );
+        let failed_hash = failed_tx.hash;
+        let (failed_block, _) = node
+            .state
+            .execute_block(std::slice::from_ref(&failed_tx), Hash256::ZERO)
+            .unwrap();
+        node.state.receipts.get_mut(&failed_hash.0).unwrap().success = false;
+        let failed_receipt = node.state.get_receipt(&failed_hash.0).unwrap();
+        let failed = community_reward_receipt_value(&node, failed_hash)
+            .expect("a hash-bound failed receipt has a truthful terminal state");
+        assert_eq!(failed["status"], "mined_failed");
+        assert_eq!(failed["submitted"], true);
+        assert_eq!(failed["included"], true);
+        assert_eq!(failed["confirmed"], false);
+        assert_eq!(failed["success"], false);
+        assert_eq!(failed["block_height"], failed_block.header.height);
+        assert_eq!(
+            failed["block_hash"],
+            format!("0x{}", failed_block.hash.to_hex())
+        );
+        assert_eq!(failed["index"], 0);
+        assert!(failed["reward_base"].is_null());
+        assert!(failed["reward_arc"].is_null());
+        assert_eq!(
+            failed["receipt_url"],
+            format!("/community/reward_receipt/0x{}", failed_hash.to_hex())
+        );
+
+        let mut corrupt_count_block = failed_block.clone();
+        corrupt_count_block.header.tx_count += 1;
+        corrupt_count_block.hash = Block::compute_hash(&corrupt_count_block.header);
+        assert!(
+            validate_canonical_transaction_inclusion(
+                &corrupt_count_block,
+                failed_block.header.height,
+                0,
+                failed_hash,
+            )
+            .unwrap_err()
+            .contains("transaction count differs")
+        );
+
+        let mut corrupt_root_block = failed_block.clone();
+        corrupt_root_block.header.tx_root = Hash256([26; 32]);
+        corrupt_root_block.hash = Block::compute_hash(&corrupt_root_block.header);
+        assert!(
+            validate_canonical_transaction_inclusion(
+                &corrupt_root_block,
+                failed_block.header.height,
+                0,
+                failed_hash,
+            )
+            .unwrap_err()
+            .contains("committed Merkle root")
+        );
+
+        let mut unavailable_body = payload.reward.clone();
+        unavailable_body.job_id = Hash256([27; 32]);
+        let unavailable_tx = Transaction::new_community_inference_reward(
+            unavailable_body.coordinator,
+            unavailable_body.job_nonce,
+            unavailable_body.clone(),
+        );
+        let unavailable_hash = unavailable_tx.hash;
+        let (unavailable_block, _) = node
+            .state
+            .execute_block(std::slice::from_ref(&unavailable_tx), Hash256::ZERO)
+            .unwrap();
+        node.state.receipts.remove(&unavailable_hash.0);
+        let unavailable = community_reward_receipt_value(&node, unavailable_hash)
+            .expect("the retained block index proves inclusion without inventing a receipt");
+        assert_eq!(unavailable["status"], "receipt_unavailable");
+        assert_eq!(unavailable["submitted"], true);
+        assert_eq!(unavailable["included"], true);
+        assert_eq!(unavailable["confirmed"], false);
+        assert!(unavailable["success"].is_null());
+        assert_eq!(unavailable["block_height"], unavailable_block.header.height);
+        assert_eq!(
+            unavailable["block_hash"],
+            format!("0x{}", unavailable_block.hash.to_hex())
+        );
+
+        // Inclusion can race both retry and idempotent-submit cleanup. A
+        // stale submission entry must never mask or resubmit the mined row.
+        let race_worker_key = arc_crypto::KeyPair::generate_ed25519();
+        let race_worker_id = format!("0x{}", race_worker_key.address().to_hex());
+        let race_node = fake_node_with_workers(vec![(
+            worker(&race_worker_id, &["inference"]),
+            std::time::Instant::now(),
+        )]);
+        let race_job_id = Hash256([29; 32]);
+        let race_output_hash = Hash256([30; 32]);
+        let mut race_payload = test_verified_settlement_payload(race_job_id, 100);
+        race_payload.reward.worker = race_worker_key.address();
+        race_payload.reward.output_hash = race_output_hash;
+        let race_body = race_payload.reward.clone();
+        let race_tx = Transaction::new_community_inference_reward(
+            race_payload.reward.coordinator,
+            race_payload.reward.job_nonce,
+            race_payload.reward.clone(),
+        );
+        let race_tx_hash = race_tx.hash;
+        race_node
+            .state
+            .execute_block(std::slice::from_ref(&race_tx), Hash256::ZERO)
+            .unwrap();
+        race_node
+            .state
+            .receipts
+            .get_mut(&race_tx_hash.0)
+            .unwrap()
+            .success = true;
+        race_node.community_reward_submissions.insert(
+            race_job_id,
+            CommunityRewardSubmission {
+                worker: race_worker_key.address(),
+                output_hash: race_output_hash,
+                tx_hash: race_tx_hash,
+                approvals: 5,
+            },
+        );
+        race_node.community_verified_settlements.insert(
+            race_job_id,
+            VerifiedCommunitySettlement {
+                payload: race_payload,
+                verified_at_unix_ms: 1,
+                attempts: 1,
+                retry_running: false,
+                last_error: None,
+            },
+        );
+        let mined_from_retry = attempt_verified_community_reward(&race_node, race_job_id)
+            .await
+            .expect("retry resolves the mined index before stale mempool bookkeeping");
+        assert_eq!(mined_from_retry["status"], "mined_success");
+        assert_eq!(mined_from_retry["success"], true);
+        assert!(
+            race_node
+                .community_reward_submissions
+                .contains_key(&race_job_id)
+        );
+
+        let result = WorkResult {
+            job_id: format!("0x{}", race_job_id.to_hex()),
+            worker_id: race_worker_id,
+            success: true,
+            declined: false,
+            output: "ok".to_string(),
+            output_hash: format!("0x{}", race_output_hash.to_hex()),
+            tokens_generated: 1,
+            total_ms: 1,
+            ms_per_token: 1,
+            engine: canonical_profile(),
+            error: None,
+            signed_attestation_hex: None,
+        };
+        let Json(mined_submit_replay) =
+            community_submit_work(AxumState(race_node.clone()), Json(result.clone()))
+                .await
+                .expect("a stale submission entry cannot mask successful inclusion");
+        assert_eq!(mined_submit_replay["settlement"]["status"], "mined_success");
+        assert_eq!(mined_submit_replay["settlement"]["success"], true);
+
+        let later_failed_tx = Transaction::new_community_inference_reward(
+            race_body.coordinator,
+            race_body.job_nonce + 1,
+            race_body,
+        );
+        let later_failed_hash = later_failed_tx.hash;
+        let (_, later_receipts) = race_node
+            .state
+            .execute_block(std::slice::from_ref(&later_failed_tx), Hash256::ZERO)
+            .unwrap();
+        assert!(!later_receipts[0].success);
+        let selected = indexed_reward_for_job(&race_node, race_job_id)
+            .unwrap()
+            .expect("the unique successful receipt wins over a later failed replay");
+        assert_eq!(selected.0, race_tx_hash);
+        race_node
+            .state
+            .receipts
+            .get_mut(&later_failed_hash.0)
+            .unwrap()
+            .success = true;
+        assert!(
+            indexed_reward_for_job(&race_node, race_job_id)
+                .unwrap_err()
+                .contains("multiple successful")
+        );
+        let duplicate_earnings = worker_earnings(
+            AxumState(race_node.clone()),
+            axum::extract::Path(format!("0x{}", race_worker_key.address().to_hex())),
+        )
+        .await
+        .expect_err("worker earnings must reject two successful receipts for one job");
+        assert_eq!(duplicate_earnings.0, StatusCode::CONFLICT);
+        assert!(
+            duplicate_earnings
+                .1
+                .contains("multiple successful 0x25 receipts")
+        );
+        race_node
+            .state
+            .receipts
+            .get_mut(&later_failed_hash.0)
+            .unwrap()
+            .success = false;
+
+        race_node
+            .state
+            .receipts
+            .get_mut(&race_tx_hash.0)
+            .unwrap()
+            .success = false;
+        let Json(failed_submit_replay) = community_submit_work(AxumState(race_node), Json(result))
+            .await
+            .expect("a stale submission entry cannot mask failed inclusion");
+        assert_eq!(failed_submit_replay["settlement"]["status"], "mined_failed");
+        assert_eq!(failed_submit_replay["settlement"]["success"], false);
+
+        let mut corrupt_receipt = failed_receipt.clone();
+        corrupt_receipt.tx_hash = Hash256([28; 32]);
+        node.state.receipts.insert(failed_hash.0, corrupt_receipt);
+        assert!(
+            community_reward_receipt_value(&node, failed_hash)
+                .unwrap_err()
+                .contains("receipt hash differs")
+        );
+
+        let mut corrupt_receipt = failed_receipt.clone();
+        corrupt_receipt.block_height = corrupt_receipt.block_height.saturating_add(1);
+        node.state.receipts.insert(failed_hash.0, corrupt_receipt);
+        assert!(
+            community_reward_receipt_value(&node, failed_hash)
+                .unwrap_err()
+                .contains("block height differs")
+        );
+
+        let mut corrupt_receipt = failed_receipt.clone();
+        corrupt_receipt.block_hash = Hash256([28; 32]);
+        node.state.receipts.insert(failed_hash.0, corrupt_receipt);
+        assert!(
+            community_reward_receipt_value(&node, failed_hash)
+                .unwrap_err()
+                .contains("block hash differs")
+        );
+
+        let mut corrupt_receipt = failed_receipt.clone();
+        corrupt_receipt.index = corrupt_receipt.index.saturating_add(1);
+        node.state.receipts.insert(failed_hash.0, corrupt_receipt);
+        assert!(
+            community_reward_receipt_value(&node, failed_hash)
+                .unwrap_err()
+                .contains("transaction index differs")
+        );
+        node.state.receipts.insert(failed_hash.0, failed_receipt);
+
+        node.state
+            .full_transactions
+            .get_mut(&unavailable_hash.0)
+            .unwrap()
+            .tx_type = TxType::Transfer;
+        assert!(
+            indexed_reward_for_job(&node, unavailable_body.job_id)
+                .unwrap_err()
+                .contains("non-0x25")
+        );
+        {
+            let mut transaction = node
+                .state
+                .full_transactions
+                .get_mut(&unavailable_hash.0)
+                .unwrap();
+            transaction.tx_type = TxType::CommunityInferenceReward;
+            let TxBody::CommunityInferenceReward(body) = &mut transaction.body else {
+                panic!("fixture transaction body changed variant")
+            };
+            body.output_hash = Hash256([31; 32]);
+        }
+        assert!(
+            community_reward_receipt_value(&node, unavailable_hash)
+                .unwrap_err()
+                .contains("do not reproduce their committed hash"),
+            "a mutated reward body retaining its old embedded hash must fail closed"
+        );
+        let corrupted_earnings = worker_earnings(
+            AxumState(node),
+            axum::extract::Path(format!("0x{}", worker_hash.to_hex())),
+        )
+        .await
+        .expect_err("matching-worker corruption cannot be silently skipped");
+        assert_eq!(corrupted_earnings.0, StatusCode::CONFLICT);
+        assert!(
+            corrupted_earnings
+                .1
+                .contains("do not reproduce their committed hash")
+        );
     }
 
     fn community_register_payload(keypair: &arc_crypto::KeyPair) -> CommunityRegisterRequest {
@@ -19375,6 +20333,15 @@ mod tests {
         assert_eq!(replay["recovery_probe_id"], request["recovery_probe_id"]);
         assert_eq!(replay["job_id"], format!("0x{}", item.job_id));
         assert_eq!(replay["settlement"]["status"], "assignment_in_progress");
+        assert!(replay["settlement"]["worker"].is_null());
+        assert!(replay["settlement"]["tx_hash"].is_null());
+        assert_eq!(replay["settlement"]["submitted"], false);
+        assert_eq!(replay["settlement"]["included"], false);
+        assert_eq!(replay["settlement"]["confirmed"], false);
+        assert!(replay["settlement"]["success"].is_null());
+        assert!(replay["settlement"]["reward_base"].is_null());
+        assert!(replay["settlement"]["reward_arc"].is_null());
+        assert!(replay["settlement"]["receipt_url"].is_null());
         assert!(queue.lock().await.try_recv().is_err());
 
         let mut tampered = request;
@@ -19403,6 +20370,7 @@ mod tests {
             let item = queue.lock().await.recv().await.expect("a job");
             observed_max_worker.store(item.max_tokens, Ordering::Relaxed);
             if let Some((_, pending)) = results.remove(&item.job_id) {
+                let settlement_job_id = item.job_id.clone();
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
                         job_id: item.job_id,
@@ -19432,8 +20400,19 @@ mod tests {
                         replicas_contacted_per_quorum: 3,
                     }),
                     settlement: Some(json!({
-                        "status": "reward_submitted_to_mempool",
+                        "status": "pending_mined_receipt",
+                        "tx_type": "0x25",
+                        "tx_hash": format!("0x{}", Hash256([7; 32]).to_hex()),
+                        "job_id": settlement_job_id,
+                        "worker": "w1",
+                        "submitted": true,
                         "included": false,
+                        "confirmed": false,
+                        "success": Value::Null,
+                        "receipt_url": format!(
+                            "/community/reward_receipt/0x{}",
+                            Hash256([7; 32]).to_hex()
+                        ),
                     })),
                 });
             }
@@ -19487,9 +20466,16 @@ mod tests {
             response["attestation"]["request_overrides_applied"], false,
             "community responses must not echo ignored local-attestation overrides"
         );
+        assert_eq!(response["settlement"]["status"], "pending_mined_receipt");
+        assert_eq!(response["settlement"]["tx_type"], "0x25");
+        assert_eq!(response["settlement"]["worker"], "w1");
+        assert_eq!(response["settlement"]["submitted"], true);
+        assert_eq!(response["settlement"]["included"], false);
+        assert_eq!(response["settlement"]["confirmed"], false);
+        assert!(response["settlement"]["success"].is_null());
         assert_eq!(
-            response["settlement"]["status"],
-            "reward_submitted_to_mempool"
+            response["settlement"]["receipt_url"],
+            format!("/community/reward_receipt/0x{}", Hash256([7; 32]).to_hex())
         );
     }
 
@@ -19513,9 +20499,10 @@ mod tests {
         tokio::spawn(async move {
             let item = queue.lock().await.recv().await.expect("a community job");
             if let Some((_, pending)) = results.remove(&item.job_id) {
+                let job_id = item.job_id.clone();
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
-                        job_id: item.job_id,
+                        job_id: job_id.clone(),
                         worker_id: "w1".to_string(),
                         success: true,
                         declined: false,
@@ -19541,10 +20528,12 @@ mod tests {
                         signatures_required_per_quorum: 2,
                         replicas_contacted_per_quorum: 3,
                     }),
-                    settlement: Some(json!({
-                        "status": "reward_quorum_approval_unavailable",
-                        "included": false,
-                    })),
+                    settlement: Some(unsubmitted_community_reward_settlement(
+                        "reward_approval_quorum_unavailable",
+                        &job_id,
+                        "w1",
+                        "test fixture could not collect the 0x25 approval quorum",
+                    )),
                 });
             }
         });
@@ -19560,6 +20549,20 @@ mod tests {
         assert_eq!(response["route"], "community_worker");
         assert_eq!(response["routed_via"], "community:w1");
         assert_eq!(response["inference"]["output"], "community output");
+        assert_eq!(
+            response["settlement"]["status"],
+            "reward_approval_quorum_unavailable"
+        );
+        assert_eq!(response["settlement"]["tx_type"], "0x25");
+        assert!(response["settlement"]["tx_hash"].is_null());
+        assert_eq!(response["settlement"]["worker"], "w1");
+        assert_eq!(response["settlement"]["submitted"], false);
+        assert_eq!(response["settlement"]["included"], false);
+        assert_eq!(response["settlement"]["confirmed"], false);
+        assert!(response["settlement"]["success"].is_null());
+        assert!(response["settlement"]["reward_base"].is_null());
+        assert!(response["settlement"]["reward_arc"].is_null());
+        assert!(response["settlement"]["receipt_url"].is_null());
     }
 
     #[tokio::test]

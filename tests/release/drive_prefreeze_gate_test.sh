@@ -8,7 +8,38 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 GATE="$REPO_ROOT/scripts/recovery/verify-drive-prefreeze.sh"
 IDENTITY_HELPER="$REPO_ROOT/scripts/recovery/drive-account-identity.py"
 IDENTITY_UNIT_TEST="$TEST_DIR/test_drive_account_identity.py"
-SYSTEM_PYTHON3=/usr/bin/python3
+
+# Ubuntu exposes /usr/bin/python3 as a symlink, while the production gate
+# deliberately requires the reviewed interpreter itself to be a normalized,
+# executable regular non-symlink file. Resolve the system entrypoint once,
+# validate the exact production-shaped path and file metadata, then hash and
+# pin those resolved bytes below.
+SYSTEM_PYTHON3="$(python3 -I - <<'PY'
+import os
+import pathlib
+import re
+import stat
+
+entrypoint = pathlib.Path("/usr/bin/python3")
+candidate = pathlib.Path(os.path.realpath(entrypoint))
+try:
+    metadata = candidate.lstat()
+except OSError as error:
+    raise SystemExit(f"cannot resolve the system Python fixture: {error}")
+if re.fullmatch(r"/usr/bin/python3(?:\.[0-9]+)?", str(candidate)) is None:
+    raise SystemExit(f"system Python resolved outside /usr/bin/python3[.VERSION]: {candidate}")
+if (
+    stat.S_ISLNK(metadata.st_mode)
+    or not stat.S_ISREG(metadata.st_mode)
+    or not os.access(candidate, os.X_OK)
+    or metadata.st_uid != 0
+    or stat.S_IMODE(metadata.st_mode) & 0o022
+):
+    raise SystemExit(f"system Python fixture is not a protected executable regular file: {candidate}")
+print(candidate)
+PY
+)" || exit 1
+readonly SYSTEM_PYTHON3
 
 hash_text() {
     printf '%s' "$1" | python3 -c \
@@ -71,7 +102,8 @@ case "$command_name" in
                 printf '[%s]\n' "$remote"
                 printf 'type = drive\n'
                 if [ "${FAKE_NO_CLIENT:-false}" != true ]; then
-                    printf 'client_id = arc-recovery-client.apps.googleusercontent.com\n'
+                    # Real rclone v1.75.0 redacts both OAuth client fields.
+                    printf 'client_id = XXX\n'
                     printf 'client_secret = XXX\n'
                 fi
                 printf 'token = XXX\n'
@@ -86,11 +118,30 @@ case "$command_name" in
                 fi
                 remote="${2:-}"
                 [ "$remote" = arc-recovery-drive ] || exit 12
+                calls_path="$FAKE_FIXTURE_ROOT/config-show-calls"
+                previous_calls=0
+                [ ! -f "$calls_path" ] || read -r previous_calls < "$calls_path"
+                calls="$((previous_calls + 1))"
+                printf '%s\n' "$calls" > "$calls_path"
                 access_token="$(/bin/cat "$FAKE_TOKEN_STATE")"
+                client_id=arc-recovery-client.apps.googleusercontent.com
+                client_secret=private-client-secret
+                if [ -e "$FAKE_FIXTURE_ROOT/no-client" ]; then
+                    client_id=''
+                elif [ -e "$FAKE_FIXTURE_ROOT/redacted-client" ]; then
+                    client_id=XXX
+                elif [ "$calls" -gt 1 ] && [ -e "$FAKE_FIXTURE_ROOT/client-switch" ]; then
+                    client_id=switched-client.apps.googleusercontent.com
+                fi
+                if [ -e "$FAKE_FIXTURE_ROOT/no-client-secret" ]; then
+                    client_secret=''
+                elif [ -e "$FAKE_FIXTURE_ROOT/redacted-client-secret" ]; then
+                    client_secret=XXX
+                fi
                 printf '[%s]\n' "$remote"
                 printf 'type = drive\n'
-                printf 'client_id = arc-recovery-client.apps.googleusercontent.com\n'
-                printf 'client_secret = private-client-secret\n'
+                [ -z "$client_id" ] || printf 'client_id = %s\n' "$client_id"
+                [ -z "$client_secret" ] || printf 'client_secret = %s\n' "$client_secret"
                 printf 'token = {"access_token":"%s","token_type":"Bearer","refresh_token":"private-refresh-token"}\n' "$access_token"
                 ;;
             *) exit 2 ;;
@@ -154,6 +205,14 @@ if f'"access_token":"{expected_token}"' not in selected_config:
 if "client_secret = private-client-secret" not in selected_config:
     print("drive-account-identity: selected config was not decrypted in memory", file=sys.stderr)
     raise SystemExit(22)
+client_lines = [
+    line.split("=", 1)[1].strip()
+    for line in selected_config.splitlines()
+    if line.startswith("client_id =")
+]
+if len(client_lines) != 1 or not client_lines[0] or client_lines[0] == "XXX":
+    print("drive-account-identity: selected custom client is invalid", file=sys.stderr)
+    raise SystemExit(22)
 calls_path = root / "identity-calls"
 calls = int(calls_path.read_text(encoding="utf-8")) + 1 if calls_path.exists() else 1
 calls_path.write_text(f"{calls}\n", encoding="utf-8")
@@ -174,6 +233,7 @@ if calls > 1 and (root / "account-switch").exists():
 if calls > 1 and (root / "permission-switch").exists():
     permission = "permission_switched"
 print(
+    hashlib.sha256(client_lines[0].encode("utf-8")).hexdigest(),
     hashlib.sha256(account.encode("utf-8")).hexdigest(),
     hashlib.sha256(permission.encode("utf-8")).hexdigest(),
 )
@@ -221,12 +281,34 @@ PY
     PINNED_PYTHON_SHA="$(hash_file "$SYSTEM_PYTHON3")"
     export FAKE_RCLONE_LOG FAKE_RCLONE_STORE FAKE_TOKEN_STATE
     export FAKE_IDENTITY_CALLS FAKE_PYTHON_ARGV_LOG
+    FAKE_FIXTURE_ROOT="$FIXTURE"
+    export FAKE_FIXTURE_ROOT
 }
 
 gate() {
     local mode="$1"
     shift
     printf '%s\n' "${FAKE_IDENTITY_MODE:-success}" > "$FIXTURE/identity-mode"
+    if [ "${FAKE_NO_CLIENT:-false}" = true ]; then
+        : > "$FIXTURE/no-client"
+    else
+        rm -f -- "$FIXTURE/no-client"
+    fi
+    if [ "${FAKE_REDACTED_CLIENT:-false}" = true ]; then
+        : > "$FIXTURE/redacted-client"
+    else
+        rm -f -- "$FIXTURE/redacted-client"
+    fi
+    if [ "${FAKE_NO_CLIENT_SECRET:-false}" = true ]; then
+        : > "$FIXTURE/no-client-secret"
+    else
+        rm -f -- "$FIXTURE/no-client-secret"
+    fi
+    if [ "${FAKE_REDACTED_CLIENT_SECRET:-false}" = true ]; then
+        : > "$FIXTURE/redacted-client-secret"
+    else
+        rm -f -- "$FIXTURE/redacted-client-secret"
+    fi
     if [ "${FAKE_ACCOUNT_SWITCH:-false}" = true ]; then
         : > "$FIXTURE/account-switch"
     else
@@ -236,6 +318,11 @@ gate() {
         : > "$FIXTURE/permission-switch"
     else
         rm -f -- "$FIXTURE/permission-switch"
+    fi
+    if [ "${FAKE_CLIENT_SWITCH:-false}" = true ]; then
+        : > "$FIXTURE/client-switch"
+    else
+        rm -f -- "$FIXTURE/client-switch"
     fi
     ARC_RECOVERY_PYTHON_PATH="$SYSTEM_PYTHON3" \
     ARC_RECOVERY_PYTHON_SHA256="$PINNED_PYTHON_SHA" \
@@ -247,7 +334,7 @@ gate() {
         --expected-root-sha256 "$ROOT_SHA" \
         --expected-client-id-sha256 "$CLIENT_SHA" \
         --expected-account-sha256 "$ACCOUNT_SHA" \
-        --daily-upload-budget-bytes 751619276800 "$@"
+        --daily-upload-budget-bytes 700000000000 "$@"
 }
 
 preflight_is_read_only_and_binds_receipt() (
@@ -300,6 +387,12 @@ custom_client_account_and_root_fail_closed() (
     trap 'rm -rf -- "$FIXTURE"' EXIT
     FAKE_NO_CLIENT=true gate preflight >/dev/null 2>&1 && return 1
     unset FAKE_NO_CLIENT
+    FAKE_REDACTED_CLIENT=true gate preflight >/dev/null 2>&1 && return 1
+    unset FAKE_REDACTED_CLIENT
+    FAKE_NO_CLIENT_SECRET=true gate preflight >/dev/null 2>&1 && return 1
+    unset FAKE_NO_CLIENT_SECRET
+    FAKE_REDACTED_CLIENT_SECRET=true gate preflight >/dev/null 2>&1 && return 1
+    unset FAKE_REDACTED_CLIENT_SECRET
     local original="$CLIENT_SHA"
     CLIENT_SHA="$(printf '0%.0s' {1..64})"
     gate preflight >/dev/null 2>&1 && return 1
@@ -363,6 +456,9 @@ account_and_permission_switch_after_canary_fail_closed() (
     FAKE_ACCOUNT_SWITCH=true gate execute >/dev/null 2>&1 && return 1
     rm -f -- "$FAKE_RCLONE_STORE" "$FAKE_IDENTITY_CALLS"
     FAKE_PERMISSION_SWITCH=true gate execute >/dev/null 2>&1 && return 1
+    rm -f -- "$FAKE_RCLONE_STORE" "$FAKE_IDENTITY_CALLS" \
+        "$FIXTURE/config-show-calls"
+    FAKE_CLIENT_SWITCH=true gate execute >/dev/null 2>&1 && return 1
     return 0
 )
 
@@ -389,6 +485,7 @@ token_config_and_tls_overrides_do_not_leak_or_bypass() (
 identity_helper_unit_contract_and_real_rclone_capability() (
     "$SYSTEM_PYTHON3" -I "$IDENTITY_UNIT_TEST" || return 1
     ! grep -Fq 'config userinfo' "$GATE" || return 1
+    ! grep -Fq 'config redacted' "$GATE" || return 1
 
     local real_rclone real_version config output
     real_rclone="$(command -v rclone || true)"
@@ -404,11 +501,23 @@ client_id = test.apps.googleusercontent.com
 client_secret = fake-secret
 token = {"access_token":"fake-access","token_type":"Bearer","refresh_token":"fake-refresh","expiry":"2099-01-01T00:00:00Z"}
 EOF
+    output="$($real_rclone --config "$config" config redacted capability-drive 2>/dev/null)" || {
+        rm -f -- "$config"
+        return 1
+    }
+    [ "$(printf '%s\n' "$output" | sed -n 's/^client_id = //p')" = XXX ] || {
+        rm -f -- "$config"
+        return 1
+    }
+    [ "$(printf '%s\n' "$output" | sed -n 's/^client_secret = //p')" = XXX ] || {
+        rm -f -- "$config"
+        return 1
+    }
     output="$($real_rclone --config "$config" config show capability-drive 2>/dev/null)" || {
         rm -f -- "$config"
         return 1
     }
-    printf '%s\n' "$output" | grep -Fq '[capability-drive]' || {
+    printf '%s\n' "$output" | grep -Fq 'client_id = test.apps.googleusercontent.com' || {
         rm -f -- "$config"
         return 1
     }
@@ -426,6 +535,11 @@ capacity_budget_and_object_limits_fail_closed() (
     trap 'rm -rf -- "$FIXTURE"' EXIT
     FAKE_FREE_BYTES=1000 gate preflight >/dev/null 2>&1 && return 1
     FAKE_ABOUT_WITHOUT_FREE=true gate preflight >/dev/null 2>&1 && return 1
+
+    gate preflight --daily-upload-budget-bytes 750000000001 \
+        > /dev/null 2> "$FIXTURE/hard-cap.err" && return 1
+    grep -Fq 'exceeds the 750 GB (750,000,000,000 byte)' \
+        "$FIXTURE/hard-cap.err" || return 1
 
     write_freeze_fixture "$FREEZE_PLAN" $((50 * 1024 * 1024 * 1024))
     FREEZE_SHA="$(hash_file "$FREEZE_PLAN")"; CAPTURE="$(capture_id "$FREEZE_SHA")"
@@ -473,7 +587,7 @@ run_test 'custom client account and root fail closed' custom_client_account_and_
 run_test 'any rclone stderr warning is fatal' every_stderr_warning_is_fatal
 run_test 'rclone version and selected-config capability are bound' rclone_version_and_selected_config_capability_are_bound
 run_test 'expired token refresh and API failures fail closed' expired_token_refreshes_before_identity_and_api_failures_are_fatal
-run_test 'post-canary account and permission switches fail closed' account_and_permission_switch_after_canary_fail_closed
+run_test 'post-canary client account and permission switches fail closed' account_and_permission_switch_after_canary_fail_closed
 run_test 'token config and TLS overrides neither leak nor bypass' token_config_and_tls_overrides_do_not_leak_or_bypass
 run_test 'identity helper and real rclone capability are regression tested' identity_helper_unit_contract_and_real_rclone_capability
 run_test 'capacity budget and object limits fail closed' capacity_budget_and_object_limits_fail_closed

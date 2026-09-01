@@ -323,7 +323,7 @@ jobs:
           cms_row="$(/usr/bin/sha256sum "$cms_output")"
           cms_sha256="${cms_row%% *}"
           [[ "$cms_sha256" =~ ^[0-9a-f]{64}$ ]]
-          /usr/bin/jq -n \
+          /usr/bin/jq -cS -n \
             --arg schema arc.validator-vault-rewrap.v1 \
             --arg source_commit "$EXPECTED_MAIN_SHA" \
             --arg source_ciphertext_sha256 "$EXPECTED_CIPHERTEXT_SHA256" \

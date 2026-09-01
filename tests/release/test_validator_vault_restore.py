@@ -228,7 +228,9 @@ class Fixture:
     @classmethod
     def make_certificate(cls) -> None:
         cls.openssl, cls.libssl, cls.libcrypto = openssl_runtime_paths()
-        cls.cert_root = Path(tempfile.mkdtemp(prefix="arc-vault-cert-fixture.")).resolve()
+        cls.cert_root = Path(
+            tempfile.mkdtemp(prefix="arc-vault-cert-fixture.", dir=Path.home())
+        ).resolve()
         cls.cert_root.chmod(0o700)
         cls.certificate = cls.cert_root / "restore.cert.pem"
         cls.private_key = cls.cert_root / "restore.key.pem"
@@ -1027,10 +1029,50 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         Fixture.remove_certificate()
 
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="arc-vault-restore-test.")
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="arc-vault-restore-test.", dir=Path.home()
+        )
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.fixture = Fixture(self.root)
+
+    def test_linux_loader_trace_distinguishes_search_probes_from_loaded_paths(self) -> None:
+        helper = load_helper_module()
+        runtime = SimpleNamespace(
+            library_root=Path("/private/arc-openssl-libraries"),
+            libssl_name="libssl.so.3",
+            libcrypto_name="libcrypto.so.3",
+        )
+        valid_trace = b"\n".join(
+            (
+                b"100: find library=libssl.so.3 [0]; searching",
+                b"100: trying file=/private/arc-openssl-libraries/glibc-hwcaps/x86-64-v3/libssl.so.3",
+                b"100: trying file=/private/arc-openssl-libraries/libssl.so.3",
+                b"100: find library=libcrypto.so.3 [0]; searching",
+                b"100: trying file=/private/arc-openssl-libraries/libcrypto.so.3",
+                b"100: calling init: /private/arc-openssl-libraries/libcrypto.so.3",
+                b"100: calling init: /private/arc-openssl-libraries/libssl.so.3",
+            )
+        )
+        with mock.patch.object(helper.sys, "platform", "linux"):
+            helper.verify_openssl_loader_trace(runtime, valid_trace, label="fixture")
+
+            unreviewed_trace = valid_trace.replace(
+                b"calling init: /private/arc-openssl-libraries/libssl.so.3",
+                b"calling init: /usr/lib/x86_64-linux-gnu/libssl.so.3",
+            )
+            with self.assertRaisesRegex(
+                helper.VaultError, "resolved an unreviewed OpenSSL dependency path"
+            ):
+                helper.verify_openssl_loader_trace(runtime, unreviewed_trace, label="fixture")
+
+            missing_trace = valid_trace.replace(
+                b"100: calling init: /private/arc-openssl-libraries/libcrypto.so.3", b""
+            )
+            with self.assertRaisesRegex(
+                helper.VaultError, "did not load the reviewed private libcrypto.so.3"
+            ):
+                helper.verify_openssl_loader_trace(runtime, missing_trace, label="fixture")
 
     def rewrite_cms(self, members: list[tuple[tarfile.TarInfo, bytes]], **kwargs) -> None:
         self.fixture.write_cms(members, **kwargs)

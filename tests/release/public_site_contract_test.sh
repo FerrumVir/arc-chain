@@ -8,6 +8,8 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 
 WORKFLOW="$REPO_ROOT/.github/workflows/deploy-explorer.yml"
 BUILDER="$REPO_ROOT/scripts/build-public-site.sh"
+LIVE_DASHBOARD_GATE="$REPO_ROOT/dashboard/test-live.mjs"
+LIVE_EXPLORER_GATE="$REPO_ROOT/explorer/test-live.mjs"
 
 every_action_is_commit_sha_pinned() {
     local workflow ref
@@ -104,6 +106,26 @@ pages_workflow_is_pinned_and_self_contained() {
         printf 'Pages OIDC write permission must exist only on the deploy job\n'
         return 1
     }
+}
+
+live_publication_gates_require_six_maintenance_interlocks() {
+    local gate
+    for gate in "$LIVE_DASHBOARD_GATE" "$LIVE_EXPLORER_GATE"; do
+        grep -Fq 'network.auditMaintenanceInterlock({ resolver, fetchImpl: fetch })' "$gate" || {
+            printf 'active Pages live gate does not fetch maintenance evidence: %s\n' "$gate"
+            return 1
+        }
+    done
+    grep -Fq 'dashboard.activeFleetPublicationError(config, fleet, maintenanceAudit)' \
+        "$LIVE_DASHBOARD_GATE" || {
+            printf 'dashboard live gate does not pass maintenance evidence to publication policy\n'
+            return 1
+        }
+    if ! grep -Fq 'assert.equal(maintenanceAudit.state, "healthy"' "$LIVE_EXPLORER_GATE" \
+        || ! grep -Fq 'assert.equal(maintenanceAudit.samples.length, 6' "$LIVE_EXPLORER_GATE"; then
+            printf 'explorer live gate does not require six fresh healthy maintenance interlocks\n'
+            return 1
+    fi
 }
 
 site_builder_is_reproducible_and_complete() (
@@ -218,6 +240,7 @@ site_builder_preserves_unowned_and_last_good_outputs() (
 
 run_test 'Pages workflow uses pinned, secret-free deployment actions' pages_workflow_is_pinned_and_self_contained
 run_test 'every GitHub Action is pinned to a full immutable SHA' every_action_is_commit_sha_pinned
+run_test 'active Pages gates require six healthy maintenance interlocks' live_publication_gates_require_six_maintenance_interlocks
 run_test 'public console assembles reproducibly without unsafe legacy surfaces' site_builder_is_reproducible_and_complete
 run_test 'public-console builder refuses destructive broad targets' site_builder_rejects_broad_targets
 run_test 'public-console builder preserves unowned and last-good outputs' site_builder_preserves_unowned_and_last_good_outputs

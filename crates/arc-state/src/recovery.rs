@@ -1285,10 +1285,12 @@ fn legacy_wal_boundary_report(
         })?;
     let source_wal_tail_reason = match (valid_tail_entries, &read.rejected_tail) {
         (0, None) => "none".to_string(),
-        (count, None) => format!("uncommitted_valid_entries_after_checkpoint:{count}"),
+        (count, None) => {
+            format!("valid_entries_after_selected_snapshot_boundary:{count}")
+        }
         (0, Some(reason)) => reason.stable_reason(),
         (count, Some(reason)) => format!(
-            "uncommitted_valid_entries_after_checkpoint:{count};{}",
+            "valid_entries_after_selected_snapshot_boundary:{count};{}",
             reason.stable_reason()
         ),
     };
@@ -1494,6 +1496,64 @@ fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundar
         StateError::PersistenceError(
             "legacy source has no complete SetBlock + Checkpoint boundary".into(),
         )
+    })
+}
+
+/// Locate the complete WAL boundary committed by an independently captured
+/// snapshot.  A live writer may append one or more later complete blocks after
+/// `/sync/snapshot` has serialized its state and before the WAL is read.  Those
+/// later frames are a suffix of the capture, not evidence that the snapshot is
+/// stale or unsafe.  Selection is therefore by the snapshot's exact
+/// height/root tuple rather than by the newest complete WAL checkpoint.
+fn exact_complete_legacy_boundary(
+    entries: &[WalEntry],
+    snapshot_height: u64,
+    snapshot_root: Hash256,
+) -> Result<LegacyBoundary, StateError> {
+    let mut blocks = HashMap::<u64, usize>::new();
+    let mut selected = None;
+    for (index, entry) in entries.iter().enumerate() {
+        match &entry.op {
+            WalOp::SetBlock(height, block)
+                if *height == block.header.height
+                    && block.hash == Block::compute_hash(&block.header) =>
+            {
+                blocks.insert(*height, index);
+            }
+            WalOp::Checkpoint(root)
+                if entry.block_height == snapshot_height && *root == snapshot_root =>
+            {
+                let Some(&block_index) = blocks.get(&snapshot_height) else {
+                    continue;
+                };
+                let WalOp::SetBlock(_, block) = &entries[block_index].op else {
+                    unreachable!("legacy block index is created only from SetBlock")
+                };
+                if block.header.state_root != snapshot_root
+                    || entries[block_index + 1..index]
+                        .iter()
+                        .any(|candidate| legacy_post_root_state_mutation(&candidate.op))
+                {
+                    continue;
+                }
+                if selected.is_some() {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy WAL contains more than one complete boundary for snapshot height/root {snapshot_height}/{snapshot_root}"
+                    )));
+                }
+                selected = Some(LegacyBoundary {
+                    height: snapshot_height,
+                    state_root: snapshot_root,
+                    checkpoint_index: index,
+                });
+            }
+            _ => {}
+        }
+    }
+    selected.ok_or_else(|| {
+        StateError::PersistenceError(format!(
+            "legacy snapshot height/root {snapshot_height}/{snapshot_root} has no exact complete SetBlock + Checkpoint WAL boundary"
+        ))
     })
 }
 
@@ -2405,21 +2465,15 @@ impl StateDB {
             ));
         }
 
-        let boundary = latest_complete_legacy_boundary(entries)?;
+        let boundary = if let Some(snapshot) = snapshot.as_ref() {
+            exact_complete_legacy_boundary(entries, snapshot.block_height, snapshot.state_root)?
+        } else {
+            latest_complete_legacy_boundary(entries)?
+        };
         let wal_report = prefix_read
             .as_ref()
             .map(|read| legacy_wal_boundary_report(read, &boundary))
             .transpose()?;
-        if let Some(snapshot) = snapshot.as_ref()
-            && (snapshot.block_height != boundary.height
-                || snapshot.state_root != boundary.state_root)
-        {
-            return Err(StateError::PersistenceError(format!(
-                "legacy snapshot/WAL boundary mismatch: snapshot height/root {}/{}, latest complete WAL height/root {}/{}",
-                snapshot.block_height, snapshot.state_root, boundary.height, boundary.state_root
-            )));
-        }
-
         validate_legacy_boundary(entries, &boundary)?;
         let committed_entries = &entries[..=boundary.checkpoint_index];
         let state = StateDB::new();
@@ -4398,6 +4452,41 @@ mod tests {
     }
 
     #[test]
+    fn live_capture_snapshot_loads_when_the_source_and_its_sibling_have_no_snapshot() {
+        let (data_dir, generated_snapshot, _, _, _, root) =
+            legacy_snapshot_fixture("live-capture-no-existing-snapshot");
+        let capture_attempt = temp_dir("live-capture-external-attempt");
+        let captured_snapshot = capture_attempt.join("live.snapshot.lz4");
+        fs::rename(&generated_snapshot, &captured_snapshot).unwrap();
+
+        assert!(!data_dir.join("state.snapshot.lz4").exists());
+        assert!(
+            !data_dir.with_extension("snapshot.lz4").exists(),
+            "the fixture must model production data directories with no sibling snapshot"
+        );
+        assert!(captured_snapshot.is_file());
+
+        let (loaded, report) = StateDB::load_legacy_recovery_export_source_with_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &captured_snapshot,
+            &legacy_validator_set(),
+        )
+        .expect("an external live /sync/snapshot capture must be a complete loader input");
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(report.source_wal_accepted_prefix_bytes > 0);
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes + report.source_wal_quarantined_tail_bytes,
+            report.source_wal_original_bytes
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_dir_all(capture_attempt).unwrap();
+    }
+
+    #[test]
     fn canonical_legacy_validator_input_rejects_wrong_shape_and_arithmetic() {
         let canonical = legacy_validator_set();
         let mut reversed = canonical.clone();
@@ -4641,7 +4730,7 @@ mod tests {
         );
         assert_eq!(
             report.source_wal_tail_reason,
-            "uncommitted_valid_entries_after_checkpoint:1;truncated_wal_frame_payload"
+            "valid_entries_after_selected_snapshot_boundary:1;truncated_wal_frame_payload"
         );
         assert_eq!(
             report.source_wal_accepted_prefix_bytes + report.source_wal_quarantined_tail_bytes,
@@ -4658,9 +4747,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_assisted_loader_rejects_complete_looking_forged_higher_boundary() {
+    fn snapshot_assisted_loader_keeps_exact_snapshot_boundary_before_later_complete_suffix() {
         let (data_dir, snapshot_path, snapshot, _, _, _) =
             legacy_snapshot_fixture("snapshot-forged");
+        let accepted_prefix = fs::read(data_dir.join("state.wal")).unwrap();
         let header = BlockHeader {
             height: 2,
             timestamp: 2,
@@ -4680,6 +4770,37 @@ mod tests {
         writer.sync().unwrap();
         drop(writer);
 
+        let (loaded, report) = StateDB::load_legacy_recovery_source_with_snapshot_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .expect("a later complete suffix must not roll the snapshot boundary forward");
+        assert_eq!(loaded.height(), snapshot.block_height);
+        assert_eq!(loaded.get_state_root(), snapshot.state_root);
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert!(report.source_wal_quarantined_tail_bytes > 0);
+        assert!(
+            report
+                .source_wal_tail_reason
+                .starts_with("valid_entries_after_selected_snapshot_boundary:")
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_rejects_snapshot_without_exact_wal_boundary() {
+        let (data_dir, snapshot_path, mut snapshot, _, _, _) =
+            legacy_snapshot_fixture("snapshot-no-exact-boundary");
+        snapshot.block_height += 1;
+        snapshot.write_to(&snapshot_path).unwrap();
+
         let error = StateDB::load_legacy_recovery_source_with_snapshot(
             &data_dir,
             Hash256::ZERO,
@@ -4687,8 +4808,13 @@ mod tests {
             &snapshot_path,
         )
         .err()
-        .expect("a complete-looking suffix cannot roll the snapshot boundary forward");
-        assert!(error.to_string().contains("snapshot/WAL boundary mismatch"));
+        .expect("a snapshot without its exact WAL boundary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("has no exact complete SetBlock + Checkpoint WAL boundary"),
+            "{error}"
+        );
 
         fs::remove_dir_all(data_dir).unwrap();
         fs::remove_file(snapshot_path).unwrap();

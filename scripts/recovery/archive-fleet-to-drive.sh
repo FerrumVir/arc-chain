@@ -12,6 +12,8 @@ ROLLOUT_TOOL="$SCRIPT_DIR/recovery_rollout.py"
 ROLLOUT_SCHEMA="$SCRIPT_DIR/recovery-manifest.schema.json"
 DRIVE_PREFREEZE_GATE="$SCRIPT_DIR/verify-drive-prefreeze.sh"
 LEGACY_HEIGHT_TOOL="$SCRIPT_DIR/legacy-public-height.py"
+QUARANTINE_ROUND_DRIVER="$SCRIPT_DIR/quarantine_round_driver.py"
+QUARANTINE_ROUND_MODULE="$SCRIPT_DIR/quarantine_rounds.py"
 LATE_FORK_INTERLOCK_TOOL="$SCRIPT_DIR/legacy-late-fork-interlock.py"
 DRIVE_REMOTE="${ARC_RECOVERY_DRIVE_REMOTE:-arc-drive-arc:ARC Chain Recovery v0.8}"
 SSH_USER="${ARC_RECOVERY_SSH_USER:-root}"
@@ -758,6 +760,26 @@ cannot make quorum. Dynamically admitted external legacy identities are
 recorded as untrusted forks; this tool never claims the vulnerable old network
 globally halted. No legacy byte is deleted.
 
+`capture` fences the non-atomic fleet through immutable mixed-state rounds.
+Every attempt freshly samples exactly the still-live targets, re-proves every
+previously secured node in the same observation bracket, and gives each target
+the same exact all-target authorization/readiness bytes. A target may cross its
+kernel nft gate only during the 300-second authorization window. An attempt
+that secures no node is preserved outside the transition ledger and is never a
+lease for a later retry; its still-live targets are sampled again. A positive
+partial round is sealed only after the old helpers expire, and its remaining
+targets move to a fresh round. Thus at most six positive rounds secure all six
+nodes without unquarantining or restarting a node that already transitioned.
+
+A reboot after the persistent restart barrier but before the nft applied
+commit is represented by a distinct persistently-stopped-precommit transition:
+the exact round intent/barrier must have been armed in-window, the old writer
+must remain absent behind the fail-closed restart dependency, and the offline
+captured head and ancestry must bind the same authorization. The boundary is
+derived only after an actual secured transition and the final ledger carries
+every node exactly once. Post-stop construction verifies this sealed history;
+it never substitutes current wall-clock age or re-queries retired origins.
+
 `seal` runs only after the final 5-of-6 checkpoint and the canonical prearchive
 rollout manifest exist. That prearchive has four all-zero archive-finalization
 roots; the final manifest may replace only those roots and must project exactly
@@ -836,6 +858,7 @@ pin_freeze_plan() {
 import hashlib
 import os
 import pathlib
+import re
 import stat
 import sys
 
@@ -1590,6 +1613,7 @@ PY
 
     python3 - "$output" "$legacy_validators" "$legacy_sha" "$temporary" "${NODES[@]}" <<'PY'
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -1828,8 +1852,8 @@ seal_freeze_plan() {
     require_hash "$drive_client_sha" "Drive OAuth client-id hash"
     require_hash "$drive_account_sha" "Drive account hash"
     require_uint "$drive_daily_budget" "Drive daily upload budget"
-    [ "$drive_daily_budget" -le $((700 * 1024 * 1024 * 1024)) ] || \
-        die "Drive operational upload budget exceeds the reviewed 700 GiB ceiling"
+    [ "$drive_daily_budget" -le 700000000000 ] || \
+        die "Drive operational upload budget exceeds the reviewed decimal 700 GB ceiling"
     [ "$dedicated_drive_uploader" = true ] || \
         die "freeze sealing requires --attest-dedicated-drive-uploader"
     require_commands python3 git
@@ -2164,7 +2188,7 @@ if not isinstance(remote_root, str) or remote_root.startswith("arc-drive:") or "
 if hashlib.sha256(remote_root.encode("utf-8")).hexdigest() != drive["remote_root_sha256"]:
     raise SystemExit("freeze plan Drive remote root hash differs")
 budget = drive.get("daily_upload_budget_bytes")
-if isinstance(budget, bool) or not isinstance(budget, int) or not 0 < budget <= 700 * 1024**3:
+if isinstance(budget, bool) or not isinstance(budget, int) or not 0 < budget <= 700_000_000_000:
     raise SystemExit("freeze plan Drive upload budget is outside the reviewed ceiling")
 if drive.get("dedicated_no_other_upload_writers_attested") is not True:
     raise SystemExit("freeze plan lacks the dedicated ARC Drive uploader attestation")
@@ -2338,6 +2362,22 @@ run_remote() {
     ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" "$remote_command"
 }
 
+run_remote_canonical_input() {
+    [ "$#" -ge 3 ] || die "run_remote_canonical_input requires node, input, and mode"
+    local node="$1" input="$2"
+    shift 2
+    require_absolute_file "$input" "remote canonical JSON input"
+    python3 - "$input" <<'PY'
+import os,pathlib,stat,sys
+path=pathlib.Path(sys.argv[1]);details=path.lstat()
+if (path.is_symlink() or not stat.S_ISREG(details.st_mode)
+        or stat.S_IMODE(details.st_mode)!=0o400 or details.st_nlink!=1
+        or details.st_uid not in {0,os.geteuid()}):
+    raise SystemExit("remote canonical JSON input must be a protected single-link mode-0400 file")
+PY
+    run_remote "$node" "$@" < "$input"
+}
+
 freeze_node_field() {
     local plan="$1" node="$2" field="$3"
     python3 - "$plan" "$node" "$field" <<'PY'
@@ -2384,30 +2424,45 @@ run_stopped_status_exact() {
 run_stopped_status_challenged_exact() {
     local freeze_plan="$1" freeze_sha="$2" capture_id="$3" node="$4"
     local host="$5" challenge="$6" known_hosts="$7" identity="$8"
+    local transition_kind="${9:-network-quarantine-active}" transition_sha="${10:--}"
     local remote_command remote_argument quoted_argument
-    local remote_arguments=(
-        "$REMOTE_HELPER_PATH" "$REMOTE_HELPER_SHA"
-        stopped-status-challenged "$capture_id" "$node" "$freeze_sha"
-        "$(freeze_node_field "$freeze_plan" "$node" validator_address)"
-        "$(freeze_node_field "$freeze_plan" "$node" stake)"
-        "$(freeze_node_field "$freeze_plan" "$node" writer_pid)"
-        "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)"
-        "$(freeze_node_field "$freeze_plan" "$node" boot_id)"
-        "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)"
-        "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)"
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)"
-        "$(freeze_node_field "$freeze_plan" "$node" executable_path)"
-        "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)"
-        "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)"
-        "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
-        "$host" "$challenge"
-    )
+    local remote_arguments
+    if [ "$transition_kind" = persistently-stopped-precommit ]; then
+        require_hash "$transition_sha" "challenged persistently-stopped transition root"
+        remote_arguments=(
+            "$REMOTE_HELPER_PATH" "$REMOTE_HELPER_SHA"
+            quarantine-round-stopped-status-challenged "$capture_id" "$node"
+            "$freeze_sha" "$transition_sha" "$host" "$challenge"
+        )
+    elif [ "$transition_kind" = network-quarantine-active ]; then
+        [ "$transition_sha" = - ] || \
+            die "active challenged stopped-status unexpectedly supplied a stopped transition root"
+        remote_arguments=(
+            "$REMOTE_HELPER_PATH" "$REMOTE_HELPER_SHA"
+            stopped-status-challenged "$capture_id" "$node" "$freeze_sha"
+            "$(freeze_node_field "$freeze_plan" "$node" validator_address)"
+            "$(freeze_node_field "$freeze_plan" "$node" stake)"
+            "$(freeze_node_field "$freeze_plan" "$node" writer_pid)"
+            "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)"
+            "$(freeze_node_field "$freeze_plan" "$node" boot_id)"
+            "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)"
+            "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)"
+            "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)"
+            "$(freeze_node_field "$freeze_plan" "$node" executable_path)"
+            "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)"
+            "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)"
+            "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
+            "$host" "$challenge"
+        )
+    else
+        die "offline-stop challenged transition kind differs for $node"
+    fi
     remote_command='/bin/bash -s --'
     for remote_argument in "${remote_arguments[@]}"; do
         printf -v quoted_argument '%q' "$remote_argument"
@@ -2445,6 +2500,41 @@ exec /bin/bash /proc/self/fd/9 "$@"
 REMOTE
 }
 
+offline_stop_node_transition_ref() {
+    local evidence="$1" node="$2"
+    python3 - "$evidence" "$node" <<'PY'
+import json,pathlib,re,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows=[row for row in value.get("nodes",[]) if row.get("node")==sys.argv[2]]
+if len(rows)!=1:raise SystemExit("offline-stop node row is missing or ambiguous")
+row=rows[0]
+active={"node","host","validator_address","stake","stop_complete_sha256",
+        "stop_files_sha256","stopped_status_argv_sha256","stopped_status_sha256"}
+stopped={"node","host","transition_kind","transition_receipt_sha256",
+         "current_status_sha256","persisted_head_sha256"}
+if set(row)==active:
+    print("network-quarantine-active -")
+elif (set(row)==stopped and row.get("transition_kind")=="persistently-stopped-precommit"
+      and re.fullmatch(r"[0-9a-f]{64}",str(row.get("transition_receipt_sha256")))):
+    print("persistently-stopped-precommit",row["transition_receipt_sha256"])
+else:raise SystemExit("offline-stop node transition row differs")
+PY
+}
+
+run_offline_stop_status_exact() {
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" evidence="$4" node="$5"
+    local transition_kind transition_sha
+    read -r transition_kind transition_sha < <(
+        offline_stop_node_transition_ref "$evidence" "$node"
+    ) || die "cannot resolve offline-stop transition kind for $node"
+    if [ "$transition_kind" = network-quarantine-active ]; then
+        run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
+    else
+        run_remote "$node" quarantine-round-stopped-status "$capture_id" "$node" \
+            "$freeze_sha" "$transition_sha"
+    fi
+}
+
 verify_offline_stop_inputs() {
     local freeze_plan="$1" freeze_sha="$2" evidence="$3" evidence_sha="$4"
     local known_hosts="$5" known_hosts_sha="$6" identity="$7"
@@ -2457,6 +2547,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import stat
 import struct
 import sys
@@ -2536,13 +2627,44 @@ if not isinstance(receipt, dict) or set(receipt) != set(expected_top) | {
     "first_quarantine_started_at", "all_controlled_stopped_at",
     "legacy_height_cross_proof", "legacy_maintenance_boundary",
     "legacy_maintenance_boundary_sha256",
-    "legacy_maintenance_evidence_bundle_sha256", "nodes"
+    "legacy_maintenance_evidence_bundle_sha256",
+    "quarantine_generation_ledger_sha256", "nodes"
 }:
     raise SystemExit("offline-stop evidence fields differ")
 if any(receipt.get(key) != value for key, value in expected_top.items()):
     raise SystemExit("offline-stop evidence source/freeze/helper binding differs")
 if not isinstance(receipt.get("nodes"), list) or len(receipt["nodes"]) != len(fleet):
     raise SystemExit("offline-stop evidence is not a complete six-node receipt")
+hash_re = re.compile(r"[0-9a-f]{64}")
+active_fields = {
+    "node", "host", "validator_address", "stake", "stop_complete_sha256",
+    "stop_files_sha256", "stopped_status_argv_sha256", "stopped_status_sha256",
+}
+stopped_fields = {
+    "node", "host", "transition_kind", "transition_receipt_sha256",
+    "current_status_sha256", "persisted_head_sha256",
+}
+for (node, host), frozen, row in zip(fleet, plan["nodes"], receipt["nodes"]):
+    if (row.get("node"), row.get("host")) != (node, host):
+        raise SystemExit(f"offline-stop evidence topology differs for {node}")
+    if set(row) == active_fields:
+        if ((row.get("validator_address"), row.get("stake"))
+                != (frozen.get("validator_address"), frozen.get("stake"))):
+            raise SystemExit(f"offline-stop active writer identity differs for {node}")
+        roots = [row.get(field) for field in (
+            "stop_complete_sha256", "stop_files_sha256",
+            "stopped_status_argv_sha256", "stopped_status_sha256",
+        )]
+    elif set(row) == stopped_fields:
+        if row.get("transition_kind") != "persistently-stopped-precommit":
+            raise SystemExit(f"offline-stop stopped transition kind differs for {node}")
+        roots = [row.get(field) for field in (
+            "transition_receipt_sha256", "current_status_sha256", "persisted_head_sha256",
+        )]
+    else:
+        raise SystemExit(f"offline-stop evidence node fields differ for {node}")
+    if any(hash_re.fullmatch(str(root)) is None for root in roots):
+        raise SystemExit(f"offline-stop evidence node root is malformed for {node}")
 try:
     first_quarantine = datetime.datetime.strptime(
         receipt["first_quarantine_started_at"], "%Y-%m-%dT%H:%M:%SZ"
@@ -2568,6 +2690,8 @@ if (not isinstance(boundary, dict)
         or digest(canonical(boundary)) != receipt.get("legacy_maintenance_boundary_sha256")
         or boundary.get("legacy_maintenance_evidence_bundle_sha256")
             != receipt.get("legacy_maintenance_evidence_bundle_sha256")
+        or boundary.get("quarantine_generation_ledger_sha256")
+            != receipt.get("quarantine_generation_ledger_sha256")
         or boundary.get("source_main_commit") != plan.get("source_commit")
         or boundary.get("freeze_plan_sha256") != freeze_sha
         or boundary.get("capture_id") != capture
@@ -2588,7 +2712,7 @@ build_offline_stop_remote_verification() {
     local duration_ms="$9" status_root="${10}" ssh_sha="${11}"
     python3 - "$freeze_plan" "$freeze_sha" "$evidence" "$evidence_sha" \
         "$known_sha" "$challenge" "$started_at" "$completed_at" "$duration_ms" \
-        "$status_root" "$ssh_sha" <<'PY'
+        "$status_root" "$ssh_sha" "$QUARANTINE_ROUND_MODULE" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -2597,7 +2721,8 @@ import stat
 import sys
 
 (freeze_raw, freeze_sha, evidence_raw, evidence_sha, known_sha, challenge,
- started_at, completed_at, duration_raw, status_root_raw, ssh_sha) = sys.argv[1:]
+ started_at, completed_at, duration_raw, status_root_raw, ssh_sha,
+ rounds_module_raw) = sys.argv[1:]
 plan = json.loads(pathlib.Path(freeze_raw).read_text(encoding="utf-8"))
 receipt = json.loads(pathlib.Path(evidence_raw).read_text(encoding="utf-8"))
 status_root = pathlib.Path(status_root_raw)
@@ -2609,28 +2734,84 @@ fleet = (
 canonical = lambda value: (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 digest = lambda value: hashlib.sha256(value).hexdigest()
 hash_re = re.compile(r"[0-9a-f]{64}")
-status_fields = {
+active_status_fields = {
     "schema", "capture_id", "node", "host", "freeze_plan_sha256", "validator_address",
     "stake", "stopped", "restart_fenced", "stop_schema", "stop_complete_sha256",
     "stop_files_sha256", "challenge",
 }
+active_receipt_fields = {
+    "node", "host", "validator_address", "stake", "stop_complete_sha256",
+    "stop_files_sha256", "stopped_status_argv_sha256", "stopped_status_sha256",
+}
+stopped_receipt_fields = {
+    "node", "host", "transition_kind", "transition_receipt_sha256",
+    "current_status_sha256", "persisted_head_sha256",
+}
+import importlib.util
+spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",rounds_module_raw)
+if spec is None or spec.loader is None:
+    raise SystemExit("remote stop verifier cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);spec.loader.exec_module(rounds)
+
+def unwrap(wrapper,label):
+    if not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}:
+        raise SystemExit(f"challenged {label} wrapper fields differ")
+    raw=canonical(wrapper["value"])
+    if digest(raw)!=wrapper["sha256"]:
+        raise SystemExit(f"challenged {label} wrapper root differs")
+    return wrapper["value"],wrapper["sha256"]
+
 rows = []
 for (node, host), frozen, local in zip(fleet, plan["nodes"], receipt["nodes"]):
     path = status_root / f"{node}-challenged-status.json"
     raw = path.read_bytes(); status = json.loads(raw)
-    if raw != canonical(status) or set(status) != status_fields:
-        raise SystemExit(f"challenged stopped-status is noncanonical or inexact: {node}")
-    expected = {
-        "schema": "arc.recovery.offline-stop-challenged-status.v1",
-        "capture_id": receipt["capture_id"], "node": node, "host": host,
-        "freeze_plan_sha256": freeze_sha, "validator_address": frozen["validator_address"],
-        "stake": frozen["stake"], "stopped": True, "restart_fenced": True,
-        "stop_schema": "arc.recovery.offline-stop.v4",
-        "stop_complete_sha256": local["stop_complete_sha256"],
-        "stop_files_sha256": local["stop_files_sha256"], "challenge": challenge,
-    }
-    if status != expected:
-        raise SystemExit(f"challenged stopped-status differs from sealed stop tree: {node}")
+    if raw != canonical(status):
+        raise SystemExit(f"challenged stopped-status is noncanonical: {node}")
+    if set(local)==active_receipt_fields:
+        if set(status)!=active_status_fields:
+            raise SystemExit(f"challenged active stopped-status fields differ: {node}")
+        expected = {
+            "schema": "arc.recovery.offline-stop-challenged-status.v1",
+            "capture_id": receipt["capture_id"], "node": node, "host": host,
+            "freeze_plan_sha256": freeze_sha, "validator_address": frozen["validator_address"],
+            "stake": frozen["stake"], "stopped": True, "restart_fenced": True,
+            "stop_schema": "arc.recovery.offline-stop.v4",
+            "stop_complete_sha256": local["stop_complete_sha256"],
+            "stop_files_sha256": local["stop_files_sha256"], "challenge": challenge,
+        }
+        if status != expected:
+            raise SystemExit(f"challenged active stopped-status differs from sealed stop tree: {node}")
+    elif set(local)==stopped_receipt_fields:
+        stopped_status_fields={
+            "schema","capture_id","freeze_plan_sha256","node","host","transition_kind",
+            "transition_receipt","current_status","challenge",
+        }
+        if (set(status)!=stopped_status_fields
+                or status.get("schema")
+                    !="arc.recovery.quarantine-persistently-stopped-challenged-status.v1"
+                or (status.get("capture_id"),status.get("freeze_plan_sha256"),
+                    status.get("node"),status.get("host"),status.get("transition_kind"),
+                    status.get("challenge"))!=(receipt["capture_id"],freeze_sha,node,host,
+                        "persistently-stopped-precommit",challenge)
+                or local.get("transition_kind")!="persistently-stopped-precommit"):
+            raise SystemExit(f"challenged persistently-stopped identity differs: {node}")
+        transition,transition_sha=unwrap(status["transition_receipt"],f"{node} transition")
+        current,_current_sha=unwrap(status["current_status"],f"{node} current status")
+        try:
+            projection=rounds.validate_node_transition(transition)
+            rounds.validate_prior_fenced_status(
+                current,transition=transition,transition_sha256=transition_sha
+            )
+        except rounds.QuarantineRoundError as error:
+            raise SystemExit(f"challenged persistently-stopped proof differs: {node}: {error}") from error
+        if (projection.get("kind")!=rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or transition_sha!=local.get("transition_receipt_sha256")
+                or transition.get("node")!=node or transition.get("host")!=host
+                or any(hash_re.fullmatch(str(local.get(field))) is None for field in (
+                    "current_status_sha256","persisted_head_sha256"))):
+            raise SystemExit(f"challenged persistently-stopped ancestry differs: {node}")
+    else:
+        raise SystemExit(f"offline-stop challenged node receipt fields differ: {node}")
     rows.append({"node": node, "host": host, "status": status, "status_sha256": digest(raw)})
 helper_sha = plan["remote_helper_sha256"]
 value = {
@@ -2789,6 +2970,7 @@ verify_offline_stop_phase() (
     require_hash "$REMOTE_HELPER_SHA" "sealed remote helper hash"
     REMOTE_HELPER_PATH="/root/.arc-recovery-helpers/$REMOTE_HELPER_SHA/archive-node.sh"
     local temporary started started_at completed completed_at duration_ms node host failed=0 index
+    local transition_kind transition_sha
     local pids=() names=()
     temporary="$(/usr/bin/mktemp -d)"
     trap 'chmod -R u+w "$temporary" 2>/dev/null || true; rm -rf -- "$temporary"' EXIT
@@ -2799,9 +2981,13 @@ PY
 )
     for node in nyc lax ams lhr nrt sgp; do
         host="$(host_for "$node")"
+        read -r transition_kind transition_sha < <(
+            offline_stop_node_transition_ref "$evidence" "$node"
+        ) || die "cannot resolve challenged offline-stop transition for $node"
         ( ulimit -f 128
           run_stopped_status_challenged_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
-            "$node" "$host" "$challenge" "$known_hosts" "$identity" ) \
+            "$node" "$host" "$challenge" "$known_hosts" "$identity" \
+            "$transition_kind" "$transition_sha" ) \
             > "$temporary/$node-challenged-status.json" 2> "$temporary/$node.stderr" &
         pids+=("$!"); names+=("$node")
     done
@@ -2836,7 +3022,7 @@ create_offline_stop_evidence() {
         "$helper_sha" "$helper_path" "$status_root" "$output" \
         "$first_quarantine_started_at" "$all_controlled_stopped_at" \
         "$legacy_height_cross_proof" "$maintenance_boundary" \
-        "$maintenance_evidence_bundle" <<'PY'
+        "$maintenance_evidence_bundle" "$QUARANTINE_ROUND_MODULE" <<'PY'
 import datetime
 import hashlib
 import json
@@ -2849,7 +3035,7 @@ import sys
 (plan_raw, sidecar_raw, freeze_sha, capture_id, helper_sha, helper_path,
  status_root_raw, output_raw, first_quarantine_started_at,
  all_controlled_stopped_at, cross_proof_raw, maintenance_boundary_raw,
- maintenance_evidence_bundle_raw) = sys.argv[1:]
+ maintenance_evidence_bundle_raw, rounds_module_raw) = sys.argv[1:]
 plan_path = pathlib.Path(plan_raw)
 sidecar_path = pathlib.Path(sidecar_raw)
 status_root = pathlib.Path(status_root_raw)
@@ -2921,6 +3107,34 @@ if (not isinstance(plan_nodes, list)
         or [(row.get("name"), row.get("host")) for row in plan_nodes] != list(nodes)):
     raise SystemExit("offline-stop evidence freeze topology differs from the fixed production fleet")
 
+bundle_details = maintenance_evidence_bundle_path.lstat()
+bundle_payload = maintenance_evidence_bundle_path.read_bytes()
+bundle = json.loads(bundle_payload)
+if (maintenance_evidence_bundle_path.is_symlink()
+        or not stat.S_ISREG(bundle_details.st_mode)
+        or bundle_payload != canonical(bundle)
+        or bundle.get("schema") != "arc.recovery.legacy-maintenance-evidence-bundle.v1"
+        or (bundle.get("source_main_commit"), bundle.get("freeze_plan_sha256"),
+            bundle.get("capture_id")) != (source_commit, freeze_sha, capture_id)):
+    raise SystemExit("offline-stop maintenance evidence bundle identity differs")
+bundle_rows = bundle.get("nodes")
+if (not isinstance(bundle_rows, list)
+        or [(row.get("node"), row.get("host")) for row in bundle_rows] != list(nodes)):
+    raise SystemExit("offline-stop maintenance evidence bundle topology differs")
+import importlib.util
+spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",rounds_module_raw)
+if spec is None or spec.loader is None:
+    raise SystemExit("offline-stop evidence cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);spec.loader.exec_module(rounds)
+
+def unwrap(wrapper,label):
+    if not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}:
+        raise SystemExit(f"offline-stop {label} wrapper differs")
+    raw=canonical(wrapper["value"])
+    if digest(raw)!=wrapper["sha256"]:
+        raise SystemExit(f"offline-stop {label} wrapper root differs")
+    return wrapper["value"],wrapper["sha256"]
+
 status_fields = {
     "schema", "capture_id", "node", "freeze_plan_sha256", "validator_address",
     "stake", "stopped", "restart_fenced", "stop_schema",
@@ -2935,15 +3149,53 @@ argv_fields = (
     "argv_sha256", "data_dir",
 )
 receipt_nodes = []
-for (name, host), frozen in zip(nodes, plan_nodes):
+active_completion_roots = []
+for (name, host), frozen, bundle_row in zip(nodes, plan_nodes, bundle_rows):
     status_path = status_root / f"{name}-stopped-status.json"
     details = status_path.lstat()
     if status_path.is_symlink() or not stat.S_ISREG(details.st_mode):
         raise SystemExit(f"offline-stop status is unsafe: {name}")
     status_payload = status_path.read_bytes()
     status = json.loads(status_payload)
-    if status_payload != canonical(status) or set(status) != status_fields:
-        raise SystemExit(f"offline-stop status is noncanonical or has inexact fields: {name}")
+    if status_payload != canonical(status):
+        raise SystemExit(f"offline-stop status is noncanonical: {name}")
+    if bundle_row.get("transition_kind") == rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+        stopped_fields={"node","host","transition_kind","transition_receipt",
+                        "current_status","persisted_head"}
+        if set(bundle_row)!=stopped_fields or (bundle_row.get("node"),bundle_row.get("host"))!=(name,host):
+            raise SystemExit(f"offline-stop stopped maintenance row fields differ: {name}")
+        transition,transition_sha=unwrap(bundle_row["transition_receipt"],f"{name} transition")
+        historical_status,historical_status_sha=unwrap(
+            bundle_row["current_status"],f"{name} historical current status"
+        )
+        persisted,persisted_sha=unwrap(bundle_row["persisted_head"],f"{name} persisted head")
+        try:
+            projection=rounds.validate_node_transition(transition)
+            rounds.validate_prior_fenced_status(
+                status,transition=transition,transition_sha256=transition_sha
+            )
+            rounds.validate_prior_fenced_status(
+                historical_status,transition=transition,transition_sha256=transition_sha
+            )
+        except rounds.QuarantineRoundError as error:
+            raise SystemExit(f"offline-stop stopped transition/status differs: {name}: {error}") from error
+        if (projection.get("kind")!=rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or transition.get("node")!=name or transition.get("host")!=host
+                or persisted.get("source_pair_role")!="preauthorization-boundary"
+                or persisted.get("head")!=transition.get("stable_head")
+                or transition.get("persisted_head",{}).get("sha256")!=persisted_sha
+                or transition.get("persisted_head",{}).get("value")!=persisted):
+            raise SystemExit(f"offline-stop stopped transition ancestry differs: {name}")
+        receipt_nodes.append({
+            "host":host,"node":name,
+            "transition_kind":"persistently-stopped-precommit",
+            "transition_receipt_sha256":transition_sha,
+            "current_status_sha256":historical_status_sha,
+            "persisted_head_sha256":persisted_sha,
+        })
+        continue
+    if set(status) != status_fields:
+        raise SystemExit(f"offline-stop active status has inexact fields: {name}")
     expected = {
         "schema": "arc.recovery.offline-stop-status.v1",
         "capture_id": capture_id,
@@ -2972,8 +3224,9 @@ for (name, host), frozen in zip(nodes, plan_nodes):
         "stopped_status_sha256": digest(status_payload),
         "validator_address": frozen["validator_address"],
     })
-if len({row["stop_complete_sha256"] for row in receipt_nodes}) != len(nodes):
-    raise SystemExit("offline-stop completion roots are not unique per validator")
+    active_completion_roots.append(status["stop_complete_sha256"])
+if len(set(active_completion_roots)) != len(active_completion_roots):
+    raise SystemExit("offline-stop active completion roots are not unique per validator")
 
 cross_details = cross_proof_path.lstat()
 cross_payload = cross_proof_path.read_bytes()
@@ -3006,6 +3259,7 @@ boundary_fields = {
     "first_quarantine_started_at", "all_controlled_stopped_at", "created_at",
     "official_origin_scope", "legacy_public_height_receipt",
     "authenticated_prefence_height_cross_proof_sha256",
+    "quarantine_generation_ledger_sha256",
     "legacy_maintenance_evidence_bundle_sha256", "network_quarantine_challenge",
     "network_quarantine_stability_proof_sha256",
     "tools", "nodes", "evidence_heights", "observed_cutoff_height", "continuity_safety_margin",
@@ -3042,9 +3296,6 @@ if (boundary_sidecar.is_symlink() or not stat.S_ISREG(boundary_sidecar_details.s
         or boundary_sidecar_payload != f"{boundary_sha}  {maintenance_boundary_path.name}\n".encode("ascii")):
     raise SystemExit("offline-stop maintenance-boundary sidecar differs")
 
-bundle_details = maintenance_evidence_bundle_path.lstat()
-bundle_payload = maintenance_evidence_bundle_path.read_bytes()
-bundle = json.loads(bundle_payload)
 bundle_sha = digest(bundle_payload)
 bundle_sidecar = maintenance_evidence_bundle_path.with_name(
     maintenance_evidence_bundle_path.name + ".sha256"
@@ -3062,6 +3313,8 @@ if (maintenance_evidence_bundle_path.is_symlink() or not stat.S_ISREG(bundle_det
         or boundary.get("legacy_maintenance_evidence_bundle_sha256") != bundle_sha
         or boundary.get("network_quarantine_stability_proof_sha256")
             != bundle.get("quarantine_stability_proof", {}).get("sha256")
+        or boundary.get("quarantine_generation_ledger_sha256")
+            != bundle.get("quarantine_generation_ledger", {}).get("sha256")
         or bundle_sidecar.is_symlink() or not stat.S_ISREG(bundle_sidecar_details.st_mode)
         or bundle_sidecar_details.st_nlink != 1
         or bundle_sidecar_details.st_uid not in {0, os.geteuid()}
@@ -3080,6 +3333,8 @@ value = {
     "legacy_maintenance_boundary": boundary,
     "legacy_maintenance_boundary_sha256": boundary_sha,
     "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
+    "quarantine_generation_ledger_sha256":
+        bundle["quarantine_generation_ledger"]["sha256"],
     "nodes": receipt_nodes,
     "remote_helper_path": helper_path,
     "remote_helper_sha256": helper_sha,
@@ -3143,7 +3398,8 @@ verify_offline_stop_evidence_remote() (
     temporary="$(mktemp -d)"
     trap 'chmod -R u+w "$temporary" 2>/dev/null || true; rm -rf -- "$temporary"' EXIT
     for node in nyc lax ams lhr nrt sgp; do
-        run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" \
+        run_offline_stop_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
+            "$evidence" "$node" \
             > "$temporary/$node-stopped-status.json"
     done
     python3 - "$evidence" "$maintenance_evidence_bundle" "$freeze_sha" "$capture_id" <<'PY'
@@ -3155,7 +3411,9 @@ if (raw!=canonical(bundle) or bundle.get("schema")!="arc.recovery.legacy-mainten
         or bundle.get("freeze_plan_sha256")!=sys.argv[3] or bundle.get("capture_id")!=sys.argv[4]
         or hashlib.sha256(raw).hexdigest()!=evidence.get("legacy_maintenance_evidence_bundle_sha256")
         or evidence.get("legacy_maintenance_boundary",{}).get("legacy_maintenance_evidence_bundle_sha256")
-            !=evidence.get("legacy_maintenance_evidence_bundle_sha256")):
+            !=evidence.get("legacy_maintenance_evidence_bundle_sha256")
+        or bundle.get("quarantine_generation_ledger",{}).get("sha256")
+            !=evidence.get("quarantine_generation_ledger_sha256")):
     raise SystemExit("fresh remote verification maintenance evidence bundle differs")
 PY
     local persisted_binary_sha persisted_genesis_sha persisted_validators_sha persisted_legacy_sha
@@ -3171,11 +3429,17 @@ if any(tuple(row["persisted_head"]["value"][key] for key in keys)!=wanted for ro
 print(*wanted)
 PY
     )
+    local transition_kind transition_sha
     for node in nyc lax ams lhr nrt sgp; do
-        run_persisted_head_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" \
-            "$persisted_binary_sha" "$persisted_genesis_sha" "$persisted_validators_sha" \
-            "$persisted_legacy_sha" > "$temporary/$node-persisted-head.json"
-        python3 - "$maintenance_evidence_bundle" "$temporary/$node-persisted-head.json" "$node" <<'PY'
+        read -r transition_kind transition_sha < <(
+            offline_stop_node_transition_ref "$evidence" "$node"
+        ) || die "cannot resolve persisted-head transition for $node"
+        if [ "$transition_kind" = network-quarantine-active ]; then
+            run_persisted_head_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" \
+                "$persisted_binary_sha" "$persisted_genesis_sha" "$persisted_validators_sha" \
+                "$persisted_legacy_sha" > "$temporary/$node-persisted-head.json"
+            python3 - "$maintenance_evidence_bundle" \
+                "$temporary/$node-persisted-head.json" "$node" <<'PY'
 import json,pathlib,sys
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
 bundle=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"));raw=pathlib.Path(sys.argv[2]).read_bytes()
@@ -3183,6 +3447,7 @@ rows=[row for row in bundle["nodes"] if row.get("node")==sys.argv[3]]
 if len(rows)!=1 or raw!=canonical(rows[0]["persisted_head"]["value"]):
     raise SystemExit(f"fresh persisted-head export differs: {sys.argv[3]}")
 PY
+        fi
     done
     local challenge
     challenge="$(offline_cross_field "$evidence" fleet challenge)"
@@ -3268,7 +3533,7 @@ if hashlib.sha256(payload).hexdigest() != expected or payload != derived.read_by
 if sidecar.read_bytes() != f"{expected}  {evidence.name}\n".encode("ascii"):
     raise SystemExit("sealed offline-stop evidence sidecar differs")
 PY
-    printf 'archive fleet: PASS six exact remote offline-stop.v4 roots match sealed evidence %s\n' \
+    printf 'archive fleet: PASS six exact tagged remote stop roots match sealed evidence %s\n' \
         "$expected_sha"
 )
 
@@ -3429,57 +3694,18 @@ remote_readiness() {
     done
 }
 
-ensure_stopped() {
-    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" node="$4"
-    if run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null 2>&1; then
-        run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
-        return 0
-    fi
-    assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
-    run_remote "$node" fence-stop "$capture_id" "$node" "$freeze_sha" \
-        "$(freeze_node_field "$freeze_plan" "$node" validator_address)" \
-        "$(freeze_node_field "$freeze_plan" "$node" stake)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
-        "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
-        "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
-    run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
-}
-
-run_quarantine_exact() {
-    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" node="$4"
-    assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
-    run_remote "$node" quarantine "$capture_id" "$node" "$freeze_sha" \
-        "$(freeze_node_field "$freeze_plan" "$node" validator_address)" \
-        "$(freeze_node_field "$freeze_plan" "$node" stake)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
-        "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" supervisor_context_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
-        "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
-        "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
+stop_after_quarantine_round_exact() {
+    local capture_id="$1" freeze_sha="$2" node="$3" round="$4"
+    local authorization_sha="$5" readiness_sha="$6" transition_sha="$7"
+    local final_source_capture_sha="$8"
+    require_uint "$round" "quarantine transition round"
+    require_hash "$authorization_sha" "quarantine round authorization root"
+    require_hash "$readiness_sha" "quarantine round readiness root"
+    require_hash "$transition_sha" "quarantine node transition root"
+    require_hash "$final_source_capture_sha" "post-quarantine final source capture root"
+    run_remote "$node" stop-after-quarantine-round "$capture_id" "$node" \
+        "$freeze_sha" "$round" "$authorization_sha" "$readiness_sha" \
+        "$transition_sha" "$final_source_capture_sha"
 }
 
 run_quarantine_status_exact() {
@@ -3511,11 +3737,13 @@ create_network_quarantine_stability_proof() {
     local freeze_plan="$1" freeze_sha="$2" capture_id="$3" challenge="$4"
     local sample_root="$5" output="$6" started_at="$7" completed_at="$8"
     local elapsed_ns="$9"
+    local generation_ledger="${10}"
     python3 - "$freeze_plan" "$freeze_sha" "$capture_id" "$challenge" \
         "$sample_root" "$output" "$started_at" "$completed_at" "$elapsed_ns" \
+        "$generation_ledger" \
         "${NODES[@]}" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
-(plan_raw,freeze,capture,challenge,root_raw,output_raw,started,completed,elapsed_raw,
+(plan_raw,freeze,capture,challenge,root_raw,output_raw,started,completed,elapsed_raw,ledger_raw,
  *fleet_raw)=sys.argv[1:]
 root=pathlib.Path(root_raw);output=pathlib.Path(output_raw);fleet=[tuple(row.split("=",1)) for row in fleet_raw]
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
@@ -3526,10 +3754,32 @@ if fleet!=expected or hash_re.fullmatch(freeze) is None or hash_re.fullmatch(cap
     raise SystemExit("quarantine stability fleet/hash identity differs")
 for timestamp in (started,completed):datetime.datetime.strptime(timestamp,"%Y-%m-%dT%H:%M:%SZ")
 elapsed=int(elapsed_raw)
-if elapsed<120_000_000_000:raise SystemExit("quarantine stability monotonic interval is below 120 seconds")
 plan=json.loads(pathlib.Path(plan_raw).read_text(encoding="utf-8"));source=plan.get("source_commit")
 if plan.get("schema")!="arc.recovery.freeze-plan.v5" or not isinstance(source,str):
     raise SystemExit("quarantine stability freeze plan differs")
+ledger_path=pathlib.Path(ledger_raw);ledger_bytes=ledger_path.read_bytes();ledger=json.loads(ledger_bytes)
+if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v1"
+        or (ledger.get("freeze_plan_sha256"),ledger.get("capture_id"))!=(freeze,capture)
+        or [(row.get("node"),row.get("host")) for row in ledger.get("fleet",[])]!=fleet):
+    raise SystemExit("quarantine stability generation ledger differs")
+transitions=[]
+for round_wrapper in ledger.get("rounds",[]):
+    for wrapper in round_wrapper.get("result",{}).get("value",{}).get("transitions",[]):
+        value=wrapper.get("value",{})
+        transitions.append((value.get("node"),value.get("schema"),wrapper.get("sha256")))
+if len(transitions)!=len(fleet) or {row[0] for row in transitions}!={row[0] for row in fleet}:
+    raise SystemExit("quarantine stability transition partition differs")
+active_schema="arc.recovery.quarantine-node-nft-applied.v1"
+active_names={node for node,schema,_root in transitions if schema==active_schema}
+active_fleet=[row for row in fleet if row[0] in active_names]
+active_roots=[{"node":node,"sha256":next(root for name,schema,root in transitions
+        if name==node and schema==active_schema)} for node,_host in active_fleet]
+if any(hash_re.fullmatch(str(row["sha256"])) is None for row in active_roots):
+    raise SystemExit("quarantine stability active transition roots differ")
+if active_fleet and elapsed<120_000_000_000:
+    raise SystemExit("quarantine stability monotonic interval is below 120 seconds")
+if not active_fleet and elapsed!=0:
+    raise SystemExit("all-stopped stability proof must have zero elapsed time")
 sample_fields={"schema","capture_id","node","freeze_plan_sha256","challenge","sample_index",
     "started_at","completed_at","quarantine_status_before","quarantine_status_before_sha256",
     "quarantine_status_after","quarantine_status_after_sha256","writer","listener_ownership",
@@ -3538,7 +3788,7 @@ status_fields={"schema","capture_id","node","freeze_plan_sha256","receipt_sha256
     "rule_counters","counter_snapshot_sha256","owned_ruleset_stateless_sha256",
     "listener_inventory","loopback_head","quarantine_policy","active","enabled"}
 rows=[];fleet_heads=[]
-for node,host in fleet:
+for node,host in active_fleet:
     samples=[]
     for index in (0,1):
         path=root/f"{node}-{index}.json";details=path.lstat();raw=path.read_bytes();value=json.loads(raw)
@@ -3584,7 +3834,10 @@ for node,host in fleet:
                  "output_deny_packets":{"sample_0":counters[0],"sample_1":counters[1]}})
 value={"schema":"arc.recovery.legacy-network-quarantine-stability.v1",
        "source_main_commit":source,"freeze_plan_sha256":freeze,"capture_id":capture,
-       "challenge":challenge,"interval_seconds":120,"sample_count":2,
+       "quarantine_generation_ledger_sha256":digest(ledger_bytes),
+       "active_transition_sha256s":active_roots,
+       "challenge":challenge,"interval_seconds":120 if active_fleet else 0,
+       "sample_count":2 if active_fleet else 0,
        "started_at":started,"completed_at":completed,"monotonic_elapsed_ns":elapsed,
        "fleet_heads":fleet_heads,"nodes":rows,"global_absence_claimed":False}
 payload=canonical(value)
@@ -3595,10 +3848,12 @@ PY
 
 verify_network_quarantine_stability_proof() {
     local proof="$1" freeze_sha="$2" capture_id="$3" challenge="$4"
-    python3 - "$proof" "$freeze_sha" "$capture_id" "$challenge" "${NODES[@]}" <<'PY'
+    local generation_ledger="$5"
+    python3 - "$proof" "$freeze_sha" "$capture_id" "$challenge" \
+        "$generation_ledger" "${NODES[@]}" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
-path=pathlib.Path(sys.argv[1]);freeze,capture,challenge=sys.argv[2:5]
-fleet=[tuple(row.split("=",1)) for row in sys.argv[5:]]
+path=pathlib.Path(sys.argv[1]);freeze,capture,challenge,ledger_raw=sys.argv[2:6]
+fleet=[tuple(row.split("=",1)) for row in sys.argv[6:]]
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
 digest=lambda raw:hashlib.sha256(raw).hexdigest();hash_re=re.compile(r"[0-9a-f]{64}")
 details=path.lstat();raw=path.read_bytes();value=json.loads(raw)
@@ -3607,27 +3862,45 @@ if (path.is_symlink() or not stat.S_ISREG(details.st_mode) or details.st_uid!=os
     raise SystemExit("network-quarantine stability proof is unsafe")
 fields={"schema","source_main_commit","freeze_plan_sha256","capture_id","challenge",
         "interval_seconds","sample_count","started_at","completed_at","monotonic_elapsed_ns",
-        "fleet_heads","nodes","global_absence_claimed"}
+        "fleet_heads","nodes","global_absence_claimed",
+        "quarantine_generation_ledger_sha256","active_transition_sha256s"}
+ledger_path=pathlib.Path(ledger_raw);ledger_bytes=ledger_path.read_bytes();ledger=json.loads(ledger_bytes)
+if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v1"
+        or (ledger.get("freeze_plan_sha256"),ledger.get("capture_id"))!=(freeze,capture)):
+    raise SystemExit("network-quarantine stability ledger differs")
+transitions=[]
+for round_wrapper in ledger.get("rounds",[]):
+    for wrapper in round_wrapper.get("result",{}).get("value",{}).get("transitions",[]):
+        item=wrapper.get("value",{});transitions.append((item.get("node"),item.get("schema"),wrapper.get("sha256")))
+active_schema="arc.recovery.quarantine-node-nft-applied.v1"
+active_fleet=[row for row in fleet if any(name==row[0] and schema==active_schema for name,schema,_ in transitions)]
+active_roots=[{"node":node,"sha256":next(root for name,schema,root in transitions
+    if name==node and schema==active_schema)} for node,_host in active_fleet]
 if (set(value)!=fields or value.get("schema")!="arc.recovery.legacy-network-quarantine-stability.v1"
         or (value.get("freeze_plan_sha256"),value.get("capture_id"),value.get("challenge"))
-            !=(freeze,capture,challenge) or value.get("interval_seconds")!=120
-        or value.get("sample_count")!=2 or value.get("global_absence_claimed") is not False
+            !=(freeze,capture,challenge)
+        or value.get("quarantine_generation_ledger_sha256")!=digest(ledger_bytes)
+        or value.get("active_transition_sha256s")!=active_roots
+        or value.get("interval_seconds")!=(120 if active_fleet else 0)
+        or value.get("sample_count")!=(2 if active_fleet else 0)
+        or value.get("global_absence_claimed") is not False
         or isinstance(value.get("monotonic_elapsed_ns"),bool)
         or not isinstance(value.get("monotonic_elapsed_ns"),int)
-        or value["monotonic_elapsed_ns"]<120_000_000_000):
+        or (active_fleet and value["monotonic_elapsed_ns"]<120_000_000_000)
+        or (not active_fleet and value["monotonic_elapsed_ns"]!=0)):
     raise SystemExit("network-quarantine stability proof identity differs")
 for timestamp in (value.get("started_at"),value.get("completed_at")):
     datetime.datetime.strptime(timestamp,"%Y-%m-%dT%H:%M:%SZ")
 rows=value.get("nodes");heads=value.get("fleet_heads")
 if (not isinstance(rows,list) or not isinstance(heads,list)
-        or [(row.get("node"),row.get("host")) for row in rows]!=fleet
-        or [(row.get("node"),row.get("host")) for row in heads]!=fleet):
+        or [(row.get("node"),row.get("host")) for row in rows]!=active_fleet
+        or [(row.get("node"),row.get("host")) for row in heads]!=active_fleet):
     raise SystemExit("network-quarantine stability topology differs")
 sample_fields={"schema","capture_id","node","freeze_plan_sha256","challenge","sample_index",
     "started_at","completed_at","quarantine_status_before","quarantine_status_before_sha256",
     "quarantine_status_after","quarantine_status_after_sha256","writer","listener_ownership",
     "head","output_deny_packets","ss_sha256","global_absence_claimed"}
-for row,head_row,(node,host) in zip(rows,heads,fleet):
+for row,head_row,(node,host) in zip(rows,heads,active_fleet):
     if set(row)!={"node","host","samples","output_deny_packets"}:
         raise SystemExit(f"network-quarantine stability row fields differ: {node}")
     samples=row.get("samples")
@@ -3956,15 +4229,19 @@ create_legacy_maintenance_evidence_bundle() {
     local authenticated_cross="$5" quarantine_root="$6" persisted_root="$7"
     local stability_proof="$8" output="$9"
     local first_quarantine_started_at="${10}" all_controlled_stopped_at="${11}"
+    local quarantine_generation_ledger="${12}"
     python3 - "$freeze_plan" "$freeze_sha" "$capture_id" "$status_root" \
         "$authenticated_cross" "$quarantine_root" "$persisted_root" "$stability_proof" "$output" \
-        "$first_quarantine_started_at" "$all_controlled_stopped_at" "${NODES[@]}" <<'PY'
+        "$first_quarantine_started_at" "$all_controlled_stopped_at" \
+        "$quarantine_generation_ledger" "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
 (plan_raw,freeze_sha,capture_id,status_root_raw,authenticated_raw,quarantine_raw,
- persisted_raw,stability_raw,output_raw,first_started,all_stopped,*fleet_raw)=sys.argv[1:]
+ persisted_raw,stability_raw,output_raw,first_started,all_stopped,ledger_raw,
+ rounds_module_raw,*fleet_raw)=sys.argv[1:]
 plan_path=pathlib.Path(plan_raw);status_root=pathlib.Path(status_root_raw)
 authenticated_path=pathlib.Path(authenticated_raw);quarantine_root=pathlib.Path(quarantine_raw)
 persisted_root=pathlib.Path(persisted_raw);stability_path=pathlib.Path(stability_raw)
+ledger_path=pathlib.Path(ledger_raw)
 output=pathlib.Path(output_raw)
 sidecar=output.with_name(output.name+".sha256")
 fleet=[tuple(row.split("=",1)) for row in fleet_raw]
@@ -4018,6 +4295,35 @@ if (authenticated.get("schema")!="arc.recovery.authenticated-legacy-height-fleet
         or (authenticated.get("source_main_commit"),authenticated.get("freeze_plan_sha256"),
             authenticated.get("capture_id"))!=(source_commit,freeze_sha,capture_id)):
     raise SystemExit("maintenance evidence bundle authenticated proof differs")
+ledger,ledger_bytes=locked(ledger_path,"quarantine generation ledger")
+import importlib.util
+spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",rounds_module_raw)
+if spec is None or spec.loader is None:
+    raise SystemExit("maintenance evidence bundle cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);spec.loader.exec_module(rounds)
+try:ledger_state=rounds.validate_generation_ledger(ledger)
+except rounds.QuarantineRoundError as error:
+    raise SystemExit(f"maintenance evidence bundle generation ledger differs: {error}") from error
+if ((ledger_state["freeze_plan_sha256"],ledger_state["capture_id"])
+        !=(freeze_sha,capture_id)
+        or ledger.get("first_secured_at")!=first_started
+        or ledger_state["all_nodes_secured_at"]
+            >datetime.datetime.strptime(all_stopped,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)):
+    raise SystemExit("maintenance evidence bundle generation ledger identity/timeline differs")
+transition_wrappers={}
+transition_projections={}
+for round_wrapper in ledger["rounds"]:
+    for wrapper in round_wrapper["result"]["value"]["transitions"]:
+        transition=wrapper["value"];name=transition["node"]
+        if name in transition_wrappers:raise SystemExit("maintenance evidence repeats a node transition")
+        transition_wrappers[name]=wrapper
+        transition_projections[name]=rounds.validate_node_transition(transition)
+if set(transition_wrappers)!={name for name,_host in fleet}:
+    raise SystemExit("maintenance evidence transition partition differs")
+active_fleet=[row for row in fleet if transition_projections[row[0]]["kind"]
+              ==rounds.ACTIVE_TRANSITION_KIND]
+active_roots=[{"node":node,"sha256":transition_wrappers[node]["sha256"]}
+              for node,_host in active_fleet]
 challenge_path=quarantine_root/"quarantine-challenge.json"
 challenge_value,challenge_bytes=locked(challenge_path,"quarantine challenge")
 challenge=challenge_value.get("challenge")
@@ -4028,24 +4334,29 @@ if (challenge_value.get("schema")!="arc.recovery.legacy-network-quarantine-chall
 stability,stability_bytes=locked(stability_path,"quarantine stability proof")
 stability_fields={"schema","source_main_commit","freeze_plan_sha256","capture_id","challenge",
     "interval_seconds","sample_count","started_at","completed_at","monotonic_elapsed_ns",
-    "fleet_heads","nodes","global_absence_claimed"}
+    "fleet_heads","nodes","global_absence_claimed",
+    "quarantine_generation_ledger_sha256","active_transition_sha256s"}
 if (set(stability)!=stability_fields
         or stability.get("schema")!="arc.recovery.legacy-network-quarantine-stability.v1"
         or (stability.get("source_main_commit"),stability.get("freeze_plan_sha256"),
             stability.get("capture_id"),stability.get("challenge"))
             !=(source_commit,freeze_sha,capture_id,challenge)
-        or stability.get("interval_seconds")!=120 or stability.get("sample_count")!=2
+        or stability.get("quarantine_generation_ledger_sha256")!=digest(ledger_bytes)
+        or stability.get("active_transition_sha256s")!=active_roots
+        or stability.get("interval_seconds")!=(120 if active_fleet else 0)
+        or stability.get("sample_count")!=(2 if active_fleet else 0)
         or isinstance(stability.get("monotonic_elapsed_ns"),bool)
         or not isinstance(stability.get("monotonic_elapsed_ns"),int)
-        or stability["monotonic_elapsed_ns"]<120_000_000_000
+        or (active_fleet and stability["monotonic_elapsed_ns"]<120_000_000_000)
+        or (not active_fleet and stability["monotonic_elapsed_ns"]!=0)
         or stability.get("global_absence_claimed") is not False):
     raise SystemExit("maintenance evidence bundle stability proof differs")
 stability_nodes=stability.get("nodes");stability_heads=stability.get("fleet_heads")
 if (not isinstance(stability_nodes,list) or not isinstance(stability_heads,list)
-        or [(row.get("node"),row.get("host")) for row in stability_nodes]!=fleet
-        or [(row.get("node"),row.get("host")) for row in stability_heads]!=fleet):
+        or [(row.get("node"),row.get("host")) for row in stability_nodes]!=active_fleet
+        or [(row.get("node"),row.get("host")) for row in stability_heads]!=active_fleet):
     raise SystemExit("maintenance evidence bundle stability topology differs")
-for row,head_row,(node,host) in zip(stability_nodes,stability_heads,fleet):
+for row,head_row,(node,host) in zip(stability_nodes,stability_heads,active_fleet):
     samples=row.get("samples")
     if not isinstance(samples,list) or len(samples)!=2:
         raise SystemExit(f"maintenance evidence bundle stability samples differ: {node}")
@@ -4080,11 +4391,68 @@ def sealed(value,raw,node,role):
     root=digest(raw);inventory.append({"node":node,"role":role,"sha256":root,"size":len(raw)})
     return {"value":value,"sha256":root}
 authenticated_sealed=sealed(authenticated,authenticated_bytes,"fleet","authenticated-prefence-height-cross-proof")
+ledger_sealed=sealed(ledger,ledger_bytes,"fleet","quarantine-generation-ledger")
 challenge_sealed=sealed(challenge_value,challenge_bytes,"fleet","network-quarantine-challenge")
 stability_sealed=sealed(stability,stability_bytes,"fleet","network-quarantine-stability-proof")
 nodes=[]
 for node,host in fleet:
+    transition_wrapper=transition_wrappers[node]
+    transition=transition_wrapper["value"]
+    projection=transition_projections[node]
+    if projection["kind"]==rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+        current,current_bytes=locked(
+            status_root/f"{node}-stopped-status.json",f"{node} stopped-round current status"
+        )
+        persisted,persisted_bytes=locked(
+            persisted_root/f"{node}-persisted-head.json",f"{node} stopped-round persisted head"
+        )
+        embedded=transition.get("persisted_head",{})
+        transition_bytes=canonical(transition)
+        current_fields={"schema","capture_id","freeze_plan_sha256","node","host",
+            "node_transition_receipt_sha256","transition_schema","transitioned_at",
+            "observed_at","writer_state","current_boot_id","stable_head",
+            "persistent_restart_fence_sha256","precommit_status_sha256","source_inputs",
+            "nft_table_absent","applied_commit_absent","active_selector_absent",
+            "fence_unit_enabled","fence_unit_active","automatic_legacy_restart"}
+        if (set(current)!=current_fields
+                or current.get("schema")
+                    !="arc.recovery.quarantine-prior-persistently-stopped-status.v1"
+                or (current.get("capture_id"),current.get("freeze_plan_sha256"),
+                    current.get("node"),current.get("host"))
+                    !=(capture_id,freeze_sha,node,host)
+                or current.get("node_transition_receipt_sha256")
+                    !=transition_wrapper["sha256"]
+                or current.get("transition_schema")!=projection["schema"]
+                or current.get("stable_head")!=projection["stable_head"]
+                or current.get("writer_state")!="persistently-stopped"
+                or current.get("nft_table_absent") is not True
+                or current.get("active_selector_absent") is not True
+                or current.get("fence_unit_enabled") is not True
+                or current.get("fence_unit_active") is not False
+                or current.get("automatic_legacy_restart") is not False):
+            raise SystemExit(f"maintenance evidence stopped-round current status differs: {node}")
+        if (not isinstance(embedded,dict) or set(embedded)!={"value","sha256"}
+                or persisted_bytes!=canonical(embedded.get("value"))
+                or digest(persisted_bytes)!=embedded.get("sha256")
+                or persisted.get("source_pair_role")!="preauthorization-boundary"
+                or persisted.get("live_source_capture_sha256")
+                    !=persisted.get("source_inputs",{}).get("live_source_capture_sha256")
+                or persisted.get("head")!=projection["stable_head"]):
+            raise SystemExit(f"maintenance evidence stopped-round persisted head differs: {node}")
+        transition_sealed=sealed(
+            transition,transition_bytes,node,"persistently-stopped-transition"
+        )
+        if transition_sealed!=transition_wrapper:
+            raise SystemExit(f"maintenance evidence stopped transition root differs: {node}")
+        nodes.append({"node":node,"host":host,
+            "transition_kind":"persistently-stopped-precommit",
+            "transition_receipt":transition_sealed,
+            "current_status":sealed(current,current_bytes,node,"stopped-current-status"),
+            "persisted_head":sealed(persisted,persisted_bytes,node,"persisted-head")})
+        continue
     stopped,stopped_bytes=locked(status_root/f"{node}-stopped-status.json",f"{node} stopped status")
+    network,network_bytes=locked(quarantine_root/f"{node}-network-quarantine-receipt.json",
+                                 f"{node} network quarantine receipt")
     status,status_bytes=locked(quarantine_root/f"{node}-status.json",f"{node} quarantine status")
     monitor,monitor_bytes=locked(quarantine_root/f"{node}-monitor.json",f"{node} quarantine monitor")
     post,post_bytes=locked(quarantine_root/f"{node}-post-proof-status.json",f"{node} post-proof status")
@@ -4101,6 +4469,10 @@ for node,host in fleet:
                 or (value.get("capture_id"),value.get("node"),value.get("freeze_plan_sha256"))!=identity
                 or value.get("active") is not True or value.get("enabled") is not True):
             raise SystemExit(f"maintenance evidence bundle quarantine {label} differs: {node}")
+    if (network.get("schema")!="arc.recovery.legacy-network-quarantine.v1"
+            or (network.get("capture_id"),network.get("node"),network.get("freeze_plan_sha256"))!=identity
+            or digest(network_bytes)!=status.get("receipt_sha256")):
+        raise SystemExit(f"maintenance evidence bundle network quarantine receipt differs: {node}")
     monitor_fields={"schema","capture_id","node","freeze_plan_sha256",
         "network_quarantine_receipt_sha256","monitor_contract_sha256",
         "semantic_interpreter","firewall_loader_inventory","file_sha256","unit",
@@ -4150,6 +4522,7 @@ for node,host in fleet:
         raise SystemExit(f"maintenance evidence bundle persisted head differs: {node}")
     nodes.append({"node":node,"host":host,
         "stopped_status":sealed(stopped,stopped_bytes,node,"stopped-status"),
+        "network_quarantine_receipt":sealed(network,network_bytes,node,"network-quarantine-receipt"),
         "quarantine_status":sealed(status,status_bytes,node,"quarantine-status"),
         "quarantine_monitor":sealed(monitor,monitor_bytes,node,"network-quarantine-monitor"),
         "post_proof_quarantine_status":sealed(post,post_bytes,node,"post-proof-quarantine-status"),
@@ -4163,6 +4536,7 @@ value={"schema":"arc.recovery.legacy-maintenance-evidence-bundle.v1",
        "first_quarantine_started_at":first_started,"all_controlled_stopped_at":all_stopped,
        "challenge":challenge,
        "authenticated_prefence_height_cross_proof":authenticated_sealed,
+       "quarantine_generation_ledger":ledger_sealed,
        "network_quarantine_challenge":challenge_sealed,
        "quarantine_stability_proof":stability_sealed,"nodes":nodes,
        "object_inventory":inventory,"aggregate_root_sha256":inventory_root}
@@ -4232,7 +4606,8 @@ create_legacy_maintenance_boundary() {
         "$quarantine_root" "$persisted_root" "$output" \
         "$first_quarantine_started_at" "$all_controlled_stopped_at" \
         "$helper_sha" "$inspector_binary_sha" "$genesis_sha" \
-        "$validators_sha" "$legacy_validators_sha" "$evidence_bundle" "${NODES[@]}" <<'PY'
+        "$validators_sha" "$legacy_validators_sha" "$evidence_bundle" \
+        "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
 import datetime
 import hashlib
 import json
@@ -4245,7 +4620,7 @@ import sys
 (plan_raw, freeze_sha, capture_id, public_raw, public_sha, authenticated_raw,
  quarantine_root_raw, persisted_root_raw, output_raw, first_quarantine_started_at,
  all_controlled_stopped_at, helper_sha, inspector_sha, genesis_sha, validators_sha,
- legacy_validators_sha, evidence_bundle_raw, *fleet_raw) = sys.argv[1:]
+ legacy_validators_sha, evidence_bundle_raw, rounds_module_raw, *fleet_raw) = sys.argv[1:]
 plan_path=pathlib.Path(plan_raw);public_path=pathlib.Path(public_raw)
 authenticated_path=pathlib.Path(authenticated_raw);quarantine_root=pathlib.Path(quarantine_root_raw)
 persisted_root=pathlib.Path(persisted_root_raw);output=pathlib.Path(output_raw)
@@ -4347,19 +4722,55 @@ if (not isinstance(stability_sealed,dict) or set(stability_sealed)!={"value","sh
         or not isinstance(stability_sealed.get("value"),dict)
         or digest(canonical(stability_sealed["value"]))!=stability_sealed.get("sha256")):
     raise SystemExit("maintenance-boundary stability proof seal differs")
+ledger_sealed=evidence_bundle.get("quarantine_generation_ledger")
+if (not isinstance(ledger_sealed,dict) or set(ledger_sealed)!={"value","sha256"}
+        or not isinstance(ledger_sealed.get("value"),dict)
+        or digest(canonical(ledger_sealed["value"]))!=ledger_sealed.get("sha256")):
+    raise SystemExit("maintenance-boundary generation ledger seal differs")
+import importlib.util
+spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",rounds_module_raw)
+if spec is None or spec.loader is None:
+    raise SystemExit("maintenance-boundary cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);spec.loader.exec_module(rounds)
+try:ledger_state=rounds.validate_generation_ledger(ledger_sealed["value"])
+except rounds.QuarantineRoundError as error:
+    raise SystemExit(f"maintenance-boundary generation ledger differs: {error}") from error
+if ((ledger_state["freeze_plan_sha256"],ledger_state["capture_id"])
+        !=(freeze_sha,capture_id)
+        or ledger_sealed["value"].get("first_secured_at")
+            !=first_quarantine_started_at):
+    raise SystemExit("maintenance-boundary generation ledger identity differs")
+transition_wrappers={}
+transition_projections={}
+for round_wrapper in ledger_sealed["value"]["rounds"]:
+    for wrapper in round_wrapper["result"]["value"]["transitions"]:
+        transition=wrapper["value"];name=transition["node"]
+        if name in transition_wrappers:raise SystemExit("maintenance-boundary repeats a transition")
+        transition_wrappers[name]=wrapper
+        transition_projections[name]=rounds.validate_node_transition(transition)
+if set(transition_wrappers)!={name for name,_host in fleet}:
+    raise SystemExit("maintenance-boundary transition partition differs")
+active_fleet=[row for row in fleet if transition_projections[row[0]]["kind"]
+              ==rounds.ACTIVE_TRANSITION_KIND]
+active_roots=[{"node":node,"sha256":transition_wrappers[node]["sha256"]}
+              for node,_host in active_fleet]
 stability=stability_sealed["value"]
 if (stability.get("schema")!="arc.recovery.legacy-network-quarantine-stability.v1"
         or (stability.get("source_main_commit"),stability.get("freeze_plan_sha256"),
             stability.get("capture_id"))!=(source_commit,freeze_sha,capture_id)
-        or stability.get("interval_seconds")!=120 or stability.get("sample_count")!=2
+        or stability.get("quarantine_generation_ledger_sha256")!=ledger_sealed["sha256"]
+        or stability.get("active_transition_sha256s")!=active_roots
+        or stability.get("interval_seconds")!=(120 if active_fleet else 0)
+        or stability.get("sample_count")!=(2 if active_fleet else 0)
         or isinstance(stability.get("monotonic_elapsed_ns"),bool)
         or not isinstance(stability.get("monotonic_elapsed_ns"),int)
-        or stability["monotonic_elapsed_ns"]<120_000_000_000
+        or (active_fleet and stability["monotonic_elapsed_ns"]<120_000_000_000)
+        or (not active_fleet and stability["monotonic_elapsed_ns"]!=0)
         or stability.get("global_absence_claimed") is not False):
     raise SystemExit("maintenance-boundary stability proof differs")
 stability_rows=stability.get("nodes")
 if (not isinstance(stability_rows,list)
-        or [(row.get("node"),row.get("host")) for row in stability_rows]!=fleet):
+        or [(row.get("node"),row.get("host")) for row in stability_rows]!=active_fleet):
     raise SystemExit("maintenance-boundary stability topology differs")
 bundle_rows=evidence_bundle.get("nodes")
 if (not isinstance(bundle_rows,list)
@@ -4382,16 +4793,68 @@ def exact_tuple(value,label):
         raise SystemExit(f"maintenance-boundary {label} tuple is malformed")
     return {key:value[key] for key in ("height","block_hash","state_root")}
 
-rows=[];evidence_heights=[];challenge=None
-for (node,host),origin,authenticated_row,stability_row in zip(
-        fleet,origins,authenticated_rows,stability_rows):
+rows=[];evidence_heights=[];challenge=stability.get("challenge")
+if hash_re.fullmatch(str(challenge)) is None:
+    raise SystemExit("maintenance-boundary quarantine challenge is malformed")
+stability_by={row["node"]:row for row in stability_rows}
+for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows):
+    projection=transition_projections[node]
+    transition_wrapper=transition_wrappers[node]
+    bundle_row=next(row for row in bundle_rows if row.get("node")==node)
+    persisted,persisted_bytes=locked(
+        persisted_root/f"{node}-persisted-head.json",f"{node} persisted head"
+    )
+    if projection["kind"]==rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+        if set(bundle_row)!={"node","host","transition_kind","transition_receipt",
+                            "current_status","persisted_head"}:
+            raise SystemExit(f"maintenance-boundary stopped evidence fields differ: {node}")
+        if (bundle_row.get("transition_kind")!="persistently-stopped-precommit"
+                or bundle_row.get("transition_receipt")!=transition_wrapper
+                or bundle_row.get("persisted_head",{}).get("value")!=persisted
+                or bundle_row.get("persisted_head",{}).get("sha256")!=digest(persisted_bytes)
+                or persisted.get("source_pair_role")!="preauthorization-boundary"
+                or persisted.get("head")!=projection["stable_head"]):
+            raise SystemExit(f"maintenance-boundary stopped transition binding differs: {node}")
+        current=bundle_row.get("current_status",{})
+        if (not isinstance(current,dict) or set(current)!={"value","sha256"}
+                or digest(canonical(current.get("value")))!=current.get("sha256")
+                or current.get("value",{}).get("node_transition_receipt_sha256")
+                    !=transition_wrapper["sha256"]):
+            raise SystemExit(f"maintenance-boundary stopped current status differs: {node}")
+        persisted_tuple=exact_tuple(persisted.get("head"),f"{node} persisted stopped")
+        auth_proof=authenticated_row.get("proof");auth_sha=authenticated_row.get("proof_sha256")
+        if (not isinstance(auth_proof,dict) or digest(canonical(auth_proof))!=auth_sha
+                or auth_proof.get("node")!=node
+                or auth_proof.get("public_info_after_height")!=origin["info_after_height"]):
+            raise SystemExit(f"maintenance-boundary stopped authenticated row differs: {node}")
+        height_sources=(
+            ("public_info_before",origin["info_before_height"],public_sha),
+            ("public_latest",origin["latest_block_height"],public_sha),
+            ("public_info_after",origin["info_after_height"],public_sha),
+            ("authenticated_info_before",auth_proof["authenticated_info_before_height"],auth_sha),
+            ("authenticated_latest",auth_proof["authenticated_latest_block_height"],auth_sha),
+            ("authenticated_info_after",auth_proof["authenticated_info_after_height"],auth_sha),
+            ("stopped_transition_head",persisted_tuple["height"],transition_wrapper["sha256"]),
+            ("final_persisted_head",persisted_tuple["height"],digest(persisted_bytes)),
+        )
+        for label,height,evidence_sha in height_sources:
+            if (isinstance(height,bool) or not isinstance(height,int) or height<0
+                    or hash_re.fullmatch(str(evidence_sha)) is None):
+                raise SystemExit(f"maintenance-boundary stopped evidence height differs: {node}/{label}")
+            evidence_heights.append({"node":node,"label":label,"height":height,
+                                     "evidence_sha256":evidence_sha})
+        rows.append({"node":node,"host":host,"origin":origin["origin"],
+            "transition_kind":"persistently-stopped-precommit",
+            "transition_receipt_sha256":transition_wrapper["sha256"],
+            "final_persisted_head":{"tuple":persisted_tuple,
+                                      "evidence_sha256":digest(persisted_bytes)}})
+        continue
+    stability_row=stability_by[node]
     status,status_bytes=locked(quarantine_root/f"{node}-status.json",f"{node} quarantine status")
     post_status,post_status_bytes=locked(
         quarantine_root/f"{node}-post-proof-status.json",f"{node} post-proof quarantine status")
     external,external_bytes=locked(quarantine_root/f"{node}-external-proof.json",f"{node} external proof")
     cross,cross_bytes=locked(quarantine_root/f"{node}-public-cross-proof.json",f"{node} public cross-proof")
-    persisted,persisted_bytes=locked(persisted_root/f"{node}-persisted-head.json",f"{node} persisted head")
-    bundle_row=next(row for row in bundle_rows if row.get("node")==node)
     for field,value,raw in (
         ("quarantine_status",status,status_bytes),
         ("post_proof_quarantine_status",post_status,post_status_bytes),
@@ -4482,6 +4945,9 @@ for (node,host),origin,authenticated_row,stability_row in zip(
             or persisted.get("validator_public_keys_sha256")!=validators_sha
             or persisted.get("legacy_validator_set_sha256")!=legacy_validators_sha
             or persisted.get("network_quarantine_receipt_sha256")!=status.get("receipt_sha256")
+            or persisted.get("source_pair_role")!="post-quarantine-final-export"
+            or persisted.get("selected_source_head")!=persisted.get("head")
+            or hash_re.fullmatch(str(persisted.get("final_source_capture_sha256"))) is None
             or persisted.get("export_status")!="EXPORTED_UNSIGNED"):
         raise SystemExit(f"maintenance-boundary persisted head identity differs: {node}")
     persisted_tuple=exact_tuple(persisted.get("head"),f"{node} persisted")
@@ -4586,6 +5052,7 @@ value={
     "legacy_public_height_receipt":{"schema":public["schema"],"sha256":public_sha,
         "completed_at":public["completed_at"],"observed_max_height":public["legacy_public_max_height"]},
     "authenticated_prefence_height_cross_proof_sha256":digest(authenticated_bytes),
+    "quarantine_generation_ledger_sha256":ledger_sealed["sha256"],
     "legacy_maintenance_evidence_bundle_sha256":digest(evidence_bundle_bytes),
     "network_quarantine_stability_proof_sha256":stability_sealed["sha256"],
     "network_quarantine_challenge":challenge,
@@ -4897,8 +5364,11 @@ PY
 
 reserve_stop_boundary_timestamp() {
     local evidence_output="$1" boundary="$2" freeze_sha="$3" capture_id="$4"
-    python3 - "$evidence_output" "$boundary" "$freeze_sha" "$capture_id" <<'PY'
+    local public_receipt="${5:-}" public_receipt_sha="${6:-}" authenticated_cross="${7:-}"
+    python3 - "$evidence_output" "$boundary" "$freeze_sha" "$capture_id" \
+        "$public_receipt" "$public_receipt_sha" "$authenticated_cross" <<'PY'
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -4908,7 +5378,7 @@ import stat
 import sys
 
 output = pathlib.Path(sys.argv[1])
-boundary, freeze_sha, capture_id = sys.argv[2:]
+boundary, freeze_sha, capture_id, public_raw, public_sha, authenticated_raw = sys.argv[2:]
 if boundary not in {"first-quarantine-started", "all-controlled-stopped"}:
     raise SystemExit("unsupported stop boundary")
 if (not output.is_absolute() or output.suffix != ".json"
@@ -4928,13 +5398,111 @@ expected = {
     "freeze_plan_sha256": freeze_sha,
     "capture_id": capture_id,
 }
-def locked_bytes(name, *, modes):
+
+def locked_json(raw_path, label):
+    candidate = pathlib.Path(raw_path)
+    if not candidate.is_absolute():
+        raise SystemExit(f"first-quarantine {label} path is not absolute")
+    descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        stable = lambda item: (
+            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+        )
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid not in {0, os.geteuid()}
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o400
+                or before.st_size <= 0 or before.st_size > 16 * 1024 * 1024):
+            raise SystemExit(f"first-quarantine {label} identity is unsafe")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size or stable(os.fstat(descriptor)) != stable(before):
+            raise SystemExit(f"first-quarantine {label} changed while read")
+    finally:
+        os.close(descriptor)
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"first-quarantine {label} is invalid JSON") from error
+    if payload != canonical(decoded):
+        raise SystemExit(f"first-quarantine {label} is noncanonical")
+    return decoded, payload
+
+def validate_first_quarantine_authorization(value):
+    if boundary != "first-quarantine-started":
+        if any((public_raw, public_sha, authenticated_raw)):
+            raise SystemExit("unexpected public-height inputs for terminal stop boundary")
+        return
+    if not all((public_raw, public_sha, authenticated_raw)):
+        raise SystemExit("first quarantine requires sealed public-height authorization inputs")
+    if re.fullmatch(r"[0-9a-f]{64}", public_sha) is None:
+        raise SystemExit("first-quarantine public-height hash is malformed")
+    public, public_payload = locked_json(public_raw, "public-height receipt")
+    authenticated, _authenticated_payload = locked_json(
+        authenticated_raw, "authenticated-height fleet proof"
+    )
+    public_fields = {
+        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+        "started_at", "completed_at", "duration_ms", "request_policy", "origins",
+        "legacy_public_max_height",
+    }
+    authenticated_fields = {
+        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+        "legacy_public_height_receipt_sha256", "challenge", "started_at",
+        "completed_at", "conservative_height_floor", "nodes",
+    }
+    if (not isinstance(public, dict) or set(public) != public_fields
+            or hashlib.sha256(public_payload).hexdigest() != public_sha
+            or public.get("schema") != "arc.recovery.legacy-public-height.v1"
+            or (public.get("freeze_plan_sha256"), public.get("capture_id"))
+                != (freeze_sha, capture_id)):
+        raise SystemExit("first-quarantine public-height receipt binding differs")
+    if (not isinstance(authenticated, dict) or set(authenticated) != authenticated_fields
+            or authenticated.get("schema")
+                != "arc.recovery.authenticated-legacy-height-fleet.v1"
+            or (authenticated.get("source_main_commit"),
+                authenticated.get("freeze_plan_sha256"), authenticated.get("capture_id"),
+                authenticated.get("legacy_public_height_receipt_sha256"))
+                != (public.get("source_main_commit"), freeze_sha, capture_id, public_sha)):
+        raise SystemExit("first-quarantine authenticated-height binding differs")
+
+    def utc(raw, label):
+        if not isinstance(raw, str) or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", raw
+        ) is None:
+            raise SystemExit(f"first-quarantine {label} is not canonical UTC")
+        try:
+            return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError as error:
+            raise SystemExit(f"first-quarantine {label} is invalid") from error
+
+    public_completed = utc(public.get("completed_at"), "public completion")
+    fleet_started = utc(authenticated.get("started_at"), "fleet start")
+    fleet_completed = utc(authenticated.get("completed_at"), "fleet completion")
+    first = utc(value.get("timestamp"), "boundary timestamp")
+    if not public_completed <= fleet_started <= fleet_completed <= first:
+        raise SystemExit("first-quarantine public-height authorization timeline is not ordered")
+    if (first - public_completed).total_seconds() > 300:
+        raise SystemExit(
+            "first-quarantine public-height receipt exceeded the 300-second live boundary"
+        )
+
+def locked_bytes(name, *, modes, links={1}, allow_empty=False):
     fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
     try:
         details = os.fstat(fd)
+        stable = lambda item: (
+            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+        )
         if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid()
-                or details.st_nlink != 1 or stat.S_IMODE(details.st_mode) not in modes
-                or details.st_size <= 0 or details.st_size > 4096):
+                or details.st_nlink not in links or stat.S_IMODE(details.st_mode) not in modes
+                or details.st_size < (0 if allow_empty else 1) or details.st_size > 4096):
             raise SystemExit("stop boundary timestamp file identity is unsafe")
         raw = b""
         while len(raw) <= 4096:
@@ -4942,7 +5510,7 @@ def locked_bytes(name, *, modes):
             if not chunk:
                 break
             raw += chunk
-        if len(raw) != details.st_size:
+        if len(raw) != details.st_size or stable(os.fstat(fd)) != stable(details):
             raise SystemExit("stop boundary timestamp changed while read")
         return raw
     finally:
@@ -4950,23 +5518,53 @@ def locked_bytes(name, *, modes):
 
 dfd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
 try:
+    lock_name = path.name + ".lock"
+    lock_fd = os.open(
+        lock_name,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=dfd,
+    )
+    lock_details = os.fstat(lock_fd)
+    if (not stat.S_ISREG(lock_details.st_mode) or lock_details.st_uid != os.geteuid()
+            or lock_details.st_gid != os.getegid() or lock_details.st_nlink != 1
+            or stat.S_IMODE(lock_details.st_mode) != 0o600):
+        raise SystemExit("stop boundary timestamp lock is unsafe")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
     if path.exists() or path.is_symlink():
-        payload = locked_bytes(path.name, modes={0o400})
+        same_inode = bool(
+            (partial.exists() or partial.is_symlink()) and os.path.samefile(path, partial)
+        )
+        payload = locked_bytes(path.name, modes={0o400}, links={2} if same_inode else {1})
         value = json.loads(payload)
         if payload != canonical(value) or set(value) != set(expected) | {"timestamp"}:
             raise SystemExit("existing stop boundary timestamp is noncanonical")
         if any(value.get(key) != wanted for key, wanted in expected.items()):
             raise SystemExit("existing stop boundary timestamp belongs to another capture")
+        validate_first_quarantine_authorization(value)
         if partial.exists() or partial.is_symlink():
-            # A committed terminal is authoritative.  Remove only an exact,
-            # operator-owned uncommitted partial from the same transaction.
-            locked_bytes(partial.name, modes={0o400, 0o600})
+            fragment = locked_bytes(
+                partial.name, modes={0o400, 0o600}, links={1, 2}, allow_empty=True
+            )
+            if same_inode:
+                if fragment != payload:
+                    raise SystemExit("stop boundary committed final/partial bytes differ")
+            elif fragment:
+                try:
+                    fragment_value = json.loads(fragment)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    fragment_value = None
+                if isinstance(fragment_value, dict) and fragment == canonical(fragment_value):
+                    if fragment != payload:
+                        raise SystemExit("stop boundary canonical partial conflicts with terminal")
             os.unlink(partial.name, dir_fd=dfd)
             os.fsync(dfd)
     else:
         value = None
         if partial.exists() or partial.is_symlink():
-            raw = locked_bytes(partial.name, modes={0o400, 0o600})
+            raw = locked_bytes(
+                partial.name, modes={0o400, 0o600}, allow_empty=True
+            )
             try:
                 candidate = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -4976,11 +5574,25 @@ try:
                     and all(candidate.get(key) == wanted for key, wanted in expected.items())
                     and isinstance(candidate.get("timestamp"), str)
                     and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", candidate["timestamp"])):
+                validate_first_quarantine_authorization(candidate)
                 os.chmod(partial.name, 0o400, dir_fd=dfd, follow_symlinks=False)
-                os.rename(partial.name, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+                descriptor = os.open(
+                    partial.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.link(
+                    partial.name, path.name, src_dir_fd=dfd, dst_dir_fd=dfd,
+                    follow_symlinks=False,
+                )
+                os.unlink(partial.name, dir_fd=dfd)
                 os.fsync(dfd)
                 value = candidate
             else:
+                if isinstance(candidate, dict) and raw == canonical(candidate):
+                    raise SystemExit("stop boundary canonical partial has conflicting identity")
                 os.unlink(partial.name, dir_fd=dfd)
                 os.fsync(dfd)
         if value is None:
@@ -4988,6 +5600,10 @@ try:
                 **expected,
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
+            # Validate and write in one process so no quarantine command can
+            # interleave between the live <=300-second decision and this
+            # create-only authorization boundary.
+            validate_first_quarantine_authorization(value)
             payload = canonical(value)
             descriptor = os.open(
                 partial.name,
@@ -4996,10 +5612,21 @@ try:
                 dir_fd=dfd,
             )
             with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload); handle.flush(); os.fsync(handle.fileno())
-                os.fchmod(handle.fileno(), 0o400)
-            os.rename(partial.name, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+                handle.write(payload); handle.flush(); os.fchmod(handle.fileno(), 0o400)
+                os.fsync(handle.fileno())
+            try:
+                os.link(
+                    partial.name, path.name, src_dir_fd=dfd, dst_dir_fd=dfd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                terminal = locked_bytes(path.name, modes={0o400}, links={1, 2})
+                if terminal != payload:
+                    raise SystemExit("concurrent stop boundary terminal differs")
+            os.unlink(partial.name, dir_fd=dfd)
             os.fsync(dfd)
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
 finally:
     os.close(dfd)
 timestamp = value["timestamp"]
@@ -5037,7 +5664,7 @@ PY
 publish_canonical_maintenance_input() {
     local source="$1" destination="$2"
     python3 - "$source" "$destination" <<'PY'
-import json,os,pathlib,stat,sys
+import fcntl,json,os,pathlib,stat,sys
 source=pathlib.Path(sys.argv[1]);destination=pathlib.Path(sys.argv[2])
 raw=source.read_bytes();value=json.loads(raw)
 canonical=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
@@ -5048,15 +5675,16 @@ if (parent.is_symlink() or not stat.S_ISDIR(details.st_mode)
     raise SystemExit("maintenance evidence destination directory is unsafe")
 dfd=os.open(parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
 partial=destination.with_name(destination.name+".partial")
-def read_locked(name,modes):
+def read_locked(name,modes,links={1},empty=False):
     fd=os.open(name,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0),dir_fd=dfd)
     try:
         before=os.fstat(fd)
         stable=lambda value:(value.st_dev,value.st_ino,value.st_mode,value.st_uid,value.st_gid,
                              value.st_nlink,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid()
-                or before.st_nlink!=1 or stat.S_IMODE(before.st_mode) not in modes
-                or before.st_size<=0 or before.st_size>32*1024*1024):
+                or before.st_nlink not in links or stat.S_IMODE(before.st_mode) not in modes
+                or before.st_size<0 or (before.st_size==0 and not empty)
+                or before.st_size>32*1024*1024):
             raise SystemExit("maintenance evidence input identity differs")
         chunks=[];remaining=32*1024*1024+1
         while remaining:
@@ -5069,29 +5697,636 @@ def read_locked(name,modes):
         return current
     finally:os.close(fd)
 try:
+    lock_name=destination.name+".lock"
+    lock_fd=os.open(lock_name,os.O_RDWR|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600,dir_fd=dfd)
+    lock_details=os.fstat(lock_fd)
+    if (not stat.S_ISREG(lock_details.st_mode) or lock_details.st_uid!=os.geteuid()
+            or lock_details.st_gid!=os.getegid() or lock_details.st_nlink!=1
+            or stat.S_IMODE(lock_details.st_mode)!=0o600):
+        raise SystemExit("maintenance evidence lock identity differs")
+    fcntl.flock(lock_fd,fcntl.LOCK_EX)
     if destination.exists() or destination.is_symlink():
-        if read_locked(destination.name,{0o400})!=raw:
+        same=(partial.exists() or partial.is_symlink()) and os.path.samefile(destination,partial)
+        if read_locked(destination.name,{0o400},{2} if same else {1})!=raw:
             raise SystemExit("existing maintenance evidence input differs")
         if partial.exists() or partial.is_symlink():
-            read_locked(partial.name,{0o400,0o600})
+            fragment=read_locked(partial.name,{0o400,0o600},{1,2},True)
+            if fragment and fragment!=raw:
+                try:fragment_value=json.loads(fragment)
+                except (UnicodeDecodeError,json.JSONDecodeError):fragment_value=None
+                if isinstance(fragment_value,dict) and fragment==(json.dumps(fragment_value,sort_keys=True,separators=(",",":"))+"\n").encode():
+                    raise SystemExit("canonical maintenance partial conflicts with terminal")
             os.unlink(partial.name,dir_fd=dfd);os.fsync(dfd)
     else:
         promote=False
         if partial.exists() or partial.is_symlink():
-            current=read_locked(partial.name,{0o400,0o600})
+            current=read_locked(partial.name,{0o400,0o600},{1},True)
             if current==raw:
                 os.chmod(partial.name,0o400,dir_fd=dfd,follow_symlinks=False)
+                fd=os.open(partial.name,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0),dir_fd=dfd)
+                try:os.fsync(fd)
+                finally:os.close(fd)
                 promote=True
             else:
+                try:partial_value=json.loads(current)
+                except (UnicodeDecodeError,json.JSONDecodeError):partial_value=None
+                if isinstance(partial_value,dict) and current==(json.dumps(partial_value,sort_keys=True,separators=(",",":"))+"\n").encode():
+                    raise SystemExit("canonical maintenance partial conflicts with source")
                 os.unlink(partial.name,dir_fd=dfd);os.fsync(dfd)
         if not promote:
             fd=os.open(partial.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600,dir_fd=dfd)
             with os.fdopen(fd,"wb") as handle:
-                handle.write(raw);handle.flush();os.fsync(handle.fileno());os.fchmod(handle.fileno(),0o400)
-        os.rename(partial.name,destination.name,src_dir_fd=dfd,dst_dir_fd=dfd)
+                handle.write(raw);handle.flush();os.fchmod(handle.fileno(),0o400);os.fsync(handle.fileno())
+        try:
+            os.link(partial.name,destination.name,src_dir_fd=dfd,dst_dir_fd=dfd,follow_symlinks=False)
+        except FileExistsError:
+            if read_locked(destination.name,{0o400},{1,2})!=raw:
+                raise SystemExit("concurrent maintenance evidence terminal differs")
+        os.unlink(partial.name,dir_fd=dfd)
         os.fsync(dfd)
+    fcntl.flock(lock_fd,fcntl.LOCK_UN);os.close(lock_fd)
 finally:os.close(dfd)
 PY
+}
+
+round_artifact_sha() {
+    local path="$1"
+    require_absolute_file "$path" "quarantine round artifact"
+    hash_file "$path"
+}
+
+round_authorization_is_live() {
+    local authorization="$1"
+    python3 - "$authorization" <<'PY'
+import datetime,json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+deadline=datetime.datetime.strptime(value["authorization_deadline"],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+raise SystemExit(0 if datetime.datetime.now(datetime.timezone.utc)<=deadline else 1)
+PY
+}
+
+quarantine_round_prefix_ref() {
+    local round_root="$1" through="$2" node="$3"
+    python3 -I "$QUARANTINE_ROUND_DRIVER" prefix-ref \
+        --round-root "$round_root" --through "$through" --node "$node"
+}
+
+quarantine_round_remaining_targets() {
+    local round_root="$1" through="$2"
+    python3 - "$round_root" "$through" "$QUARANTINE_ROUND_MODULE" <<'PY'
+import importlib.util,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]);through=int(sys.argv[2]);module_path=sys.argv[3]
+spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",module_path)
+if spec is None or spec.loader is None:raise SystemExit("cannot load quarantine-round validator")
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+secured=set();prior=[]
+for number in range(1,through+1):
+    auth=json.loads((root/f"round-{number}"/"authorization.json").read_text(encoding="utf-8"))
+    result=json.loads((root/f"round-{number}"/"result.json").read_text(encoding="utf-8"))
+    transitions=[module.validate_wrapper(row,"prefix transition")[0] for row in result["transitions"]]
+    module.validate_round_result(
+        result,authorization=auth,prior_results=prior,transition_receipts=transitions
+    )
+    secured.update(row["node"] for row in transitions);prior.append(result)
+print(",".join(name for name,_host in module.FLEET if name not in secured))
+PY
+}
+
+capture_quarantine_round_prior_statuses() {
+    local round_root="$1" through="$2" freeze_sha="$3" capture_id="$4"
+    local output_root="$5" log_root="$6" node round auth_sha readiness_sha applied_sha
+    for node in nyc lax ams lhr nrt sgp; do
+        if [ "$through" -eq 0 ]; then
+            break
+        fi
+        if ! read -r round auth_sha readiness_sha applied_sha < <(
+            quarantine_round_prefix_ref "$round_root" "$through" "$node" 2>/dev/null
+        ); then
+            continue
+        fi
+        require_uint "$round" "prior-fenced quarantine round"
+        require_hash "$auth_sha" "prior-fenced authorization root"
+        require_hash "$readiness_sha" "prior-fenced readiness root"
+        require_hash "$applied_sha" "prior-fenced applied root"
+        run_remote "$node" quarantine-round-status "$capture_id" "$node" "$freeze_sha" \
+            "$round" "$auth_sha" "$readiness_sha" "$applied_sha" \
+            > "$log_root/$node-prior-fenced-status.new.json"
+        chmod 400 -- "$log_root/$node-prior-fenced-status.new.json"
+        publish_canonical_maintenance_input \
+            "$log_root/$node-prior-fenced-status.new.json" "$output_root/$node.json"
+    done
+}
+
+capture_quarantine_round_target_cross() {
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" targets="$4"
+    local public_receipt="$5" attempt_root="$6"
+    local challenge bracket_root cross node index failed=0
+    local pids=() names=()
+    challenge="$(python3 -I - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
+    require_hash "$challenge" "quarantine-round authenticated-height challenge"
+    bracket_root="$attempt_root/authenticated-brackets"
+    mkdir -m 700 -- "$bracket_root"
+    cross="$attempt_root/authenticated-target-cross.json"
+    IFS=',' read -r -a names <<< "$targets"
+    for node in "${names[@]}"; do
+        (
+            run_remote "$node" legacy-height-bracket "$capture_id" "$node" "$freeze_sha" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
+                "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+                "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
+                "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" rpc_origin)" \
+                "$(legacy_height_row_field "$public_receipt" "$node" info_before_height)" \
+                "$(legacy_height_row_field "$public_receipt" "$node" latest_block_height)" \
+                "$(legacy_height_row_field "$public_receipt" "$node" info_after_height)" \
+                "$(legacy_height_row_field "$public_receipt" "$node" latest_block_hash)" \
+                "$challenge" > "$bracket_root/$node.new.json"
+            chmod 400 -- "$bracket_root/$node.new.json"
+            publish_canonical_maintenance_input \
+                "$bracket_root/$node.new.json" "$bracket_root/$node.json"
+        ) > "$attempt_root/$node-authenticated-bracket.log" 2>&1 &
+        pids+=("$!")
+    done
+    for index in "${!pids[@]}"; do
+        if ! wait "${pids[$index]}"; then
+            sed -n '1,80p' "$attempt_root/${names[$index]}-authenticated-bracket.log" >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] || die \
+        "one or more still-live targets failed the authenticated quarantine-round bracket"
+    python3 -I "$QUARANTINE_ROUND_DRIVER" build-cross \
+        --freeze-plan "$freeze_plan" --freeze-plan-sha256 "$freeze_sha" \
+        --capture-id "$capture_id" --targets "$targets" --public "$public_receipt" \
+        --bracket-root "$bracket_root" --output "$cross" >/dev/null
+}
+
+quarantine_cross_node_field() {
+    local cross="$1" node="$2" field="$3"
+    python3 - "$cross" "$node" "$field" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows=[row for row in value.get("nodes",[]) if row.get("node")==sys.argv[2]]
+if len(rows)!=1 or sys.argv[3] not in rows[0]:raise SystemExit("quarantine cross field is absent or ambiguous")
+item=rows[0][sys.argv[3]]
+if isinstance(item,(dict,list,bool)) or item is None:raise SystemExit("quarantine cross field is not scalar")
+print(item)
+PY
+}
+
+capture_quarantine_round_live_sources() {
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" round_number="$4"
+    local targets="$5" public_receipt="$6" cross="$7" attempt_root="$8"
+    local inspector_sha="$9" genesis_sha="${10}" legacy_sha="${11}" allow_unbound="${12}"
+    local output_root="$attempt_root/live-source-captures" node index failed=0
+    local public_sha cross_sha temporary
+    local pids=() names=()
+    mkdir -m 700 -- "$output_root"
+    public_sha="$(round_artifact_sha "$public_receipt")"
+    cross_sha="$(round_artifact_sha "$cross")"
+    IFS=',' read -r -a names <<< "$targets"
+    for node in "${names[@]}"; do
+        (
+            temporary="$attempt_root/$node-live-source.new.json"
+            local public_after authenticated_after minimum_height
+            public_after="$(legacy_height_row_field "$public_receipt" "$node" info_after_height)"
+            authenticated_after="$(quarantine_cross_node_field "$cross" "$node" loopback_info_after_height)"
+            if [ "$public_after" -ge "$authenticated_after" ]; then
+                minimum_height="$public_after"
+            else
+                minimum_height="$authenticated_after"
+            fi
+            run_remote "$node" capture-live-source "$capture_id" "$node" "$freeze_sha" \
+                "$round_number" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
+                "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
+                "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" data_dir)" \
+                "$(freeze_node_field "$freeze_plan" "$node" rpc_origin)" \
+                "$inspector_sha" "$genesis_sha" "$legacy_sha" "$allow_unbound" \
+                "$(legacy_height_row_field "$public_receipt" "$node" latest_block_height)" \
+                "$(legacy_height_row_field "$public_receipt" "$node" latest_block_hash)" \
+                "$(quarantine_cross_node_field "$cross" "$node" loopback_latest_height)" \
+                "$(quarantine_cross_node_field "$cross" "$node" loopback_latest_block_hash)" \
+                "$public_sha" "$cross_sha" preauthorization-boundary \
+                "$minimum_height" - - - "$cross_sha" - - > "$temporary"
+            chmod 400 -- "$temporary"
+            publish_canonical_maintenance_input "$temporary" "$output_root/$node.json"
+        ) > "$attempt_root/$node-live-source.log" 2>&1 &
+        pids+=("$!")
+    done
+    for index in "${!pids[@]}"; do
+        if ! wait "${pids[$index]}"; then
+            sed -n '1,120p' "$attempt_root/${names[$index]}-live-source.log" >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] || die \
+        "one or more live targets failed exact snapshot/WAL-prefix capture"
+}
+
+capture_post_quarantine_final_sources() {
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3" ledger="$4"
+    local stability_proof="$5" status_root="$6" output_root="$7" log_root="$8"
+    local inspector_sha="$9" genesis_sha="${10}" legacy_sha="${11}"
+    local allow_unbound="${12}"
+    shift 12
+    local nodes=("$@") node index failed=0 stability_sha temporary
+    local pids=() names=()
+    stability_sha="$(round_artifact_sha "$stability_proof")"
+    mkdir -m 700 -- "$output_root"
+    for node in "${nodes[@]}"; do
+        (
+            local round public_height public_hash authenticated_height authenticated_hash
+            local public_sha cross_sha minimum_height expected_height expected_hash expected_state
+            local network_receipt_sha owned_ruleset_sha
+            read -r round public_height public_hash authenticated_height authenticated_hash \
+                public_sha cross_sha minimum_height expected_height expected_hash expected_state \
+                network_receipt_sha owned_ruleset_sha < <(
+                python3 - "$ledger" "$stability_proof" "$status_root/$node-pre-stop-status.json" \
+                    "$node" "$stability_sha" <<'PY'
+import hashlib,json,pathlib,sys
+ledger_path,stability_path,status_path,node,stability_sha=sys.argv[1:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+ledger_raw=pathlib.Path(ledger_path).read_bytes();ledger=json.loads(ledger_raw)
+stability_raw=pathlib.Path(stability_path).read_bytes();stability=json.loads(stability_raw)
+status_raw=pathlib.Path(status_path).read_bytes();status=json.loads(status_raw)
+if (ledger_raw!=canonical(ledger) or stability_raw!=canonical(stability)
+        or status_raw!=canonical(status)
+        or hashlib.sha256(stability_raw).hexdigest()!=stability_sha):
+    raise SystemExit("final source capture inputs are noncanonical")
+found=[]
+for round_wrapper in ledger.get("rounds",[]):
+    authorization=round_wrapper.get("authorization",{}).get("value",{})
+    for wrapper in round_wrapper.get("result",{}).get("value",{}).get("transitions",[]):
+        transition=wrapper.get("value",{})
+        if transition.get("node")==node:found.append((authorization,transition))
+if len(found)!=1 or found[0][1].get("schema")!="arc.recovery.quarantine-node-nft-applied.v1":
+    raise SystemExit("final source capture node is not an exact active transition")
+authorization,transition=found[0]
+public_wrapper=authorization["public_height_receipt"]
+cross_wrapper=authorization["authenticated_height_cross_proof"]
+public=public_wrapper["value"];cross=cross_wrapper["value"]
+public_rows=[row for row in public["origins"] if row.get("name")==node]
+cross_rows=[row for row in cross["nodes"] if row.get("node")==node]
+head_rows=[row for row in stability.get("fleet_heads",[]) if row.get("node")==node]
+if len(public_rows)!=1 or len(cross_rows)!=1 or len(head_rows)!=1:
+    raise SystemExit("final source capture boundary row is missing or ambiguous")
+public_row=public_rows[0];cross_row=cross_rows[0];head=head_rows[0]["head"]
+if (status.get("schema")!="arc.recovery.legacy-network-quarantine-status.v1"
+        or status.get("node")!=node or status.get("active") is not True
+        or status.get("enabled") is not True
+        or {"height":status.get("loopback_head",{}).get("latest_height"),
+            "block_hash":status.get("loopback_head",{}).get("block_hash"),
+            "state_root":status.get("loopback_head",{}).get("state_root")}!=head):
+    raise SystemExit("final source capture status/head differs from stability proof")
+values=(authorization["round_number"],public_row["latest_block_height"],
+    public_row["latest_block_hash"],cross_row["loopback_latest_height"],
+    cross_row["loopback_latest_block_hash"],public_wrapper["sha256"],cross_wrapper["sha256"],
+    max(public_row["info_after_height"],cross_row["loopback_info_after_height"]),
+    head["height"],head["block_hash"],head["state_root"],status["receipt_sha256"],
+    status["owned_ruleset_stateless_sha256"])
+print(" ".join(map(str,values)))
+PY
+            )
+            temporary="$log_root/$node-final-source.new.json"
+            run_remote "$node" capture-live-source "$capture_id" "$node" "$freeze_sha" \
+                "$round" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
+                "$(freeze_node_field "$freeze_plan" "$node" boot_id)" \
+                "$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" executable_path)" \
+                "$(freeze_node_field "$freeze_plan" "$node" executable_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" argv_sha256)" \
+                "$(freeze_node_field "$freeze_plan" "$node" data_dir)" \
+                "$(freeze_node_field "$freeze_plan" "$node" rpc_origin)" \
+                "$inspector_sha" "$genesis_sha" "$legacy_sha" "$allow_unbound" \
+                "$public_height" "$public_hash" "$authenticated_height" \
+                "$authenticated_hash" "$public_sha" "$cross_sha" \
+                post-quarantine-final-export "$minimum_height" "$expected_height" \
+                "$expected_hash" "$expected_state" "$stability_sha" \
+                "$network_receipt_sha" "$owned_ruleset_sha" > "$temporary"
+            chmod 400 -- "$temporary"
+            python3 - "$temporary" "$node" "$expected_height" "$expected_hash" \
+                "$expected_state" "$stability_sha" <<'PY'
+import hashlib,json,pathlib,sys
+path=pathlib.Path(sys.argv[1]);node=sys.argv[2];height=int(sys.argv[3])
+expected={"height":height,"block_hash":sys.argv[4],"state_root":sys.argv[5]}
+value=json.loads(path.read_text(encoding="utf-8"))
+raw=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+if (path.read_bytes()!=raw or value.get("node")!=node
+        or value.get("source_pair_role")!="post-quarantine-final-export"
+        or value.get("expected_head")!=expected or value.get("head")!=expected
+        or value.get("boundary_proof_sha256")!=sys.argv[6]
+        or value.get("content_sealed") is not True
+        or value.get("strict_offline_replay") is not True):
+    raise SystemExit("post-quarantine final source capture differs")
+PY
+            publish_canonical_maintenance_input "$temporary" "$output_root/$node.json"
+        ) > "$log_root/$node-final-source.log" 2>&1 &
+        pids+=("$!"); names+=("$node")
+    done
+    for index in "${!pids[@]}"; do
+        if ! wait "${pids[$index]}"; then
+            sed -n '1,120p' "$log_root/${names[$index]}-final-source.log" >&2
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] || die \
+        "one or more active nodes lack an exact post-stability source pair; no writer stop is authorized"
+}
+
+complete_quarantine_round_attempt() {
+    local freeze_sha="$1" capture_id="$2" round_number="$3"
+    local round_root="$4" attempt_root="$5" log_root="$6"
+    local inspector_binary_sha="$7" inspector_genesis_sha="$8"
+    local inspector_validators_sha="$9" inspector_legacy_validators_sha="${10}"
+    local allow_unbound_legacy_wal="${11}"
+    local authorization="$attempt_root/authorization.json"
+    local acceptance_root="$attempt_root/authorization-acceptances"
+    local readiness="$attempt_root/readiness.json"
+    local applied_root="$attempt_root/node-transitions"
+    local result="$attempt_root/result.json"
+    local auth_sha readiness_sha temporary targets node index failed applied_count
+    local pids=() names=()
+    auth_sha="$(round_artifact_sha "$authorization")"
+    targets="$(python3 - "$authorization" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+names=[row.get("node") for row in value.get("targets",[])]
+if not names:raise SystemExit("round authorization target set is empty")
+print(",".join(names))
+PY
+)"
+    IFS=',' read -r -a names <<< "$targets"
+    [ -e "$acceptance_root" ] || mkdir -m 700 -- "$acceptance_root"
+    [ -e "$applied_root" ] || mkdir -m 700 -- "$applied_root"
+    if [ -f "$readiness" ] && [ ! -L "$readiness" ]; then
+        readiness_sha="$(round_artifact_sha "$readiness")"
+        for node in "${names[@]}"; do
+            [ ! -f "$applied_root/$node.json" ] || continue
+            temporary="$log_root/$node-round-$round_number-applied-status.new.json"
+            if run_remote "$node" quarantine-round-applied-status "$capture_id" "$node" \
+                    "$freeze_sha" "$round_number" "$auth_sha" "$readiness_sha" \
+                    > "$temporary" 2> "$temporary.stderr"; then
+                chmod 400 -- "$temporary"
+                publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
+            else
+                temporary="$log_root/$node-round-$round_number-stopped-precommit.new.json"
+                if run_remote "$node" quarantine-round-stopped-precommit \
+                        "$capture_id" "$node" "$freeze_sha" "$round_number" \
+                        "$auth_sha" "$readiness_sha" "$inspector_binary_sha" \
+                        "$inspector_genesis_sha" "$inspector_validators_sha" \
+                        "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal" \
+                        > "$temporary" 2> "$temporary.stderr"; then
+                    chmod 400 -- "$temporary"
+                    publish_canonical_maintenance_input "$temporary" \
+                        "$applied_root/$node.json"
+                fi
+            fi
+        done
+    fi
+    applied_count=0
+    for node in "${names[@]}"; do [ ! -f "$applied_root/$node.json" ] || applied_count=$((applied_count + 1)); done
+    if [ "$applied_count" -lt "${#names[@]}" ]; then
+        if ! round_authorization_is_live "$authorization"; then
+            if [ "$applied_count" -eq 0 ]; then
+                return 2
+            fi
+        else
+            pids=(); failed=0
+            for node in "${names[@]}"; do
+                [ -f "$acceptance_root/$node.json" ] && continue
+                (
+                    temporary="$log_root/$node-round-$round_number-acceptance.new.json"
+                    if ! run_remote "$node" quarantine-round-authorization-status \
+                            "$capture_id" "$node" "$freeze_sha" "$round_number" "$auth_sha" \
+                            > "$temporary" 2> "$temporary.stderr"; then
+                        run_remote_canonical_input "$node" "$authorization" \
+                            quarantine-round-authorize "$capture_id" "$node" "$freeze_sha" \
+                            "$round_number" "$auth_sha" > "$temporary"
+                    fi
+                    chmod 400 -- "$temporary"
+                    publish_canonical_maintenance_input "$temporary" \
+                        "$acceptance_root/$node.json"
+                ) > "$log_root/$node-round-$round_number-authorize.log" 2>&1 &
+                pids+=("$!")
+            done
+            for index in "${!pids[@]}"; do
+                if ! wait "${pids[$index]}"; then failed=1; fi
+            done
+            [ "$failed" -eq 0 ] || die \
+                "not every still-live target accepted the exact quarantine-round authorization"
+            if [ ! -f "$readiness" ]; then
+                python3 -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
+                    --round-number "$round_number" --round-root "$round_root" \
+                    --authorization "$authorization" --acceptance-root "$acceptance_root" \
+                    --output "$readiness" >/dev/null
+            fi
+            readiness_sha="$(round_artifact_sha "$readiness")"
+            pids=(); failed=0
+            for node in "${names[@]}"; do
+                (
+                    temporary="$log_root/$node-round-$round_number-readiness.new.json"
+                    run_remote_canonical_input "$node" "$readiness" quarantine-round-ready \
+                        "$capture_id" "$node" "$freeze_sha" "$round_number" "$auth_sha" \
+                        "$readiness_sha" > "$temporary"
+                    chmod 400 -- "$temporary"
+                    cmp --silent "$readiness" "$temporary" || \
+                        die "remote quarantine-round readiness bytes differ for $node"
+                ) > "$log_root/$node-round-$round_number-ready.log" 2>&1 &
+                pids+=("$!")
+            done
+            for index in "${!pids[@]}"; do
+                if ! wait "${pids[$index]}"; then failed=1; fi
+            done
+            [ "$failed" -eq 0 ] || die \
+                "the exact all-target quarantine-round readiness was not durable everywhere"
+            pids=()
+            for node in "${names[@]}"; do
+                [ ! -f "$applied_root/$node.json" ] || continue
+                (
+                    temporary="$log_root/$node-round-$round_number-applied.new.json"
+                    run_remote "$node" quarantine-round-apply "$capture_id" "$node" \
+                        "$freeze_sha" "$round_number" "$auth_sha" "$readiness_sha" \
+                        > "$temporary"
+                    chmod 400 -- "$temporary"
+                    publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
+                ) > "$log_root/$node-round-$round_number-apply.log" 2>&1 &
+                pids+=("$!")
+            done
+            # Individual failures are an expected partial-round state.  Do not
+            # roll back a successful fence and do not authorize a late retry.
+            for index in "${!pids[@]}"; do wait "${pids[$index]}" || true; done
+        fi
+    fi
+    readiness_sha="$(round_artifact_sha "$readiness")"
+    applied_count=0
+    for node in "${names[@]}"; do [ ! -f "$applied_root/$node.json" ] || applied_count=$((applied_count + 1)); done
+    if [ "$applied_count" -lt "${#names[@]}" ]; then
+        local wait_seconds
+        wait_seconds="$(python3 - "$authorization" <<'PY'
+import datetime,json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+deadline=datetime.datetime.strptime(value["authorization_deadline"],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+remaining=(deadline-datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+print(max(0,int(remaining)+1))
+PY
+)"
+        require_uint "$wait_seconds" "quarantine-round deadline wait"
+        [ "$wait_seconds" -eq 0 ] || /bin/sleep "$wait_seconds"
+        for node in "${names[@]}"; do
+            [ ! -f "$applied_root/$node.json" ] || continue
+            temporary="$log_root/$node-round-$round_number-final-applied-status.new.json"
+            if run_remote "$node" quarantine-round-applied-status "$capture_id" "$node" \
+                    "$freeze_sha" "$round_number" "$auth_sha" "$readiness_sha" \
+                    > "$temporary" 2> "$temporary.stderr"; then
+                chmod 400 -- "$temporary"
+                publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
+            else
+                temporary="$log_root/$node-round-$round_number-final-stopped-precommit.new.json"
+                if run_remote "$node" quarantine-round-stopped-precommit \
+                        "$capture_id" "$node" "$freeze_sha" "$round_number" \
+                        "$auth_sha" "$readiness_sha" "$inspector_binary_sha" \
+                        "$inspector_genesis_sha" "$inspector_validators_sha" \
+                        "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal" \
+                        > "$temporary" 2> "$temporary.stderr"; then
+                    chmod 400 -- "$temporary"
+                    publish_canonical_maintenance_input "$temporary" \
+                        "$applied_root/$node.json"
+                fi
+            fi
+        done
+    fi
+    python3 -I "$QUARANTINE_ROUND_DRIVER" build-result \
+        --round-number "$round_number" --round-root "$round_root" \
+        --authorization "$authorization" --readiness "$readiness" \
+        --applied-root "$applied_root" --output "$result" >/dev/null
+    applied_count="$(python3 - "$result" <<'PY'
+import json,pathlib,sys
+print(len(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["transitions"]))
+PY
+)"
+    if [ "$applied_count" -eq 0 ]; then
+        return 2
+    fi
+    local final_round_root="$round_root/round-$round_number"
+    if [ ! -e "$final_round_root" ]; then
+        mkdir -m 700 -- "$final_round_root"
+    fi
+    publish_canonical_maintenance_input "$authorization" \
+        "$final_round_root/authorization.json"
+    publish_canonical_maintenance_input "$result" "$final_round_root/result.json"
+    return 0
+}
+
+run_quarantine_generation_rounds() {
+    local freeze_plan="$1" freeze_sha="$2" capture_id="$3"
+    local maintenance_input_root="$4" log_root="$5" output="$6"
+    local inspector_binary_sha="$7" inspector_genesis_sha="$8"
+    local inspector_validators_sha="$9" inspector_legacy_validators_sha="${10}"
+    local allow_unbound_legacy_wal="${11}"
+    local source_main round_number round_dir attempt_root authorization
+    local prior_status_root public_receipt status targets
+    source_main="$(manifest_field "$freeze_plan" source_commit)"
+    [ -f "$QUARANTINE_ROUND_DRIVER" ] && [ ! -L "$QUARANTINE_ROUND_DRIVER" ] || \
+        die "quarantine round driver is missing or unsafe"
+    [ -f "$QUARANTINE_ROUND_MODULE" ] && [ ! -L "$QUARANTINE_ROUND_MODULE" ] || \
+        die "quarantine round validator is missing or unsafe"
+    tracked_source_hash "$QUARANTINE_ROUND_DRIVER" >/dev/null
+    tracked_source_hash "$QUARANTINE_ROUND_MODULE" >/dev/null
+    local round_root
+    round_root="$(prepare_protected_maintenance_directory \
+        "$maintenance_input_root/quarantine-rounds")"
+    round_number=1
+    while [ "$round_number" -le 6 ]; do
+        round_dir="$round_root/round-$round_number"
+        if [ -f "$round_dir/result.json" ] && [ ! -L "$round_dir/result.json" ]; then
+            quarantine_round_remaining_targets "$round_root" "$round_number" >/dev/null
+            round_number=$((round_number + 1))
+            continue
+        fi
+        targets="$(quarantine_round_remaining_targets "$round_root" "$((round_number - 1))")"
+        [ -n "$targets" ] || break
+        for authorization in "$round_dir"/attempt.*/authorization.json; do
+            [ -f "$authorization" ] && [ ! -L "$authorization" ] || continue
+            attempt_root="${authorization%/authorization.json}"
+            if complete_quarantine_round_attempt "$freeze_sha" "$capture_id" \
+                    "$round_number" "$round_root" "$attempt_root" "$log_root" \
+                    "$inspector_binary_sha" "$inspector_genesis_sha" \
+                    "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
+                    "$allow_unbound_legacy_wal"; then
+                break
+            else
+                status=$?
+                [ "$status" -eq 2 ] || die \
+                    "quarantine round $round_number recovery failed"
+            fi
+        done
+        if [ -f "$round_dir/result.json" ] && [ ! -L "$round_dir/result.json" ]; then
+            printf 'archive fleet: recovered positive quarantine round %s\n' "$round_number"
+            round_number=$((round_number + 1))
+            continue
+        fi
+        if [ ! -e "$round_dir" ]; then
+            mkdir -m 700 -- "$round_dir"
+        fi
+        attempt_root="$(mktemp -d "$round_dir/attempt.XXXXXX")"
+        chmod 700 -- "$attempt_root"
+        public_receipt="$attempt_root/target-public-height.json"
+        python3 -I "$LEGACY_HEIGHT_TOOL" sample-targets \
+            --source-main "$source_main" --freeze-plan "$freeze_plan" \
+            --freeze-plan-sha256 "$freeze_sha" --targets "$targets" \
+            --output "$public_receipt" --timeout-seconds 10 >/dev/null
+        prior_status_root="$attempt_root/prior-fenced-status"
+        mkdir -m 700 -- "$prior_status_root"
+        capture_quarantine_round_prior_statuses "$round_root" "$((round_number - 1))" \
+            "$freeze_sha" "$capture_id" "$prior_status_root" "$log_root"
+        capture_quarantine_round_target_cross "$freeze_plan" "$freeze_sha" \
+            "$capture_id" "$targets" "$public_receipt" "$attempt_root"
+        capture_quarantine_round_live_sources "$freeze_plan" "$freeze_sha" \
+            "$capture_id" "$round_number" "$targets" "$public_receipt" \
+            "$attempt_root/authenticated-target-cross.json" "$attempt_root" \
+            "$inspector_binary_sha" "$inspector_genesis_sha" \
+            "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal"
+        python3 -I "$QUARANTINE_ROUND_DRIVER" build-authorization \
+            --freeze-plan "$freeze_plan" --freeze-plan-sha256 "$freeze_sha" \
+            --capture-id "$capture_id" --round-number "$round_number" \
+            --round-root "$round_root" --public "$public_receipt" \
+            --cross "$attempt_root/authenticated-target-cross.json" \
+            --prior-status-root "$prior_status_root" \
+            --source-capture-root "$attempt_root/live-source-captures" \
+            --output "$attempt_root/authorization.json" >/dev/null
+        if complete_quarantine_round_attempt "$freeze_sha" "$capture_id" \
+                "$round_number" "$round_root" "$attempt_root" "$log_root" \
+                "$inspector_binary_sha" "$inspector_genesis_sha" \
+                "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
+                "$allow_unbound_legacy_wal"; then
+            printf 'archive fleet: sealed positive quarantine transition round %s\n' \
+                "$round_number"
+            round_number=$((round_number + 1))
+        else
+            status=$?
+            [ "$status" -eq 2 ] || die "fresh quarantine round failed"
+            printf 'archive fleet: preserved zero-progress round attempt %s; resampling still-live targets\n' \
+                "$round_number"
+        fi
+    done
+    python3 -I "$QUARANTINE_ROUND_DRIVER" build-ledger \
+        --round-root "$round_root" --freeze-plan-sha256 "$freeze_sha" \
+        --capture-id "$capture_id" --output "$output" >/dev/null
+    hash_file "$output"
 }
 
 reserve_quarantine_challenge() {
@@ -5157,13 +6392,15 @@ PY
 verify_quarantine_maintenance_inputs() {
     local root="$1" freeze_sha="$2" capture_id="$3" public_receipt="$4" challenge="$5"
     local stability_proof="$6"
+    local generation_ledger="$7"
     verify_network_quarantine_stability_proof "$stability_proof" "$freeze_sha" \
-        "$capture_id" "$challenge" >/dev/null
+        "$capture_id" "$challenge" "$generation_ledger" >/dev/null
     python3 - "$root" "$freeze_sha" "$capture_id" "$public_receipt" "$challenge" \
-        "${NODES[@]}" <<'PY'
+        "$generation_ledger" "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
 import hashlib,json,os,pathlib,re,stat,sys
 root=pathlib.Path(sys.argv[1]);freeze,capture,public_raw,challenge=sys.argv[2:6]
-fleet=[tuple(row.split("=",1)) for row in sys.argv[6:]]
+ledger_raw,rounds_module_raw=sys.argv[6:8]
+fleet=[tuple(row.split("=",1)) for row in sys.argv[8:]]
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
 hash_re=re.compile(r"[0-9a-f]{64}")
 def locked(path,label):
@@ -5181,7 +6418,29 @@ public=json.loads(pathlib.Path(public_raw).read_bytes())
 origins=public.get("origins")
 if not isinstance(origins,list) or [row.get("name") for row in origins]!=[row[0] for row in fleet]:
     raise SystemExit("maintenance quarantine public topology differs")
+ledger_path=pathlib.Path(ledger_raw);ledger_bytes=ledger_path.read_bytes();ledger=json.loads(ledger_bytes)
+if (ledger_bytes!=canonical(ledger) or ledger.get("schema")!="arc.recovery.quarantine-generation-ledger.v1"
+        or (ledger.get("freeze_plan_sha256"),ledger.get("capture_id"))!=(freeze,capture)):
+    raise SystemExit("maintenance quarantine generation ledger differs")
+transitions=[]
+for round_wrapper in ledger.get("rounds",[]):
+    for wrapper in round_wrapper.get("result",{}).get("value",{}).get("transitions",[]):
+        item=wrapper.get("value",{});transitions.append((item.get("node"),item.get("schema")))
+if len(transitions)!=len(fleet) or {row[0] for row in transitions}!={row[0] for row in fleet}:
+    raise SystemExit("maintenance quarantine transition partition differs")
+active_schema="arc.recovery.quarantine-node-nft-applied.v1"
+stopped_schema="arc.recovery.quarantine-node-persistently-stopped-precommit.v1"
+if any(schema not in {active_schema,stopped_schema} for _node,schema in transitions):
+    raise SystemExit("maintenance quarantine transition kind differs")
+active_names={node for node,schema in transitions if schema==active_schema}
 for (node,host),origin in zip(fleet,origins):
+    if node not in active_names:
+        forbidden=[root/f"{node}-{suffix}.json" for suffix in (
+            "status","post-proof-status","external-proof","public-cross-proof",
+            "network-quarantine-receipt")]
+        if any(path.exists() or path.is_symlink() for path in forbidden):
+            raise SystemExit(f"stopped transition has active-quarantine evidence: {node}")
+        continue
     status,status_raw=locked(root/f"{node}-status.json",f"{node} status")
     post,post_raw=locked(root/f"{node}-post-proof-status.json",f"{node} post status")
     external,external_raw=locked(root/f"{node}-external-proof.json",f"{node} external proof")
@@ -5279,6 +6538,7 @@ capture_phase() {
     local inspector_genesis="" inspector_genesis_sha="" inspector_validators=""
     local inspector_validators_sha="" inspector_legacy_validators=""
     local inspector_legacy_validators_sha="" execute=false
+    local allow_unbound_legacy_wal=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --freeze-plan) [ "$#" -ge 2 ] || die "--freeze-plan needs a value"; freeze_plan="$2"; shift 2 ;;
@@ -5293,6 +6553,7 @@ capture_phase() {
             --validator-public-keys-sha256) [ "$#" -ge 2 ] || die "--validator-public-keys-sha256 needs a value"; inspector_validators_sha="$2"; shift 2 ;;
             --legacy-validator-set) [ "$#" -ge 2 ] || die "--legacy-validator-set needs a value"; inspector_legacy_validators="$2"; shift 2 ;;
             --legacy-validator-set-sha256) [ "$#" -ge 2 ] || die "--legacy-validator-set-sha256 needs a value"; inspector_legacy_validators_sha="$2"; shift 2 ;;
+            --allow-unbound-legacy-wal) allow_unbound_legacy_wal=true; shift ;;
             --execute) execute=true; shift ;;
             --plan) execute=false; shift ;;
             -h|--help) usage; return 0 ;;
@@ -5341,12 +6602,11 @@ capture_phase() {
     printf 'ARC staged legacy freeze plan\n'
     printf '  freeze:   %s\n' "$freeze_sha"
     printf '  capture:  %s\n' "$capture_id"
-    printf '  quarantine: all six exact hosts concurrently before any TERM/thaw\n'
+    printf '  quarantine: crash-safe fresh mixed-state rounds before any TERM/thaw\n'
     printf '  stops:      all six quarantined writers concurrently; no global halt/absence claim\n'
     REMOTE_HELPER_SHA="$(manifest_field "$freeze_plan" remote_helper_sha256)"
     require_hash "$REMOTE_HELPER_SHA" "sealed remote helper hash"
     REMOTE_HELPER_PATH="/root/.arc-recovery-helpers/$REMOTE_HELPER_SHA/archive-node.sh"
-    remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan"
     run_drive_prefreeze_gate preflight "$freeze_plan" "$freeze_sha" "$capture_id"
     if [ "$execute" != true ]; then
         printf 'archive fleet: PLAN ONLY; no service or remote/local file was changed\n'
@@ -5402,25 +6662,9 @@ capture_phase() {
     local legacy_height_cross_proof="${offline_stop_output}.authenticated-height-cross-proof.json"
     local first_quarantine_started_at all_controlled_stopped_at
     local first_boundary_path="${offline_stop_output}.first-quarantine-started.json"
-    if [ -e "$first_boundary_path" ] || [ -L "$first_boundary_path" ]; then
-        local boundary_mutations_before_retry=0
-        local boundary_probe_node
-        for boundary_probe_node in nyc lax ams lhr nrt sgp; do
-            if run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
-                    "$boundary_probe_node" >/dev/null 2>&1 \
-                    || run_quarantine_status_exact "$freeze_plan" "$freeze_sha" \
-                    "$capture_id" "$boundary_probe_node" >/dev/null 2>&1; then
-                boundary_mutations_before_retry=$((boundary_mutations_before_retry + 1))
-            fi
-        done
-        [ "$boundary_mutations_before_retry" -gt 0 ] || die \
-            "a prior maintenance boundary exists but no writer is quarantined/stopped; resample height and use a new offline evidence output"
-    fi
     if [ -e "$legacy_height_cross_proof" ] || [ -L "$legacy_height_cross_proof" ]; then
         [ -f "$legacy_height_cross_proof" ] && [ ! -L "$legacy_height_cross_proof" ] || \
             die "durable authenticated legacy-height cross-proof is unsafe"
-        [ -e "$first_boundary_path" ] || die \
-            "authenticated height cross-proof exists without its maintenance boundary; use a new offline evidence output"
         python3 - "$legacy_height_cross_proof" "$freeze_sha" "$capture_id" \
             "$legacy_height_receipt_sha" <<'PY'
 import json,pathlib,stat,sys
@@ -5437,43 +6681,53 @@ PY
         printf 'archive fleet: reusing the durable authenticated pre-quarantine height proof\n'
     else
         [ ! -e "$first_boundary_path" ] && [ ! -L "$first_boundary_path" ] || die \
-            "maintenance mutation began without a durable authenticated height proof"
+            "first quarantine boundary exists without its durable authenticated height proof"
         printf 'archive fleet: cross-proving public height samples against every exact SSH-authenticated loopback writer\n'
         capture_authenticated_legacy_height_cross_proof "$freeze_plan" "$freeze_sha" \
             "$capture_id" "$legacy_height_receipt" "$legacy_height_receipt_sha" \
             "$legacy_height_cross_proof" "$log_root"
     fi
-    # Reserve the authenticated public-height boundary immediately before the
-    # first possible full-host quarantine. A partial quarantine is itself a
-    # durable fail-closed mutation, so crash recovery must reuse this root.
-    first_quarantine_started_at="$(reserve_stop_boundary_timestamp \
-        "$offline_stop_output" first-quarantine-started "$freeze_sha" "$capture_id")"
     local quarantine_root
     quarantine_root="$(prepare_protected_maintenance_directory \
         "$maintenance_input_root/network-quarantine")"
-    printf 'archive fleet: installing the capture-bound full-host legacy quarantine concurrently on all six writers\n'
-    local quarantine_node quarantine_index quarantine_failed=0
-    local quarantine_pids=() quarantine_nodes=()
+    local quarantine_generation_ledger="$maintenance_input_root/quarantine-generation-ledger.json"
+    local quarantine_generation_ledger_sha
+    quarantine_generation_ledger_sha="$(run_quarantine_generation_rounds \
+        "$freeze_plan" "$freeze_sha" "$capture_id" "$maintenance_input_root" \
+        "$log_root" "$quarantine_generation_ledger" "$inspector_binary_sha" \
+        "$inspector_genesis_sha" "$inspector_validators_sha" \
+        "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal")"
+    require_hash "$quarantine_generation_ledger_sha" "quarantine generation ledger root"
+    local active_quarantine_nodes=() stopped_quarantine_nodes=() transition_kind
     for quarantine_node in nyc lax ams lhr nrt sgp; do
-        (
-            run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
-                "$quarantine_node"
-        ) > "$quarantine_root/$quarantine_node-apply.log" 2>&1 &
-        quarantine_pids+=("$!")
-        quarantine_nodes+=("$quarantine_node")
-    done
-    for quarantine_index in "${!quarantine_pids[@]}"; do
-        if ! wait "${quarantine_pids[$quarantine_index]}"; then
-            printf 'archive fleet: legacy network quarantine failed: %s\n' \
-                "${quarantine_nodes[$quarantine_index]}" >&2
-            sed -n '1,120p' \
-                "$quarantine_root/${quarantine_nodes[$quarantine_index]}-apply.log" >&2
-            quarantine_failed=1
+        transition_kind="$(python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+            --ledger "$quarantine_generation_ledger" --node "$quarantine_node" \
+            --kind transition-kind)"
+        if [ "$transition_kind" = network-quarantine-active ]; then
+            active_quarantine_nodes+=("$quarantine_node")
+        elif [ "$transition_kind" = persistently-stopped-precommit ]; then
+            stopped_quarantine_nodes+=("$quarantine_node")
+        else
+            die "unknown quarantine transition kind for $quarantine_node: $transition_kind"
         fi
     done
-    [ "$quarantine_failed" -eq 0 ] || die \
-        "at least one host was not quarantined; no writer stop/thaw was authorized"
-    for quarantine_node in nyc lax ams lhr nrt sgp; do
+    python3 -I "$QUARANTINE_ROUND_DRIVER" build-first-boundary \
+        --ledger "$quarantine_generation_ledger" --output "$first_boundary_path" >/dev/null
+    first_quarantine_started_at="$(python3 - "$first_boundary_path" <<'PY'
+import json,pathlib,sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["timestamp"])
+PY
+)"
+    local quarantine_node quarantine_index quarantine_failed=0
+    local quarantine_pids=() quarantine_nodes=()
+    for quarantine_node in "${active_quarantine_nodes[@]}"; do
+        python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+            --ledger "$quarantine_generation_ledger" --node "$quarantine_node" \
+            --kind network > "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
+        chmod 400 -- "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
+        publish_canonical_maintenance_input \
+            "$log_root/$quarantine_node-network-quarantine-receipt.new.json" \
+            "$quarantine_root/$quarantine_node-network-quarantine-receipt.json"
         if [ ! -e "$quarantine_root/$quarantine_node-status.json" ] \
                 && [ ! -L "$quarantine_root/$quarantine_node-status.json" ]; then
             run_quarantine_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
@@ -5483,6 +6737,7 @@ PY
                 "$quarantine_root/$quarantine_node-status.json"
         fi
     done
+    printf 'archive fleet: all six nodes are fenced by the sealed mixed-state quarantine generation ledger\n'
     local quarantine_challenge
     quarantine_challenge="$(reserve_quarantine_challenge "$quarantine_root" \
         "$freeze_sha" "$capture_id")"
@@ -5490,7 +6745,7 @@ PY
     quarantine_pids=()
     quarantine_nodes=()
     quarantine_failed=0
-    for quarantine_node in nyc lax ams lhr nrt sgp; do
+    for quarantine_node in "${active_quarantine_nodes[@]}"; do
         if [ -e "$quarantine_root/$quarantine_node-external-proof.json" ] \
                 || [ -L "$quarantine_root/$quarantine_node-external-proof.json" ]; then
             continue
@@ -5520,7 +6775,7 @@ PY
     quarantine_pids=()
     quarantine_nodes=()
     quarantine_failed=0
-    for quarantine_node in nyc lax ams lhr nrt sgp; do
+    for quarantine_node in "${active_quarantine_nodes[@]}"; do
         if [ -e "$quarantine_root/$quarantine_node-public-cross-proof.json" ] \
                 || [ -L "$quarantine_root/$quarantine_node-public-cross-proof.json" ]; then
             continue
@@ -5543,7 +6798,7 @@ PY
     done
     [ "$quarantine_failed" -eq 0 ] || die \
         "quarantined loopback heads did not cryptographically cover every public observation"
-    for quarantine_node in nyc lax ams lhr nrt sgp; do
+    for quarantine_node in "${active_quarantine_nodes[@]}"; do
         if [ -e "$log_root/$quarantine_node-public-cross-proof.new.json" ]; then
             publish_canonical_maintenance_input \
                 "$log_root/$quarantine_node-public-cross-proof.new.json" \
@@ -5574,8 +6829,9 @@ PY
     local quarantine_stability_proof="$quarantine_root/fleet-stability-proof.json"
     if [ -e "$quarantine_stability_proof" ] || [ -L "$quarantine_stability_proof" ]; then
         verify_network_quarantine_stability_proof "$quarantine_stability_proof" \
-            "$freeze_sha" "$capture_id" "$quarantine_challenge" >/dev/null
-        printf 'archive fleet: reusing the canonical 120-second all-six quarantine stability proof\n'
+            "$freeze_sha" "$capture_id" "$quarantine_challenge" \
+            "$quarantine_generation_ledger" >/dev/null
+        printf 'archive fleet: reusing the canonical active-subset quarantine stability proof\n'
     else
         local stability_sample_root="$log_root/quarantine-stability-samples"
         mkdir -m 700 -- "$stability_sample_root"
@@ -5589,7 +6845,7 @@ PY
         local stability_pids stability_nodes
         for stability_index in 0 1; do
             stability_pids=(); stability_nodes=(); stability_failed=0
-            for quarantine_node in nyc lax ams lhr nrt sgp; do
+            for quarantine_node in "${active_quarantine_nodes[@]}"; do
                 (
                     run_quarantine_stability_sample_exact "$freeze_plan" "$freeze_sha" \
                         "$capture_id" "$quarantine_node" "$quarantine_challenge" \
@@ -5607,8 +6863,9 @@ PY
             done
             [ "$stability_failed" -eq 0 ] || die \
                 "a full live-fence/head stability sample failed; no writer stop is authorized"
-            if [ "$stability_index" -eq 0 ]; then
-                printf 'archive fleet: first exact six-host quarantine/head sample complete; observing a full 120-second drain interval\n'
+            if [ "$stability_index" -eq 0 ] \
+                    && [ "${#active_quarantine_nodes[@]}" -gt 0 ]; then
+                printf 'archive fleet: first exact active-subset quarantine/head sample complete; observing a full 120-second drain interval\n'
                 /bin/sleep 120
             fi
         done
@@ -5624,32 +6881,53 @@ if end<start:raise SystemExit("quarantine stability monotonic clock regressed")
 print(end-start)
 PY
         )"
+        if [ "${#active_quarantine_nodes[@]}" -eq 0 ]; then
+            stability_elapsed_ns=0
+        fi
         create_network_quarantine_stability_proof "$freeze_plan" "$freeze_sha" \
             "$capture_id" "$quarantine_challenge" "$stability_sample_root" \
             "$log_root/fleet-stability-proof.new.json" "$stability_started_at" \
-            "$stability_completed_at" "$stability_elapsed_ns"
+            "$stability_completed_at" "$stability_elapsed_ns" \
+            "$quarantine_generation_ledger"
         publish_canonical_maintenance_input "$log_root/fleet-stability-proof.new.json" \
             "$quarantine_stability_proof"
         verify_network_quarantine_stability_proof "$quarantine_stability_proof" \
-            "$freeze_sha" "$capture_id" "$quarantine_challenge" >/dev/null
+            "$freeze_sha" "$capture_id" "$quarantine_challenge" \
+            "$quarantine_generation_ledger" >/dev/null
     fi
     verify_quarantine_maintenance_inputs "$quarantine_root" "$freeze_sha" \
         "$capture_id" "$legacy_height_receipt" "$quarantine_challenge" \
-        "$quarantine_stability_proof"
+        "$quarantine_stability_proof" "$quarantine_generation_ledger"
     # A historical stability proof is never substituted for the live boundary.
     # Re-run the full remote AST/tool/unit/status proof on every host immediately
     # before the stop transaction; fence drift leaves the writer untouched.
-    for quarantine_node in nyc lax ams lhr nrt sgp; do
+    for quarantine_node in "${active_quarantine_nodes[@]}"; do
         run_quarantine_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
             "$quarantine_node" > "$log_root/$quarantine_node-pre-stop-status.json"
     done
-    printf 'archive fleet: all six exact writers are live behind proved persistent full-host quarantines; cgroup freeze/TERM may now begin\n'
+    local final_source_capture_root
+    final_source_capture_root="$(prepare_protected_maintenance_directory \
+        "$maintenance_input_root/post-quarantine-final-source-captures")"
+    capture_post_quarantine_final_sources "$freeze_plan" "$freeze_sha" "$capture_id" \
+        "$quarantine_generation_ledger" "$quarantine_stability_proof" "$log_root" \
+        "$final_source_capture_root" "$log_root" "$inspector_binary_sha" \
+        "$inspector_genesis_sha" "$inspector_legacy_validators_sha" \
+        "$allow_unbound_legacy_wal" "${active_quarantine_nodes[@]}"
+    printf 'archive fleet: all active legacy writers are behind exact round-bound persistent full-host quarantines; pidfd TERM may now begin\n'
     local node
     local pids=() names=()
-    printf 'archive fleet: stopping all six quarantined writers concurrently; no host may thaw outside its proved quarantine\n'
-    for node in nyc lax ams lhr nrt sgp; do
+    printf 'archive fleet: stopping the active quarantined writers concurrently; no host may thaw outside its proved quarantine\n'
+    for node in "${active_quarantine_nodes[@]}"; do
         (
-            ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" "$node"
+            local node_round node_authorization_sha node_readiness_sha node_transition_sha
+            read -r node_round node_authorization_sha node_readiness_sha node_transition_sha < <(
+                python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+                    --ledger "$quarantine_generation_ledger" --node "$node" --kind refs
+            )
+            stop_after_quarantine_round_exact "$capture_id" "$freeze_sha" "$node" \
+                "$node_round" "$node_authorization_sha" "$node_readiness_sha" \
+                "$node_transition_sha" \
+                "$(hash_file "$final_source_capture_root/$node.json")"
         ) > "$log_root/$node-stop.log" 2>&1 &
         pids+=("$!")
         names+=("$node")
@@ -5666,9 +6944,18 @@ PY
     done
     [ "$failed" -eq 0 ] || die \
         "at least one quarantined writer stop failed; completed nodes remain restart-fenced and incomplete nodes remain network-quarantined"
-    for node in nyc lax ams lhr nrt sgp; do
+    for node in "${active_quarantine_nodes[@]}"; do
         run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" \
             > "$log_root/$node-stopped-status.json"
+    done
+    for node in "${stopped_quarantine_nodes[@]}"; do
+        read -r node_round node_authorization_sha node_readiness_sha node_transition_sha < <(
+            python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+                --ledger "$quarantine_generation_ledger" --node "$node" --kind refs
+        )
+        run_remote "$node" quarantine-round-status "$capture_id" "$node" "$freeze_sha" \
+            "$node_round" "$node_authorization_sha" "$node_readiness_sha" \
+            "$node_transition_sha" > "$log_root/$node-stopped-status.json"
     done
     # Only seal the all-stopped boundary after all six exact final remote
     # stopped-status proofs have completed successfully.
@@ -5713,10 +7000,24 @@ PY
             continue
         fi
         (
-            run_persisted_head_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" \
-                "$inspector_binary_sha" "$inspector_genesis_sha" \
-                "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
-                > "$log_root/$node-persisted-head.new.json"
+            local node_kind
+            node_kind="$(python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+                --ledger "$quarantine_generation_ledger" --node "$node" \
+                --kind transition-kind)"
+            if [ "$node_kind" = network-quarantine-active ]; then
+                run_persisted_head_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" \
+                    "$inspector_binary_sha" "$inspector_genesis_sha" \
+                    "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
+                    > "$log_root/$node-persisted-head.new.json"
+            elif [ "$node_kind" = persistently-stopped-precommit ]; then
+                python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+                    --ledger "$quarantine_generation_ledger" --node "$node" \
+                    --kind transition | python3 -c \
+                    'import hashlib,json,sys; value=json.load(sys.stdin); persisted=value["persisted_head"]; raw=(json.dumps(persisted["value"],sort_keys=True,separators=(",",":"))+"\n").encode(); assert hashlib.sha256(raw).hexdigest()==persisted["sha256"] and persisted["value"]["source_pair_role"]=="preauthorization-boundary"; sys.stdout.buffer.write(raw)' \
+                    > "$log_root/$node-persisted-head.new.json"
+            else
+                die "persisted-head transition kind differs for $node"
+            fi
             publish_canonical_maintenance_input "$log_root/$node-persisted-head.new.json" \
                 "$persisted_root/$node-persisted-head.json"
         ) > "$log_root/$node-persisted-head.log" 2>&1 &
@@ -5731,11 +7032,12 @@ PY
     done
     [ "$failed" -eq 0 ] || die \
         "at least one final stopped snapshot/WAL pair lacks an exact recovery-export head"
-    # Retain the full, freshly revalidated monitor receipt for every node.  Its
+    # Retain the full, freshly revalidated monitor receipt for every active
+    # network-quarantine transition.  Its
     # semantic-interpreter identity is required later to run the fail-closed
     # public late-fork interlock without trusting an ambient host Python.
     pids=(); names=(); failed=0
-    for node in nyc lax ams lhr nrt sgp; do
+    for node in "${active_quarantine_nodes[@]}"; do
         if [ -e "$quarantine_root/$node-monitor.json" ] \
                 || [ -L "$quarantine_root/$node-monitor.json" ]; then
             continue
@@ -5764,7 +7066,7 @@ PY
         "$legacy_height_cross_proof" "$quarantine_root" "$persisted_root" \
         "$quarantine_stability_proof" "$maintenance_evidence_bundle" \
         "$first_quarantine_started_at" \
-        "$all_controlled_stopped_at")"
+        "$all_controlled_stopped_at" "$quarantine_generation_ledger")"
     local maintenance_boundary="${offline_stop_output}.legacy-maintenance-boundary.json"
     local maintenance_boundary_sha
     maintenance_boundary_sha="$(create_legacy_maintenance_boundary \

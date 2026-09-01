@@ -301,6 +301,52 @@ class LegacyPublicHeightTests(unittest.TestCase):
             height.create_private_receipt(output, self.receipt())
         self.assertEqual(target.read_text(encoding="utf-8"), "untouched")
 
+    def test_target_receipt_accepts_only_fixed_order_live_subset(self) -> None:
+        current = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        full = self.receipt(current)
+        targets = ("ams", "lhr", "sgp")
+        selected = [row for row in full["origins"] if row["name"] in targets]
+        value = {
+            **{key: full[key] for key in (
+                "source_main_commit", "freeze_plan_sha256", "capture_id", "started_at",
+                "completed_at", "duration_ms", "request_policy",
+            )},
+            "schema": height.TARGET_HEIGHT_SCHEMA,
+            "targets": [
+                {
+                    "node": name,
+                    "host": height.ROUND_FLEET_MAP[name],
+                    "rpc_origin": next(
+                        row["origin"] for row in selected if row["name"] == name
+                    ),
+                }
+                for name in targets
+            ],
+            "origins": selected,
+            "legacy_public_max_height": max(row["info_after_height"] for row in selected),
+        }
+        maximum = height.validate_target_receipt_live(
+            value, source_main="1" * 40, freeze_sha="2" * 64,
+            targets=targets, now=current,
+        )
+        self.assertEqual(maximum, 105)
+
+        reordered = json.loads(json.dumps(value))
+        reordered["targets"][0], reordered["targets"][1] = (
+            reordered["targets"][1], reordered["targets"][0]
+        )
+        with self.assertRaisesRegex(height.HeightReceiptError, "order"):
+            height.validate_target_receipt_live(
+                reordered, source_main="1" * 40, freeze_sha="2" * 64,
+                targets=targets, now=current,
+            )
+
+    def test_target_parser_rejects_duplicate_unknown_and_reordered_nodes(self) -> None:
+        self.assertEqual(height.parse_targets("nyc,ams,sgp"), ("nyc", "ams", "sgp"))
+        for raw in ("", "ams,nyc", "nyc,nyc", "nyc,unknown"):
+            with self.subTest(raw=raw), self.assertRaises(height.HeightReceiptError):
+                height.parse_targets(raw)
+
 
 class RequestPolicyTests(unittest.TestCase):
     @classmethod

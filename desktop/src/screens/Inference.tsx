@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Coins,
   Copy,
@@ -11,14 +11,14 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
 import { formatHash } from "../lib/format";
 import { hostLabel } from "../lib/hosts";
 import { useAppStore } from "../lib/store";
-import type { InferenceResult } from "../lib/types";
+import type { InferenceResult, InferenceSettlement } from "../lib/types";
 
 const EXAMPLES = [
   "The largest planet is",
@@ -27,8 +27,10 @@ const EXAMPLES = [
   "Bitcoin is a",
 ];
 
-const ARC_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
+const ARC_HASH_RE = /^0x[0-9a-f]{64}$/;
 const COMMUNITY_REWARD_ARC = 2.5;
+const MAX_RECEIPT_POLLS = 20;
+const MAX_RECEIPT_POLL_MS = 60_000;
 
 /// Local execution stays first. If this machine cannot serve, call a seed's
 /// `/inference/run` before the standalone consensus route: that endpoint gives
@@ -90,6 +92,8 @@ export function Inference() {
   const [prompt, setPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState(16);
   const [copied, setCopied] = useState<string | null>(null);
+  const [receiptPollingExhausted, setReceiptPollingExhausted] = useState(false);
+  const receiptPollBudget = useRef({ key: "", attempts: 0, startedAt: 0 });
   const run = useMutation<InferenceResult, Error, void>({
     mutationFn: async () => {
       if (!prompt.trim()) throw new Error("Prompt is empty");
@@ -104,23 +108,199 @@ export function Inference() {
   const communityWorker = run.data?.routedVia?.startsWith("community:")
     ? run.data.routedVia.slice("community:".length)
     : null;
+  const settlement = run.data?.settlement;
   const isCommunityRewardTx = Boolean(
-    run.data?.settlement?.txType === "0x25" &&
-    ARC_HASH_RE.test(run.data.settlement.txHash.trim()),
+    settlement?.submitted === true &&
+    settlement.txType === "0x25" &&
+    ARC_HASH_RE.test(settlement.txHash),
+  );
+  const exactCommunityReceiptUrl = settlement?.txHash
+    ? `/community/reward_receipt/${settlement.txHash}`
+    : "";
+  const receiptExpectation =
+    run.isSuccess &&
+    settlement?.submitted === true &&
+    settlement.txType === "0x25" &&
+    ARC_HASH_RE.test(settlement.txHash) &&
+    ARC_HASH_RE.test(settlement.jobId) &&
+    ARC_HASH_RE.test(settlement.worker) &&
+    settlement.worker === communityWorker &&
+    settlement.receiptUrl === exactCommunityReceiptUrl &&
+    typeof run.data?.coordinator === "string" &&
+    run.data.coordinator.length > 0
+      ? {
+          sourceHost: run.data.coordinator,
+          txHash: settlement.txHash,
+          jobId: settlement.jobId,
+          worker: settlement.worker,
+          receiptUrl: settlement.receiptUrl,
+        }
+      : null;
+  const receiptPollKey = receiptExpectation
+    ? [
+        receiptExpectation.sourceHost,
+        receiptExpectation.txHash,
+        receiptExpectation.jobId,
+        receiptExpectation.worker,
+        receiptExpectation.receiptUrl,
+      ].join("|")
+    : "";
+  useEffect(() => {
+    receiptPollBudget.current = {
+      key: receiptPollKey,
+      attempts: 0,
+      startedAt: Date.now(),
+    };
+    setReceiptPollingExhausted(false);
+  }, [receiptPollKey]);
+  const rewardReceipt = useQuery<InferenceSettlement, Error>({
+    queryKey: [
+      "community-reward-receipt",
+      receiptExpectation?.sourceHost ?? "",
+      receiptExpectation?.txHash ?? "",
+      receiptExpectation?.jobId ?? "",
+      receiptExpectation?.worker ?? "",
+      receiptExpectation?.receiptUrl ?? "",
+    ],
+    queryFn: async () => {
+      if (!receiptExpectation) {
+        throw new Error("reward receipt expectation is unavailable");
+      }
+      if (receiptPollBudget.current.key !== receiptPollKey) {
+        receiptPollBudget.current = {
+          key: receiptPollKey,
+          attempts: 0,
+          startedAt: Date.now(),
+        };
+      }
+      receiptPollBudget.current.attempts += 1;
+      try {
+        const receipt = await api.fetchCommunityRewardReceipt(
+          receiptExpectation.sourceHost,
+          receiptExpectation.txHash,
+          receiptExpectation.jobId,
+          receiptExpectation.worker,
+          receiptExpectation.receiptUrl,
+        );
+        if (
+          receipt.status === "pending_mined_receipt" &&
+          (receiptPollBudget.current.attempts >= MAX_RECEIPT_POLLS ||
+            Date.now() - receiptPollBudget.current.startedAt >=
+              MAX_RECEIPT_POLL_MS)
+        ) {
+          setReceiptPollingExhausted(true);
+        }
+        return receipt;
+      } catch (error) {
+        if (
+          receiptPollBudget.current.attempts >= MAX_RECEIPT_POLLS ||
+          Date.now() - receiptPollBudget.current.startedAt >=
+            MAX_RECEIPT_POLL_MS
+        ) {
+          setReceiptPollingExhausted(true);
+        }
+        throw error;
+      }
+    },
+    enabled: receiptExpectation !== null,
+    retry: false,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "mined_success" ||
+        status === "mined_failed" ||
+        status === "receipt_unavailable" ||
+        receiptPollingExhausted
+        ? false
+        : 3_000;
+    },
+  });
+  const independentReceiptMatchesExpectation = Boolean(
+    receiptExpectation &&
+    rewardReceipt.data?.txType === "0x25" &&
+    rewardReceipt.data.txHash === receiptExpectation.txHash &&
+    rewardReceipt.data.jobId === receiptExpectation.jobId &&
+    rewardReceipt.data.worker === receiptExpectation.worker &&
+    rewardReceipt.data.receiptUrl === receiptExpectation.receiptUrl,
+  );
+  const independentInclusionEvidence = Boolean(
+    rewardReceipt.data &&
+    Number.isSafeInteger(rewardReceipt.data.blockHeight) &&
+    (rewardReceipt.data.blockHeight ?? -1) >= 0 &&
+    ARC_HASH_RE.test(rewardReceipt.data.blockHash ?? "") &&
+    Number.isSafeInteger(rewardReceipt.data.index) &&
+    (rewardReceipt.data.index ?? -1) >= 0,
   );
   const confirmedCommunityReward = Boolean(
-    isCommunityRewardTx &&
-    run.data?.settlement?.status === "mined_success" &&
-    run.data.settlement.submitted &&
-    run.data?.settlement?.confirmed &&
-    run.data.settlement.included &&
-    run.data.settlement.rewardArc === COMMUNITY_REWARD_ARC &&
-    ARC_HASH_RE.test(run.data.settlement.jobId.trim()),
+    independentReceiptMatchesExpectation &&
+    rewardReceipt.data?.status === "mined_success" &&
+    rewardReceipt.data.submitted &&
+    rewardReceipt.data.included &&
+    rewardReceipt.data.confirmed &&
+    rewardReceipt.data.success === true &&
+    rewardReceipt.data.rewardBase === 2_500_000_000 &&
+    rewardReceipt.data.rewardArc === COMMUNITY_REWARD_ARC &&
+    independentInclusionEvidence,
+  );
+  const minedFailedCommunityReward = Boolean(
+    independentReceiptMatchesExpectation &&
+    rewardReceipt.data?.status === "mined_failed" &&
+    rewardReceipt.data.submitted &&
+    rewardReceipt.data.included &&
+    !rewardReceipt.data.confirmed &&
+    rewardReceipt.data.success === false &&
+    rewardReceipt.data.rewardBase === null &&
+    rewardReceipt.data.rewardArc === null &&
+    independentInclusionEvidence,
+  );
+  const canonicalReceiptUnavailable = Boolean(
+    independentReceiptMatchesExpectation &&
+    rewardReceipt.data?.status === "receipt_unavailable",
   );
   const confirmedCommunityRewardAmount =
-    run.data?.settlement?.rewardArc == null
+    rewardReceipt.data?.rewardArc == null
       ? "Amount not reported"
-      : `${run.data.settlement.rewardArc} ARC`;
+      : `${rewardReceipt.data.rewardArc} ARC`;
+  let communitySettlementMessage: string;
+  if (confirmedCommunityReward) {
+    communitySettlementMessage = `${confirmedCommunityRewardAmount} confirmed for the serving worker by an independently fetched successful mined 0x25 receipt`;
+  } else if (settlement?.txType && settlement.txType !== "0x25") {
+    communitySettlementMessage = `unrecognized settlement type ${settlement.txType}; no community reward credited`;
+  } else if (settlement && !settlement.submitted) {
+    communitySettlementMessage = `No 0x25 was submitted (${settlement.status.replaceAll("_", " ")}); no ARC reward can be confirmed`;
+  } else if (minedFailedCommunityReward) {
+    communitySettlementMessage =
+      "0x25 receipt was mined but failed; no ARC reward was earned";
+  } else if (canonicalReceiptUnavailable || rewardReceipt.isError) {
+    communitySettlementMessage =
+      "Reward receipt unavailable; ARC earnings cannot be confirmed";
+  } else if (settlement?.submitted === true && !receiptExpectation) {
+    communitySettlementMessage =
+      "Reward receipt unavailable; the submission did not bind the exact transaction, job, worker, receipt URL, and serving host";
+  } else if (receiptExpectation && receiptPollingExhausted) {
+    communitySettlementMessage =
+      "0x25 is still pending after bounded receipt checks; no ARC reward is confirmed";
+  } else if (receiptExpectation) {
+    communitySettlementMessage =
+      "0x25 submitted; waiting for an independently fetched mined receipt";
+  } else {
+    communitySettlementMessage = `no confirmed 0x25 reward (${settlement?.status?.replaceAll("_", " ") ?? "no settlement"}); inference verification is separate from payment`;
+  }
+
+  let displayedReceiptStatus =
+    rewardReceipt.data?.status ?? "pending_mined_receipt";
+  if (confirmedCommunityReward) {
+    displayedReceiptStatus = "mined_success";
+  } else if (minedFailedCommunityReward) {
+    displayedReceiptStatus = "mined_failed";
+  } else if (settlement && !settlement.submitted) {
+    displayedReceiptStatus = settlement.status;
+  } else if (
+    canonicalReceiptUnavailable ||
+    rewardReceipt.isError ||
+    (settlement && !receiptExpectation)
+  ) {
+    displayedReceiptStatus = "receipt_unavailable";
+  }
 
   return (
     <div className="main-inner" data-testid="inference-screen">
@@ -438,6 +618,7 @@ export function Inference() {
           {run.data.settlement && (
             <div
               data-testid="community-settlement"
+              data-receipt-status={displayedReceiptStatus}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -459,14 +640,7 @@ export function Inference() {
               <Coins size={14} style={{ color: "var(--accent)" }} />
               <span>
                 <strong>Community reward:</strong>{" "}
-                {confirmedCommunityReward
-                  ? `${confirmedCommunityRewardAmount} confirmed for the serving worker by a successful mined 0x25 receipt`
-                  : isCommunityRewardTx && run.data.settlement.submitted
-                    ? "0x25 submitted; not earned until a successful mined receipt"
-                    : run.data.settlement.txType &&
-                        run.data.settlement.txType !== "0x25"
-                      ? `unrecognized settlement type ${run.data.settlement.txType}; no community reward credited`
-                    : `no confirmed 0x25 reward (${run.data.settlement.status.replaceAll("_", " ")}); inference verification is separate from payment`}
+                {communitySettlementMessage}
               </span>
             </div>
           )}

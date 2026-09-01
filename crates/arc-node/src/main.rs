@@ -23,7 +23,7 @@ use arc_types::Block;
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -149,8 +149,10 @@ struct Cli {
     node_name: Option<String>,
 
     /// Archive mode - disable all pruning, keep full transaction history.
-    /// Use for block explorers and analytics. Requires more disk space.
-    /// Regular validators should NOT use this flag.
+    /// Use only under an operator plan that budgets unbounded history growth.
+    /// The protected v0.8 production rollout enables it on all six selectable
+    /// public validators so mined reward history survives host selection and
+    /// restart. Requires more memory, disk space, and replay time.
     #[arg(long, default_value_t = false)]
     archive: bool,
 
@@ -443,6 +445,57 @@ enum RecoveryCommand {
         #[arg(long)]
         checkpoint: String,
     },
+    /// Read one historical block from an exact, stopped legacy WAL/snapshot.
+    /// This never starts a node, opens a listener, or writes source state.
+    InspectLegacyBlock {
+        #[arg(long)]
+        data_dir: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        genesis: String,
+        #[arg(long)]
+        legacy_validator_set: String,
+        #[arg(long)]
+        height: u64,
+        #[arg(long)]
+        expected_state_wal_sha256: String,
+        #[arg(long)]
+        expected_snapshot_sha256: String,
+        #[arg(long)]
+        expected_genesis_sha256: String,
+        #[arg(long)]
+        expected_legacy_validator_set_sha256: String,
+        /// Explicitly permit an old WAL that predates genesis.network-hash.
+        #[arg(long, default_value_t = false)]
+        allow_unbound_legacy_wal: bool,
+    },
+    /// Materialize and strictly replay-validate the exact WAL prefix committed
+    /// by a live `/sync/snapshot` capture.  The source directory is read-only;
+    /// OUTPUT_DATA_DIR is create-only and contains an immutable snapshot/WAL
+    /// pair suitable for use after the original writer has stopped.
+    CaptureLegacySource {
+        #[arg(long)]
+        data_dir: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        genesis: String,
+        #[arg(long)]
+        legacy_validator_set: String,
+        #[arg(long)]
+        output_data_dir: String,
+        #[arg(long)]
+        expected_snapshot_sha256: String,
+        #[arg(long)]
+        expected_genesis_sha256: String,
+        #[arg(long)]
+        expected_legacy_validator_set_sha256: String,
+        /// Explicitly permit a source WAL that predates
+        /// genesis.network-hash.  The fixed output is always bound.
+        #[arg(long, default_value_t = false)]
+        allow_unbound_legacy_wal: bool,
+    },
     /// Export an unsigned, content-addressed checkpoint from a complete legacy WAL.
     Export {
         #[arg(long)]
@@ -713,6 +766,462 @@ fn print_recovery_summary(
     }
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryReadOnlyInput {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    sha256: String,
+    size: u64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryReadOnlyDirectory {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryCapturedHead {
+    height: u64,
+    block_hash: String,
+    state_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoverySourceWalPrefix {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+    loader_observed_bytes: u64,
+    copy_observed_bytes: u64,
+    accepted_prefix_bytes: u64,
+    accepted_prefix_sha256: String,
+    quarantined_suffix_bytes_at_loader: u64,
+    loader_tail_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryFixedSourcePair {
+    data_dir: RecoveryReadOnlyDirectory,
+    state_wal: RecoveryReadOnlyInput,
+    snapshot: RecoveryReadOnlyInput,
+    genesis_binding: RecoveryReadOnlyInput,
+    strict_replay: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct LegacySourceCaptureReceipt {
+    schema: String,
+    captured_at_unix_ms: u64,
+    head: RecoveryCapturedHead,
+    source_data_dir: RecoveryReadOnlyDirectory,
+    source_wal_prefix: RecoverySourceWalPrefix,
+    source_snapshot: RecoveryReadOnlyInput,
+    genesis: RecoveryReadOnlyInput,
+    legacy_validator_set: RecoveryReadOnlyInput,
+    fixed_pair: RecoveryFixedSourcePair,
+    allow_unbound_legacy_wal: bool,
+}
+
+/// Stable no-follow metadata identity projected in
+/// `(device, inode, mode, uid, gid, nlink, mtime_ns, ctime_ns)` order.
+type RecoveryMetadataProjection = (u64, u64, u32, u32, u32, u64, i64, i64);
+
+#[cfg(unix)]
+fn recovery_metadata_projection(
+    metadata: &std::fs::Metadata,
+) -> Result<RecoveryMetadataProjection> {
+    use std::os::unix::fs::MetadataExt;
+    let mtime_ns = metadata
+        .mtime()
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(metadata.mtime_nsec()))
+        .context("recovery input mtime exceeds i64 nanoseconds")?;
+    let ctime_ns = metadata
+        .ctime()
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(metadata.ctime_nsec()))
+        .context("recovery input ctime exceeds i64 nanoseconds")?;
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.nlink(),
+        mtime_ns,
+        ctime_ns,
+    ))
+}
+
+#[cfg(not(unix))]
+fn recovery_metadata_projection(
+    metadata: &std::fs::Metadata,
+) -> Result<RecoveryMetadataProjection> {
+    use std::time::UNIX_EPOCH;
+    let modified = metadata
+        .modified()
+        .context("recovery input has no modified timestamp")?
+        .duration_since(UNIX_EPOCH)
+        .context("recovery input modified time predates the Unix epoch")?;
+    let modified_ns = i64::try_from(modified.as_nanos())
+        .context("recovery input modified time exceeds i64 nanoseconds")?;
+    Ok((0, 0, 0, 0, 0, 1, modified_ns, 0))
+}
+
+/// Hash one recovery input through a no-follow descriptor and prove that its
+/// inode/size/timestamps did not change while read. The caller repeats this
+/// after the legacy loader so concurrent source drift is fail-closed.
+fn recovery_read_only_input(path: &Path, label: &str) -> Result<RecoveryReadOnlyInput> {
+    use sha2::{Digest, Sha256};
+    use std::io::BufReader;
+
+    let path_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {label} {}", path.display()))?;
+    ensure!(
+        path_metadata.file_type().is_file() && !path_metadata.file_type().is_symlink(),
+        "{label} is not a regular no-follow file: {}",
+        path.display()
+    );
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to no-follow open {label} {}", path.display()))?;
+    let before = file
+        .metadata()
+        .with_context(|| format!("failed to inspect open {label} {}", path.display()))?;
+    ensure!(before.is_file(), "open {label} descriptor is not regular");
+    let path_projection = recovery_metadata_projection(&path_metadata)?;
+    let before_projection = recovery_metadata_projection(&before)?;
+    ensure!(
+        before_projection == path_projection,
+        "{label} pathname identity changed before its no-follow open"
+    );
+    ensure!(
+        before_projection.5 == 1,
+        "{label} must have exactly one hard link"
+    );
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash {label}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = reader
+        .get_ref()
+        .metadata()
+        .with_context(|| format!("failed to restat open {label}"))?;
+    ensure!(
+        before_projection == recovery_metadata_projection(&after)?,
+        "{label} changed while it was hashed"
+    );
+    Ok(RecoveryReadOnlyInput {
+        device: before_projection.0,
+        inode: before_projection.1,
+        mode: before_projection.2,
+        uid: before_projection.3,
+        gid: before_projection.4,
+        nlink: before_projection.5,
+        sha256: hex::encode(hasher.finalize()),
+        size: before.len(),
+        mtime_ns: before_projection.6,
+        ctime_ns: before_projection.7,
+    })
+}
+
+fn require_recovery_input_hash(
+    observed: &RecoveryReadOnlyInput,
+    expected: &str,
+    label: &str,
+) -> Result<()> {
+    ensure!(
+        expected.len() == 64
+            && expected
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "expected {label} SHA-256 is malformed"
+    );
+    ensure!(
+        observed.sha256 == expected,
+        "{label} SHA-256 differs from the exact pin"
+    );
+    Ok(())
+}
+
+fn recovery_directory_input(metadata: &std::fs::Metadata) -> Result<RecoveryReadOnlyDirectory> {
+    let projection = recovery_metadata_projection(metadata)?;
+    Ok(RecoveryReadOnlyDirectory {
+        device: projection.0,
+        inode: projection.1,
+        mode: projection.2,
+        uid: projection.3,
+        gid: projection.4,
+        nlink: projection.5,
+        mtime_ns: projection.6,
+        ctime_ns: projection.7,
+    })
+}
+
+fn recovery_copy_input_create_new(
+    source: &Path,
+    output: &Path,
+    label: &str,
+    expected_sha256: &str,
+) -> Result<RecoveryReadOnlyInput> {
+    let before = recovery_read_only_input(source, label)?;
+    require_recovery_input_hash(&before, expected_sha256, label)?;
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        source_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut source_file = source_options
+        .open(source)
+        .with_context(|| format!("failed to no-follow open {label} {}", source.display()))?;
+    let mut output_options = OpenOptions::new();
+    output_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        output_options.mode(0o600);
+    }
+    let mut output_file = output_options
+        .open(output)
+        .with_context(|| format!("failed to create fixed {label} {}", output.display()))?;
+    std::io::copy(&mut source_file, &mut output_file)
+        .with_context(|| format!("failed to copy fixed {label}"))?;
+    output_file
+        .sync_all()
+        .with_context(|| format!("failed to fsync fixed {label}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        output_file
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .with_context(|| format!("failed to seal fixed {label} permissions"))?;
+        output_file
+            .sync_all()
+            .with_context(|| format!("failed to fsync fixed {label} mode"))?;
+    }
+    drop(output_file);
+    let after = recovery_read_only_input(source, label)?;
+    ensure!(before == after, "{label} changed while it was copied");
+    let fixed = recovery_read_only_input(output, &format!("fixed {label}"))?;
+    require_recovery_input_hash(&fixed, expected_sha256, &format!("fixed {label}"))?;
+    ensure!(fixed.size == before.size, "fixed {label} size differs");
+    Ok(fixed)
+}
+
+fn recovery_write_create_new(
+    output: &Path,
+    raw: &[u8],
+    label: &str,
+) -> Result<RecoveryReadOnlyInput> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(output)
+        .with_context(|| format!("failed to create {label} {}", output.display()))?;
+    file.write_all(raw)
+        .with_context(|| format!("failed to write {label}"))?;
+    file.sync_all()
+        .with_context(|| format!("failed to fsync {label}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o400))
+            .with_context(|| format!("failed to seal {label} permissions"))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync {label} mode"))?;
+    }
+    drop(file);
+    recovery_read_only_input(output, label)
+}
+
+fn recovery_copy_exact_wal_prefix(
+    source_file: &mut File,
+    source_projection: RecoveryMetadataProjection,
+    accepted_prefix_bytes: u64,
+    output: &Path,
+) -> Result<(RecoveryReadOnlyInput, u64)> {
+    use sha2::{Digest, Sha256};
+
+    ensure!(
+        accepted_prefix_bytes > 0,
+        "accepted legacy WAL prefix is empty"
+    );
+    let before = source_file
+        .metadata()
+        .context("failed to inspect held source WAL before prefix copy")?;
+    let before_projection = recovery_metadata_projection(&before)?;
+    ensure!(
+        (
+            before_projection.0,
+            before_projection.1,
+            before_projection.2,
+            before_projection.3,
+            before_projection.4,
+            before_projection.5,
+        ) == (
+            source_projection.0,
+            source_projection.1,
+            source_projection.2,
+            source_projection.3,
+            source_projection.4,
+            source_projection.5,
+        ),
+        "source WAL identity changed before fixed-prefix copy"
+    );
+    ensure!(
+        before.len() >= accepted_prefix_bytes,
+        "source WAL was truncated before fixed-prefix copy"
+    );
+    source_file
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind held source WAL")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut fixed = options
+        .open(output)
+        .with_context(|| format!("failed to create fixed WAL {}", output.display()))?;
+    let mut remaining = accepted_prefix_bytes;
+    let mut copied_hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))?;
+        let read = source_file
+            .read(&mut buffer[..requested])
+            .context("failed to read held source WAL prefix")?;
+        ensure!(read != 0, "source WAL ended inside the accepted prefix");
+        fixed
+            .write_all(&buffer[..read])
+            .context("failed to write fixed WAL prefix")?;
+        copied_hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    fixed
+        .sync_all()
+        .context("failed to fsync fixed WAL prefix")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fixed
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .context("failed to seal fixed WAL permissions")?;
+        fixed.sync_all().context("failed to fsync fixed WAL mode")?;
+    }
+    drop(fixed);
+    let copied_sha256 = hex::encode(copied_hasher.finalize());
+
+    // Read the same prefix again through the held descriptor.  Appends after
+    // the selected boundary are allowed; any change to the accepted bytes is
+    // rejected before the pair can be published.
+    source_file
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind source WAL for prefix recheck")?;
+    let mut remaining = accepted_prefix_bytes;
+    let mut recheck_hasher = Sha256::new();
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64))?;
+        let read = source_file
+            .read(&mut buffer[..requested])
+            .context("failed to re-read held source WAL prefix")?;
+        ensure!(read != 0, "source WAL was truncated during prefix recheck");
+        recheck_hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    ensure!(
+        copied_sha256 == hex::encode(recheck_hasher.finalize()),
+        "source WAL accepted-prefix bytes changed during capture"
+    );
+    let after = source_file
+        .metadata()
+        .context("failed to inspect held source WAL after prefix copy")?;
+    let after_projection = recovery_metadata_projection(&after)?;
+    ensure!(
+        (
+            after_projection.0,
+            after_projection.1,
+            after_projection.2,
+            after_projection.3,
+            after_projection.4,
+            after_projection.5,
+        ) == (
+            source_projection.0,
+            source_projection.1,
+            source_projection.2,
+            source_projection.3,
+            source_projection.4,
+            source_projection.5,
+        ),
+        "source WAL identity changed during fixed-prefix copy"
+    );
+    ensure!(
+        after.len() >= before.len(),
+        "source WAL did not remain append-only during fixed-prefix copy"
+    );
+    let fixed_input = recovery_read_only_input(output, "fixed legacy state WAL")?;
+    ensure!(
+        fixed_input.size == accepted_prefix_bytes && fixed_input.sha256 == copied_sha256,
+        "fixed WAL prefix identity differs from copied source bytes"
+    );
+    Ok((fixed_input, after.len()))
+}
+
+fn exact_legacy_inspection_block(state: &StateDB, height: u64) -> Result<Block> {
+    ensure!(
+        height <= state.height(),
+        "requested legacy block height is above the persisted head"
+    );
+    let block = state
+        .get_block(height)
+        .with_context(|| format!("requested legacy block height {height} is absent"))?;
+    ensure!(
+        block.header.height == height && block.hash == Block::compute_hash(&block.header),
+        "requested legacy block identity/hash is inconsistent"
+    );
+    Ok(block)
 }
 
 const RECOVERY_DAG_BINDING_VERSION: u16 = 2;
@@ -2019,6 +2528,504 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
         RecoveryCommand::Inspect { checkpoint } => {
             let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
             print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION", None)
+        }
+        RecoveryCommand::InspectLegacyBlock {
+            data_dir,
+            snapshot,
+            genesis,
+            legacy_validator_set,
+            height,
+            expected_state_wal_sha256,
+            expected_snapshot_sha256,
+            expected_genesis_sha256,
+            expected_legacy_validator_set_sha256,
+            allow_unbound_legacy_wal,
+        } => {
+            let data_dir_path = Path::new(&data_dir);
+            let data_dir_metadata = std::fs::symlink_metadata(data_dir_path)
+                .with_context(|| format!("failed to stat legacy data directory {data_dir}"))?;
+            ensure!(
+                data_dir_metadata.is_dir() && !data_dir_metadata.file_type().is_symlink(),
+                "legacy data directory is not a regular no-follow directory"
+            );
+            let mut directory_options = OpenOptions::new();
+            directory_options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                directory_options
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+            }
+            let data_dir_handle = directory_options
+                .open(data_dir_path)
+                .with_context(|| format!("failed to no-follow open data directory {data_dir}"))?;
+            let data_dir_open_metadata = data_dir_handle
+                .metadata()
+                .context("failed to inspect open legacy data directory")?;
+            let data_dir_projection = recovery_metadata_projection(&data_dir_open_metadata)?;
+            ensure!(
+                data_dir_projection == recovery_metadata_projection(&data_dir_metadata)?,
+                "legacy data directory pathname changed before its no-follow open"
+            );
+            ensure!(
+                data_dir_projection.3 == 0
+                    && data_dir_projection.4 == 0
+                    && data_dir_projection.2 & 0o022 == 0,
+                "legacy data directory ownership/mode is unsafe"
+            );
+            let data_dir_input = RecoveryReadOnlyDirectory {
+                device: data_dir_projection.0,
+                inode: data_dir_projection.1,
+                mode: data_dir_projection.2,
+                uid: data_dir_projection.3,
+                gid: data_dir_projection.4,
+                nlink: data_dir_projection.5,
+                mtime_ns: data_dir_projection.6,
+                ctime_ns: data_dir_projection.7,
+            };
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let loader_data_dir = {
+                use std::os::fd::AsRawFd;
+                format!("/proc/self/fd/{}", data_dir_handle.as_raw_fd())
+            };
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            // macOS exposes `/dev/fd/N` for the descriptor itself, but does
+            // not reliably support opening child pathnames such as
+            // `/dev/fd/N/state.wal`.  Keep the independently opened no-follow
+            // directory descriptor as the identity pin and use the original
+            // pathname for traversal; the before/after descriptor + pathname
+            // projection checks below still fail closed on replacement.
+            let loader_data_dir = data_dir.clone();
+            #[cfg(not(unix))]
+            let loader_data_dir = data_dir.clone();
+            let wal_path = Path::new(&loader_data_dir).join("state.wal");
+            let snapshot_path = Path::new(&snapshot);
+            let genesis_path = Path::new(&genesis);
+            let legacy_path = Path::new(&legacy_validator_set);
+            let before = [
+                (
+                    "state_wal",
+                    recovery_read_only_input(&wal_path, "legacy state WAL")?,
+                ),
+                (
+                    "snapshot",
+                    recovery_read_only_input(snapshot_path, "legacy snapshot")?,
+                ),
+                (
+                    "genesis",
+                    recovery_read_only_input(genesis_path, "recovery genesis")?,
+                ),
+                (
+                    "legacy_validator_set",
+                    recovery_read_only_input(legacy_path, "legacy validator set")?,
+                ),
+            ];
+            for (label, observed, expected) in [
+                (
+                    "state WAL",
+                    &before[0].1,
+                    expected_state_wal_sha256.as_str(),
+                ),
+                ("snapshot", &before[1].1, expected_snapshot_sha256.as_str()),
+                ("genesis", &before[2].1, expected_genesis_sha256.as_str()),
+                (
+                    "legacy validator set",
+                    &before[3].1,
+                    expected_legacy_validator_set_sha256.as_str(),
+                ),
+            ] {
+                require_recovery_input_hash(observed, expected, label)?;
+            }
+            let (_, network) = recovery_network_from_genesis(&genesis, 1, 1)?;
+            let legacy_validators = load_legacy_recovery_validator_file(&legacy_validator_set)?;
+            let state = StateDB::load_legacy_recovery_export_source(
+                &loader_data_dir,
+                network.genesis_hash,
+                allow_unbound_legacy_wal,
+                &snapshot,
+                &legacy_validators,
+            )?;
+            let block = exact_legacy_inspection_block(&state, height)?;
+            let after = [
+                (
+                    "state_wal",
+                    recovery_read_only_input(&wal_path, "legacy state WAL")?,
+                ),
+                (
+                    "snapshot",
+                    recovery_read_only_input(snapshot_path, "legacy snapshot")?,
+                ),
+                (
+                    "genesis",
+                    recovery_read_only_input(genesis_path, "recovery genesis")?,
+                ),
+                (
+                    "legacy_validator_set",
+                    recovery_read_only_input(legacy_path, "legacy validator set")?,
+                ),
+            ];
+            ensure!(
+                before == after,
+                "a recovery inspection input changed during legacy replay"
+            );
+            ensure!(
+                data_dir_projection == recovery_metadata_projection(&data_dir_handle.metadata()?)?
+                    && data_dir_projection
+                        == recovery_metadata_projection(&std::fs::symlink_metadata(
+                            data_dir_path
+                        )?)?,
+                "legacy data directory identity changed during replay"
+            );
+            let mut input_roots = before
+                .into_iter()
+                .map(|(name, input)| Ok((name.to_string(), serde_json::to_value(input)?)))
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+            input_roots.insert(
+                "data_dir".to_string(),
+                serde_json::to_value(data_dir_input)?,
+            );
+            let output = std::collections::BTreeMap::from([
+                (
+                    "block_hash".to_string(),
+                    serde_json::Value::String(block.hash.to_hex()),
+                ),
+                ("height".to_string(), serde_json::Value::from(height)),
+                (
+                    "input_roots".to_string(),
+                    serde_json::to_value(input_roots)?,
+                ),
+                (
+                    "schema".to_string(),
+                    serde_json::Value::String(
+                        "arc.recovery.legacy-block-inspection.v1".to_string(),
+                    ),
+                ),
+                (
+                    "state_root".to_string(),
+                    serde_json::Value::String(block.header.state_root.to_hex()),
+                ),
+            ]);
+            println!("{}", serde_json::to_string(&output)?);
+            Ok(())
+        }
+        RecoveryCommand::CaptureLegacySource {
+            data_dir,
+            snapshot,
+            genesis,
+            legacy_validator_set,
+            output_data_dir,
+            expected_snapshot_sha256,
+            expected_genesis_sha256,
+            expected_legacy_validator_set_sha256,
+            allow_unbound_legacy_wal,
+        } => {
+            let data_dir_path = Path::new(&data_dir);
+            let output_dir = Path::new(&output_data_dir);
+            ensure!(
+                data_dir_path.is_absolute() && output_dir.is_absolute(),
+                "legacy source and fixed output directories must be absolute"
+            );
+            ensure!(
+                !output_dir.exists() && std::fs::symlink_metadata(output_dir).is_err(),
+                "fixed legacy source output already exists"
+            );
+            let output_parent = output_dir
+                .parent()
+                .context("fixed legacy source output has no parent")?;
+            let canonical_source = std::fs::canonicalize(data_dir_path)
+                .context("failed to canonicalize legacy source directory")?;
+            let canonical_output_parent = std::fs::canonicalize(output_parent)
+                .context("failed to canonicalize fixed legacy source parent")?;
+            ensure!(
+                canonical_output_parent != canonical_source
+                    && !canonical_output_parent.starts_with(&canonical_source),
+                "fixed legacy source output must be outside the live source directory"
+            );
+
+            let data_dir_metadata = std::fs::symlink_metadata(data_dir_path)
+                .with_context(|| format!("failed to stat legacy data directory {data_dir}"))?;
+            ensure!(
+                data_dir_metadata.is_dir() && !data_dir_metadata.file_type().is_symlink(),
+                "legacy data directory is not a regular no-follow directory"
+            );
+            let mut directory_options = OpenOptions::new();
+            directory_options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                directory_options
+                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+            }
+            let data_dir_handle = directory_options
+                .open(data_dir_path)
+                .with_context(|| format!("failed to no-follow open data directory {data_dir}"))?;
+            let data_dir_open_metadata = data_dir_handle
+                .metadata()
+                .context("failed to inspect open legacy data directory")?;
+            let data_dir_projection = recovery_metadata_projection(&data_dir_open_metadata)?;
+            ensure!(
+                data_dir_projection == recovery_metadata_projection(&data_dir_metadata)?,
+                "legacy data directory pathname changed before its no-follow open"
+            );
+            ensure!(
+                data_dir_projection.3 == 0
+                    && data_dir_projection.4 == 0
+                    && data_dir_projection.2 & 0o022 == 0,
+                "legacy data directory ownership/mode is unsafe"
+            );
+            let source_data_dir = recovery_directory_input(&data_dir_open_metadata)?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let loader_data_dir = {
+                use std::os::fd::AsRawFd;
+                format!("/proc/self/fd/{}", data_dir_handle.as_raw_fd())
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let loader_data_dir = data_dir.clone();
+
+            let source_wal_path = Path::new(&loader_data_dir).join("state.wal");
+            let source_wal_path_metadata = std::fs::symlink_metadata(&source_wal_path)
+                .context("failed to stat live legacy state WAL")?;
+            ensure!(
+                source_wal_path_metadata.is_file()
+                    && !source_wal_path_metadata.file_type().is_symlink(),
+                "live legacy state WAL is not a regular no-follow file"
+            );
+            let mut wal_options = OpenOptions::new();
+            wal_options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                wal_options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            }
+            let mut source_wal_handle = wal_options
+                .open(&source_wal_path)
+                .context("failed to no-follow open live legacy state WAL")?;
+            let source_wal_metadata = source_wal_handle
+                .metadata()
+                .context("failed to inspect held live legacy state WAL")?;
+            let source_wal_projection = recovery_metadata_projection(&source_wal_metadata)?;
+            ensure!(
+                source_wal_projection == recovery_metadata_projection(&source_wal_path_metadata)?,
+                "live legacy state WAL pathname changed before its no-follow open"
+            );
+            ensure!(
+                source_wal_projection.3 == 0
+                    && source_wal_projection.4 == 0
+                    && source_wal_projection.5 == 1
+                    && source_wal_projection.2 & 0o022 == 0
+                    && source_wal_metadata.len() > 0,
+                "live legacy state WAL ownership/mode/identity is unsafe"
+            );
+            let source_wal_initial_bytes = source_wal_metadata.len();
+
+            let snapshot_path = Path::new(&snapshot);
+            let genesis_path = Path::new(&genesis);
+            let legacy_path = Path::new(&legacy_validator_set);
+            let source_snapshot = recovery_read_only_input(snapshot_path, "live legacy snapshot")?;
+            let genesis_input = recovery_read_only_input(genesis_path, "recovery genesis")?;
+            let legacy_input = recovery_read_only_input(legacy_path, "legacy validator set")?;
+            require_recovery_input_hash(
+                &source_snapshot,
+                &expected_snapshot_sha256,
+                "live legacy snapshot",
+            )?;
+            require_recovery_input_hash(
+                &genesis_input,
+                &expected_genesis_sha256,
+                "recovery genesis",
+            )?;
+            require_recovery_input_hash(
+                &legacy_input,
+                &expected_legacy_validator_set_sha256,
+                "legacy validator set",
+            )?;
+
+            let (_, network) = recovery_network_from_genesis(&genesis, 1, 1)?;
+            let legacy_validators = load_legacy_recovery_validator_file(&legacy_validator_set)?;
+            let (source_state, source_report) =
+                StateDB::load_legacy_recovery_export_source_with_report(
+                    &loader_data_dir,
+                    network.genesis_hash,
+                    allow_unbound_legacy_wal,
+                    &snapshot,
+                    &legacy_validators,
+                )?;
+            ensure!(
+                source_report.source_wal_original_bytes >= source_wal_initial_bytes,
+                "live legacy WAL shrank between its held open and snapshot-bound replay"
+            );
+            let source_head = exact_legacy_inspection_block(&source_state, source_state.height())?;
+            let head = RecoveryCapturedHead {
+                height: source_head.header.height,
+                block_hash: source_head.hash.to_hex(),
+                state_root: source_head.header.state_root.to_hex(),
+            };
+            ensure!(
+                recovery_read_only_input(snapshot_path, "live legacy snapshot")? == source_snapshot
+                    && recovery_read_only_input(genesis_path, "recovery genesis")? == genesis_input
+                    && recovery_read_only_input(legacy_path, "legacy validator set")?
+                        == legacy_input,
+                "a fixed capture input changed during snapshot/WAL replay"
+            );
+
+            std::fs::create_dir(output_dir).with_context(|| {
+                format!(
+                    "failed to create fixed legacy source directory {}",
+                    output_dir.display()
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(output_dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+            sync_directory(output_parent)?;
+            let fixed_wal_path = output_dir.join("state.wal");
+            let (fixed_wal, copy_observed_bytes) = recovery_copy_exact_wal_prefix(
+                &mut source_wal_handle,
+                source_wal_projection,
+                source_report.source_wal_accepted_prefix_bytes,
+                &fixed_wal_path,
+            )?;
+            ensure!(
+                copy_observed_bytes >= source_report.source_wal_original_bytes,
+                "live legacy WAL did not remain append-only after snapshot-bound replay"
+            );
+            let fixed_snapshot_path = output_dir.join("state.snapshot.lz4");
+            let fixed_snapshot = recovery_copy_input_create_new(
+                snapshot_path,
+                &fixed_snapshot_path,
+                "legacy snapshot",
+                &expected_snapshot_sha256,
+            )?;
+            let fixed_binding = recovery_write_create_new(
+                &output_dir.join("genesis.network-hash"),
+                format!("{}\n", network.genesis_hash.to_hex()).as_bytes(),
+                "fixed genesis binding",
+            )?;
+            sync_directory(output_dir)?;
+
+            let (fixed_state, fixed_report) =
+                StateDB::load_legacy_recovery_export_source_with_report(
+                    output_dir,
+                    network.genesis_hash,
+                    false,
+                    &fixed_snapshot_path,
+                    &legacy_validators,
+                )?;
+            let fixed_head = exact_legacy_inspection_block(&fixed_state, fixed_state.height())?;
+            ensure!(
+                fixed_head.header.height == head.height
+                    && fixed_head.hash.to_hex() == head.block_hash
+                    && fixed_head.header.state_root.to_hex() == head.state_root,
+                "strict fixed-pair replay selected a different canonical head"
+            );
+            ensure!(
+                fixed_report.source_wal_original_bytes == fixed_wal.size
+                    && fixed_report.source_wal_accepted_prefix_bytes == fixed_wal.size
+                    && fixed_report.source_wal_quarantined_tail_bytes == 0
+                    && fixed_report.source_wal_tail_reason == "none",
+                "strict fixed-pair replay did not accept every copied WAL byte"
+            );
+
+            ensure!(
+                data_dir_projection == recovery_metadata_projection(&data_dir_handle.metadata()?)?
+                    && data_dir_projection
+                        == recovery_metadata_projection(&std::fs::symlink_metadata(
+                            data_dir_path,
+                        )?)?,
+                "legacy source data directory identity changed during capture"
+            );
+            let final_source_wal_projection =
+                recovery_metadata_projection(&source_wal_handle.metadata()?)?;
+            ensure!(
+                (
+                    final_source_wal_projection.0,
+                    final_source_wal_projection.1,
+                    final_source_wal_projection.2,
+                    final_source_wal_projection.3,
+                    final_source_wal_projection.4,
+                    final_source_wal_projection.5,
+                ) == (
+                    source_wal_projection.0,
+                    source_wal_projection.1,
+                    source_wal_projection.2,
+                    source_wal_projection.3,
+                    source_wal_projection.4,
+                    source_wal_projection.5,
+                ),
+                "legacy source WAL identity changed during capture"
+            );
+            ensure!(
+                recovery_read_only_input(snapshot_path, "live legacy snapshot")? == source_snapshot
+                    && recovery_read_only_input(genesis_path, "recovery genesis")? == genesis_input
+                    && recovery_read_only_input(legacy_path, "legacy validator set")?
+                        == legacy_input,
+                "a fixed capture input changed before content seal"
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(output_dir, std::fs::Permissions::from_mode(0o500))?;
+            }
+            sync_directory(output_dir)?;
+            sync_directory(output_parent)?;
+            let fixed_dir_metadata = std::fs::symlink_metadata(output_dir)?;
+            ensure!(
+                fixed_dir_metadata.is_dir() && !fixed_dir_metadata.file_type().is_symlink(),
+                "fixed legacy source directory is not a no-follow directory"
+            );
+            let fixed_pair = RecoveryFixedSourcePair {
+                data_dir: recovery_directory_input(&fixed_dir_metadata)?,
+                state_wal: recovery_read_only_input(&fixed_wal_path, "fixed legacy WAL")?,
+                snapshot: recovery_read_only_input(&fixed_snapshot_path, "fixed legacy snapshot")?,
+                genesis_binding: recovery_read_only_input(
+                    &output_dir.join("genesis.network-hash"),
+                    "fixed genesis binding",
+                )?,
+                strict_replay: true,
+            };
+            ensure!(
+                fixed_pair.state_wal == fixed_wal
+                    && fixed_pair.snapshot == fixed_snapshot
+                    && fixed_pair.genesis_binding == fixed_binding,
+                "fixed pair changed while its directory was sealed"
+            );
+            let captured_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("host clock is before the Unix epoch")?
+                .as_millis()
+                .try_into()
+                .context("Unix timestamp exceeds u64")?;
+            let receipt = LegacySourceCaptureReceipt {
+                schema: "arc.recovery.live-legacy-source-capture.v1".to_string(),
+                captured_at_unix_ms,
+                head,
+                source_data_dir,
+                source_wal_prefix: RecoverySourceWalPrefix {
+                    device: source_wal_projection.0,
+                    inode: source_wal_projection.1,
+                    mode: source_wal_projection.2,
+                    uid: source_wal_projection.3,
+                    gid: source_wal_projection.4,
+                    nlink: source_wal_projection.5,
+                    loader_observed_bytes: source_report.source_wal_original_bytes,
+                    copy_observed_bytes,
+                    accepted_prefix_bytes: source_report.source_wal_accepted_prefix_bytes,
+                    accepted_prefix_sha256: fixed_pair.state_wal.sha256.clone(),
+                    quarantined_suffix_bytes_at_loader: source_report
+                        .source_wal_quarantined_tail_bytes,
+                    loader_tail_reason: source_report.source_wal_tail_reason,
+                },
+                source_snapshot,
+                genesis: genesis_input,
+                legacy_validator_set: legacy_input,
+                fixed_pair,
+                allow_unbound_legacy_wal,
+            };
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
         }
         RecoveryCommand::Export {
             data_dir,
@@ -4672,8 +5679,11 @@ async fn main() -> Result<()> {
             );
         }
         if cli.archive {
-            db.archive_mode = true;
-            tracing::info!("Archive mode ENABLED - no pruning, full transaction history retained");
+            let history_complete = db.enable_archive_mode();
+            tracing::info!(
+                history_complete_since_v3_recovery = history_complete,
+                "Archive mode ENABLED - no future pruning; historical completeness reported only after full v3 index verification"
+            );
         }
         // Legacy state still needs its configured validator seed. Recovered
         // state already contains the exact H+1 validator map plus any later
@@ -6520,6 +7530,179 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn inspect_legacy_block_cli_requires_every_input_root_and_explicit_wal_policy() {
+        let hash = "a".repeat(64);
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "recovery",
+            "inspect-legacy-block",
+            "--data-dir",
+            "/legacy",
+            "--snapshot",
+            "/legacy.snapshot",
+            "--genesis",
+            "/sealed/genesis.toml",
+            "--legacy-validator-set",
+            "/sealed/legacy.json",
+            "--height",
+            "7",
+            "--expected-state-wal-sha256",
+            &hash,
+            "--expected-snapshot-sha256",
+            &hash,
+            "--expected-genesis-sha256",
+            &hash,
+            "--expected-legacy-validator-set-sha256",
+            &hash,
+            "--allow-unbound-legacy-wal",
+        ])
+        .expect("fully pinned offline block inspection should parse");
+        let Some(OperatorCommand::Recovery {
+            command:
+                RecoveryCommand::InspectLegacyBlock {
+                    height,
+                    allow_unbound_legacy_wal,
+                    ..
+                },
+        }) = cli.operator_command
+        else {
+            panic!("wrong operator command parsed")
+        };
+        assert_eq!(height, 7);
+        assert!(allow_unbound_legacy_wal);
+
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "recovery",
+                "inspect-legacy-block",
+                "--data-dir",
+                "/legacy",
+                "--snapshot",
+                "/legacy.snapshot",
+                "--genesis",
+                "/sealed/genesis.toml",
+                "--legacy-validator-set",
+                "/sealed/legacy.json",
+                "--height",
+                "7",
+            ])
+            .is_err(),
+            "floating recovery inputs must not parse"
+        );
+    }
+
+    #[test]
+    fn capture_legacy_source_cli_requires_fixed_output_and_every_static_input_root() {
+        let hash = "a".repeat(64);
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "recovery",
+            "capture-legacy-source",
+            "--data-dir",
+            "/legacy",
+            "--snapshot",
+            "/attempt/live.snapshot.lz4",
+            "--genesis",
+            "/sealed/genesis.toml",
+            "--legacy-validator-set",
+            "/sealed/legacy.json",
+            "--output-data-dir",
+            "/attempt/fixed",
+            "--expected-snapshot-sha256",
+            &hash,
+            "--expected-genesis-sha256",
+            &hash,
+            "--expected-legacy-validator-set-sha256",
+            &hash,
+            "--allow-unbound-legacy-wal",
+        ])
+        .expect("fully pinned live source capture should parse");
+        let Some(OperatorCommand::Recovery {
+            command:
+                RecoveryCommand::CaptureLegacySource {
+                    output_data_dir,
+                    allow_unbound_legacy_wal,
+                    ..
+                },
+        }) = cli.operator_command
+        else {
+            panic!("wrong operator command parsed")
+        };
+        assert_eq!(output_data_dir, "/attempt/fixed");
+        assert!(allow_unbound_legacy_wal);
+
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "recovery",
+                "capture-legacy-source",
+                "--data-dir",
+                "/legacy",
+                "--snapshot",
+                "/attempt/live.snapshot.lz4",
+                "--genesis",
+                "/sealed/genesis.toml",
+                "--legacy-validator-set",
+                "/sealed/legacy.json",
+                "--output-data-dir",
+                "/attempt/fixed",
+            ])
+            .is_err(),
+            "floating static capture inputs must not parse"
+        );
+    }
+
+    #[test]
+    fn exact_legacy_inspection_selects_both_requested_tuples_and_rejects_absence() {
+        let producer = hash_bytes(b"offline-inspection-producer");
+        let state = StateDB::with_genesis(&[(producer, 1_000)]);
+        let genesis = exact_legacy_inspection_block(&state, 0).unwrap();
+        assert_eq!(genesis.header.height, 0);
+        let (next, _) = state.execute_block(&[], producer).unwrap();
+        let public = exact_legacy_inspection_block(&state, next.header.height).unwrap();
+        let authenticated = exact_legacy_inspection_block(&state, next.header.height).unwrap();
+        assert_eq!(public.hash, authenticated.hash);
+        assert!(exact_legacy_inspection_block(&state, next.header.height + 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_input_hashing_rejects_symlinks_hardlinks_and_same_byte_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "arc-recovery-input-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("input");
+        std::fs::write(&path, b"same bytes").unwrap();
+        let first = recovery_read_only_input(&path, "test input").unwrap();
+
+        let link = root.join("input.link");
+        symlink(&path, &link).unwrap();
+        assert!(recovery_read_only_input(&link, "symlink input").is_err());
+
+        let hardlink = root.join("input.hardlink");
+        std::fs::hard_link(&path, &hardlink).unwrap();
+        assert!(recovery_read_only_input(&path, "hardlinked input").is_err());
+        std::fs::remove_file(&hardlink).unwrap();
+
+        let displaced = root.join("input.old");
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::write(&path, b"same bytes").unwrap();
+        let replacement = recovery_read_only_input(&path, "replacement input").unwrap();
+        assert_eq!(first.sha256, replacement.sha256);
+        assert_ne!(
+            first, replacement,
+            "same-byte inode replacement must be visible"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn shutdown_exit_status_fails_closed_on_wal_barrier_error() {

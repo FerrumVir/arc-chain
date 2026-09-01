@@ -638,10 +638,11 @@
       const parsed = classifyLookup(value, "block");
       if (parsed.error) return inspectorError("Block", "Invalid height", parsed.error);
       state.lookupController?.abort();
-      state.lookupController = new AbortController();
+      const controller = new AbortController();
+      state.lookupController = controller;
       inspectorLoading("Block", `#${formatInteger(parsed.value)}`);
       try {
-        const result = await queryBlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), height: parsed.value, sourceId: state.sourceId, signal: state.lookupController.signal, checkpointAudit: state.checkpointAudit });
+        const result = await queryBlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), height: parsed.value, sourceId: state.sourceId, signal: controller.signal, checkpointAudit: state.checkpointAudit });
         setInspector(result.route.canonical ? "Canonical block" : "NON-CANONICAL BLOCK", `Block #${formatInteger(result.route.height)}`);
         const warning = !result.route.canonical ? create("p", "inspector-note warning", result.route.warning || "This result is outside the configured canonical route.") : null;
         if (warning) elements.inspectorContent.append(warning);
@@ -660,7 +661,7 @@
         ]), rawSection("Block response", result.block));
         if (result.transactions) elements.inspectorContent.append(rawSection("Transaction index response", result.transactions));
       } catch (error) {
-        if (!signal.aborted) inspectorError("Block", "Block unavailable", error.message);
+        if (!controller.signal.aborted) inspectorError("Block", "Block unavailable", error.message);
       }
     }
 
@@ -691,25 +692,27 @@
 
     async function inspectTransaction(hash) {
       state.lookupController?.abort();
-      state.lookupController = new AbortController();
+      const controller = new AbortController();
+      state.lookupController = controller;
       inspectorLoading("Transaction / receipt", network.formatHash(hash, 14, 12));
       try {
-        const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, signal: state.lookupController.signal, checkpointAudit: state.checkpointAudit });
+        const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, signal: controller.signal, checkpointAudit: state.checkpointAudit });
         if (!result.occurrences.length) return inspectorError("Transaction / receipt", "Transaction not found", `No record was returned by ${result.plannedSources.length} permitted source(s). Alternate forks were not searched unless explicitly selected.`);
         setInspector("Transaction / receipt", network.formatHash(hash, 14, 12));
         elements.inspectorContent.append(create("p", "inspector-note", "Each occurrence is classified independently. A transaction on an alternate source is never promoted to the canonical timeline."));
         for (const occurrence of result.occurrences) elements.inspectorContent.append(occurrenceCard(occurrence));
       } catch (error) {
-        if (!state.lookupController.signal.aborted) inspectorError("Transaction / receipt", "Lookup failed", error.message);
+        if (!controller.signal.aborted) inspectorError("Transaction / receipt", "Lookup failed", error.message);
       }
     }
 
     async function inspectAddress(address) {
       state.lookupController?.abort();
-      state.lookupController = new AbortController();
+      const controller = new AbortController();
+      state.lookupController = controller;
       inspectorLoading("Address", network.formatHash(address, 14, 12));
       try {
-        const result = await queryAddress({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), address, sourceId: state.sourceId, signal: state.lookupController.signal, checkpointAudit: state.checkpointAudit });
+        const result = await queryAddress({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), address, sourceId: state.sourceId, signal: controller.signal, checkpointAudit: state.checkpointAudit });
         if (!result.records.length) return inspectorError("Address", "Address unavailable", "No account or indexed history was returned by the permitted sources.");
         setInspector("Address · source-separated", network.formatHash(address, 14, 12));
         elements.inspectorContent.append(create("p", "inspector-note", "Balances and histories below remain source-scoped. They are not added together across the recovery boundary."));
@@ -723,7 +726,7 @@
           elements.inspectorContent.append(card);
         }
       } catch (error) {
-        if (!state.lookupController.signal.aborted) inspectorError("Address", "Lookup failed", error.message);
+        if (!controller.signal.aborted) inspectorError("Address", "Lookup failed", error.message);
       }
     }
 

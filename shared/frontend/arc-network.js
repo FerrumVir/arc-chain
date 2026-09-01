@@ -798,17 +798,41 @@
     const explicitSuccess = receipt?.success ?? (explicitProvenance ? payload?.success : undefined);
     const success = receiptBacked && explicitSuccess !== false && (explicitSuccess === true || SUCCESS_STATES.has(status));
     const failed = receiptBacked && (explicitSuccess === false || FAILURE_STATES.has(status));
-    const height = activityEnvelope
+    const rawHeight = activityEnvelope
       ? integer(payload?.block_height)
       : integer(receipt?.block_height ?? receipt?.height ?? tx?.block_height ?? tx?.height ?? payload?.block_height ?? payload?.height);
+    const height = rawHeight !== null && rawHeight >= 0 ? rawHeight : null;
     const txHash = activityEnvelope
       ? normalizeHex(payload?.tx_hash, 32)
       : normalizeHex(tx?.hash ?? tx?.tx_hash ?? payload?.hash ?? payload?.tx_hash, 32);
-    const mined = receiptBacked && height !== null && txHash !== null;
+    const blockHash = activityEnvelope
+      ? normalizeHex(payload?.block_hash, 32)
+      : normalizeHex(receipt?.block_hash ?? tx?.block_hash ?? payload?.block_hash, 32);
+    const rawIndex = activityEnvelope
+      ? integer(payload?.index)
+      : integer(receipt?.index ?? tx?.index ?? payload?.index);
+    const index = rawIndex !== null && rawIndex >= 0 ? rawIndex : null;
+    const activityInclusionEvidence = !activityEnvelope || (blockHash !== null && index !== null);
+    const mined = receiptBacked && height !== null && txHash !== null && activityInclusionEvidence;
+    const rewardWorker = canonicalRewardIdentity ? normalizeHex(payload?.worker, 32) : null;
+    const rewardJob = canonicalRewardIdentity ? normalizeHex(payload?.job_id, 32) : null;
     const canonicalPaidReward = canonicalRewardIdentity
       && payload?.computed === true
       && payload?.paid === true
-      && payload?.earned === true;
+      && payload?.earned === true
+      && payload?.submitted === true
+      && payload?.included === true
+      && payload?.confirmed === true
+      && payload?.success === true
+      && rewardWorker !== null
+      && rewardJob !== null
+      && payload?.reward_base === 2_500_000_000
+      && payload?.reward_arc === 2.5
+      && payload?.receipt_url === `/community/reward_receipt/0x${txHash}`
+      && payload?.payment?.status === "earned"
+      && payload?.payment?.receipt_backed === true
+      && payload?.payment?.reward_base === 2_500_000_000
+      && payload?.payment?.reward_arc === 2.5;
     const canonicalComputation = (canonicalInferenceIdentity
       && payload?.computed === true
       && payload?.paid === false
@@ -825,6 +849,10 @@
       mined,
       height,
       txHash,
+      blockHash,
+      index,
+      rewardWorker,
+      rewardJob,
       rewardEarned: canonicalPaidReward && success && mined,
       inferenceConfirmed: (canonicalComputation || lookupComputation) && success && mined,
       computationConfirmed: (canonicalComputation || lookupComputation) && success && mined,

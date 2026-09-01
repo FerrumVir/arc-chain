@@ -104,7 +104,7 @@ npm test                # all suites, headless
 npm run test:ui         # Playwright UI mode (time-travel debugger)
 ```
 
-At this audited tree state, `npx playwright test --list` enumerates 211 tests in
+At this audited tree state, `npx playwright test --list` enumerates 225 tests in
 20 files. Native test inventory is intentionally not hard-coded: run
 `cargo test --manifest-path src-tauri/Cargo.toml -- --list`, and treat only a
 successful compiling listing as evidence. The suites cover onboarding,

@@ -6,6 +6,14 @@ const CONTROL_DIR: &str = ".arc-desktop-control";
 const TOKEN_FILE: &str = "token";
 const REQUEST_FILE: &str = "request";
 const REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
+// The lifecycle receipt deliberately re-hashes the exact arc-node executable
+// when it is loaded, authenticated, and acknowledged.  An unstripped debug
+// binary is hundreds of MiB on hosted runners, where those security checks can
+// legitimately take longer than the old 60-second fixture deadline even
+// though the node is making forward progress.  Keep this bounded far below
+// the production graceful-drain budget while allowing the integrity checks to
+// complete under slow CI I/O instead of weakening or bypassing them.
+const STARTUP_SHUTDOWN_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn publish_private_request(
     control_dir: &std::path::Path,
@@ -120,7 +128,7 @@ fn private_desktop_request_stops_node_during_initialization() {
 
     publish_private_request(&control_dir, child_pid, &token, &receipt.nonce);
 
-    let exit_deadline = Instant::now() + Duration::from_secs(60);
+    let exit_deadline = Instant::now() + STARTUP_SHUTDOWN_TEST_TIMEOUT;
     let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {

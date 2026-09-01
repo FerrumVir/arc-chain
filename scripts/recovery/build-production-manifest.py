@@ -40,6 +40,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import recovery_rollout as rollout
+import quarantine_rounds
 from recovery_freeze import FreezeValidationError, validate_pinned_freeze_plan
 
 
@@ -106,6 +107,11 @@ PRETAG_WINDOW_SET_SCHEMA = "arc.protected-pretag-artifact-window-set.v1"
 APPROVED_ACME_EMAIL = "tj@arc.ai"
 MAX_OFFLINE_STOP_VERIFICATION_AGE_SECONDS = 300
 MAX_OFFLINE_STOP_VERIFICATION_DURATION_MS = 120_000
+# The live capture path enforces this wall-clock bound immediately before the
+# first quarantine.  The post-stop builder must instead re-prove the same
+# bound from the immutable receipt/cross-proof/maintenance-boundary timeline;
+# the six official HTTP origins no longer exist to resample at that point.
+MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS = 300
 ZERO_HASH = "0" * 64
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024
@@ -1647,6 +1653,7 @@ def validate_legacy_maintenance_evidence_bundle(
             "all_controlled_stopped_at",
             "challenge",
             "authenticated_prefence_height_cross_proof",
+            "quarantine_generation_ledger",
             "network_quarantine_challenge",
             "quarantine_stability_proof",
             "nodes",
@@ -1733,6 +1740,61 @@ def validate_legacy_maintenance_evidence_bundle(
     ):
         fail("maintenance authenticated pre-fence fleet topology differs")
 
+    generation_ledger, generation_ledger_sha = sealed(
+        bundle.get("quarantine_generation_ledger"),
+        "fleet",
+        "quarantine-generation-ledger",
+        "maintenance quarantine generation ledger",
+    )
+    try:
+        ledger_state = quarantine_rounds.validate_generation_ledger(generation_ledger)
+    except quarantine_rounds.QuarantineRoundError as error:
+        fail(f"maintenance quarantine generation ledger differs: {error}")
+    if (ledger_state["capture_id"] != capture_id
+            or ledger_state["freeze_plan_sha256"] != freeze_sha):
+        fail("maintenance quarantine generation ledger identity differs")
+    ledger_transitions_by_node: dict[str, dict[str, Any]] = {}
+    ledger_transition_wrappers_by_node: dict[str, dict[str, Any]] = {}
+    for round_wrapper in generation_ledger["rounds"]:
+        for transition_wrapper in round_wrapper["result"]["value"]["transitions"]:
+            transition_value = transition_wrapper["value"]
+            transition_node = transition_value["node"]
+            if transition_node in ledger_transitions_by_node:
+                fail("maintenance quarantine generation ledger secures a node twice")
+            ledger_transitions_by_node[transition_node] = transition_value
+            ledger_transition_wrappers_by_node[transition_node] = transition_wrapper
+    if set(ledger_transitions_by_node) != {name for name, _host in FLEET}:
+        fail("maintenance quarantine generation ledger does not cover the evidence fleet")
+    active_fleet = [
+        (name, host) for name, host in FLEET
+        if ledger_transitions_by_node[name].get("schema")
+        == quarantine_rounds.NODE_APPLIED_SCHEMA
+    ]
+    stopped_fleet = [
+        (name, host) for name, host in FLEET
+        if ledger_transitions_by_node[name].get("schema")
+        == quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA
+    ]
+    if len(active_fleet) + len(stopped_fleet) != len(FLEET):
+        fail("maintenance quarantine generation contains an unsupported transition kind")
+    # The six-origin receipt is a live, pre-mutation diagnostic boundary.  It
+    # cannot safely be reused as a quarantine lease after a crash: every
+    # successful mixed-state round takes its own fresh target-only sample.
+    # Bind the first transition to the same source/capture/freeze here; the
+    # sealed timeline below proves that its fresh sample starts after the
+    # diagnostic fleet bracket completes.  Requiring byte equality would force
+    # all six nodes into one non-atomic remote transaction again.
+    first_round_public = generation_ledger["rounds"][0]["authorization"]["value"][
+        "public_height_receipt"
+    ]["value"]
+    if (
+        first_round_public.get("schema") != quarantine_rounds.TARGET_HEIGHT_SCHEMA
+        or first_round_public.get("source_main_commit") != args.source_main_sha
+        or first_round_public.get("freeze_plan_sha256") != freeze_sha
+        or first_round_public.get("capture_id") != capture_id
+    ):
+        fail("first quarantine generation public sample identity differs")
+
     challenge_receipt, _challenge_sha = sealed(
         bundle.get("network_quarantine_challenge"),
         "fleet",
@@ -1766,6 +1828,8 @@ def validate_legacy_maintenance_evidence_bundle(
             "started_at",
             "completed_at",
             "monotonic_elapsed_ns",
+            "quarantine_generation_ledger_sha256",
+            "active_transition_sha256s",
             "fleet_heads",
             "nodes",
             "global_absence_claimed",
@@ -1779,18 +1843,23 @@ def validate_legacy_maintenance_evidence_bundle(
         or stability.get("freeze_plan_sha256") != freeze_sha
         or stability.get("capture_id") != capture_id
         or stability.get("challenge") != challenge
-        or stability.get("interval_seconds") != 120
-        or stability.get("sample_count") != 2
+        or stability.get("quarantine_generation_ledger_sha256")
+        != generation_ledger_sha
+        or stability.get("active_transition_sha256s")
+        != [
+            {
+                "node": name,
+                "sha256": ledger_transition_wrappers_by_node[name]["sha256"],
+            }
+            for name, _host in active_fleet
+        ]
         or stability.get("global_absence_claimed") is not False
     ):
         fail("maintenance quarantine stability proof identity differs")
     elapsed_ns = require_uint(
         stability.get("monotonic_elapsed_ns"),
         "maintenance quarantine stability monotonic elapsed nanoseconds",
-        positive=True,
     )
-    if elapsed_ns < 120_000_000_000:
-        fail("maintenance quarantine stability interval is below 120 seconds")
     stability_started = _parse_utc_seconds(
         stability.get("started_at"), "maintenance quarantine stability started_at"
     )
@@ -1799,6 +1868,19 @@ def validate_legacy_maintenance_evidence_bundle(
     )
     if not first <= stability_started <= stability_completed <= stopped:
         fail("maintenance quarantine stability timestamps are outside the quarantine/stop window")
+    if active_fleet:
+        if (
+            stability.get("interval_seconds") != 120
+            or stability.get("sample_count") != 2
+            or elapsed_ns < 120_000_000_000
+        ):
+            fail("maintenance quarantine stability interval is below 120 seconds")
+    elif (
+        stability.get("interval_seconds") != 0
+        or stability.get("sample_count") != 0
+        or elapsed_ns != 0
+    ):
+        fail("all-stopped maintenance evidence must not claim an active stability sample")
 
     stability_rows = stability.get("nodes")
     stability_heads = stability.get("fleet_heads")
@@ -1806,11 +1888,11 @@ def validate_legacy_maintenance_evidence_bundle(
         not isinstance(stability_rows, list)
         or not isinstance(stability_heads, list)
         or [(row.get("node"), row.get("host")) for row in stability_rows]
-        != list(FLEET)
+        != active_fleet
         or [(row.get("node"), row.get("host")) for row in stability_heads]
-        != list(FLEET)
+        != active_fleet
     ):
-        fail("maintenance quarantine stability topology differs")
+        fail("maintenance quarantine stability topology differs from the active transition subset")
     stability_status_fields = {
         "schema",
         "capture_id",
@@ -1849,8 +1931,10 @@ def validate_legacy_maintenance_evidence_bundle(
     }
     normalized_stability_rows: list[dict[str, Any]] = []
     normalized_stability_heads: list[dict[str, Any]] = []
+    stability_receipt_by_node: dict[str, str] = {}
+    stability_samples_by_node: dict[str, list[dict[str, Any]]] = {}
     for row_index, ((name, host), raw_row, raw_fleet_head) in enumerate(
-        zip(FLEET, stability_rows, stability_heads)
+        zip(active_fleet, stability_rows, stability_heads)
     ):
         row = require_exact_object(
             raw_row,
@@ -2034,6 +2118,10 @@ def validate_legacy_maintenance_evidence_bundle(
             }
         )
         normalized_stability_heads.append(copy.deepcopy(fleet_head))
+        stability_receipt_by_node[name] = normalized_samples[0]["value"][
+            "quarantine_status_before"
+        ]["receipt_sha256"]
+        stability_samples_by_node[name] = normalized_samples
     stability["nodes"] = normalized_stability_rows
     stability["fleet_heads"] = normalized_stability_heads
 
@@ -2112,6 +2200,10 @@ def validate_legacy_maintenance_evidence_bundle(
         "genesis_sha256",
         "validator_public_keys_sha256",
         "legacy_validator_set_sha256",
+        "source_pair_role",
+        "final_source_capture_sha256",
+        "selected_source_head",
+        "stop_after_round_receipt_sha256",
         "network_quarantine_receipt_sha256",
         "stop_complete_sha256",
         "stop_files_sha256",
@@ -2124,6 +2216,7 @@ def validate_legacy_maintenance_evidence_bundle(
         "snapshot_sha256",
         "snapshot_size",
         "source_file_identity",
+        "archived_final_wal",
         "staged_file_contract",
         "export_summary_sha256",
         "inspect_summary_sha256",
@@ -2159,12 +2252,90 @@ def validate_legacy_maintenance_evidence_bundle(
     for index, ((name, host), frozen, public, raw_node) in enumerate(
         zip(FLEET, freeze["nodes"], height_receipt["origins"], raw_nodes)
     ):
+        ledger_transition = ledger_transitions_by_node[name]
+        if ledger_transition.get("schema") == quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA:
+            node = require_exact_object(
+                raw_node,
+                {
+                    "node", "host", "transition_kind", "transition_receipt",
+                    "current_status", "persisted_head",
+                },
+                f"stopped maintenance evidence node {index}",
+            )
+            if (
+                (node.get("node"), node.get("host")) != (name, host)
+                or node.get("transition_kind")
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+            ):
+                fail(f"stopped maintenance evidence topology/kind differs at {name}")
+            transition_value, transition_sha = sealed(
+                node.get("transition_receipt"), name, "transition-receipt",
+                f"{name} stopped transition receipt",
+            )
+            if (
+                node.get("transition_receipt")
+                != ledger_transition_wrappers_by_node[name]
+                or transition_value != ledger_transition
+            ):
+                fail(f"stopped maintenance transition does not byte-match the ledger at {name}")
+            current_status, current_status_sha = sealed(
+                node.get("current_status"), name, "current-status",
+                f"{name} stopped current status",
+            )
+            try:
+                observed_at = quarantine_rounds.validate_prior_fenced_status(
+                    current_status,
+                    transition=transition_value,
+                    transition_sha256=transition_sha,
+                )
+            except quarantine_rounds.QuarantineRoundError as error:
+                fail(f"stopped maintenance current status differs at {name}: {error}")
+            if observed_at > stopped:
+                fail(f"stopped maintenance current status postdates the stop boundary at {name}")
+            persisted_value, persisted_sha = sealed(
+                node.get("persisted_head"), name, "persisted-head",
+                f"{name} stopped persisted head",
+            )
+            if node.get("persisted_head") != transition_value.get("persisted_head"):
+                fail(f"stopped maintenance persisted head differs from its transition at {name}")
+            if (
+                persisted_value.get("head") != transition_value.get("stable_head")
+                or persisted_value.get("source_pair_role")
+                != "preauthorization-boundary"
+                or not isinstance(persisted_value.get("source_inputs"), dict)
+                or persisted_value["source_inputs"].get("source_pair_role")
+                != "preauthorization-boundary"
+                or persisted_value.get("live_source_capture_sha256")
+                != persisted_value["source_inputs"].get("live_source_capture_sha256")
+                or current_status.get("stable_head") != transition_value.get("stable_head")
+                or current_status.get("persistent_restart_fence_sha256")
+                != transition_value.get("persistent_restart_fence", {}).get("sha256")
+            ):
+                fail(f"stopped maintenance source/head/restart-fence projection differs at {name}")
+            normalized_nodes.append(
+                {
+                    "node": name,
+                    "host": host,
+                    "transition_kind": quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND,
+                    "transition_receipt": {
+                        "value": transition_value, "sha256": transition_sha,
+                    },
+                    "current_status": {
+                        "value": current_status, "sha256": current_status_sha,
+                    },
+                    "persisted_head": {
+                        "value": persisted_value, "sha256": persisted_sha,
+                    },
+                }
+            )
+            continue
         node = require_exact_object(
             raw_node,
             {
                 "node",
                 "host",
                 "stopped_status",
+                "network_quarantine_receipt",
                 "quarantine_status",
                 "quarantine_monitor",
                 "post_proof_quarantine_status",
@@ -2178,6 +2349,12 @@ def validate_legacy_maintenance_evidence_bundle(
             fail(f"maintenance evidence topology differs at {name}")
         stopped_value, stopped_sha = sealed(
             node.get("stopped_status"), name, "stopped-status", f"{name} stopped status"
+        )
+        network_value, network_sha = sealed(
+            node.get("network_quarantine_receipt"),
+            name,
+            "network-quarantine-receipt",
+            f"{name} network quarantine receipt",
         )
         status_value, status_sha = sealed(
             node.get("quarantine_status"),
@@ -2212,6 +2389,152 @@ def validate_legacy_maintenance_evidence_bundle(
         persisted_value, persisted_sha = sealed(
             node.get("persisted_head"), name, "persisted-head", f"{name} persisted head"
         )
+
+        network_value = require_exact_object(
+            network_value,
+            {
+                "schema", "capture_id", "node", "host", "freeze_plan_sha256",
+                "source_main_commit", "round_number", "round_authorization_sha256",
+                "round_readiness_sha256", "nft_deadline_gate_sha256",
+                "nft_apply_intent_sha256", "nft_apply_intent",
+                "nft_table_binding_sha256", "nft_table_binding", "table_comment",
+                "nft_table_comment", "nft_policy_source_sha256",
+                "apply_helper_sha256", "applied_commit_sha256",
+                "authorization_ancestry_proof_sha256", "boot_id", "writer",
+                "table", "quarantine_policy", "persistence", "file_sha256",
+                "tool_sha256", "owned_ruleset_stateless_sha256", "loopback_head",
+                "stable_head", "authorization_ancestry_proof", "nft_deadline_gate",
+                "applied_commit", "installed_at",
+                "global_absence_claimed", "threat_model",
+            },
+            f"{name} network quarantine receipt value",
+        )
+        network_head = require_exact_object(
+            network_value.get("loopback_head"),
+            {
+                "rpc_origin", "info_before_height", "latest_height", "block_height",
+                "info_after_height", "block_hash", "state_root", "response_sha256",
+                "stable_attempt",
+            },
+            f"{name} network quarantine receipt loopback head",
+        )
+        if (
+            network_value.get("schema") != "arc.recovery.legacy-network-quarantine.v1"
+            or (
+                network_value.get("capture_id"), network_value.get("node"),
+                network_value.get("freeze_plan_sha256"),
+            ) != (capture_id, name, freeze_sha)
+            or network_value.get("host") != host
+            or network_value.get("source_main_commit") != args.source_main_sha
+            or network_value.get("owned_ruleset_stateless_sha256")
+                != status_value.get("owned_ruleset_stateless_sha256")
+            or network_sha != status_value.get("receipt_sha256")
+            or network_value.get("boot_id") != frozen.get("boot_id")
+            or network_value.get("global_absence_claimed") is not False
+        ):
+            fail(f"maintenance evidence network quarantine receipt differs at {name}")
+        for field in (
+            "round_authorization_sha256", "round_readiness_sha256",
+            "nft_deadline_gate_sha256", "nft_apply_intent_sha256",
+            "nft_table_binding_sha256", "nft_policy_source_sha256",
+            "apply_helper_sha256", "applied_commit_sha256",
+            "authorization_ancestry_proof_sha256", "owned_ruleset_stateless_sha256",
+        ):
+            require_hash(network_value.get(field), f"{name} network receipt {field}")
+        network_writer = require_exact_object(
+            network_value.get("writer"),
+            {"pid", "start_ticks", "cgroup_sha256"},
+            f"{name} network quarantine writer",
+        )
+        if (
+            network_writer.get("pid") != frozen.get("writer_pid")
+            or network_writer.get("start_ticks") != frozen.get("writer_start_ticks")
+            or network_writer.get("cgroup_sha256") != frozen.get("writer_cgroup_sha256")
+        ):
+            fail(f"maintenance evidence network quarantine writer differs at {name}")
+        network_table = require_exact_object(
+            network_value.get("table"),
+            {
+                "family", "name", "priority", "hooks", "policy", "comment",
+                "loopback_retained",
+            },
+            f"{name} network quarantine table",
+        )
+        if network_table != {
+            "family": "inet", "name": "arc_legacy_maintenance_v1", "priority": -310,
+            "hooks": ["prerouting", "input", "forward", "output"],
+            "policy": "accept", "comment": network_value.get("nft_table_comment"),
+            "loopback_retained": True,
+        }:
+            fail(f"maintenance evidence network quarantine table differs at {name}")
+        for collection in ("tool_sha256", "file_sha256"):
+            roots = network_value.get(collection)
+            if not isinstance(roots, dict) or not roots:
+                fail(f"maintenance evidence network quarantine {collection} is empty at {name}")
+            for root in roots.values():
+                require_hash(root, f"{name} network quarantine {collection} root")
+        threat_model = require_exact_object(
+            network_value.get("threat_model"),
+            {"legacy_binary", "legacy_binary_sha256"},
+            f"{name} network quarantine threat model",
+        )
+        if threat_model != {
+            "legacy_binary": "reviewed-non-adversarial-exact-hash",
+            "legacy_binary_sha256": frozen.get("executable_sha256"),
+        }:
+            fail(f"maintenance evidence network quarantine threat model differs at {name}")
+        _parse_utc_seconds(
+            network_value.get("installed_at"), f"{name} network quarantine installed_at"
+        )
+        if (
+            len({
+                require_uint(network_head.get(field), f"{name} network {field}")
+                for field in (
+                    "info_before_height", "latest_height", "block_height",
+                    "info_after_height",
+                )
+            }) != 1
+            or network_head.get("rpc_origin") != frozen.get("rpc_origin")
+            or require_uint(network_head.get("stable_attempt"), f"{name} stable attempt", positive=True)
+                > 10
+        ):
+            fail(f"maintenance evidence network quarantine head differs at {name}")
+        require_hash(network_head.get("block_hash"), f"{name} network block hash")
+        require_hash(network_head.get("state_root"), f"{name} network state root")
+        network_responses = network_head.get("response_sha256")
+        expected_response_keys = {
+            "/info:before", "/block/latest", f"/block/{network_head['latest_height']}",
+            "/health", "/info:after",
+        }
+        if not isinstance(network_responses, dict) or set(network_responses) != expected_response_keys:
+            fail(f"maintenance evidence network quarantine response roots differ at {name}")
+        for root in network_responses.values():
+            require_hash(root, f"{name} network quarantine response root")
+        if ledger_transition.get("schema") != quarantine_rounds.NODE_APPLIED_SCHEMA:
+            fail(
+                f"active maintenance evidence cannot represent the persistently-stopped "
+                f"transition at {name}"
+            )
+        if (
+            ledger_transition.get("network_quarantine_receipt")
+                != {"value": network_value, "sha256": network_sha}
+            or ledger_transition.get("network_quarantine_receipt_sha256") != network_sha
+            or ledger_transition.get("owned_ruleset_stateless_sha256")
+                != network_value.get("owned_ruleset_stateless_sha256")
+            or ledger_transition.get("nft_policy_source_sha256")
+                != network_value.get("file_sha256", {}).get("policy.nft")
+            or ledger_transition.get("stable_head") != {
+                "height": network_head["latest_height"],
+                "block_hash": network_head["block_hash"],
+                "state_root": network_head["state_root"],
+            }
+            or (
+                ledger_transition.get("capture_id"), ledger_transition.get("node"),
+                ledger_transition.get("host"), ledger_transition.get("freeze_plan_sha256"),
+            ) != (capture_id, name, host, freeze_sha)
+            or stability_receipt_by_node.get(name) != network_sha
+        ):
+            fail(f"maintenance generation ledger is not bound to node evidence at {name}")
         identity = (capture_id, name, freeze_sha)
         stopped_value = require_exact_object(
             stopped_value, stopped_fields, f"{name} stopped status value"
@@ -2546,6 +2869,8 @@ def validate_legacy_maintenance_evidence_bundle(
             or persisted_value.get("boot_id") != frozen["boot_id"]
             or persisted_value.get("network_quarantine_receipt_sha256")
             != status_value["receipt_sha256"]
+            or persisted_value.get("source_pair_role")
+            != "post-quarantine-final-export"
             or persisted_value.get("export_status") != "EXPORTED_UNSIGNED"
             or persisted_value.get("rerun_reexecutes_export") is not True
             or persisted_value.get("writer_stopped") is not True
@@ -2582,6 +2907,8 @@ def validate_legacy_maintenance_evidence_bundle(
             "inspect_summary_sha256",
             "wal_boundary_sha256",
             "candidate_checkpoint_sha256",
+            "final_source_capture_sha256",
+            "stop_after_round_receipt_sha256",
         ):
             require_hash(persisted_value.get(field), f"{name} persisted-head {field}")
         if (
@@ -2646,6 +2973,81 @@ def validate_legacy_maintenance_evidence_bundle(
             persisted_value.get("completed_at"), f"{name} persisted-head completed_at"
         )
         persisted_head = head(persisted_value.get("head"), f"{name} persisted head tuple")
+        selected_source_head = head(
+            persisted_value.get("selected_source_head"),
+            f"{name} persisted selected source head",
+        )
+        if selected_source_head != persisted_head:
+            fail(f"maintenance evidence selected final source head differs at {name}")
+        archived_wal = require_exact_object(
+            persisted_value.get("archived_final_wal"),
+            {
+                "path", "sha256", "size", "file_identity",
+                "selected_prefix_bytes", "selected_prefix_sha256",
+                "post_capture_suffix_bytes", "post_capture_suffix_sha256",
+                "post_capture_suffix_classification", "preserved_by",
+            },
+            f"{name} persisted archived final WAL",
+        )
+        archived_path = archived_wal.get("path")
+        if not isinstance(archived_path, str):
+            fail(f"{name} persisted archived final WAL path differs")
+        _lexical_absolute(Path(archived_path), f"{name} persisted archived final WAL path")
+        archive_size = require_uint(
+            archived_wal.get("size"), f"{name} persisted archived final WAL size",
+            positive=True,
+        )
+        archived_identity = require_exact_object(
+            archived_wal.get("file_identity"),
+            {"device", "inode", "size", "mode"},
+            f"{name} persisted archived final WAL identity",
+        )
+        for field in ("device", "inode", "size", "mode"):
+            require_uint(
+                archived_identity.get(field),
+                f"{name} persisted archived final WAL identity {field}",
+                positive=field in {"device", "inode", "size"},
+            )
+        selected_bytes = require_uint(
+            archived_wal.get("selected_prefix_bytes"),
+            f"{name} persisted archived final WAL selected prefix bytes",
+            positive=True,
+        )
+        suffix_bytes = require_uint(
+            archived_wal.get("post_capture_suffix_bytes"),
+            f"{name} persisted archived final WAL suffix bytes",
+        )
+        if (
+            require_hash(
+                archived_wal.get("sha256"),
+                f"{name} persisted archived final WAL root",
+            )
+            != archived_wal["sha256"]
+            or archived_identity["size"] != archive_size
+            or selected_bytes != persisted_value["state_wal_size"]
+            or archived_wal.get("selected_prefix_sha256")
+            != persisted_value["state_wal_sha256"]
+            or archive_size != selected_bytes + suffix_bytes
+            or archived_wal.get("preserved_by")
+            != "complete-content-indexed-stopped-legacy-source-v4"
+        ):
+            fail(f"maintenance evidence archived final WAL binding differs at {name}")
+        if suffix_bytes == 0:
+            if (
+                archived_wal.get("post_capture_suffix_sha256") is not None
+                or archived_wal.get("post_capture_suffix_classification") != "none"
+            ):
+                fail(f"maintenance evidence empty archived WAL suffix differs at {name}")
+        elif (
+            require_hash(
+                archived_wal.get("post_capture_suffix_sha256"),
+                f"{name} persisted archived final WAL suffix root",
+            )
+            != archived_wal["post_capture_suffix_sha256"]
+            or archived_wal.get("post_capture_suffix_classification")
+            != "archived_noncanonical_post_capture_suffix"
+        ):
+            fail(f"maintenance evidence archived WAL suffix policy differs at {name}")
         if persisted_head["height"] < fenced_head["height"]:
             fail(f"maintenance evidence persisted head precedes fenced head at {name}")
         normalized_nodes.append(
@@ -2653,6 +3055,10 @@ def validate_legacy_maintenance_evidence_bundle(
                 "node": name,
                 "host": host,
                 "stopped_status": {"value": stopped_value, "sha256": stopped_sha},
+                "network_quarantine_receipt": {
+                    "value": network_value,
+                    "sha256": network_sha,
+                },
                 "quarantine_status": {"value": status_value, "sha256": status_sha},
                 "quarantine_monitor": {
                     "value": monitor_value,
@@ -2685,6 +3091,10 @@ def validate_legacy_maintenance_evidence_bundle(
     normalized["authenticated_prefence_height_cross_proof"] = {
         "value": authenticated,
         "sha256": authenticated_sha,
+    }
+    normalized["quarantine_generation_ledger"] = {
+        "value": generation_ledger,
+        "sha256": generation_ledger_sha,
     }
     normalized["quarantine_stability_proof"] = {
         "value": stability,
@@ -2739,6 +3149,7 @@ def validate_legacy_maintenance_boundary(
             "official_origin_scope",
             "legacy_public_height_receipt",
             "authenticated_prefence_height_cross_proof_sha256",
+            "quarantine_generation_ledger_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
             "network_quarantine_stability_proof_sha256",
             "network_quarantine_challenge",
@@ -2819,6 +3230,8 @@ def validate_legacy_maintenance_boundary(
     if (
         boundary.get("authenticated_prefence_height_cross_proof_sha256")
         != evidence_bundle["authenticated_prefence_height_cross_proof"]["sha256"]
+        or boundary.get("quarantine_generation_ledger_sha256")
+        != evidence_bundle["quarantine_generation_ledger"]["sha256"]
         or boundary.get("network_quarantine_stability_proof_sha256")
         != evidence_bundle["quarantine_stability_proof"]["sha256"]
         or boundary.get("network_quarantine_challenge") != evidence_bundle["challenge"]
@@ -2915,7 +3328,7 @@ def validate_legacy_maintenance_boundary(
         head = exact_head(observation.get("tuple"), f"{label} tuple")
         return {"tuple": head, "evidence_sha256": observation["evidence_sha256"]}
 
-    node_fields = {
+    active_node_fields = {
         "node",
         "host",
         "origin",
@@ -2930,6 +3343,12 @@ def validate_legacy_maintenance_boundary(
         "post_quarantine_head",
         "final_persisted_head",
     }
+    stopped_node_fields = {
+        "node", "host", "origin", "transition_kind",
+        "authenticated_prefence_proof_sha256", "transition_receipt_sha256",
+        "current_status_sha256", "persistent_restart_fence_sha256",
+        "stable_head", "final_persisted_head",
+    }
     for index, ((name, host), public, raw_node, bundle_node, authenticated_node) in enumerate(
         zip(
             FLEET,
@@ -2939,7 +3358,58 @@ def validate_legacy_maintenance_boundary(
             evidence_bundle["authenticated_prefence_height_cross_proof"]["value"]["nodes"],
         )
     ):
-        node = require_exact_object(raw_node, node_fields, f"legacy maintenance node {index}")
+        if bundle_node.get("transition_kind") \
+                == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+            node = require_exact_object(
+                raw_node, stopped_node_fields,
+                f"stopped legacy maintenance node {index}",
+            )
+            if (
+                (node.get("node"), node.get("host"), node.get("origin"))
+                != (name, host, public["origin"])
+                or node.get("transition_kind")
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+            ):
+                fail(f"stopped legacy maintenance node topology/kind differs at {name}")
+            transition_wrapper = bundle_node["transition_receipt"]
+            status_wrapper = bundle_node["current_status"]
+            persisted_wrapper = bundle_node["persisted_head"]
+            transition = transition_wrapper["value"]
+            status = status_wrapper["value"]
+            persisted_value = persisted_wrapper["value"]
+            expected_roots = {
+                "authenticated_prefence_proof_sha256": authenticated_node["proof_sha256"],
+                "transition_receipt_sha256": transition_wrapper["sha256"],
+                "current_status_sha256": status_wrapper["sha256"],
+                "persistent_restart_fence_sha256": transition[
+                    "persistent_restart_fence"
+                ]["sha256"],
+            }
+            if any(node.get(field) != expected for field, expected in expected_roots.items()):
+                fail(f"stopped legacy maintenance {name} roots differ from the evidence bundle")
+            stable = exact_observation(
+                node.get("stable_head"), f"stopped legacy maintenance {name} stable head",
+            )
+            persisted = exact_observation(
+                node.get("final_persisted_head"),
+                f"stopped legacy maintenance {name} final persisted head",
+            )
+            if (
+                stable["tuple"] != transition.get("stable_head")
+                or stable["evidence_sha256"] != transition_wrapper["sha256"]
+                or persisted["tuple"] != persisted_value.get("head")
+                or persisted["evidence_sha256"] != persisted_wrapper["sha256"]
+                or persisted["tuple"] != stable["tuple"]
+                or status.get("stable_head") != stable["tuple"]
+                or status.get("persistent_restart_fence_sha256")
+                != node.get("persistent_restart_fence_sha256")
+            ):
+                fail(f"stopped legacy maintenance {name} head/fence projection differs")
+            normalized_nodes.append(copy.deepcopy(node))
+            continue
+        node = require_exact_object(
+            raw_node, active_node_fields, f"legacy maintenance node {index}"
+        )
         if (node.get("node"), node.get("host"), node.get("origin")) != (
             name,
             host,
@@ -3026,97 +3496,110 @@ def validate_legacy_maintenance_boundary(
                 fail(f"legacy maintenance {name} same-height persisted tuple disagrees")
         normalized_nodes.append(copy.deepcopy(node))
 
-    raw_heights = boundary.get("evidence_heights")
-    labels = (
-        "public_info_before",
-        "public_latest",
-        "public_info_after",
-        "authenticated_info_before",
-        "authenticated_latest",
-        "authenticated_info_after",
-        "authenticated_conservative_floor",
-        "initial_post_quarantine_head",
-        "public_cross_info_after",
-        "post_quarantine_head",
-        "quarantine_stability_sample_0",
-        "quarantine_stability_sample_1",
-        "final_persisted_head",
-    )
-    if not isinstance(raw_heights, list) or len(raw_heights) != len(FLEET) * len(labels):
-        fail("legacy maintenance evidence-height ledger is not exact six-by-thirteen")
-    normalized_heights: list[dict[str, Any]] = []
-    height_fields = {"node", "label", "height", "evidence_sha256"}
-    for index, raw_height in enumerate(raw_heights):
-        row = require_exact_object(
-            raw_height, height_fields, f"legacy maintenance evidence height {index}"
-        )
-        node_index, label_index = divmod(index, len(labels))
-        name = FLEET[node_index][0]
-        if (row.get("node"), row.get("label")) != (name, labels[label_index]):
-            fail("legacy maintenance evidence-height order differs")
-        normalized_heights.append(
+    expected_heights: list[dict[str, Any]] = []
+    stability_by_name = {
+        row["node"]: row
+        for row in evidence_bundle["quarantine_stability_proof"]["value"]["nodes"]
+    }
+
+    def append_height(name: str, label: str, height_value: Any, root: Any) -> None:
+        expected_heights.append(
             {
                 "node": name,
-                "label": labels[label_index],
+                "label": label,
                 "height": require_uint(
-                    row.get("height"), f"legacy maintenance {name}/{labels[label_index]} height"
+                    height_value, f"legacy maintenance {name}/{label} height"
                 ),
                 "evidence_sha256": require_hash(
-                    row.get("evidence_sha256"),
-                    f"legacy maintenance {name}/{labels[label_index]} evidence root",
+                    root, f"legacy maintenance {name}/{label} evidence root"
                 ),
             }
         )
 
-    for node_index, (node, public) in enumerate(zip(normalized_nodes, public_rows)):
-        by_label = {
-            row["label"]: row for row in normalized_heights[
-                node_index * len(labels) : (node_index + 1) * len(labels)
-            ]
-        }
-        expected_public = {
-            "public_info_before": public["info_before_height"],
-            "public_latest": public["latest_block_height"],
-            "public_info_after": public["info_after_height"],
-            "public_cross_info_after": node["public_observation"]["tuple"]["height"],
-            "initial_post_quarantine_head": node["initial_post_quarantine_head"]["tuple"]["height"],
-            "post_quarantine_head": node["post_quarantine_head"]["tuple"]["height"],
-            "quarantine_stability_sample_0": evidence_bundle["quarantine_stability_proof"][
-                "value"
-            ]["nodes"][node_index]["samples"][0]["value"]["head"]["height"],
-            "quarantine_stability_sample_1": evidence_bundle["quarantine_stability_proof"][
-                "value"
-            ]["nodes"][node_index]["samples"][1]["value"]["head"]["height"],
-            "final_persisted_head": node["final_persisted_head"]["tuple"]["height"],
-        }
-        for label, expected in expected_public.items():
-            if by_label[label]["height"] != expected:
-                fail(f"legacy maintenance {node['node']} evidence-height tuple differs: {label}")
-        if any(
-            by_label[label]["evidence_sha256"] != height_receipt_sha
-            for label in ("public_info_before", "public_latest", "public_info_after")
+    for node, public, bundle_node, authenticated_node in zip(
+        normalized_nodes,
+        public_rows,
+        evidence_bundle["nodes"],
+        evidence_bundle["authenticated_prefence_height_cross_proof"]["value"]["nodes"],
+    ):
+        name = node["node"]
+        proof = authenticated_node.get("proof")
+        if not isinstance(proof, dict):
+            fail(f"legacy maintenance {name} authenticated proof differs")
+        for label, field in (
+            ("public_info_before", "info_before_height"),
+            ("public_latest", "latest_block_height"),
+            ("public_info_after", "info_after_height"),
         ):
-            fail(f"legacy maintenance {node['node']} public evidence roots differ")
-        if by_label["initial_post_quarantine_head"]["evidence_sha256"] != node[
-            "quarantine_status_sha256"
-        ]:
-            fail(f"legacy maintenance {node['node']} initial evidence-height root differs")
-        for label in ("public_cross_info_after", "post_quarantine_head"):
-            if by_label[label]["evidence_sha256"] != node["public_cross_proof_sha256"]:
-                fail(f"legacy maintenance {node['node']} cross-proof evidence root differs")
-        stability_samples = evidence_bundle["quarantine_stability_proof"]["value"]["nodes"][
-            node_index
-        ]["samples"]
-        for sample_index in (0, 1):
-            label = f"quarantine_stability_sample_{sample_index}"
-            if by_label[label]["evidence_sha256"] != stability_samples[sample_index]["sha256"]:
-                fail(
-                    f"legacy maintenance {node['node']} stability evidence root differs: {label}"
-                )
-        if by_label["final_persisted_head"]["evidence_sha256"] != node[
-            "final_persisted_head"
-        ]["evidence_sha256"]:
-            fail(f"legacy maintenance {node['node']} persisted evidence root differs")
+            append_height(name, label, public.get(field), height_receipt_sha)
+        for label, field in (
+            ("authenticated_info_before", "authenticated_info_before_height"),
+            ("authenticated_latest", "authenticated_latest_block_height"),
+            ("authenticated_info_after", "authenticated_info_after_height"),
+            ("authenticated_conservative_floor", "conservative_height_floor"),
+        ):
+            append_height(name, label, proof.get(field), authenticated_node.get("proof_sha256"))
+        if node.get("transition_kind") \
+                == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+            append_height(
+                name, "transition_stable_head", node["stable_head"]["tuple"]["height"],
+                node["transition_receipt_sha256"],
+            )
+            append_height(
+                name, "final_persisted_head",
+                node["final_persisted_head"]["tuple"]["height"],
+                node["final_persisted_head"]["evidence_sha256"],
+            )
+            continue
+        append_height(
+            name, "initial_post_quarantine_head",
+            node["initial_post_quarantine_head"]["tuple"]["height"],
+            node["quarantine_status_sha256"],
+        )
+        append_height(
+            name, "public_cross_info_after", node["public_observation"]["tuple"]["height"],
+            node["public_cross_proof_sha256"],
+        )
+        append_height(
+            name, "post_quarantine_head", node["post_quarantine_head"]["tuple"]["height"],
+            node["public_cross_proof_sha256"],
+        )
+        stability_node = stability_by_name.get(name)
+        if not isinstance(stability_node, dict):
+            fail(f"legacy maintenance {name} active stability evidence is missing")
+        for sample_index, sample in enumerate(stability_node["samples"]):
+            append_height(
+                name, f"quarantine_stability_sample_{sample_index}",
+                sample["value"]["head"]["height"], sample["sha256"],
+            )
+        append_height(
+            name, "final_persisted_head", node["final_persisted_head"]["tuple"]["height"],
+            node["final_persisted_head"]["evidence_sha256"],
+        )
+
+    raw_heights = boundary.get("evidence_heights")
+    if not isinstance(raw_heights, list) or len(raw_heights) != len(expected_heights):
+        fail("legacy maintenance evidence-height ledger row count differs by transition kind")
+    normalized_heights: list[dict[str, Any]] = []
+    height_fields = {"node", "label", "height", "evidence_sha256"}
+    for index, (raw_height, expected) in enumerate(zip(raw_heights, expected_heights)):
+        row = require_exact_object(
+            raw_height, height_fields, f"legacy maintenance evidence height {index}"
+        )
+        normalized = {
+            "node": row.get("node"),
+            "label": row.get("label"),
+            "height": require_uint(
+                row.get("height"), f"legacy maintenance evidence height {index} value"
+            ),
+            "evidence_sha256": require_hash(
+                row.get("evidence_sha256"),
+                f"legacy maintenance evidence height {index} root",
+            ),
+        }
+        if normalized != expected:
+            fail("legacy maintenance evidence-height ledger differs from its retained proofs")
+        normalized_heights.append(normalized)
 
     cutoff = require_uint(
         boundary.get("observed_cutoff_height"), "legacy maintenance observed cutoff"
@@ -3236,6 +3719,7 @@ def validate_offline_stop_evidence(
             "legacy_maintenance_boundary",
             "legacy_maintenance_boundary_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
+            "quarantine_generation_ledger_sha256",
             "nodes",
         },
         "offline-stop fleet evidence",
@@ -3274,6 +3758,11 @@ def validate_offline_stop_evidence(
         != boundary["legacy_maintenance_evidence_bundle_sha256"]
     ):
         fail("offline-stop evidence does not bind the exact maintenance evidence bundle")
+    if (receipt.get("quarantine_generation_ledger_sha256")
+            != evidence_bundle["quarantine_generation_ledger"]["sha256"]
+            or receipt.get("quarantine_generation_ledger_sha256")
+            != boundary["quarantine_generation_ledger_sha256"]):
+        fail("offline-stop evidence does not bind the quarantine generation ledger")
 
     cross = require_exact_object(
         receipt.get("legacy_height_cross_proof"),
@@ -3450,7 +3939,7 @@ def validate_offline_stop_evidence(
     if not isinstance(rows, list) or len(rows) != len(FLEET):
         fail("offline-stop evidence must contain exactly six ordered node roots")
     frozen_rows = freeze["nodes"]
-    node_fields = {
+    active_node_fields = {
         "node",
         "host",
         "validator_address",
@@ -3459,6 +3948,10 @@ def validate_offline_stop_evidence(
         "stop_files_sha256",
         "stopped_status_sha256",
         "stopped_status_argv_sha256",
+    }
+    stopped_node_fields = {
+        "node", "host", "transition_kind", "transition_receipt_sha256",
+        "current_status_sha256", "persisted_head_sha256",
     }
     status_fields = (
         "validator_address",
@@ -3484,7 +3977,35 @@ def validate_offline_stop_evidence(
     for index, ((name, host), frozen, raw_row, bundle_node) in enumerate(
         zip(FLEET, frozen_rows, rows, evidence_bundle["nodes"])
     ):
-        row = require_exact_object(raw_row, node_fields, f"offline-stop node {index}")
+        is_stopped = bundle_node.get("transition_kind") \
+            == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+        row = require_exact_object(
+            raw_row,
+            stopped_node_fields if is_stopped else active_node_fields,
+            f"offline-stop node {index}",
+        )
+        if is_stopped:
+            if (
+                (row.get("node"), row.get("host")) != (name, host)
+                or row.get("transition_kind")
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or row.get("transition_receipt_sha256")
+                != bundle_node.get("transition_receipt", {}).get("sha256")
+                or row.get("current_status_sha256")
+                != bundle_node.get("current_status", {}).get("sha256")
+                or row.get("persisted_head_sha256")
+                != bundle_node.get("persisted_head", {}).get("sha256")
+            ):
+                fail(
+                    f"offline-stop evidence {name} stopped transition roots differ "
+                    "from the tagged evidence bundle"
+                )
+            for field in (
+                "transition_receipt_sha256", "current_status_sha256",
+                "persisted_head_sha256",
+            ):
+                require_hash(row.get(field), f"offline-stop {name} {field}")
+            continue
         expected_identity = {
             "node": name,
             "host": host,
@@ -3528,8 +4049,8 @@ def validate_offline_stop_evidence(
         if sha256_bytes(canonical_bytes(status)) != status_sha:
             fail(f"offline-stop evidence {name} stopped-status hash is not reproducible")
         if (
-            bundle_node["stopped_status"]["sha256"] != status_sha
-            or bundle_node["stopped_status"]["value"] != status
+            bundle_node.get("stopped_status", {}).get("sha256") != status_sha
+            or bundle_node.get("stopped_status", {}).get("value") != status
         ):
             fail(f"offline-stop evidence {name} status differs from the evidence bundle")
         if complete_sha in complete_roots:
@@ -3811,6 +4332,210 @@ def _parse_utc_seconds(value: Any, field: str) -> dt.datetime:
     return parsed
 
 
+def load_intrinsic_legacy_public_height_receipt(
+    args: argparse.Namespace,
+    *,
+    freeze_sha: str,
+) -> tuple[dict[str, Any], int, str, bytes]:
+    """Load a historical stopped-fleet receipt without using the current clock.
+
+    ``archive-fleet-to-drive.sh capture`` retains the live <=300-second check
+    before it may create the first quarantine boundary.  After that boundary,
+    resampling would require restarting the retired writers, so this builder
+    validates intrinsic receipt semantics and later proves freshness from the
+    exact sealed capture timeline instead of comparing against ``now()``.
+    """
+
+    payload, _details = read_secure(
+        args.legacy_public_height_receipt,
+        label="legacy public-height receipt",
+        maximum_bytes=16 * 1024 * 1024,
+        exact_mode=0o400,
+    )
+    value = decode_json(payload, "legacy public-height receipt")
+    if not isinstance(value, dict) or canonical_bytes(value) != payload:
+        fail("legacy public-height receipt must be canonical JSON")
+    completed = _parse_utc_seconds(
+        value.get("completed_at"), "legacy public-height completed_at"
+    )
+    try:
+        maximum = legacy_height.validate_receipt(
+            value,
+            source_main=args.source_main_sha,
+            freeze_sha=freeze_sha,
+            now=completed,
+            max_age_seconds=MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS,
+        )
+    except legacy_height.HeightReceiptError as error:
+        fail(f"legacy public-height receipt failed intrinsic validation: {error}")
+    return copy.deepcopy(value), maximum, sha256_bytes(payload), payload
+
+
+def validate_sealed_legacy_height_capture_timeline(
+    *,
+    args: argparse.Namespace,
+    freeze_sha: str,
+    height_receipt: Mapping[str, Any],
+    height_receipt_sha: str,
+    evidence_bundle: Mapping[str, Any],
+    boundary: Mapping[str, Any],
+    offline_stop: Mapping[str, Any],
+) -> None:
+    """Authenticate the historical freshness decision without using ``now()``."""
+
+    capture_id = rollout.capture_id_for_freeze_plan_hash(freeze_sha)
+    expected_identity = {
+        "source_main_commit": args.source_main_sha,
+        "freeze_plan_sha256": freeze_sha,
+        "capture_id": capture_id,
+    }
+    for label, value in (
+        ("legacy public-height receipt", height_receipt),
+        ("maintenance evidence bundle", evidence_bundle),
+        ("legacy maintenance boundary", boundary),
+        ("offline-stop evidence", offline_stop),
+    ):
+        for field, expected in expected_identity.items():
+            if value.get(field) != expected:
+                fail(f"{label} sealed capture timeline {field} differs")
+
+    cross = require_exact_object(
+        offline_stop.get("legacy_height_cross_proof"),
+        {
+            "schema",
+            "source_main_commit",
+            "freeze_plan_sha256",
+            "capture_id",
+            "legacy_public_height_receipt_sha256",
+            "challenge",
+            "started_at",
+            "completed_at",
+            "conservative_height_floor",
+            "nodes",
+        },
+        "sealed legacy-height capture authorization",
+    )
+    cross_payload = canonical_bytes(cross)
+    cross_sha = sha256_bytes(cross_payload)
+    sealed_cross = require_exact_object(
+        evidence_bundle.get("authenticated_prefence_height_cross_proof"),
+        {"value", "sha256"},
+        "sealed legacy-height authorization wrapper",
+    )
+    public_root = require_exact_object(
+        boundary.get("legacy_public_height_receipt"),
+        {"schema", "sha256", "completed_at", "observed_max_height"},
+        "sealed legacy public-height boundary root",
+    )
+    if (
+        cross.get("schema") != "arc.recovery.authenticated-legacy-height-fleet.v1"
+        or any(cross.get(field) != expected for field, expected in expected_identity.items())
+        or cross.get("legacy_public_height_receipt_sha256") != height_receipt_sha
+        or sealed_cross.get("value") != cross
+        or sealed_cross.get("sha256") != cross_sha
+        or boundary.get("authenticated_prefence_height_cross_proof_sha256") != cross_sha
+        or public_root
+        != {
+            "schema": legacy_height.SCHEMA,
+            "sha256": height_receipt_sha,
+            "completed_at": height_receipt["completed_at"],
+            "observed_max_height": height_receipt["legacy_public_max_height"],
+        }
+    ):
+        fail("sealed legacy public-height capture timeline binding differs")
+
+    ledger_wrapper = require_exact_object(
+        evidence_bundle.get("quarantine_generation_ledger"),
+        {"value", "sha256"},
+        "sealed quarantine generation ledger wrapper",
+    )
+    ledger = ledger_wrapper.get("value")
+    if (not isinstance(ledger, dict)
+            or sha256_bytes(canonical_bytes(ledger)) != ledger_wrapper.get("sha256")):
+        fail("sealed quarantine generation ledger wrapper differs")
+    try:
+        ledger_state = quarantine_rounds.validate_generation_ledger(ledger)
+    except quarantine_rounds.QuarantineRoundError as error:
+        fail(f"sealed quarantine generation ledger differs: {error}")
+    if (ledger_state["capture_id"] != capture_id
+            or ledger_state["freeze_plan_sha256"] != freeze_sha
+            or boundary.get("quarantine_generation_ledger_sha256")
+                != ledger_wrapper.get("sha256")
+            or offline_stop.get("quarantine_generation_ledger_sha256")
+                != ledger_wrapper.get("sha256")):
+        fail("sealed quarantine generation ledger roots differ")
+
+    public_completed = _parse_utc_seconds(
+        height_receipt.get("completed_at"), "sealed legacy public-height completed_at"
+    )
+    fleet_started = _parse_utc_seconds(
+        cross.get("started_at"), "sealed authenticated-height fleet started_at"
+    )
+    fleet_completed = _parse_utc_seconds(
+        cross.get("completed_at"), "sealed authenticated-height fleet completed_at"
+    )
+    first_round_public = ledger["rounds"][0]["authorization"]["value"][
+        "public_height_receipt"
+    ]["value"]
+    first_round_public_started = _parse_utc_seconds(
+        first_round_public.get("started_at"),
+        "sealed first quarantine-round public started_at",
+    )
+    original_projection = {
+        **copy.deepcopy(height_receipt),
+        "schema": quarantine_rounds.TARGET_HEIGHT_SCHEMA,
+        "targets": [
+            {
+                "node": name,
+                "host": host,
+                "rpc_origin": next(
+                    row["origin"] for row in height_receipt["origins"]
+                    if row["name"] == name
+                ),
+            }
+            for name, host in quarantine_rounds.FLEET
+        ],
+    }
+    # Existing evidence may atomically authorize all six deadline-gated
+    # helpers from the original full-fleet sample.  Mixed-state recovery must
+    # instead take a new target-only sample after the diagnostic fleet bracket.
+    round_sample_after_fleet = (
+        first_round_public == original_projection
+        or fleet_completed <= first_round_public_started
+    )
+    first_quarantine = _parse_utc_seconds(
+        boundary.get("first_quarantine_started_at"),
+        "sealed first-quarantine boundary",
+    )
+    if first_quarantine != ledger_state["first_secured_at"]:
+        fail("sealed first-quarantine boundary is not the first actual secured transition")
+    all_stopped = _parse_utc_seconds(
+        boundary.get("all_controlled_stopped_at"),
+        "sealed all-controlled-stopped boundary",
+    )
+    boundary_created = _parse_utc_seconds(
+        boundary.get("created_at"), "sealed maintenance-boundary created_at"
+    )
+    if not (
+        public_completed
+        <= fleet_started
+        <= fleet_completed
+        and round_sample_after_fleet
+        and first_round_public_started
+        <= first_quarantine
+        <= ledger_state["all_nodes_secured_at"]
+        <= all_stopped
+        <= boundary_created
+    ):
+        fail(
+            "sealed legacy public-height capture timeline is not ordered "
+            "receipt<=fleet-start<=fleet-complete<=round-sample<=quarantine"
+            "<=stopped<=boundary"
+        )
+    if boundary.get("observed_cutoff_height") < ledger_state["legacy_cutoff_height"]:
+        fail("sealed maintenance cutoff precedes a quarantine generation")
+
+
 def validate_remote_stop_verification(
     value: Any,
     *,
@@ -3818,6 +4543,7 @@ def validate_remote_stop_verification(
     freeze: Mapping[str, Any],
     freeze_sha: str,
     evidence: Mapping[str, Any],
+    evidence_bundle: Mapping[str, Any],
     evidence_sha: str,
     known_hosts_sha: str,
     ssh_sha: str,
@@ -3864,23 +4590,96 @@ def validate_remote_stop_verification(
     if not isinstance(rows, list) or len(rows) != len(FLEET):
         fail("fresh offline-stop remote verification must contain all six ordered hosts")
     local_rows = evidence["nodes"]
-    status_fields = {
+    bundle_rows = evidence_bundle["nodes"]
+    active_status_fields = {
         "schema", "capture_id", "node", "host", "freeze_plan_sha256",
         "validator_address", "stake", "stopped", "restart_fenced", "stop_schema",
         "stop_complete_sha256", "stop_files_sha256", "challenge",
     }
+    stopped_status_fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "node", "host",
+        "transition_kind", "transition_receipt", "current_status", "challenge",
+    }
+
+    def fresh_wrapper(raw: Any, label: str) -> tuple[dict[str, Any], str]:
+        wrapper = require_exact_object(raw, {"value", "sha256"}, label)
+        inner = wrapper.get("value")
+        if not isinstance(inner, dict):
+            fail(f"{label} value is not an object")
+        digest = require_hash(wrapper.get("sha256"), f"{label} hash")
+        if sha256_bytes(canonical_bytes(inner)) != digest:
+            fail(f"{label} hash is not reproducible")
+        return inner, digest
+
     seen_statuses: set[str] = set()
-    for index, ((node, host), frozen, local, raw) in enumerate(
-        zip(FLEET, freeze["nodes"], local_rows, rows)
+    for index, ((node, host), frozen, local, bundle_node, raw) in enumerate(
+        zip(FLEET, freeze["nodes"], local_rows, bundle_rows, rows)
     ):
         row = require_exact_object(raw, {"node", "host", "status", "status_sha256"}, f"fresh stop node {index}")
         if row.get("node") != node or row.get("host") != host:
             fail(f"fresh offline-stop remote verification topology differs at {node}")
-        status = require_exact_object(row.get("status"), status_fields, f"fresh stop status {node}")
         status_sha = require_hash(row.get("status_sha256"), f"fresh stop status hash {node}")
+        if not isinstance(row.get("status"), dict):
+            fail(f"fresh stop status {node} is not an object")
+        is_stopped = (
+            bundle_node.get("transition_kind")
+            == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+        )
+        status = require_exact_object(
+            row["status"],
+            stopped_status_fields if is_stopped else active_status_fields,
+            f"fresh stop status {node}",
+        )
         if sha256_bytes(canonical_bytes(status)) != status_sha or status_sha in seen_statuses:
             fail(f"fresh offline-stop {node} status hash is not unique and reproducible")
         seen_statuses.add(status_sha)
+        if is_stopped:
+            transition, transition_sha = fresh_wrapper(
+                status.get("transition_receipt"),
+                f"fresh stopped {node} transition receipt",
+            )
+            current, _current_sha = fresh_wrapper(
+                status.get("current_status"),
+                f"fresh stopped {node} current status",
+            )
+            if (
+                status.get("schema")
+                != "arc.recovery.quarantine-persistently-stopped-challenged-status.v1"
+                or status.get("capture_id") != capture
+                or status.get("freeze_plan_sha256") != freeze_sha
+                or (status.get("node"), status.get("host")) != (node, host)
+                or status.get("transition_kind")
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or status.get("challenge") != challenge
+                or transition_sha != local.get("transition_receipt_sha256")
+                or status.get("transition_receipt")
+                != bundle_node.get("transition_receipt")
+            ):
+                fail(
+                    f"fresh offline-stop {node} stopped transition differs from "
+                    "the sealed maintenance evidence"
+                )
+            try:
+                normalized = quarantine_rounds.validate_node_transition(
+                    transition, node=node
+                )
+                quarantine_rounds.validate_prior_fenced_status(
+                    current,
+                    transition=transition,
+                    transition_sha256=transition_sha,
+                )
+            except quarantine_rounds.QuarantineRoundError as error:
+                fail(f"fresh offline-stop {node} stopped status is invalid: {error}")
+            if (
+                normalized.get("kind")
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or (normalized.get("node"), normalized.get("host")) != (node, host)
+            ):
+                fail(f"fresh offline-stop {node} stopped transition topology differs")
+            # The historical current-status root remains bound by the sealed
+            # offline receipt.  A fresh status may have a later observed_at and
+            # therefore must re-prove, rather than byte-match, that transition.
+            continue
         expected_status = {
             "schema": "arc.recovery.offline-stop-challenged-status.v1",
             "capture_id": capture,
@@ -4367,18 +5166,12 @@ def prearchive(args: argparse.Namespace) -> str:
         fail("staged protected pre-tag provenance set differs from the nine live proof transactions")
     metadata, metadata_sha = validate_build_metadata(args)
     freeze, freeze_payload, freeze_sha, freeze_sidecar_sha, freeze_sidecar = validate_freeze_inputs(args)
-    try:
-        height_receipt, prequarantine_public_max_height = legacy_height.load_and_validate_receipt(
-            args.legacy_public_height_receipt,
-            source_main=args.source_main_sha,
-            freeze_sha=freeze_sha,
-            max_age_seconds=300,
-        )
-    except legacy_height.HeightReceiptError as error:
-        fail(f"legacy public-height receipt failed validation: {error}")
-    height_receipt_sha, _ = hash_secure(
-        args.legacy_public_height_receipt, "legacy public-height receipt"
-    )
+    (
+        height_receipt,
+        prequarantine_public_max_height,
+        height_receipt_sha,
+        height_receipt_payload,
+    ) = load_intrinsic_legacy_public_height_receipt(args, freeze_sha=freeze_sha)
     genesis_info, genesis_validators = validate_genesis(args.genesis)
     _public_keys, public_keys_sha, _public_keys_size = validate_validator_public_keys(
         args.validator_public_keys, genesis_validators
@@ -4444,6 +5237,15 @@ def prearchive(args: argparse.Namespace) -> str:
         height_receipt,
         height_receipt_sha,
     )
+    validate_sealed_legacy_height_capture_timeline(
+        args=args,
+        freeze_sha=freeze_sha,
+        height_receipt=height_receipt,
+        height_receipt_sha=height_receipt_sha,
+        evidence_bundle=maintenance_evidence_bundle,
+        boundary=maintenance_boundary,
+        offline_stop=offline_stop,
+    )
     known_hosts_sha, _known_hosts_size, known_hosts_payload = validate_known_hosts(
         args.ssh_known_hosts
     )
@@ -4472,6 +5274,7 @@ def prearchive(args: argparse.Namespace) -> str:
         freeze=freeze,
         freeze_sha=freeze_sha,
         evidence=offline_stop,
+        evidence_bundle=maintenance_evidence_bundle,
         evidence_sha=offline_stop_sha,
         known_hosts_sha=known_hosts_sha,
         ssh_sha=ssh_sha,
@@ -4723,17 +5526,26 @@ def prearchive(args: argparse.Namespace) -> str:
         fail("freeze plan checksum changed before prearchive publication")
     if hash_secure(args.validator_public_keys, "validator public-key manifest")[0] != public_keys_sha:
         fail("validator public-key manifest changed before prearchive publication")
-    try:
-        _receipt, final_legacy_max = legacy_height.load_and_validate_receipt(
-            args.legacy_public_height_receipt,
-            source_main=args.source_main_sha,
-            freeze_sha=freeze_sha,
-            max_age_seconds=300,
-        )
-    except legacy_height.HeightReceiptError as error:
-        fail(f"legacy public-height receipt failed final freshness check: {error}")
-    if final_legacy_max != prequarantine_public_max_height:
+    final_height_payload, _ = read_secure(
+        args.legacy_public_height_receipt,
+        label="legacy public-height receipt final recheck",
+        maximum_bytes=16 * 1024 * 1024,
+        exact_mode=0o400,
+    )
+    if (
+        final_height_payload != height_receipt_payload
+        or sha256_bytes(final_height_payload) != height_receipt_sha
+    ):
         fail("legacy public-height receipt changed before prearchive publication")
+    validate_sealed_legacy_height_capture_timeline(
+        args=args,
+        freeze_sha=freeze_sha,
+        height_receipt=height_receipt,
+        height_receipt_sha=height_receipt_sha,
+        evidence_bundle=maintenance_evidence_bundle,
+        boundary=maintenance_boundary,
+        offline_stop=offline_stop,
+    )
     final_bundle_payload, _ = read_secure(
         args.legacy_maintenance_evidence_bundle,
         label="legacy maintenance evidence bundle final recheck",
@@ -4861,6 +5673,7 @@ def prearchive(args: argparse.Namespace) -> str:
         freeze=freeze,
         freeze_sha=freeze_sha,
         evidence=offline_stop,
+        evidence_bundle=maintenance_evidence_bundle,
         evidence_sha=offline_stop_sha,
         known_hosts_sha=known_hosts_sha,
         ssh_sha=ssh_sha,

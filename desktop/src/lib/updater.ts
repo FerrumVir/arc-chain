@@ -40,6 +40,7 @@ export const appUpdater = createUpdateController({
     return candidate;
   },
   prepareRelaunch: api.prepareUpdateRelaunch,
+  beginHandoff: api.beginUpdateHandoff,
   abortRelaunch: api.abortUpdateRelaunch,
   relaunch: tauriRelaunch,
 });

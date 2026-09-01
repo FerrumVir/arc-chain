@@ -63,6 +63,7 @@ export interface ConfirmedRewardReceipt {
   blockHash: string;
   rewardBase: number;
   rewardArc: number;
+  receiptUrl: string;
   recoveryEpoch: number | null;
   validatorSetId: number | null;
 }
@@ -92,6 +93,10 @@ export interface Earnings {
   receiptSource: string | null;
   /** Whether the selected host reports archival state. */
   archiveMode: boolean | null;
+  /** True only when the host explicitly binds archive retention to v3 recovery. */
+  historyCompleteSinceRecovery: boolean | null;
+  /** Exact backend-declared reward-history boundary/window. */
+  historyScope: string | null;
   /** True only for the candidate's mined-0x25 receipt/readiness contract. */
   fromChain: boolean;
 }
@@ -570,10 +575,19 @@ export interface InferenceSettlement {
   txType: string;
   txHash: string;
   jobId: string;
+  /** Worker identity bound into the 0x25 body and canonical receipt. */
+  worker: string;
   submitted: boolean;
   included: boolean;
   /** True only for a successful mined reward receipt. */
   confirmed: boolean;
+  /** True for a successful receipt, false for a mined failure, null while pending. */
+  success: boolean | null;
+  blockHeight: number | null;
+  blockHash: string | null;
+  index: number | null;
+  /** Exact base-unit reward, populated only for a successful mined receipt. */
+  rewardBase: number | null;
   rewardArc: number | null;
   receiptUrl: string;
 }

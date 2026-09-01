@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
+const TEST_WORKER = "99".repeat(32);
+
 async function useLiveEarningsBody(
   page: import("@playwright/test").Page,
   earningsBody: Record<string, unknown>,
@@ -46,6 +48,7 @@ async function useLiveEarningsBody(
 
 function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
   return {
+    address: `0x${TEST_WORKER}`,
     total_rewards: 2,
     estimated_total_arc: 5,
     confirmed_receipt_count: 2,
@@ -56,9 +59,14 @@ function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
         tx_type: "0x25",
         tx_hash: `0x${"aa".repeat(32)}`,
         job_id: `0x${"01".repeat(32)}`,
+        worker: `0x${TEST_WORKER}`,
         block_height: 123_461,
         block_hash: `0x${"10".repeat(32)}`,
+        submitted: true,
+        included: true,
+        confirmed: true,
         success: true,
+        receipt_url: `/community/reward_receipt/0x${"aa".repeat(32)}`,
         reward_base: 2_500_000_000,
         reward_arc: 2.5,
         recovery_epoch: 1,
@@ -68,9 +76,14 @@ function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
         tx_type: "0x25",
         tx_hash: `0x${"ab".repeat(32)}`,
         job_id: `0x${"02".repeat(32)}`,
+        worker: `0x${TEST_WORKER}`,
         block_height: 123_462,
         block_hash: `0x${"11".repeat(32)}`,
+        submitted: true,
+        included: true,
+        confirmed: true,
         success: true,
+        receipt_url: `/community/reward_receipt/0x${"ab".repeat(32)}`,
         reward_base: 2_500_000_000,
         reward_arc: 2.5,
         recovery_epoch: 1,
@@ -81,6 +94,10 @@ function candidateEarningsBody(overrides: Record<string, unknown> = {}) {
       "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
     source: "scan of this node's in-memory full_transactions map",
     archive_mode: false,
+    history_complete_since_recovery: false,
+    history_scope: "this node's bounded retained reward-receipt window",
+    history_domain:
+      "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain",
     today_arc: null,
     projected_daily_arc: null,
     projected_daily_unavailable_reason:
@@ -103,9 +120,14 @@ function candidateProjectionBody(receiptCount: 0 | 1 | 2 | 3) {
     tx_type: "0x25",
     tx_hash: `0x${"ac".repeat(32)}`,
     job_id: `0x${"03".repeat(32)}`,
+    worker: `0x${TEST_WORKER}`,
     block_height: 123_463,
     block_hash: `0x${"12".repeat(32)}`,
+    submitted: true,
+    included: true,
+    confirmed: true,
     success: true,
+    receipt_url: `/community/reward_receipt/0x${"ac".repeat(32)}`,
     reward_base: 2_500_000_000,
     reward_arc: 2.5,
     recovery_epoch: 1,
@@ -165,6 +187,7 @@ test.describe("Dashboard", () => {
     page,
   }) => {
     await useLiveEarningsBody(page, {
+      address: `0x${TEST_WORKER}`,
       total_attestations: 7,
       total_arc: 17.5,
       today_arc: 2.5,
@@ -341,6 +364,60 @@ test.describe("Dashboard", () => {
     const rows = body.confirmed_receipts as Array<Record<string, unknown>>;
     rows[0].job_id = "0xdeadbeef";
     await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
+  });
+
+  test("earnings and projection reject a response bound to another worker", async ({ page }) => {
+    const other = "98".repeat(32);
+    const body = candidateProjectionBody(3);
+    body.address = `0x${other}`;
+    for (const row of body.confirmed_receipts) row.worker = `0x${other}`;
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+    await expect(page.getByTestId("projection-unavailable")).toContainText(
+      "not bound to the requested worker address",
+    );
+  });
+
+  test("earnings reject a receipt attributed to another worker", async ({ page }) => {
+    const body = candidateEarningsBody();
+    body.confirmed_receipts[0].worker = `0x${"98".repeat(32)}`;
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
+  });
+
+  test("incomplete receipt truth flags fail closed", async ({ page }) => {
+    const body = candidateEarningsBody();
+    const rows = body.confirmed_receipts as Array<Record<string, unknown>>;
+    rows[0].included = false;
+    await useLiveEarningsBody(page, body);
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
+  });
+
+  test("archive copy requires the explicit canonical recovery-history scope", async ({ page }) => {
+    await useLiveEarningsBody(page, candidateEarningsBody({
+      archive_mode: true,
+      history_complete_since_recovery: false,
+      history_scope: "this node's bounded retained reward-receipt window",
+    }));
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("earnings-unavailable")).toContainText(
+      "did not provide the candidate mined-0x25 retained-receipt contract",
+    );
+    await expect(page.getByText("Gross mined rewards · canonical v3")).toHaveCount(0);
+  });
+
+  test("earnings reject a current-epoch-only history-domain claim", async ({ page }) => {
+    await useLiveEarningsBody(page, candidateEarningsBody({
+      history_domain: "current recovery epoch only",
+    }));
     await page.goto("/");
     await expect(page.getByTestId("earnings-total")).toContainText("not confirmed");
   });

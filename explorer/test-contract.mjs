@@ -17,6 +17,38 @@ const legacyHtml = readFileSync(join(here, "index-live.html"), "utf8");
 
 const H = 88;
 const hex = (char) => char.repeat(64);
+const rewardActivity = (overrides = {}) => ({
+  schema: "arc.inference.activity.v1",
+  record_kind: "mined_community_inference_reward",
+  source: "chain_receipt",
+  mined: true,
+  receipt_status: "success",
+  success: true,
+  computed: true,
+  paid: true,
+  earned: true,
+  submitted: true,
+  included: true,
+  confirmed: true,
+  tx_type: "CommunityInferenceReward",
+  tx_type_code: "0x25",
+  block_height: H + 2,
+  block_hash: hex("8"),
+  index: 0,
+  tx_hash: hex("6"),
+  job_id: hex("7"),
+  worker: hex("9"),
+  reward_base: 2_500_000_000,
+  reward_arc: 2.5,
+  receipt_url: `/community/reward_receipt/0x${hex("6")}`,
+  payment: {
+    status: "earned",
+    receipt_backed: true,
+    reward_base: 2_500_000_000,
+    reward_arc: 2.5,
+  },
+  ...overrides,
+});
 const forkArchive = {
   schema: "arc.legacy-archive.source.v1",
   readOnly: true,
@@ -143,39 +175,25 @@ await test("extracts and sorts block collections without mutating input", () => 
 await test("inference activity consumes v3 0x25 activity rows before legacy attestations", () => {
   const paid = { record_kind: "mined_community_inference_reward", tx_type: "CommunityInferenceReward", tx_hash: hex("6") };
   assert.deepEqual(app.extractRows({ activities: [paid], attestations: [{ tx_hash: hex("7") }] }), [paid]);
-  const classification = network.classifyReceipt({
-    schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward",
-    source: "chain_receipt", mined: true, receipt_status: "success", success: true,
-    computed: true, paid: true, earned: true,
-    tx_type: "CommunityInferenceReward", tx_type_code: "0x25",
-    block_height: H + 2, tx_hash: hex("6"),
-  });
+  const classification = network.classifyReceipt(rewardActivity());
   assert.equal(classification.inferenceConfirmed, true);
   assert.equal(classification.paymentConfirmed, true);
   assert.equal(classification.rewardEarned, true);
 });
 
 await test("explorer activity rejects fuzzy reward names and absent or invalid transaction hashes", () => {
-  const common = {
-    schema: "arc.inference.activity.v1",
-    record_kind: "mined_community_inference_reward",
-    source: "chain_receipt",
-    mined: true,
-    receipt_status: "success",
-    success: true,
-    computed: true,
-    paid: true,
-    earned: true,
-    tx_type: "CommunityInferenceReward",
-    tx_type_code: "0x25",
-    block_height: H + 2,
-    tx_hash: hex("6"),
-  };
+  const common = rewardActivity();
   for (const overrides of [
     { tx_type: "InferenceRewardBogus" },
     { tx_type: "CommunityRewardPreview" },
     { tx_hash: undefined },
     { tx_hash: "not-a-hash" },
+    { worker: undefined },
+    { job_id: "not-a-hash" },
+    { block_hash: undefined },
+    { index: -1 },
+    { reward_base: 2_499_999_999 },
+    { reward_arc: 2.49 },
   ]) {
     const classification = network.classifyReceipt({ ...common, ...overrides });
     assert.equal(classification.inferenceConfirmed, false);
@@ -346,6 +364,13 @@ await test("request helper performs only source-relative GET requests", async ()
   assert.equal(calls[0].options.method, "GET");
   assert.equal(calls[0].options.cache, "no-store");
   await assert.rejects(app.requestJson(mockFetch({}), sourceConfig, "https://evil.example/health"), /source-relative/);
+});
+
+await test("lookup failures use their own abort controller and render the intended error", () => {
+  assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 3);
+  assert.doesNotMatch(source, /signal: state\.lookupController\.signal/);
+  assert.doesNotMatch(source, /if \(!signal\.aborted\) inspectorError\("Block"/);
+  assert.match(source, /if \(!controller\.signal\.aborted\) inspectorError\("Block", "Block unavailable", error\.message\)/);
 });
 
 await test("entry page loads shared resolver before explorer application", () => {

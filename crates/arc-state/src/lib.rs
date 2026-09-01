@@ -472,6 +472,13 @@ pub struct StateDB {
     /// Archive mode - when true, skips all pruning (keeps full history).
     /// Used by block explorers and analytics nodes.
     pub archive_mode: bool,
+    /// Earliest block at or after the initial protocol-v3 recovery boundary
+    /// whose complete transaction/receipt history was verified. `u64::MAX`
+    /// means the claim has not been established.
+    archive_history_boundary: AtomicU64,
+    /// Highest block whose full block → tx index → body → receipt bindings
+    /// were verified while archive mode was already enabled.
+    archive_history_verified_through: AtomicU64,
     /// Canonical genesis-committed activation height for community reward v1.
     /// `u64::MAX` means disabled. This runtime copy is not mutable through RPC;
     /// nodes derive it from the genesis configuration whose semantic hash is
@@ -562,6 +569,8 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            archive_history_boundary: AtomicU64::new(u64::MAX),
+            archive_history_verified_through: AtomicU64::new(u64::MAX),
             community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
@@ -608,6 +617,8 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            archive_history_boundary: AtomicU64::new(u64::MAX),
+            archive_history_verified_through: AtomicU64::new(u64::MAX),
             community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
@@ -859,7 +870,26 @@ impl StateDB {
                 }
             }
             WalOp::SetBlock(height, block) => {
-                self.blocks.insert(*height, block.clone());
+                // `tx_index` is derived from canonical block bodies and has no
+                // independent WAL record. Rebuild it while replaying each
+                // durable block so archive completeness can be recomputed
+                // after restart rather than depending on pre-crash memory.
+                if let Some(replaced) = self.blocks.insert(*height, block.clone()) {
+                    for old_hash in replaced.tx_hashes {
+                        let points_to_replaced_height = self
+                            .tx_index
+                            .get(&old_hash.0)
+                            .is_some_and(|location| location.value().0 == *height);
+                        if points_to_replaced_height {
+                            self.tx_index.remove(&old_hash.0);
+                        }
+                    }
+                }
+                for (index, tx_hash) in block.tx_hashes.iter().enumerate() {
+                    if let Ok(index) = u32::try_from(index) {
+                        self.tx_index.insert(tx_hash.0, (*height, index));
+                    }
+                }
                 let mut h = self.height.write();
                 if *height > *h {
                     *h = *height;
@@ -2225,6 +2255,14 @@ impl StateDB {
     /// entries (DashMap has no insertion order; a proper LRU would require
     /// an ordered map, but this simple cap prevents OOM).
     pub fn evict_transactions(&self, max_entries: usize) {
+        // Archive mode is a durability contract, not merely a longer cache.
+        // Removing a body here also makes an old mined reward disappear from
+        // `/worker/earnings`, and deleting its WAL segment makes that loss
+        // survive restart.  Archive operators explicitly accept unbounded
+        // history growth and must retain both the in-memory index and WAL.
+        if self.archive_mode {
+            return;
+        }
         let current = self.full_transactions.len();
         if current <= max_entries {
             return;
@@ -7844,10 +7882,148 @@ impl StateDB {
             .sum()
     }
 
+    /// Enable no-pruning mode and prove whether this data set is complete from
+    /// the *initial* protocol-v3 recovery boundary.
+    ///
+    /// Merely toggling archive mode cannot establish historical completeness:
+    /// a node may already have pruned transaction bodies or receipts. The
+    /// proof walks every v3-and-later block once and binds its committed
+    /// transaction vector to the tx index, full body, and exact receipt. A
+    /// future recovery checkpoint that omits any earlier v3 row therefore
+    /// stays incomplete even though pruning is disabled after import.
+    pub fn enable_archive_mode(&mut self) -> bool {
+        self.archive_mode = true;
+        self.archive_history_boundary
+            .store(u64::MAX, Ordering::Release);
+        self.archive_history_verified_through
+            .store(u64::MAX, Ordering::Release);
+
+        if self.recovery_context().is_none() {
+            return false;
+        }
+        let current = self.height();
+        let boundary = (0..=current).find(|height| {
+            self.get_block(*height)
+                .is_some_and(|block| block.header.protocol_version.major >= 3)
+        });
+        let Some(boundary) = boundary else {
+            return false;
+        };
+        if !self.verify_archive_history_range(boundary, current) {
+            return false;
+        }
+        self.archive_history_boundary
+            .store(boundary, Ordering::Release);
+        self.archive_history_verified_through
+            .store(current, Ordering::Release);
+        true
+    }
+
+    /// True only after [`Self::enable_archive_mode`] proved every canonical
+    /// transaction and receipt from the initial v3 recovery boundary. New
+    /// archive blocks are checked incrementally before extending the claim.
+    pub fn archive_reward_history_complete_since_v3_recovery(&self) -> bool {
+        if !self.archive_mode || self.recovery_context().is_none() {
+            return false;
+        }
+        let boundary = self.archive_history_boundary.load(Ordering::Acquire);
+        let verified = self
+            .archive_history_verified_through
+            .load(Ordering::Acquire);
+        if boundary == u64::MAX || verified == u64::MAX || verified < boundary {
+            return false;
+        }
+        let current = self.height();
+        if current < verified {
+            return false;
+        }
+        if current == verified {
+            return true;
+        }
+        if !self.verify_archive_history_range(verified.saturating_add(1), current) {
+            // A block can be observed between the height increment and its
+            // final index publication. Return a transient false without
+            // destroying the already-proven prefix.
+            return false;
+        }
+        self.archive_history_verified_through
+            .store(current, Ordering::Release);
+        true
+    }
+
+    fn verify_archive_history_range(&self, from: u64, through: u64) -> bool {
+        if from > through {
+            return true;
+        }
+        // A later recovery epoch changes the signing domain. Reward bodies
+        // retain their exact historical domain, and every protected recovery
+        // rollout mines canonical reward canaries, so the archive can verify
+        // all retained transaction bodies without incorrectly applying only
+        // today's domain to older v3 blocks.
+        let mut recovery_domains = HashSet::new();
+        if let Some(domain) = self.transaction_domain_hash() {
+            recovery_domains.insert(domain);
+        }
+        for transaction in self.full_transactions.iter() {
+            if let TxBody::CommunityInferenceReward(body) = &transaction.body
+                && body.transaction_domain != Hash256::ZERO
+            {
+                recovery_domains.insert(body.transaction_domain);
+            }
+        }
+        for height in from..=through {
+            let Some(block) = self.get_block(height) else {
+                return false;
+            };
+            if block.header.height != height
+                || block.hash != Block::compute_hash(&block.header)
+                || block.header.tx_count as usize != block.tx_hashes.len()
+                || MerkleTree::from_leaves(block.tx_hashes.clone()).root() != block.header.tx_root
+            {
+                return false;
+            }
+            for (index, tx_hash) in block.tx_hashes.iter().enumerate() {
+                let Ok(index_u32) = u32::try_from(index) else {
+                    return false;
+                };
+                if self
+                    .tx_index
+                    .get(&tx_hash.0)
+                    .is_none_or(|location| *location.value() != (height, index_u32))
+                {
+                    return false;
+                }
+                let Some(transaction) = self.full_transactions.get(&tx_hash.0) else {
+                    return false;
+                };
+                if transaction.hash != *tx_hash
+                    || transaction.tx_type != transaction.body.tx_type()
+                    || !recovery_domains
+                        .iter()
+                        .any(|domain| transaction.compute_hash_in_domain(domain) == *tx_hash)
+                {
+                    return false;
+                }
+                if self.receipts.get(&tx_hash.0).is_none_or(|receipt| {
+                    receipt.tx_hash != *tx_hash
+                        || receipt.block_height != height
+                        || receipt.block_hash != block.hash
+                        || receipt.index != index_u32
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Prune old JMT state, keeping the last `keep_versions` versions.
     /// This frees memory for historical state that is no longer needed for
     /// rollback or proofs.
     pub fn prune_old_state(&self, keep_versions: u64) {
+        if self.archive_mode {
+            return;
+        }
         let mut jmt = self.jmt.lock();
         let current = jmt.version();
         if current > keep_versions {
@@ -7861,6 +8037,9 @@ impl StateDB {
     /// This prevents unbounded memory growth at high TPS by discarding
     /// historical receipt data that is no longer needed for normal operation.
     pub fn prune_old_receipts(&self, keep_blocks: u64) {
+        if self.archive_mode {
+            return;
+        }
         let current = self.height();
         if current <= keep_blocks {
             return;
@@ -10705,6 +10884,319 @@ mod tests {
         // keep_blocks > current height → nothing pruned.
         state.prune_old_receipts(1000);
         assert_eq!(state.receipts.len(), 1);
+    }
+
+    #[test]
+    fn archive_mode_disables_receipt_transaction_and_wal_pruning_across_restart() {
+        let directory = persistent_test_dir("archive-history-restart");
+        let genesis_hash = hash_bytes(b"archive-history-genesis");
+        let prefunded = [(addr(1), 10_000_000), (addr(2), 10_000_000)];
+        let mut state =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.enable_archive_mode();
+
+        let mut hashes = Vec::new();
+        for nonce in 0..3 {
+            let transaction = Transaction::new_transfer(addr(1), addr(2), 100, nonce);
+            hashes.push(transaction.hash.0);
+            state.execute_block(&[transaction], addr(99)).unwrap();
+        }
+        state.sync_wal();
+        let wal_bytes = std::fs::metadata(directory.join("state.wal"))
+            .unwrap()
+            .len();
+
+        state.prune_old_receipts(0);
+        state.evict_transactions(0);
+        assert_eq!(state.receipts.len(), 3);
+        assert_eq!(state.full_transactions.len(), 3);
+        assert_eq!(
+            std::fs::metadata(directory.join("state.wal"))
+                .unwrap()
+                .len(),
+            wal_bytes
+        );
+        drop(state);
+
+        let mut recovered =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        recovered.enable_archive_mode();
+        for hash in hashes {
+            assert!(recovered.get_transaction(&hash).is_some());
+            assert!(recovered.get_receipt(&hash).is_some());
+        }
+        recovered.evict_transactions(0);
+        recovered.prune_old_receipts(0);
+        assert_eq!(recovered.receipts.len(), 3);
+        assert_eq!(recovered.full_transactions.len(), 3);
+        drop(recovered);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn archive_lifetime_history_requires_complete_v3_block_body_and_receipt_bindings() {
+        let mut state = StateDB::new();
+        let recovery_context = recovery::RecoveryContext::new(
+            "arc-history-test",
+            hash_bytes(b"archive-history-recovery-genesis"),
+            1,
+            1,
+        );
+        *state.recovery_context.write() = Some(recovery_context.clone());
+        *state.recovery_manifest_hash.write() = Some(hash_bytes(b"archive-history-manifest"));
+
+        let mut transaction = Transaction::new_transfer(addr(1), addr(2), 1, 0);
+        transaction.hash = transaction.compute_hash_in_domain(&recovery_context.domain_hash());
+        let transaction_hash = transaction.hash;
+        let tx_hashes = vec![transaction_hash];
+        let header = BlockHeader {
+            height: 0,
+            timestamp: 1,
+            parent_hash: Hash256::ZERO,
+            tx_root: MerkleTree::from_leaves(tx_hashes.clone()).root(),
+            state_root: Hash256::ZERO,
+            proof_hash: Hash256::ZERO,
+            tx_count: 1,
+            producer: addr(9),
+            protocol_version: recovery::RECOVERY_PROTOCOL_VERSION,
+            state_diff: None,
+        };
+        let block = Block::new(header, tx_hashes);
+        state.blocks.insert(0, block.clone());
+        state.tx_index.insert(transaction_hash.0, (0, 0));
+        state
+            .full_transactions
+            .insert(transaction_hash.0, transaction);
+        *state.height.write() = 0;
+
+        assert!(
+            !state.enable_archive_mode(),
+            "archive mode cannot manufacture a missing historical receipt"
+        );
+        assert!(!state.archive_reward_history_complete_since_v3_recovery());
+
+        state.receipts.insert(
+            transaction_hash.0,
+            TxReceipt {
+                tx_hash: transaction_hash,
+                block_height: 0,
+                block_hash: block.hash,
+                index: 0,
+                success: true,
+                gas_used: 0,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        );
+        assert!(state.enable_archive_mode());
+        assert!(state.archive_reward_history_complete_since_v3_recovery());
+
+        // A node that ran without archive retention and lost a historical row
+        // cannot regain the lifetime claim merely by toggling the flag later.
+        state.archive_mode = false;
+        state.receipts.remove(&transaction_hash.0);
+        assert!(!state.enable_archive_mode());
+        assert!(!state.archive_reward_history_complete_since_v3_recovery());
+    }
+
+    fn install_historical_archive_reward(
+        state: &StateDB,
+        historical_context: &recovery::RecoveryContext,
+        current_context: &recovery::RecoveryContext,
+        height: u64,
+        parent_hash: Hash256,
+        tag: &[u8],
+    ) -> (Hash256, Block, TxReceipt) {
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        *state.recovery_context.write() = Some(historical_context.clone());
+        let transaction = make_recovery_signed_community_reward(
+            state,
+            &validators[0],
+            &worker,
+            &validators,
+            height,
+            tag,
+        );
+        *state.recovery_context.write() = Some(current_context.clone());
+
+        let transaction_hash = transaction.hash;
+        let tx_hashes = vec![transaction_hash];
+        let header = BlockHeader {
+            height,
+            timestamp: 1_787_857_623_010 + height,
+            parent_hash,
+            tx_root: MerkleTree::from_leaves(tx_hashes.clone()).root(),
+            state_root: Hash256::ZERO,
+            proof_hash: Hash256::ZERO,
+            tx_count: 1,
+            producer: validators[0].address(),
+            protocol_version: recovery::RECOVERY_PROTOCOL_VERSION,
+            state_diff: None,
+        };
+        let block = Block::new(header, tx_hashes);
+        let receipt = TxReceipt {
+            tx_hash: transaction_hash,
+            block_height: height,
+            block_hash: block.hash,
+            index: 0,
+            success: true,
+            gas_used: 0,
+            value_commitment: None,
+            inclusion_proof: None,
+            logs: Vec::new(),
+        };
+        state.blocks.insert(height, block.clone());
+        state.tx_index.insert(transaction_hash.0, (height, 0));
+        state
+            .full_transactions
+            .insert(transaction_hash.0, transaction);
+        state.receipts.insert(transaction_hash.0, receipt.clone());
+        *state.height.write() = height;
+        (transaction_hash, block, receipt)
+    }
+
+    #[test]
+    fn archive_history_completeness_recomputes_from_durable_v3_evidence_after_restart() {
+        let directory = persistent_test_dir("archive-completeness-restart");
+        let genesis_hash = hash_bytes(b"archive-completeness-restart-genesis");
+        let historical_context =
+            recovery::RecoveryContext::new("arc-history-restart", genesis_hash, 1, 7);
+        let current_context =
+            recovery::RecoveryContext::new("arc-history-restart", genesis_hash, 2, 8);
+        let mut state = StateDB::with_genesis_persistent(&[], &directory, genesis_hash).unwrap();
+        let parent_hash = state.get_block(0).expect("durable genesis block").hash;
+        let (transaction_hash, block, receipt) = install_historical_archive_reward(
+            &state,
+            &historical_context,
+            &current_context,
+            1,
+            parent_hash,
+            b"durable-historical-reward",
+        );
+        state.wal.append(WalOp::SetBlock(1, block.clone()), 1);
+        state.wal.append(
+            WalOp::SetFullTransaction(
+                transaction_hash,
+                Box::new(
+                    state
+                        .get_transaction(&transaction_hash.0)
+                        .expect("installed full transaction"),
+                ),
+            ),
+            1,
+        );
+        state
+            .wal
+            .append(WalOp::SetReceipt(transaction_hash, receipt.clone()), 1);
+        state.wal.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+        state.sync_wal();
+
+        assert!(state.enable_archive_mode());
+        assert!(state.archive_reward_history_complete_since_v3_recovery());
+        drop(state);
+
+        let mut restarted =
+            StateDB::with_genesis_persistent(&[], &directory, genesis_hash).unwrap();
+        *restarted.recovery_context.write() = Some(current_context.clone());
+        assert!(
+            !restarted.archive_reward_history_complete_since_v3_recovery(),
+            "the in-memory completeness marker itself must not survive restart"
+        );
+        assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(
+            restarted.get_transaction(&transaction_hash.0).unwrap().hash,
+            transaction_hash
+        );
+        let restored_receipt = restarted.get_receipt(&transaction_hash.0).unwrap();
+        assert_eq!(restored_receipt.tx_hash, receipt.tx_hash);
+        assert_eq!(restored_receipt.block_height, receipt.block_height);
+        assert_eq!(restored_receipt.block_hash, receipt.block_hash);
+        assert_eq!(restored_receipt.index, receipt.index);
+        assert_eq!(restored_receipt.success, receipt.success);
+        assert_eq!(restarted.get_tx_location(&transaction_hash.0), Some((1, 0)));
+        assert!(
+            restarted.enable_archive_mode(),
+            "restored canonical block/body/receipt/index evidence must re-establish completeness"
+        );
+        assert!(restarted.archive_reward_history_complete_since_v3_recovery());
+        drop(restarted);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn historical_archive_state(tag: &[u8]) -> (StateDB, Hash256, Hash256) {
+        let state = StateDB::new();
+        let genesis_hash = hash_bytes(b"archive-historical-domain-corruption");
+        let historical_context =
+            recovery::RecoveryContext::new("arc-history-corruption", genesis_hash, 1, 7);
+        let current_context =
+            recovery::RecoveryContext::new("arc-history-corruption", genesis_hash, 2, 8);
+        let historical_domain = historical_context.domain_hash();
+        let (transaction_hash, _, _) = install_historical_archive_reward(
+            &state,
+            &historical_context,
+            &current_context,
+            0,
+            Hash256::ZERO,
+            tag,
+        );
+        (state, transaction_hash, historical_domain)
+    }
+
+    #[test]
+    fn archive_history_rejects_discriminator_and_body_hash_corruption_in_historical_domain() {
+        let (mut valid, valid_hash, historical_domain) =
+            historical_archive_state(b"historical-valid");
+        assert_ne!(
+            valid.transaction_domain_hash().unwrap(),
+            historical_domain,
+            "the fixture must exercise an earlier recovery domain"
+        );
+        assert_eq!(
+            valid
+                .get_transaction(&valid_hash.0)
+                .unwrap()
+                .compute_hash_in_domain(&historical_domain),
+            valid_hash
+        );
+        assert!(valid.enable_archive_mode());
+
+        let (mut wrong_discriminator, discriminator_hash, _) =
+            historical_archive_state(b"historical-wrong-discriminator");
+        wrong_discriminator
+            .full_transactions
+            .get_mut(&discriminator_hash.0)
+            .unwrap()
+            .tx_type = TxType::Transfer;
+        assert!(
+            !wrong_discriminator.enable_archive_mode(),
+            "an envelope discriminator that differs from the retained body must fail closed"
+        );
+        assert!(!wrong_discriminator.archive_reward_history_complete_since_v3_recovery());
+
+        let (mut wrong_body, body_hash, historical_domain) =
+            historical_archive_state(b"historical-wrong-body-hash");
+        {
+            let mut transaction = wrong_body.full_transactions.get_mut(&body_hash.0).unwrap();
+            let TxBody::CommunityInferenceReward(body) = &mut transaction.body else {
+                panic!("historical archive fixture must contain a 0x25 body");
+            };
+            body.output_hash = hash_bytes(b"corrupted-retained-output");
+            assert_ne!(
+                transaction.compute_hash_in_domain(&historical_domain),
+                body_hash
+            );
+        }
+        assert!(
+            !wrong_body.enable_archive_mode(),
+            "a retained body that no longer hashes to its historical-domain key must fail closed"
+        );
+        assert!(!wrong_body.archive_reward_history_complete_since_v3_recovery());
     }
 
     // ── State rent tests ──────────────────────────────────────────────────

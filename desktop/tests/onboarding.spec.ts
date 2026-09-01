@@ -22,7 +22,7 @@ test.describe("Onboarding wizard", () => {
     // Identity (no role / hardware step - the role is derived later from
     // whether a model was downloaded)
     await expect(page.getByTestId("step-identity")).toBeVisible();
-    await expect(page.getByTestId("identity-address")).toContainText("arc1q");
+    await expect(page.getByTestId("identity-address")).toContainText("99".repeat(16));
     await expect(page.getByTestId("btn-continue-identity")).toBeDisabled();
     await page.getByTestId("btn-reveal-seed").click();
     await expect(page.getByTestId("btn-continue-identity")).toBeEnabled();

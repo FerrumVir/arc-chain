@@ -58,17 +58,96 @@ all_six_exact_writers_stop_before_content_capture() {
 import pathlib,sys
 t=pathlib.Path(sys.argv[1]).read_text(); b=t[t.index("capture_phase()"):t.index("manifest_field()")]
 assert b.index('run_drive_prefreeze_gate execute') < b.index('capture_all_live_observations')
-quarantine=b.index('run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id"')
-stop=b.index('ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" "$node"')
+height_cross=b.index('capture_authenticated_legacy_height_cross_proof "$freeze_plan"')
+rounds=b.index('run_quarantine_generation_rounds')
+first_boundary=b.index('build-first-boundary')
+stop=b.index('stop_after_quarantine_round_exact')
 capture=b.index('ensure_offline_capture "$capture_id" "$node"')
 persisted=b.index('run_persisted_head_exact "$freeze_plan"')
 boundary=b.index('create_legacy_maintenance_boundary')
 offline=b.index('create_offline_stop_evidence')
-assert b.index('capture_all_live_observations') < quarantine < stop < capture < persisted < boundary < offline
+assert b.index('capture_all_live_observations') < height_cross < rounds < first_boundary
+assert first_boundary < stop < capture < persisted < boundary < offline
 assert 'ALL SIX CONTROLLED WRITERS HALTED' in b and 'no global halt is claimed' in b
+for required in ('sample-targets', 'quarantine-round-authorize',
+                 'quarantine-round-ready', 'quarantine-round-apply',
+                 'quarantine-round-stopped-precommit'):
+    assert required in t, required
+for obsolete in ('run_quarantine_exact', 'run_quarantine_starter_exact',
+                 'create_quarantine_fleet_start_readiness', 'ensure_stopped'):
+    assert obsolete not in t, obsolete
 PY
     ! grep -Eq 'pkill[[:space:]]|killall[[:space:]]|kill[[:space:]]+-9' "$NODE_HELPER"
 }
+
+first_quarantine_boundary_is_temporally_authorized_before_write() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture freeze capture receipt_sha
+    fixture="$(mktemp -d "$REPO_ROOT/.first-boundary-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    freeze="$(printf 'a%.0s' {1..64})"
+    capture="$(printf 'b%.0s' {1..64})"
+    python3 - "$fixture" "$freeze" "$capture" <<'PY' || return 1
+import datetime, hashlib, json, pathlib, sys
+root=pathlib.Path(sys.argv[1]);freeze,capture=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+now=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+stamp=lambda value:value.strftime("%Y-%m-%dT%H:%M:%SZ")
+def write_case(name,public_completed,fleet_started,fleet_completed):
+    public={"schema":"arc.recovery.legacy-public-height.v1","source_main_commit":"c"*40,
+        "freeze_plan_sha256":freeze,"capture_id":capture,"started_at":stamp(public_completed),
+        "completed_at":stamp(public_completed),"duration_ms":1,"request_policy":{},
+        "origins":[],"legacy_public_max_height":1}
+    public_raw=canonical(public);public_sha=hashlib.sha256(public_raw).hexdigest()
+    cross={"schema":"arc.recovery.authenticated-legacy-height-fleet.v1",
+        "source_main_commit":"c"*40,"freeze_plan_sha256":freeze,"capture_id":capture,
+        "legacy_public_height_receipt_sha256":public_sha,"challenge":"d"*64,
+        "started_at":stamp(fleet_started),"completed_at":stamp(fleet_completed),
+        "conservative_height_floor":1,"nodes":[]}
+    (root/f"{name}-public.json").write_bytes(public_raw)
+    (root/f"{name}-cross.json").write_bytes(canonical(cross))
+    for path in (root/f"{name}-public.json",root/f"{name}-cross.json"):path.chmod(0o400)
+    (root/f"{name}-sha.txt").write_text(public_sha+"\n",encoding="ascii")
+write_case("valid",now-datetime.timedelta(seconds=2),now-datetime.timedelta(seconds=1),now)
+write_case("stale",now-datetime.timedelta(seconds=301),now-datetime.timedelta(seconds=300),now)
+write_case("reordered",now,now+datetime.timedelta(seconds=1),now+datetime.timedelta(seconds=2))
+PY
+    receipt_sha="$(cat "$fixture/valid-sha.txt")"
+    reserve_stop_boundary_timestamp "$fixture/valid-evidence.json" \
+        first-quarantine-started "$freeze" "$capture" \
+        "$fixture/valid-public.json" "$receipt_sha" "$fixture/valid-cross.json" \
+        >/dev/null || return 1
+    [ -f "$fixture/valid-evidence.json.first-quarantine-started.json" ] || return 1
+    python3 - "$fixture/valid-evidence.json.first-quarantine-started.json" <<'PY' || return 1
+import pathlib,stat,sys
+assert stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode)==0o400
+PY
+
+    receipt_sha="$(cat "$fixture/stale-sha.txt")"
+    set +e
+    reserve_stop_boundary_timestamp "$fixture/stale-evidence.json" \
+        first-quarantine-started "$freeze" "$capture" \
+        "$fixture/stale-public.json" "$receipt_sha" "$fixture/stale-cross.json" \
+        >/dev/null 2>&1
+    local stale_status=$?
+    set -e
+    [ "$stale_status" -ne 0 ] || return 1
+    [ ! -e "$fixture/stale-evidence.json.first-quarantine-started.json" ] || return 1
+    [ ! -e "$fixture/stale-evidence.json.first-quarantine-started.json.partial" ] || return 1
+
+    receipt_sha="$(cat "$fixture/reordered-sha.txt")"
+    set +e
+    reserve_stop_boundary_timestamp "$fixture/reordered-evidence.json" \
+        first-quarantine-started "$freeze" "$capture" \
+        "$fixture/reordered-public.json" "$receipt_sha" "$fixture/reordered-cross.json" \
+        >/dev/null 2>&1
+    local reordered_status=$?
+    set -e
+    [ "$reordered_status" -ne 0 ] || return 1
+    [ ! -e "$fixture/reordered-evidence.json.first-quarantine-started.json" ] || return 1
+    [ ! -e "$fixture/reordered-evidence.json.first-quarantine-started.json.partial" ] || return 1
+)
 
 offline_stop_roots_are_remote_derived_and_archive_bound() {
     python3 - "$ORCHESTRATOR" "$NODE_HELPER" <<'PY' || return 1
@@ -110,7 +189,11 @@ for function in ('reserve_stop_boundary_timestamp', 'publish_canonical_maintenan
     next_function=re.search(r'(?m)^[_a-zA-Z][_a-zA-Z0-9]*\(\) [({]\s*$',text[search_from:])
     end=(search_from+next_function.start()) if next_function else len(text)
     body=text[start:end]
-    assert '.partial' in body and 'os.rename' in body, function
+    assert '.partial' in body, function
+    if function in ('reserve_stop_boundary_timestamp', 'publish_canonical_maintenance_input'):
+        assert 'os.link' in body and 'os.rename' not in body, function
+    else:
+        assert 'os.rename' in body or 'os.link' in body, function
 PY
 }
 
@@ -178,6 +261,7 @@ boundary = {
     "all_controlled_stopped_at":"2026-08-28T12:00:01Z","created_at":"2026-08-28T12:00:02Z",
     "official_origin_scope":{"global_absence_claimed":False,"origins":[]},
     "legacy_public_height_receipt":{},"authenticated_prefence_height_cross_proof_sha256":"9"*64,
+    "quarantine_generation_ledger_sha256":"c"*64,
     "legacy_maintenance_evidence_bundle_sha256":"0"*64,
     "network_quarantine_challenge":"a"*64,
     "network_quarantine_stability_proof_sha256":"b"*64,"tools":{},
@@ -190,9 +274,12 @@ bundle={"schema":"arc.recovery.legacy-maintenance-evidence-bundle.v1",
         "source_main_commit":"7"*40,"freeze_plan_sha256":freeze_sha,"capture_id":capture,
         "first_quarantine_started_at":"2026-08-28T12:00:00Z",
         "all_controlled_stopped_at":"2026-08-28T12:00:01Z","challenge":"a"*64,
-        "authenticated_prefence_height_cross_proof":{},"network_quarantine_challenge":{},
+        "authenticated_prefence_height_cross_proof":{},
+        "quarantine_generation_ledger":{"value":{},"sha256":"c"*64},
+        "network_quarantine_challenge":{},
         "quarantine_stability_proof":{"value":{},"sha256":"b"*64},
-        "nodes":[],"object_inventory":[],"aggregate_root_sha256":"1"*64}
+        "nodes":[{"node":name,"host":host} for name,host in fleet],
+        "object_inventory":[],"aggregate_root_sha256":"1"*64}
 bundle_raw=canonical(bundle);bundle_sha=hashlib.sha256(bundle_raw).hexdigest()
 boundary["legacy_maintenance_evidence_bundle_sha256"]=bundle_sha
 (root/"legacy-maintenance-evidence-bundle.json").write_bytes(bundle_raw)
@@ -289,7 +376,9 @@ PY
     ( verify_offline_stop_transport_tools /tmp/python3 "$python_sha" "$ssh_sha" ) \
         >/dev/null 2>&1 && return 1
     expected_fixture_freeze_sha="$freeze_sha"
+    # shellcheck disable=SC2329 # invoked indirectly by the sourced orchestrator
     freeze_plan_hash() { printf '%s\n' "$expected_fixture_freeze_sha"; }
+    # shellcheck disable=SC2329 # invoked indirectly by the sourced orchestrator
     run_stopped_status_challenged_exact() {
         local node="$4"
         /bin/cat "$f/challenged/$node-challenged-status.json"
@@ -366,12 +455,19 @@ value = {
 }
 path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     verify_tree_index() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     verify_stop_identity() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     verify_sealed_stop_contract() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     verify_stop_journal_semantics() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     verify_legacy_restart_fence() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     pgrep() { return 1; }
+    # shellcheck disable=SC2329 # invoked indirectly by stopped_status
     hash_file() {
         case "$1" in
             */stop.complete) printf '%064d\n' 1 ;;
@@ -696,14 +792,17 @@ assert 'terminal-after-leaf-seal' in barrier
 assert 'expected_go="STAGE-BARRIERS $orchestrator_sha HELPER $helper_sha"' in orchestrator
 assert 'expected_go="FREEZE $freeze_sha CAPTURE $capture_id"' in orchestrator
 assert 'expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"' in orchestrator
-assert orchestrator.index("run_drive_prefreeze_gate execute") < orchestrator.index(
+capture = orchestrator[
+    orchestrator.index("capture_phase()") : orchestrator.index("manifest_field()")
+]
+assert capture.index("run_drive_prefreeze_gate execute") < capture.index(
     'capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"'
 )
-assert orchestrator.index('capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"') < orchestrator.index(
-    'run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id"'
+assert capture.index('capture_all_live_observations "$freeze_plan" "$freeze_sha" "$capture_id" "$log_root"') < capture.index(
+    'run_quarantine_generation_rounds'
 )
-assert orchestrator.index('run_quarantine_exact "$freeze_plan" "$freeze_sha" "$capture_id"') < orchestrator.index(
-    'ensure_stopped "$freeze_plan" "$freeze_sha" "$capture_id" "$node"'
+assert capture.index('run_quarantine_generation_rounds') < capture.index(
+    'stop_after_quarantine_round_exact'
 )
 PY
 }
@@ -928,6 +1027,7 @@ with os.fdopen(fd,"wb") as f:f.write((json.dumps(v,sort_keys=True,separators=(",
 PY
     build_archive_complete "$f/complete/COMPLETE.json" "$f/finalization.json" \
         "$f/finalization.json.gist-anchor.json" || return 1
+    # shellcheck disable=SC2329 # invoked indirectly by the sourced archive helper
     fetch_verify_or_recover_complete_gist_anchor() { :; }
     cp "$f/shared/"* "$remote/"; cp "$f/meta/"* "$remote/"; cp "$f/complete/COMPLETE.json" "$remote/"
     chmod 600 "$remote/"*
@@ -989,7 +1089,9 @@ response={"id":gid,"public":False,"owner":{"login":"FerrumVir"},"history":[{"ver
 (r/"historical.json").write_bytes(c(response))
 PY
     export ARC_OPERATOR_GH_LOGIN=FerrumVir
+    # shellcheck disable=SC2329 # invoked indirectly by the sourced orchestrator
     configure_github_anchor_transport() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by the sourced orchestrator
     gh_api() {
         [ "$#" -eq 1 ] || return 91
         [ "$1" = "/gists/$(printf 'e%.0s' {1..32})/$(printf 'f%.0s' {1..40})" ] || return 92
@@ -1065,7 +1167,13 @@ for exact in ('public_info_after_block', 'public_latest_block', 'fenced_head',
               'proof["quarantine_status"]=status'):
     assert exact in cross
 dispatch = t[t.index('ACTION="${1:-}"'):]
-assert 'quarantine)' in dispatch and '[ "$#" -eq 22 ]' in dispatch
+assert 'fence-stop|quarantine|quarantine-starter|quarantine-authority|' in dispatch
+assert 'obsolete global quarantine authority is retired; use an exact quarantine round' in dispatch
+for exact in ('quarantine-round-authorize)', 'quarantine-round-ready)',
+              'quarantine-round-apply)', 'quarantine-round-applied-status)',
+              'quarantine-round-precommit-status)', 'quarantine-round-status)',
+              'stop-after-quarantine-round)'):
+    assert exact in dispatch, exact
 assert 'quarantine-status)' in dispatch and '[ "$#" -eq 4 ]' in dispatch
 assert 'quarantine-restart-arm)' in dispatch and 'quarantine_restart_arm "$2" "$3" "$4"' in dispatch
 assert 'quarantine-restart-status)' in dispatch and 'quarantine_restart_status "$2" "$3" "$4"' in dispatch
@@ -1460,7 +1568,11 @@ PY
     expected="$(hash_file "$source")"
     register_shared_input "$source" "$expected" "$root/catalog" sizable-sparse.bin || return 1
     catalog="$root/catalog/sizable-sparse.bin"
-    [ "$(stat -f %z "$catalog" 2>/dev/null || stat -c %s "$catalog")" -lt 4096 ] || return 1
+    # GNU stat accepts `-f` as filesystem-statistics mode and can emit output
+    # for the valid operand even while failing the BSD `%z` operand.  Try the
+    # unambiguous GNU file-format form first; BSD stat rejects `-c` and falls
+    # through without contaminating the command substitution.
+    [ "$(stat -c '%s' "$catalog" 2>/dev/null || stat -f '%z' "$catalog")" -lt 4096 ] || return 1
     status="$root/work/stream.hash-size"
     stream_shared_input_descriptor "$catalog" "$status" >/dev/null || return 1
     [ "$(cat "$status")" = "$expected 67108864" ] || return 1
@@ -1511,6 +1623,7 @@ run_test 'exact authorizations bind every domain' exact_authorizations_bind_ever
 run_test 'capture id and destination fail closed' capture_id_and_destination_fail_closed
 run_test 'sealed stake proof never claims global halt' sealed_stake_quorum_never_claims_global_halt
 run_test 'all six exact writers stop before capture' all_six_exact_writers_stop_before_content_capture
+run_test 'first quarantine boundary is temporally authorized before write' first_quarantine_boundary_is_temporally_authorized_before_write
 run_test 'offline-stop roots are remote-derived and archive-bound' offline_stop_roots_are_remote_derived_and_archive_bound
 run_test 'offline-stop receipt is canonical, private, and adversarial' offline_stop_receipt_is_canonical_private_and_adversarial
 run_test 'ordinary and challenged stopped-status execute' ordinary_and_challenged_stopped_status_execute

@@ -18,6 +18,15 @@ ARCHIVE_BASE="/root/arc-recovery-archive"
 PERSISTED_HEAD_BASE="/root/arc-recovery-persisted-heads"
 NETWORK_FENCE_STATE="/etc/arc-recovery/network-fence"
 NETWORK_FENCE_UNIT="/etc/systemd/system/arc-legacy-maintenance-fence.service"
+QUARANTINE_AUTHORIZATION_BASE="/root/arc-recovery-quarantine-authorizations"
+QUARANTINE_ROUND_BASE="/root/arc-recovery-quarantine-rounds"
+LIVE_SOURCE_CAPTURE_BASE="/root/arc-recovery-live-source-captures"
+QUARANTINE_ROUND_STATE_BASE="/etc/arc-recovery/network-fence-rounds"
+# The selector is intentionally boot-scoped.  Durable commit + persistence
+# authorizes re-creation only after a complete node transition exists; a reboot
+# before that receipt therefore collapses to the stopped-precommit classifier.
+QUARANTINE_ROUND_ACTIVE="/run/arc-recovery/active-network-fence"
+QUARANTINE_ROUND_DISPATCHER="/etc/arc-recovery/network-fence-dispatch"
 ARCHIVE_NODE_TEMP_PATH=""
 
 # Every semantic Python block runs through one normalized, inode/hash-pinned
@@ -91,7 +100,9 @@ cleanup_temporary_path() {
     # been installed even if its next durable marker was interrupted. Preserve
     # the journal across SSH loss or reboot; only a lock holder may reconcile it.
     if [ -n "$ARCHIVE_NODE_TEMP_PATH" ]; then
-        if { [ -f "$ARCHIVE_NODE_TEMP_PATH/01-prefreeze-runtime-safety-intent.json" ] \
+        if { [ -f "$ARCHIVE_NODE_TEMP_PATH/00-quarantine-fleet-start-authorization.json" ] \
+                && [ ! -L "$ARCHIVE_NODE_TEMP_PATH/00-quarantine-fleet-start-authorization.json" ]; } \
+            || { [ -f "$ARCHIVE_NODE_TEMP_PATH/01-prefreeze-runtime-safety-intent.json" ] \
                 && [ ! -L "$ARCHIVE_NODE_TEMP_PATH/01-prefreeze-runtime-safety-intent.json" ]; } \
             || { [ -f "$ARCHIVE_NODE_TEMP_PATH/02-fast-cgroup-freeze-intent.json" ] \
                 && [ ! -L "$ARCHIVE_NODE_TEMP_PATH/02-fast-cgroup-freeze-intent.json" ]; } \
@@ -134,13 +145,76 @@ Usage (operator orchestration only):
     SUPERVISOR_UNIT SUPERVISOR_MAIN_PID \
     SUPERVISOR_START_TICKS SUPERVISOR_EXECUTABLE_PATH SUPERVISOR_EXECUTABLE_SHA256 \
     SUPERVISOR_ARGV_SHA256 SUPERVISOR_CONTEXT_SHA256 \
-    EXECUTABLE_PATH EXECUTABLE_SHA256 ARGV_SHA256 DATA_DIR
+    EXECUTABLE_PATH EXECUTABLE_SHA256 ARGV_SHA256 DATA_DIR \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 \
+    FIRST_QUARANTINE_BOUNDARY_SHA256 PUBLIC_HEIGHT_COMPLETED_AT \
+    AUTHENTICATED_HEIGHT_STARTED_AT AUTHENTICATED_HEIGHT_COMPLETED_AT \
+    FIRST_QUARANTINE_STARTED_AT AUTHORITY_ACCEPTED_AT FLEET_START_AUTHORIZATION_SHA256 \
+    ALL_SIX_READY_AT FLEET_START_READINESS_SHA256
   archive-node.sh quarantine CAPTURE_SHA256 NODE FREEZE_SHA256 VALIDATOR_ADDRESS STAKE \
     WRITER_PID WRITER_START_TICKS BOOT_ID WRITER_CGROUP_SHA256 WRITER_SUPERVISION_MODE \
     SUPERVISOR_UNIT SUPERVISOR_MAIN_PID \
     SUPERVISOR_START_TICKS SUPERVISOR_EXECUTABLE_PATH SUPERVISOR_EXECUTABLE_SHA256 \
     SUPERVISOR_ARGV_SHA256 SUPERVISOR_CONTEXT_SHA256 \
-    EXECUTABLE_PATH EXECUTABLE_SHA256 ARGV_SHA256 DATA_DIR
+    EXECUTABLE_PATH EXECUTABLE_SHA256 ARGV_SHA256 DATA_DIR \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 \
+    FIRST_QUARANTINE_BOUNDARY_SHA256 PUBLIC_HEIGHT_COMPLETED_AT \
+    AUTHENTICATED_HEIGHT_STARTED_AT AUTHENTICATED_HEIGHT_COMPLETED_AT \
+    FIRST_QUARANTINE_STARTED_AT AUTHORITY_ACCEPTED_AT FLEET_START_AUTHORIZATION_SHA256 \
+    ALL_SIX_READY_AT FLEET_START_READINESS_SHA256
+  archive-node.sh quarantine-authority CAPTURE_SHA256 nyc FREEZE_SHA256 \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 \
+    FIRST_QUARANTINE_BOUNDARY_SHA256 PUBLIC_HEIGHT_COMPLETED_AT \
+    AUTHENTICATED_HEIGHT_STARTED_AT AUTHENTICATED_HEIGHT_COMPLETED_AT \
+    FIRST_QUARANTINE_STARTED_AT
+  archive-node.sh quarantine-authorization-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 \
+    FIRST_QUARANTINE_BOUNDARY_SHA256 PUBLIC_HEIGHT_COMPLETED_AT \
+    AUTHENTICATED_HEIGHT_STARTED_AT AUTHENTICATED_HEIGHT_COMPLETED_AT \
+    FIRST_QUARANTINE_STARTED_AT
+  archive-node.sh quarantine-authorize CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 \
+    FIRST_QUARANTINE_BOUNDARY_SHA256 PUBLIC_HEIGHT_COMPLETED_AT \
+    AUTHENTICATED_HEIGHT_STARTED_AT AUTHENTICATED_HEIGHT_COMPLETED_AT \
+    FIRST_QUARANTINE_STARTED_AT AUTHORITY_ACCEPTED_AT FLEET_START_AUTHORIZATION_SHA256
+  archive-node.sh quarantine-ready CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    FIRST_QUARANTINE_BOUNDARY_SHA256 FLEET_START_AUTHORIZATION_SHA256 \
+    ALL_SIX_READY_AT FLEET_START_READINESS_SHA256
+  archive-node.sh quarantine-round-authorize CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 < AUTHORIZATION_JSON
+  archive-node.sh quarantine-round-authorization-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256
+  archive-node.sh quarantine-round-ready CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256 < READINESS_JSON
+  archive-node.sh quarantine-round-readiness-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256
+  archive-node.sh capture-live-source CAPTURE_SHA256 NODE FREEZE_SHA256 ROUND \
+    WRITER_PID WRITER_START_TICKS BOOT_ID WRITER_CGROUP_SHA256 EXECUTABLE_PATH \
+    EXECUTABLE_SHA256 ARGV_SHA256 DATA_DIR RPC_ORIGIN INSPECTOR_SHA256 \
+    GENESIS_SHA256 LEGACY_VALIDATOR_SET_SHA256 ALLOW_UNBOUND_LEGACY_WAL \
+    PUBLIC_HEIGHT PUBLIC_BLOCK_HASH AUTHENTICATED_HEIGHT AUTHENTICATED_BLOCK_HASH \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 SOURCE_PAIR_ROLE \
+    MINIMUM_HEIGHT EXPECTED_HEIGHT_OR_DASH EXPECTED_BLOCK_HASH_OR_DASH \
+    EXPECTED_STATE_ROOT_OR_DASH BOUNDARY_PROOF_SHA256 \
+    NETWORK_QUARANTINE_RECEIPT_SHA256_OR_DASH OWNED_RULESET_SHA256_OR_DASH
+  archive-node.sh quarantine-round-apply CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256
+  archive-node.sh quarantine-round-applied-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256
+  archive-node.sh quarantine-round-precommit-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256
+  archive-node.sh quarantine-round-stopped-precommit CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256 INSPECTOR_SHA256 GENESIS_SHA256 \
+    VALIDATOR_KEYS_SHA256 LEGACY_VALIDATOR_SET_SHA256 ALLOW_UNBOUND_LEGACY_WAL
+  archive-node.sh quarantine-round-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256 NODE_APPLIED_SHA256
+  archive-node.sh quarantine-round-stopped-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    NODE_STOPPED_PRECOMMIT_SHA256
+  archive-node.sh quarantine-round-stopped-status-challenged CAPTURE_SHA256 NODE \
+    FREEZE_SHA256 NODE_STOPPED_PRECOMMIT_SHA256 HOST CHALLENGE_SHA256
+  archive-node.sh stop-after-quarantine-round CAPTURE_SHA256 NODE FREEZE_SHA256 \
+    ROUND AUTHORIZATION_SHA256 READINESS_SHA256 NODE_APPLIED_SHA256 \
+    POST_QUARANTINE_FINAL_SOURCE_CAPTURE_SHA256
   archive-node.sh quarantine-status CAPTURE_SHA256 NODE FREEZE_SHA256
   archive-node.sh quarantine-restart-arm CAPTURE_SHA256 NODE FREEZE_SHA256
   archive-node.sh quarantine-restart-status CAPTURE_SHA256 NODE FREEZE_SHA256
@@ -283,6 +357,7 @@ require_commands() {
 
 hash_file() {
     python3 - "$1" <<'PY'
+import datetime
 import hashlib
 import secrets
 import sys
@@ -300,8 +375,6 @@ PY
 # isolation: it never guesses the boundary from file hashes or process exit.
 write_offline_wal_evidence() {
     python3 - "$1" "$2" "$3" "$4" <<'PY'
-import hashlib
-import hashlib
 import hashlib
 import json
 import pathlib
@@ -474,6 +547,7 @@ import hashlib
 import os
 import pathlib
 import re
+import signal
 import stat
 import sys
 
@@ -3738,6 +3812,5203 @@ publish(frozen_path, value)
 PY
 }
 
+# Capture a live snapshot and the exact WAL prefix that commits it before any
+# restart-affecting or nft mutation.  Every request has a create-only attempt
+# journal.  A failed/torn attempt is retained and a fresh attempt is made; only
+# a pair that the pinned recovery binary strictly replays byte-for-byte can be
+# selected for a quarantine authorization.
+capture_live_legacy_source() {
+    [ "$#" -eq 31 ] || die "capture-live-source requires the exact writer, height, role, and inspector boundary"
+    local capture_id="$1" node="$2" freeze_sha="$3" round="$4"
+    local writer_pid="$5" writer_start="$6" boot_id="$7" writer_cgroup_sha="$8"
+    local executable_path="$9" executable_sha="${10}" argv_sha="${11}"
+    local data_dir="${12}" rpc_origin="${13}" inspector_sha="${14}"
+    local genesis_sha="${15}" legacy_validators_sha="${16}" allow_unbound="${17}"
+    local public_height="${18}" public_hash="${19}"
+    local authenticated_height="${20}" authenticated_hash="${21}"
+    local public_receipt_sha="${22}" cross_sha="${23}"
+    local source_pair_role="${24}" minimum_height="${25}" expected_height="${26}"
+    local expected_block_hash="${27}" expected_state_root="${28}"
+    local boundary_proof_sha="${29}" network_receipt_sha="${30}"
+    local owned_ruleset_sha="${31}"
+    require_hash "$capture_id" "capture id"; require_node "$node"
+    require_hash "$freeze_sha" "freeze plan hash"; require_uint "$round" "round"
+    require_uint "$writer_pid" "writer pid"; require_uint "$writer_start" "writer start ticks"
+    require_hash "$writer_cgroup_sha" "writer cgroup hash"
+    require_safe_absolute_path "$executable_path" "writer executable path"
+    require_hash "$executable_sha" "writer executable hash"
+    require_hash "$argv_sha" "writer argv hash"
+    require_safe_absolute_path "$data_dir" "writer data directory"
+    printf '%s\n' "$rpc_origin" | grep -Eq '^http://127\.0\.0\.1:[1-9][0-9]{0,4}$' || \
+        die "capture-live-source RPC origin is not exact loopback HTTP"
+    require_hash "$inspector_sha" "capture inspector hash"
+    require_hash "$genesis_sha" "capture genesis hash"
+    require_hash "$legacy_validators_sha" "capture legacy-validator hash"
+    case "$allow_unbound" in true|false) ;; *) die "capture allow-unbound policy differs" ;; esac
+    require_uint "$public_height" "public height"; require_hash "$public_hash" "public block hash"
+    require_uint "$authenticated_height" "authenticated height"
+    require_hash "$authenticated_hash" "authenticated block hash"
+    require_hash "$public_receipt_sha" "public-height receipt hash"
+    require_hash "$cross_sha" "authenticated-height cross hash"
+    case "$source_pair_role" in
+        preauthorization-boundary)
+            [ "$expected_height" = - ] && [ "$expected_block_hash" = - ] \
+                && [ "$expected_state_root" = - ] \
+                && [ "$network_receipt_sha" = - ] && [ "$owned_ruleset_sha" = - ] || \
+                die "preauthorization source-pair boundary fields differ"
+            ;;
+        post-quarantine-final-export)
+            require_uint "$expected_height" "final source-pair expected height"
+            require_hash "$expected_block_hash" "final source-pair expected block hash"
+            require_hash "$expected_state_root" "final source-pair expected state root"
+            require_hash "$network_receipt_sha" "final source-pair quarantine receipt"
+            require_hash "$owned_ruleset_sha" "final source-pair owned ruleset"
+            ;;
+        *) die "capture-live-source source-pair role differs" ;;
+    esac
+    require_uint "$minimum_height" "source-pair minimum height"
+    require_hash "$boundary_proof_sha" "source-pair boundary proof"
+    require_commands python3
+    python3 - "$LIVE_SOURCE_CAPTURE_BASE" "$SEAL_BASE" "$capture_id" "$node" \
+        "$freeze_sha" "$round" "$writer_pid" "$writer_start" "$boot_id" \
+        "$writer_cgroup_sha" "$executable_path" "$executable_sha" "$argv_sha" \
+        "$data_dir" "$rpc_origin" "$inspector_sha" "$genesis_sha" \
+        "$legacy_validators_sha" "$allow_unbound" "$public_height" "$public_hash" \
+        "$authenticated_height" "$authenticated_hash" "$public_receipt_sha" "$cross_sha" \
+        "$source_pair_role" "$minimum_height" "$expected_height" "$expected_block_hash" \
+        "$expected_state_root" "$boundary_proof_sha" "$network_receipt_sha" \
+        "$owned_ruleset_sha" "$0" <<'PY'
+import datetime
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+import uuid
+
+(base_raw, seal_raw, capture, node, freeze, round_raw, pid_raw, start_raw,
+ boot_id, cgroup_sha, executable, executable_sha, argv_sha, data_raw,
+ rpc_origin, inspector_sha, genesis_sha, legacy_sha, allow_raw,
+ public_height_raw, public_hash, authenticated_height_raw, authenticated_hash,
+ public_receipt_sha, cross_sha, source_pair_role, minimum_height_raw,
+ expected_height_raw, expected_block_hash, expected_state_root,
+ boundary_proof_sha, network_receipt_sha, owned_ruleset_sha, helper_raw) = sys.argv[1:]
+base = pathlib.Path(base_raw); seal = pathlib.Path(seal_raw)
+round_number = int(round_raw); pid = int(pid_raw); start_ticks = int(start_raw)
+public_height = int(public_height_raw); authenticated_height = int(authenticated_height_raw)
+minimum_height = int(minimum_height_raw)
+expected_height = None if expected_height_raw == "-" else int(expected_height_raw)
+data_dir = pathlib.Path(data_raw); allow_unbound = allow_raw == "true"
+helper = pathlib.Path(helper_raw)
+HASH_RE = re.compile(r"[0-9a-f]{64}")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+MAX_SNAPSHOT = 256 * 1024 * 1024
+MAX_ATTEMPTS = 12
+FLEET = {"nyc":"149.28.32.76","lax":"140.82.16.112","ams":"136.244.109.1",
+         "lhr":"104.238.171.11","nrt":"202.182.107.41","sgp":"149.28.153.31"}
+
+def fail(message): raise RuntimeError(message)
+def canonical(value): return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+def sha(raw): return hashlib.sha256(raw).hexdigest()
+def now(): return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+def fsync_dir(path):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os,"O_DIRECTORY",0) | getattr(os,"O_NOFOLLOW",0))
+    try: os.fsync(descriptor)
+    finally: os.close(descriptor)
+def ensure_dir(path, mode=0o700):
+    if not path.exists() and not path.is_symlink():
+        os.mkdir(path, mode); fsync_dir(path.parent)
+    details=path.lstat()
+    if (path.is_symlink() or not stat.S_ISDIR(details.st_mode) or details.st_uid!=0
+            or details.st_gid!=0 or stat.S_IMODE(details.st_mode)!=mode):
+        fail(f"unsafe live-source capture directory: {path}")
+def create(path, raw, mode=0o400):
+    descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    try:
+        view=memoryview(raw)
+        while view:
+            written=os.write(descriptor,view)
+            if written<=0: fail("short live-source evidence write")
+            view=view[written:]
+        os.fsync(descriptor);os.fchmod(descriptor,mode);os.fsync(descriptor)
+    finally:os.close(descriptor)
+    fsync_dir(path.parent)
+def secure_raw(path, mode, maximum):
+    descriptor=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(descriptor);identity=lambda item:(item.st_dev,item.st_ino,item.st_mode,
+            item.st_uid,item.st_gid,item.st_nlink,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_gid!=0
+                or before.st_nlink!=1 or stat.S_IMODE(before.st_mode)!=mode
+                or before.st_size<=0 or before.st_size>maximum):
+            fail(f"unsafe live-source input: {path}")
+        chunks=[];remaining=maximum+1
+        while remaining:
+            chunk=os.read(descriptor,min(1024*1024,remaining))
+            if not chunk:break
+            chunks.append(chunk);remaining-=len(chunk)
+        raw=b"".join(chunks)
+        if len(raw)!=before.st_size or identity(os.fstat(descriptor))!=identity(before):
+            fail(f"live-source input changed while read: {path}")
+        return raw
+    finally:os.close(descriptor)
+def digest_file(path, mode, maximum): return sha(secure_raw(path,mode,maximum))
+def parse_canonical(raw,label):
+    try:value=json.loads(raw)
+    except (UnicodeDecodeError,json.JSONDecodeError) as error:raise RuntimeError(f"{label} is invalid JSON") from error
+    if not isinstance(value,dict) or raw!=canonical(value):fail(f"{label} is not canonical JSON")
+    return value
+def proc_start(process):
+    raw=pathlib.Path(f"/proc/{process}/stat").read_text(encoding="ascii");end=raw.rfind(")")
+    fields=raw[end+2:].split()
+    if end<0 or len(fields)<20:fail("sealed writer stat is truncated")
+    return int(fields[19])
+def file_sha(path):
+    result=hashlib.sha256()
+    with open(path,"rb") as handle:
+        for chunk in iter(lambda:handle.read(1024*1024),b""):result.update(chunk)
+    return result.hexdigest()
+def verify_writer():
+    if pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()!=boot_id:
+        fail("sealed writer boot changed before live source capture")
+    proc=pathlib.Path(f"/proc/{pid}")
+    if (not proc.is_dir() or proc.joinpath("comm").read_text().strip()!="arc-node"
+            or proc_start(pid)!=start_ticks or sha(proc.joinpath("cgroup").read_bytes())!=cgroup_sha
+            or os.readlink(proc/"exe")!=executable or file_sha(proc/"exe")!=executable_sha
+            or file_sha(proc/"cmdline")!=argv_sha):
+        fail("sealed writer identity changed before live source capture")
+    writers=sorted(int(path.parent.name) for path in pathlib.Path("/proc").glob("[0-9]*/comm")
+                   if path.read_text(errors="replace").strip()=="arc-node")
+    if writers!=[pid]:fail("host does not have exactly the sealed legacy writer")
+def listener_owner():
+    origin=urllib.parse.urlsplit(rpc_origin);port=origin.port
+    owned=set()
+    for fd in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+        try:target=os.readlink(fd)
+        except (FileNotFoundError,PermissionError,OSError):continue
+        match=re.fullmatch(r"socket:\[([0-9]+)\]",target)
+        if match:owned.add(int(match.group(1)))
+    listeners=[]
+    for table in (pathlib.Path("/proc/net/tcp"),):
+        for line in table.read_text().splitlines()[1:]:
+            fields=line.split()
+            if len(fields)<10:continue
+            local,state,inode=fields[1],fields[3],fields[9]
+            address,port_hex=local.split(":",1)
+            if state=="0A" and address=="0100007F" and int(port_hex,16)==port:
+                listeners.append(int(inode))
+    matches=sorted(set(listeners)&owned)
+    if len(matches)!=1 or len(set(listeners))!=1:
+        fail("loopback snapshot listener is not uniquely owned by the sealed writer")
+    return {"boot_id":boot_id,"pid":pid,"start_ticks":start_ticks,
+            "port":port,"socket_inode":matches[0]}
+def verify_network_quarantine():
+    if source_pair_role == "preauthorization-boundary":
+        return None
+    result=subprocess.run(
+        [str(helper),"quarantine-status",capture,node,freeze],
+        env={"HOME":"/root","PATH":"/usr/bin:/bin","LANG":"C","LC_ALL":"C","TZ":"UTC"},
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90,check=False,
+    )
+    if result.returncode!=0:fail("network quarantine changed during final source capture")
+    status=parse_canonical(result.stdout,"final source-capture quarantine status")
+    loopback=status.get("loopback_head",{})
+    observed_head={"height":loopback.get("latest_height"),
+        "block_hash":loopback.get("block_hash"),"state_root":loopback.get("state_root")}
+    expected_head={"height":expected_height,"block_hash":expected_block_hash,
+        "state_root":expected_state_root}
+    if (status.get("schema")!="arc.recovery.legacy-network-quarantine-status.v1"
+            or status.get("capture_id")!=capture or status.get("node")!=node
+            or status.get("freeze_plan_sha256")!=freeze
+            or status.get("receipt_sha256")!=network_receipt_sha
+            or status.get("owned_ruleset_stateless_sha256")!=owned_ruleset_sha
+            or status.get("active") is not True or status.get("enabled") is not True
+            or observed_head!=expected_head):
+        fail("final source capture is not behind the exact stable full-host quarantine")
+    # nft counters (including the SSH allow rule carrying this invocation) may
+    # advance while the loopback snapshot is copied.  Bind the immutable policy
+    # roots and exact fenced head, not the mutable full status document hash.
+    return {"receipt_sha256":status["receipt_sha256"],
+            "owned_ruleset_stateless_sha256":status["owned_ruleset_stateless_sha256"],
+            "head":observed_head,"active":True,"enabled":True}
+
+plan_path=pathlib.Path(f"/root/.arc-recovery-plans/{freeze}/freeze.lock.json")
+plan_raw=secure_raw(plan_path,0o400,16*1024*1024)
+plan=parse_canonical(plan_raw,"pinned freeze plan")
+expected_capture=hashlib.sha256(b"ARC recovery capture v2\0"+bytes.fromhex(freeze)).hexdigest()
+rows=[row for row in plan.get("nodes",[]) if row.get("name")==node]
+if (sha(plan_raw)!=freeze or capture!=expected_capture or len(rows)!=1
+        or plan.get("schema")!="arc.recovery.freeze-plan.v5"):
+    fail("live source capture freeze identity differs")
+row=rows[0]
+expected={"writer_pid":pid,"writer_start_ticks":start_ticks,"boot_id":boot_id,
+ "writer_cgroup_sha256":cgroup_sha,"executable_path":executable,
+ "executable_sha256":executable_sha,"argv_sha256":argv_sha,
+ "data_dir":str(data_dir),"rpc_origin":rpc_origin}
+if any(row.get(key)!=wanted for key,wanted in expected.items()):
+    fail("live source capture writer differs from freeze plan")
+if node not in FLEET or row.get("host")!=FLEET[node]:fail("live source capture host differs")
+if file_sha(helper)!=plan.get("remote_helper_sha256"):
+    fail("live source capture helper differs from the freeze plan")
+stage=seal/freeze/node
+inspector=stage/"arc-node";genesis=stage/"genesis.toml"
+legacy=stage/"legacy-validator-set-40m.json"
+if (digest_file(inspector,0o500,512*1024*1024)!=inspector_sha
+        or digest_file(genesis,0o400,16*1024*1024)!=genesis_sha
+        or digest_file(legacy,0o400,16*1024*1024)!=legacy_sha):
+    fail("staged live-source inspector inputs differ")
+data_details=data_dir.lstat()
+if (data_dir.is_symlink() or not stat.S_ISDIR(data_details.st_mode) or data_details.st_uid!=0
+        or data_details.st_gid!=0 or data_details.st_mode&0o022):
+    fail("live legacy data directory is unsafe")
+wal_details=(data_dir/"state.wal").lstat()
+if (not stat.S_ISREG(wal_details.st_mode) or (data_dir/"state.wal").is_symlink()
+        or wal_details.st_uid!=0 or wal_details.st_gid!=0 or wal_details.st_nlink!=1
+        or wal_details.st_mode&0o022 or wal_details.st_size<=0):
+    fail("live legacy state WAL is unsafe")
+
+for directory in (base,base/capture,base/capture/node,base/capture/node/f"round-{round_number}",
+                  base/capture/node/f"round-{round_number}"/source_pair_role):
+    ensure_dir(directory)
+round_root=base/capture/node/f"round-{round_number}"/source_pair_role
+request_binding={"schema":"arc.recovery.quarantine-live-source-request.v1",
+ "capture_id":capture,"freeze_plan_sha256":freeze,"source_main_commit":plan["source_commit"],
+ "round_number":round_number,"node":node,"host":FLEET[node],
+ "authorized_writer":{"boot_id":boot_id,"pid":pid,"start_ticks":start_ticks,"cgroup_sha256":cgroup_sha},
+ "rpc_origin":rpc_origin,"snapshot_endpoint":"/sync/snapshot",
+ "public_height_receipt_sha256":public_receipt_sha,
+ "authenticated_height_cross_proof_sha256":cross_sha,
+ "public_latest":{"height":public_height,"block_hash":public_hash},
+ "authenticated_latest":{"height":authenticated_height,"block_hash":authenticated_hash},
+ "inspector_binary_sha256":inspector_sha,"genesis_sha256":genesis_sha,
+ "legacy_validator_set_sha256":legacy_sha,"allow_unbound_legacy_wal":allow_unbound,
+ "source_pair_role":source_pair_role,"minimum_height":minimum_height,
+ "expected_head":None if expected_height is None else {"height":expected_height,
+     "block_hash":expected_block_hash,"state_root":expected_state_root},
+ "boundary_proof_sha256":boundary_proof_sha,
+ "network_quarantine_receipt_sha256":None if network_receipt_sha=="-" else network_receipt_sha,
+ "owned_ruleset_stateless_sha256":None if owned_ruleset_sha=="-" else owned_ruleset_sha}
+request_key=sha(canonical(request_binding));generation=round_root/request_key
+ensure_dir(generation);attempts=generation/"attempts";ensure_dir(attempts)
+lock_path=generation/"capture.lock"
+lock_fd=os.open(lock_path,os.O_RDWR|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600)
+lock_details=os.fstat(lock_fd)
+if (not stat.S_ISREG(lock_details.st_mode) or lock_details.st_uid!=0
+        or lock_details.st_gid!=0 or lock_details.st_nlink!=1):fail("unsafe live-source lock")
+os.fchmod(lock_fd,0o600);os.fsync(lock_fd);fcntl.flock(lock_fd,fcntl.LOCK_EX)
+selected=generation/"selected.json"
+command_env={"HOME":"/root","PATH":"/usr/bin:/bin","LANG":"C","LC_ALL":"C","TZ":"UTC"}
+receipt_fields={"schema","capture_id","freeze_plan_sha256","source_main_commit",
+    "round_number","node","host","source_pair_role","minimum_height","expected_head",
+    "boundary_proof_sha256","network_quarantine_receipt_sha256",
+    "owned_ruleset_stateless_sha256","authorized_writer","rpc_origin",
+    "public_height_receipt_sha256","authenticated_height_cross_proof_sha256",
+    "snapshot_endpoint","snapshot_listener","capture_attempt_id","capture_started_at",
+    "capture_completed_at","inspector_binary_sha256","genesis_sha256",
+    "legacy_validator_set_sha256","fixed_pair_path","snapshot_source",
+    "existing_source_snapshot_used","rust_capture","head","ancestry_checks",
+    "content_sealed","strict_offline_replay"}
+def current_identity(path,expected,label,directory=False):
+    path=pathlib.Path(path);details=path.lstat()
+    if (path.is_symlink() or (not stat.S_ISDIR(details.st_mode) if directory
+            else not stat.S_ISREG(details.st_mode))):
+        fail(f"selected live-source {label} is missing or unsafe")
+    observed={"device":details.st_dev,"inode":details.st_ino,"mode":details.st_mode,
+        "uid":details.st_uid,"gid":details.st_gid,"nlink":details.st_nlink,
+        "mtime_ns":details.st_mtime_ns,"ctime_ns":details.st_ctime_ns}
+    if not directory:
+        observed.update({"sha256":file_sha(path),"size":details.st_size})
+    if observed!=expected:fail(f"selected live-source {label} identity changed")
+def validate_selected_capture(raw,label):
+    value=parse_canonical(raw,label)
+    if (set(value)!=receipt_fields
+            or value.get("schema")!="arc.recovery.quarantine-live-source-capture.v1"
+            or (value.get("capture_id"),value.get("freeze_plan_sha256"),
+                value.get("source_main_commit"),value.get("round_number"),value.get("node"),
+                value.get("host"))!=(capture,freeze,plan["source_commit"],round_number,node,FLEET[node])
+            or value.get("source_pair_role")!=source_pair_role
+            or value.get("minimum_height")!=minimum_height
+            or value.get("expected_head")!=request_binding["expected_head"]
+            or value.get("boundary_proof_sha256")!=boundary_proof_sha
+            or value.get("network_quarantine_receipt_sha256")
+                !=request_binding["network_quarantine_receipt_sha256"]
+            or value.get("owned_ruleset_stateless_sha256")
+                !=request_binding["owned_ruleset_stateless_sha256"]
+            or value.get("authorized_writer")!=request_binding["authorized_writer"]
+            or value.get("rpc_origin")!=rpc_origin
+            or value.get("public_height_receipt_sha256")!=public_receipt_sha
+            or value.get("authenticated_height_cross_proof_sha256")!=cross_sha
+            or value.get("snapshot_endpoint")!="/sync/snapshot"
+            or value.get("snapshot_source")!="sealed-writer-owned-loopback-/sync/snapshot"
+            or value.get("existing_source_snapshot_used") is not False
+            or value.get("content_sealed") is not True
+            or value.get("strict_offline_replay") is not True):
+        fail("selected live source capture request binding differs")
+    attempt_id=value.get("capture_attempt_id")
+    try:parsed_attempt_id=uuid.UUID(str(attempt_id))
+    except (ValueError,TypeError) as error:raise RuntimeError("selected live source attempt id differs") from error
+    if str(parsed_attempt_id)!=attempt_id:
+        fail("selected live source attempt id is not canonical")
+    attempt=attempts/attempt_id
+    expected_fixed=attempt/"fixed-source"
+    if value.get("fixed_pair_path")!=str(expected_fixed):
+        fail("selected live source fixed-pair path differs")
+    receipt_raw=secure_raw(attempt/"receipt.json",0o400,32*1024*1024)
+    if receipt_raw!=raw:fail("selected live source differs from its create-only attempt receipt")
+    wrapper=value.get("rust_capture")
+    if not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}:
+        fail("selected Rust live-source wrapper differs")
+    rust=wrapper["value"];rust_raw=canonical(rust)
+    if (sha(rust_raw)!=wrapper["sha256"]
+            or secure_raw(attempt/"rust-capture.json",0o400,32*1024*1024)!=rust_raw
+            or rust.get("schema")!="arc.recovery.live-legacy-source-capture.v1"
+            or rust.get("head")!=value.get("head")
+            or rust.get("allow_unbound_legacy_wal") is not allow_unbound):
+        fail("selected Rust live-source receipt differs")
+    fixed=rust.get("fixed_pair")
+    if (not isinstance(fixed,dict) or set(fixed)!={"data_dir","state_wal","snapshot",
+            "genesis_binding","strict_replay"} or fixed.get("strict_replay") is not True):
+        fail("selected fixed live-source pair fields differ")
+    current_identity(data_dir,rust.get("source_data_dir"),"source directory",True)
+    current_identity(attempt/"live.snapshot.lz4",rust.get("source_snapshot"),"captured snapshot")
+    current_identity(genesis,rust.get("genesis"),"staged genesis")
+    current_identity(legacy,rust.get("legacy_validator_set"),"staged legacy validator set")
+    current_identity(expected_fixed,fixed.get("data_dir"),"fixed directory",True)
+    current_identity(expected_fixed/"state.wal",fixed.get("state_wal"),"fixed WAL")
+    current_identity(expected_fixed/"state.snapshot.lz4",fixed.get("snapshot"),"fixed snapshot")
+    current_identity(expected_fixed/"genesis.network-hash",fixed.get("genesis_binding"),
+        "fixed genesis binding")
+    source_prefix=rust.get("source_wal_prefix",{})
+    if (fixed.get("state_wal",{}).get("sha256")!=source_prefix.get("accepted_prefix_sha256")
+            or fixed.get("state_wal",{}).get("size")!=source_prefix.get("accepted_prefix_bytes")
+            or fixed.get("snapshot",{}).get("sha256")
+                !=rust.get("source_snapshot",{}).get("sha256")):
+        fail("selected fixed live-source pair is not the exact WAL prefix/snapshot")
+    verify_writer()
+    if listener_owner()!=value.get("snapshot_listener"):
+        fail("selected live-source listener no longer belongs to the sealed writer")
+    quarantine_status=verify_network_quarantine()
+    if source_pair_role=="post-quarantine-final-export" and quarantine_status is None:
+        fail("selected final source pair lost its network quarantine")
+    head=value.get("head",{});inspect_command=[str(inspector),"recovery","inspect-legacy-block",
+        "--data-dir",str(expected_fixed),"--snapshot",str(expected_fixed/"state.snapshot.lz4"),
+        "--genesis",str(genesis),"--legacy-validator-set",str(legacy),
+        "--height",str(head.get("height")),"--expected-state-wal-sha256",
+        fixed["state_wal"]["sha256"],"--expected-snapshot-sha256",fixed["snapshot"]["sha256"],
+        "--expected-genesis-sha256",genesis_sha,"--expected-legacy-validator-set-sha256",legacy_sha]
+    inspected=subprocess.run(inspect_command,env=command_env,stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,timeout=240,check=False)
+    if inspected.returncode!=0:fail("selected fixed live-source pair no longer strictly replays")
+    observed=parse_canonical(inspected.stdout,"selected fixed live-source head inspection")
+    if ({"height":observed.get("height"),"block_hash":observed.get("block_hash"),
+            "state_root":observed.get("state_root")}!=head):
+        fail("selected fixed live-source head changed")
+    return value
+
+if selected.exists() or selected.is_symlink():
+    raw=secure_raw(selected,0o400,32*1024*1024)
+    validate_selected_capture(raw,"selected live source capture")
+    sys.stdout.buffer.write(raw);raise SystemExit(0)
+
+# A power loss may occur after the complete attempt receipt is fsynced but
+# before its generation selector is created.  Reconcile that gap without a
+# second snapshot request; every terminal attempt remains immutable evidence.
+completed=[]
+for receipt_path in sorted(attempts.glob("*/receipt.json")):
+    receipt_raw=secure_raw(receipt_path,0o400,32*1024*1024)
+    receipt_value=parse_canonical(receipt_raw,"completed live source attempt")
+    completed.append((receipt_value.get("capture_started_at",""),
+        receipt_value.get("capture_attempt_id",""),receipt_raw))
+if completed:
+    _started,_attempt,raw=min(completed,key=lambda item:(item[0],item[1]))
+    validate_selected_capture(raw,"recovered live source attempt")
+    create(selected,raw)
+    sys.stdout.buffer.write(raw);raise SystemExit(0)
+
+last_error="no_attempt"
+for _attempt_number in range(MAX_ATTEMPTS):
+    attempt_id=str(uuid.uuid4());attempt=attempts/attempt_id;os.mkdir(attempt,0o700);fsync_dir(attempts)
+    started_at=now();request={**request_binding,"capture_attempt_id":attempt_id,"started_at":started_at}
+    create(attempt/"request.json",canonical(request))
+    snapshot=attempt/"live.snapshot.lz4";partial=attempt/"live.snapshot.partial"
+    try:
+        verify_writer();listener=listener_owner();quarantine_status_before=verify_network_quarantine()
+        connection=http.client.HTTPConnection("127.0.0.1",listener["port"],timeout=45)
+        deadline=time.monotonic()+45
+        connection.connect();connection.sock.settimeout(max(.001,deadline-time.monotonic()))
+        connection.request("GET","/sync/snapshot",headers={"Host":f"127.0.0.1:{listener['port']}",
+            "User-Agent":"arc-recovery-live-source-capture/1","Accept":"application/octet-stream",
+            "Connection":"close"})
+        response=connection.getresponse()
+        if response.status!=200:fail(f"snapshot endpoint returned HTTP {response.status}")
+        declared=response.getheader("Content-Length")
+        if declared is not None and (not declared.isdigit() or not 4<=int(declared)<=MAX_SNAPSHOT):
+            fail("snapshot Content-Length is outside the recovery bound")
+        descriptor=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+        size=0;hasher=hashlib.sha256()
+        try:
+            while True:
+                remaining=deadline-time.monotonic()
+                if remaining<=0:raise TimeoutError("snapshot request deadline expired")
+                if connection.sock is not None:connection.sock.settimeout(max(.001,remaining))
+                chunk=response.read(min(1024*1024,MAX_SNAPSHOT+1-size))
+                if not chunk:break
+                size+=len(chunk)
+                if size>MAX_SNAPSHOT:fail("snapshot response exceeds recovery bound")
+                view=memoryview(chunk)
+                while view:
+                    written=os.write(descriptor,view)
+                    if written<=0:fail("short live snapshot write")
+                    view=view[written:]
+                hasher.update(chunk)
+            if size<4:fail("snapshot response is truncated")
+            os.fsync(descriptor);os.fchmod(descriptor,0o400);os.fsync(descriptor)
+        finally:os.close(descriptor);connection.close()
+        if declared is not None and size!=int(declared):fail("snapshot body differs from Content-Length")
+        os.link(partial,snapshot,follow_symlinks=False);os.unlink(partial);fsync_dir(attempt)
+        snapshot_sha=hasher.hexdigest()
+        verify_writer()
+        if listener_owner()!=listener:fail("sealed writer snapshot listener changed during request")
+        fixed=attempt/"fixed-source"
+        capture_command=[str(inspector),"recovery","capture-legacy-source",
+            "--data-dir",str(data_dir),"--snapshot",str(snapshot),"--genesis",str(genesis),
+            "--legacy-validator-set",str(legacy),"--output-data-dir",str(fixed),
+            "--expected-snapshot-sha256",snapshot_sha,"--expected-genesis-sha256",genesis_sha,
+            "--expected-legacy-validator-set-sha256",legacy_sha]
+        if allow_unbound:capture_command.append("--allow-unbound-legacy-wal")
+        result=subprocess.run(capture_command,env=command_env,stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,timeout=240,check=False)
+        if result.returncode!=0:fail("pinned inspector rejected live snapshot/WAL attempt")
+        try:rust=json.loads(result.stdout)
+        except (UnicodeDecodeError,json.JSONDecodeError) as error:raise RuntimeError("pinned inspector capture receipt is invalid JSON") from error
+        rust_raw=canonical(rust)
+        if (rust.get("schema")!="arc.recovery.live-legacy-source-capture.v1"
+                or rust.get("fixed_pair",{}).get("strict_replay") is not True):
+            fail("pinned inspector capture receipt differs")
+        create(attempt/"rust-capture.json",rust_raw)
+        if (rust.get("head",{}).get("height",-1)<minimum_height
+                or (expected_height is not None and rust.get("head")!={
+                    "height":expected_height,"block_hash":expected_block_hash,
+                    "state_root":expected_state_root})):
+            fail("captured source head differs from its selected boundary")
+        fixed_pair=rust["fixed_pair"];fixed_wal=fixed_pair["state_wal"];fixed_snapshot=fixed_pair["snapshot"]
+        checks=[]
+        for label,height,expected_hash in (("public-latest",public_height,public_hash),
+                ("authenticated-loopback-latest",authenticated_height,authenticated_hash)):
+            if height>rust["head"]["height"]:fail("captured head is below fresh authorization evidence")
+            inspect_command=[str(inspector),"recovery","inspect-legacy-block","--data-dir",str(fixed),
+                "--snapshot",str(fixed/"state.snapshot.lz4"),"--genesis",str(genesis),
+                "--legacy-validator-set",str(legacy),"--height",str(height),
+                "--expected-state-wal-sha256",fixed_wal["sha256"],
+                "--expected-snapshot-sha256",fixed_snapshot["sha256"],
+                "--expected-genesis-sha256",genesis_sha,
+                "--expected-legacy-validator-set-sha256",legacy_sha]
+            inspected=subprocess.run(inspect_command,env=command_env,stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,timeout=240,check=False)
+            if inspected.returncode!=0:fail(f"fixed source ancestry inspection failed: {label}")
+            try:observed=json.loads(inspected.stdout)
+            except (UnicodeDecodeError,json.JSONDecodeError) as error:raise RuntimeError("fixed source ancestry output is invalid") from error
+            if (observed.get("schema")!="arc.recovery.legacy-block-inspection.v1"
+                    or observed.get("height")!=height or observed.get("block_hash")!=expected_hash
+                    or HASH_RE.fullmatch(str(observed.get("state_root"))) is None):
+                fail(f"fixed source ancestry differs: {label}")
+            checks.append({"label":label,"height":height,"expected_block_hash":expected_hash,
+                "observed_block_hash":observed["block_hash"],"state_root":observed["state_root"],
+                "inspection_sha256":sha(canonical(observed))})
+        verify_writer()
+        if listener_owner()!=listener:fail("sealed writer snapshot listener changed before capture seal")
+        quarantine_status_after=verify_network_quarantine()
+        if quarantine_status_after!=quarantine_status_before:
+            fail("network quarantine status changed during final source capture")
+        completed_at=now()
+        value={"schema":"arc.recovery.quarantine-live-source-capture.v1",
+            "capture_id":capture,"freeze_plan_sha256":freeze,"source_main_commit":plan["source_commit"],
+            "round_number":round_number,"node":node,"host":FLEET[node],
+            "source_pair_role":source_pair_role,"minimum_height":minimum_height,
+            "expected_head":request_binding["expected_head"],
+            "boundary_proof_sha256":boundary_proof_sha,
+            "network_quarantine_receipt_sha256":request_binding["network_quarantine_receipt_sha256"],
+            "owned_ruleset_stateless_sha256":request_binding["owned_ruleset_stateless_sha256"],
+            "authorized_writer":request_binding["authorized_writer"],"rpc_origin":rpc_origin,
+            "public_height_receipt_sha256":public_receipt_sha,
+            "authenticated_height_cross_proof_sha256":cross_sha,
+            "snapshot_endpoint":"/sync/snapshot","snapshot_listener":listener,
+            "capture_attempt_id":attempt_id,"capture_started_at":started_at,
+            "capture_completed_at":completed_at,"inspector_binary_sha256":inspector_sha,
+            "genesis_sha256":genesis_sha,"legacy_validator_set_sha256":legacy_sha,
+            "fixed_pair_path":str(fixed),
+            "snapshot_source":"sealed-writer-owned-loopback-/sync/snapshot",
+            "existing_source_snapshot_used":False,
+            "rust_capture":{"value":rust,"sha256":sha(rust_raw)},"head":rust["head"],
+            "ancestry_checks":checks,"content_sealed":True,"strict_offline_replay":True}
+        raw=canonical(value);create(attempt/"receipt.json",raw);create(selected,raw)
+        sys.stdout.buffer.write(raw);raise SystemExit(0)
+    except Exception as error:
+        last_error=f"{type(error).__name__}:{str(error)}"[:512]
+        failure={"schema":"arc.recovery.quarantine-live-source-attempt-failure.v1",
+            "capture_id":capture,"freeze_plan_sha256":freeze,"round_number":round_number,
+            "node":node,"capture_attempt_id":attempt_id,"started_at":started_at,
+            "failed_at":now(),"reason":last_error}
+        try:create(attempt/"failure.json",canonical(failure))
+        except FileExistsError:pass
+raise SystemExit(f"no strictly replay-valid live snapshot/WAL pair after {MAX_ATTEMPTS} attempts: {last_error}")
+PY
+}
+
+# Crash-safe quarantine rounds.  Authorization contains the full ordered set
+# of still-live targets and readiness contains an exact acceptance from every
+# one.  Each host selects only its own row.  These artifacts live outside
+# STOP_BASE and are immutable; callers cannot restate a writer identity or
+# extend a deadline on argv.
+quarantine_round_entry() {
+    local mode="$1" capture_id="$2" node="$3" freeze_sha="$4" round="$5"
+    local authorization_sha="$6" readiness_sha="${7:--}" applied_sha="${8:--}"
+    local inspector_sha="${9:--}" genesis_sha="${10:--}"
+    local validators_sha="${11:--}" legacy_validators_sha="${12:--}"
+    local allow_unbound_legacy_wal="${13:--}"
+    require_hash "$capture_id" "capture id"
+    require_node "$node"
+    require_hash "$freeze_sha" "freeze plan hash"
+    require_uint "$round" "quarantine round"
+    [ "$round" -ge 1 ] && [ "$round" -le 6 ] || die "quarantine round must be in [1,6]"
+    require_hash "$authorization_sha" "round authorization hash"
+    case "$mode" in
+        authorize|authorization-status) ;;
+        ready|readiness-status|apply|applied-status|precommit-status)
+            require_hash "$readiness_sha" "round readiness hash"
+            ;;
+        stopped-precommit)
+            require_hash "$readiness_sha" "round readiness hash"
+            require_hash "$inspector_sha" "stopped-precommit inspector hash"
+            require_hash "$genesis_sha" "stopped-precommit genesis hash"
+            require_hash "$validators_sha" "stopped-precommit validator-key hash"
+            require_hash "$legacy_validators_sha" "stopped-precommit legacy validator-set hash"
+            case "$allow_unbound_legacy_wal" in true|false) ;;
+                *) die "stopped-precommit allow-unbound-legacy-wal must be true or false" ;;
+            esac
+            ;;
+        status)
+            require_hash "$readiness_sha" "round readiness hash"
+            require_hash "$applied_sha" "node-applied receipt hash"
+            ;;
+        stop)
+            require_hash "$readiness_sha" "round readiness hash"
+            require_hash "$applied_sha" "node-applied receipt hash"
+            require_hash "$inspector_sha" "post-quarantine final source capture hash"
+            ;;
+        *) die "unsupported quarantine-round mode" ;;
+    esac
+    require_commands python3
+    python3 - "$mode" "$capture_id" "$node" "$freeze_sha" "$round" \
+        "$authorization_sha" "$readiness_sha" "$applied_sha" \
+        "$QUARANTINE_ROUND_BASE" "$QUARANTINE_ROUND_STATE_BASE" \
+        "$QUARANTINE_ROUND_ACTIVE" "$QUARANTINE_ROUND_DISPATCHER" \
+        "$NETWORK_FENCE_UNIT" "$ARC_RECOVERY_PYTHON_PATH" "$SEAL_BASE" \
+        "$inspector_sha" "$genesis_sha" "$validators_sha" "$legacy_validators_sha" \
+        "$allow_unbound_legacy_wal" \
+        3<&0 <<'PY'
+import ctypes
+import datetime
+import errno
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+
+(mode, capture_id, node, freeze_sha, round_raw, authorization_sha,
+ readiness_sha, applied_sha, round_base_raw, state_base_raw, active_raw,
+ dispatcher_raw, unit_raw, python_raw, seal_base_raw, inspector_sha,
+ genesis_sha, validators_sha, legacy_validators_sha,
+ allow_unbound_legacy_wal_raw) = sys.argv[1:]
+round_number = int(round_raw)
+round_base = pathlib.Path(round_base_raw)
+state_base = pathlib.Path(state_base_raw)
+active_path = pathlib.Path(active_raw)
+dispatcher_path = pathlib.Path(dispatcher_raw)
+unit_path = pathlib.Path(unit_raw)
+python_path = pathlib.Path(python_raw)
+seal_base = pathlib.Path(seal_base_raw)
+attempt = round_base / capture_id / authorization_sha
+state = state_base / capture_id / authorization_sha
+auth_path = attempt / "authorization.json"
+acceptance_path = attempt / "authorization.acceptance.json"
+readiness_path = attempt / "readiness.json"
+applied_path = attempt / "node-applied.json"
+table_name = "arc_legacy_maintenance_v1"
+priority = -310
+FLEET = (
+    ("nyc", "149.28.32.76"), ("lax", "140.82.16.112"),
+    ("ams", "136.244.109.1"), ("lhr", "104.238.171.11"),
+    ("nrt", "202.182.107.41"), ("sgp", "149.28.153.31"),
+)
+FLEET_MAP = dict(FLEET)
+HASH_RE = re.compile(r"[0-9a-f]{64}")
+COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+AUTH_SCHEMA = "arc.recovery.quarantine-round-authorization.v1"
+ACCEPTANCE_SCHEMA = "arc.recovery.quarantine-round-authorization-acceptance.v1"
+READINESS_SCHEMA = "arc.recovery.quarantine-round-readiness.v1"
+GATE_SCHEMA = "arc.recovery.quarantine-nft-deadline-gate.v1"
+BINDING_SCHEMA = "arc.recovery.quarantine-nft-table-binding.v1"
+APPLIED_COMMIT_SCHEMA = "arc.recovery.quarantine-nft-applied-commit.v1"
+NODE_APPLIED_SCHEMA = "arc.recovery.quarantine-node-nft-applied.v1"
+NODE_STOPPED_SCHEMA = "arc.recovery.quarantine-node-persistently-stopped-precommit.v1"
+PERSISTED_STOPPED_SCHEMA = "arc.recovery.persisted-legacy-head-stopped-precommit.v1"
+STOPPED_STATUS_SCHEMA = "arc.recovery.quarantine-prior-persistently-stopped-status.v1"
+ANCESTRY_SCHEMA = "arc.recovery.quarantine-post-fence-ancestry.v1"
+STATUS_SCHEMA = "arc.recovery.quarantine-prior-fenced-status.v1"
+
+def fail(message):
+    raise SystemExit(message)
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+def now_value():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+def format_utc(value):
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def parse_utc(raw, label):
+    if not isinstance(raw, str) or UTC_RE.fullmatch(raw) is None:
+        fail(f"{label} is not canonical UTC seconds")
+    try:
+        return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except ValueError:
+        fail(f"{label} is invalid")
+
+def fsync_dir(path):
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+def secure_dir(path, mode_value, *, create=False):
+    if create and not path.exists() and not path.is_symlink():
+        try:
+            os.mkdir(path, mode_value)
+            fsync_dir(path.parent)
+        except FileExistsError:
+            pass
+    details = path.lstat()
+    if (path.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != 0 or details.st_gid != 0
+            or stat.S_IMODE(details.st_mode) != mode_value):
+        fail(f"unsafe quarantine-round directory: {path}")
+
+def secure_read(path, mode_value, *, maximum=16 * 1024 * 1024):
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+        )
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != mode_value
+                or before.st_size <= 0 or before.st_size > maximum):
+            fail(f"unsafe quarantine-round file: {path}")
+        raw = b""
+        while len(raw) <= maximum:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) != before.st_size or identity(os.fstat(descriptor)) != identity(before):
+            fail(f"quarantine-round file changed while read: {path}")
+        return raw
+    finally:
+        os.close(descriptor)
+
+def parse_canonical(raw, label):
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail(f"{label} is invalid JSON")
+    if not isinstance(value, dict) or raw != canonical(value):
+        fail(f"{label} is not a canonical JSON object")
+    return value
+
+def publish(path, raw, mode_value):
+    if path.exists() or path.is_symlink():
+        if secure_read(path, mode_value) != raw:
+            fail(f"create-only quarantine-round artifact differs: {path}")
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.partial")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail("short quarantine-round evidence write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, mode_value)
+        # The mode transition is evidence too; make it durable before publish.
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        temporary.unlink(missing_ok=True)
+        fail("renameat2(RENAME_NOREPLACE) is required for quarantine evidence")
+    result = renameat2(
+        -100, os.fsencode(temporary), -100, os.fsencode(path), 1,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        temporary.unlink(missing_ok=True)
+        if error == errno.EEXIST and path.exists() and not path.is_symlink():
+            if secure_read(path, mode_value) == raw:
+                return
+        fail(f"create-only quarantine-round publish failed: {path}: errno={error}")
+    fsync_dir(path.parent)
+
+def create_hierarchy(base, capture, leaf):
+    secure_dir(base.parent, 0o700)
+    secure_dir(base, 0o700, create=True)
+    capture_path = base / capture
+    secure_dir(capture_path, 0o700, create=True)
+    leaf_path = capture_path / leaf
+    secure_dir(leaf_path, 0o700, create=True)
+    return leaf_path
+
+def take_lock(directory, name="round.lock"):
+    path = directory / name
+    descriptor = os.open(
+        path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    details = os.fstat(descriptor)
+    if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_gid != 0
+            or details.st_nlink != 1 or stat.S_IMODE(details.st_mode) != 0o600):
+        os.close(descriptor)
+        fail("unsafe quarantine-round lock")
+    os.fsync(descriptor)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+def unwrap(value, label):
+    if not isinstance(value, dict) or set(value) != {"sha256", "value"}:
+        fail(f"{label} wrapper fields differ")
+    wrapped = value.get("value")
+    root = value.get("sha256")
+    if (not isinstance(wrapped, dict) or not isinstance(root, str)
+            or HASH_RE.fullmatch(root) is None or sha(canonical(wrapped)) != root):
+        fail(f"{label} wrapper root differs")
+    return wrapped, root
+
+def load_freeze():
+    path = pathlib.Path(f"/root/.arc-recovery-plans/{freeze_sha}/freeze.lock.json")
+    raw = secure_read(path, 0o400)
+    if sha(raw) != freeze_sha:
+        fail("pinned freeze plan hash differs")
+    value = parse_canonical(raw, "pinned freeze plan")
+    if value.get("schema") != "arc.recovery.freeze-plan.v5":
+        fail("pinned freeze plan schema differs")
+    expected_capture = hashlib.sha256(
+        b"ARC recovery capture v2\0" + bytes.fromhex(freeze_sha)
+    ).hexdigest()
+    if capture_id != expected_capture:
+        fail("quarantine-round capture id does not derive from the freeze plan")
+    rows = [row for row in value.get("nodes", []) if row.get("name") == node]
+    if len(rows) != 1 or rows[0].get("host") != FLEET_MAP[node]:
+        fail("quarantine-round node is absent or ambiguous in the freeze plan")
+    if not isinstance(rows[0].get("executable_sha256"), str) \
+            or HASH_RE.fullmatch(rows[0]["executable_sha256"]) is None:
+        fail("quarantine-round pinned writer executable root is malformed")
+    source = value.get("source_commit")
+    if not isinstance(source, str) or COMMIT_RE.fullmatch(source) is None:
+        fail("pinned freeze-plan source commit is malformed")
+    return value, rows[0]
+
+def proc_start(pid):
+    raw = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    end = raw.rfind(")")
+    fields = raw[end + 2:].split()
+    if end < 0 or len(fields) < 20:
+        fail("sealed writer stat is truncated")
+    return int(fields[19])
+
+def writer_set():
+    answer = []
+    for path in pathlib.Path("/proc").glob("[0-9]*/comm"):
+        try:
+            if path.read_text(errors="replace").strip() == "arc-node":
+                answer.append(int(path.parent.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+    return sorted(answer)
+
+def verify_writer(target):
+    boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    pid = target.get("writer_pid")
+    start = target.get("writer_start_ticks")
+    cgroup_sha = target.get("writer_cgroup_sha256")
+    if (boot != target.get("boot_id") or isinstance(pid, bool) or not isinstance(pid, int)
+            or pid <= 0 or isinstance(start, bool) or not isinstance(start, int) or start <= 0
+            or not isinstance(cgroup_sha, str) or HASH_RE.fullmatch(cgroup_sha) is None):
+        fail("sealed quarantine-round writer identity is malformed or on another boot")
+    proc = pathlib.Path(f"/proc/{pid}")
+    if (not proc.is_dir() or proc.joinpath("comm").read_text().strip() != "arc-node"
+            or proc_start(pid) != start
+            or sha(proc.joinpath("cgroup").read_bytes()) != cgroup_sha
+            or writer_set() != [pid]):
+        fail("sealed quarantine-round writer identity changed")
+
+def supervisor_contract(frozen):
+    value = {
+        "mode": frozen.get("writer_supervision_mode"),
+        "unit": frozen.get("supervisor_unit"),
+        "main_pid": frozen.get("supervisor_main_pid"),
+        "start_ticks": frozen.get("supervisor_start_ticks"),
+        "executable_path": frozen.get("supervisor_executable_path"),
+        "executable_sha256": frozen.get("supervisor_executable_sha256"),
+        "argv_sha256": frozen.get("supervisor_argv_sha256"),
+        "context_sha256": frozen.get("supervisor_context_sha256"),
+        "prepare_barrier_sha256": sha(canonical(frozen.get("prepare_barrier"))),
+    }
+    if (value["mode"] not in {"systemd-unit", "detached-root-session"}
+            or value["unit"] not in {"arc-self-heal.service", "arc-node.service"}
+            or isinstance(value["main_pid"], bool)
+            or not isinstance(value["main_pid"], int) or value["main_pid"] <= 0
+            or isinstance(value["start_ticks"], bool)
+            or not isinstance(value["start_ticks"], int) or value["start_ticks"] <= 0
+            or not isinstance(value["executable_path"], str)
+            or not value["executable_path"].startswith("/")
+            or any(HASH_RE.fullmatch(str(value[label])) is None for label in (
+                "executable_sha256", "argv_sha256", "context_sha256",
+                "prepare_barrier_sha256",
+            ))):
+        fail("sealed quarantine-round supervisor contract is malformed")
+    context = frozen.get("supervisor_context")
+    if (not isinstance(context, dict)
+            or sha(canonical(context)) != value["context_sha256"]
+            or context.get("unit") != value["unit"]):
+        fail("sealed quarantine-round supervisor context differs")
+    return value
+
+def verify_supervisor(frozen, target):
+    """Prove the exact live supervisor plus detached/direct writer topology."""
+    verify_writer(target)
+    sealed = supervisor_contract(frozen)
+    pid = sealed["main_pid"]
+    proc = pathlib.Path(f"/proc/{pid}")
+    if (not proc.is_dir() or proc_start(pid) != sealed["start_ticks"]
+            or os.readlink(proc / "exe") != sealed["executable_path"]
+            or sha((proc / "exe").read_bytes()) != sealed["executable_sha256"]
+            or sha((proc / "cmdline").read_bytes()) != sealed["argv_sha256"]):
+        fail("sealed quarantine-round supervisor process changed")
+    context = frozen["supervisor_context"]
+    properties = {}
+    for prop in ("MainPID", "ActiveState", "Job", "ControlGroup", "InvocationID"):
+        properties[prop] = subprocess.check_output(
+            ["/usr/bin/systemctl", "show", sealed["unit"],
+             f"--property={prop}", "--value"], text=True,
+        ).strip()
+    if (properties["MainPID"] != str(pid) or properties["ActiveState"] != "active"
+            or properties["Job"] not in {"", "0"}
+            or properties["ControlGroup"] != context.get("control_group")
+            or properties["InvocationID"] != context.get("invocation_id")):
+        fail("sealed quarantine-round supervisor unit changed")
+    cgroup_rows = (proc / "cgroup").read_text().splitlines()
+    unified = [row.split("::", 1)[1] for row in cgroup_rows if "::" in row]
+    if unified != [context.get("control_group")]:
+        fail("sealed quarantine-round supervisor cgroup changed")
+    writer_pid = target["writer_pid"]
+    writer_proc = pathlib.Path(f"/proc/{writer_pid}")
+    writer_rows = (writer_proc / "cgroup").read_text().splitlines()
+    writer_unified = [row.split("::", 1)[1] for row in writer_rows if "::" in row]
+    if writer_unified != [frozen.get("writer_cgroup_path")]:
+        fail("sealed quarantine-round writer cgroup path changed")
+    stat_raw = (writer_proc / "stat").read_text(encoding="ascii")
+    fields = stat_raw[stat_raw.rfind(")") + 2:].split()
+    if sealed["mode"] == "systemd-unit":
+        if writer_pid != pid or writer_unified != unified:
+            fail("sealed systemd writer topology changed")
+    elif (sealed["unit"] != "arc-self-heal.service" or writer_pid == pid
+            or len(fields) < 4 or fields[1] != "1" or fields[3] != str(writer_pid)):
+        fail("sealed detached root-session writer topology changed")
+
+def validate_authorization(raw):
+    if sha(raw) != authorization_sha:
+        fail("quarantine-round authorization hash differs")
+    value = parse_canonical(raw, "quarantine-round authorization")
+    fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "round_number",
+        "source_main_commit", "prior_round_result_sha256s", "prior_fenced",
+        "targets", "public_height_receipt", "authenticated_height_cross_proof",
+        "live_source_captures",
+        "authorized_at", "authorization_deadline",
+    }
+    plan, frozen = load_freeze()
+    if (set(value) != fields or value.get("schema") != AUTH_SCHEMA
+            or (value.get("capture_id"), value.get("freeze_plan_sha256"),
+                value.get("round_number"), value.get("source_main_commit"))
+            != (capture_id, freeze_sha, round_number, plan.get("source_commit"))):
+        fail("quarantine-round authorization identity/source differs")
+    targets = value.get("targets")
+    if not isinstance(targets, list) or not targets:
+        fail("quarantine-round current-live target set is empty")
+    target_fields = {
+        "node", "host", "boot_id", "writer_pid", "writer_start_ticks",
+        "writer_cgroup_sha256",
+    }
+    target_names = []
+    freeze_by_name = {row.get("name"): row for row in plan.get("nodes", [])}
+    for row in targets:
+        name = row.get("node") if isinstance(row, dict) else None
+        frozen_row = freeze_by_name.get(name)
+        if (not isinstance(row, dict) or set(row) != target_fields
+                or name not in FLEET_MAP or row.get("host") != FLEET_MAP[name]
+                or not isinstance(frozen_row, dict)
+                or any(row.get(key) != frozen_row.get(key) for key in (
+                    "boot_id", "writer_pid", "writer_start_ticks", "writer_cgroup_sha256"
+                ))):
+            fail("quarantine-round target differs from its pinned writer")
+        target_names.append(name)
+    expected_target_order = [name for name, _host in FLEET if name in set(target_names)]
+    if target_names != expected_target_order or len(target_names) != len(set(target_names)):
+        fail("quarantine-round target order/uniqueness differs")
+    local_targets = [row for row in targets if row.get("node") == node]
+    if len(local_targets) != 1:
+        fail("this host is not an exact current-live target of the round")
+    target = local_targets[0]
+    prior = value.get("prior_fenced")
+    if not isinstance(prior, list):
+        fail("quarantine-round prior-fenced partition is missing")
+    prior_names = []
+    prior_observed = []
+    prior_fields = {
+        "node", "host", "node_transition_receipt_sha256", "transition_schema",
+        "transitioned_at", "stable_head", "persistent_restart_fence_sha256",
+        "current_status",
+    }
+    for row in prior:
+        if (not isinstance(row, dict) or set(row) != prior_fields
+                or row.get("node") not in FLEET_MAP \
+                or row.get("host") != FLEET_MAP[row["node"]]):
+            fail("quarantine-round prior-fenced topology differs")
+        name = row["node"]
+        transition_root = row.get("node_transition_receipt_sha256")
+        transition_schema = row.get("transition_schema")
+        transitioned_at = parse_utc(
+            row.get("transitioned_at"), f"{name} prior transition"
+        )
+        head = row.get("stable_head")
+        restart_root = row.get("persistent_restart_fence_sha256")
+        if (HASH_RE.fullmatch(str(transition_root)) is None
+                or transition_schema not in {NODE_APPLIED_SCHEMA, NODE_STOPPED_SCHEMA}
+                or not isinstance(head, dict) or set(head) != {
+                    "height", "block_hash", "state_root"
+                } or isinstance(head.get("height"), bool)
+                or not isinstance(head.get("height"), int) or head["height"] < 1
+                or HASH_RE.fullmatch(str(head.get("block_hash"))) is None
+                or HASH_RE.fullmatch(str(head.get("state_root"))) is None
+                or HASH_RE.fullmatch(str(restart_root)) is None):
+            fail("quarantine-round prior transition projection differs")
+        status, _status_root = unwrap(
+            row.get("current_status"), f"{name} prior current status"
+        )
+        if transition_schema == NODE_APPLIED_SCHEMA:
+            active_fields = {
+                "schema", "capture_id", "freeze_plan_sha256", "node", "host",
+                "node_applied_receipt_sha256", "observed_at", "writer_state",
+                "boot_id", "writer_pid", "writer_start_ticks",
+                "writer_cgroup_sha256", "network_quarantine_receipt_sha256",
+                "owned_ruleset_stateless_sha256", "stable_head", "active", "enabled",
+                "persistent_restart_fence_sha256",
+            }
+            if (set(status) != active_fields or status.get("schema") != STATUS_SCHEMA
+                    or (status.get("capture_id"), status.get("freeze_plan_sha256"),
+                        status.get("node"), status.get("host")) != (
+                            capture_id, freeze_sha, name, FLEET_MAP[name],
+                        )
+                    or status.get("node_applied_receipt_sha256") != transition_root
+                    or status.get("stable_head") != head
+                    or status.get("active") is not True
+                    or status.get("enabled") is not True
+                    or status.get("writer_state") not in {
+                        "exact-live-fenced", "persistently-stopped"
+                    }
+                    or (status.get("persistent_restart_fence_sha256")
+                        not in {None, restart_root})):
+                fail("quarantine-round prior active-nft status differs")
+        else:
+            stopped_fields = {
+                "schema", "capture_id", "freeze_plan_sha256", "node", "host",
+                "node_transition_receipt_sha256", "transition_schema",
+                "transitioned_at", "observed_at", "writer_state", "current_boot_id",
+                "stable_head", "persistent_restart_fence_sha256",
+                "precommit_status_sha256", "source_inputs", "nft_table_absent",
+                "applied_commit_absent", "active_selector_absent",
+                "fence_unit_enabled", "fence_unit_active",
+                "automatic_legacy_restart",
+            }
+            if (set(status) != stopped_fields
+                    or status.get("schema") != STOPPED_STATUS_SCHEMA
+                    or (status.get("capture_id"), status.get("freeze_plan_sha256"),
+                        status.get("node"), status.get("host")) != (
+                            capture_id, freeze_sha, name, FLEET_MAP[name],
+                        )
+                    or status.get("node_transition_receipt_sha256") != transition_root
+                    or status.get("transition_schema") != transition_schema
+                    or status.get("transitioned_at") != row.get("transitioned_at")
+                    or status.get("stable_head") != head
+                    or status.get("persistent_restart_fence_sha256") != restart_root
+                    or status.get("writer_state") != "persistently-stopped"
+                    or status.get("nft_table_absent") is not True
+                    or status.get("applied_commit_absent") is not True
+                    or status.get("active_selector_absent") is not True
+                    or status.get("fence_unit_enabled") is not True
+                    or status.get("fence_unit_active") is not False
+                    or status.get("automatic_legacy_restart") is not False):
+                fail("quarantine-round prior stopped status differs")
+        observed_at = parse_utc(status.get("observed_at"), f"{name} prior observation")
+        if observed_at < transitioned_at:
+            fail("quarantine-round prior observation predates its transition")
+        prior_observed.append(observed_at)
+        prior_names.append(name)
+    expected_prior_order = [name for name, _host in FLEET if name in set(prior_names)]
+    if (prior_names != expected_prior_order or len(set(prior_names)) != len(prior_names)
+            or set(prior_names) & set(target_names)
+            or set(prior_names) | set(target_names) != set(FLEET_MAP)):
+        fail("quarantine-round partition does not exactly cover the fixed fleet")
+    prior_roots = value.get("prior_round_result_sha256s")
+    if (not isinstance(prior_roots, list) or len(prior_roots) != round_number - 1
+            or any(not isinstance(item, str) or HASH_RE.fullmatch(item) is None
+                   for item in prior_roots)):
+        fail("quarantine-round prior result roots differ")
+    public, public_sha = unwrap(value.get("public_height_receipt"), "target public height")
+    cross, _cross_sha = unwrap(
+        value.get("authenticated_height_cross_proof"), "target authenticated height"
+    )
+    if ((public.get("schema"), public.get("source_main_commit"),
+         public.get("freeze_plan_sha256"), public.get("capture_id")) != (
+            "arc.recovery.legacy-public-height-targets.v1", plan.get("source_commit"),
+            freeze_sha, capture_id,
+        ) or (cross.get("schema"), cross.get("source_main_commit"),
+              cross.get("freeze_plan_sha256"), cross.get("capture_id"),
+              cross.get("legacy_public_height_receipt_sha256")) != (
+            "arc.recovery.authenticated-legacy-height-targets.v1", plan.get("source_commit"),
+            freeze_sha, capture_id, public_sha,
+        )):
+        fail("quarantine-round height evidence identity/source differs")
+    public_targets = public.get("targets")
+    cross_targets = cross.get("targets")
+    expected_targets = [
+        {"node": name, "host": FLEET_MAP[name],
+         "rpc_origin": f"http://{FLEET_MAP[name]}:9090"}
+        for name in target_names
+    ]
+    if public_targets != expected_targets or cross_targets != expected_targets:
+        fail("quarantine-round public/authenticated target pin differs")
+    origins = public.get("origins")
+    cross_nodes = cross.get("nodes")
+    if (not isinstance(origins, list) or len(origins) != len(target_names)
+            or not isinstance(cross_nodes, list) or len(cross_nodes) != len(target_names)
+            or [row.get("name") for row in origins] != target_names
+            or [row.get("node") for row in cross_nodes] != target_names):
+        fail("quarantine-round height evidence count differs")
+    public_row = next(row for row in origins if row.get("name") == node)
+    cross_row = next(row for row in cross_nodes if row.get("node") == node)
+    if (public_row.get("name") != node
+            or (cross_row.get("node"), cross_row.get("host")) != (node, FLEET_MAP[node])
+            or any(cross_row.get(key) != target.get(key) for key in (
+                "boot_id", "writer_pid", "writer_start_ticks", "writer_cgroup_sha256"
+            ))):
+        fail("quarantine-round height evidence writer differs")
+    for label, height, block_hash in (
+        ("public", public_row.get("latest_block_height"), public_row.get("latest_block_hash")),
+        ("authenticated", cross_row.get("loopback_latest_height"),
+         cross_row.get("loopback_latest_block_hash")),
+    ):
+        if (isinstance(height, bool) or not isinstance(height, int) or height < 1
+                or not isinstance(block_hash, str) or HASH_RE.fullmatch(block_hash) is None):
+            fail(f"quarantine-round {label} ancestry tuple is malformed")
+    source_capture_rows = value.get("live_source_captures")
+    if (not isinstance(source_capture_rows, list)
+            or len(source_capture_rows) != len(target_names)):
+        fail("quarantine-round live-source capture set differs")
+    source_captures = []
+    for wrapper, expected_name in zip(source_capture_rows, target_names):
+        capture_value, capture_root = unwrap(
+            wrapper, f"{expected_name} live source capture"
+        )
+        capture_fields = {
+            "schema", "capture_id", "freeze_plan_sha256", "source_main_commit",
+            "round_number", "node", "host", "authorized_writer", "rpc_origin",
+            "public_height_receipt_sha256", "authenticated_height_cross_proof_sha256",
+            "snapshot_endpoint", "snapshot_listener", "capture_attempt_id",
+            "capture_started_at", "capture_completed_at", "inspector_binary_sha256",
+            "genesis_sha256", "legacy_validator_set_sha256", "fixed_pair_path",
+            "snapshot_source", "existing_source_snapshot_used", "rust_capture",
+            "head", "ancestry_checks", "content_sealed", "strict_offline_replay",
+            "source_pair_role", "minimum_height", "expected_head",
+            "boundary_proof_sha256", "network_quarantine_receipt_sha256",
+            "owned_ruleset_stateless_sha256",
+        }
+        expected_target = next(row for row in targets if row["node"] == expected_name)
+        expected_writer = {
+            "boot_id": expected_target["boot_id"],
+            "pid": expected_target["writer_pid"],
+            "start_ticks": expected_target["writer_start_ticks"],
+            "cgroup_sha256": expected_target["writer_cgroup_sha256"],
+        }
+        listener = capture_value.get("snapshot_listener")
+        head = capture_value.get("head")
+        fixed_path = capture_value.get("fixed_pair_path")
+        if (set(capture_value) != capture_fields
+                or capture_value.get("schema")
+                    != "arc.recovery.quarantine-live-source-capture.v1"
+                or (capture_value.get("capture_id"),
+                    capture_value.get("freeze_plan_sha256"),
+                    capture_value.get("source_main_commit"),
+                    capture_value.get("round_number"), capture_value.get("node"),
+                    capture_value.get("host")) != (
+                        capture_id, freeze_sha, plan.get("source_commit"), round_number,
+                        expected_name, FLEET_MAP[expected_name],
+                    )
+                or capture_value.get("authorized_writer") != expected_writer
+                or capture_value.get("public_height_receipt_sha256") != public_sha
+                or capture_value.get("authenticated_height_cross_proof_sha256")
+                    != sha(canonical(cross))
+                or capture_value.get("snapshot_endpoint") != "/sync/snapshot"
+                or capture_value.get("snapshot_source")
+                    != "sealed-writer-owned-loopback-/sync/snapshot"
+                or capture_value.get("existing_source_snapshot_used") is not False
+                or capture_value.get("content_sealed") is not True
+                or capture_value.get("strict_offline_replay") is not True
+                or capture_value.get("source_pair_role")
+                    != "preauthorization-boundary"
+                or capture_value.get("expected_head") is not None
+                or capture_value.get("boundary_proof_sha256") != sha(canonical(cross))
+                or capture_value.get("network_quarantine_receipt_sha256") is not None
+                or capture_value.get("owned_ruleset_stateless_sha256") is not None
+                or not isinstance(listener, dict) or set(listener) != {
+                    "boot_id", "pid", "start_ticks", "port", "socket_inode"
+                } or (listener.get("boot_id"), listener.get("pid"),
+                      listener.get("start_ticks")) != (
+                          expected_writer["boot_id"], expected_writer["pid"],
+                          expected_writer["start_ticks"],
+                      )
+                or not isinstance(listener.get("port"), int)
+                or isinstance(listener.get("port"), bool)
+                or not 1 <= listener["port"] <= 65535
+                or not isinstance(listener.get("socket_inode"), int)
+                or isinstance(listener.get("socket_inode"), bool)
+                or listener["socket_inode"] <= 0
+                or capture_value.get("rpc_origin")
+                    != f"http://127.0.0.1:{listener['port']}"
+                or not isinstance(head, dict) or set(head) != {
+                    "height", "block_hash", "state_root"
+                } or isinstance(head.get("height"), bool)
+                or not isinstance(head.get("height"), int) or head["height"] < 1
+                or HASH_RE.fullmatch(str(head.get("block_hash"))) is None
+                or HASH_RE.fullmatch(str(head.get("state_root"))) is None
+                or capture_value.get("minimum_height") != max(
+                    next(row for row in origins if row.get("name") == expected_name).get(
+                        "info_after_height", -1
+                    ),
+                    next(row for row in cross_nodes if row.get("node") == expected_name).get(
+                        "loopback_info_after_height", -1
+                    ),
+                )
+                or head["height"] < capture_value["minimum_height"]
+                or not isinstance(fixed_path, str)
+                or not fixed_path.startswith(
+                    f"/root/arc-recovery-live-source-captures/{capture_id}/"
+                    f"{expected_name}/round-{round_number}/"
+                ) or not fixed_path.endswith("/fixed-source") or ".." in fixed_path):
+            fail("quarantine-round live-source capture identity differs")
+        rust_capture, _rust_root = unwrap(
+            capture_value.get("rust_capture"),
+            f"{expected_name} Rust live source capture",
+        )
+        fixed = rust_capture.get("fixed_pair") if isinstance(rust_capture, dict) else None
+        if (rust_capture.get("schema")
+                != "arc.recovery.live-legacy-source-capture.v1"
+                or rust_capture.get("head") != head
+                or not isinstance(fixed, dict) or fixed.get("strict_replay") is not True):
+            fail("quarantine-round Rust fixed-pair proof differs")
+        source_captures.append((capture_value, capture_root))
+    local_capture_rows = [row for row in source_captures if row[0].get("node") == node]
+    if len(local_capture_rows) != 1:
+        fail("this host has no unique live-source capture")
+    local_capture, local_capture_root = local_capture_rows[0]
+    local_checks = local_capture.get("ancestry_checks")
+    expected_checks = (
+        ("public-latest", public_row.get("latest_block_height"),
+         public_row.get("latest_block_hash")),
+        ("authenticated-loopback-latest", cross_row.get("loopback_latest_height"),
+         cross_row.get("loopback_latest_block_hash")),
+    )
+    if not isinstance(local_checks, list) or len(local_checks) != 2:
+        fail("local live-source ancestry proof differs")
+    for check, (label, height, block_hash) in zip(local_checks, expected_checks):
+        if (not isinstance(check, dict) or set(check) != {
+                "label", "height", "expected_block_hash", "observed_block_hash",
+                "state_root", "inspection_sha256"
+            } or (check.get("label"), check.get("height"),
+                  check.get("expected_block_hash"), check.get("observed_block_hash")) != (
+                      label, height, block_hash, block_hash,
+                  ) or height > local_capture["head"]["height"]
+                or HASH_RE.fullmatch(str(check.get("state_root"))) is None
+                or HASH_RE.fullmatch(str(check.get("inspection_sha256"))) is None):
+            fail("local live-source ancestry differs from height evidence")
+    local_rust, _local_rust_sha = unwrap(
+        local_capture.get("rust_capture"), "local Rust live-source capture"
+    )
+    local_fixed = local_rust.get("fixed_pair")
+    fixed_root = pathlib.Path(local_capture["fixed_pair_path"])
+
+    def reprove_capture_file(path, expected, mode_value, label):
+        if not isinstance(expected, dict):
+            fail(f"{label} proof is missing")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(descriptor)
+            identity = lambda item: {
+                "device": item.st_dev, "inode": item.st_ino, "mode": item.st_mode,
+                "uid": item.st_uid, "gid": item.st_gid, "nlink": item.st_nlink,
+                "size": item.st_size, "mtime_ns": item.st_mtime_ns,
+                "ctime_ns": item.st_ctime_ns,
+            }
+            observed = identity(before)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
+                    or before.st_gid != 0 or before.st_nlink != 1
+                    or stat.S_IMODE(before.st_mode) != mode_value):
+                fail(f"{label} identity is unsafe")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            observed["sha256"] = digest.hexdigest()
+            if identity(os.fstat(descriptor)) != identity(before) or observed != expected:
+                fail(f"{label} changed after live capture")
+        finally:
+            os.close(descriptor)
+
+    fixed_details = fixed_root.lstat()
+    fixed_directory_observed = {
+        "device": fixed_details.st_dev, "inode": fixed_details.st_ino,
+        "mode": fixed_details.st_mode, "uid": fixed_details.st_uid,
+        "gid": fixed_details.st_gid, "nlink": fixed_details.st_nlink,
+        "mtime_ns": fixed_details.st_mtime_ns, "ctime_ns": fixed_details.st_ctime_ns,
+    }
+    if (fixed_root.is_symlink() or not stat.S_ISDIR(fixed_details.st_mode)
+            or stat.S_IMODE(fixed_details.st_mode) != 0o500
+            or fixed_directory_observed != local_fixed.get("data_dir")):
+        fail("fixed live-source directory changed before authorization")
+    reprove_capture_file(
+        fixed_root / "state.wal", local_fixed.get("state_wal"), 0o400,
+        "fixed live-source WAL",
+    )
+    reprove_capture_file(
+        fixed_root / "state.snapshot.lz4", local_fixed.get("snapshot"), 0o400,
+        "fixed live-source snapshot",
+    )
+    reprove_capture_file(
+        fixed_root / "genesis.network-hash", local_fixed.get("genesis_binding"), 0o400,
+        "fixed live-source genesis binding",
+    )
+    staged_root = seal_base / freeze_sha / node
+    for staged_path, expected_root, expected_mode, label in (
+        (staged_root / "arc-node", local_capture["inspector_binary_sha256"], 0o500,
+         "live-source inspector"),
+        (staged_root / "genesis.toml", local_capture["genesis_sha256"], 0o400,
+         "live-source genesis"),
+        (staged_root / "legacy-validator-set-40m.json",
+         local_capture["legacy_validator_set_sha256"], 0o400,
+         "live-source legacy validator set"),
+    ):
+        descriptor = os.open(staged_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            details = os.fstat(descriptor); digest = hashlib.sha256()
+            if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0
+                    or details.st_gid != 0 or details.st_nlink != 1
+                    or stat.S_IMODE(details.st_mode) != expected_mode):
+                fail(f"{label} identity is unsafe")
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk: break
+                digest.update(chunk)
+            if digest.hexdigest() != expected_root:
+                fail(f"{label} root changed before authorization")
+        finally:
+            os.close(descriptor)
+    target = {**target, "_live_source_capture": local_capture,
+              "_live_source_capture_sha256": local_capture_root}
+    public_started = parse_utc(public.get("started_at"), "target public start")
+    public_completed = parse_utc(public.get("completed_at"), "target public completion")
+    cross_started = parse_utc(cross.get("started_at"), "target authenticated start")
+    cross_completed = parse_utc(cross.get("completed_at"), "target authenticated completion")
+    capture_completed = [
+        parse_utc(row[0].get("capture_completed_at"), "target live source capture")
+        for row in source_captures
+    ]
+    authorized = parse_utc(value.get("authorized_at"), "round authorization")
+    deadline = parse_utc(value.get("authorization_deadline"), "round deadline")
+    if (not public_started <= public_completed <= cross_started <= cross_completed
+            <= min(capture_completed) <= max(capture_completed) <= authorized <= deadline
+            or deadline - public_completed != datetime.timedelta(seconds=300)):
+        fail("quarantine-round authorization timeline differs")
+    if any(observed < public_started or observed > authorized
+           or authorized - observed > datetime.timedelta(seconds=300)
+           for observed in prior_observed):
+        fail("quarantine-round prior secured status is outside the fresh bracket")
+    return value, target, deadline, public_row, cross_row, frozen
+
+def validate_acceptance(raw, auth, deadline, expected_node=None):
+    expected_node = node if expected_node is None else expected_node
+    value = parse_canonical(raw, "round authorization acceptance")
+    fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "round_number",
+        "round_authorization_sha256", "node", "host", "accepted_at",
+        "authorization_deadline",
+    }
+    if (set(value) != fields or value.get("schema") != ACCEPTANCE_SCHEMA
+            or (value.get("capture_id"), value.get("freeze_plan_sha256"),
+                value.get("round_number"), value.get("round_authorization_sha256"),
+                value.get("node"), value.get("host"), value.get("authorization_deadline"))
+            != (capture_id, freeze_sha, round_number, authorization_sha, expected_node,
+                FLEET_MAP[expected_node], auth.get("authorization_deadline"))):
+        fail("round authorization acceptance binding differs")
+    accepted = parse_utc(value.get("accepted_at"), "round authorization acceptance")
+    authorized = parse_utc(auth.get("authorized_at"), "round authorization")
+    if not authorized <= accepted <= deadline:
+        fail("round authorization acceptance is outside the live window")
+    return value
+
+def validate_readiness(raw, auth, acceptance_raw, deadline):
+    if sha(raw) != readiness_sha:
+        fail("quarantine-round readiness hash differs")
+    value = parse_canonical(raw, "quarantine-round readiness")
+    fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "round_number",
+        "round_authorization_sha256", "targets", "completed_at",
+        "authorization_deadline",
+    }
+    if (set(value) != fields or value.get("schema") != READINESS_SCHEMA
+            or (value.get("capture_id"), value.get("freeze_plan_sha256"),
+                value.get("round_number"), value.get("round_authorization_sha256"),
+                value.get("authorization_deadline")) != (
+                    capture_id, freeze_sha, round_number, authorization_sha,
+                    auth.get("authorization_deadline"),
+                )):
+        fail("quarantine-round readiness identity differs")
+    auth_target_names = [row["node"] for row in auth["targets"]]
+    rows = value.get("targets")
+    if not isinstance(rows, list) or len(rows) != len(auth_target_names):
+        fail("quarantine-round readiness does not cover every current target")
+    accepted_times = []
+    for row, expected_node in zip(rows, auth_target_names):
+        if (not isinstance(row, dict) or set(row) != {
+                "node", "host", "authorization_acceptance"
+            } or (row.get("node"), row.get("host")) != (
+                expected_node, FLEET_MAP[expected_node]
+            )):
+            fail("quarantine-round readiness target order/topology differs")
+        nested, nested_sha = unwrap(
+            row.get("authorization_acceptance"), f"{expected_node} round acceptance"
+        )
+        nested_raw = canonical(nested)
+        acceptance = validate_acceptance(nested_raw, auth, deadline, expected_node)
+        if nested_sha != sha(nested_raw):
+            fail("quarantine-round readiness acceptance root differs")
+        if expected_node == node and (
+                nested != validate_acceptance(acceptance_raw, auth, deadline)
+                or nested_sha != sha(acceptance_raw)):
+            fail("local quarantine-round readiness acceptance differs from durable bytes")
+        accepted_times.append(parse_utc(acceptance["accepted_at"], "round acceptance"))
+    completed = parse_utc(value.get("completed_at"), "round readiness completion")
+    if not max(accepted_times) <= completed <= deadline:
+        fail("quarantine-round readiness timeline differs")
+    return value
+
+def input_bytes():
+    with os.fdopen(3, "rb", closefd=False) as handle:
+        raw = handle.read(16 * 1024 * 1024 + 1)
+    if not raw or len(raw) > 16 * 1024 * 1024:
+        fail("quarantine-round stdin is empty or exceeds 16 MiB")
+    return raw
+
+create_hierarchy(round_base, capture_id, authorization_sha)
+lock_fd = take_lock(attempt)
+try:
+    if mode == "authorize":
+        incoming = input_bytes()
+        auth, target, deadline, _public, _cross, _frozen = validate_authorization(incoming)
+        publish(auth_path, incoming, 0o400)
+        if acceptance_path.exists() or acceptance_path.is_symlink():
+            acceptance_raw = secure_read(acceptance_path, 0o400)
+            validate_acceptance(acceptance_raw, auth, deadline)
+            sys.stdout.buffer.write(acceptance_raw)
+            raise SystemExit(0)
+        current = now_value()
+        if current < parse_utc(auth.get("authorized_at"), "round authorization") \
+                or current > deadline:
+            fail("round authorization acceptance is outside the local live window")
+        verify_writer(target)
+        acceptance = {
+            "schema": ACCEPTANCE_SCHEMA, "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha, "round_number": round_number,
+            "round_authorization_sha256": authorization_sha, "node": node,
+            "host": FLEET_MAP[node], "accepted_at": format_utc(current),
+            "authorization_deadline": auth["authorization_deadline"],
+        }
+        acceptance_raw = canonical(acceptance)
+        publish(acceptance_path, acceptance_raw, 0o400)
+        sys.stdout.buffer.write(acceptance_raw)
+        raise SystemExit(0)
+
+    auth_raw = secure_read(auth_path, 0o400)
+    auth, target, deadline, public_row, cross_row, frozen = validate_authorization(auth_raw)
+    acceptance_raw = secure_read(acceptance_path, 0o400)
+    acceptance = validate_acceptance(acceptance_raw, auth, deadline)
+    if mode == "authorization-status":
+        sys.stdout.buffer.write(acceptance_raw)
+        raise SystemExit(0)
+    if mode == "ready":
+        incoming = input_bytes()
+        readiness = validate_readiness(incoming, auth, acceptance_raw, deadline)
+        if readiness_path.exists() or readiness_path.is_symlink():
+            existing = secure_read(readiness_path, 0o400)
+            validate_readiness(existing, auth, acceptance_raw, deadline)
+            if existing != incoming:
+                fail("create-only quarantine-round readiness differs")
+            sys.stdout.buffer.write(existing)
+            raise SystemExit(0)
+        current = now_value()
+        if current > deadline:
+            fail("quarantine-round readiness arrived after its deadline")
+        verify_writer(target)
+        publish(readiness_path, incoming, 0o400)
+        sys.stdout.buffer.write(incoming)
+        raise SystemExit(0)
+    readiness_raw = secure_read(readiness_path, 0o400)
+    readiness = validate_readiness(readiness_raw, auth, acceptance_raw, deadline)
+    if mode == "readiness-status":
+        sys.stdout.buffer.write(readiness_raw)
+        raise SystemExit(0)
+
+    def persistence_payloads():
+        """Return the one reviewed, attempt-independent systemd fence closure."""
+        dispatcher = f'''#!/bin/bash
+set -Eeuo pipefail
+umask 077
+ACTIVE={active_path}
+MODE="${{1:-}}"
+case "$MODE" in ensure|probe|monitor) ;; *) exit 64 ;; esac
+test "$(/usr/bin/stat -c %u:%g:%a:%h "$ACTIVE")" = 0:0:400:1 || exit 77
+STATE="$(/usr/bin/cat "$ACTIVE")"
+case "$STATE" in /etc/arc-recovery/network-fence-rounds/[0-9a-f]*/*) ;; *) exit 77 ;; esac
+test "$(/usr/bin/stat -c %u:%g:%a:%h "$STATE/apply")" = 0:0:500:1 || exit 77
+test "$(/usr/bin/stat -c %u:%g:%a:%h "$STATE/applied.commit.json")" = 0:0:400:1 || exit 77
+exec "$STATE/apply" "$MODE"
+'''.encode()
+        unit = f'''[Unit]
+Description=ARC legacy maintenance quarantine-round fence
+DefaultDependencies=no
+Wants=network-pre.target
+After=local-fs.target firewalld.service ip6tables-restore.service ip6tables.service iptables-restore.service iptables.service netfilter-persistent.service nftables.service ufw.service
+Before=network-pre.target network.target network-online.target arc-self-heal.service arc-node.service arc-node-update.service arc-node-update.timer
+RefuseManualStop=yes
+IgnoreOnIsolate=yes
+
+[Service]
+Type=simple
+ExecStartPre={dispatcher_path} ensure
+ExecStart={dispatcher_path} monitor
+Restart=always
+RestartPreventExitStatus=77
+RestartSec=1
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=no
+
+[Install]
+WantedBy=multi-user.target
+'''.encode()
+        dependencies = {}
+        # The frozen live supervisor is deliberately first.  Publishing its
+        # drop-in is the first restart-effective systemd mutation.  The
+        # required allow path is permanently absent, so a reboot after any
+        # subsequent prefix cannot create an unsealed replacement writer.
+        legacy_units = [frozen["supervisor_unit"]]
+        legacy_units.extend(unit_name for unit_name in (
+            "arc-self-heal.service", "arc-node.service",
+            "arc-node-update.service", "arc-node-update.timer",
+        ) if unit_name not in legacy_units)
+        for legacy_unit in legacy_units:
+            dependency = pathlib.Path(
+                f"/etc/systemd/system/{legacy_unit}.d/zzzy-arc-recovery-network-fence.conf"
+            )
+            dependency_value = (
+                "[Unit]\n"
+                "ConditionPathExists=/etc/arc-recovery/"
+                "quarantine-round-legacy-start.allow\n"
+                "Requires=arc-legacy-maintenance-fence.service\n"
+                "After=arc-legacy-maintenance-fence.service\n"
+                + (f"\n[Service]\nExecStartPre={dispatcher_path} probe\n"
+                   if legacy_unit.endswith(".service") else "")
+            ).encode()
+            dependencies[dependency] = dependency_value
+        return dispatcher, unit, dependencies
+
+    def persistence_file_roots(dispatcher, unit, dependencies):
+        return {
+            "dispatcher": {"path": str(dispatcher_path), "sha256": sha(dispatcher),
+                           "mode": 0o500},
+            "unit": {"path": str(unit_path), "sha256": sha(unit), "mode": 0o400},
+            "dependencies": [
+                {"path": str(path), "sha256": sha(raw), "mode": 0o400}
+                for path, raw in dependencies.items()
+            ],
+        }
+
+    if mode in {"precommit-status", "stopped-precommit"}:
+        secure_dir(state_base.parent, 0o700)
+        secure_dir(state_base, 0o700)
+        secure_dir(state_base / capture_id, 0o700)
+        secure_dir(state, 0o700)
+        contract_raw = secure_read(state / "contract.json", 0o400)
+        contract = parse_canonical(contract_raw, "precommit runtime contract")
+        if (contract.get("capture_id"), contract.get("freeze_plan_sha256"),
+                contract.get("round_number"), contract.get("round_authorization_sha256"),
+                contract.get("round_readiness_sha256"), contract.get("node"),
+                contract.get("host"), contract.get("source_main_commit")) != (
+                    capture_id, freeze_sha, round_number, authorization_sha,
+                    readiness_sha, node, FLEET_MAP[node], auth["source_main_commit"],
+                ):
+            fail("precommit runtime contract identity differs")
+        commit_path = state / "applied.commit.json"
+        if commit_path.is_symlink():
+            fail("precommit stopped applied-commit path is unsafe")
+        intent_raw = secure_read(state / "nft-apply-intent.json", 0o400)
+        intent = parse_canonical(intent_raw, "precommit nft apply intent")
+        if (sha(intent_raw) != contract.get("nft_apply_intent_sha256")
+                or intent.get("round_authorization_sha256") != authorization_sha
+                or intent.get("round_readiness_sha256") != readiness_sha
+                or intent.get("authorization_deadline") != auth["authorization_deadline"]
+                or parse_utc(intent.get("prepared_at"), "precommit apply-intent") > deadline):
+            fail("precommit nft apply-intent differs")
+        gate_path = state / "nft-deadline-gate.json"
+        if gate_path.exists() and not gate_path.is_symlink():
+            gate_raw = secure_read(gate_path, 0o400)
+            gate = parse_canonical(gate_raw, "precommit nft deadline gate")
+            if (gate.get("capture_id"), gate.get("freeze_plan_sha256"),
+                    gate.get("round_number"), gate.get("round_authorization_sha256"),
+                    gate.get("round_readiness_sha256"), gate.get("node"), gate.get("host"),
+                    gate.get("authorization_deadline"), gate.get("apply_helper_sha256"),
+                    gate.get("policy_sha256"), gate.get("table_binding_sha256"),
+                    gate.get("table_comment")) != (
+                        capture_id, freeze_sha, round_number, authorization_sha,
+                        readiness_sha, node, FLEET_MAP[node], auth["authorization_deadline"],
+                        contract.get("apply_helper_sha256"),
+                        contract.get("nft_policy_source_sha256"),
+                        contract.get("table_binding_sha256"), contract.get("table_comment"),
+                    ):
+                fail("precommit nft deadline gate differs")
+            gate_invoked = parse_utc(gate.get("invoked_at"), "precommit nft gate invocation")
+            if gate_invoked > deadline:
+                fail("precommit nft gate invocation was outside its deadline")
+            gate_wrapper = {"value": gate, "sha256": sha(gate_raw)}
+        elif gate_path.is_symlink():
+            fail("precommit nft deadline gate path is unsafe")
+        else:
+            gate_wrapper = None
+        if commit_path.exists():
+            commit_raw = secure_read(commit_path, 0o400)
+            commit = parse_canonical(commit_raw, "stopped applied commit")
+            commit_expected = {
+                "schema": APPLIED_COMMIT_SCHEMA,
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_number": round_number,
+                "round_authorization_sha256": authorization_sha,
+                "round_readiness_sha256": readiness_sha,
+                "node": node, "host": FLEET_MAP[node],
+                "table_binding_sha256": contract.get("table_binding_sha256"),
+                "table_comment": contract.get("table_comment"),
+                "apply_helper_sha256": contract.get("apply_helper_sha256"),
+                "nft_policy_source_sha256": contract.get("nft_policy_source_sha256"),
+            }
+            if (set(commit) != set(commit_expected) | {
+                    "nft_deadline_gate_sha256", "owned_ruleset_stateless_sha256",
+                    "nft_applied_at",
+                } or any(commit.get(key) != value
+                         for key, value in commit_expected.items())
+                    or gate_wrapper is None
+                    or commit.get("nft_deadline_gate_sha256") != gate_wrapper["sha256"]
+                    or commit.get("nft_applied_at") != gate_wrapper["value"].get("invoked_at")
+                    or HASH_RE.fullmatch(str(
+                        commit.get("owned_ruleset_stateless_sha256")
+                    )) is None):
+                fail("stopped applied commit binding differs")
+            commit_wrapper = {"value": commit, "sha256": sha(commit_raw)}
+        else:
+            commit_raw = None
+            commit_wrapper = None
+        binding_raw = secure_read(state / "table-binding.json", 0o400)
+        binding = parse_canonical(binding_raw, "precommit nft table binding")
+        if sha(binding_raw) != contract.get("table_binding_sha256") \
+                or binding != contract.get("table_binding"):
+            fail("precommit nft table-binding root differs")
+        helper_raw = secure_read(state / "apply", 0o500)
+        policy_raw = secure_read(state / "policy.nft", 0o400)
+        if (sha(helper_raw) != contract.get("apply_helper_sha256")
+                or sha(policy_raw) != contract.get("nft_policy_source_sha256")):
+            fail("precommit helper/policy roots differ")
+        pinned_nft = state / "nft"
+        secure_read(pinned_nft, 0o500)
+        if subprocess.run(
+            [str(pinned_nft), "list", "table", "inet", table_name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            fail("precommit stopped status still has an nft table")
+        if active_path.exists() or active_path.is_symlink():
+            fail("precommit stopped status unexpectedly has an active selector")
+        current_boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if UUID_RE.fullmatch(current_boot) is None:
+            fail("precommit stopped status boot id is malformed")
+        reboot_after_intent = current_boot != target["boot_id"]
+        if writer_set():
+            fail("precommit stopped status found a live arc-node writer")
+        recovery_started = now_value()
+        if recovery_started <= deadline:
+            fail("precommit stopped status is not after authorization expiry")
+
+        dispatcher_raw_value, unit_value, dependencies = persistence_payloads()
+        persistence_files = persistence_file_roots(
+            dispatcher_raw_value, unit_value, dependencies
+        )
+        persistence_plan_raw = secure_read(state / "persistence-plan.json", 0o400)
+        persistence_plan = parse_canonical(
+            persistence_plan_raw, "precommit persistence plan"
+        )
+        persistence_plan_fields = {
+            "schema", "capture_id", "freeze_plan_sha256", "source_main_commit",
+            "round_number", "round_authorization_sha256",
+            "round_readiness_sha256", "authorization_deadline", "node", "host",
+            "authorized_writer", "authorized_supervisor",
+            "legacy_start_allow_path", "legacy_start_allow_absent",
+            "nft_apply_intent_sha256",
+            "table_binding_sha256", "apply_helper_sha256",
+            "nft_policy_source_sha256", "files", "fence_unit",
+            "fence_unit_enabled", "active_selector_published_only_after_applied_commit",
+            "missing_selector_behavior", "automatic_unfence", "prepared_at",
+        }
+        if (set(persistence_plan) != persistence_plan_fields
+                or persistence_plan.get("schema")
+                    != "arc.recovery.quarantine-persistence-plan.v1"
+                or (persistence_plan.get("capture_id"),
+                    persistence_plan.get("freeze_plan_sha256"),
+                    persistence_plan.get("source_main_commit"),
+                    persistence_plan.get("round_number"),
+                    persistence_plan.get("round_authorization_sha256"),
+                    persistence_plan.get("round_readiness_sha256"),
+                    persistence_plan.get("authorization_deadline"),
+                    persistence_plan.get("node"), persistence_plan.get("host")) != (
+                        capture_id, freeze_sha, auth["source_main_commit"], round_number,
+                        authorization_sha, readiness_sha, auth["authorization_deadline"],
+                        node, FLEET_MAP[node],
+                    )
+                or persistence_plan.get("authorized_writer") != contract.get("writer")
+                or persistence_plan.get("authorized_supervisor")
+                    != supervisor_contract(frozen)
+                or persistence_plan.get("legacy_start_allow_path")
+                    != "/etc/arc-recovery/quarantine-round-legacy-start.allow"
+                or persistence_plan.get("legacy_start_allow_absent") is not True
+                or persistence_plan.get("nft_apply_intent_sha256") != sha(intent_raw)
+                or persistence_plan.get("table_binding_sha256")
+                    != contract.get("table_binding_sha256")
+                or persistence_plan.get("apply_helper_sha256") != sha(helper_raw)
+                or persistence_plan.get("nft_policy_source_sha256") != sha(policy_raw)
+                or persistence_plan.get("files") != persistence_files
+                or persistence_plan.get("fence_unit")
+                    != "arc-legacy-maintenance-fence.service"
+                or persistence_plan.get("fence_unit_enabled") is not True
+                or persistence_plan.get(
+                    "active_selector_published_only_after_applied_commit") is not True
+                or persistence_plan.get("missing_selector_behavior")
+                    != "fail-closed-without-nft-apply"
+                or persistence_plan.get("automatic_unfence") is not False
+                or sha(persistence_plan_raw) != contract.get("persistence_plan_sha256")):
+            fail("precommit persistence plan binding differs")
+        persistence_prepared = parse_utc(
+            persistence_plan.get("prepared_at"), "precommit persistence plan preparation"
+        )
+        intent_prepared = parse_utc(
+            intent.get("prepared_at"), "precommit apply-intent preparation"
+        )
+        if not intent_prepared <= persistence_prepared <= deadline:
+            fail("precommit persistence plan chronology differs")
+
+        legacy_start_allow = pathlib.Path(
+            persistence_plan["legacy_start_allow_path"]
+        )
+        if legacy_start_allow.exists() or legacy_start_allow.is_symlink():
+            fail("precommit legacy restart allow path unexpectedly exists")
+
+        # The plan above was create-only and fsynced before the first possible
+        # /etc mutation.  Once expiry plus stable absence proves the authorized
+        # writer gone (on this boot or a later one),
+        # finish only that exact fail-closed persistence closure.  This never
+        # calls the nft helper and never publishes the active selector.
+        secure_dir(pathlib.Path("/etc/arc-recovery"), 0o700)
+        # Same order as initial apply: the selected live supervisor barrier is
+        # the first effective mutation; a missing dispatcher also fails closed.
+        for dependency, dependency_value in dependencies.items():
+            secure_dir(dependency.parent, 0o755, create=True)
+            publish(dependency, dependency_value, 0o400)
+        publish(dispatcher_path, dispatcher_raw_value, 0o500)
+        publish(unit_path, unit_value, 0o400)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+        subprocess.run(
+            ["/usr/bin/systemctl", "enable", "arc-legacy-maintenance-fence.service"],
+            stdout=subprocess.DEVNULL, check=True,
+        )
+        subprocess.run(["/usr/bin/sync"], check=True)
+
+        barrier_common = {
+            "schema": "arc.recovery.quarantine-persistent-restart-fence.v1",
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "source_main_commit": auth["source_main_commit"],
+            "round_number": round_number,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "node": node, "host": FLEET_MAP[node],
+            "dispatcher_sha256": sha(dispatcher_raw_value),
+            "authorization_deadline": auth["authorization_deadline"],
+            "nft_apply_intent_sha256": sha(intent_raw),
+            "persistence_plan_sha256": sha(persistence_plan_raw),
+            "authorized_writer": contract["writer"],
+            "unit_sha256": sha(unit_value),
+            "dependency_sha256": {
+                str(path): sha(raw) for path, raw in sorted(
+                    dependencies.items(), key=lambda item: str(item[0])
+                )
+            },
+            "automatic_unfence": False,
+            "precommit_missing_selector_behavior": "fail-closed-without-nft-apply",
+        }
+        barrier_path = state / "persistent-restart-fence.json"
+        if barrier_path.exists() or barrier_path.is_symlink():
+            barrier_raw = secure_read(barrier_path, 0o400)
+            barrier = parse_canonical(barrier_raw, "precommit persistent restart fence")
+            if (set(barrier) != set(barrier_common) | {
+                    "armed_at", "arming_mode", "armed_boot_id"
+                } or any(barrier.get(key) != value
+                         for key, value in barrier_common.items())):
+                fail("precommit persistent restart fence binding differs")
+        else:
+            barrier = {
+                **barrier_common,
+                "arming_mode": (
+                    "post-reboot-fail-closed-reconciliation"
+                    if reboot_after_intent else
+                    "same-boot-fail-closed-reconciliation"
+                ),
+                "armed_boot_id": current_boot,
+                "armed_at": format_utc(now_value()),
+            }
+            barrier_raw = canonical(barrier)
+            publish(barrier_path, barrier_raw, 0o400)
+        armed_at = parse_utc(barrier.get("armed_at"), "precommit restart-fence arm")
+        if barrier.get("arming_mode") == "initial-live-window":
+            if barrier.get("armed_boot_id") != target["boot_id"] or armed_at > deadline:
+                fail("initial restart fence chronology differs")
+        elif barrier.get("arming_mode") == "post-reboot-fail-closed-reconciliation":
+            if (barrier.get("armed_boot_id") == target["boot_id"]
+                    or UUID_RE.fullmatch(str(barrier.get("armed_boot_id"))) is None
+                    or armed_at <= deadline):
+                fail("reconciled restart fence chronology differs")
+        elif barrier.get("arming_mode") == "same-boot-fail-closed-reconciliation":
+            if (barrier.get("armed_boot_id") != target["boot_id"]
+                    or reboot_after_intent or armed_at <= deadline):
+                fail("same-boot restart fence chronology differs")
+        else:
+            fail("precommit restart fence arming mode differs")
+
+        file_roots = {
+            dispatcher_path: barrier.get("dispatcher_sha256"),
+            unit_path: barrier.get("unit_sha256"),
+            **{pathlib.Path(path): root for path, root in
+               (barrier.get("dependency_sha256") or {}).items()},
+        }
+        for path, expected_root in file_roots.items():
+            mode_value = 0o500 if path == dispatcher_path else 0o400
+            if not isinstance(expected_root, str) or \
+                    sha(secure_read(path, mode_value)) != expected_root:
+                fail(f"precommit persistent restart-fence file differs: {path}")
+
+        def stable_absence_sample():
+            observed_value = now_value()
+            writers = writer_set()
+            selector_absent = not active_path.exists() and not active_path.is_symlink()
+            allow_absent = not legacy_start_allow.exists() and not legacy_start_allow.is_symlink()
+            nft_absent = subprocess.run(
+                [str(pinned_nft), "list", "table", "inet", table_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+            enabled_value = subprocess.run(
+                ["/usr/bin/systemctl", "is-enabled",
+                 "arc-legacy-maintenance-fence.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            active_value = subprocess.run(
+                ["/usr/bin/systemctl", "is-active",
+                 "arc-legacy-maintenance-fence.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            unit_rows = []
+            for legacy_unit in (
+                "arc-self-heal.service", "arc-node.service",
+                "arc-node-update.service", "arc-node-update.timer",
+            ):
+                properties = {}
+                for prop in (
+                    "ActiveState", "Job", "MainPID", "Requires", "After", "DropInPaths"
+                ):
+                    properties[prop] = subprocess.check_output(
+                        ["/usr/bin/systemctl", "show", legacy_unit,
+                         f"--property={prop}", "--value"], text=True,
+                    ).strip()
+                if (properties["ActiveState"] not in {"inactive", "failed"}
+                        or properties["Job"] not in {"", "0"}
+                        or (legacy_unit.endswith(".service")
+                            and properties["MainPID"] != "0")
+                        or "arc-legacy-maintenance-fence.service"
+                            not in properties["Requires"].split()
+                        or "arc-legacy-maintenance-fence.service"
+                            not in properties["After"].split()
+                        or "zzzy-arc-recovery-network-fence.conf"
+                            not in properties["DropInPaths"]):
+                    fail(
+                        "precommit legacy activation source is not durably "
+                        f"fail-closed: {legacy_unit}"
+                    )
+                unit_rows.append({
+                    "unit": legacy_unit, "active_state": properties["ActiveState"],
+                    "job": properties["Job"], "main_pid": properties["MainPID"],
+                    "dropin_effective": True,
+                })
+            if (writers or not selector_absent or not allow_absent or not nft_absent
+                    or not enabled_value or active_value):
+                fail("writer/restart source appeared during stable precommit absence")
+            return {
+                "observed_at": format_utc(observed_value), "writer_pids": writers,
+                "active_selector_absent": selector_absent,
+                "legacy_start_allow_absent": allow_absent,
+                "nft_table_absent": nft_absent,
+                "fence_unit_enabled": enabled_value,
+                "fence_unit_active": active_value,
+                "legacy_units": unit_rows,
+            }
+
+        absence_samples = [stable_absence_sample()]
+        time.sleep(1)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+        absence_samples.append(stable_absence_sample())
+        observed = parse_utc(
+            absence_samples[-1]["observed_at"], "stable absence observation"
+        )
+        preliminary = {
+            "schema": "arc.recovery.quarantine-precommit-stopped-status.v1",
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "source_main_commit": auth["source_main_commit"],
+            "round_number": round_number,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "node": node, "host": FLEET_MAP[node],
+            "authorized_writer": {
+                "boot_id": target["boot_id"], "pid": target["writer_pid"],
+                "start_ticks": target["writer_start_ticks"],
+                "cgroup_sha256": target["writer_cgroup_sha256"],
+            },
+            "nft_apply_intent": {"value": intent, "sha256": sha(intent_raw)},
+            "persistence_plan": {
+                "value": persistence_plan, "sha256": sha(persistence_plan_raw),
+            },
+            "nft_deadline_gate": gate_wrapper,
+            "applied_commit": commit_wrapper,
+            "nft_table_binding": {"value": binding, "sha256": sha(binding_raw)},
+            "apply_helper_sha256": sha(helper_raw),
+            "nft_policy_source_sha256": sha(policy_raw),
+            "persistent_restart_fence": {
+                "value": barrier, "sha256": sha(barrier_raw),
+            },
+            "restart_fence_armed_at": barrier["armed_at"],
+            "restart_fence_arming_mode": barrier["arming_mode"],
+            "reconciliation_started_at": format_utc(recovery_started),
+            "observed_at": format_utc(observed),
+            "authorization_deadline": auth["authorization_deadline"],
+            "recorded_boot_id": target["boot_id"],
+            "current_boot_id": current_boot,
+            "reboot_after_intent": reboot_after_intent,
+            "writer_exit_cause": "unknown", "writer_exit_signal": None,
+            "recovery_signal_sent": False,
+            "stable_absence_samples": absence_samples,
+            "writer_state": "persistently-stopped",
+            "nft_table_absent": True,
+            "applied_commit_absent": commit_wrapper is None,
+            "active_selector_absent": True, "fence_unit_enabled": True,
+            "fence_unit_active": False,
+        }
+        preliminary_raw = canonical(preliminary)
+        if mode == "precommit-status":
+            sys.stdout.buffer.write(preliminary_raw)
+            raise SystemExit(0)
+
+        # Finalize the no-restart transition from the original, persistently
+        # stopped source.  The recovery binary is an offline command only: it
+        # opens no listener and the loader is read-only.  Held no-follow FDs,
+        # full stat projections, and hashes bracket every invocation.
+        precommit_evidence_path = attempt / "precommit-stopped-status.json"
+        if precommit_evidence_path.exists() or precommit_evidence_path.is_symlink():
+            durable_precommit_raw = secure_read(precommit_evidence_path, 0o400)
+            durable_precommit = parse_canonical(
+                durable_precommit_raw, "durable precommit stopped status"
+            )
+            if ((durable_precommit.get("capture_id"),
+                 durable_precommit.get("freeze_plan_sha256"),
+                 durable_precommit.get("round_number"),
+                 durable_precommit.get("round_authorization_sha256"),
+                 durable_precommit.get("round_readiness_sha256"),
+                 durable_precommit.get("node"), durable_precommit.get("host")) != (
+                    capture_id, freeze_sha, round_number, authorization_sha,
+                    readiness_sha, node, FLEET_MAP[node],
+                 ) or durable_precommit.get("writer_state") != "persistently-stopped"
+                    or durable_precommit.get("nft_table_absent") is not True
+                    or durable_precommit.get("applied_commit") != commit_wrapper
+                    or durable_precommit.get("applied_commit_absent")
+                        is not (commit_wrapper is None)
+                    or durable_precommit.get("active_selector_absent") is not True):
+                fail("durable precommit stopped status identity differs")
+        else:
+            durable_precommit = preliminary
+            durable_precommit_raw = preliminary_raw
+            publish(precommit_evidence_path, durable_precommit_raw, 0o400)
+
+        allow_unbound = {"true": True, "false": False}.get(
+            allow_unbound_legacy_wal_raw
+        )
+        if allow_unbound is None:
+            fail("stopped-precommit legacy-WAL override differs")
+        stage = seal_base / freeze_sha / node
+        secure_dir(seal_base, 0o700)
+        secure_dir(seal_base / freeze_sha, 0o700)
+        secure_dir(stage, 0o700)
+        staged_paths = {
+            "inspector": (stage / "arc-node", inspector_sha, 0o500),
+            "genesis": (stage / "genesis.toml", genesis_sha, 0o400),
+            "validator_public_keys": (
+                stage / "validator-public-keys.json", validators_sha, 0o400,
+            ),
+            "legacy_validator_set": (
+                stage / "legacy-validator-set-40m.json", legacy_validators_sha, 0o400,
+            ),
+        }
+
+        def open_held(path, *, mode_value=None, expected_sha=None, directory=False):
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | \
+                (getattr(os, "O_DIRECTORY", 0) if directory else 0)
+            descriptor = os.open(path, flags)
+            details = os.fstat(descriptor)
+            path_details = path.lstat()
+            if (path.is_symlink()
+                    or (directory and not stat.S_ISDIR(details.st_mode))
+                    or (not directory and not stat.S_ISREG(details.st_mode))
+                    or (details.st_dev, details.st_ino) !=
+                       (path_details.st_dev, path_details.st_ino)
+                    or details.st_uid != 0 or details.st_gid != 0
+                    or details.st_mode & 0o022
+                    or (not directory and details.st_nlink != 1)
+                    or (mode_value is not None
+                        and stat.S_IMODE(details.st_mode) != mode_value)):
+                os.close(descriptor)
+                fail(f"unsafe stopped-precommit input: {path}")
+            identity = {
+                "path": str(path), "device": details.st_dev,
+                "inode": details.st_ino, "mode": details.st_mode,
+                "uid": details.st_uid, "gid": details.st_gid,
+                "nlink": details.st_nlink, "size": details.st_size,
+                "mtime_ns": details.st_mtime_ns, "ctime_ns": details.st_ctime_ns,
+            }
+            if directory:
+                return descriptor, identity
+            digest = hashlib.sha256()
+            while True:
+                part = os.read(descriptor, 1024 * 1024)
+                if not part:
+                    break
+                digest.update(part)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            identity["sha256"] = digest.hexdigest()
+            if expected_sha is not None and identity["sha256"] != expected_sha:
+                os.close(descriptor)
+                fail(f"stopped-precommit input hash differs: {path}")
+            return descriptor, identity
+
+        def hash_fd(descriptor):
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            while True:
+                part = os.read(descriptor, 1024 * 1024)
+                if not part:
+                    break
+                digest.update(part)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return digest.hexdigest()
+
+        def reprove_held(path, descriptor, sealed, *, directory=False):
+            current = os.fstat(descriptor)
+            path_current = path.lstat()
+            current_identity = {
+                "path": str(path), "device": current.st_dev,
+                "inode": current.st_ino, "mode": current.st_mode,
+                "uid": current.st_uid, "gid": current.st_gid,
+                "nlink": current.st_nlink, "size": current.st_size,
+                "mtime_ns": current.st_mtime_ns, "ctime_ns": current.st_ctime_ns,
+            }
+            if not directory:
+                current_identity["sha256"] = hash_fd(descriptor)
+            if (current_identity != sealed or path.is_symlink()
+                    or (path_current.st_dev, path_current.st_ino) !=
+                       (current.st_dev, current.st_ino)):
+                fail(f"stopped-precommit input changed during inspection: {path}")
+
+        held = {}
+        try:
+            staged_inputs = {}
+            for label, (path, expected, expected_mode) in staged_paths.items():
+                descriptor, identity = open_held(
+                    path, mode_value=expected_mode, expected_sha=expected
+                )
+                held[label] = (path, descriptor, identity, False)
+                staged_inputs[label] = identity
+            data_dir = pathlib.Path(frozen.get("data_dir", ""))
+            if (not data_dir.is_absolute() or str(data_dir) in {"/", "/root"}
+                    or str(data_dir) != frozen.get("data_dir")):
+                fail("stopped-precommit data directory differs from the freeze plan")
+            data_fd, data_identity = open_held(data_dir, directory=True)
+            if (data_identity["device"] != frozen.get("data_device")
+                    or data_identity["inode"] <= 0):
+                fail("stopped-precommit data directory device differs")
+            held["original_data_dir"] = (data_dir, data_fd, data_identity, True)
+            final_wal_path = data_dir / "state.wal"
+            final_wal_fd, final_wal_identity = open_held(final_wal_path)
+            if final_wal_identity["size"] <= 0:
+                fail("stopped-precommit state WAL is empty")
+            held["final_state_wal"] = (
+                final_wal_path, final_wal_fd, final_wal_identity, False,
+            )
+
+            live_capture = target.get("_live_source_capture")
+            live_capture_sha = target.get("_live_source_capture_sha256")
+            if (not isinstance(live_capture, dict)
+                    or HASH_RE.fullmatch(str(live_capture_sha)) is None
+                    or sha(canonical(live_capture)) != live_capture_sha
+                    or live_capture.get("source_pair_role")
+                        != "preauthorization-boundary"
+                    or live_capture.get("inspector_binary_sha256") != inspector_sha
+                    or live_capture.get("genesis_sha256") != genesis_sha
+                    or live_capture.get("legacy_validator_set_sha256")
+                        != legacy_validators_sha):
+                fail("stopped-precommit live-source capture binding differs")
+            rust_capture, rust_capture_sha = unwrap(
+                live_capture.get("rust_capture"), "stopped Rust live-source capture"
+            )
+            if (rust_capture.get("schema")
+                    != "arc.recovery.live-legacy-source-capture.v1"
+                    or rust_capture.get("head") != live_capture.get("head")
+                    or rust_capture.get("allow_unbound_legacy_wal") is not allow_unbound):
+                fail("stopped-precommit Rust live-source capture differs")
+            fixed_proof = rust_capture.get("fixed_pair")
+            if not isinstance(fixed_proof, dict) or fixed_proof.get("strict_replay") is not True:
+                fail("stopped-precommit fixed source replay proof differs")
+            fixed_dir = pathlib.Path(live_capture.get("fixed_pair_path", ""))
+            expected_fixed_prefix = (
+                f"/root/arc-recovery-live-source-captures/{capture_id}/{node}/"
+                f"round-{round_number}/"
+            )
+            if (not fixed_dir.is_absolute() or not str(fixed_dir).startswith(expected_fixed_prefix)
+                    or not str(fixed_dir).endswith("/fixed-source") or ".." in str(fixed_dir)):
+                fail("stopped-precommit fixed source path differs")
+
+            def require_rust_identity(observed, expected, label, *, directory=False):
+                keys = {
+                    "device", "inode", "mode", "uid", "gid", "nlink",
+                    "mtime_ns", "ctime_ns",
+                }
+                if not directory:
+                    keys |= {"sha256", "size"}
+                if (not isinstance(expected, dict) or set(expected) != keys
+                        or {key: observed.get(key) for key in keys} != expected):
+                    fail(f"stopped-precommit {label} differs from live capture")
+
+            fixed_dir_fd, fixed_dir_identity = open_held(
+                fixed_dir, mode_value=0o500, directory=True
+            )
+            require_rust_identity(
+                fixed_dir_identity, fixed_proof.get("data_dir"),
+                "fixed directory", directory=True,
+            )
+            held["fixed_data_dir"] = (
+                fixed_dir, fixed_dir_fd, fixed_dir_identity, True,
+            )
+            wal_path = fixed_dir / "state.wal"
+            wal_fd, wal_identity = open_held(wal_path, mode_value=0o400)
+            require_rust_identity(wal_identity, fixed_proof.get("state_wal"), "fixed WAL")
+            held["fixed_state_wal"] = (wal_path, wal_fd, wal_identity, False)
+            snapshot_path = fixed_dir / "state.snapshot.lz4"
+            snapshot_fd, snapshot_identity = open_held(snapshot_path, mode_value=0o400)
+            require_rust_identity(
+                snapshot_identity, fixed_proof.get("snapshot"), "fixed snapshot"
+            )
+            held["fixed_snapshot"] = (
+                snapshot_path, snapshot_fd, snapshot_identity, False,
+            )
+            binding_path = fixed_dir / "genesis.network-hash"
+            binding_fd, binding_identity = open_held(binding_path, mode_value=0o400)
+            require_rust_identity(
+                binding_identity, fixed_proof.get("genesis_binding"),
+                "fixed genesis binding",
+            )
+            held["fixed_genesis_binding"] = (
+                binding_path, binding_fd, binding_identity, False,
+            )
+            source_inputs = {
+                "original_data_dir": data_identity,
+                "final_state_wal": final_wal_identity,
+                "fixed_data_dir": fixed_dir_identity,
+                "fixed_state_wal": wal_identity,
+                "fixed_snapshot": snapshot_identity,
+                "fixed_genesis_binding": binding_identity,
+                "live_source_capture_sha256": live_capture_sha,
+                "rust_live_source_capture_sha256": rust_capture_sha,
+                "source_pair_role": "preauthorization-boundary",
+            }
+            if writer_set():
+                fail("writer appeared before stopped-precommit offline inspection")
+            current_inspection_boot = pathlib.Path(
+                "/proc/sys/kernel/random/boot_id"
+            ).read_text().strip()
+            if current_inspection_boot != current_boot:
+                fail("host rebooted between precommit classification and inspection")
+
+            command_env = {
+                "HOME": "/root", "PATH": "/usr/bin:/bin", "LANG": "C",
+                "LC_ALL": "C", "TZ": "UTC",
+            }
+            with tempfile.TemporaryDirectory(
+                prefix=".stopped-precommit-inspect.", dir=str(attempt)
+            ) as work_raw:
+                work = pathlib.Path(work_raw)
+                candidate = work / "candidate.arcchkpt"
+                export_command = [
+                    str(staged_paths["inspector"][0]), "recovery", "export",
+                    "--data-dir", str(fixed_dir), "--snapshot", str(snapshot_path),
+                    "--genesis", str(staged_paths["genesis"][0]),
+                    "--validator-public-keys",
+                    str(staged_paths["validator_public_keys"][0]),
+                    "--legacy-validator-set",
+                    str(staged_paths["legacy_validator_set"][0]),
+                    "--output", str(candidate), "--source-consensus-round", "0",
+                    "--created-at-unix-ms", "0", "--recovery-epoch", "1",
+                    "--validator-set-id", "1",
+                ]
+                export_result = subprocess.run(
+                    export_command, env=command_env, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False,
+                )
+                if export_result.returncode != 0:
+                    fail("stopped-precommit exact recovery export failed")
+                try:
+                    export_summary = json.loads(export_result.stdout)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    fail("stopped-precommit export summary is invalid JSON")
+                inspect_result = subprocess.run(
+                    [str(staged_paths["inspector"][0]), "recovery", "inspect",
+                     "--checkpoint", str(candidate)],
+                    env=command_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    check=False,
+                )
+                if inspect_result.returncode != 0:
+                    fail("stopped-precommit candidate inspection failed")
+                try:
+                    inspect_summary = json.loads(inspect_result.stdout)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    fail("stopped-precommit inspect summary is invalid JSON")
+                summary_keys = {
+                    "status", "manifest_hash", "payload_hash", "full_state_root",
+                    "chain_id", "genesis_hash", "source_height", "source_block_hash",
+                    "source_state_root", "source_consensus_round", "created_at_unix_ms",
+                    "transition_height", "transition_block_hash", "recovery_domain",
+                    "recovery_epoch", "validator_set_id", "protocol_version",
+                    "validator_count", "signature_count", "source_validator_count",
+                    "source_validator_stake", "source_validator_set_hash",
+                    "community_reward_issuance_policy",
+                    "community_reward_issuance_policy_hash",
+                    "source_wal_original_bytes", "source_wal_accepted_prefix_bytes",
+                    "source_wal_quarantined_tail_bytes", "source_wal_tail_reason",
+                }
+                inspect_keys = summary_keys - {
+                    "source_wal_original_bytes", "source_wal_accepted_prefix_bytes",
+                    "source_wal_quarantined_tail_bytes", "source_wal_tail_reason",
+                }
+                if (not isinstance(export_summary, dict)
+                        or set(export_summary) != summary_keys
+                        or export_summary.get("status") != "EXPORTED_UNSIGNED"
+                        or not isinstance(inspect_summary, dict)
+                        or set(inspect_summary) != inspect_keys
+                        or inspect_summary.get("status") != "UNTRUSTED_INSPECTION"):
+                    fail("stopped-precommit export/inspect exact fields differ")
+                for key in inspect_keys - {"status"}:
+                    if inspect_summary.get(key) != export_summary.get(key):
+                        fail("stopped-precommit export/inspect summaries differ")
+                head_height = export_summary.get("source_height")
+                head_hash = str(export_summary.get("source_block_hash", "")).removeprefix("0x")
+                head_state = str(export_summary.get("source_state_root", "")).removeprefix("0x")
+                if (isinstance(head_height, bool) or not isinstance(head_height, int)
+                        or head_height < 1 or HASH_RE.fullmatch(head_hash) is None
+                        or HASH_RE.fullmatch(head_state) is None
+                        or export_summary.get("signature_count") != 0
+                        or export_summary.get("source_wal_original_bytes")
+                            != wal_identity["size"]
+                        or export_summary.get("source_wal_accepted_prefix_bytes")
+                            != wal_identity["size"]
+                        or export_summary.get("source_wal_quarantined_tail_bytes") != 0
+                        or export_summary.get("source_wal_tail_reason") != "none"):
+                    fail("stopped-precommit persisted head tuple differs")
+                stable_head = {
+                    "height": head_height, "block_hash": head_hash,
+                    "state_root": head_state,
+                }
+                if stable_head != live_capture.get("head"):
+                    fail("stopped-precommit head differs from the pre-transition fixed pair")
+                candidate_details = candidate.lstat()
+                if (candidate.is_symlink() or not stat.S_ISREG(candidate_details.st_mode)
+                        or candidate_details.st_uid != 0 or candidate_details.st_gid != 0
+                        or candidate_details.st_nlink != 1
+                        or candidate_details.st_mode & 0o022
+                        or candidate_details.st_size <= 0):
+                    fail("stopped-precommit candidate checkpoint is unsafe")
+                candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+
+                expected_cli_inputs = {
+                    "data_dir": {
+                        key: fixed_dir_identity[key] for key in (
+                            "device", "inode", "mode", "uid", "gid", "nlink",
+                            "mtime_ns", "ctime_ns",
+                        )
+                    },
+                    "state_wal": {
+                        key: wal_identity[key] for key in (
+                            "device", "inode", "mode", "uid", "gid", "nlink",
+                            "sha256", "size", "mtime_ns", "ctime_ns",
+                        )
+                    },
+                    "snapshot": {
+                        key: snapshot_identity[key] for key in (
+                            "device", "inode", "mode", "uid", "gid", "nlink",
+                            "sha256", "size", "mtime_ns", "ctime_ns",
+                        )
+                    },
+                    "genesis": {
+                        key: staged_inputs["genesis"][key] for key in (
+                            "device", "inode", "mode", "uid", "gid", "nlink",
+                            "sha256", "size", "mtime_ns", "ctime_ns",
+                        )
+                    },
+                    "legacy_validator_set": {
+                        key: staged_inputs["legacy_validator_set"][key] for key in (
+                            "device", "inode", "mode", "uid", "gid", "nlink",
+                            "sha256", "size", "mtime_ns", "ctime_ns",
+                        )
+                    },
+                }
+                checks = []
+                for label, height, expected_hash in (
+                    ("public-latest", public_row["latest_block_height"],
+                     public_row["latest_block_hash"]),
+                    ("authenticated-loopback-latest",
+                     cross_row["loopback_latest_height"],
+                     cross_row["loopback_latest_block_hash"]),
+                ):
+                    if height > head_height:
+                        fail("stopped persisted head is below fresh authorization evidence")
+                    block_command = [
+                        str(staged_paths["inspector"][0]), "recovery",
+                        "inspect-legacy-block", "--data-dir", str(fixed_dir),
+                        "--snapshot", str(snapshot_path), "--genesis",
+                        str(staged_paths["genesis"][0]), "--legacy-validator-set",
+                        str(staged_paths["legacy_validator_set"][0]), "--height",
+                        str(height), "--expected-state-wal-sha256",
+                        wal_identity["sha256"], "--expected-snapshot-sha256",
+                        snapshot_identity["sha256"], "--expected-genesis-sha256",
+                        genesis_sha, "--expected-legacy-validator-set-sha256",
+                        legacy_validators_sha,
+                    ]
+                    block_result = subprocess.run(
+                        block_command, env=command_env, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, check=False,
+                    )
+                    if block_result.returncode != 0:
+                        fail(f"stopped-precommit historical inspection failed: {label}")
+                    try:
+                        block_value = json.loads(block_result.stdout)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        fail("stopped-precommit historical inspection returned invalid JSON")
+                    if (not isinstance(block_value, dict) or set(block_value) != {
+                            "schema", "height", "block_hash", "state_root", "input_roots"
+                        } or block_value.get("schema")
+                            != "arc.recovery.legacy-block-inspection.v1"
+                        or block_value.get("height") != height
+                        or block_value.get("block_hash") != expected_hash
+                        or HASH_RE.fullmatch(str(block_value.get("state_root"))) is None
+                        or block_value.get("input_roots") != expected_cli_inputs):
+                        fail(f"stopped-precommit authorization ancestry differs: {label}")
+                    checks.append({
+                        "label": label, "height": height,
+                        "expected_block_hash": expected_hash,
+                        "observed_block_hash": block_value["block_hash"],
+                        "state_root": block_value["state_root"],
+                        "inspection_sha256": sha(block_result.stdout),
+                        "input_roots": block_value["input_roots"],
+                    })
+
+                ancestry = {
+                    "schema": "arc.recovery.quarantine-stopped-precommit-ancestry.v1",
+                    "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                    "round_number": round_number,
+                    "round_authorization_sha256": authorization_sha,
+                    "round_readiness_sha256": readiness_sha,
+                    "node": node, "host": FLEET_MAP[node],
+                    "persisted_head": stable_head, "checks": checks,
+                    "loader_contract": "continuous-canonical-parent-chain-through-persisted-head",
+                }
+                ancestry_raw = canonical(ancestry)
+                ancestry_path = attempt / "stopped-authorization-ancestry.json"
+                publish(ancestry_path, ancestry_raw, 0o400)
+
+                final_absence_sample = stable_absence_sample()
+                persisted_path = attempt / "persisted-stopped-head.json"
+                completed_at = None
+                if persisted_path.exists() and not persisted_path.is_symlink():
+                    prior_persisted_raw = secure_read(persisted_path, 0o400)
+                    prior_persisted = parse_canonical(
+                        prior_persisted_raw, "prior stopped persisted head"
+                    )
+                    completed_at = prior_persisted.get("completed_at")
+                if completed_at is None:
+                    completed_at = format_utc(now_value())
+                parse_utc(completed_at, "stopped persisted-head completion")
+                persisted = {
+                    "schema": "arc.recovery.persisted-legacy-head-stopped-precommit.v1",
+                    "source_main_commit": auth["source_main_commit"],
+                    "capture_id": capture_id, "node": node, "host": FLEET_MAP[node],
+                    "freeze_plan_sha256": freeze_sha, "round_number": round_number,
+                    "round_authorization_sha256": authorization_sha,
+                    "round_readiness_sha256": readiness_sha,
+                    "current_boot_id": current_boot,
+                    "precommit_status_sha256": sha(durable_precommit_raw),
+                    "nft_apply_intent_sha256": sha(intent_raw),
+                    "applied_commit_sha256": (
+                        None if commit_wrapper is None else commit_wrapper["sha256"]
+                    ),
+                    "persistence_plan_sha256": sha(persistence_plan_raw),
+                    "persistent_restart_fence_sha256": sha(barrier_raw),
+                    "inspector_binary_sha256": inspector_sha,
+                    "genesis_sha256": genesis_sha,
+                    "validator_public_keys_sha256": validators_sha,
+                    "legacy_validator_set_sha256": legacy_validators_sha,
+                    "source_inputs": source_inputs, "staged_inputs": staged_inputs,
+                    "source_pair_role": "preauthorization-boundary",
+                    "live_source_capture_sha256": live_capture_sha,
+                    "final_absence_sample": final_absence_sample,
+                    "export_summary_sha256": sha(export_result.stdout),
+                    "inspect_summary_sha256": sha(inspect_result.stdout),
+                    "candidate_checkpoint_sha256": candidate_sha,
+                    "candidate_checkpoint_size": candidate_details.st_size,
+                    "authorization_ancestry_proof_sha256": sha(ancestry_raw),
+                    "head": stable_head,
+                    "allow_unbound_legacy_wal": allow_unbound,
+                    "completed_at": completed_at, "writer_stopped": True,
+                    "restart_barrier_active": True,
+                    "network_quarantine_active": False,
+                    "nft_table_absent": True,
+                    "applied_commit_absent": commit_wrapper is None,
+                    "active_selector_absent": True,
+                    "global_absence_claimed": False,
+                }
+                persisted_raw = canonical(persisted)
+                publish(persisted_path, persisted_raw, 0o400)
+
+            for held_path, held_fd, held_identity, held_directory in held.values():
+                reprove_held(
+                    held_path, held_fd, held_identity, directory=held_directory
+                )
+            if (writer_set() or pathlib.Path(
+                    "/proc/sys/kernel/random/boot_id").read_text().strip() != current_boot):
+                fail("writer/boot changed during stopped-precommit inspection")
+            if subprocess.run(
+                [str(pinned_nft), "list", "table", "inet", table_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0 or active_path.exists() or active_path.is_symlink():
+                fail("forbidden nft/selector appeared during stopped inspection")
+            if ((commit_wrapper is None and (
+                    commit_path.exists() or commit_path.is_symlink()))
+                    or (commit_wrapper is not None and
+                        secure_read(commit_path, 0o400) != commit_raw)):
+                fail("stopped applied commit changed during offline inspection")
+            stopped_transition_path = attempt / "node-stopped-precommit.json"
+            transition = {
+                "schema": "arc.recovery.quarantine-node-persistently-stopped-precommit.v1",
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "source_main_commit": auth["source_main_commit"],
+                "round_number": round_number,
+                "round_authorization_sha256": authorization_sha,
+                "round_readiness_sha256": readiness_sha,
+                "node": node, "host": FLEET_MAP[node],
+                "authorized_writer": contract["writer"],
+                "authorization_deadline": auth["authorization_deadline"],
+                "nft_apply_intent": {"value": intent, "sha256": sha(intent_raw)},
+                "nft_deadline_gate": gate_wrapper,
+                "applied_commit": commit_wrapper,
+                "nft_table_binding": {"value": binding, "sha256": sha(binding_raw)},
+                "apply_helper_sha256": sha(helper_raw),
+                "nft_policy_source_sha256": sha(policy_raw),
+                "persistence_plan": {
+                    "value": persistence_plan, "sha256": sha(persistence_plan_raw),
+                },
+                "persistent_restart_fence": {
+                    "value": barrier, "sha256": sha(barrier_raw),
+                },
+                "precommit_status": {
+                    "value": durable_precommit,
+                    "sha256": sha(durable_precommit_raw),
+                },
+                "persisted_head": {"value": persisted, "sha256": sha(persisted_raw)},
+                "stable_head": persisted["head"],
+                "authorization_ancestry_proof": {
+                    "value": ancestry, "sha256": sha(ancestry_raw),
+                },
+                "current_boot_id": current_boot,
+                "restart_fence_armed_at": barrier["armed_at"],
+                "secured_at": persisted["completed_at"],
+                "writer_state": "persistently-stopped",
+                "network_quarantine_active": False,
+                "nft_table_absent": True,
+                "applied_commit_absent": commit_wrapper is None,
+                "active_selector_absent": True,
+                "automatic_legacy_restart": False,
+            }
+            transition_raw = canonical(transition)
+            publish(stopped_transition_path, transition_raw, 0o400)
+            sys.stdout.buffer.write(transition_raw)
+            raise SystemExit(0)
+        finally:
+            for value in held.values():
+                try:
+                    os.close(value[1])
+                except OSError:
+                    pass
+
+    def validate_stopped_transition(raw, expected_sha=None):
+        if expected_sha is not None and sha(raw) != expected_sha:
+            fail("persistently-stopped transition hash differs")
+        value = parse_canonical(raw, "persistently-stopped transition")
+        fields = {
+            "schema", "capture_id", "freeze_plan_sha256", "source_main_commit",
+            "round_number", "round_authorization_sha256",
+            "round_readiness_sha256", "node", "host", "authorized_writer",
+            "authorization_deadline", "nft_apply_intent", "nft_deadline_gate",
+            "applied_commit", "nft_table_binding", "apply_helper_sha256",
+            "nft_policy_source_sha256", "persistence_plan",
+            "persistent_restart_fence", "precommit_status", "persisted_head",
+            "stable_head", "authorization_ancestry_proof", "current_boot_id",
+            "restart_fence_armed_at", "secured_at", "writer_state",
+            "network_quarantine_active", "nft_table_absent",
+            "applied_commit_absent", "active_selector_absent",
+            "automatic_legacy_restart",
+        }
+        if (set(value) != fields or value.get("schema") != NODE_STOPPED_SCHEMA
+                or (value.get("capture_id"), value.get("freeze_plan_sha256"),
+                    value.get("source_main_commit"), value.get("round_number"),
+                    value.get("round_authorization_sha256"),
+                    value.get("round_readiness_sha256"), value.get("node"),
+                    value.get("host")) != (
+                        capture_id, freeze_sha, auth["source_main_commit"], round_number,
+                        authorization_sha, readiness_sha, node, FLEET_MAP[node],
+                    ) or value.get("authorized_writer") != {
+                        "boot_id": target["boot_id"], "pid": target["writer_pid"],
+                        "start_ticks": target["writer_start_ticks"],
+                        "cgroup_sha256": target["writer_cgroup_sha256"],
+                    }
+                or value.get("authorization_deadline") != auth["authorization_deadline"]
+                or value.get("writer_state") != "persistently-stopped"
+                or value.get("network_quarantine_active") is not False
+                or value.get("nft_table_absent") is not True
+                or value.get("applied_commit_absent") is not (
+                    value.get("applied_commit") is None
+                )
+                or value.get("active_selector_absent") is not True
+                or value.get("automatic_legacy_restart") is not False):
+            fail("persistently-stopped transition identity/state differs")
+        wrappers = {}
+        for label in (
+            "nft_apply_intent", "nft_table_binding", "persistence_plan",
+            "persistent_restart_fence", "precommit_status", "persisted_head",
+            "authorization_ancestry_proof",
+        ):
+            wrappers[label] = unwrap(value.get(label), f"stopped transition {label}")
+        gate = value.get("nft_deadline_gate")
+        if gate is not None:
+            unwrap(gate, "stopped transition nft deadline gate")
+        commit = value.get("applied_commit")
+        commit_sha = None
+        if commit is not None:
+            _commit_value, commit_sha = unwrap(
+                commit, "stopped transition applied commit"
+            )
+        persisted, persisted_sha = wrappers["persisted_head"]
+        persisted_fields = {
+            "schema", "source_main_commit", "capture_id", "node", "host",
+            "freeze_plan_sha256", "round_number", "round_authorization_sha256",
+            "round_readiness_sha256", "current_boot_id",
+            "precommit_status_sha256", "nft_apply_intent_sha256",
+            "applied_commit_sha256",
+            "persistence_plan_sha256", "persistent_restart_fence_sha256",
+            "inspector_binary_sha256", "genesis_sha256",
+            "validator_public_keys_sha256", "legacy_validator_set_sha256",
+            "source_inputs", "staged_inputs", "source_pair_role",
+            "live_source_capture_sha256",
+            "final_absence_sample", "export_summary_sha256",
+            "inspect_summary_sha256", "candidate_checkpoint_sha256",
+            "candidate_checkpoint_size", "authorization_ancestry_proof_sha256",
+            "head", "allow_unbound_legacy_wal", "completed_at", "writer_stopped",
+            "restart_barrier_active", "network_quarantine_active",
+            "nft_table_absent", "applied_commit_absent", "active_selector_absent",
+            "global_absence_claimed",
+        }
+        if (set(persisted) != persisted_fields
+                or persisted.get("schema") != PERSISTED_STOPPED_SCHEMA
+                or (persisted.get("capture_id"), persisted.get("freeze_plan_sha256"),
+                    persisted.get("round_number"),
+                    persisted.get("round_authorization_sha256"),
+                    persisted.get("round_readiness_sha256"), persisted.get("node"),
+                    persisted.get("host")) != (
+                        capture_id, freeze_sha, round_number, authorization_sha,
+                        readiness_sha, node, FLEET_MAP[node],
+                    ) or persisted.get("head") != value.get("stable_head")
+                or persisted.get("source_pair_role")
+                    != "preauthorization-boundary"
+                or persisted.get("completed_at") != value.get("secured_at")
+                or persisted.get("writer_stopped") is not True
+                or persisted.get("restart_barrier_active") is not True
+                or persisted.get("network_quarantine_active") is not False
+                or persisted.get("nft_table_absent") is not True
+                or persisted.get("applied_commit_absent") is not (commit is None)
+                or persisted.get("applied_commit_sha256") != commit_sha
+                or persisted.get("active_selector_absent") is not True
+                or persisted.get("global_absence_claimed") is not False):
+            fail("persistently-stopped persisted-head projection differs")
+        head = value.get("stable_head")
+        if (not isinstance(head, dict) or set(head) != {
+                "height", "block_hash", "state_root"
+            } or isinstance(head.get("height"), bool)
+                or not isinstance(head.get("height"), int) or head["height"] < 1
+                or HASH_RE.fullmatch(str(head.get("block_hash"))) is None
+                or HASH_RE.fullmatch(str(head.get("state_root"))) is None):
+            fail("persistently-stopped stable head differs")
+        if (wrappers["nft_apply_intent"][1]
+                != persisted.get("nft_apply_intent_sha256")
+                or wrappers["persistence_plan"][1]
+                    != persisted.get("persistence_plan_sha256")
+                or wrappers["persistent_restart_fence"][1]
+                    != persisted.get("persistent_restart_fence_sha256")
+                or wrappers["precommit_status"][1]
+                    != persisted.get("precommit_status_sha256")
+                or wrappers["authorization_ancestry_proof"][1]
+                    != persisted.get("authorization_ancestry_proof_sha256")):
+            fail("persistently-stopped transition roots differ")
+        parse_utc(value.get("secured_at"), "persistently-stopped secured time")
+        return value, persisted, persisted_sha
+
+    stopped_transition_path = attempt / "node-stopped-precommit.json"
+    if mode in {"status", "applied-status"} and (
+            stopped_transition_path.exists() or stopped_transition_path.is_symlink()):
+        stopped_raw = secure_read(stopped_transition_path, 0o400)
+        stopped, persisted, _persisted_sha = validate_stopped_transition(
+            stopped_raw, applied_sha if mode == "status" else None
+        )
+        if mode == "applied-status":
+            sys.stdout.buffer.write(stopped_raw)
+            raise SystemExit(0)
+        if writer_set():
+            fail("fresh stopped status found a live arc-node writer")
+        current_status_boot = pathlib.Path(
+            "/proc/sys/kernel/random/boot_id"
+        ).read_text().strip()
+        if UUID_RE.fullmatch(current_status_boot) is None:
+            fail("fresh stopped status boot id differs")
+        if active_path.exists() or active_path.is_symlink():
+            fail("fresh stopped status found an active selector")
+        stopped_commit = stopped.get("applied_commit")
+        commit_path = state / "applied.commit.json"
+        if stopped_commit is None:
+            if commit_path.exists() or commit_path.is_symlink():
+                fail("fresh stopped status found an unexpected applied commit")
+        else:
+            commit_value, commit_root = unwrap(
+                stopped_commit, "fresh stopped applied commit"
+            )
+            if (sha(canonical(commit_value)) != commit_root
+                    or secure_read(commit_path, 0o400) != canonical(commit_value)):
+                fail("fresh stopped applied commit changed")
+        pinned_nft = state / "nft"
+        secure_read(pinned_nft, 0o500)
+        if subprocess.run(
+            [str(pinned_nft), "list", "table", "inet", table_name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            fail("fresh stopped status found an nft table")
+        intent, intent_root = unwrap(
+            stopped["nft_apply_intent"], "fresh stopped intent"
+        )
+        plan, plan_root = unwrap(
+            stopped["persistence_plan"], "fresh stopped persistence plan"
+        )
+        barrier, barrier_root = unwrap(
+            stopped["persistent_restart_fence"], "fresh stopped restart fence"
+        )
+        if (secure_read(state / "nft-apply-intent.json", 0o400) != canonical(intent)
+                or secure_read(state / "persistence-plan.json", 0o400) != canonical(plan)
+                or secure_read(state / "persistent-restart-fence.json", 0o400)
+                    != canonical(barrier)):
+            fail("fresh stopped durable intent/plan/barrier bytes differ")
+        plan_files = plan.get("files")
+        if not isinstance(plan_files, dict) or set(plan_files) != {
+                "dispatcher", "unit", "dependencies"
+            }:
+            fail("fresh stopped persistence file inventory differs")
+        file_rows = [plan_files["dispatcher"], plan_files["unit"]]
+        dependencies_rows = plan_files.get("dependencies")
+        if not isinstance(dependencies_rows, list):
+            fail("fresh stopped dependency inventory differs")
+        file_rows += dependencies_rows
+        for row in file_rows:
+            if (not isinstance(row, dict) or set(row) != {"path", "sha256", "mode"}
+                    or HASH_RE.fullmatch(str(row.get("sha256"))) is None):
+                fail("fresh stopped persistence file row differs")
+            if sha(secure_read(pathlib.Path(row["path"]), row["mode"])) != row["sha256"]:
+                fail("fresh stopped persistence file changed")
+        enabled = subprocess.run(
+            ["/usr/bin/systemctl", "is-enabled", "arc-legacy-maintenance-fence.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        fence_active = subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "arc-legacy-maintenance-fence.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if not enabled or fence_active:
+            fail("fresh stopped fence unit is not enabled/fail-closed-inactive")
+        legacy_start_allow = pathlib.Path(
+            plan.get("legacy_start_allow_path", "")
+        )
+        if (not legacy_start_allow.is_absolute()
+                or legacy_start_allow.exists() or legacy_start_allow.is_symlink()):
+            fail("fresh stopped legacy-start allow path appeared")
+        for legacy_unit in (
+            "arc-self-heal.service", "arc-node.service",
+            "arc-node-update.service", "arc-node-update.timer",
+        ):
+            properties = {
+                prop: subprocess.check_output(
+                    ["/usr/bin/systemctl", "show", legacy_unit,
+                     f"--property={prop}", "--value"], text=True,
+                ).strip()
+                for prop in (
+                    "ActiveState", "Job", "MainPID", "Requires", "After",
+                    "DropInPaths",
+                )
+            }
+            if (properties["ActiveState"] not in {"inactive", "failed"}
+                    or properties["Job"] not in {"", "0"}
+                    or (legacy_unit.endswith(".service")
+                        and properties["MainPID"] != "0")
+                    or "arc-legacy-maintenance-fence.service"
+                        not in properties["Requires"].split()
+                    or "arc-legacy-maintenance-fence.service"
+                        not in properties["After"].split()
+                    or "zzzy-arc-recovery-network-fence.conf"
+                        not in properties["DropInPaths"]):
+                fail("fresh stopped legacy activation source differs")
+
+        def current_source_projection(sealed):
+            expected_labels = {
+                "original_data_dir", "final_state_wal", "fixed_data_dir",
+                "fixed_state_wal", "fixed_snapshot", "fixed_genesis_binding",
+                "live_source_capture_sha256", "rust_live_source_capture_sha256",
+                "source_pair_role",
+            }
+            if not isinstance(sealed, dict) or set(sealed) != expected_labels:
+                fail("fresh stopped source-input inventory differs")
+            result = {}
+            for label in (
+                "final_state_wal", "fixed_state_wal", "fixed_snapshot",
+                "fixed_genesis_binding",
+            ):
+                row = sealed.get(label)
+                if not isinstance(row, dict) or "path" not in row:
+                    fail("fresh stopped source-input row differs")
+                path = pathlib.Path(row["path"])
+                descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    details = os.fstat(descriptor)
+                    digest = hashlib.sha256()
+                    while True:
+                        part = os.read(descriptor, 1024 * 1024)
+                        if not part:
+                            break
+                        digest.update(part)
+                    observed_row = {
+                        "path": str(path), "device": details.st_dev,
+                        "inode": details.st_ino, "mode": details.st_mode,
+                        "uid": details.st_uid, "gid": details.st_gid,
+                        "nlink": details.st_nlink, "size": details.st_size,
+                        "mtime_ns": details.st_mtime_ns,
+                        "ctime_ns": details.st_ctime_ns,
+                        "sha256": digest.hexdigest(),
+                    }
+                finally:
+                    os.close(descriptor)
+                if observed_row != row:
+                    fail("fresh stopped source input changed")
+                result[label] = observed_row
+            for label in ("original_data_dir", "fixed_data_dir"):
+                data_row = sealed.get(label)
+                data_path = pathlib.Path(data_row.get("path", "")) \
+                    if isinstance(data_row, dict) else pathlib.Path("")
+                descriptor = os.open(
+                    data_path,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_DIRECTORY", 0),
+                )
+                try:
+                    data_details = os.fstat(descriptor)
+                    path_details = data_path.lstat()
+                    observed_data = {
+                        "path": str(data_path), "device": data_details.st_dev,
+                        "inode": data_details.st_ino, "mode": data_details.st_mode,
+                        "uid": data_details.st_uid, "gid": data_details.st_gid,
+                        "nlink": data_details.st_nlink, "size": data_details.st_size,
+                        "mtime_ns": data_details.st_mtime_ns,
+                        "ctime_ns": data_details.st_ctime_ns,
+                    }
+                finally:
+                    os.close(descriptor)
+                if (data_path.is_symlink()
+                        or (path_details.st_dev, path_details.st_ino)
+                            != (data_details.st_dev, data_details.st_ino)
+                        or observed_data != data_row):
+                    fail("fresh stopped data directory changed")
+                result[label] = observed_data
+            for label in (
+                "live_source_capture_sha256", "rust_live_source_capture_sha256",
+            ):
+                if HASH_RE.fullmatch(str(sealed.get(label))) is None:
+                    fail("fresh stopped source capture root differs")
+                result[label] = sealed[label]
+            if sealed.get("source_pair_role") != "preauthorization-boundary":
+                fail("fresh stopped source-pair role differs")
+            result["source_pair_role"] = "preauthorization-boundary"
+            return result
+
+        fresh_sources = current_source_projection(persisted.get("source_inputs"))
+        observed_at = format_utc(now_value())
+        status_value = {
+            "schema": STOPPED_STATUS_SCHEMA, "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha, "node": node,
+            "host": FLEET_MAP[node],
+            "node_transition_receipt_sha256": applied_sha,
+            "transition_schema": NODE_STOPPED_SCHEMA,
+            "transitioned_at": stopped["secured_at"],
+            "observed_at": observed_at, "writer_state": "persistently-stopped",
+            "current_boot_id": current_status_boot,
+            "stable_head": stopped["stable_head"],
+            "persistent_restart_fence_sha256": barrier_root,
+            "precommit_status_sha256": stopped["precommit_status"]["sha256"],
+            "source_inputs": fresh_sources,
+            "nft_table_absent": True,
+            "applied_commit_absent": stopped_commit is None,
+            "active_selector_absent": True, "fence_unit_enabled": True,
+            "fence_unit_active": False, "automatic_legacy_restart": False,
+        }
+        sys.stdout.buffer.write(canonical(status_value))
+        raise SystemExit(0)
+
+    def validate_applied(raw, expected_sha=None):
+        if expected_sha is not None and sha(raw) != expected_sha:
+            fail("node-applied receipt hash differs")
+        value = parse_canonical(raw, "node-applied receipt")
+        fields = {
+            "schema", "capture_id", "freeze_plan_sha256",
+            "round_authorization_sha256", "round_readiness_sha256",
+            "round_number", "node", "host", "boot_id", "writer_pid",
+            "writer_start_ticks", "writer_cgroup_sha256",
+            "nft_policy_source_sha256", "owned_ruleset_stateless_sha256",
+            "nft_applied_at", "nft_deadline_gate", "network_quarantine_receipt",
+            "network_quarantine_receipt_sha256", "stable_head",
+            "authorization_ancestry_proof", "persistent_restart_fence_sha256",
+        }
+        if (set(value) != fields or value.get("schema") != NODE_APPLIED_SCHEMA
+                or (value.get("capture_id"), value.get("freeze_plan_sha256"),
+                    value.get("round_number"), value.get("round_authorization_sha256"),
+                    value.get("round_readiness_sha256"), value.get("node"),
+                    value.get("host")) != (
+                        capture_id, freeze_sha, round_number, authorization_sha,
+                        readiness_sha, node, FLEET_MAP[node],
+                    )):
+            fail("node-applied receipt identity differs")
+        for label in (
+            "writer_cgroup_sha256", "nft_policy_source_sha256",
+            "owned_ruleset_stateless_sha256", "network_quarantine_receipt_sha256",
+            "persistent_restart_fence_sha256",
+        ):
+            if not isinstance(value.get(label), str) or HASH_RE.fullmatch(value[label]) is None:
+                fail(f"node-applied receipt {label} differs")
+        for label in ("nft_deadline_gate", "network_quarantine_receipt",
+                      "authorization_ancestry_proof"):
+            unwrap(value.get(label), f"node-applied {label}")
+        return value
+
+    if applied_path.exists() or applied_path.is_symlink():
+        existing_applied_raw = secure_read(applied_path, 0o400)
+        existing_applied = validate_applied(
+            existing_applied_raw, applied_sha if mode in {"status", "stop"} else None
+        )
+        if mode == "applied-status":
+            sys.stdout.buffer.write(existing_applied_raw)
+            raise SystemExit(0)
+        # The active selector is deliberately volatile.  Only a complete,
+        # durable node transition may recreate it after reboot; the permanent
+        # absent-allow drop-ins prove no legacy writer can be started first.
+        active_value = (str(state) + "\n").encode()
+        if not active_path.exists() and not active_path.is_symlink():
+            live = writer_set()
+            if live:
+                verify_writer(target)
+            plan_raw = secure_read(state / "persistence-plan.json", 0o400)
+            plan = parse_canonical(plan_raw, "applied persistence plan")
+            if (plan.get("authorized_supervisor") != supervisor_contract(frozen)
+                    or plan.get("legacy_start_allow_path")
+                        != "/etc/arc-recovery/quarantine-round-legacy-start.allow"
+                    or plan.get("legacy_start_allow_absent") is not True):
+                fail("applied persistence restart closure differs")
+            allow_path = pathlib.Path(plan["legacy_start_allow_path"])
+            if allow_path.exists() or allow_path.is_symlink():
+                fail("applied legacy restart allow path exists")
+            files = plan.get("files")
+            if not isinstance(files, dict) or set(files) != {
+                    "dispatcher", "unit", "dependencies"
+                }:
+                fail("applied persistence file inventory differs")
+            rows = [files["dispatcher"], files["unit"]]
+            if not isinstance(files.get("dependencies"), list):
+                fail("applied persistence dependency inventory differs")
+            rows.extend(files["dependencies"])
+            for row in rows:
+                if (not isinstance(row, dict)
+                        or set(row) != {"path", "sha256", "mode"}
+                        or sha(secure_read(pathlib.Path(row["path"]), row["mode"]))
+                            != row["sha256"]):
+                    fail("applied persistence file bytes differ")
+            secure_dir(active_path.parent, 0o700, create=True)
+            publish(active_path, active_value, 0o400)
+            subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+        elif secure_read(active_path, 0o400) != active_value:
+            fail("active quarantine selector differs from the applied round")
+        subprocess.run(
+            ["/usr/bin/systemctl", "start", "arc-legacy-maintenance-fence.service"],
+            check=True,
+        )
+        ensured_raw = subprocess.check_output([str(state / "apply"), "ensure"])
+        ensured = parse_canonical(ensured_raw, "committed quarantine ensure")
+        if ensured.get("owned_ruleset_stateless_sha256") != \
+                existing_applied.get("owned_ruleset_stateless_sha256"):
+            fail("committed quarantine ensure differs from node-applied receipt")
+        if mode == "apply":
+            sys.stdout.buffer.write(existing_applied_raw)
+            raise SystemExit(0)
+    elif mode in {"status", "stop"}:
+        fail("quarantine-round status/stop has no local node-applied receipt")
+
+    if mode == "stop":
+        if secure_read(active_path, 0o400) != (str(state) + "\n").encode():
+            fail("stop-after-round active selector differs")
+        probe_raw = subprocess.check_output([str(state / "apply"), "probe"])
+        probe = parse_canonical(probe_raw, "stop-after-round nft probe")
+        if probe.get("owned_ruleset_stateless_sha256") != \
+                existing_applied.get("owned_ruleset_stateless_sha256"):
+            fail("stop-after-round active nft table differs")
+        if subprocess.run(
+                ["/usr/bin/systemctl", "is-active",
+                 "arc-legacy-maintenance-fence.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0 or subprocess.run(
+                ["/usr/bin/systemctl", "is-enabled",
+                 "arc-legacy-maintenance-fence.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0:
+            fail("stop-after-round requires the active durable nft fence")
+
+        legacy_units = (
+            "arc-self-heal.service", "arc-node.service",
+            "arc-node-update.service", "arc-node-update.timer",
+        )
+        allow_marker = pathlib.Path("/etc/arc-recovery/legacy-start-allowed")
+        stop_dropins = {}
+        for legacy_unit in legacy_units:
+            path = pathlib.Path(
+                f"/etc/systemd/system/{legacy_unit}.d/"
+                "zzzz-arc-recovery-stop-after-round.conf"
+            )
+            value = (
+                "[Unit]\n"
+                "ConditionPathExists=/etc/arc-recovery/legacy-start-allowed\n"
+                "RefuseManualStart=yes\n"
+                "IgnoreOnIsolate=yes\n"
+                + ("\n[Service]\nRestart=no\nSendSIGKILL=no\n"
+                   "TimeoutStopSec=infinity\nKillMode=process\n"
+                   "ExecStop=\nExecStopPost=\n"
+                   if legacy_unit.endswith(".service") else "")
+            ).encode()
+            stop_dropins[path] = value
+
+        def marker_identity():
+            if not allow_marker.exists() and not allow_marker.is_symlink():
+                return None
+            raw = secure_read(allow_marker, 0o400, maximum=4096)
+            if raw != b"schema=arc.recovery.legacy-start-allow.v1\n":
+                fail("stop-after-round legacy start marker differs")
+            details = allow_marker.lstat()
+            return {
+                "path": str(allow_marker), "sha256": sha(raw),
+                "device": details.st_dev, "inode": details.st_ino,
+                "uid": details.st_uid, "gid": details.st_gid,
+                "mode": stat.S_IMODE(details.st_mode), "size": details.st_size,
+                "nlink": details.st_nlink,
+            }
+
+        final_capture_candidates = list(pathlib.Path(
+            f"/root/arc-recovery-live-source-captures/{capture_id}/{node}/"
+            f"round-{round_number}/post-quarantine-final-export"
+        ).glob("*/selected.json"))
+        if len(final_capture_candidates) != 1:
+            fail("post-quarantine final source capture is missing or ambiguous")
+        final_capture_raw = secure_read(
+            final_capture_candidates[0], 0o400, maximum=32 * 1024 * 1024
+        )
+        final_capture = parse_canonical(
+            final_capture_raw, "post-quarantine final source capture"
+        )
+        final_capture_sha = sha(final_capture_raw)
+        final_rust, _final_rust_sha = unwrap(
+            final_capture.get("rust_capture"), "post-quarantine Rust source capture"
+        )
+        final_fixed = final_rust.get("fixed_pair") \
+            if isinstance(final_rust, dict) else None
+        final_head = final_capture.get("head")
+        if (final_capture_sha != inspector_sha
+                or final_capture.get("source_pair_role")
+                    != "post-quarantine-final-export"
+                or (final_capture.get("capture_id"), final_capture.get("node"),
+                    final_capture.get("freeze_plan_sha256"),
+                    final_capture.get("round_number")) != (
+                        capture_id, node, freeze_sha, round_number,
+                    )
+                or final_capture.get("authorized_writer") != {
+                    "boot_id": target["boot_id"], "pid": target["writer_pid"],
+                    "start_ticks": target["writer_start_ticks"],
+                    "cgroup_sha256": target["writer_cgroup_sha256"],
+                }
+                or final_capture.get("expected_head") != final_head
+                or not isinstance(final_head, dict) or set(final_head) != {
+                    "height", "block_hash", "state_root"
+                }
+                or final_capture.get("network_quarantine_receipt_sha256")
+                    != existing_applied["network_quarantine_receipt_sha256"]
+                or final_capture.get("owned_ruleset_stateless_sha256")
+                    != existing_applied["owned_ruleset_stateless_sha256"]
+                or final_capture.get("content_sealed") is not True
+                or final_capture.get("strict_offline_replay") is not True
+                or not isinstance(final_fixed, dict)
+                or final_fixed.get("strict_replay") is not True
+                or final_rust.get("head") != final_head):
+            fail("post-quarantine final source capture binding differs")
+
+        final_fixed_root = pathlib.Path(final_capture.get("fixed_pair_path", ""))
+        expected_final_prefix = (
+            f"/root/arc-recovery-live-source-captures/{capture_id}/{node}/"
+            f"round-{round_number}/post-quarantine-final-export/"
+        )
+        if (not str(final_fixed_root).startswith(expected_final_prefix)
+                or not str(final_fixed_root).endswith("/fixed-source")
+                or ".." in str(final_fixed_root)):
+            fail("post-quarantine final fixed source path differs")
+
+        def reprove_final_fixed(path, expected, label, *, directory=False):
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | (
+                getattr(os, "O_DIRECTORY", 0) if directory else 0
+            )
+            descriptor = os.open(path, flags)
+            try:
+                details = os.fstat(descriptor)
+                keys = {
+                    "device", "inode", "mode", "uid", "gid", "nlink",
+                    "mtime_ns", "ctime_ns",
+                }
+                observed = {
+                    "device": details.st_dev, "inode": details.st_ino,
+                    "mode": details.st_mode, "uid": details.st_uid,
+                    "gid": details.st_gid, "nlink": details.st_nlink,
+                    "mtime_ns": details.st_mtime_ns, "ctime_ns": details.st_ctime_ns,
+                }
+                if directory:
+                    if not stat.S_ISDIR(details.st_mode):
+                        fail(f"post-quarantine {label} is not a directory")
+                else:
+                    keys |= {"size", "sha256"}
+                    observed["size"] = details.st_size
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    observed["sha256"] = digest.hexdigest()
+                current_path = path.lstat()
+                if (path.is_symlink()
+                        or (current_path.st_dev, current_path.st_ino)
+                            != (details.st_dev, details.st_ino)
+                        or not isinstance(expected, dict) or set(expected) != keys
+                        or observed != expected):
+                    fail(f"post-quarantine {label} changed before stop intent")
+            finally:
+                os.close(descriptor)
+
+        reprove_final_fixed(
+            final_fixed_root, final_fixed.get("data_dir"), "fixed directory",
+            directory=True,
+        )
+        reprove_final_fixed(
+            final_fixed_root / "state.wal", final_fixed.get("state_wal"), "fixed WAL"
+        )
+        reprove_final_fixed(
+            final_fixed_root / "state.snapshot.lz4", final_fixed.get("snapshot"),
+            "fixed snapshot",
+        )
+        reprove_final_fixed(
+            final_fixed_root / "genesis.network-hash",
+            final_fixed.get("genesis_binding"), "fixed genesis binding",
+        )
+
+        stop_path = attempt / "stop-after-round.json"
+        stop_intent_path = state / "stop-after-round.intent.json"
+        if stop_path.exists() or stop_path.is_symlink():
+            stop_raw = secure_read(stop_path, 0o400)
+            stopped = parse_canonical(stop_raw, "stop-after-round receipt")
+            stopped_fields = {
+                "schema", "capture_id", "freeze_plan_sha256", "source_main_commit",
+                "round_number", "round_authorization_sha256",
+                "round_readiness_sha256", "node", "host",
+                "node_applied_receipt_sha256", "node_applied_receipt",
+                "stop_intent", "termination", "authorized_writer", "supervisor",
+                "dropin_sha256", "allow_marker_removed", "current_boot_id",
+                "stopped_at", "writer_state",
+                "activation_sources_inactive", "network_quarantine_active",
+                "owned_ruleset_stateless_sha256", "automatic_legacy_restart",
+                "final_source_capture", "final_source_capture_sha256",
+                "source_pair_role", "selected_source_head",
+            }
+            applied_wrapped, applied_wrapped_sha = unwrap(
+                stopped.get("node_applied_receipt"), "stop-after-round applied receipt"
+            )
+            intent_wrapped, intent_wrapped_sha = unwrap(
+                stopped.get("stop_intent"), "stop-after-round intent"
+            )
+            termination_wrapped, termination_wrapped_sha = unwrap(
+                stopped.get("termination"), "stop-after-round termination"
+            )
+            if (set(stopped) != stopped_fields
+                    or stopped.get("schema") != "arc.recovery.stop-after-quarantine-round.v1"
+                    or (stopped.get("capture_id"), stopped.get("freeze_plan_sha256"),
+                        stopped.get("round_number"),
+                        stopped.get("round_authorization_sha256"),
+                        stopped.get("round_readiness_sha256"), stopped.get("node"),
+                        stopped.get("host")) != (
+                            capture_id, freeze_sha, round_number, authorization_sha,
+                            readiness_sha, node, FLEET_MAP[node],
+                        )
+                    or applied_wrapped != existing_applied
+                    or applied_wrapped_sha != applied_sha
+                    or stopped.get("node_applied_receipt_sha256") != applied_sha
+                    or stopped.get("final_source_capture") != {
+                        "value": final_capture, "sha256": final_capture_sha,
+                    }
+                    or stopped.get("final_source_capture_sha256") != final_capture_sha
+                    or stopped.get("source_pair_role")
+                        != "post-quarantine-final-export"
+                    or stopped.get("selected_source_head") != final_head
+                    or intent_wrapped_sha != sha(secure_read(stop_intent_path, 0o400))
+                    or intent_wrapped != parse_canonical(
+                        secure_read(stop_intent_path, 0o400), "durable stop intent"
+                    )
+                    or termination_wrapped_sha != sha(secure_read(
+                        state / "stop-after-round.termination.json", 0o400
+                    ))
+                    or termination_wrapped != parse_canonical(
+                        secure_read(state / "stop-after-round.termination.json", 0o400),
+                        "durable stop termination",
+                    )
+                    or stopped.get("dropin_sha256") != {
+                        str(path): sha(raw) for path, raw in sorted(
+                            stop_dropins.items(), key=lambda item: str(item[0])
+                        )
+                    }
+                    or stopped.get("writer_state") != "persistently-stopped"
+                    or stopped.get("activation_sources_inactive") is not True
+                    or stopped.get("network_quarantine_active") is not True
+                    or stopped.get("owned_ruleset_stateless_sha256")
+                        != existing_applied["owned_ruleset_stateless_sha256"]
+                    or stopped.get("automatic_legacy_restart") is not False):
+                fail("existing stop-after-round receipt differs")
+            if writer_set():
+                fail("stopped round has a live arc-node writer")
+            for path, raw in stop_dropins.items():
+                if sha(secure_read(path, 0o400)) != sha(raw):
+                    fail("stopped round activation barrier changed")
+            if allow_marker.exists() or allow_marker.is_symlink():
+                fail("stopped round legacy start marker reappeared")
+            subprocess.check_output([str(state / "apply"), "probe"])
+            sys.stdout.buffer.write(stop_raw)
+            raise SystemExit(0)
+
+        current_marker = marker_identity()
+        supervisor = {
+            "mode": frozen.get("writer_supervision_mode"),
+            "unit": frozen.get("supervisor_unit"),
+            "main_pid": frozen.get("supervisor_main_pid"),
+            "start_ticks": frozen.get("supervisor_start_ticks"),
+            "executable_path": frozen.get("supervisor_executable_path"),
+            "executable_sha256": frozen.get("supervisor_executable_sha256"),
+            "argv_sha256": frozen.get("supervisor_argv_sha256"),
+            "context_sha256": frozen.get("supervisor_context_sha256"),
+        }
+        for label in ("executable_sha256", "argv_sha256", "context_sha256"):
+            if not isinstance(supervisor.get(label), str) or \
+                    HASH_RE.fullmatch(supervisor[label]) is None:
+                fail("stop-after-round supervisor contract differs")
+        if (supervisor.get("mode") not in {"systemd-unit", "detached-root-session"}
+                or not isinstance(supervisor.get("unit"), str)
+                or not supervisor["unit"]):
+            fail("stop-after-round supervisor identity differs")
+        if stop_intent_path.exists() or stop_intent_path.is_symlink():
+            preloaded_intent_raw = secure_read(stop_intent_path, 0o400)
+            preloaded_intent = parse_canonical(
+                preloaded_intent_raw, "stop-after-round intent"
+            )
+            marker_before = preloaded_intent.get("allow_marker")
+            if current_marker is not None and current_marker != marker_before:
+                fail("legacy start marker changed after the stop intent")
+        else:
+            preloaded_intent_raw = None
+            preloaded_intent = None
+            marker_before = current_marker
+        live_writers = writer_set()
+        if live_writers:
+            verify_writer(target)
+        # A reboot after the durable node transition intentionally leaves the
+        # legacy writer absent while the volatile selector is reconstructed
+        # above from the applied commit.  That is already safer than signaling;
+        # create the exact stop intent and record an already-absent outcome.
+        stop_intent_fixed = {
+            "schema": "arc.recovery.stop-after-quarantine-round-intent.v1",
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "source_main_commit": auth["source_main_commit"],
+            "round_number": round_number,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "node": node, "host": FLEET_MAP[node],
+            "node_applied_receipt_sha256": applied_sha,
+            "authorized_writer": {
+                "boot_id": target["boot_id"], "pid": target["writer_pid"],
+                "start_ticks": target["writer_start_ticks"],
+                "cgroup_sha256": target["writer_cgroup_sha256"],
+            },
+            "supervisor": supervisor, "allow_marker": marker_before,
+            "dropin_sha256": {
+                str(path): sha(raw) for path, raw in sorted(
+                    stop_dropins.items(), key=lambda item: str(item[0])
+                )
+            },
+            "owned_ruleset_stateless_sha256":
+                existing_applied["owned_ruleset_stateless_sha256"],
+            "final_source_capture": {
+                "value": final_capture, "sha256": final_capture_sha,
+            },
+            "final_source_capture_sha256": final_capture_sha,
+            "source_pair_role": "post-quarantine-final-export",
+            "selected_source_head": final_head,
+            "signal_policy": "pidfd-sigterm-only-no-sigkill",
+        }
+        if preloaded_intent is not None:
+            stop_intent_raw = preloaded_intent_raw
+            stop_intent = preloaded_intent
+            if (set(stop_intent) != set(stop_intent_fixed) | {"prepared_at"}
+                    or any(stop_intent.get(key) != value
+                           for key, value in stop_intent_fixed.items())):
+                fail("stop-after-round intent differs")
+        else:
+            stop_intent = {
+                **stop_intent_fixed, "prepared_at": format_utc(now_value()),
+            }
+            stop_intent_raw = canonical(stop_intent)
+            publish(stop_intent_path, stop_intent_raw, 0o400)
+
+        for path, raw in stop_dropins.items():
+            secure_dir(path.parent, 0o755, create=True)
+            publish(path, raw, 0o400)
+        if allow_marker.exists() or allow_marker.is_symlink():
+            if marker_identity() != marker_before:
+                fail("legacy start marker changed before removal")
+            allow_marker.unlink()
+            fsync_dir(allow_marker.parent)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+        for legacy_unit in legacy_units:
+            dropins = subprocess.check_output(
+                ["/usr/bin/systemctl", "show", legacy_unit,
+                 "--property=DropInPaths", "--value"], text=True,
+            ).strip()
+            if "zzzz-arc-recovery-stop-after-round.conf" not in dropins:
+                fail(f"stop-after-round drop-in is not effective: {legacy_unit}")
+        subprocess.check_output([str(state / "apply"), "probe"])
+        signal_gate_path = state / "stop-after-round.signal-gate.json"
+        signal_gate_wrapper = None
+        if writer_set():
+            verify_writer(target)
+            signal_gate_fixed = {
+                "schema": "arc.recovery.stop-after-quarantine-round-signal-gate.v1",
+                "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+                "round_authorization_sha256": authorization_sha,
+                "round_readiness_sha256": readiness_sha,
+                "node": node, "host": FLEET_MAP[node],
+                "stop_intent_sha256": sha(stop_intent_raw),
+                "authorized_writer": stop_intent["authorized_writer"],
+                "signal": "SIGTERM", "pidfd_required": True, "sigkill_forbidden": True,
+            }
+            if signal_gate_path.exists() or signal_gate_path.is_symlink():
+                signal_gate_raw = secure_read(signal_gate_path, 0o400)
+                signal_gate = parse_canonical(signal_gate_raw, "stop signal gate")
+                if (set(signal_gate) != set(signal_gate_fixed) | {"invoked_at"}
+                        or any(signal_gate.get(key) != value
+                               for key, value in signal_gate_fixed.items())):
+                    fail("stop-after-round signal gate differs")
+            else:
+                signal_gate = {
+                    **signal_gate_fixed, "invoked_at": format_utc(now_value()),
+                }
+                signal_gate_raw = canonical(signal_gate)
+                publish(signal_gate_path, signal_gate_raw, 0o400)
+            signal_gate_wrapper = {
+                "value": signal_gate, "sha256": sha(signal_gate_raw),
+            }
+            verify_writer(target)
+            descriptor = os.pidfd_open(target["writer_pid"], 0)
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGTERM, None, 0)
+            finally:
+                os.close(descriptor)
+        for legacy_unit in reversed(legacy_units):
+            subprocess.run(
+                ["/usr/bin/systemctl", "disable", legacy_unit],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["/usr/bin/systemctl", "stop", "--no-block", legacy_unit],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        stable_absent = 0
+        for _attempt in range(120):
+            if not writer_set():
+                stable_absent += 1
+                if stable_absent >= 5:
+                    break
+            else:
+                stable_absent = 0
+            time.sleep(1)
+        if stable_absent < 5:
+            fail("legacy writer did not stop after pidfd SIGTERM; SIGKILL is forbidden")
+        termination_path = state / "stop-after-round.termination.json"
+        if signal_gate_wrapper is None and signal_gate_path.exists() \
+                and not signal_gate_path.is_symlink():
+            signal_gate_raw = secure_read(signal_gate_path, 0o400)
+            signal_gate = parse_canonical(signal_gate_raw, "prior stop signal gate")
+            if signal_gate.get("stop_intent_sha256") != sha(stop_intent_raw):
+                fail("prior stop signal gate differs from the stop intent")
+            signal_gate_wrapper = {
+                "value": signal_gate, "sha256": sha(signal_gate_raw),
+            }
+        termination_fixed = {
+            "schema": "arc.recovery.stop-after-quarantine-round-termination.v1",
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "node": node, "host": FLEET_MAP[node],
+            "stop_intent_sha256": sha(stop_intent_raw),
+            "signal_gate": signal_gate_wrapper,
+            "outcome": ("writer-absent-after-pidfd-sigterm-gate"
+                        if signal_gate_wrapper is not None
+                        else "writer-already-absent-after-stop-intent"),
+            "writer_absent": True, "sigkill_sent": False,
+        }
+        if termination_path.exists() or termination_path.is_symlink():
+            termination_raw = secure_read(termination_path, 0o400)
+            termination = parse_canonical(termination_raw, "stop termination")
+            if (set(termination) != set(termination_fixed) | {"observed_at"}
+                    or any(termination.get(key) != value
+                           for key, value in termination_fixed.items())):
+                fail("stop-after-round termination differs")
+        else:
+            termination = {
+                **termination_fixed, "observed_at": format_utc(now_value()),
+            }
+            termination_raw = canonical(termination)
+            publish(termination_path, termination_raw, 0o400)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+        for legacy_unit in legacy_units:
+            active_state = subprocess.check_output(
+                ["/usr/bin/systemctl", "show", legacy_unit,
+                 "--property=ActiveState", "--value"], text=True,
+            ).strip()
+            job = subprocess.check_output(
+                ["/usr/bin/systemctl", "show", legacy_unit,
+                 "--property=Job", "--value"], text=True,
+            ).strip()
+            main_pid = subprocess.check_output(
+                ["/usr/bin/systemctl", "show", legacy_unit,
+                 "--property=MainPID", "--value"], text=True,
+            ).strip()
+            if (active_state not in {"inactive", "failed"} or job not in {"", "0"}
+                    or (legacy_unit.endswith(".service") and main_pid != "0")):
+                fail(f"legacy activation source did not become stably inactive: {legacy_unit}")
+        final_probe_raw = subprocess.check_output([str(state / "apply"), "probe"])
+        final_probe = parse_canonical(final_probe_raw, "post-stop nft probe")
+        if final_probe.get("owned_ruleset_stateless_sha256") != \
+                existing_applied["owned_ruleset_stateless_sha256"]:
+            fail("network quarantine changed while stopping the writer")
+        stopped_at = format_utc(now_value())
+        stopped = {
+            "schema": "arc.recovery.stop-after-quarantine-round.v1",
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "source_main_commit": auth["source_main_commit"],
+            "round_number": round_number,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "node": node, "host": FLEET_MAP[node],
+            "node_applied_receipt_sha256": applied_sha,
+            "node_applied_receipt": {
+                "value": existing_applied, "sha256": applied_sha,
+            },
+            "stop_intent": {
+                "value": stop_intent, "sha256": sha(stop_intent_raw),
+            },
+            "termination": {
+                "value": termination, "sha256": sha(termination_raw),
+            },
+            "authorized_writer": stop_intent["authorized_writer"],
+            "supervisor": supervisor,
+            "dropin_sha256": stop_intent["dropin_sha256"],
+            "allow_marker_removed": True,
+            "current_boot_id": pathlib.Path(
+                "/proc/sys/kernel/random/boot_id"
+            ).read_text().strip(),
+            "stopped_at": stopped_at,
+            "writer_state": "persistently-stopped",
+            "activation_sources_inactive": True,
+            "network_quarantine_active": True,
+            "owned_ruleset_stateless_sha256":
+                existing_applied["owned_ruleset_stateless_sha256"],
+            "final_source_capture": {
+                "value": final_capture, "sha256": final_capture_sha,
+            },
+            "final_source_capture_sha256": final_capture_sha,
+            "source_pair_role": "post-quarantine-final-export",
+            "selected_source_head": final_head,
+            "automatic_legacy_restart": False,
+        }
+        stop_raw = canonical(stopped)
+        publish(stop_path, stop_raw, 0o400)
+        sys.stdout.buffer.write(stop_raw)
+        raise SystemExit(0)
+
+    if mode == "status":
+        if secure_read(active_path, 0o400) != (str(state) + "\n").encode():
+            fail("active quarantine selector differs from the applied round")
+        helper_path = state / "apply"
+        commit_raw = subprocess.check_output([str(helper_path), "probe"])
+        commit = parse_canonical(commit_raw, "active quarantine helper probe")
+        if commit.get("owned_ruleset_stateless_sha256") != \
+                existing_applied.get("owned_ruleset_stateless_sha256"):
+            fail("active quarantine table differs from node-applied receipt")
+        active = subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "arc-legacy-maintenance-fence.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        enabled = subprocess.run(
+            ["/usr/bin/systemctl", "is-enabled", "arc-legacy-maintenance-fence.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if not active or not enabled:
+            fail("persistent quarantine service is not active and enabled")
+        barrier_raw = secure_read(state / "persistent-restart-fence.json", 0o400)
+        if sha(barrier_raw) != existing_applied["persistent_restart_fence_sha256"]:
+            fail("persistent restart-fence root differs")
+        try:
+            verify_writer(target)
+            status_origin = urllib.parse.urlsplit(frozen.get("rpc_origin", ""))
+            if (status_origin.scheme, status_origin.hostname, status_origin.path,
+                    status_origin.query, status_origin.fragment) != (
+                        "http", "127.0.0.1", "", "", ""
+                    ) or status_origin.port is None:
+                fail("fresh quarantine status loopback origin differs")
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", status_origin.port, timeout=5
+            )
+            try:
+                connection.request("GET", "/block/latest", headers={
+                    "Accept": "application/json", "Connection": "close",
+                    "Host": f"127.0.0.1:{status_origin.port}",
+                })
+                response = connection.getresponse()
+                body = response.read(8 * 1024 * 1024 + 1)
+                if response.status != 200 or len(body) > 8 * 1024 * 1024:
+                    fail("fresh quarantine status latest-block request failed")
+                latest = json.loads(body)
+            finally:
+                connection.close()
+            latest_header = latest.get("header") if isinstance(latest, dict) else None
+            if not isinstance(latest_header, dict) or {
+                "height": latest_header.get("height", latest.get("height")),
+                "block_hash": latest.get("hash", latest_header.get("hash")),
+                "state_root": latest_header.get("state_root"),
+            } != existing_applied["stable_head"]:
+                fail("fresh quarantine status head differs from the sealed fenced head")
+            writer_state = "exact-live-fenced"
+            status_boot = target["boot_id"]
+            status_pid = target["writer_pid"]
+            status_start = target["writer_start_ticks"]
+            status_cgroup = target["writer_cgroup_sha256"]
+            status_restart = None
+        except SystemExit:
+            if writer_set():
+                fail("prior-fenced host has a nonsealed live arc-node writer")
+            writer_state = "persistently-stopped"
+            status_boot = None
+            status_pid = None
+            status_start = None
+            status_cgroup = None
+            status_restart = existing_applied["persistent_restart_fence_sha256"]
+        status_value = {
+            "schema": STATUS_SCHEMA, "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha, "node": node,
+            "host": FLEET_MAP[node],
+            "node_applied_receipt_sha256": applied_sha,
+            "observed_at": format_utc(now_value()), "writer_state": writer_state,
+            "boot_id": status_boot, "writer_pid": status_pid,
+            "writer_start_ticks": status_start,
+            "writer_cgroup_sha256": status_cgroup,
+            "network_quarantine_receipt_sha256":
+                existing_applied["network_quarantine_receipt_sha256"],
+            "owned_ruleset_stateless_sha256":
+                existing_applied["owned_ruleset_stateless_sha256"],
+            "stable_head": existing_applied["stable_head"],
+            "active": True, "enabled": True,
+            "persistent_restart_fence_sha256": status_restart,
+        }
+        sys.stdout.buffer.write(canonical(status_value))
+        raise SystemExit(0)
+
+    # Reaching this point proves the exact local authorization and readiness
+    # roots.  All remaining filesystem/service/kernel changes are downstream
+    # of those durable facts.
+    def tool_bytes(path):
+        details = path.lstat()
+        if (path.is_symlink() or not stat.S_ISREG(details.st_mode)
+                or details.st_uid != 0 or details.st_gid != 0
+                or details.st_mode & 0o022 or details.st_nlink != 1):
+            fail(f"unsafe quarantine-round tool: {path}")
+        return path.read_bytes()
+
+    policy_template = '''table inet arc_legacy_maintenance_v1 {
+ comment "__ARC_TABLE_COMMENT__"
+ chain prerouting {
+  type filter hook prerouting priority -310; policy accept;
+  iifname "lo" counter accept comment "arc-recovery:prerouting:iifname:loopback"
+  iifname != "lo" tcp dport 22 counter accept comment "arc-recovery:prerouting:iifname:ssh"
+  iifname != "lo" udp sport 67 udp dport 68 counter accept comment "arc-recovery:prerouting:iifname:dhcp4"
+  iifname != "lo" udp sport 547 udp dport 546 counter accept comment "arc-recovery:prerouting:iifname:dhcp6"
+  iifname != "lo" icmpv6 type { 2, 133, 134, 135, 136 } counter accept comment "arc-recovery:prerouting:iifname:icmpv6-control"
+  iifname != "lo" counter drop comment "arc-recovery:prerouting:iifname:deny"
+ }
+ chain input {
+  type filter hook input priority -310; policy accept;
+  iifname "lo" counter accept comment "arc-recovery:input:iifname:loopback"
+  iifname != "lo" tcp dport 22 counter accept comment "arc-recovery:input:iifname:ssh"
+  iifname != "lo" udp sport 67 udp dport 68 counter accept comment "arc-recovery:input:iifname:dhcp4"
+  iifname != "lo" udp sport 547 udp dport 546 counter accept comment "arc-recovery:input:iifname:dhcp6"
+  iifname != "lo" icmpv6 type { 2, 133, 134, 135, 136 } counter accept comment "arc-recovery:input:iifname:icmpv6-control"
+  iifname != "lo" counter drop comment "arc-recovery:input:iifname:deny"
+ }
+ chain forward {
+  type filter hook forward priority -310; policy accept;
+  counter drop comment "arc-recovery:forward:all:deny-all"
+ }
+ chain output {
+  type filter hook output priority -310; policy accept;
+  oifname "lo" counter accept comment "arc-recovery:output:oifname:loopback"
+  oifname != "lo" tcp sport 22 counter accept comment "arc-recovery:output:oifname:ssh"
+  oifname != "lo" udp sport 68 udp dport 67 counter accept comment "arc-recovery:output:oifname:dhcp4"
+  oifname != "lo" udp sport 546 udp dport 547 counter accept comment "arc-recovery:output:oifname:dhcp6"
+  oifname != "lo" icmpv6 type { 2, 133, 134, 135, 136 } counter accept comment "arc-recovery:output:oifname:icmpv6-control"
+  oifname != "lo" counter drop comment "arc-recovery:output:oifname:deny"
+ }
+}
+'''.encode()
+
+    helper_template = r'''#!@@PYTHON@@
+import ctypes, datetime, errno, fcntl, hashlib, json, os, pathlib, re, stat, subprocess, sys, time
+STATE = pathlib.Path(@@STATE@@)
+TABLE = "arc_legacy_maintenance_v1"
+HASH_RE = re.compile(r"[0-9a-f]{64}")
+UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+MODE = sys.argv[1] if len(sys.argv) == 2 else ""
+if MODE not in {"initial", "ensure", "probe", "monitor"}: raise SystemExit(64)
+canonical=lambda v:(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n").encode()
+sha=lambda b:hashlib.sha256(b).hexdigest()
+def fail(message, code=1): print(message,file=sys.stderr); raise SystemExit(code)
+def fsync_dir(path):
+ fd=os.open(path,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+ try: os.fsync(fd)
+ finally: os.close(fd)
+def read(path, mode, maximum=16*1024*1024):
+ fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+ try:
+  before=os.fstat(fd); ident=lambda x:(x.st_dev,x.st_ino,x.st_mode,x.st_uid,x.st_gid,x.st_nlink,x.st_size,x.st_mtime_ns,x.st_ctime_ns)
+  if not stat.S_ISREG(before.st_mode) or before.st_uid or before.st_gid or before.st_nlink!=1 or stat.S_IMODE(before.st_mode)!=mode or before.st_size<=0 or before.st_size>maximum: fail(f"unsafe quarantine helper file: {path}")
+  raw=b""
+  while len(raw)<=maximum:
+   part=os.read(fd,min(1048576,maximum+1-len(raw)))
+   if not part: break
+   raw+=part
+  if len(raw)!=before.st_size or ident(os.fstat(fd))!=ident(before): fail(f"quarantine helper file changed: {path}")
+  return raw
+ finally: os.close(fd)
+def obj(path, mode=0o400):
+ raw=read(path,mode)
+ try: value=json.loads(raw)
+ except Exception: fail(f"invalid quarantine helper JSON: {path}")
+ if not isinstance(value,dict) or raw!=canonical(value): fail(f"noncanonical quarantine helper JSON: {path}")
+ return value,raw
+def raw_obj(path, mode=0o400):
+ raw=read(path,mode)
+ try:value=json.loads(raw)
+ except Exception:fail(f"invalid quarantine helper JSON: {path}")
+ if not isinstance(value,dict):fail(f"non-object quarantine helper JSON: {path}")
+ return value,raw
+def publish(path, raw, mode):
+ if path.exists() or path.is_symlink():
+  if read(path,mode)!=raw: fail(f"create-only quarantine helper file differs: {path}")
+  return
+ tmp=path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.partial")
+ fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+ try:
+  view=memoryview(raw)
+  while view:
+   size=os.write(fd,view)
+   if size<=0: fail("short quarantine helper write")
+   view=view[size:]
+  os.fsync(fd);os.fchmod(fd,mode);os.fsync(fd)
+ finally: os.close(fd)
+ fn=getattr(ctypes.CDLL(None,use_errno=True),"renameat2",None)
+ if fn is None: tmp.unlink(missing_ok=True);fail("renameat2 required")
+ if fn(-100,os.fsencode(tmp),-100,os.fsencode(path),1)!=0:
+  error=ctypes.get_errno();tmp.unlink(missing_ok=True)
+  if error==errno.EEXIST and path.exists() and not path.is_symlink() and read(path,mode)==raw:return
+  fail(f"no-replace quarantine helper publish failed: errno={error}")
+ fsync_dir(path.parent)
+def parse_utc(raw):
+ if not isinstance(raw,str) or UTC_RE.fullmatch(raw) is None: fail("quarantine helper UTC differs")
+ try:return datetime.datetime.strptime(raw,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+ except ValueError:fail("quarantine helper UTC is invalid")
+def now():return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+def start(pid):
+ raw=pathlib.Path(f"/proc/{pid}/stat").read_text();end=raw.rfind(")");fields=raw[end+2:].split()
+ if end<0 or len(fields)<20:fail("writer stat truncated at nft gate")
+ return int(fields[19])
+def writers():
+ answer=[]
+ for path in pathlib.Path("/proc").glob("[0-9]*/comm"):
+  try:
+   if path.read_text(errors="replace").strip()=="arc-node":answer.append(int(path.parent.name))
+  except (FileNotFoundError,ProcessLookupError,PermissionError,ValueError):pass
+ return sorted(answer)
+def verify_writer(contract):
+ writer=contract["writer"];pid=writer["pid"]
+ if pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()!=writer["boot_id"]:fail("writer boot changed at nft gate")
+ proc=pathlib.Path(f"/proc/{pid}")
+ if not proc.is_dir() or proc.joinpath("comm").read_text().strip()!="arc-node" or start(pid)!=writer["start_ticks"] or sha(proc.joinpath("cgroup").read_bytes())!=writer["cgroup_sha256"] or writers()!=[pid]:fail("writer PID/start/cgroup changed at nft gate")
+def normalize_nonowned(value):
+ def scrub(item):
+  if isinstance(item,dict):return {k:scrub(v) for k,v in sorted(item.items()) if k not in {"handle","position","index","packets","bytes"}}
+  if isinstance(item,list):return [scrub(v) for v in item]
+  return item
+ answer=[]
+ for entry in value.get("nftables",[]):
+  if "metainfo" in entry:continue
+  item=next(iter(entry.values())) if isinstance(entry,dict) and len(entry)==1 else None
+  if isinstance(item,dict) and ((entry.get("table",{}).get("family"),entry.get("table",{}).get("name"))==("inet",TABLE) or (item.get("family"),item.get("table"))==("inet",TABLE)):continue
+  answer.append(scrub(entry))
+ return answer
+def nft_json(nft,*args):
+ raw=subprocess.check_output([str(nft),"--json",*args]);value=json.loads(raw)
+ if not isinstance(value,dict) or not isinstance(value.get("nftables"),list):fail("nft JSON differs")
+ return value,raw
+def exists(nft):return subprocess.run([str(nft),"list","table","inet",TABLE],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+def extract(expr,interface):
+ iface=None;payload=[];verdict=None;counter=False
+ for row in expr:
+  if "counter" in row:counter=True
+  if "accept" in row:verdict="accept"
+  if "drop" in row:verdict="drop"
+  match=row.get("match")
+  if not isinstance(match,dict):continue
+  left,right=match.get("left"),match.get("right")
+  if left=={"meta":{"key":interface}}:iface=(match.get("op"),right)
+  elif isinstance(left,dict) and isinstance(left.get("payload"),dict):
+   p=left["payload"];values=sorted(right["set"]) if isinstance(right,dict) and isinstance(right.get("set"),list) else [right]
+   payload.append((p.get("protocol"),p.get("field"),values))
+ return iface,payload,verdict,counter
+def verify_table(nft, comment):
+ value,_=nft_json(nft,"list","table","inet",TABLE);rows=[x for x in value["nftables"] if "metainfo" not in x]
+ tables=[x["table"] for x in rows if "table" in x]
+ if len(tables)!=1 or any(tables[0].get(k)!=v for k,v in {"family":"inet","name":TABLE,"comment":comment}.items()):fail("owned nft table binding differs",77)
+ hooks=[("prerouting","prerouting"),("input","input"),("forward","forward"),("output","output")]
+ chains=[x["chain"] for x in rows if "chain" in x]
+ if len(chains)!=4:fail("owned nft chain count differs",77)
+ for chain,(name,hook) in zip(chains,hooks):
+  if any(chain.get(k)!=v for k,v in {"family":"inet","table":TABLE,"name":name,"type":"filter","hook":hook,"prio":-310,"policy":"accept"}.items()):fail("owned nft chain differs",77)
+ expected=[]
+ for chain,_ in hooks:
+  if chain in {"prerouting","input"}:expected += [(chain,"iifname","loopback",[],"accept"),(chain,"iifname","ssh",[("tcp","dport",[22])],"accept"),(chain,"iifname","dhcp4",[("udp","sport",[67]),("udp","dport",[68])],"accept"),(chain,"iifname","dhcp6",[("udp","sport",[547]),("udp","dport",[546])],"accept"),(chain,"iifname","icmpv6-control",[("icmpv6","type",[2,133,134,135,136])],"accept"),(chain,"iifname","deny",[],"drop")]
+  elif chain=="output":expected += [(chain,"oifname","loopback",[],"accept"),(chain,"oifname","ssh",[("tcp","sport",[22])],"accept"),(chain,"oifname","dhcp4",[("udp","sport",[68]),("udp","dport",[67])],"accept"),(chain,"oifname","dhcp6",[("udp","sport",[546]),("udp","dport",[547])],"accept"),(chain,"oifname","icmpv6-control",[("icmpv6","type",[2,133,134,135,136])],"accept"),(chain,"oifname","deny",[],"drop")]
+  else:expected.append((chain,None,"deny-all",[],"drop"))
+ rules=[x["rule"] for x in rows if "rule" in x]
+ if len(rules)!=len(expected):fail("owned nft rule count differs",77)
+ for rule,wanted in zip(rules,expected):
+  chain,interface,slug,payload,verdict=wanted;comment_value=f"arc-recovery:{chain}:{interface or 'all'}:{slug}"
+  if (rule.get("family"),rule.get("table"),rule.get("chain"),rule.get("comment"))!=("inet",TABLE,chain,comment_value):fail("owned nft rule identity/order differs",77)
+  if interface is None:
+   got=(None,[],next((key for row in rule.get("expr",[]) for key in ("accept","drop") if key in row),None),any("counter" in row for row in rule.get("expr",[])))
+  else:got=extract(rule.get("expr",[]),interface)
+  wanted_iface=None if interface is None else (("==","lo") if slug=="loopback" else ("!=","lo"))
+  if got!=(wanted_iface,payload,verdict,True):fail("owned nft rule semantics differ",77)
+ raw=subprocess.check_output([str(nft),"--stateless","list","table","inet",TABLE])
+ return sha(raw)
+contract,contract_raw=obj(STATE/"contract.json")
+helper_raw=read(STATE/"apply",0o500)
+if sha(helper_raw)!=contract.get("apply_helper_sha256"):fail("apply helper root differs")
+for name,wanted in (("authorization.json",contract["round_authorization_sha256"]),("readiness.json",contract["round_readiness_sha256"]),("policy.nft",contract["nft_policy_source_sha256"]),("table-binding.json",contract["table_binding_sha256"])):
+ if sha(read(STATE/name,0o400))!=wanted:fail(f"quarantine helper root differs: {name}")
+auth,_=obj(STATE/"authorization.json");ready,_=obj(STATE/"readiness.json");binding,binding_raw=obj(STATE/"table-binding.json")
+intent,intent_raw=obj(STATE/"nft-apply-intent.json")
+if sha(intent_raw)!=contract.get("nft_apply_intent_sha256") or intent.get("round_authorization_sha256")!=contract["round_authorization_sha256"] or intent.get("round_readiness_sha256")!=contract["round_readiness_sha256"] or intent.get("table_binding_sha256")!=contract["table_binding_sha256"] or intent.get("apply_helper_sha256")!=contract["apply_helper_sha256"] or intent.get("nft_policy_source_sha256")!=contract["nft_policy_source_sha256"] or intent.get("authorization_deadline")!=contract["authorization_deadline"]:fail("nft apply-intent binding differs")
+if auth.get("source_main_commit")!=contract["source_main_commit"] or auth.get("capture_id")!=contract["capture_id"] or auth.get("freeze_plan_sha256")!=contract["freeze_plan_sha256"] or auth.get("round_number")!=contract["round_number"]:fail("apply authorization binding differs")
+if ready.get("capture_id")!=contract["capture_id"] or ready.get("freeze_plan_sha256")!=contract["freeze_plan_sha256"] or ready.get("round_number")!=contract["round_number"] or ready.get("round_authorization_sha256")!=contract["round_authorization_sha256"] or ready.get("authorization_deadline")!=contract["authorization_deadline"]:fail("apply readiness binding differs")
+if binding!=contract["table_binding"] or sha(binding_raw)!=contract["table_binding_sha256"]:fail("nft table binding differs")
+targets=auth.get("targets");ready_rows=ready.get("targets")
+if not isinstance(targets,list) or not targets or not isinstance(ready_rows,list) or len(ready_rows)!=len(targets):fail("apply target readiness closure differs")
+names=[];local=[]
+for target_row,ready_row in zip(targets,ready_rows):
+ name=target_row.get("node") if isinstance(target_row,dict) else None;names.append(name)
+ if not isinstance(ready_row,dict) or (ready_row.get("node"),ready_row.get("host"))!=(name,target_row.get("host")):fail("apply target readiness topology differs")
+ wrapper=ready_row.get("authorization_acceptance")
+ if not isinstance(wrapper,dict) or set(wrapper)!={"sha256","value"} or not isinstance(wrapper.get("value"),dict) or sha(canonical(wrapper["value"]))!=wrapper.get("sha256"):fail("apply target acceptance root differs")
+ accepted=wrapper["value"]
+ if accepted.get("round_authorization_sha256")!=contract["round_authorization_sha256"] or accepted.get("authorization_deadline")!=contract["authorization_deadline"] or (accepted.get("node"),accepted.get("host"))!=(name,target_row.get("host")):fail("apply target acceptance binding differs")
+ if name==contract["node"]:local.append(target_row)
+if len(names)!=len(set(names)) or len(local)!=1:fail("apply target set/local row differs")
+local_writer={"boot_id":local[0].get("boot_id"),"pid":local[0].get("writer_pid"),"start_ticks":local[0].get("writer_start_ticks"),"cgroup_sha256":local[0].get("writer_cgroup_sha256")}
+if local_writer!=contract["writer"] or local[0].get("host")!=contract["host"]:fail("apply local writer authorization differs")
+plan_path=pathlib.Path(f"/root/.arc-recovery-plans/{contract['freeze_plan_sha256']}/freeze.lock.json");plan_raw=read(plan_path,0o400);plan=json.loads(plan_raw)
+if sha(plan_raw)!=contract["freeze_plan_sha256"] or canonical(plan)!=plan_raw or plan.get("source_commit")!=contract["source_main_commit"]:fail("freeze/source changed at nft gate")
+nft=STATE/"nft";policy=read(STATE/"policy.nft",0o400);rendered=policy.replace(b"__ARC_TABLE_COMMENT__",contract["table_comment"].encode())
+if rendered==policy or rendered.count(contract["table_comment"].encode())!=1:fail("rendered nft policy binding differs")
+publish(STATE/"rendered-policy.nft",rendered,0o400)
+if sha(read(nft,0o500))!=contract["pinned_nft_sha256"]:fail("pinned nft root differs")
+lock_path=pathlib.Path("/run/lock/arc-recovery-network-fence.lock");lock_fd=os.open(lock_path,os.O_RDWR|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600);lock_stat=os.fstat(lock_fd)
+if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid or lock_stat.st_gid or lock_stat.st_nlink!=1:fail("unsafe global nft transaction lock")
+os.fchmod(lock_fd,0o600);os.fsync(lock_fd);fcntl.flock(lock_fd,fcntl.LOCK_EX)
+gate_path=STATE/"nft-deadline-gate.json";commit_path=STATE/"applied.commit.json";baseline_path=STATE/"preexisting-ruleset.json"
+def load_gate():
+ gate,raw=obj(gate_path)
+ expected={"schema":"arc.recovery.quarantine-nft-deadline-gate.v1","capture_id":contract["capture_id"],"freeze_plan_sha256":contract["freeze_plan_sha256"],"round_authorization_sha256":contract["round_authorization_sha256"],"round_readiness_sha256":contract["round_readiness_sha256"],"round_number":contract["round_number"],"node":contract["node"],"host":contract["host"],"authorization_deadline":contract["authorization_deadline"],"apply_helper_sha256":contract["apply_helper_sha256"],"policy_sha256":contract["nft_policy_source_sha256"],"table_binding_sha256":contract["table_binding_sha256"],"table_comment":contract["table_comment"]}
+ if set(gate)!=set(expected)|{"invoked_at"} or any(gate.get(k)!=v for k,v in expected.items()):fail("nft deadline gate differs")
+ if parse_utc(gate.get("invoked_at"))>parse_utc(contract["authorization_deadline"]):fail("nft deadline gate invocation is late")
+ return gate,raw
+def load_commit():
+ commit,raw=obj(commit_path)
+ expected={"schema":"arc.recovery.quarantine-nft-applied-commit.v1","capture_id":contract["capture_id"],"freeze_plan_sha256":contract["freeze_plan_sha256"],"round_number":contract["round_number"],"round_authorization_sha256":contract["round_authorization_sha256"],"round_readiness_sha256":contract["round_readiness_sha256"],"node":contract["node"],"host":contract["host"],"table_binding_sha256":contract["table_binding_sha256"],"table_comment":contract["table_comment"],"apply_helper_sha256":contract["apply_helper_sha256"],"nft_policy_source_sha256":contract["nft_policy_source_sha256"]}
+ if set(commit)!=set(expected)|{"nft_deadline_gate_sha256","owned_ruleset_stateless_sha256","nft_applied_at"} or any(commit.get(k)!=v for k,v in expected.items()) or not HASH_RE.fullmatch(str(commit.get("nft_deadline_gate_sha256"))) or not HASH_RE.fullmatch(str(commit.get("owned_ruleset_stateless_sha256"))):fail("nft applied commit differs")
+ gate,gate_raw=load_gate()
+ if sha(gate_raw)!=commit["nft_deadline_gate_sha256"] or commit["nft_applied_at"]!=gate["invoked_at"]:fail("nft applied commit gate differs")
+ return commit,raw
+def verify_nonowned():
+ baseline,baseline_raw=raw_obj(baseline_path);current,_=nft_json(nft,"list","ruleset")
+ if sha(canonical(normalize_nonowned(baseline)))!=sha(canonical(normalize_nonowned(current))):fail("nonowned firewall changed while applying quarantine")
+ return sha(canonical(normalize_nonowned(baseline)))
+def result(commit):
+ sys.stdout.buffer.write(canonical(commit))
+if MODE=="probe":
+ commit,_=load_commit()
+ if not exists(nft):fail("committed quarantine table is absent",77)
+ observed=verify_table(nft,contract["table_comment"])
+ if observed!=commit["owned_ruleset_stateless_sha256"]:fail("committed quarantine table bytes differ",77)
+ result(commit);raise SystemExit(0)
+if MODE=="monitor":
+ commit,_=load_commit()
+ while True:
+  if not exists(nft):raise SystemExit(1)
+  if verify_table(nft,contract["table_comment"])!=commit["owned_ruleset_stateless_sha256"]:raise SystemExit(77)
+  time.sleep(1)
+if MODE=="ensure":
+ commit,_=load_commit()
+ if not exists(nft):subprocess.run([str(nft),"-f",str(STATE/"rendered-policy.nft")],check=True)
+ observed=verify_table(nft,contract["table_comment"])
+ if observed!=commit["owned_ruleset_stateless_sha256"]:fail("restored quarantine table differs",77)
+ result(commit);raise SystemExit(0)
+# initial: a durable commit permits reapply; without it, absence always passes
+# through the live writer+deadline gate immediately before the nft batch.
+if commit_path.exists() or commit_path.is_symlink():
+ commit,_=load_commit()
+ if not exists(nft):subprocess.run([str(nft),"-f",str(STATE/"rendered-policy.nft")],check=True)
+ if verify_table(nft,contract["table_comment"])!=commit["owned_ruleset_stateless_sha256"]:fail("reconciled committed table differs",77)
+ result(commit);raise SystemExit(0)
+if exists(nft):
+ if not gate_path.exists() or gate_path.is_symlink() and not gate_path.exists():fail("nft table predates its exact durable gate",77)
+ gate,gate_raw=load_gate();observed=verify_table(nft,contract["table_comment"])
+ verify_nonowned()
+else:
+ if not baseline_path.exists() and not baseline_path.is_symlink():
+  baseline,baseline_raw=nft_json(nft,"list","ruleset");publish(baseline_path,baseline_raw,0o400)
+ else:baseline,baseline_raw=raw_obj(baseline_path)
+ verify_writer(contract)
+ current=now()
+ if current>parse_utc(contract["authorization_deadline"]):fail("nft authorization expired before its initial commit")
+ if gate_path.exists() or gate_path.is_symlink():gate,gate_raw=load_gate()
+ else:
+  gate={"schema":"arc.recovery.quarantine-nft-deadline-gate.v1","capture_id":contract["capture_id"],"freeze_plan_sha256":contract["freeze_plan_sha256"],"round_authorization_sha256":contract["round_authorization_sha256"],"round_readiness_sha256":contract["round_readiness_sha256"],"round_number":contract["round_number"],"node":contract["node"],"host":contract["host"],"authorization_deadline":contract["authorization_deadline"],"invoked_at":current.strftime("%Y-%m-%dT%H:%M:%SZ"),"apply_helper_sha256":contract["apply_helper_sha256"],"policy_sha256":contract["nft_policy_source_sha256"],"table_binding_sha256":contract["table_binding_sha256"],"table_comment":contract["table_comment"]}
+  gate_raw=canonical(gate);publish(gate_path,gate_raw,0o400)
+ verify_writer(contract)
+ if now()>parse_utc(contract["authorization_deadline"]):fail("nft authorization expired immediately before its initial commit")
+ subprocess.run([str(nft),"-f",str(STATE/"rendered-policy.nft")],check=True)
+ observed=verify_table(nft,contract["table_comment"]);verify_nonowned()
+gate,gate_raw=load_gate()
+commit={"schema":"arc.recovery.quarantine-nft-applied-commit.v1","capture_id":contract["capture_id"],"freeze_plan_sha256":contract["freeze_plan_sha256"],"round_number":contract["round_number"],"round_authorization_sha256":contract["round_authorization_sha256"],"round_readiness_sha256":contract["round_readiness_sha256"],"node":contract["node"],"host":contract["host"],"nft_deadline_gate_sha256":sha(gate_raw),"table_binding_sha256":contract["table_binding_sha256"],"table_comment":contract["table_comment"],"apply_helper_sha256":contract["apply_helper_sha256"],"nft_policy_source_sha256":contract["nft_policy_source_sha256"],"owned_ruleset_stateless_sha256":observed,"nft_applied_at":gate["invoked_at"]}
+publish(commit_path,canonical(commit),0o400);result(commit)
+'''
+
+    helper_raw = (helper_template
+        .replace("@@PYTHON@@", str(python_path))
+        .replace("@@STATE@@", repr(str(state)))).encode()
+    policy_sha = sha(policy_template)
+    helper_sha = sha(helper_raw)
+    table_binding = {
+        "schema": BINDING_SCHEMA, "capture_id": capture_id,
+        "freeze_plan_sha256": freeze_sha, "round_number": round_number,
+        "round_authorization_sha256": authorization_sha,
+        "round_readiness_sha256": readiness_sha,
+        "authorization_deadline": auth["authorization_deadline"],
+        "apply_helper_sha256": helper_sha,
+        "policy_sha256": policy_sha,
+        "node": node, "host": FLEET_MAP[node],
+        "writer": {
+            "boot_id": target["boot_id"], "pid": target["writer_pid"],
+            "start_ticks": target["writer_start_ticks"],
+            "cgroup_sha256": target["writer_cgroup_sha256"],
+        },
+    }
+    table_binding_raw = canonical(table_binding)
+    table_binding_sha = sha(table_binding_raw)
+    table_comment = f"arc-recovery:round={round_number}:bind={table_binding_sha}:node={node}"
+    nft_system = pathlib.Path("/usr/sbin/nft")
+    nft_raw = tool_bytes(nft_system)
+    nft_sha = sha(nft_raw)
+
+    def system_table_comment():
+        exists_result = subprocess.run(
+            [str(nft_system), "list", "table", "inet", table_name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if exists_result.returncode != 0:
+            return None
+        raw = subprocess.check_output(
+            [str(nft_system), "--json", "list", "table", "inet", table_name]
+        )
+        value = json.loads(raw)
+        rows = [entry.get("table") for entry in value.get("nftables", []) if "table" in entry]
+        if len(rows) != 1:
+            fail("preexisting quarantine table identity is ambiguous")
+        return rows[0].get("comment")
+
+    # Expired attempts with no exact kernel mutation stop here, before any
+    # /etc, systemd, STOP_BASE, or nft write.  An exact table is allowed through
+    # solely so the post-kernel/pre-receipt crash can be reconciled.
+    existing_comment = system_table_comment()
+    if existing_comment is None:
+        if now_value() > deadline:
+            fail("quarantine-round authorization expired before any nft mutation")
+        verify_writer(target)
+    elif existing_comment != table_comment:
+        fail("a nonmatching quarantine table already owns the host")
+
+    secure_dir(state_base.parent, 0o700, create=True)
+    create_hierarchy(state_base, capture_id, authorization_sha)
+    publish(state / "authorization.json", auth_raw, 0o400)
+    publish(state / "readiness.json", readiness_raw, 0o400)
+    publish(state / "policy.nft", policy_template, 0o400)
+    publish(state / "apply", helper_raw, 0o500)
+    publish(state / "nft", nft_raw, 0o500)
+    publish(state / "table-binding.json", table_binding_raw, 0o400)
+    intent_path = state / "nft-apply-intent.json"
+    intent_fixed = {
+        "schema": "arc.recovery.quarantine-nft-apply-intent.v1",
+        "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+        "source_main_commit": auth["source_main_commit"],
+        "round_number": round_number,
+        "round_authorization_sha256": authorization_sha,
+        "round_readiness_sha256": readiness_sha,
+        "authorization_deadline": auth["authorization_deadline"],
+        "node": node, "host": FLEET_MAP[node], "writer": table_binding["writer"],
+        "table_binding_sha256": table_binding_sha, "table_comment": table_comment,
+        "apply_helper_sha256": helper_sha, "nft_policy_source_sha256": policy_sha,
+    }
+    if intent_path.exists() or intent_path.is_symlink():
+        intent_raw = secure_read(intent_path, 0o400)
+        intent = parse_canonical(intent_raw, "quarantine nft apply intent")
+        if (set(intent) != set(intent_fixed) | {"prepared_at"}
+                or any(intent.get(key) != value for key, value in intent_fixed.items())
+                or parse_utc(intent.get("prepared_at"), "nft apply-intent preparation") > deadline):
+            fail("quarantine nft apply-intent differs")
+    else:
+        prepared_at = now_value()
+        if prepared_at > deadline:
+            fail("quarantine nft apply-intent missed its authorization deadline")
+        intent = {**intent_fixed, "prepared_at": format_utc(prepared_at)}
+        intent_raw = canonical(intent)
+        publish(intent_path, intent_raw, 0o400)
+    intent_sha = sha(intent_raw)
+    dispatcher_raw_value, unit_value, dependencies = persistence_payloads()
+    persistence_files = persistence_file_roots(
+        dispatcher_raw_value, unit_value, dependencies
+    )
+    persistence_plan_path = state / "persistence-plan.json"
+    persistence_plan_fixed = {
+        "schema": "arc.recovery.quarantine-persistence-plan.v1",
+        "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+        "source_main_commit": auth["source_main_commit"],
+        "round_number": round_number,
+        "round_authorization_sha256": authorization_sha,
+        "round_readiness_sha256": readiness_sha,
+        "authorization_deadline": auth["authorization_deadline"],
+        "node": node, "host": FLEET_MAP[node],
+        "authorized_writer": table_binding["writer"],
+        "authorized_supervisor": supervisor_contract(frozen),
+        "legacy_start_allow_path":
+            "/etc/arc-recovery/quarantine-round-legacy-start.allow",
+        "legacy_start_allow_absent": True,
+        "nft_apply_intent_sha256": intent_sha,
+        "table_binding_sha256": table_binding_sha,
+        "apply_helper_sha256": helper_sha,
+        "nft_policy_source_sha256": policy_sha,
+        "files": persistence_files,
+        "fence_unit": "arc-legacy-maintenance-fence.service",
+        "fence_unit_enabled": True,
+        "active_selector_published_only_after_applied_commit": True,
+        "missing_selector_behavior": "fail-closed-without-nft-apply",
+        "automatic_unfence": False,
+    }
+    if persistence_plan_path.exists() or persistence_plan_path.is_symlink():
+        persistence_plan_raw = secure_read(persistence_plan_path, 0o400)
+        persistence_plan = parse_canonical(
+            persistence_plan_raw, "quarantine persistence plan"
+        )
+        if (set(persistence_plan) != set(persistence_plan_fixed) | {"prepared_at"}
+                or any(persistence_plan.get(key) != value
+                       for key, value in persistence_plan_fixed.items())
+                or parse_utc(persistence_plan.get("prepared_at"),
+                             "quarantine persistence plan preparation") > deadline):
+            fail("quarantine persistence plan differs")
+    else:
+        persistence_prepared_at = now_value()
+        if persistence_prepared_at > deadline:
+            fail("quarantine persistence plan missed its authorization deadline")
+        persistence_plan = {
+            **persistence_plan_fixed,
+            "prepared_at": format_utc(persistence_prepared_at),
+        }
+        persistence_plan_raw = canonical(persistence_plan)
+        # This plan is durable before the first restart-affecting /etc write.
+        publish(persistence_plan_path, persistence_plan_raw, 0o400)
+    persistence_plan_sha = sha(persistence_plan_raw)
+    contract = {
+        "schema": "arc.recovery.quarantine-nft-runtime-contract.v1",
+        "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+        "source_main_commit": auth["source_main_commit"],
+        "round_number": round_number,
+        "round_authorization_sha256": authorization_sha,
+        "round_readiness_sha256": readiness_sha,
+        "authorization_deadline": auth["authorization_deadline"],
+        "node": node, "host": FLEET_MAP[node],
+        "writer": table_binding["writer"],
+        "table_name": table_name, "table_priority": priority,
+        "table_comment": table_comment,
+        "table_binding": table_binding,
+        "table_binding_sha256": table_binding_sha,
+        "apply_helper_sha256": helper_sha,
+        "nft_policy_source_sha256": policy_sha,
+        "nft_apply_intent_sha256": intent_sha,
+        "persistence_plan_sha256": persistence_plan_sha,
+        "pinned_nft_sha256": nft_sha,
+        "round_artifact_path": str(attempt),
+        "state_path": str(state),
+    }
+    publish(state / "contract.json", canonical(contract), 0o400)
+
+    # A precommit reboot must not start a writer and must not apply an expired
+    # fence.  The generic unit therefore exists before the nft batch but has no
+    # active selector until an applied.commit is durable.  Its ensure command
+    # fails closed while the selector is absent.
+    verify_supervisor(frozen, target)
+    legacy_start_allow = pathlib.Path(
+        persistence_plan["legacy_start_allow_path"]
+    )
+    if legacy_start_allow.exists() or legacy_start_allow.is_symlink():
+        fail("quarantine-round legacy restart allow path unexpectedly exists")
+    secure_dir(pathlib.Path("/etc/arc-recovery"), 0o700)
+    # The selected frozen supervisor dependency is first in insertion order.
+    # A crash after this or any later prefix leaves boot activation fail-closed.
+    for dependency, dependency_value in dependencies.items():
+        secure_dir(dependency.parent, 0o755)
+        publish(dependency, dependency_value, 0o400)
+    publish(dispatcher_path, dispatcher_raw_value, 0o500)
+    publish(unit_path, unit_value, 0o400)
+    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+    subprocess.run(
+        ["/usr/bin/systemctl", "enable", "arc-legacy-maintenance-fence.service"],
+        stdout=subprocess.DEVNULL, check=True,
+    )
+    subprocess.run(["/usr/bin/sync"], check=True)
+    if subprocess.run(
+        ["/usr/bin/systemctl", "is-enabled", "arc-legacy-maintenance-fence.service"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode != 0:
+        fail("quarantine-round persistent unit is not enabled")
+    barrier_fixed = {
+        "schema": "arc.recovery.quarantine-persistent-restart-fence.v1",
+        "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+        "source_main_commit": auth["source_main_commit"],
+        "round_number": round_number,
+        "round_authorization_sha256": authorization_sha,
+        "round_readiness_sha256": readiness_sha, "node": node,
+        "host": FLEET_MAP[node], "dispatcher_sha256": sha(dispatcher_raw_value),
+        "authorization_deadline": auth["authorization_deadline"],
+        "nft_apply_intent_sha256": intent_sha,
+        "persistence_plan_sha256": persistence_plan_sha,
+        "authorized_writer": table_binding["writer"],
+        "unit_sha256": sha(unit_value),
+        "dependency_sha256": {
+            str(path): sha(raw) for path, raw in sorted(
+                dependencies.items(), key=lambda item: str(item[0])
+            )
+        },
+        "automatic_unfence": False,
+        "precommit_missing_selector_behavior": "fail-closed-without-nft-apply",
+        "arming_mode": "initial-live-window",
+        "armed_boot_id": target["boot_id"],
+    }
+    barrier_path = state / "persistent-restart-fence.json"
+    if barrier_path.exists() or barrier_path.is_symlink():
+        barrier_raw = secure_read(barrier_path, 0o400)
+        barrier = parse_canonical(barrier_raw, "persistent restart fence")
+        if (set(barrier) != set(barrier_fixed) | {"armed_at"}
+                or any(barrier.get(key) != value for key, value in barrier_fixed.items())
+                or parse_utc(barrier.get("armed_at"), "persistent restart-fence arm") > deadline):
+            fail("persistent restart-fence receipt differs")
+    else:
+        armed_at = now_value()
+        if armed_at > deadline:
+            fail("persistent restart fence was not armed inside the authorization window")
+        barrier = {**barrier_fixed, "armed_at": format_utc(armed_at)}
+        barrier_raw = canonical(barrier)
+        publish(barrier_path, barrier_raw, 0o400)
+    barrier_sha = sha(barrier_raw)
+
+    # Re-prove the exact live supervisor plus direct/detached writer immediately
+    # before the only initial kernel mutation.
+    verify_supervisor(frozen, target)
+    # The pinned helper owns the exact gate -> nft -> applied.commit sequence.
+    # It is the sole command below that may call nft -f.
+    commit_raw = subprocess.check_output([str(state / "apply"), "initial"])
+    commit = parse_canonical(commit_raw, "quarantine nft applied commit")
+    if (commit.get("schema") != APPLIED_COMMIT_SCHEMA
+            or commit.get("round_authorization_sha256") != authorization_sha
+            or commit.get("round_readiness_sha256") != readiness_sha
+            or commit.get("table_binding_sha256") != table_binding_sha
+            or commit.get("nft_policy_source_sha256") != policy_sha):
+        fail("quarantine nft applied commit binding differs")
+    durable_commit_raw = secure_read(state / "applied.commit.json", 0o400)
+    if durable_commit_raw != commit_raw:
+        fail("quarantine nft applied commit stdout differs from durable bytes")
+    gate_raw = secure_read(state / "nft-deadline-gate.json", 0o400)
+    gate = parse_canonical(gate_raw, "quarantine nft deadline gate")
+    if sha(gate_raw) != commit.get("nft_deadline_gate_sha256"):
+        fail("quarantine nft applied commit gate root differs")
+
+    active_value = (str(state) + "\n").encode()
+    secure_dir(active_path.parent, 0o700, create=True)
+    publish(active_path, active_value, 0o400)
+    subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
+    subprocess.run(
+        ["/usr/bin/systemctl", "start", "arc-legacy-maintenance-fence.service"],
+        check=True,
+    )
+    if (subprocess.run(
+            ["/usr/bin/systemctl", "is-active", "arc-legacy-maintenance-fence.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode != 0):
+        fail("quarantine-round persistent unit is not active after commit")
+
+    origin = urllib.parse.urlsplit(frozen.get("rpc_origin", ""))
+    if (origin.scheme, origin.hostname, origin.path, origin.query, origin.fragment) != (
+            "http", "127.0.0.1", "", "", "") or origin.port is None:
+        fail("pinned quarantine-round RPC origin is not exact loopback HTTP")
+
+    def rpc(path):
+        connection = http.client.HTTPConnection("127.0.0.1", origin.port, timeout=5)
+        try:
+            connection.request("GET", path, headers={
+                "Host": f"127.0.0.1:{origin.port}", "Accept": "application/json",
+                "Connection": "close", "User-Agent": "arc-recovery-quarantine-round/1",
+            })
+            response = connection.getresponse()
+            raw = response.read(8 * 1024 * 1024 + 1)
+            if response.status != 200 or len(raw) > 8 * 1024 * 1024:
+                fail(f"post-fence loopback RPC failed: {path}")
+            try:
+                value = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                fail(f"post-fence loopback RPC returned invalid JSON: {path}")
+            if not isinstance(value, dict):
+                fail(f"post-fence loopback RPC returned a non-object: {path}")
+            return value, raw
+        finally:
+            connection.close()
+
+    def block_identity(value, label):
+        header = value.get("header")
+        if not isinstance(header, dict):
+            fail(f"{label} block header is missing")
+        height = header.get("height", value.get("height"))
+        block_hash = value.get("hash", header.get("hash"))
+        state_root = header.get("state_root")
+        if (isinstance(height, bool) or not isinstance(height, int) or height < 1
+                or not isinstance(block_hash, str) or HASH_RE.fullmatch(block_hash) is None
+                or not isinstance(state_root, str) or HASH_RE.fullmatch(state_root) is None):
+            fail(f"{label} block identity is malformed")
+        return height, block_hash, state_root
+
+    receipt_path = attempt / "08-network-quarantine.json"
+    ancestry_path = attempt / "authorization-ancestry.json"
+    if receipt_path.exists() or receipt_path.is_symlink():
+        network_raw = secure_read(receipt_path, 0o400)
+        network = parse_canonical(network_raw, "network-quarantine receipt")
+        ancestry_raw = secure_read(ancestry_path, 0o400)
+        ancestry = parse_canonical(ancestry_raw, "post-fence ancestry proof")
+        if (network.get("round_authorization_sha256") != authorization_sha
+                or network.get("round_readiness_sha256") != readiness_sha
+                or network.get("nft_deadline_gate_sha256") != sha(gate_raw)
+                or network.get("nft_table_binding_sha256") != table_binding_sha
+                or network.get("applied_commit_sha256") != sha(durable_commit_raw)
+                or network.get("authorization_ancestry_proof_sha256") != sha(ancestry_raw)
+                or network.get("owned_ruleset_stateless_sha256")
+                    != commit.get("owned_ruleset_stateless_sha256")):
+            fail("existing network-quarantine receipt roots differ")
+        loopback = network.get("loopback_head")
+        stable_head = {
+            "height": loopback.get("latest_height") if isinstance(loopback, dict) else None,
+            "block_hash": loopback.get("block_hash") if isinstance(loopback, dict) else None,
+            "state_root": loopback.get("state_root") if isinstance(loopback, dict) else None,
+        }
+    else:
+        verify_writer(target)
+        minimum_height = max(
+            public_row.get("info_after_height", 0),
+            cross_row.get("loopback_info_after_height", 0),
+        )
+        stable = None
+        for sample_index in range(10):
+            info_before, info_before_raw = rpc("/info")
+            latest, latest_raw = rpc("/block/latest")
+            height, block_hash, state_root = block_identity(latest, "post-fence latest")
+            exact, exact_raw = rpc(f"/block/{height}")
+            exact_height, exact_hash, exact_state = block_identity(exact, "post-fence exact")
+            health, health_raw = rpc("/health")
+            info_after, info_after_raw = rpc("/info")
+            before_height = info_before.get("block_height")
+            after_height = info_after.get("block_height")
+            if ([before_height, height, exact_height, after_height] == [height] * 4
+                    and exact_hash == block_hash and exact_state == state_root
+                    and height >= minimum_height):
+                stable = {
+                    "rpc_origin": f"http://127.0.0.1:{origin.port}",
+                    "info_before_height": height, "latest_height": height,
+                    "block_height": height, "info_after_height": height,
+                    "block_hash": block_hash, "state_root": state_root,
+                    "response_sha256": {
+                        "/info:before": sha(info_before_raw),
+                        "/block/latest": sha(latest_raw),
+                        f"/block/{height}": sha(exact_raw),
+                        "/health": sha(health_raw),
+                        "/info:after": sha(info_after_raw),
+                    },
+                    "stable_attempt": sample_index + 1,
+                }
+                break
+            time.sleep(0.2)
+        if stable is None:
+            fail("post-fence loopback head did not stabilize above fresh authorization")
+        stable_head = {
+            "height": stable["latest_height"], "block_hash": stable["block_hash"],
+            "state_root": stable["state_root"],
+        }
+        checks = []
+        for label, height, expected_hash in (
+            ("public-latest", public_row["latest_block_height"],
+             public_row["latest_block_hash"]),
+            ("authenticated-loopback-latest", cross_row["loopback_latest_height"],
+             cross_row["loopback_latest_block_hash"]),
+        ):
+            observed, observed_raw = rpc(f"/block/{height}")
+            observed_height, observed_hash, _observed_state = block_identity(
+                observed, f"post-fence {label} ancestry"
+            )
+            if observed_height != height or observed_hash != expected_hash:
+                fail(f"post-fence {label} authorization ancestry differs")
+            checks.append({
+                "label": label, "height": height,
+                "expected_block_hash": expected_hash,
+                "observed_block_hash": observed_hash,
+                "response_sha256": sha(observed_raw),
+            })
+        ancestry = {
+            "schema": ANCESTRY_SCHEMA, "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha,
+            "round_authorization_sha256": authorization_sha,
+            "round_number": round_number, "node": node,
+            "host": FLEET_MAP[node], "checks": checks,
+        }
+        ancestry_raw = canonical(ancestry)
+        publish(ancestry_path, ancestry_raw, 0o400)
+        # Re-prove the exact table after every loopback/ancestry request.
+        probe_raw = subprocess.check_output([str(state / "apply"), "probe"])
+        probe = parse_canonical(probe_raw, "post-fence nft probe")
+        if probe.get("owned_ruleset_stateless_sha256") != \
+                commit.get("owned_ruleset_stateless_sha256"):
+            fail("owned nft table changed during post-fence evidence")
+        inventory = {
+            "authorization.json": sha(auth_raw),
+            "readiness.json": sha(readiness_raw),
+            "contract.json": sha(canonical(contract)),
+            "table-binding.json": table_binding_sha,
+            "nft-apply-intent.json": intent_sha,
+            "persistence-plan.json": persistence_plan_sha,
+            "policy.nft": policy_sha, "apply": helper_sha, "nft": nft_sha,
+            "nft-deadline-gate.json": sha(gate_raw),
+            "applied.commit.json": sha(durable_commit_raw),
+            "persistent-restart-fence.json": barrier_sha,
+            str(dispatcher_path): sha(dispatcher_raw_value),
+            str(unit_path): sha(unit_value),
+            **{str(path): sha(raw) for path, raw in dependencies.items()},
+        }
+        rendered_path = state / "rendered-policy.nft"
+        inventory["rendered-policy.nft"] = sha(secure_read(rendered_path, 0o400))
+        baseline_path = state / "preexisting-ruleset.json"
+        if baseline_path.exists() and not baseline_path.is_symlink():
+            inventory["preexisting-ruleset.json"] = sha(secure_read(baseline_path, 0o400))
+        network = {
+            "schema": "arc.recovery.legacy-network-quarantine.v1",
+            "capture_id": capture_id, "node": node,
+            "host": FLEET_MAP[node], "freeze_plan_sha256": freeze_sha,
+            "source_main_commit": auth["source_main_commit"],
+            "round_number": round_number,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "nft_deadline_gate_sha256": sha(gate_raw),
+            "nft_apply_intent_sha256": intent_sha,
+            "nft_apply_intent": {"value": intent, "sha256": intent_sha},
+            "nft_table_binding_sha256": table_binding_sha,
+            "nft_table_binding": table_binding,
+            "table_comment": table_comment,
+            "nft_table_comment": table_comment,
+            "nft_policy_source_sha256": policy_sha,
+            "apply_helper_sha256": helper_sha,
+            "applied_commit_sha256": sha(durable_commit_raw),
+            "authorization_ancestry_proof_sha256": sha(ancestry_raw),
+            "boot_id": target["boot_id"],
+            "writer": {
+                "pid": target["writer_pid"],
+                "start_ticks": target["writer_start_ticks"],
+                "cgroup_sha256": target["writer_cgroup_sha256"],
+            },
+            "table": {
+                "family": "inet", "name": table_name, "priority": priority,
+                "hooks": ["prerouting", "input", "forward", "output"],
+                "policy": "accept", "comment": table_comment,
+                "loopback_retained": True,
+            },
+            "quarantine_policy": {
+                "mode": "deny-all-nonloopback-except-host-maintenance",
+                "families": ["ipv4", "ipv6"],
+                "directions": ["input", "output", "forward"],
+                "allowed": ["loopback", "ssh-tcp-22", "dhcpv4-67-68",
+                            "dhcpv6-546-547", "icmpv6-ndp-ra-packet-too-big"],
+                "priority_before_conntrack": True, "established_bypass": False,
+                "legacy_rpc_p2p_web_dynamic_all_blocked": True,
+            },
+            "persistence": {
+                "unit_path": str(unit_path), "unit_enabled": True,
+                "unit_active": True, "state_path": str(state),
+                "active_selector_path": str(active_path), "automatic_unfence": False,
+            },
+            "file_sha256": inventory,
+            "tool_sha256": {"/usr/sbin/nft": nft_sha},
+            "owned_ruleset_stateless_sha256":
+                commit["owned_ruleset_stateless_sha256"],
+            "loopback_head": stable,
+            "stable_head": stable_head,
+            "authorization_ancestry_proof": {
+                "value": ancestry, "sha256": sha(ancestry_raw),
+            },
+            "nft_deadline_gate": {"value": gate, "sha256": sha(gate_raw)},
+            "applied_commit": {
+                "value": commit, "sha256": sha(durable_commit_raw),
+            },
+            "installed_at": format_utc(now_value()),
+            "global_absence_claimed": False,
+            "threat_model": {
+                "legacy_binary": "reviewed-non-adversarial-exact-hash",
+                "legacy_binary_sha256": frozen["executable_sha256"],
+            },
+        }
+        network_raw = canonical(network)
+        publish(receipt_path, network_raw, 0o400)
+
+    network_sha = sha(network_raw)
+    ancestry_sha = sha(ancestry_raw)
+    node_applied = {
+        "schema": NODE_APPLIED_SCHEMA, "capture_id": capture_id,
+        "freeze_plan_sha256": freeze_sha,
+        "round_authorization_sha256": authorization_sha,
+        "round_readiness_sha256": readiness_sha,
+        "round_number": round_number, "node": node, "host": FLEET_MAP[node],
+        "boot_id": target["boot_id"], "writer_pid": target["writer_pid"],
+        "writer_start_ticks": target["writer_start_ticks"],
+        "writer_cgroup_sha256": target["writer_cgroup_sha256"],
+        "nft_policy_source_sha256": policy_sha,
+        "owned_ruleset_stateless_sha256":
+            commit["owned_ruleset_stateless_sha256"],
+        "nft_applied_at": commit["nft_applied_at"],
+        "nft_deadline_gate": {"value": gate, "sha256": sha(gate_raw)},
+        "network_quarantine_receipt": {
+            "value": network, "sha256": network_sha,
+        },
+        "network_quarantine_receipt_sha256": network_sha,
+        "stable_head": stable_head,
+        "authorization_ancestry_proof": {
+            "value": ancestry, "sha256": ancestry_sha,
+        },
+        "persistent_restart_fence_sha256": barrier_sha,
+    }
+    node_applied_raw = canonical(node_applied)
+    publish(applied_path, node_applied_raw, 0o400)
+    validate_applied(node_applied_raw)
+    sys.stdout.buffer.write(node_applied_raw)
+finally:
+    os.close(lock_fd)
+
+PY
+}
+
+quarantine_fleet_start_authorization() {
+    local mode="$1" capture_id="$2" node="$3" freeze_sha="$4"
+    local public_height_sha="$5" authenticated_cross_sha="$6" first_boundary_sha="$7"
+    local public_completed_at="$8" authenticated_started_at="$9"
+    local authenticated_completed_at="${10}" first_quarantine_started_at="${11}"
+    local authority_accepted_at="${12:-}" expected_latch_sha="${13:-}"
+    require_hash "$capture_id" "capture id"
+    require_node "$node"
+    require_hash "$freeze_sha" "freeze plan hash"
+    require_hash "$public_height_sha" "public-height receipt hash"
+    require_hash "$authenticated_cross_sha" "authenticated height-cross hash"
+    require_hash "$first_boundary_sha" "first-quarantine boundary hash"
+    case "$mode" in
+        authority)
+            [ "$node" = nyc ] || die "only the deterministic nyc authority may create a fleet-start latch"
+            [ -z "$authority_accepted_at" ] && [ -z "$expected_latch_sha" ] || \
+                die "fleet-start authority received unexpected replica fields"
+            ;;
+        status)
+            [ -z "$authority_accepted_at" ] && [ -z "$expected_latch_sha" ] || \
+                die "fleet-start status received unexpected replica fields"
+            ;;
+        replica|exact)
+            require_hash "$expected_latch_sha" "fleet-start authorization hash"
+            [ -n "$authority_accepted_at" ] || die "fleet-start authority acceptance time is required"
+            ;;
+        *) die "unsupported fleet-start authorization mode" ;;
+    esac
+    python3 - "$QUARANTINE_AUTHORIZATION_BASE" "$mode" "$capture_id" "$node" \
+        "$freeze_sha" "$public_height_sha" "$authenticated_cross_sha" \
+        "$first_boundary_sha" "$public_completed_at" "$authenticated_started_at" \
+        "$authenticated_completed_at" "$first_quarantine_started_at" \
+        "$authority_accepted_at" "$expected_latch_sha" <<'PY'
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+(base_raw, mode, capture_id, invoking_node, freeze_sha, public_sha, cross_sha,
+ boundary_sha, public_completed_raw, cross_started_raw, cross_completed_raw,
+ first_started_raw, accepted_raw, expected_sha) = sys.argv[1:]
+base = pathlib.Path(base_raw)
+nodes = [
+    {"name": "nyc", "host": "149.28.32.76"},
+    {"name": "lax", "host": "140.82.16.112"},
+    {"name": "ams", "host": "136.244.109.1"},
+    {"name": "lhr", "host": "104.238.171.11"},
+    {"name": "nrt", "host": "202.182.107.41"},
+    {"name": "sgp", "host": "149.28.153.31"},
+]
+hash_re = re.compile(r"[0-9a-f]{64}")
+utc_re = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+if (mode not in {"authority", "status", "replica", "exact"}
+        or invoking_node not in {row["name"] for row in nodes}
+        or any(hash_re.fullmatch(value) is None
+               for value in (capture_id, freeze_sha, public_sha, cross_sha, boundary_sha))
+        or (mode == "authority" and invoking_node != "nyc")):
+    raise SystemExit("fleet-start authorization identity is malformed")
+
+def canonical(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+def parse_utc(raw, label):
+    if not isinstance(raw, str) or utc_re.fullmatch(raw) is None:
+        raise SystemExit(f"fleet-start {label} is not canonical UTC")
+    try:
+        return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except ValueError as error:
+        raise SystemExit(f"fleet-start {label} is invalid") from error
+
+public_completed = parse_utc(public_completed_raw, "public completion")
+cross_started = parse_utc(cross_started_raw, "authenticated start")
+cross_completed = parse_utc(cross_completed_raw, "authenticated completion")
+first_started = parse_utc(first_started_raw, "first-quarantine boundary")
+deadline = public_completed + datetime.timedelta(seconds=300)
+if not public_completed <= cross_started <= cross_completed <= first_started <= deadline:
+    raise SystemExit("fleet-start authorization timeline is not ordered within 300 seconds")
+deadline_raw = deadline.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+expected_common = {
+    "schema": "arc.recovery.quarantine-fleet-start-authorization.v1",
+    "capture_id": capture_id,
+    "freeze_plan_sha256": freeze_sha,
+    "legacy_public_height_receipt_sha256": public_sha,
+    "authenticated_legacy_height_cross_proof_sha256": cross_sha,
+    "first_quarantine_boundary_sha256": boundary_sha,
+    "public_height_completed_at": public_completed_raw,
+    "authenticated_height_started_at": cross_started_raw,
+    "authenticated_height_completed_at": cross_completed_raw,
+    "first_quarantine_started_at": first_started_raw,
+    "authorization_deadline": deadline_raw,
+    "authority": {"node": "nyc", "host": "149.28.32.76"},
+    "nodes": nodes,
+}
+
+def validate_payload(raw, *, exact_accepted=None, exact_sha=None):
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit("fleet-start authorization is invalid JSON") from error
+    if (not isinstance(value, dict) or raw != canonical(value)
+            or set(value) != set(expected_common) | {"authority_accepted_at"}
+            or any(value.get(key) != wanted for key, wanted in expected_common.items())):
+        raise SystemExit("fleet-start authorization binding differs")
+    accepted = parse_utc(value.get("authority_accepted_at"), "authority acceptance")
+    if not first_started <= accepted <= deadline:
+        raise SystemExit("fleet-start authority acceptance is outside the sealed live window")
+    digest = hashlib.sha256(raw).hexdigest()
+    if exact_accepted is not None and value["authority_accepted_at"] != exact_accepted:
+        raise SystemExit("fleet-start authority acceptance differs")
+    if exact_sha is not None and digest != exact_sha:
+        raise SystemExit("fleet-start authorization hash differs")
+    return value, digest
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+def ensure_dir(path):
+    if not path.exists() and not path.is_symlink():
+        os.mkdir(path, 0o700)
+        fsync_dir(path.parent)
+    details = path.lstat()
+    if (path.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.geteuid() or details.st_gid != os.getegid()
+            or stat.S_IMODE(details.st_mode) != 0o700):
+        raise SystemExit(f"fleet-start authorization directory is unsafe: {path}")
+
+def read_file(path, *, modes={0o400}, links={1}):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        stable = lambda item: (
+            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+        )
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or before.st_gid != os.getegid() or before.st_nlink not in links
+                or stat.S_IMODE(before.st_mode) not in modes
+                or before.st_size <= 0 or before.st_size > 64 * 1024):
+            raise SystemExit("fleet-start authorization file identity is unsafe")
+        raw = b""
+        while len(raw) <= 64 * 1024:
+            chunk = os.read(fd, 64 * 1024 + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) != before.st_size or stable(os.fstat(fd)) != stable(before):
+            raise SystemExit("fleet-start authorization changed while read")
+        return raw
+    finally:
+        os.close(fd)
+
+def read_partial(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        stable = lambda item: (
+            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
+            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
+        )
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or before.st_gid != os.getegid() or before.st_nlink not in {1, 2}
+                or stat.S_IMODE(before.st_mode) not in {0o400, 0o600}
+                or before.st_size < 0 or before.st_size > 64 * 1024):
+            raise SystemExit("fleet-start authorization partial identity is unsafe")
+        raw = b""
+        while len(raw) <= 64 * 1024:
+            chunk = os.read(fd, 64 * 1024 + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+        if len(raw) != before.st_size or stable(os.fstat(fd)) != stable(before):
+            raise SystemExit("fleet-start authorization partial changed while read")
+        return raw
+    finally:
+        os.close(fd)
+
+def is_complete_canonical(raw):
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and raw == canonical(value)
+
+generation = base / capture_id / boundary_sha
+receipt_path = generation / "fleet-start-authorization.json"
+partial_path = generation / ".fleet-start-authorization.json.partial"
+
+if mode in {"status", "exact"}:
+    if partial_path.exists() or partial_path.is_symlink():
+        same_inode = os.path.samefile(receipt_path, partial_path)
+        final_raw = read_file(receipt_path, links={2} if same_inode else {1})
+        partial_raw = read_partial(partial_path)
+        if same_inode:
+            if partial_raw != final_raw or not is_complete_canonical(partial_raw):
+                raise SystemExit("fleet-start committed final/partial state differs")
+        elif is_complete_canonical(partial_raw):
+            validate_payload(partial_raw)
+            if partial_raw != final_raw:
+                raise SystemExit("fleet-start final conflicts with a canonical partial")
+        raw = final_raw
+    else:
+        raw = read_file(receipt_path)
+    validate_payload(
+        raw,
+        exact_accepted=accepted_raw if mode == "exact" else None,
+        exact_sha=expected_sha if mode == "exact" else None,
+    )
+    sys.stdout.buffer.write(raw)
+    raise SystemExit(0)
+
+for directory in (base, base / capture_id, generation):
+    ensure_dir(directory)
+
+if receipt_path.exists() or receipt_path.is_symlink():
+    if partial_path.exists() or partial_path.is_symlink():
+        final_raw = read_file(receipt_path, links={1, 2})
+        partial_raw = read_partial(partial_path)
+        validate_payload(final_raw)
+        if not is_complete_canonical(partial_raw):
+            os.unlink(partial_path)
+            fsync_dir(generation)
+        else:
+            validate_payload(partial_raw)
+            if final_raw != partial_raw:
+                raise SystemExit("fleet-start final/partial receipts differ")
+            os.unlink(partial_path)
+            fsync_dir(generation)
+    raw = read_file(receipt_path)
+    validate_payload(
+        raw,
+        exact_accepted=accepted_raw if mode == "replica" else None,
+        exact_sha=expected_sha if mode == "replica" else None,
+    )
+    sys.stdout.buffer.write(raw)
+    raise SystemExit(0)
+
+if mode == "authority":
+    raw = None
+    if partial_path.exists() or partial_path.is_symlink():
+        partial_raw = read_partial(partial_path)
+        if not is_complete_canonical(partial_raw):
+            # No terminal exists and authorization is non-disruptive.  A
+            # truncated, identity-safe partial proves no accepted latch, so it
+            # may be removed and freshly authorized inside the live window.
+            os.unlink(partial_path)
+            fsync_dir(generation)
+        else:
+            # Canonical conflicting bytes are not a crash fragment.
+            validate_payload(partial_raw)
+            raw = partial_raw
+    if raw is None:
+        accepted = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+        if not first_started <= accepted <= deadline:
+            raise SystemExit("fresh fleet-start authority creation missed the 300-second live window")
+        raw = canonical({
+            **expected_common,
+            "authority_accepted_at": accepted.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+else:
+    value = {**expected_common, "authority_accepted_at": accepted_raw}
+    raw = canonical(value)
+    validate_payload(raw, exact_accepted=accepted_raw, exact_sha=expected_sha)
+    if partial_path.exists() or partial_path.is_symlink():
+        existing = read_partial(partial_path)
+        if not is_complete_canonical(existing):
+            os.unlink(partial_path)
+            fsync_dir(generation)
+        else:
+            validate_payload(existing)
+            if existing != raw:
+                raise SystemExit("fleet-start replica partial differs from authoritative receipt")
+
+if not partial_path.exists() and not partial_path.is_symlink():
+    fd = os.open(
+        partial_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fchmod(handle.fileno(), 0o400)
+        os.fsync(handle.fileno())
+else:
+    os.chmod(partial_path, 0o400, follow_symlinks=False)
+    descriptor = os.open(partial_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+try:
+    os.link(partial_path, receipt_path, follow_symlinks=False)
+except FileExistsError:
+    final_raw = read_file(receipt_path)
+    validate_payload(final_raw)
+    if final_raw != raw:
+        raise SystemExit("concurrent fleet-start authorization differs")
+else:
+    # link(2) is the no-replace commit point.  Removing the private partial
+    # leaves the terminal at link-count one; both directory transitions are
+    # then covered by one durability barrier.
+    pass
+os.unlink(partial_path)
+fsync_dir(generation)
+raw = read_file(receipt_path)
+validate_payload(
+    raw,
+    exact_accepted=accepted_raw if mode == "replica" else None,
+    exact_sha=expected_sha if mode == "replica" else None,
+)
+sys.stdout.buffer.write(raw)
+PY
+}
+
+quarantine_fleet_authority() {
+    [ "$#" -eq 10 ] || die "quarantine-authority requires the exact fleet-start boundary"
+    quarantine_fleet_start_authorization authority "$@"
+}
+
+quarantine_fleet_authorization_status() {
+    [ "$#" -eq 10 ] || die "quarantine-authorization-status requires the exact fleet-start boundary"
+    quarantine_fleet_start_authorization status "$@"
+}
+
+quarantine_fleet_authorize_replica() {
+    [ "$#" -eq 12 ] || die "quarantine-authorize requires an exact authoritative latch"
+    quarantine_fleet_start_authorization replica "$@"
+}
+
+quarantine_fleet_authorization_exact() {
+    [ "$#" -eq 12 ] || die "mutation requires the exact fleet-start authorization"
+    quarantine_fleet_start_authorization exact "$@"
+}
+
+quarantine_fleet_start_readiness() {
+    local mode="$1" capture_id="$2" node="$3" freeze_sha="$4" boundary_sha="$5"
+    local authorization_sha="$6" all_six_ready_at="$7" readiness_sha="$8"
+    require_hash "$capture_id" "capture id"; require_node "$node"
+    require_hash "$freeze_sha" "freeze plan hash"
+    require_hash "$boundary_sha" "first-quarantine boundary hash"
+    require_hash "$authorization_sha" "fleet-start authorization hash"
+    require_hash "$readiness_sha" "fleet-start readiness hash"
+    case "$mode" in replica|exact) ;; *) die "unsupported fleet-start readiness mode" ;; esac
+    python3 - "$QUARANTINE_AUTHORIZATION_BASE" "$mode" "$capture_id" "$node" \
+        "$freeze_sha" "$boundary_sha" "$authorization_sha" "$all_six_ready_at" \
+        "$readiness_sha" <<'PY'
+import datetime,hashlib,json,os,pathlib,re,stat,sys
+base=pathlib.Path(sys.argv[1]);mode,capture,node,freeze,boundary,auth_sha,ready_at,ready_sha=sys.argv[2:]
+nodes=[{"node":"nyc","host":"149.28.32.76","authorization_receipt_sha256":auth_sha},
+ {"node":"lax","host":"140.82.16.112","authorization_receipt_sha256":auth_sha},
+ {"node":"ams","host":"136.244.109.1","authorization_receipt_sha256":auth_sha},
+ {"node":"lhr","host":"104.238.171.11","authorization_receipt_sha256":auth_sha},
+ {"node":"nrt","host":"202.182.107.41","authorization_receipt_sha256":auth_sha},
+ {"node":"sgp","host":"149.28.153.31","authorization_receipt_sha256":auth_sha}]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+if (mode not in {"replica","exact"} or node not in {row["node"] for row in nodes}
+        or any(re.fullmatch(r"[0-9a-f]{64}",value) is None
+               for value in (capture,freeze,boundary,auth_sha,ready_sha))
+        or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",ready_at) is None):
+    raise SystemExit("fleet-start readiness arguments are malformed")
+generation=base/capture/boundary
+auth_path=generation/"fleet-start-authorization.json"
+path=generation/"fleet-start-ready.json";partial=generation/".fleet-start-ready.json.partial"
+def stable_read(candidate,modes,links={1},allow_empty=False):
+    fd=os.open(candidate,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(fd);stable=lambda value:(value.st_dev,value.st_ino,value.st_mode,
+            value.st_uid,value.st_gid,value.st_nlink,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid()
+                or before.st_gid!=os.getegid() or before.st_nlink not in links
+                or stat.S_IMODE(before.st_mode) not in modes or before.st_size<0
+                or (before.st_size==0 and not allow_empty) or before.st_size>64*1024):
+            raise SystemExit("fleet-start readiness file identity is unsafe")
+        raw=os.read(fd,64*1024+1)
+        if len(raw)!=before.st_size or stable(os.fstat(fd))!=stable(before):
+            raise SystemExit("fleet-start readiness file changed while read")
+        return raw
+    finally:os.close(fd)
+auth_raw=stable_read(auth_path,{0o400})
+try:auth=json.loads(auth_raw)
+except (UnicodeDecodeError,json.JSONDecodeError) as error:raise SystemExit("fleet-start latch is invalid") from error
+if (auth_raw!=canonical(auth) or hashlib.sha256(auth_raw).hexdigest()!=auth_sha
+        or auth.get("schema")!="arc.recovery.quarantine-fleet-start-authorization.v1"
+        or (auth.get("capture_id"),auth.get("freeze_plan_sha256"),
+            auth.get("first_quarantine_boundary_sha256"))!=(capture,freeze,boundary)):
+    raise SystemExit("fleet-start readiness does not bind the exact latch")
+try:
+    if datetime.datetime.strptime(ready_at,"%Y-%m-%dT%H:%M:%SZ") < datetime.datetime.strptime(
+        auth.get("authority_accepted_at"),"%Y-%m-%dT%H:%M:%SZ"
+    ):raise SystemExit("fleet-start readiness precedes authority acceptance")
+except (TypeError,ValueError) as error:raise SystemExit("fleet-start readiness time differs") from error
+value={"schema":"arc.recovery.quarantine-fleet-start-ready.v1","capture_id":capture,
+ "freeze_plan_sha256":freeze,"first_quarantine_boundary_sha256":boundary,
+ "quarantine_fleet_start_authorization_sha256":auth_sha,"nodes":nodes,"completed_at":ready_at}
+raw=canonical(value)
+if hashlib.sha256(raw).hexdigest()!=ready_sha:
+    raise SystemExit("fleet-start readiness hash differs")
+def fsync_dir(directory):
+    fd=os.open(directory,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def canonical_complete(fragment):
+    try:item=json.loads(fragment)
+    except (UnicodeDecodeError,json.JSONDecodeError):return False
+    return fragment==canonical(item)
+if path.exists() or path.is_symlink():
+    if partial.exists() or partial.is_symlink():
+        same=os.path.samefile(path,partial)
+        final=stable_read(path,{0o400},{2} if same else {1})
+        fragment=stable_read(partial,{0o400,0o600},{1,2},True)
+        if final!=raw or (canonical_complete(fragment) and fragment!=raw):
+            raise SystemExit("fleet-start readiness final/partial differs")
+        if mode=="replica":os.unlink(partial);fsync_dir(generation)
+    elif stable_read(path,{0o400})!=raw:
+        raise SystemExit("existing fleet-start readiness differs")
+    sys.stdout.buffer.write(raw);raise SystemExit(0)
+if mode=="exact":raise SystemExit("fleet-start readiness replica is missing")
+if partial.exists() or partial.is_symlink():
+    fragment=stable_read(partial,{0o400,0o600},{1},True)
+    if canonical_complete(fragment) and fragment!=raw:
+        raise SystemExit("canonical fleet-start readiness partial conflicts")
+    if fragment!=raw:os.unlink(partial);fsync_dir(generation)
+if not partial.exists() and not partial.is_symlink():
+    fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    with os.fdopen(fd,"wb") as handle:
+        handle.write(raw);handle.flush();os.fchmod(handle.fileno(),0o400);os.fsync(handle.fileno())
+else:
+    os.chmod(partial,0o400,follow_symlinks=False)
+    fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0));os.fsync(fd);os.close(fd)
+try:os.link(partial,path,follow_symlinks=False)
+except FileExistsError:
+    final=stable_read(path,{0o400},{1,2})
+    if final!=raw:raise SystemExit("concurrent fleet-start readiness differs")
+os.unlink(partial);fsync_dir(generation)
+if stable_read(path,{0o400})!=raw:raise SystemExit("committed fleet-start readiness differs")
+sys.stdout.buffer.write(raw)
+PY
+}
+
+quarantine_fleet_ready_replica() {
+    [ "$#" -eq 7 ] || die "quarantine-ready requires the exact all-six readiness receipt"
+    quarantine_fleet_start_readiness replica "$@"
+}
+
+quarantine_fleet_readiness_exact() {
+    [ "$#" -eq 7 ] || die "mutation requires the exact all-six readiness receipt"
+    quarantine_fleet_start_readiness exact "$@"
+}
+
+quarantine_fleet_mutation_start() {
+    local mode="$1" capture_id="$2" node="$3" freeze_sha="$4" boundary_sha="$5"
+    local authorization_sha="$6" readiness_sha="$7" starter_receipt_sha="${8:-}"
+    local starter_installed_at="${9:-}" authorization_deadline="${10:-}"
+    local mutation_start_sha="${11:-}"
+    require_hash "$capture_id" "capture id"; require_node "$node"
+    require_hash "$freeze_sha" "freeze plan hash"
+    require_hash "$boundary_sha" "first-quarantine boundary hash"
+    require_hash "$authorization_sha" "fleet-start authorization hash"
+    require_hash "$readiness_sha" "fleet-start readiness hash"
+    case "$mode" in
+        create)
+            [ "$node" = nyc ] || die "only nyc may seal the first controlled mutation"
+            [ -z "$starter_receipt_sha$starter_installed_at$authorization_deadline$mutation_start_sha" ] || \
+                die "fleet-mutation create received unexpected replica fields"
+            ;;
+        status)
+            [ -z "$starter_receipt_sha$starter_installed_at$authorization_deadline$mutation_start_sha" ] || \
+                die "fleet-mutation status received unexpected replica fields"
+            ;;
+        replica|exact)
+            require_hash "$starter_receipt_sha" "starter network-quarantine receipt hash"
+            require_hash "$mutation_start_sha" "fleet mutation-start hash"
+            [ -n "$starter_installed_at" ] && [ -n "$authorization_deadline" ] || \
+                die "fleet-mutation exact timestamps are required"
+            ;;
+        *) die "unsupported fleet mutation-start mode" ;;
+    esac
+    python3 - "$QUARANTINE_AUTHORIZATION_BASE" "$STOP_BASE" "$mode" "$capture_id" "$node" \
+        "$freeze_sha" "$boundary_sha" "$authorization_sha" "$readiness_sha" \
+        "$starter_receipt_sha" "$starter_installed_at" "$authorization_deadline" \
+        "$mutation_start_sha" <<'PY'
+import datetime,hashlib,json,os,pathlib,re,stat,sys
+(base_raw,stop_raw,mode,capture,node,freeze,boundary,auth_sha,ready_sha,
+ starter_receipt_sha,installed_at,deadline,expected_sha)=sys.argv[1:]
+base=pathlib.Path(base_raw);stop=pathlib.Path(stop_raw)
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+hash_re=re.compile(r"[0-9a-f]{64}");utc_re=re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+if (mode not in {"create","status","replica","exact"}
+        or node not in {"nyc","lax","ams","lhr","nrt","sgp"}
+        or any(hash_re.fullmatch(value) is None for value in (capture,freeze,boundary,auth_sha,ready_sha))):
+    raise SystemExit("fleet mutation-start identity is malformed")
+generation=base/capture/boundary
+auth_path=generation/"fleet-start-authorization.json"
+ready_path=generation/"fleet-start-ready.json"
+path=generation/"fleet-mutation-start.json";partial=generation/".fleet-mutation-start.json.partial"
+def read(candidate,modes={0o400},links={1},empty=False):
+    fd=os.open(candidate,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(fd);stable=lambda value:(value.st_dev,value.st_ino,value.st_mode,
+            value.st_uid,value.st_gid,value.st_nlink,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid()
+                or before.st_gid!=os.getegid() or before.st_nlink not in links
+                or stat.S_IMODE(before.st_mode) not in modes or before.st_size<0
+                or (before.st_size==0 and not empty) or before.st_size>128*1024):
+            raise SystemExit("fleet mutation-start file identity is unsafe")
+        raw=os.read(fd,128*1024+1)
+        if len(raw)!=before.st_size or stable(os.fstat(fd))!=stable(before):
+            raise SystemExit("fleet mutation-start file changed while read")
+        return raw
+    finally:os.close(fd)
+auth_raw=read(auth_path);ready_raw=read(ready_path)
+try:auth=json.loads(auth_raw);ready=json.loads(ready_raw)
+except (UnicodeDecodeError,json.JSONDecodeError) as error:
+    raise SystemExit("fleet mutation-start prerequisites are invalid") from error
+if (auth_raw!=canonical(auth) or ready_raw!=canonical(ready)
+        or hashlib.sha256(auth_raw).hexdigest()!=auth_sha
+        or hashlib.sha256(ready_raw).hexdigest()!=ready_sha
+        or auth.get("schema")!="arc.recovery.quarantine-fleet-start-authorization.v1"
+        or ready.get("schema")!="arc.recovery.quarantine-fleet-start-ready.v1"
+        or (auth.get("capture_id"),auth.get("freeze_plan_sha256"),auth.get("first_quarantine_boundary_sha256"))
+            !=(capture,freeze,boundary)
+        or (ready.get("capture_id"),ready.get("freeze_plan_sha256"),ready.get("first_quarantine_boundary_sha256"),
+            ready.get("quarantine_fleet_start_authorization_sha256"))!=(capture,freeze,boundary,auth_sha)):
+    raise SystemExit("fleet mutation-start prerequisite roots differ")
+auth_deadline=auth.get("authorization_deadline")
+ready_at=ready.get("completed_at")
+if mode in {"create","status"}:
+    deadline=auth_deadline
+if deadline!=auth_deadline:
+    raise SystemExit("fleet mutation-start deadline differs")
+def parse_time(raw,label):
+    if not isinstance(raw,str) or utc_re.fullmatch(raw) is None:
+        raise SystemExit(f"fleet mutation-start {label} is not canonical UTC")
+    try:return datetime.datetime.strptime(raw,"%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:raise SystemExit(f"fleet mutation-start {label} is invalid") from error
+ready_time=parse_time(ready_at,"readiness time");deadline_time=parse_time(deadline,"deadline")
+if mode=="create":
+    roots=[stop/capture/".nyc.stop.partial",stop/capture/"nyc"]
+    candidates=[root/"08-network-quarantine.json" for root in roots
+                if (root/"08-network-quarantine.json").exists() or (root/"08-network-quarantine.json").is_symlink()]
+    if len(candidates)!=1:raise SystemExit("nyc has no unique completed network-quarantine receipt")
+    starter_raw=read(candidates[0]);starter=json.loads(starter_raw)
+    if (starter_raw!=canonical(starter)
+            or starter.get("schema")!="arc.recovery.legacy-network-quarantine.v1"
+            or (starter.get("capture_id"),starter.get("node"),starter.get("freeze_plan_sha256"))
+                !=(capture,"nyc",freeze)
+            or starter.get("quarantine_fleet_start_authorization_sha256")!=auth_sha
+            or starter.get("quarantine_fleet_start_readiness_sha256")!=ready_sha):
+        raise SystemExit("nyc network-quarantine receipt does not bind fleet readiness")
+    starter_receipt_sha=hashlib.sha256(starter_raw).hexdigest();installed_at=starter.get("installed_at")
+installed_time=parse_time(installed_at,"starter install time")
+if not ready_time<=installed_time<=deadline_time:
+    raise SystemExit("nyc controlled mutation was not completed inside the live authorization window")
+value={"schema":"arc.recovery.quarantine-fleet-mutation-start.v1","capture_id":capture,
+ "freeze_plan_sha256":freeze,"first_quarantine_boundary_sha256":boundary,
+ "quarantine_fleet_start_authorization_sha256":auth_sha,
+ "quarantine_fleet_start_readiness_sha256":ready_sha,
+ "starter":{"node":"nyc","host":"149.28.32.76"},
+ "starter_network_quarantine_receipt_sha256":starter_receipt_sha,
+ "starter_network_quarantine_installed_at":installed_at,
+ "authorization_deadline":deadline}
+raw=canonical(value);digest=hashlib.sha256(raw).hexdigest()
+if mode in {"replica","exact"} and digest!=expected_sha:
+    raise SystemExit("fleet mutation-start hash differs")
+def validate(fragment):
+    try:item=json.loads(fragment)
+    except (UnicodeDecodeError,json.JSONDecodeError):return None
+    if fragment!=canonical(item):return None
+    if item!=value:raise SystemExit("canonical fleet mutation-start receipt conflicts")
+    return item
+def fsync_dir(directory):
+    fd=os.open(directory,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    try:os.fsync(fd)
+    finally:os.close(fd)
+if path.exists() or path.is_symlink():
+    same=(partial.exists() or partial.is_symlink()) and os.path.samefile(path,partial)
+    final=read(path,links={2} if same else {1})
+    if final!=raw:raise SystemExit("existing fleet mutation-start receipt differs")
+    if partial.exists() or partial.is_symlink():
+        fragment=read(partial,{0o400,0o600},{1,2},True)
+        if fragment and fragment!=raw:
+            validate(fragment);raise SystemExit("fleet mutation-start final/partial differs")
+        if mode!="status" or same:
+            os.unlink(partial);fsync_dir(generation)
+    sys.stdout.buffer.write(raw);raise SystemExit(0)
+if mode in {"status","exact"}:
+    raise SystemExit("fleet mutation-start receipt is missing")
+if partial.exists() or partial.is_symlink():
+    fragment=read(partial,{0o400,0o600},{1},True)
+    if fragment:
+        if validate(fragment) is None:os.unlink(partial);fsync_dir(generation)
+    else:os.unlink(partial);fsync_dir(generation)
+if not partial.exists() and not partial.is_symlink():
+    fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+    with os.fdopen(fd,"wb") as handle:
+        handle.write(raw);handle.flush();os.fchmod(handle.fileno(),0o400);os.fsync(handle.fileno())
+else:
+    os.chmod(partial,0o400,follow_symlinks=False)
+    fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0));os.fsync(fd);os.close(fd)
+try:os.link(partial,path,follow_symlinks=False)
+except FileExistsError:
+    if read(path,links={1,2})!=raw:raise SystemExit("concurrent fleet mutation-start differs")
+os.unlink(partial);fsync_dir(generation)
+if read(path)!=raw:raise SystemExit("committed fleet mutation-start differs")
+sys.stdout.buffer.write(raw)
+PY
+}
+
+quarantine_fleet_mutation_create() {
+    [ "$#" -eq 6 ] || die "quarantine-mutation-start requires the exact nyc quarantine roots"
+    quarantine_fleet_mutation_start create "$@"
+}
+
+quarantine_fleet_mutation_status() {
+    [ "$#" -eq 6 ] || die "quarantine-mutation-status requires the exact generation roots"
+    quarantine_fleet_mutation_start status "$@"
+}
+
+quarantine_fleet_mutation_replica() {
+    [ "$#" -eq 10 ] || die "quarantine-mutation-replica requires the exact starter receipt"
+    quarantine_fleet_mutation_start replica "$@"
+}
+
+quarantine_fleet_mutation_exact() {
+    [ "$#" -eq 10 ] || die "mutation requires the exact fleet mutation-start receipt"
+    quarantine_fleet_mutation_start exact "$@"
+}
+
+embed_quarantine_fleet_authorization() {
+    local root="$1" payload="$2" expected_sha="$3"
+    python3 - "$root" "$payload" "$expected_sha" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+root=pathlib.Path(sys.argv[1]);raw=(sys.argv[2]+"\n").encode();expected=sys.argv[3]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+try:value=json.loads(raw)
+except (UnicodeDecodeError,json.JSONDecodeError) as error:raise SystemExit("embedded fleet-start latch is invalid") from error
+if (raw!=canonical(value) or value.get("schema")!="arc.recovery.quarantine-fleet-start-authorization.v1"
+        or re.fullmatch(r"[0-9a-f]{64}",expected) is None
+        or hashlib.sha256(raw).hexdigest()!=expected):
+    raise SystemExit("embedded fleet-start latch differs from its exact hash")
+details=root.lstat()
+if (root.is_symlink() or not stat.S_ISDIR(details.st_mode) or details.st_uid!=os.geteuid()
+        or details.st_gid!=os.getegid() or stat.S_IMODE(details.st_mode)!=0o700):
+    raise SystemExit("fleet-start latch journal root is unsafe")
+path=root/"00-quarantine-fleet-start-authorization.json";partial=root/".00-quarantine-fleet-start-authorization.json.partial"
+def fsync_dir(directory):
+    fd=os.open(directory,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def read(candidate,modes,links={1}):
+    details=candidate.lstat()
+    if (candidate.is_symlink() or not stat.S_ISREG(details.st_mode)
+            or details.st_uid!=os.geteuid() or details.st_gid!=os.getegid()
+            or details.st_nlink not in links or stat.S_IMODE(details.st_mode) not in modes):
+        raise SystemExit("embedded fleet-start latch identity is unsafe")
+    return candidate.read_bytes()
+if path.exists() or path.is_symlink():
+    if partial.exists() or partial.is_symlink():
+        if (read(path,{0o400},{1,2})!=raw
+                or read(partial,{0o400,0o600},{1,2})!=raw):
+            raise SystemExit("embedded fleet-start final/partial bytes differ")
+        os.unlink(partial);fsync_dir(root)
+    if read(path,{0o400})!=raw:raise SystemExit("embedded fleet-start latch bytes differ")
+else:
+    if partial.exists() or partial.is_symlink():
+        if read(partial,{0o400,0o600})!=raw:raise SystemExit("embedded fleet-start latch partial differs")
+        os.chmod(partial,0o400,follow_symlinks=False)
+        fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0));os.fsync(fd);os.close(fd)
+    else:
+        fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+        with os.fdopen(fd,"wb") as handle:
+            handle.write(raw);handle.flush();os.fchmod(handle.fileno(),0o400);os.fsync(handle.fileno())
+    try:os.link(partial,path,follow_symlinks=False)
+    except FileExistsError:
+        if read(path,{0o400})!=raw:raise SystemExit("concurrent embedded fleet-start latch differs")
+    os.unlink(partial);fsync_dir(root)
+PY
+}
+
+embed_quarantine_fleet_readiness() {
+    local root="$1" payload="$2" expected_sha="$3" authorization_sha="$4"
+    python3 - "$root" "$payload" "$expected_sha" "$authorization_sha" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+root=pathlib.Path(sys.argv[1]);raw=(sys.argv[2]+"\n").encode();expected,auth_sha=sys.argv[3:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+try:value=json.loads(raw)
+except (UnicodeDecodeError,json.JSONDecodeError) as error:raise SystemExit("embedded fleet readiness is invalid") from error
+if (raw!=canonical(value) or value.get("schema")!="arc.recovery.quarantine-fleet-start-ready.v1"
+        or any(re.fullmatch(r"[0-9a-f]{64}",item) is None for item in (expected,auth_sha))
+        or hashlib.sha256(raw).hexdigest()!=expected
+        or value.get("quarantine_fleet_start_authorization_sha256")!=auth_sha):
+    raise SystemExit("embedded fleet readiness differs from its exact roots")
+details=root.lstat()
+if (root.is_symlink() or not stat.S_ISDIR(details.st_mode) or details.st_uid!=os.geteuid()
+        or details.st_gid!=os.getegid() or stat.S_IMODE(details.st_mode)!=0o700):
+    raise SystemExit("fleet readiness journal root is unsafe")
+path=root/"00-quarantine-fleet-start-ready.json";partial=root/".00-quarantine-fleet-start-ready.json.partial"
+def read(candidate,modes,links={1},empty=False):
+    fd=os.open(candidate,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or details.st_uid!=os.geteuid()
+                or details.st_gid!=os.getegid() or details.st_nlink not in links
+                or stat.S_IMODE(details.st_mode) not in modes or details.st_size<0
+                or (details.st_size==0 and not empty) or details.st_size>64*1024):
+            raise SystemExit("embedded fleet readiness identity is unsafe")
+        raw_value=os.read(fd,64*1024+1)
+        if len(raw_value)!=details.st_size:raise SystemExit("embedded fleet readiness changed")
+        return raw_value
+    finally:os.close(fd)
+def fsync_dir():
+    fd=os.open(root,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    try:os.fsync(fd)
+    finally:os.close(fd)
+if path.exists() or path.is_symlink():
+    if partial.exists() or partial.is_symlink():
+        same=os.path.samefile(path,partial);final=read(path,{0o400},{2} if same else {1})
+        fragment=read(partial,{0o400,0o600},{1,2},True)
+        if final!=raw or (fragment and fragment!=raw):raise SystemExit("embedded readiness final/partial differs")
+        os.unlink(partial);fsync_dir()
+    if read(path,{0o400})!=raw:raise SystemExit("embedded fleet readiness differs")
+else:
+    if partial.exists() or partial.is_symlink():
+        fragment=read(partial,{0o400,0o600},{1},True)
+        if fragment not in {b"",raw}:raise SystemExit("embedded fleet readiness partial conflicts")
+        if fragment==b"":os.unlink(partial)
+    if not partial.exists() and not partial.is_symlink():
+        fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+        with os.fdopen(fd,"wb") as handle:
+            handle.write(raw);handle.flush();os.fchmod(handle.fileno(),0o400);os.fsync(handle.fileno())
+    else:
+        os.chmod(partial,0o400,follow_symlinks=False)
+        fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0));os.fsync(fd);os.close(fd)
+    try:os.link(partial,path,follow_symlinks=False)
+    except FileExistsError:
+        if read(path,{0o400},{1,2})!=raw:raise SystemExit("concurrent embedded readiness differs")
+    os.unlink(partial);fsync_dir()
+PY
+}
+
+embed_quarantine_fleet_mutation_start() {
+    local root="$1" payload="$2" expected_sha="$3" readiness_sha="$4"
+    python3 - "$root" "$payload" "$expected_sha" "$readiness_sha" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+root=pathlib.Path(sys.argv[1]);raw=(sys.argv[2]+"\n").encode();expected,ready_sha=sys.argv[3:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+try:value=json.loads(raw)
+except (UnicodeDecodeError,json.JSONDecodeError) as error:raise SystemExit("embedded fleet mutation-start is invalid") from error
+if (raw!=canonical(value) or value.get("schema")!="arc.recovery.quarantine-fleet-mutation-start.v1"
+        or any(re.fullmatch(r"[0-9a-f]{64}",item) is None for item in (expected,ready_sha))
+        or hashlib.sha256(raw).hexdigest()!=expected
+        or value.get("quarantine_fleet_start_readiness_sha256")!=ready_sha):
+    raise SystemExit("embedded fleet mutation-start differs from its exact roots")
+details=root.lstat()
+if (root.is_symlink() or not stat.S_ISDIR(details.st_mode) or details.st_uid!=os.geteuid()
+        or details.st_gid!=os.getegid() or stat.S_IMODE(details.st_mode)!=0o700):
+    raise SystemExit("fleet mutation-start journal root is unsafe")
+path=root/"00-quarantine-fleet-mutation-start.json";partial=root/".00-quarantine-fleet-mutation-start.json.partial"
+def read(candidate,modes={0o400},links={1},empty=False):
+    fd=os.open(candidate,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        before=os.fstat(fd);stable=lambda item:(item.st_dev,item.st_ino,item.st_mode,item.st_uid,
+            item.st_gid,item.st_nlink,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid()
+                or before.st_gid!=os.getegid() or before.st_nlink not in links
+                or stat.S_IMODE(before.st_mode) not in modes or before.st_size<0
+                or (before.st_size==0 and not empty) or before.st_size>64*1024):
+            raise SystemExit("embedded fleet mutation-start identity is unsafe")
+        fragment=os.read(fd,64*1024+1)
+        if len(fragment)!=before.st_size or stable(os.fstat(fd))!=stable(before):
+            raise SystemExit("embedded fleet mutation-start changed while read")
+        return fragment
+    finally:os.close(fd)
+def fsync_dir():
+    fd=os.open(root,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
+    try:os.fsync(fd)
+    finally:os.close(fd)
+if path.exists() or path.is_symlink():
+    same=(partial.exists() or partial.is_symlink()) and os.path.samefile(path,partial)
+    if read(path,links={2} if same else {1})!=raw:raise SystemExit("embedded fleet mutation-start differs")
+    if partial.exists() or partial.is_symlink():
+        fragment=read(partial,{0o400,0o600},{1,2},True)
+        if fragment and fragment!=raw:raise SystemExit("embedded fleet mutation-start partial differs")
+        os.unlink(partial);fsync_dir()
+else:
+    if partial.exists() or partial.is_symlink():
+        fragment=read(partial,{0o400,0o600},{1},True)
+        if fragment not in {b"",raw}:raise SystemExit("embedded fleet mutation-start partial conflicts")
+        if not fragment:os.unlink(partial);fsync_dir()
+    if not partial.exists() and not partial.is_symlink():
+        fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+        with os.fdopen(fd,"wb") as handle:
+            handle.write(raw);handle.flush();os.fchmod(handle.fileno(),0o400);os.fsync(handle.fileno())
+    else:
+        os.chmod(partial,0o400,follow_symlinks=False)
+        fd=os.open(partial,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0));os.fsync(fd);os.close(fd)
+    try:os.link(partial,path,follow_symlinks=False)
+    except FileExistsError:
+        if read(path,links={1,2})!=raw:raise SystemExit("concurrent embedded fleet mutation-start differs")
+    os.unlink(partial);fsync_dir()
+PY
+}
+
 install_legacy_network_quarantine() {
     local root="$1" capture_id="$2" node="$3" freeze_sha="$4" boot_id="$5"
     local writer_supervision_mode="$6" supervisor_unit="$7" supervisor_pid="$8"
@@ -4345,9 +9616,17 @@ current_after, _ = nft_json("list", "ruleset")
 if sha(canonical(normalize_nonowned(current_after))) != baseline_structural_sha:
     raise SystemExit("nonowned firewall changed during loopback proof")
 
+fleet_start_authorization_raw = secure_file(
+    root / "00-quarantine-fleet-start-authorization.json", 0o400
+)
+fleet_start_readiness_raw = secure_file(
+    root / "00-quarantine-fleet-start-ready.json", 0o400
+)
 receipt = {
     "schema": "arc.recovery.legacy-network-quarantine.v1",
     "capture_id": capture_id, "node": node, "freeze_plan_sha256": freeze_sha,
+    "quarantine_fleet_start_authorization_sha256": sha(fleet_start_authorization_raw),
+    "quarantine_fleet_start_readiness_sha256": sha(fleet_start_readiness_raw),
     "boot_id": boot_id,
     "writer": {"pid": writer_pid, "start_ticks": writer_start,
                "cgroup_sha256": writer_cgroup_sha,
@@ -4837,7 +10116,7 @@ verify_legacy_network_quarantine() {
     local root="$1" capture_id="$2" node="$3" freeze_sha="$4"
     python3 - "$root" "$capture_id" "$node" "$freeze_sha" \
         "$NETWORK_FENCE_STATE" "$NETWORK_FENCE_UNIT" <<'PY'
-import hashlib, json, os, pathlib, re, stat, subprocess, sys
+import datetime, hashlib, json, os, pathlib, re, stat, subprocess, sys
 root, capture_id, node, freeze_sha, state_raw, unit_raw = sys.argv[1:]
 root = pathlib.Path(root); state = pathlib.Path(state_raw); unit = pathlib.Path(unit_raw)
 canonical = lambda value: (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -4849,6 +10128,64 @@ def secure(path, mode):
     return path.read_bytes()
 receipt_raw = secure(root / "08-network-quarantine.json", 0o400)
 receipt = json.loads(receipt_raw)
+authorization_raw = secure(root / "00-quarantine-fleet-start-authorization.json", 0o400)
+authorization = json.loads(authorization_raw)
+readiness_raw = secure(root / "00-quarantine-fleet-start-ready.json", 0o400)
+readiness = json.loads(readiness_raw)
+authorization_fields = {
+    "schema", "capture_id", "freeze_plan_sha256",
+    "legacy_public_height_receipt_sha256",
+    "authenticated_legacy_height_cross_proof_sha256",
+    "first_quarantine_boundary_sha256", "public_height_completed_at",
+    "authenticated_height_started_at", "authenticated_height_completed_at",
+    "first_quarantine_started_at", "authorization_deadline", "authority",
+    "authority_accepted_at", "nodes",
+}
+expected_nodes = [
+    {"name":"nyc","host":"149.28.32.76"}, {"name":"lax","host":"140.82.16.112"},
+    {"name":"ams","host":"136.244.109.1"}, {"name":"lhr","host":"104.238.171.11"},
+    {"name":"nrt","host":"202.182.107.41"}, {"name":"sgp","host":"149.28.153.31"},
+]
+if (authorization_raw != canonical(authorization) or set(authorization) != authorization_fields
+        or authorization.get("schema") != "arc.recovery.quarantine-fleet-start-authorization.v1"
+        or (authorization.get("capture_id"), authorization.get("freeze_plan_sha256"))
+            != (capture_id, freeze_sha)
+        or authorization.get("authority") != {"node":"nyc","host":"149.28.32.76"}
+        or authorization.get("nodes") != expected_nodes):
+    raise SystemExit("network-quarantine fleet-start authorization differs")
+try:
+    public_completed, cross_started, cross_completed, first_started, accepted, deadline = (
+        datetime.datetime.strptime(authorization[key], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+        for key in (
+            "public_height_completed_at", "authenticated_height_started_at",
+            "authenticated_height_completed_at", "first_quarantine_started_at",
+            "authority_accepted_at", "authorization_deadline",
+        )
+    )
+except (KeyError, TypeError, ValueError) as error:
+    raise SystemExit("network-quarantine fleet-start timestamps are invalid") from error
+if (not public_completed <= cross_started <= cross_completed <= first_started <= accepted <= deadline
+        or deadline - public_completed != datetime.timedelta(seconds=300)):
+    raise SystemExit("network-quarantine fleet-start timeline differs")
+expected_ready_nodes = [
+    {"node":row["name"],"host":row["host"],
+     "authorization_receipt_sha256":hashlib.sha256(authorization_raw).hexdigest()}
+    for row in expected_nodes
+]
+if (readiness_raw != canonical(readiness)
+        or set(readiness) != {"schema","capture_id","freeze_plan_sha256",
+            "first_quarantine_boundary_sha256","quarantine_fleet_start_authorization_sha256",
+            "nodes","completed_at"}
+        or readiness.get("schema") != "arc.recovery.quarantine-fleet-start-ready.v1"
+        or (readiness.get("capture_id"),readiness.get("freeze_plan_sha256"),
+            readiness.get("first_quarantine_boundary_sha256"))
+            != (capture_id,freeze_sha,authorization.get("first_quarantine_boundary_sha256"))
+        or readiness.get("quarantine_fleet_start_authorization_sha256")
+            != hashlib.sha256(authorization_raw).hexdigest()
+        or readiness.get("nodes") != expected_ready_nodes):
+    raise SystemExit("network-quarantine fleet-start readiness differs")
 if (receipt_raw != canonical(receipt)
         or receipt.get("schema") != "arc.recovery.legacy-network-quarantine.v1"
         or (receipt.get("capture_id"), receipt.get("node"), receipt.get("freeze_plan_sha256"))
@@ -4864,6 +10201,10 @@ if (receipt_raw != canonical(receipt)
                        "icmpv6-ndp-ra-packet-too-big"],
             "legacy_rpc_p2p_web_dynamic_all_blocked":True}
         or receipt.get("threat_model", {}).get("legacy_binary") != "reviewed-non-adversarial-exact-hash"
+        or receipt.get("quarantine_fleet_start_authorization_sha256")
+            != hashlib.sha256(authorization_raw).hexdigest()
+        or receipt.get("quarantine_fleet_start_readiness_sha256")
+            != hashlib.sha256(readiness_raw).hexdigest()
         or receipt.get("global_absence_claimed") is not False):
     raise SystemExit("network-quarantine receipt identity/coverage differs")
 monitor_raw = secure(root / "08-network-quarantine-monitor.json", 0o400)
@@ -7985,6 +13326,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 (root_raw, writer_pid_raw, writer_start_raw, boot_id, writer_cgroup_sha,
@@ -9651,6 +14993,7 @@ PY
 verify_stop_journal_semantics() {
     local root="$1" capture_id="$2" node="$3" freeze_sha="$4"
     python3 - "$root" "$capture_id" "$node" "$freeze_sha" <<'PY'
+import datetime
 import hashlib
 import json
 import pathlib
@@ -9691,6 +15034,64 @@ if not isinstance(context_object, dict) or context_object.get("schema") != "arc.
     raise SystemExit("writer contract supervisor context is malformed")
 if sha(canonical(context_object)) != contract.get("supervisor_context_sha256"):
     raise SystemExit("writer contract supervisor context hash differs")
+
+fleet_start, fleet_start_raw = load(
+    "00-quarantine-fleet-start-authorization.json",
+    "arc.recovery.quarantine-fleet-start-authorization.v1",
+)
+fleet_start_fields = {
+    "schema", "capture_id", "freeze_plan_sha256", "legacy_public_height_receipt_sha256",
+    "authenticated_legacy_height_cross_proof_sha256", "first_quarantine_boundary_sha256",
+    "public_height_completed_at", "authenticated_height_started_at",
+    "authenticated_height_completed_at", "first_quarantine_started_at",
+    "authorization_deadline", "authority", "authority_accepted_at", "nodes",
+}
+expected_fleet = [
+    {"name":"nyc","host":"149.28.32.76"}, {"name":"lax","host":"140.82.16.112"},
+    {"name":"ams","host":"136.244.109.1"}, {"name":"lhr","host":"104.238.171.11"},
+    {"name":"nrt","host":"202.182.107.41"}, {"name":"sgp","host":"149.28.153.31"},
+]
+if (set(fleet_start) != fleet_start_fields
+        or (fleet_start.get("capture_id"), fleet_start.get("freeze_plan_sha256"))
+            != (capture_id, freeze_sha)
+        or fleet_start.get("authority") != {"node":"nyc","host":"149.28.32.76"}
+        or fleet_start.get("nodes") != expected_fleet
+        or any(hex64.fullmatch(str(fleet_start.get(key))) is None for key in (
+            "legacy_public_height_receipt_sha256",
+            "authenticated_legacy_height_cross_proof_sha256",
+            "first_quarantine_boundary_sha256",
+        ))):
+    raise SystemExit("durable fleet-start authorization differs")
+try:
+    public_completed, cross_started, cross_completed, first_started, accepted, deadline = (
+        datetime.datetime.strptime(fleet_start[key], "%Y-%m-%dT%H:%M:%SZ")
+        for key in (
+            "public_height_completed_at", "authenticated_height_started_at",
+            "authenticated_height_completed_at", "first_quarantine_started_at",
+            "authority_accepted_at", "authorization_deadline",
+        )
+    )
+except (KeyError, TypeError, ValueError) as error:
+    raise SystemExit("durable fleet-start authorization timestamps differ") from error
+if (not public_completed <= cross_started <= cross_completed <= first_started <= accepted <= deadline
+        or deadline - public_completed != datetime.timedelta(seconds=300)):
+    raise SystemExit("durable fleet-start authorization timeline differs")
+fleet_ready, fleet_ready_raw = load(
+    "00-quarantine-fleet-start-ready.json", "arc.recovery.quarantine-fleet-start-ready.v1"
+)
+expected_ready_nodes = [
+    {"node":row["name"],"host":row["host"],
+     "authorization_receipt_sha256":sha(fleet_start_raw)} for row in expected_fleet
+]
+if (set(fleet_ready) != {"schema","capture_id","freeze_plan_sha256",
+        "first_quarantine_boundary_sha256","quarantine_fleet_start_authorization_sha256",
+        "nodes","completed_at"}
+        or (fleet_ready.get("capture_id"),fleet_ready.get("freeze_plan_sha256"),
+            fleet_ready.get("first_quarantine_boundary_sha256"))
+            != (capture_id,freeze_sha,fleet_start.get("first_quarantine_boundary_sha256"))
+        or fleet_ready.get("quarantine_fleet_start_authorization_sha256")!=sha(fleet_start_raw)
+        or fleet_ready.get("nodes")!=expected_ready_nodes):
+    raise SystemExit("durable fleet-start readiness differs")
 
 safety, safety_raw = load("01-prefreeze-runtime-safety-intent.json", "arc.recovery.prefreeze-runtime-safety-intent.v1")
 expected_safety_keys = {
@@ -10091,6 +15492,10 @@ network_quarantine, network_quarantine_raw = load(
 )
 if ((network_quarantine.get("capture_id"), network_quarantine.get("node"),
      network_quarantine.get("freeze_plan_sha256")) != (capture_id, node, freeze_sha)
+        or network_quarantine.get("quarantine_fleet_start_authorization_sha256")
+            != sha(fleet_start_raw)
+        or network_quarantine.get("quarantine_fleet_start_readiness_sha256")
+            != sha(fleet_ready_raw)
         or network_quarantine.get("writer", {}).get("pid") != contract.get("writer_pid")
         or network_quarantine.get("writer", {}).get("start_ticks") != contract.get("writer_start_ticks")):
     raise SystemExit("network-quarantine receipt differs in sealed stop")
@@ -10767,7 +16172,7 @@ if (set(context) != expected_context_keys or context["schema"] != "arc.recovery.
     raise SystemExit("offline-stop context differs from durable cgroup journal")
 
 allowed = re.compile(
-    r"(?:01-prefreeze-runtime-safety-intent|02-fast-cgroup-freeze-intent|"
+    r"(?:00-quarantine-fleet-start-(?:authorization|ready)|01-prefreeze-runtime-safety-intent|02-fast-cgroup-freeze-intent|"
     r"02-(?:supervisor|writer|writer-parent)-cgroup-frozen|"
     r"02-writer-leaf-move-intent|02-writer-parent-released|03-fast-cgroups-frozen|"
     r"04-pre-fence-quiesce-intent|05-cgroups-frozen|"
@@ -10902,6 +16307,14 @@ fence_stop() {
     local supervisor_executable_sha="${15}" supervisor_argv_sha="${16}"
     local supervisor_context_sha="${17}" executable_path="${18}"
     local executable_sha="${19}" argv_sha="${20}" data_dir="${21}"
+    local public_height_sha="${22}" authenticated_cross_sha="${23}"
+    local first_boundary_sha="${24}" public_completed_at="${25}"
+    local authenticated_started_at="${26}" authenticated_completed_at="${27}"
+    local first_quarantine_started_at="${28}" authority_accepted_at="${29}"
+    local fleet_start_authorization_sha="${30}"
+    local all_six_ready_at="${31}" fleet_start_readiness_sha="${32}"
+    local starter_network_receipt_sha="${33:-}" starter_network_installed_at="${34:-}"
+    local authorization_deadline="${35:-}" fleet_mutation_start_sha="${36:-}"
     require_hash "$capture_id" "capture id"
     require_node "$node"
     require_hash "$freeze_sha" "freeze plan hash"
@@ -10926,6 +16339,56 @@ fence_stop() {
     require_hash "$executable_sha" "writer executable hash"
     require_hash "$argv_sha" "writer argv hash"
     require_safe_absolute_path "$data_dir" "writer data directory"
+    require_hash "$public_height_sha" "public-height receipt hash"
+    require_hash "$authenticated_cross_sha" "authenticated height-cross hash"
+    require_hash "$first_boundary_sha" "first-quarantine boundary hash"
+    require_hash "$fleet_start_authorization_sha" "fleet-start authorization hash"
+    require_hash "$fleet_start_readiness_sha" "fleet-start readiness hash"
+    # This is the first mutation entrypoint.  It must prove a remote authority
+    # accepted the fresh fleet boundary and that the exact latch was replicated
+    # before STOP_BASE or any runtime/network state can be touched.
+    local fleet_start_authorization_payload
+    fleet_start_authorization_payload="$(quarantine_fleet_authorization_exact \
+        "$capture_id" "$node" "$freeze_sha" "$public_height_sha" \
+        "$authenticated_cross_sha" "$first_boundary_sha" "$public_completed_at" \
+        "$authenticated_started_at" "$authenticated_completed_at" \
+        "$first_quarantine_started_at" "$authority_accepted_at" \
+        "$fleet_start_authorization_sha")"
+    local fleet_start_readiness_payload
+    fleet_start_readiness_payload="$(quarantine_fleet_readiness_exact \
+        "$capture_id" "$node" "$freeze_sha" "$first_boundary_sha" \
+        "$fleet_start_authorization_sha" "$all_six_ready_at" \
+        "$fleet_start_readiness_sha")"
+    local fleet_mutation_start_payload=""
+    if [ "${ARC_RECOVERY_FLEET_STARTER:-false}" = true ]; then
+        [ "$node" = nyc ] || die "only nyc may enter the first controlled mutation"
+        [ -z "$starter_network_receipt_sha$starter_network_installed_at$authorization_deadline$fleet_mutation_start_sha" ] || \
+            die "nyc fleet starter received an already-sealed mutation receipt"
+        if ! python3 - "$fleet_start_authorization_payload" "$fleet_start_readiness_payload" <<'PY'
+import datetime,json,sys
+auth=json.loads(sys.argv[1]);ready=json.loads(sys.argv[2])
+parse=lambda value:datetime.datetime.strptime(value,"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+now=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+if not parse(ready["completed_at"])<=now<=parse(auth["authorization_deadline"]):
+    raise SystemExit(1)
+PY
+        then
+            # A delayed retry is authorized only after nyc already completed
+            # the exact network quarantine inside the sealed live window.
+            quarantine_status "$capture_id" "$node" "$freeze_sha" >/dev/null 2>&1 || \
+                die "stale fleet-start readiness has no completed nyc mutation proof; recapture a fresh generation"
+        fi
+    else
+        require_hash "$starter_network_receipt_sha" "starter network-quarantine receipt hash"
+        require_hash "$fleet_mutation_start_sha" "fleet mutation-start hash"
+        [ -n "$starter_network_installed_at" ] && [ -n "$authorization_deadline" ] || \
+            die "fleet mutation-start timestamps are required"
+        fleet_mutation_start_payload="$(quarantine_fleet_mutation_exact \
+            "$capture_id" "$node" "$freeze_sha" "$first_boundary_sha" \
+            "$fleet_start_authorization_sha" "$fleet_start_readiness_sha" \
+            "$starter_network_receipt_sha" "$starter_network_installed_at" \
+            "$authorization_deadline" "$fleet_mutation_start_sha")"
+    fi
     require_commands curl python3 mktemp mv chmod date find pgrep flock sync
     mkdir -p -- "$STOP_BASE"
     [ -d "$STOP_BASE" ] && [ ! -L "$STOP_BASE" ] || die "global stop-journal root is unsafe"
@@ -11189,7 +16652,9 @@ PY
                 "$executable_path" "$executable_sha" "$argv_sha" "$data_dir"
             return 0
         fi
-        if { [ -f "$temporary/01-prefreeze-runtime-safety-intent.json" ] \
+        if { [ -f "$temporary/00-quarantine-fleet-start-authorization.json" ] \
+                && [ ! -L "$temporary/00-quarantine-fleet-start-authorization.json" ]; } \
+            || { [ -f "$temporary/01-prefreeze-runtime-safety-intent.json" ] \
                 && [ ! -L "$temporary/01-prefreeze-runtime-safety-intent.json" ]; } \
             || { [ -f "$temporary/02-fast-cgroup-freeze-intent.json" ] \
                 && [ ! -L "$temporary/02-fast-cgroup-freeze-intent.json" ]; } \
@@ -11211,6 +16676,14 @@ PY
         prepare_owned_partial_directory "$temporary" "$partial_owner"
     fi
     ARCHIVE_NODE_TEMP_PATH="$temporary"
+    embed_quarantine_fleet_authorization "$temporary" \
+        "$fleet_start_authorization_payload" "$fleet_start_authorization_sha"
+    embed_quarantine_fleet_readiness "$temporary" "$fleet_start_readiness_payload" \
+        "$fleet_start_readiness_sha" "$fleet_start_authorization_sha"
+    if [ -n "$fleet_mutation_start_payload" ]; then
+        embed_quarantine_fleet_mutation_start "$temporary" "$fleet_mutation_start_payload" \
+            "$fleet_mutation_start_sha" "$fleet_start_readiness_sha"
+    fi
     pre_fence_quiesce "$temporary" "$capture_id" "$node" "$freeze_sha" "$boot_id" \
         "$writer_supervision_mode" "$unit" "$unit_main_pid" "$supervisor_start_ticks" \
         "$supervisor_executable_path" "$supervisor_executable_sha" "$supervisor_argv_sha" \
@@ -11438,6 +16911,124 @@ with output.open("x", encoding="utf-8", newline="\n") as handle:
 PY
 }
 
+round_stopped_transition_refs() {
+    local capture_id="$1" node="$2"
+    python3 - "$QUARANTINE_ROUND_BASE" "$capture_id" "$node" <<'PY'
+import hashlib,json,pathlib,re,stat,sys
+base=pathlib.Path(sys.argv[1]);capture,node=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+hash_re=re.compile(r"[0-9a-f]{64}")
+matches=[]
+for path in (base/capture).glob("*/node-stopped-precommit.json"):
+    details=path.lstat();raw=path.read_bytes();value=json.loads(raw)
+    if (path.is_symlink() or not stat.S_ISREG(details.st_mode) or details.st_uid!=0
+            or details.st_gid!=0 or details.st_nlink!=1 or stat.S_IMODE(details.st_mode)!=0o400
+            or raw!=canonical(value) or value.get("schema")
+                !="arc.recovery.quarantine-node-persistently-stopped-precommit.v1"
+            or value.get("capture_id")!=capture or value.get("node")!=node):
+        continue
+    root=hashlib.sha256(raw).hexdigest();auth=value.get("round_authorization_sha256")
+    ready=value.get("round_readiness_sha256");freeze=value.get("freeze_plan_sha256")
+    number=value.get("round_number")
+    if (any(hash_re.fullmatch(str(item)) is None for item in (root,auth,ready,freeze))
+            or isinstance(number,bool) or not isinstance(number,int) or not 1<=number<=6
+            or path.parent.name!=auth):
+        continue
+    matches.append((freeze,number,auth,ready,root,str(path)))
+if len(matches)!=1:raise SystemExit("persistently-stopped round transition is missing or ambiguous")
+print(*matches[0])
+PY
+}
+
+round_stopped_status() {
+    local capture_id="$1" node="$2" freeze_expected="${3:-}"
+    local freeze_sha round authorization_sha readiness_sha transition_sha transition_path
+    read -r freeze_sha round authorization_sha readiness_sha transition_sha transition_path < <(
+        round_stopped_transition_refs "$capture_id" "$node"
+    ) || die "cannot resolve exact persistently-stopped round transition"
+    if [ -n "$freeze_expected" ] && [ "$freeze_sha" != "$freeze_expected" ]; then
+        die "persistently-stopped round freeze root differs"
+    fi
+    quarantine_round_entry status "$capture_id" "$node" "$freeze_sha" "$round" \
+        "$authorization_sha" "$readiness_sha" "$transition_sha"
+}
+
+round_stopped_status_expected() {
+    [ "$#" -eq 4 ] || die "quarantine-round-stopped-status requires an exact transition root"
+    local capture_id="$1" node="$2" freeze_expected="$3" transition_expected="$4"
+    local freeze_sha round authorization_sha readiness_sha transition_sha transition_path
+    require_hash "$transition_expected" "persistently-stopped round transition root"
+    read -r freeze_sha round authorization_sha readiness_sha transition_sha transition_path < <(
+        round_stopped_transition_refs "$capture_id" "$node"
+    ) || die "cannot resolve exact persistently-stopped round transition"
+    [ "$freeze_sha" = "$freeze_expected" ] || \
+        die "persistently-stopped round freeze root differs"
+    [ "$transition_sha" = "$transition_expected" ] || \
+        die "persistently-stopped round transition root differs"
+    quarantine_round_entry status "$capture_id" "$node" "$freeze_sha" "$round" \
+        "$authorization_sha" "$readiness_sha" "$transition_sha"
+}
+
+round_stopped_status_challenged() {
+    [ "$#" -eq 6 ] || \
+        die "quarantine-round-stopped-status-challenged requires transition, host, and challenge roots"
+    local capture_id="$1" node="$2" freeze_expected="$3" transition_expected="$4"
+    local host="$5" challenge="$6" freeze_sha round authorization_sha readiness_sha
+    local transition_sha transition_path current_status
+    require_hash "$transition_expected" "challenged persistently-stopped transition root"
+    require_hash "$challenge" "challenged persistently-stopped status challenge"
+    case "$node:$host" in
+        nyc:149.28.32.76|lax:140.82.16.112|ams:136.244.109.1|lhr:104.238.171.11|nrt:202.182.107.41|sgp:149.28.153.31) ;;
+        *) die "challenged persistently-stopped host differs from the fixed production node mapping" ;;
+    esac
+    read -r freeze_sha round authorization_sha readiness_sha transition_sha transition_path < <(
+        round_stopped_transition_refs "$capture_id" "$node"
+    ) || die "cannot resolve exact challenged persistently-stopped transition"
+    [ "$freeze_sha" = "$freeze_expected" ] || \
+        die "challenged persistently-stopped freeze root differs"
+    [ "$transition_sha" = "$transition_expected" ] || \
+        die "challenged persistently-stopped transition root differs"
+    current_status="$(quarantine_round_entry status "$capture_id" "$node" "$freeze_sha" \
+        "$round" "$authorization_sha" "$readiness_sha" "$transition_sha")"
+    python3 - "$transition_path" "$transition_sha" "$current_status" "$host" \
+        "$challenge" <<'PY'
+import hashlib,json,os,pathlib,stat,sys
+path=pathlib.Path(sys.argv[1]);expected,current_raw,host,challenge=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0)|getattr(os,"O_CLOEXEC",0))
+try:
+    before=os.fstat(fd);visible=path.lstat();chunks=[]
+    while True:
+        chunk=os.read(fd,1024*1024)
+        if not chunk:break
+        chunks.append(chunk)
+    raw=b"".join(chunks);after=os.fstat(fd)
+finally:os.close(fd)
+identity=lambda value:(value.st_dev,value.st_ino,value.st_mode,value.st_uid,value.st_gid,
+                       value.st_nlink,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+if (not stat.S_ISREG(before.st_mode) or path.is_symlink() or identity(before)!=identity(visible)
+        or identity(before)!=identity(after) or before.st_uid!=0 or before.st_gid!=0
+        or before.st_nlink!=1 or stat.S_IMODE(before.st_mode)!=0o400
+        or hashlib.sha256(raw).hexdigest()!=expected):
+    raise SystemExit("challenged persistently-stopped transition changed or is unsafe")
+transition=json.loads(raw);current=json.loads(current_raw)
+transition_raw=canonical(transition);current_bytes=canonical(current)
+if raw!=transition_raw:
+    raise SystemExit("challenged persistently-stopped transition is noncanonical")
+value={
+    "schema":"arc.recovery.quarantine-persistently-stopped-challenged-status.v1",
+    "capture_id":transition.get("capture_id"),
+    "freeze_plan_sha256":transition.get("freeze_plan_sha256"),
+    "node":transition.get("node"),"host":host,
+    "transition_kind":"persistently-stopped-precommit",
+    "transition_receipt":{"sha256":expected,"value":transition},
+    "current_status":{"sha256":hashlib.sha256(current_bytes).hexdigest(),"value":current},
+    "challenge":challenge,
+}
+sys.stdout.buffer.write(canonical(value))
+PY
+}
+
 capture_source_data_dir() {
     python3 - "$1/capture-source.json" <<'PY'
 import json
@@ -11534,9 +17125,20 @@ capture_offline() {
     require_hash "$capture_id" "capture id"
     require_node "$node"
     require_commands python3 grep stat cp cmp mv sync date hostname uname find du pgrep mktemp chmod
-    stopped_status "$capture_id" "$node" >/dev/null
     local parent="$CAPTURE_BASE/$capture_id" capture_root="$CAPTURE_BASE/$capture_id/$node"
     local stop_root="$STOP_BASE/$capture_id/$node"
+    local round_stopped=false round_freeze="" round_number="" round_authorization=""
+    local round_readiness="" round_transition="" round_transition_path=""
+    if [ -d "$stop_root" ] && [ ! -L "$stop_root" ]; then
+        stopped_status "$capture_id" "$node" >/dev/null
+    else
+        read -r round_freeze round_number round_authorization round_readiness \
+            round_transition round_transition_path < <(
+            round_stopped_transition_refs "$capture_id" "$node"
+        ) || die "offline capture has neither an exact stop journal nor a stopped round transition"
+        round_stopped_status "$capture_id" "$node" "$round_freeze" >/dev/null
+        round_stopped=true
+    fi
     mkdir -p -- "$parent"
     if [ -e "$capture_root" ]; then
         verify_capture_source "$capture_root" "$capture_id" "$node"
@@ -11544,12 +17146,25 @@ capture_offline() {
         return 0
     fi
     local data_dir executable_path freeze_sha live_root live_root_sha live_receipt_sha
-    data_dir="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["data_dir"])' \
-        "$stop_root/evidence/writer-contract.json")"
-    executable_path="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["executable_path"])' \
-        "$stop_root/evidence/writer-contract.json")"
-    freeze_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["freeze_plan_sha256"])' \
-        "$stop_root/evidence/writer-contract.json")"
+    if [ "$round_stopped" = false ]; then
+        data_dir="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["data_dir"])' \
+            "$stop_root/evidence/writer-contract.json")"
+        executable_path="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["executable_path"])' \
+            "$stop_root/evidence/writer-contract.json")"
+        freeze_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["freeze_plan_sha256"])' \
+            "$stop_root/evidence/writer-contract.json")"
+    else
+        freeze_sha="$round_freeze"
+        read -r data_dir executable_path < <(python3 - \
+            "/root/.arc-recovery-plans/$freeze_sha/freeze.lock.json" "$node" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows=[row for row in value.get("nodes",[]) if row.get("name")==sys.argv[2]]
+if len(rows)!=1:raise SystemExit("stopped-round freeze target is missing or ambiguous")
+print(rows[0]["data_dir"],rows[0]["executable_path"])
+PY
+        ) || die "cannot resolve stopped-round source paths"
+    fi
     require_hash "$freeze_sha" "stopped writer freeze-plan hash"
     live_root="$LIVE_OBSERVATION_BASE/$capture_id/$node"
     verify_live_observation_receipt "$live_root" "$capture_id" "$node" "$freeze_sha"
@@ -11565,9 +17180,30 @@ capture_offline() {
     prepare_owned_partial_directory "$temporary" \
         "schema=arc.recovery.partial.v1 capture=$capture_id node=$node phase=capture"
     ARCHIVE_NODE_TEMP_PATH="$temporary"
-    mkdir -- "$temporary/evidence" "$temporary/evidence/freeze" "$temporary/legacy-public"
-    cp --archive -- "$stop_root/." "$temporary/evidence/freeze/"
-    verify_tree_index "$temporary/evidence/freeze" stop.files.sha256 stop.complete
+    mkdir -- "$temporary/evidence" "$temporary/legacy-public"
+    if [ "$round_stopped" = false ]; then
+        mkdir -- "$temporary/evidence/freeze"
+        cp --archive -- "$stop_root/." "$temporary/evidence/freeze/"
+        verify_tree_index "$temporary/evidence/freeze" stop.files.sha256 stop.complete
+    else
+        mkdir -- "$temporary/evidence/quarantine-round"
+        cp --archive -- \
+            "${round_transition_path%/node-stopped-precommit.json}/authorization.json" \
+            "${round_transition_path%/node-stopped-precommit.json}/readiness.json" \
+            "$round_transition_path" "$temporary/evidence/quarantine-round/"
+        round_stopped_status "$capture_id" "$node" "$freeze_sha" \
+            > "$temporary/evidence/quarantine-round/current-status.json"
+        python3 - "$temporary/evidence/quarantine-round" "$round_authorization" \
+            "$round_readiness" "$round_transition" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]);wanted=sys.argv[2:]
+for name,expected in zip(("authorization.json","readiness.json","node-stopped-precommit.json"),wanted):
+    path=root/name;raw=path.read_bytes();value=json.loads(raw)
+    if raw!=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode() \
+            or hashlib.sha256(raw).hexdigest()!=expected:
+        raise SystemExit(f"stopped-round capture evidence differs: {name}")
+PY
+    fi
     write_regular_tree_inventory "$data_dir" "$temporary/source-data.files.sha256"
 
     python3 - "$data_dir" "$temporary/capture-source.json" <<'PY'
@@ -11662,6 +17298,13 @@ PY
         printf 'legacy_live_observations_root_sha256=%s\n' "$live_root_sha"
         printf 'legacy_live_observations_receipt_sha256=%s\n' "$live_receipt_sha"
         printf 'legacy_live_observations_labels=diagnostic,noncanonical,nonreward\n'
+        if [ "$round_stopped" = true ]; then
+            printf 'transition_kind=persistently-stopped-precommit\n'
+            printf 'quarantine_round=%s\n' "$round_number"
+            printf 'quarantine_round_transition_sha256=%s\n' "$round_transition"
+        else
+            printf 'transition_kind=network-quarantine-active-then-controlled-stop\n'
+        fi
         printf 'excluded_outside_data_dir_private_material=true\n'
         printf 'excluded_service_environments=true\n'
         printf 'excluded_build_models_and_git=true\n'
@@ -11670,8 +17313,11 @@ PY
     [ -s "$data_dir/state.wal" ] || die "fenced content source has no final state.wal"
     rm -f -- "$temporary/.arc-recovery-partial-owner"
     write_tree_index "$temporary" capture.files.sha256 capture.complete
+    local capture_transition_kind=network-quarantine-active-then-controlled-stop
+    [ "$round_stopped" = false ] || capture_transition_kind=persistently-stopped-precommit
     write_complete_marker "$temporary" capture.files.sha256 capture.complete arc.recovery.capture.v4 \
         "capture_id=$capture_id" "node=$node" "stopped=true" \
+        "transition_kind=$capture_transition_kind" \
         "source_tree_content_sealed_by_index=true" "source_tree_os_read_only=false" \
         "legacy_live_observations_root_sha256=$live_root_sha" \
         "legacy_live_observations_receipt_sha256=$live_receipt_sha"
@@ -11694,7 +17340,14 @@ capture_status() {
     if pgrep -x arc-node >/dev/null 2>&1; then
         die "capture is complete but arc-node is running"
     fi
-    verify_legacy_restart_fence "$stop_root"
+    if [ -d "$stop_root" ] && [ ! -L "$stop_root" ]; then
+        verify_legacy_restart_fence "$stop_root"
+    else
+        local freeze_sha
+        freeze_sha="$(sed -n 's/^freeze_plan_sha256=//p' "$capture_root/capture.inventory")"
+        require_hash "$freeze_sha" "captured stopped-round freeze root"
+        round_stopped_status "$capture_id" "$node" "$freeze_sha" >/dev/null
+    fi
     printf '{"capture_id":"%s","node":"%s","capture_complete":true,"stopped":true}\n' \
         "$capture_id" "$node"
 }
@@ -11705,13 +17358,17 @@ sealed_source_status() {
     local stop_root="$STOP_BASE/$capture_id/$node"
     require_hash "$capture_id" "capture id"
     require_node "$node"
-    verify_tree_index "$stop_root" stop.files.sha256 stop.complete
-    verify_stop_identity "$stop_root" "$capture_id" "$node"
     [ "$#" -eq 21 ] || die "sealed-source-status requires the exact freeze writer contract"
-    verify_sealed_stop_contract "$stop_root" "$3" "$4" "$5" "$6" "$7" \
-        "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" \
-        "${16}" "${17}" "${18}" "${19}" "${20}" "${21}"
-    verify_legacy_restart_fence "$stop_root"
+    if [ -d "$stop_root" ] && [ ! -L "$stop_root" ]; then
+        verify_tree_index "$stop_root" stop.files.sha256 stop.complete
+        verify_stop_identity "$stop_root" "$capture_id" "$node"
+        verify_sealed_stop_contract "$stop_root" "$3" "$4" "$5" "$6" "$7" \
+            "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" \
+            "${16}" "${17}" "${18}" "${19}" "${20}" "${21}"
+        verify_legacy_restart_fence "$stop_root"
+    else
+        round_stopped_status "$capture_id" "$node" "$3" >/dev/null
+    fi
     verify_capture_source "$capture_root" "$capture_id" "$node"
     printf '{"capture_id":"%s","node":"%s","content_sealed":true,"restart_fenced":true}\n' \
         "$capture_id" "$node"
@@ -11765,33 +17422,51 @@ persisted_head() {
     verify_tree_index "$capture_root" capture.files.sha256 capture.complete
     verify_capture_source "$capture_root" "$capture_id" "$node"
     pgrep -x arc-node >/dev/null 2>&1 && die "persisted-head exporter requires the exact legacy writer to remain stopped"
-    local data_dir snapshot
-    data_dir="$(capture_source_data_dir "$capture_root")"
-    snapshot="$(python3 - "$capture_root/capture-source.json" <<'PY'
+    local data_dir snapshot final_source_capture_sha selected_head_height
+    local selected_head_hash selected_head_state stop_after_round_path
+    read -r data_dir snapshot final_source_capture_sha selected_head_height \
+        selected_head_hash selected_head_state stop_after_round_path < <(
+        python3 - "$QUARANTINE_ROUND_BASE" "$capture_id" "$node" <<'PY'
 import hashlib,json,pathlib,stat,sys
-source=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-data=pathlib.Path(source["data_dir"])
-candidates=[data/"state.snapshot.lz4",pathlib.Path(f"{data}.snapshot.lz4")]
-candidates += [pathlib.Path(row["path"]) for row in source.get("external_snapshots",[])]
-rows=[]
-for path in candidates:
-    if not path.exists() and not path.is_symlink(): continue
-    details=path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(details.st_mode):
-        raise SystemExit(f"persisted-head snapshot candidate is unsafe: {path}")
-    value=hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda:handle.read(1024*1024),b""): value.update(chunk)
-    digest=value.hexdigest()
-    rows.append((str(path),digest))
-if not rows: raise SystemExit("persisted-head capture has no stopped snapshot")
-if len({digest for _path,digest in rows})!=1:
-    raise SystemExit("persisted-head capture snapshot candidates disagree")
-print(rows[0][0])
+base=pathlib.Path(sys.argv[1]);capture,node=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+candidates=[]
+for path in (base/capture).glob("*/stop-after-round.json"):
+    details=path.lstat();raw=path.read_bytes();value=json.loads(raw)
+    if (path.is_symlink() or not stat.S_ISREG(details.st_mode) or details.st_uid!=0
+            or details.st_gid!=0 or details.st_nlink!=1 or stat.S_IMODE(details.st_mode)!=0o400
+            or raw!=canonical(value) or value.get("node")!=node):
+        continue
+    candidates.append((path,value,raw))
+if len(candidates)!=1:
+    raise SystemExit("persisted-head final source capture is missing or ambiguous")
+_stop_path,stopped,_stop_raw=candidates[0]
+wrapper=stopped.get("final_source_capture",{});source=wrapper.get("value",{})
+source_raw=canonical(source);root=wrapper.get("sha256");head=source.get("head",{})
+fixed=source.get("fixed_pair_path");fixed_path=pathlib.Path(fixed or "")
+if (hashlib.sha256(source_raw).hexdigest()!=root
+        or root!=stopped.get("final_source_capture_sha256")
+        or source.get("source_pair_role")!="post-quarantine-final-export"
+        or stopped.get("source_pair_role")!="post-quarantine-final-export"
+        or stopped.get("selected_source_head")!=head or source.get("expected_head")!=head
+        or source.get("capture_id")!=capture or source.get("node")!=node
+        or not isinstance(fixed,str) or not fixed.endswith("/fixed-source") or ".." in fixed
+        or not fixed_path.is_dir() or fixed_path.is_symlink()):
+    raise SystemExit("persisted-head selected final source capture differs")
+print(fixed, fixed+"/state.snapshot.lz4", root, head.get("height"),
+      head.get("block_hash"), head.get("state_root"), str(_stop_path))
 PY
-)" || die "cannot select exact stopped capture snapshot"
+    ) || die "cannot select exact post-quarantine final source pair"
     require_safe_absolute_path "$data_dir" "persisted-head stopped data directory"
     require_safe_absolute_path "$snapshot" "persisted-head stopped snapshot"
+    require_safe_absolute_path "$stop_after_round_path" "persisted-head stop-after-round receipt"
+    local stop_after_round_sha archive_data_dir archive_wal
+    stop_after_round_sha="$(hash_file "$stop_after_round_path")"
+    require_hash "$stop_after_round_sha" "persisted-head stop-after-round receipt hash"
+    archive_data_dir="$(capture_source_data_dir "$capture_root")"
+    require_safe_absolute_path "$archive_data_dir" "persisted-head archived final data directory"
+    archive_wal="$archive_data_dir/state.wal"
+    require_safe_absolute_path "$archive_wal" "persisted-head archived final WAL"
     local binary="$stage_root/arc-node" genesis="$stage_root/genesis.toml"
     local validators="$stage_root/validator-public-keys.json"
     local legacy_validators="$stage_root/legacy-validator-set-40m.json"
@@ -11844,7 +17519,7 @@ PY
     temporary="$(mktemp -d "$parent/.${node}.persisted-head.XXXXXX")"
     ARCHIVE_NODE_TEMP_PATH="$temporary"
     exec 8<"$binary" 9<"$genesis" 10<"$validators" 11<"$legacy_validators" \
-        12<"$snapshot" 13<"$data_dir" 14<"$data_dir/state.wal"
+        12<"$snapshot" 13<"$data_dir" 14<"$data_dir/state.wal" 15<"$archive_wal"
     local wal_before snapshot_before wal_size snapshot_size wal_identity snapshot_identity export_exit=0
     wal_before="$(hash_file /proc/self/fd/14)"
     snapshot_before="$(hash_file /proc/self/fd/12)"
@@ -11852,6 +17527,51 @@ PY
     snapshot_size="$(stat -Lc %s /proc/self/fd/12)"
     wal_identity="$(stat -Lc %d:%i:%s:%f /proc/self/fd/14)"
     snapshot_identity="$(stat -Lc %d:%i:%s:%f /proc/self/fd/12)"
+    local archive_wal_sha archive_wal_size archive_wal_identity
+    local archive_wal_suffix_bytes archive_wal_suffix_sha archive_wal_suffix_classification
+    archive_wal_sha="$(hash_file /proc/self/fd/15)"
+    archive_wal_size="$(stat -Lc %s /proc/self/fd/15)"
+    archive_wal_identity="$(stat -Lc %d:%i:%s:%f /proc/self/fd/15)"
+    read -r archive_wal_suffix_bytes archive_wal_suffix_sha \
+        archive_wal_suffix_classification < <(python3 - "$wal_size" "$wal_before" \
+            "$archive_wal" <<'PY'
+import hashlib,os,stat,sys
+prefix_size=int(sys.argv[1]);prefix_sha=sys.argv[2];complete_path=sys.argv[3]
+prefix=os.dup(14);complete=os.dup(15)
+try:
+    fresh=os.open(complete_path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        held=os.fstat(complete);current=os.fstat(fresh)
+        if ((held.st_dev,held.st_ino)!=(current.st_dev,current.st_ino)
+                or not stat.S_ISREG(held.st_mode) or held.st_uid!=0 or held.st_gid!=0
+                or held.st_nlink!=1 or held.st_mode&0o022):
+            raise SystemExit("archived final WAL held/path identity is unsafe")
+    finally:os.close(fresh)
+    os.lseek(prefix,0,os.SEEK_SET);os.lseek(complete,0,os.SEEK_SET)
+    observed=hashlib.sha256();remaining=prefix_size
+    while remaining:
+        wanted=min(1024*1024,remaining)
+        left=os.read(prefix,wanted);right=os.read(complete,wanted)
+        if not left or len(left)!=len(right) or left!=right:
+            raise SystemExit("archived final WAL does not preserve the selected fixed prefix")
+        observed.update(left);remaining-=len(left)
+    if os.read(prefix,1):
+        raise SystemExit("selected fixed WAL exceeds its sealed size")
+    if observed.hexdigest()!=prefix_sha:
+        raise SystemExit("selected fixed WAL prefix hash differs")
+    suffix=hashlib.sha256();suffix_bytes=0
+    while True:
+        chunk=os.read(complete,1024*1024)
+        if not chunk:break
+        suffix.update(chunk);suffix_bytes+=len(chunk)
+    if suffix_bytes:
+        print(suffix_bytes,suffix.hexdigest(),"archived_noncanonical_post_capture_suffix")
+    else:
+        print(0,"-","none")
+finally:
+    os.close(prefix);os.close(complete)
+PY
+    ) || die "archived final WAL is not an append-only extension of the post-quarantine fixed pair"
     python3 - "$wal_identity" "$snapshot_identity" "$temporary" "$snapshot" <<'PY'
 import hashlib,os,pathlib,stat,sys
 directory=os.dup(13)
@@ -11917,7 +17637,7 @@ PY
         --genesis /proc/self/fd/9 --validator-public-keys /proc/self/fd/10 \
         --legacy-validator-set /proc/self/fd/11 --output "$temporary/candidate.arcchkpt" \
         --source-consensus-round 0 --created-at-unix-ms 0 --recovery-epoch 1 \
-        --validator-set-id 1 --allow-unbound-legacy-wal \
+        --validator-set-id 1 \
         > "$temporary/export-summary.json" 2> "$temporary/export.stderr"; then
         export_exit=0
     else
@@ -11944,8 +17664,10 @@ PY
         die "persisted-head held inspector rejected its candidate checkpoint"
     [ "$(hash_file /proc/self/fd/14)" = "$wal_before" ] || die "persisted-head WAL changed during export"
     [ "$(hash_file /proc/self/fd/12)" = "$snapshot_before" ] || die "persisted-head snapshot changed during export"
+    [ "$(hash_file /proc/self/fd/15)" = "$archive_wal_sha" ] || die "archived final WAL changed during export"
     [ "$(stat -Lc %d:%i:%s:%f /proc/self/fd/14)" = "$wal_identity" ] || die "persisted-head WAL inode changed during export"
     [ "$(stat -Lc %d:%i:%s:%f /proc/self/fd/12)" = "$snapshot_identity" ] || die "persisted-head snapshot inode changed during export"
+    [ "$(stat -Lc %d:%i:%s:%f /proc/self/fd/15)" = "$archive_wal_identity" ] || die "archived final WAL inode changed during export"
     [ "$(hash_file /proc/self/fd/8)" = "$binary_sha" ] || die "persisted-head exporter changed during execution"
     [ "$(hash_file /proc/self/fd/9)" = "$genesis_sha" ] || die "persisted-head genesis changed during execution"
     [ "$(hash_file /proc/self/fd/10)" = "$validators_sha" ] || die "persisted-head validators changed during execution"
@@ -11959,12 +17681,20 @@ PY
         "$validators_sha" "$legacy_validators_sha" "$snapshot" "$snapshot_before" \
         "$snapshot_size" "$data_dir/state.wal" "$wal_before" "$wal_size" \
         "$capture_root" "$stop_root" "$wal_identity" "$snapshot_identity" \
-        "$staged_wal_identity" "$staged_snapshot_identity" <<'PY'
+        "$staged_wal_identity" "$staged_snapshot_identity" \
+        "$final_source_capture_sha" "$selected_head_height" "$selected_head_hash" \
+        "$selected_head_state" "$stop_after_round_path" "$stop_after_round_sha" \
+        "$archive_wal" "$archive_wal_sha" "$archive_wal_size" \
+        "$archive_wal_identity" "$archive_wal_suffix_bytes" \
+        "$archive_wal_suffix_sha" "$archive_wal_suffix_classification" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
 (summary_raw,inspect_raw,boundary_raw,candidate_raw,output_raw,capture,node,freeze,boot,binary_sha,genesis_sha,
  validators_sha,legacy_sha,snapshot_raw,snapshot_sha,snapshot_size_raw,wal_raw,wal_sha,
  wal_size_raw,capture_raw,stop_raw,wal_identity_raw,snapshot_identity_raw,
- staged_wal_identity_raw,staged_snapshot_identity_raw)=sys.argv[1:]
+ staged_wal_identity_raw,staged_snapshot_identity_raw,final_capture_sha,
+ selected_height_raw,selected_hash,selected_state,stop_after_raw,stop_after_sha,
+ archive_wal_raw,archive_wal_sha,archive_wal_size_raw,archive_wal_identity_raw,
+ archive_suffix_bytes_raw,archive_suffix_sha,archive_suffix_classification)=sys.argv[1:]
 summary_path=pathlib.Path(summary_raw); inspect_path=pathlib.Path(inspect_raw)
 boundary_path=pathlib.Path(boundary_raw); candidate=pathlib.Path(candidate_raw); output=pathlib.Path(output_raw)
 capture_root=pathlib.Path(capture_raw); stop_root=pathlib.Path(stop_raw)
@@ -11985,6 +17715,7 @@ source_wal_identity=source_identity(wal_identity_raw)
 source_snapshot_identity=source_identity(snapshot_identity_raw)
 staged_wal_identity=staged_identity(staged_wal_identity_raw)
 staged_snapshot_identity=staged_identity(staged_snapshot_identity_raw)
+archive_wal_identity=source_identity(archive_wal_identity_raw)
 if (source_wal_identity["size"]!=int(wal_size_raw)
         or source_snapshot_identity["size"]!=int(snapshot_size_raw)
         or any(value["uid"]!=0 or value["gid"]!=0 or value["nlink"]!=1
@@ -12014,6 +17745,12 @@ height=summary.get("source_height"); block_hash=bare(summary.get("source_block_h
 if (summary.get("status")!="EXPORTED_UNSIGNED" or isinstance(height,bool) or not isinstance(height,int) or height<0
         or not re.fullmatch(r"[0-9a-f]{64}",block_hash) or not re.fullmatch(r"[0-9a-f]{64}",state_root)):
     raise SystemExit("persisted-head exporter summary has no exact source tuple")
+selected_height=int(selected_height_raw)
+if (height,block_hash,state_root)!=(selected_height,selected_hash,selected_state):
+    raise SystemExit("persisted-head export differs from its post-quarantine capture head")
+if (not re.fullmatch(r"[0-9a-f]{64}",final_capture_sha)
+        or not re.fullmatch(r"[0-9a-f]{64}",stop_after_sha)):
+    raise SystemExit("persisted-head final capture/stop binding hash differs")
 for field in ("source_height","source_block_hash","source_state_root","full_state_root",
               "manifest_hash","payload_hash","source_consensus_round","created_at_unix_ms",
               "recovery_epoch","validator_set_id"):
@@ -12079,6 +17816,32 @@ if ((tail==0 and (reason not in (None,"","none")
                        or not re.fullmatch(r"[0-9a-f]{64}",boundary.get("accepted_prefix_sha256", ""))
                        or not re.fullmatch(r"[0-9a-f]{64}",boundary.get("quarantined_tail_sha256", ""))))):
     raise SystemExit("persisted-head WAL tail reason/hash policy differs")
+if (boundary.get("accepted_prefix_bytes")!=int(wal_size_raw)
+        or boundary.get("quarantined_tail_bytes")!=0
+        or boundary.get("tail_reason") not in (None,"","none")):
+    raise SystemExit("post-quarantine fixed WAL was not accepted in full")
+archive_size=int(archive_wal_size_raw);archive_suffix_bytes=int(archive_suffix_bytes_raw)
+if (archive_wal_identity["size"]!=archive_size
+        or archive_size!=int(wal_size_raw)+archive_suffix_bytes
+        or not re.fullmatch(r"[0-9a-f]{64}",archive_wal_sha)):
+    raise SystemExit("archived final WAL size/identity differs")
+if archive_suffix_bytes==0:
+    if archive_suffix_sha!="-" or archive_suffix_classification!="none":
+        raise SystemExit("empty archived final WAL suffix policy differs")
+    archived_suffix_sha=None
+else:
+    if (not re.fullmatch(r"[0-9a-f]{64}",archive_suffix_sha)
+            or archive_suffix_classification!="archived_noncanonical_post_capture_suffix"):
+        raise SystemExit("archived final WAL suffix classification differs")
+    archived_suffix_sha=archive_suffix_sha
+stop_after_path=pathlib.Path(stop_after_raw)
+stop_after_bytes=stop_after_path.read_bytes();stop_after=json.loads(stop_after_bytes)
+if (stop_after_bytes!=canonical(stop_after) or hashlib.sha256(stop_after_bytes).hexdigest()!=stop_after_sha
+        or stop_after.get("final_source_capture_sha256")!=final_capture_sha
+        or stop_after.get("source_pair_role")!="post-quarantine-final-export"
+        or stop_after.get("selected_source_head")!={"height":selected_height,
+            "block_hash":selected_hash,"state_root":selected_state}):
+    raise SystemExit("persisted-head stop-after-round final source binding differs")
 quarantine=stop_root/"08-network-quarantine.json"
 plan_path=pathlib.Path(f"/root/.arc-recovery-plans/{freeze}/freeze.lock.json")
 plan_raw=plan_path.read_bytes(); plan=json.loads(plan_raw)
@@ -12109,6 +17872,11 @@ receipt={
  "capture_id":capture,"node":node,"freeze_plan_sha256":freeze,"boot_id":boot,
  "inspector_binary_sha256":binary_sha,"genesis_sha256":genesis_sha,
  "validator_public_keys_sha256":validators_sha,"legacy_validator_set_sha256":legacy_sha,
+ "source_pair_role":"post-quarantine-final-export",
+ "final_source_capture_sha256":final_capture_sha,
+ "selected_source_head":{"height":selected_height,"block_hash":selected_hash,
+                         "state_root":selected_state},
+ "stop_after_round_receipt_sha256":stop_after_sha,
  "network_quarantine_receipt_sha256":digest(quarantine),
  "stop_complete_sha256":digest(stop_root/"stop.complete"),
  "stop_files_sha256":digest(stop_root/"stop.files.sha256"),
@@ -12120,6 +17888,14 @@ receipt={
  "snapshot_sha256":snapshot_sha,"snapshot_size":int(snapshot_size_raw),
  "source_file_identity":{
    "state_wal":source_wal_identity,"snapshot":source_snapshot_identity,
+ },
+ "archived_final_wal":{
+   "path":archive_wal_raw,"sha256":archive_wal_sha,"size":archive_size,
+   "file_identity":archive_wal_identity,"selected_prefix_bytes":int(wal_size_raw),
+   "selected_prefix_sha256":wal_sha,"post_capture_suffix_bytes":archive_suffix_bytes,
+   "post_capture_suffix_sha256":archived_suffix_sha,
+   "post_capture_suffix_classification":archive_suffix_classification,
+   "preserved_by":"complete-content-indexed-stopped-legacy-source-v4",
  },
  "staged_file_contract":{
    "state_wal":{"sha256":wal_sha,"size":int(wal_size_raw),"mode":0o100400,"uid":0,"gid":0,"nlink":1},
@@ -12136,7 +17912,7 @@ receipt={
  "export_contract":{"binary_path":"/proc/self/fd/8","exit_code":0,
                     "source_consensus_round":0,"created_at_unix_ms":0,
                     "recovery_epoch":1,"validator_set_id":1,
-                    "allow_unbound_legacy_wal":True,"read_only":True},
+                    "allow_unbound_legacy_wal":False,"read_only":True},
  "completed_at":completed_at,"rerun_reexecutes_export":True,
  "writer_stopped":True,"restart_barrier_active":True,"network_quarantine_active":True,
  "global_absence_claimed":False,
@@ -12836,8 +18612,12 @@ stream_bundle() {
     verify_tree_index "$binding_root" binding.files.sha256 binding.complete
     verify_binding_identity "$binding_root" "$capture_id" "$node" "$manifest"
     pgrep -x arc-node >/dev/null 2>&1 && die "refusing archive stream while arc-node is running"
-    verify_legacy_restart_fence "$stop_root"
     freeze_sha="$(sed -n 's/^freeze_plan_sha256=//p' "$capture_root/capture.inventory")"
+    if [ -d "$stop_root" ] && [ ! -L "$stop_root" ]; then
+        verify_legacy_restart_fence "$stop_root"
+    else
+        round_stopped_status "$capture_id" "$node" "$freeze_sha" >/dev/null
+    fi
     live_root="$LIVE_OBSERVATION_BASE/$capture_id/$node"
     verify_live_observation_receipt "$live_root" "$capture_id" "$node" "$freeze_sha"
 
@@ -12850,6 +18630,55 @@ stream_bundle() {
         "${binding_root#/}"
         "${live_root#/}"
     )
+    local selected_attempt selected_attempts
+    selected_attempts="$(python3 - "$QUARANTINE_ROUND_BASE" "$LIVE_SOURCE_CAPTURE_BASE" \
+        "$capture_id" "$node" <<'PY'
+import json,pathlib,stat,sys
+round_base,live_base=map(pathlib.Path,sys.argv[1:3]);capture,node=sys.argv[3:]
+paths=[]
+for attempt in (round_base/capture).glob("*"):
+    if not attempt.is_dir() or attempt.is_symlink():continue
+    auth_path=attempt/"authorization.json"
+    for terminal_name in ("node-applied.json","node-stopped-precommit.json"):
+        terminal_path=attempt/terminal_name
+        if not terminal_path.is_file() or terminal_path.is_symlink():continue
+        terminal=json.loads(terminal_path.read_text(encoding="utf-8"))
+        if terminal.get("node")!=node:continue
+        auth=json.loads(auth_path.read_text(encoding="utf-8"))
+        captures=[row.get("value",{}) for row in auth.get("live_source_captures",[])
+                  if row.get("value",{}).get("node")==node]
+        if len(captures)!=1:raise SystemExit("selected initial live-source capture is ambiguous")
+        paths.append(captures[0].get("fixed_pair_path"))
+        if terminal_name=="node-applied.json":
+            stop_path=attempt/"stop-after-round.json"
+            if not stop_path.is_file() or stop_path.is_symlink():
+                raise SystemExit("active archive lacks stop-after-round final capture")
+            stop=json.loads(stop_path.read_text(encoding="utf-8"))
+            paths.append(stop.get("final_source_capture",{}).get("value",{}).get("fixed_pair_path"))
+if not paths:raise SystemExit("archive has no selected live-source capture")
+expected=live_base/capture/node
+attempts=[]
+for raw in paths:
+    fixed=pathlib.Path(raw or "")
+    try:fixed.relative_to(expected)
+    except ValueError:raise SystemExit("selected live-source pair escapes its capture root")
+    if fixed.name!="fixed-source" or not fixed.is_dir() or fixed.is_symlink():
+        raise SystemExit("selected live-source pair path differs")
+    selected=fixed.parent
+    for base,dirs,files in __import__("os").walk(selected,followlinks=False):
+        for name in dirs+files:
+            path=pathlib.Path(base)/name
+            if path.is_symlink():raise SystemExit("selected live-source attempt contains a symlink")
+            if name=="capture.lock":raise SystemExit("selected attempt unexpectedly contains mutable lock")
+    attempts.append(str(selected))
+for value in dict.fromkeys(attempts):print(value)
+PY
+    )" || die "cannot select the immutable live-source attempts for archive"
+    while IFS= read -r selected_attempt; do
+        [ -n "$selected_attempt" ] || continue
+        require_safe_absolute_path "$selected_attempt" "archive selected live-source attempt"
+        members+=("${selected_attempt#/}")
+    done <<< "$selected_attempts"
     local snapshot
     while IFS= read -r snapshot; do
         [ -n "$snapshot" ] || continue
@@ -12869,6 +18698,11 @@ PY
     tar --create --zstd --sort=name --numeric-owner --acls --xattrs --sparse \
         --one-file-system --file - --directory / "${members[@]}"
     verify_capture_source "$capture_root" "$capture_id" "$node"
+    if [ -d "$stop_root" ] && [ ! -L "$stop_root" ]; then
+        verify_legacy_restart_fence "$stop_root"
+    else
+        round_stopped_status "$capture_id" "$node" "$freeze_sha" >/dev/null
+    fi
 }
 
 stream_inventory() {
@@ -13454,18 +19288,63 @@ case "$ACTION" in
         [ "$#" -eq 16 ] || { usage >&2; exit 2; }
         legacy_height_bracket "${@:2}"
         ;;
-    fence-stop)
-        [ "$#" -eq 22 ] || { usage >&2; exit 2; }
-        fence_stop "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" \
-            "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" \
-            "${17}" "${18}" "${19}" "${20}" "${21}" "${22}"
+    capture-live-source)
+        [ "$#" -eq 32 ] || { usage >&2; exit 2; }
+        capture_live_legacy_source "${@:2}"
         ;;
-    quarantine)
-        [ "$#" -eq 22 ] || { usage >&2; exit 2; }
-        ARC_RECOVERY_QUARANTINE_ONLY=true fence_stop \
-            "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" \
-            "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" \
-            "${17}" "${18}" "${19}" "${20}" "${21}" "${22}"
+    quarantine-round-authorize)
+        [ "$#" -eq 6 ] || { usage >&2; exit 2; }
+        quarantine_round_entry authorize "$2" "$3" "$4" "$5" "$6"
+        ;;
+    quarantine-round-authorization-status)
+        [ "$#" -eq 6 ] || { usage >&2; exit 2; }
+        quarantine_round_entry authorization-status "$2" "$3" "$4" "$5" "$6"
+        ;;
+    quarantine-round-ready)
+        [ "$#" -eq 7 ] || { usage >&2; exit 2; }
+        quarantine_round_entry ready "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    quarantine-round-readiness-status)
+        [ "$#" -eq 7 ] || { usage >&2; exit 2; }
+        quarantine_round_entry readiness-status "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    quarantine-round-apply)
+        [ "$#" -eq 7 ] || { usage >&2; exit 2; }
+        quarantine_round_entry apply "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    quarantine-round-applied-status)
+        [ "$#" -eq 7 ] || { usage >&2; exit 2; }
+        quarantine_round_entry applied-status "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    quarantine-round-precommit-status)
+        [ "$#" -eq 7 ] || { usage >&2; exit 2; }
+        quarantine_round_entry precommit-status "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    quarantine-round-stopped-precommit)
+        [ "$#" -eq 12 ] || { usage >&2; exit 2; }
+        quarantine_round_entry stopped-precommit "$2" "$3" "$4" "$5" "$6" "$7" - \
+            "$8" "$9" "${10}" "${11}" "${12}"
+        ;;
+    quarantine-round-status)
+        [ "$#" -eq 8 ] || { usage >&2; exit 2; }
+        quarantine_round_entry status "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        ;;
+    quarantine-round-stopped-status)
+        [ "$#" -eq 5 ] || { usage >&2; exit 2; }
+        round_stopped_status_expected "$2" "$3" "$4" "$5"
+        ;;
+    quarantine-round-stopped-status-challenged)
+        [ "$#" -eq 7 ] || { usage >&2; exit 2; }
+        round_stopped_status_challenged "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    stop-after-quarantine-round)
+        [ "$#" -eq 9 ] || { usage >&2; exit 2; }
+        quarantine_round_entry stop "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
+        ;;
+    fence-stop|quarantine|quarantine-starter|quarantine-authority|\
+    quarantine-authorization-status|quarantine-authorize|quarantine-ready|\
+    quarantine-mutation-start|quarantine-mutation-status|quarantine-mutation-replica)
+        die "obsolete global quarantine authority is retired; use an exact quarantine round"
         ;;
     quarantine-status)
         [ "$#" -eq 4 ] || { usage >&2; exit 2; }

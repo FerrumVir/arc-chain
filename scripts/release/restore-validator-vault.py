@@ -611,16 +611,7 @@ def run_openssl(
         timeout=timeout,
         extra_env=openssl_loader_environment(runtime),
     )
-    for dependency in (
-        runtime.library_root / runtime.libssl_name,
-        runtime.library_root / runtime.libcrypto_name,
-    ):
-        if str(dependency).encode() not in result.stderr:
-            fail(f"{label} did not load the reviewed private {dependency.name}")
-    for line in result.stderr.splitlines():
-        for name in (runtime.libssl_name, runtime.libcrypto_name):
-            if name.encode() in line and str(runtime.library_root / name).encode() not in line:
-                fail(f"{label} resolved an unreviewed OpenSSL dependency path")
+    verify_openssl_loader_trace(runtime, result.stderr, label=label)
     prove_openssl_runtime(
         runtime.root,
         runtime.digests,
@@ -628,6 +619,47 @@ def run_openssl(
         runtime.libcrypto_name,
     )
     return result
+
+
+def verify_openssl_loader_trace(runtime: OpenSSLRuntime, trace: bytes, *, label: str) -> None:
+    dependencies = (
+        runtime.library_root / runtime.libssl_name,
+        runtime.library_root / runtime.libcrypto_name,
+    )
+    lines = trace.splitlines()
+    if sys.platform.startswith("linux"):
+        # LD_DEBUG=libs reports every search candidate as a ``trying file``
+        # line, including glibc-hwcaps paths that do not exist.  Only
+        # ``calling init`` identifies the object the loader actually mapped.
+        # Treating search probes as resolutions makes the hermetic check reject
+        # a valid private library on GNU/Linux.
+        marker = b"calling init:"
+        for dependency in dependencies:
+            expected = os.fsencode(dependency)
+            name = os.fsencode(dependency.name)
+            loaded_paths: list[bytes] = []
+            for line in lines:
+                if marker not in line:
+                    continue
+                candidate = line.split(marker, 1)[1].strip()
+                # Some loader versions append a namespace marker.  It is not
+                # part of the resolved pathname.
+                candidate = candidate.split(b" [", 1)[0].strip()
+                if candidate.rsplit(b"/", 1)[-1] == name:
+                    loaded_paths.append(candidate)
+            if not loaded_paths:
+                fail(f"{label} did not load the reviewed private {dependency.name}")
+            if any(candidate != expected for candidate in loaded_paths):
+                fail(f"{label} resolved an unreviewed OpenSSL dependency path")
+        return
+
+    for dependency in dependencies:
+        expected = os.fsencode(dependency)
+        if expected not in trace:
+            fail(f"{label} did not load the reviewed private {dependency.name}")
+        for line in lines:
+            if os.fsencode(dependency.name) in line and expected not in line:
+                fail(f"{label} resolved an unreviewed OpenSSL dependency path")
 
 
 def validate_rewrap_receipt(

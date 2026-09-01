@@ -28,14 +28,15 @@ const config = network.normalizeConfig(await loadRawConfig(configTarget));
 assert.ok(config.checkpoint, "live dashboard gate requires an approved recovery checkpoint");
 const resolver = network.createCanonicalResolver(config);
 
-const [boundary, fleet] = await Promise.all([
+const [boundary, fleet, maintenanceAudit] = await Promise.all([
   dashboard.verifyRecoveryBoundary({ resolver, fetchImpl: fetch }),
   dashboard.collectFleetHealth({ resolver, fetchImpl: fetch }),
+  network.auditMaintenanceInterlock({ resolver, fetchImpl: fetch }),
 ]);
 
 assert.equal(boundary.state, "verified", `exact recovery checkpoint proof is ${boundary.state}: ${boundary.reason ?? "no reason"}`);
 const inference = await dashboard.loadInferenceEvidence({ resolver, fetchImpl: fetch, checkpointAudit: boundary });
-const fleetError = dashboard.activeFleetPublicationError(config, fleet);
+const fleetError = dashboard.activeFleetPublicationError(config, fleet, maintenanceAudit);
 assert.equal(fleetError, null, `active fleet publication gate failed: ${fleetError}`);
 assert.equal(inference.error, null, `inference evidence endpoint failed: ${inference.error}`);
 

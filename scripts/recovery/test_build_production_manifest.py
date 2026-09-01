@@ -59,6 +59,174 @@ class Fixture:
     run_id = 424242
     run_attempt = 3
 
+    def live_source_capture(
+        self,
+        *,
+        capture_id: str,
+        round_number: int,
+        target: dict,
+        public_row: dict,
+        cross_row: dict,
+        public_sha256: str,
+        cross_sha256: str,
+        captured_at: str,
+        index: int,
+    ) -> dict:
+        """Build the exact preauthorization source pair consumed by a round."""
+
+        seed = 20_000 + index * 100
+
+        def directory(offset: int) -> dict:
+            return {
+                "device": seed + offset,
+                "inode": seed + offset + 1,
+                "mode": 0o40700,
+                "uid": 0,
+                "gid": 0,
+                "nlink": 2,
+                "mtime_ns": seed + offset + 2,
+                "ctime_ns": seed + offset + 3,
+            }
+
+        def regular(offset: int, root: str, size: int = 8) -> dict:
+            return {
+                "device": seed + offset,
+                "inode": seed + offset + 1,
+                "mode": 0o100400,
+                "uid": 0,
+                "gid": 0,
+                "nlink": 1,
+                "mtime_ns": seed + offset + 2,
+                "ctime_ns": seed + offset + 3,
+                "sha256": root,
+                "size": size,
+            }
+
+        public_latest = public_row["latest_block_height"]
+        cross_latest = cross_row["loopback_latest_height"]
+        head_height = max(
+            public_latest,
+            cross_latest,
+            public_row["info_after_height"],
+            cross_row["loopback_info_after_height"],
+        )
+        head = {
+            "height": head_height,
+            "block_hash": cross_row["loopback_latest_block_hash"],
+            "state_root": f"{seed + 10:064x}",
+        }
+        wal_root = f"{seed + 11:064x}"
+        snapshot_root = f"{seed + 12:064x}"
+        genesis_root = sha(self.genesis.read_bytes())
+        legacy_root = sha(self.legacy.read_bytes())
+        rust_capture = {
+            "schema": builder.quarantine_rounds.RUST_SOURCE_CAPTURE_SCHEMA,
+            "captured_at_unix_ms": int(
+                dt.datetime.strptime(captured_at, "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=dt.timezone.utc)
+                .timestamp()
+                * 1000
+            ),
+            "head": head,
+            "source_data_dir": directory(20),
+            "source_wal_prefix": {
+                "device": seed + 30,
+                "inode": seed + 31,
+                "mode": 0o100600,
+                "uid": 0,
+                "gid": 0,
+                "nlink": 1,
+                "loader_observed_bytes": 8,
+                "copy_observed_bytes": 8,
+                "accepted_prefix_bytes": 8,
+                "accepted_prefix_sha256": wal_root,
+                "quarantined_suffix_bytes_at_loader": 0,
+                "loader_tail_reason": "clean-eof",
+            },
+            "source_snapshot": regular(40, snapshot_root),
+            "genesis": regular(50, genesis_root),
+            "legacy_validator_set": regular(60, legacy_root),
+            "fixed_pair": {
+                "data_dir": directory(70),
+                "state_wal": regular(80, wal_root),
+                "snapshot": regular(90, snapshot_root),
+                "genesis_binding": regular(100, f"{seed + 13:064x}"),
+                "strict_replay": True,
+            },
+            "allow_unbound_legacy_wal": False,
+        }
+        value = {
+            "schema": builder.quarantine_rounds.LIVE_SOURCE_CAPTURE_SCHEMA,
+            "capture_id": capture_id,
+            "freeze_plan_sha256": self.freeze_sha,
+            "source_main_commit": self.commit,
+            "round_number": round_number,
+            "node": target["node"],
+            "host": target["host"],
+            "authorized_writer": {
+                "boot_id": target["boot_id"],
+                "pid": target["writer_pid"],
+                "start_ticks": target["writer_start_ticks"],
+                "cgroup_sha256": target["writer_cgroup_sha256"],
+            },
+            "rpc_origin": "http://127.0.0.1:9090",
+            "public_height_receipt_sha256": public_sha256,
+            "authenticated_height_cross_proof_sha256": cross_sha256,
+            "snapshot_endpoint": "/sync/snapshot",
+            "snapshot_listener": {
+                "boot_id": target["boot_id"],
+                "pid": target["writer_pid"],
+                "start_ticks": target["writer_start_ticks"],
+                "port": 9090,
+                "socket_inode": seed + 14,
+            },
+            "capture_attempt_id": f"00000000-0000-4000-8000-{index + 1:012d}",
+            "capture_started_at": captured_at,
+            "capture_completed_at": captured_at,
+            "inspector_binary_sha256": sha(self.binary.read_bytes()),
+            "genesis_sha256": genesis_root,
+            "legacy_validator_set_sha256": legacy_root,
+            "fixed_pair_path": (
+                f"/root/arc-recovery-live-source-captures/{capture_id}/"
+                f"{target['node']}/round-{round_number}/preauthorization-boundary/"
+                f"attempt-{index + 1}/fixed-source"
+            ),
+            "snapshot_source": "sealed-writer-owned-loopback-/sync/snapshot",
+            "existing_source_snapshot_used": False,
+            "rust_capture": builder.quarantine_rounds.wrap(rust_capture),
+            "head": head,
+            "ancestry_checks": [
+                {
+                    "label": "public-latest",
+                    "height": public_latest,
+                    "expected_block_hash": public_row["latest_block_hash"],
+                    "observed_block_hash": public_row["latest_block_hash"],
+                    "state_root": f"{seed + 15:064x}",
+                    "inspection_sha256": f"{seed + 16:064x}",
+                },
+                {
+                    "label": "authenticated-loopback-latest",
+                    "height": cross_latest,
+                    "expected_block_hash": cross_row["loopback_latest_block_hash"],
+                    "observed_block_hash": cross_row["loopback_latest_block_hash"],
+                    "state_root": f"{seed + 17:064x}",
+                    "inspection_sha256": f"{seed + 18:064x}",
+                },
+            ],
+            "content_sealed": True,
+            "strict_offline_replay": True,
+            "source_pair_role": "preauthorization-boundary",
+            "minimum_height": max(
+                public_row["info_after_height"],
+                cross_row["loopback_info_after_height"],
+            ),
+            "expected_head": None,
+            "boundary_proof_sha256": cross_sha256,
+            "network_quarantine_receipt_sha256": None,
+            "owned_ruleset_stateless_sha256": None,
+        }
+        return builder.quarantine_rounds.wrap(value)
+
     def __init__(self, root: pathlib.Path) -> None:
         self.root = root
         self.archive_counter = 0
@@ -204,12 +372,7 @@ print(json.dumps(value,sort_keys=True))
         self.offline_stop = root / "offline-stop-evidence.json"
         self.write_offline_stop()
         self.late_fork_source_set = root / "legacy-late-fork-source-set.json"
-        builder.late_fork.build_source_set(
-            self.boundary,
-            sha(self.boundary.read_bytes()),
-            self.late_fork_source_set,
-            sha((SCRIPT_DIR / "legacy-late-fork-interlock.py").read_bytes()),
-        )
+        self.rebuild_late_fork_source_set()
         self.known_hosts = root / "known_hosts"
         known_lines = []
         for index, (_name, host) in enumerate(builder.FLEET):
@@ -290,8 +453,15 @@ print(json.dumps(value,sort_keys=True))
         write(sidecar, f"{digest}  {self.freeze.name}\n".encode(), 0o400)
         return digest
 
-    def write_height(self, *, stale: bool = False) -> None:
-        now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    def write_height(
+        self,
+        *,
+        stale: bool = False,
+        completed_at: dt.datetime | None = None,
+    ) -> None:
+        if stale and completed_at is not None:
+            raise ValueError("stale and completed_at are mutually exclusive fixture controls")
+        now = (completed_at or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0)
         if stale:
             now -= dt.timedelta(seconds=301)
         timestamp = now.isoformat().replace("+00:00", "Z")
@@ -333,15 +503,38 @@ print(json.dumps(value,sort_keys=True))
             self.height.chmod(0o600)
         write(self.height, canonical(receipt), 0o400)
 
-    def write_offline_stop(self) -> None:
+    def write_offline_stop(
+        self,
+        *,
+        fleet_started_at: dt.datetime | None = None,
+        fleet_completed_at: dt.datetime | None = None,
+        first_quarantine_at: dt.datetime | None = None,
+        all_stopped_at: dt.datetime | None = None,
+        boundary_created_at: dt.datetime | None = None,
+    ) -> None:
         freeze = json.loads(self.freeze.read_text())
         capture = builder.rollout.capture_id_for_freeze_plan_hash(self.freeze_sha)
         public_receipt = json.loads(self.height.read_text())
         public_sha = sha(self.height.read_bytes())
         now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        first_quarantine = now.isoformat().replace("+00:00", "Z")
-        all_stopped = (now + dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
-        boundary_created = (now + dt.timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
+        fleet_started_value = (fleet_started_at or now).replace(microsecond=0)
+        fleet_completed_value = (fleet_completed_at or fleet_started_value).replace(
+            microsecond=0
+        )
+        first_quarantine_value = (first_quarantine_at or fleet_completed_value).replace(
+            microsecond=0
+        )
+        all_stopped_value = (all_stopped_at or (
+            first_quarantine_value + dt.timedelta(seconds=1)
+        )).replace(microsecond=0)
+        boundary_created_value = (boundary_created_at or (
+            all_stopped_value + dt.timedelta(seconds=1)
+        )).replace(microsecond=0)
+        fleet_started = fleet_started_value.isoformat().replace("+00:00", "Z")
+        fleet_completed = fleet_completed_value.isoformat().replace("+00:00", "Z")
+        first_quarantine = first_quarantine_value.isoformat().replace("+00:00", "Z")
+        all_stopped = all_stopped_value.isoformat().replace("+00:00", "Z")
+        boundary_created = boundary_created_value.isoformat().replace("+00:00", "Z")
         challenge = "d" * 64
         status_fields = (
             "validator_address", "stake", "writer_pid", "writer_start_ticks", "boot_id",
@@ -350,6 +543,131 @@ print(json.dumps(value,sort_keys=True))
             "supervisor_executable_sha256", "supervisor_argv_sha256",
             "supervisor_context_sha256", "executable_path", "executable_sha256",
             "argv_sha256", "data_dir",
+        )
+        target_public_early = {
+            **copy.deepcopy(public_receipt),
+            "schema": builder.quarantine_rounds.TARGET_HEIGHT_SCHEMA,
+            "targets": [
+                {
+                    "node": name, "host": host,
+                    "rpc_origin": next(
+                        row["origin"] for row in public_receipt["origins"]
+                        if row["name"] == name
+                    ),
+                }
+                for name, host in builder.FLEET
+            ],
+        }
+        target_cross_nodes_early = []
+        for index, ((name, host), frozen, public) in enumerate(
+            zip(builder.FLEET, freeze["nodes"], public_receipt["origins"])
+        ):
+            loop_height = public["info_after_height"] + 1
+            target_cross_nodes_early.append({
+                "node": name, "host": host,
+                "writer_pid": frozen["writer_pid"],
+                "writer_start_ticks": frozen["writer_start_ticks"],
+                "boot_id": frozen["boot_id"],
+                "writer_cgroup_sha256": frozen["writer_cgroup_sha256"],
+                "public_info_after_height": public["info_after_height"],
+                "public_latest_block_height": public["latest_block_height"],
+                "public_latest_block_hash": public["latest_block_hash"],
+                "loopback_info_before_height": loop_height,
+                "loopback_latest_height": loop_height,
+                "loopback_info_after_height": loop_height,
+                "loopback_latest_block_hash": public["latest_block_hash"],
+                "response_sha256": {
+                    "/info:before": f"{index + 130:064x}",
+                    "/block/latest": f"{index + 140:064x}",
+                    "/info:after": f"{index + 150:064x}",
+                },
+            })
+        target_cross_early = {
+            "schema": builder.quarantine_rounds.TARGET_CROSS_SCHEMA,
+            "source_main_commit": self.commit,
+            "freeze_plan_sha256": self.freeze_sha,
+            "capture_id": capture,
+            "legacy_public_height_receipt_sha256": sha(canonical(target_public_early)),
+            "challenge": challenge,
+            "started_at": fleet_started,
+            "completed_at": fleet_completed,
+            "conservative_height_floor": min(
+                row["loopback_info_before_height"] for row in target_cross_nodes_early
+            ),
+            "targets": copy.deepcopy(target_public_early["targets"]),
+            "nodes": target_cross_nodes_early,
+        }
+        public_completed_early = dt.datetime.strptime(
+            public_receipt["completed_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        generation_authorization_early = {
+            "schema": builder.quarantine_rounds.ROUND_AUTH_SCHEMA,
+            "source_main_commit": self.commit,
+            "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "round_number": 1, "prior_round_result_sha256s": [], "prior_fenced": [],
+            "targets": [{
+                "node": name, "host": host, "boot_id": frozen["boot_id"],
+                "writer_pid": frozen["writer_pid"],
+                "writer_start_ticks": frozen["writer_start_ticks"],
+                "writer_cgroup_sha256": frozen["writer_cgroup_sha256"],
+            } for (name, host), frozen in zip(builder.FLEET, freeze["nodes"])],
+            "public_height_receipt": builder.quarantine_rounds.wrap(target_public_early),
+            "authenticated_height_cross_proof": builder.quarantine_rounds.wrap(
+                target_cross_early
+            ),
+            "authorized_at": fleet_completed,
+            "authorization_deadline": (
+                public_completed_early + dt.timedelta(seconds=300)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        generation_authorization_early["live_source_captures"] = [
+            self.live_source_capture(
+                capture_id=capture,
+                round_number=1,
+                target=target,
+                public_row=next(
+                    row for row in target_public_early["origins"]
+                    if row["name"] == target["node"]
+                ),
+                cross_row=next(
+                    row for row in target_cross_early["nodes"]
+                    if row["node"] == target["node"]
+                ),
+                public_sha256=builder.quarantine_rounds.digest(target_public_early),
+                cross_sha256=builder.quarantine_rounds.digest(target_cross_early),
+                captured_at=fleet_completed,
+                index=index,
+            )
+            for index, target in enumerate(generation_authorization_early["targets"])
+        ]
+        generation_authorization_sha_early = builder.quarantine_rounds.digest(
+            generation_authorization_early
+        )
+        generation_readiness_early = {
+            "schema": builder.quarantine_rounds.READINESS_SCHEMA,
+            "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "round_number": 1,
+            "round_authorization_sha256": generation_authorization_sha_early,
+            "targets": [{
+                "node": name, "host": host,
+                "authorization_acceptance": builder.quarantine_rounds.wrap({
+                    "schema": builder.quarantine_rounds.AUTH_ACCEPTANCE_SCHEMA,
+                    "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                    "round_number": 1,
+                    "round_authorization_sha256": generation_authorization_sha_early,
+                    "node": name, "host": host, "accepted_at": fleet_completed,
+                    "authorization_deadline": generation_authorization_early[
+                        "authorization_deadline"
+                    ],
+                }),
+            } for name, host in builder.FLEET],
+            "completed_at": fleet_completed,
+            "authorization_deadline": generation_authorization_early[
+                "authorization_deadline"
+            ],
+        }
+        generation_readiness_sha_early = builder.quarantine_rounds.digest(
+            generation_readiness_early
         )
         nodes = []
         cross_nodes = []
@@ -411,8 +729,8 @@ print(json.dumps(value,sort_keys=True))
                 "boot_id": frozen["boot_id"],
                 "executable_sha256": frozen["executable_sha256"],
                 "argv_sha256": frozen["argv_sha256"],
-                "started_at": first_quarantine,
-                "completed_at": first_quarantine,
+                "started_at": fleet_started,
+                "completed_at": fleet_completed,
                 "public_info_before_height": public["info_before_height"],
                 "public_latest_block_height": public["latest_block_height"],
                 "public_info_after_height": public["info_after_height"],
@@ -437,7 +755,7 @@ print(json.dumps(value,sort_keys=True))
             }
             initial_tuple = {
                 "height": authenticated_after,
-                "block_hash": f"{index + 170:064x}",
+                "block_hash": public["latest_block_hash"],
                 "state_root": f"{index + 180:064x}",
             }
             later_tuple = copy.deepcopy(initial_tuple)
@@ -446,7 +764,204 @@ print(json.dumps(value,sort_keys=True))
                 "block_hash": f"{index + 190:064x}",
                 "state_root": f"{index + 200:064x}",
             }
-            quarantine_receipt_sha = f"{index + 210:064x}"
+            round_policy_source_sha = f"{index + 204:064x}"
+            round_binding = {
+                "schema": builder.quarantine_rounds.TABLE_BINDING_SCHEMA,
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "round_number": 1,
+                "round_authorization_sha256": generation_authorization_sha_early,
+                "round_readiness_sha256": generation_readiness_sha_early,
+                "authorization_deadline": generation_authorization_early[
+                    "authorization_deadline"
+                ],
+                "apply_helper_sha256": freeze["remote_helper_sha256"],
+                "policy_sha256": round_policy_source_sha,
+                "node": name, "host": host,
+                "writer": {
+                    "boot_id": frozen["boot_id"], "pid": frozen["writer_pid"],
+                    "start_ticks": frozen["writer_start_ticks"],
+                    "cgroup_sha256": frozen["writer_cgroup_sha256"],
+                },
+            }
+            round_binding_sha = builder.quarantine_rounds.digest(round_binding)
+            round_gate = {
+                "schema": builder.quarantine_rounds.NFT_GATE_SCHEMA,
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "round_authorization_sha256": generation_authorization_sha_early,
+                "round_readiness_sha256": generation_readiness_sha_early,
+                "round_number": 1, "node": name, "host": host,
+                "authorization_deadline": generation_authorization_early[
+                    "authorization_deadline"
+                ],
+                "invoked_at": first_quarantine,
+                "apply_helper_sha256": freeze["remote_helper_sha256"],
+                "policy_sha256": round_policy_source_sha,
+                "table_binding_sha256": round_binding_sha,
+                "table_comment": (
+                    f"arc-recovery:round=1:bind={round_binding_sha}:node={name}"
+                ),
+            }
+            round_ancestry = {
+                "schema": builder.quarantine_rounds.ANCESTRY_SCHEMA,
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "round_authorization_sha256": generation_authorization_sha_early,
+                "round_number": 1, "node": name, "host": host,
+                "checks": [
+                    {
+                        "label": "public-latest", "height": public["latest_block_height"],
+                        "expected_block_hash": public["latest_block_hash"],
+                        "observed_block_hash": public["latest_block_hash"],
+                        "response_sha256": f"{int(name.encode().hex(), 16) % (1 << 256):064x}",
+                    },
+                    {
+                        "label": "authenticated-loopback-latest",
+                        "height": authenticated_after,
+                        "expected_block_hash": proof["authenticated_latest_block_hash"],
+                        "observed_block_hash": proof["authenticated_latest_block_hash"],
+                        "response_sha256": proof["authenticated_latest_block_body_sha256"],
+                    },
+                ],
+            }
+            round_intent = {
+                "schema": builder.quarantine_rounds.NFT_INTENT_SCHEMA,
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "source_main_commit": self.commit, "round_number": 1,
+                "round_authorization_sha256": generation_authorization_sha_early,
+                "round_readiness_sha256": generation_readiness_sha_early,
+                "authorization_deadline": generation_authorization_early[
+                    "authorization_deadline"
+                ],
+                "node": name, "host": host, "writer": round_binding["writer"],
+                "table_binding_sha256": round_binding_sha,
+                "table_comment": round_gate["table_comment"],
+                "apply_helper_sha256": freeze["remote_helper_sha256"],
+                "nft_policy_source_sha256": round_policy_source_sha,
+                "prepared_at": fleet_completed,
+            }
+            round_commit = {
+                "schema": "arc.recovery.quarantine-nft-applied-commit.v1",
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "round_number": 1,
+                "round_authorization_sha256": generation_authorization_sha_early,
+                "round_readiness_sha256": generation_readiness_sha_early,
+                "node": name, "host": host,
+                "nft_deadline_gate_sha256": builder.quarantine_rounds.digest(round_gate),
+                "table_binding_sha256": round_binding_sha,
+                "table_comment": round_gate["table_comment"],
+                "apply_helper_sha256": freeze["remote_helper_sha256"],
+                "nft_policy_source_sha256": round_policy_source_sha,
+                "owned_ruleset_stateless_sha256": f"{index + 211:064x}",
+                "nft_applied_at": first_quarantine,
+            }
+            round_restart_sha = f"{index + 213:064x}"
+            network_quarantine_receipt = {
+                "schema": "arc.recovery.legacy-network-quarantine.v1",
+                "capture_id": capture, "node": name, "host": host,
+                "freeze_plan_sha256": self.freeze_sha,
+                "source_main_commit": self.commit,
+                "round_number": 1,
+                "round_authorization_sha256": generation_authorization_sha_early,
+                "round_readiness_sha256": generation_readiness_sha_early,
+                "nft_deadline_gate_sha256": builder.quarantine_rounds.digest(round_gate),
+                "nft_apply_intent_sha256": builder.quarantine_rounds.digest(round_intent),
+                "nft_apply_intent": builder.quarantine_rounds.wrap(round_intent),
+                "nft_table_binding_sha256": round_binding_sha,
+                "nft_table_binding": round_binding,
+                "table_comment": round_gate["table_comment"],
+                "nft_table_comment": round_gate["table_comment"],
+                "nft_policy_source_sha256": round_policy_source_sha,
+                "apply_helper_sha256": freeze["remote_helper_sha256"],
+                "applied_commit_sha256": builder.quarantine_rounds.digest(round_commit),
+                "authorization_ancestry_proof_sha256": builder.quarantine_rounds.digest(
+                    round_ancestry
+                ),
+                "boot_id": frozen["boot_id"],
+                "writer": {
+                    "pid": frozen["writer_pid"],
+                    "start_ticks": frozen["writer_start_ticks"],
+                    "cgroup_sha256": frozen["writer_cgroup_sha256"],
+                },
+                "table": {
+                    "family": "inet", "name": "arc_legacy_maintenance_v1",
+                    "priority": -310,
+                    "hooks": ["prerouting", "input", "forward", "output"],
+                    "policy": "accept", "comment": round_gate["table_comment"],
+                    "loopback_retained": True,
+                },
+                "quarantine_policy": {
+                    "mode": "deny-all-nonloopback-except-host-maintenance",
+                    "families": ["ipv4", "ipv6"],
+                    "directions": ["input", "output", "forward"],
+                    "priority_before_conntrack": True,
+                    "established_bypass": False,
+                    "allowed": [
+                        "loopback", "ssh-tcp-22", "dhcpv4-67-68",
+                        "dhcpv6-546-547", "icmpv6-ndp-ra-packet-too-big",
+                    ],
+                    "legacy_rpc_p2p_web_dynamic_all_blocked": True,
+                },
+                "persistence": {
+                    "unit_path": "/etc/systemd/system/arc-legacy-maintenance-fence.service",
+                    "unit_enabled": True, "unit_active": True,
+                    "state_path": "/etc/arc-recovery/network-fence-rounds/fixture",
+                    "active_selector_path": "/run/arc-recovery/active-network-fence",
+                    "automatic_unfence": False,
+                },
+                "tool_sha256": {"/usr/sbin/nft": f"{index + 203:064x}"},
+                "file_sha256": {
+                    "authorization.json": generation_authorization_sha_early,
+                    "readiness.json": generation_readiness_sha_early,
+                    "contract.json": f"{index + 214:064x}",
+                    "table-binding.json": round_binding_sha,
+                    "nft-apply-intent.json": builder.quarantine_rounds.digest(
+                        round_intent
+                    ),
+                    "policy.nft": round_policy_source_sha,
+                    "apply": freeze["remote_helper_sha256"],
+                    "nft": f"{index + 203:064x}",
+                    "nft-deadline-gate.json": builder.quarantine_rounds.digest(round_gate),
+                    "applied.commit.json": builder.quarantine_rounds.digest(round_commit),
+                    "persistent-restart-fence.json": round_restart_sha,
+                    "rendered-policy.nft": f"{index + 215:064x}",
+                    "/usr/local/libexec/arc-legacy-maintenance-fence": f"{index + 216:064x}",
+                    "/etc/systemd/system/arc-legacy-maintenance-fence.service": f"{index + 217:064x}",
+                    "/etc/systemd/system/arc-self-heal.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 218:064x}",
+                    "/etc/systemd/system/arc-node.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 219:064x}",
+                    "/etc/systemd/system/arc-node-update.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 220:064x}",
+                    "/etc/systemd/system/arc-node-update.timer.d/zzzy-arc-recovery-network-fence.conf": f"{index + 221:064x}",
+                },
+                "owned_ruleset_stateless_sha256": f"{index + 211:064x}",
+                "installed_at": first_quarantine,
+                "loopback_head": {
+                    "rpc_origin": frozen["rpc_origin"],
+                    "info_before_height": initial_tuple["height"],
+                    "latest_height": initial_tuple["height"],
+                    "block_height": initial_tuple["height"],
+                    "info_after_height": initial_tuple["height"],
+                    "block_hash": initial_tuple["block_hash"],
+                    "state_root": initial_tuple["state_root"],
+                    "response_sha256": {
+                        "/info:before": f"{index + 207:064x}",
+                        "/block/latest": f"{index + 208:064x}",
+                        f"/block/{initial_tuple['height']}": f"{index + 209:064x}",
+                        "/health": f"{index + 210:064x}",
+                        "/info:after": f"{index + 212:064x}",
+                    },
+                    "stable_attempt": 1,
+                },
+                "stable_head": copy.deepcopy(initial_tuple),
+                "authorization_ancestry_proof": builder.quarantine_rounds.wrap(
+                    round_ancestry
+                ),
+                "nft_deadline_gate": builder.quarantine_rounds.wrap(round_gate),
+                "applied_commit": builder.quarantine_rounds.wrap(round_commit),
+                "global_absence_claimed": False,
+                "threat_model": {
+                    "legacy_binary": "reviewed-non-adversarial-exact-hash",
+                    "legacy_binary_sha256": frozen["executable_sha256"],
+                },
+            }
+            quarantine_receipt_sha = sha(canonical(network_quarantine_receipt))
             counters = {
                 "arc-recovery:prerouting:iifname:deny": {
                     "packets": 10 + index,
@@ -682,6 +1197,10 @@ print(json.dumps(value,sort_keys=True))
                 "genesis_sha256": sha(self.genesis.read_bytes()),
                 "validator_public_keys_sha256": sha(self.public_keys.read_bytes()),
                 "legacy_validator_set_sha256": sha(self.legacy.read_bytes()),
+                "source_pair_role": "post-quarantine-final-export",
+                "final_source_capture_sha256": f"{index + 500:064x}",
+                "selected_source_head": copy.deepcopy(persisted_tuple),
+                "stop_after_round_receipt_sha256": f"{index + 510:064x}",
                 "network_quarantine_receipt_sha256": quarantine_receipt_sha,
                 "stop_complete_sha256": complete_sha,
                 "stop_files_sha256": files_sha,
@@ -694,6 +1213,25 @@ print(json.dumps(value,sort_keys=True))
                 "snapshot_sha256": f"{index + 249:064x}",
                 "snapshot_size": 8,
                 "source_file_identity": {"state_wal": {}, "snapshot": {}},
+                "archived_final_wal": {
+                    "path": f"/private/archive/{name}/state.wal",
+                    "sha256": f"{index + 520:064x}",
+                    "size": 3,
+                    "file_identity": {
+                        "device": 500 + index,
+                        "inode": 600 + index,
+                        "size": 3,
+                        "mode": 0o100600,
+                    },
+                    "selected_prefix_bytes": 3,
+                    "selected_prefix_sha256": f"{index + 248:064x}",
+                    "post_capture_suffix_bytes": 0,
+                    "post_capture_suffix_sha256": None,
+                    "post_capture_suffix_classification": "none",
+                    "preserved_by": (
+                        "complete-content-indexed-stopped-legacy-source-v4"
+                    ),
+                },
                 "staged_file_contract": {
                     "state_wal": {
                         "sha256": f"{index + 248:064x}",
@@ -746,6 +1284,8 @@ print(json.dumps(value,sort_keys=True))
                     "host": host,
                     "stopped_status": status,
                     "quarantine_status": quarantine_status,
+                    "network_quarantine_receipt": network_quarantine_receipt,
+                    "nft_deadline_gate": round_gate,
                     "quarantine_monitor": quarantine_monitor,
                     "post_proof_quarantine_status": post_status,
                     "external_quarantine_proof": external,
@@ -811,8 +1351,8 @@ print(json.dumps(value,sort_keys=True))
             "capture_id": capture,
             "legacy_public_height_receipt_sha256": public_sha,
             "challenge": challenge,
-            "started_at": first_quarantine,
-            "completed_at": first_quarantine,
+            "started_at": fleet_started,
+            "completed_at": fleet_completed,
             "conservative_height_floor": max(
                 row["proof"]["conservative_height_floor"] for row in cross_nodes
             ),
@@ -839,6 +1379,252 @@ print(json.dumps(value,sort_keys=True))
             "nodes": stability_nodes,
             "global_absence_claimed": False,
         }
+        target_public = {
+            **copy.deepcopy(public_receipt),
+            "schema": builder.quarantine_rounds.TARGET_HEIGHT_SCHEMA,
+            "targets": [
+                {
+                    "node": name, "host": host,
+                    "rpc_origin": next(
+                        row["origin"] for row in public_receipt["origins"]
+                        if row["name"] == name
+                    ),
+                }
+                for name, host in builder.FLEET
+            ],
+        }
+        target_cross_nodes = []
+        for (name, host), frozen, public, cross_row in zip(
+            builder.FLEET, freeze["nodes"], public_receipt["origins"], cross_nodes
+        ):
+            proof = cross_row["proof"]
+            loop_height = proof["authenticated_info_after_height"]
+            target_cross_nodes.append({
+                "node": name, "host": host,
+                "writer_pid": frozen["writer_pid"],
+                "writer_start_ticks": frozen["writer_start_ticks"],
+                "boot_id": frozen["boot_id"],
+                "writer_cgroup_sha256": frozen["writer_cgroup_sha256"],
+                "public_info_after_height": public["info_after_height"],
+                "public_latest_block_height": public["latest_block_height"],
+                "public_latest_block_hash": public["latest_block_hash"],
+                "loopback_info_before_height": loop_height,
+                "loopback_latest_height": loop_height,
+                "loopback_info_after_height": loop_height,
+                "loopback_latest_block_hash": proof["authenticated_latest_block_hash"],
+                "response_sha256": {
+                    "/info:before": proof["authenticated_info_before_body_sha256"],
+                    "/block/latest": proof["authenticated_latest_block_body_sha256"],
+                    "/info:after": proof["authenticated_info_after_body_sha256"],
+                },
+            })
+        target_cross = {
+            "schema": builder.quarantine_rounds.TARGET_CROSS_SCHEMA,
+            "source_main_commit": self.commit,
+            "freeze_plan_sha256": self.freeze_sha,
+            "capture_id": capture,
+            "legacy_public_height_receipt_sha256": sha(canonical(target_public)),
+            "challenge": challenge,
+            "started_at": fleet_started,
+            "completed_at": fleet_completed,
+            "conservative_height_floor": min(
+                row["loopback_info_before_height"] for row in target_cross_nodes
+            ),
+            "targets": copy.deepcopy(target_public["targets"]),
+            "nodes": target_cross_nodes,
+        }
+        public_completed_value = dt.datetime.strptime(
+            public_receipt["completed_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        generation_authorization = {
+            "schema": builder.quarantine_rounds.ROUND_AUTH_SCHEMA,
+            "source_main_commit": self.commit,
+            "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "round_number": 1, "prior_round_result_sha256s": [], "prior_fenced": [],
+            "targets": [{
+                "node": name, "host": host, "boot_id": frozen["boot_id"],
+                "writer_pid": frozen["writer_pid"],
+                "writer_start_ticks": frozen["writer_start_ticks"],
+                "writer_cgroup_sha256": frozen["writer_cgroup_sha256"],
+            } for (name, host), frozen in zip(builder.FLEET, freeze["nodes"])],
+            "public_height_receipt": builder.quarantine_rounds.wrap(target_public),
+            "authenticated_height_cross_proof": builder.quarantine_rounds.wrap(target_cross),
+            "authorized_at": fleet_completed,
+            "authorization_deadline": (
+                public_completed_value + dt.timedelta(seconds=300)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        generation_authorization["live_source_captures"] = [
+            self.live_source_capture(
+                capture_id=capture,
+                round_number=1,
+                target=target,
+                public_row=next(
+                    row for row in target_public["origins"]
+                    if row["name"] == target["node"]
+                ),
+                cross_row=next(
+                    row for row in target_cross["nodes"]
+                    if row["node"] == target["node"]
+                ),
+                public_sha256=builder.quarantine_rounds.digest(target_public),
+                cross_sha256=builder.quarantine_rounds.digest(target_cross),
+                captured_at=fleet_completed,
+                index=index,
+            )
+            for index, target in enumerate(generation_authorization["targets"])
+        ]
+        generation_authorization_sha = builder.quarantine_rounds.digest(
+            generation_authorization
+        )
+        generation_readiness = {
+            "schema": builder.quarantine_rounds.READINESS_SCHEMA,
+            "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "round_number": 1,
+            "round_authorization_sha256": generation_authorization_sha,
+            "targets": [
+                {
+                    "node": name, "host": host,
+                    "authorization_acceptance": builder.quarantine_rounds.wrap({
+                        "schema": builder.quarantine_rounds.AUTH_ACCEPTANCE_SCHEMA,
+                        "capture_id": capture,
+                        "freeze_plan_sha256": self.freeze_sha,
+                        "round_number": 1,
+                        "round_authorization_sha256": generation_authorization_sha,
+                        "node": name, "host": host,
+                        "accepted_at": fleet_completed,
+                        "authorization_deadline": generation_authorization[
+                            "authorization_deadline"
+                        ],
+                    }),
+                }
+                for name, host in builder.FLEET
+            ],
+            "completed_at": fleet_completed,
+            "authorization_deadline": generation_authorization[
+                "authorization_deadline"
+            ],
+        }
+        generation_readiness_sha = builder.quarantine_rounds.digest(
+            generation_readiness
+        )
+        applied_values = []
+        for (name, host), frozen, evidence in zip(
+            builder.FLEET, freeze["nodes"], evidence_node_values
+        ):
+            final_head = evidence["persisted_head"]["head"]
+            round_public_row = next(
+                row for row in target_public["origins"] if row["name"] == name
+            )
+            round_cross_row = next(
+                row for row in target_cross["nodes"] if row["node"] == name
+            )
+            gate = copy.deepcopy(evidence["nft_deadline_gate"])
+            ancestry = {
+                "schema": builder.quarantine_rounds.ANCESTRY_SCHEMA,
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "round_authorization_sha256": builder.quarantine_rounds.digest(
+                    generation_authorization
+                ),
+                "round_number": 1, "node": name, "host": host,
+                "checks": [
+                    {
+                        "label": "public-latest",
+                        "height": round_public_row["latest_block_height"],
+                        "expected_block_hash": round_public_row["latest_block_hash"],
+                        "observed_block_hash": round_public_row["latest_block_hash"],
+                        "response_sha256": f"{int(name.encode().hex(), 16) % (1 << 256):064x}",
+                    },
+                    {
+                        "label": "authenticated-loopback-latest",
+                        "height": round_cross_row["loopback_latest_height"],
+                        "expected_block_hash": round_cross_row[
+                            "loopback_latest_block_hash"
+                        ],
+                        "observed_block_hash": round_cross_row[
+                            "loopback_latest_block_hash"
+                        ],
+                        "response_sha256": round_cross_row["response_sha256"]
+                            ["/block/latest"],
+                    },
+                ],
+            }
+            applied_values.append({
+                "schema": builder.quarantine_rounds.NODE_APPLIED_SCHEMA,
+                "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+                "round_authorization_sha256": builder.quarantine_rounds.digest(
+                    generation_authorization
+                ),
+                "round_readiness_sha256": generation_readiness_sha,
+                "round_number": 1, "node": name, "host": host,
+                "boot_id": frozen["boot_id"], "writer_pid": frozen["writer_pid"],
+                "writer_start_ticks": frozen["writer_start_ticks"],
+                "writer_cgroup_sha256": frozen["writer_cgroup_sha256"],
+                "nft_policy_source_sha256": evidence["network_quarantine_receipt"]
+                    ["file_sha256"]["policy.nft"],
+                "owned_ruleset_stateless_sha256": evidence["quarantine_status"]
+                    ["owned_ruleset_stateless_sha256"],
+                "nft_applied_at": first_quarantine,
+                "nft_deadline_gate": builder.quarantine_rounds.wrap(gate),
+                "network_quarantine_receipt": builder.quarantine_rounds.wrap(
+                    evidence["network_quarantine_receipt"]
+                ),
+                "network_quarantine_receipt_sha256": evidence["quarantine_status"]
+                    ["receipt_sha256"],
+                "stable_head": {
+                    "height": evidence["network_quarantine_receipt"]["loopback_head"]
+                        ["latest_height"],
+                    "block_hash": evidence["network_quarantine_receipt"]["loopback_head"]
+                        ["block_hash"],
+                    "state_root": evidence["network_quarantine_receipt"]["loopback_head"]
+                        ["state_root"],
+                },
+                "authorization_ancestry_proof": builder.quarantine_rounds.wrap(
+                    ancestry
+                ),
+                "persistent_restart_fence_sha256": evidence["network_quarantine_receipt"]
+                    ["file_sha256"]["persistent-restart-fence.json"],
+            })
+        generation_result = {
+            "schema": builder.quarantine_rounds.ROUND_RESULT_SCHEMA,
+            "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "round_number": 1,
+            "round_authorization_sha256": builder.quarantine_rounds.digest(
+                generation_authorization
+            ),
+            "target_readiness": builder.quarantine_rounds.wrap(
+                generation_readiness
+            ),
+            "transitions": [
+                builder.quarantine_rounds.wrap(item) for item in applied_values
+            ],
+            "remaining_targets": [], "completed_at": all_stopped,
+        }
+        generation_ledger = {
+            "schema": builder.quarantine_rounds.LEDGER_SCHEMA,
+            "capture_id": capture, "freeze_plan_sha256": self.freeze_sha,
+            "fleet": [{"node": name, "host": host} for name, host in builder.FLEET],
+            "rounds": [{
+                "authorization": builder.quarantine_rounds.wrap(generation_authorization),
+                "result": builder.quarantine_rounds.wrap(generation_result),
+            }],
+            "first_secured_at": first_quarantine,
+            "all_nodes_secured_at": first_quarantine,
+            "legacy_cutoff_height": max(
+                [public_receipt["legacy_public_max_height"]]
+                + [item["stable_head"]["height"] for item in applied_values]
+            ),
+        }
+        stability_proof["quarantine_generation_ledger_sha256"] = (
+            builder.quarantine_rounds.digest(generation_ledger)
+        )
+        stability_proof["active_transition_sha256s"] = [
+            {
+                "node": item["node"],
+                "sha256": builder.quarantine_rounds.digest(item),
+            }
+            for item in applied_values
+        ]
         inventory = []
 
         def sealed(value: dict, node: str, role: str) -> dict:
@@ -851,6 +1637,9 @@ print(json.dumps(value,sort_keys=True))
 
         authenticated_wrapper = sealed(
             cross_proof, "fleet", "authenticated-prefence-height-cross-proof"
+        )
+        generation_wrapper = sealed(
+            generation_ledger, "fleet", "quarantine-generation-ledger"
         )
         challenge_wrapper = sealed(
             challenge_receipt, "fleet", "network-quarantine-challenge"
@@ -867,6 +1656,11 @@ print(json.dumps(value,sort_keys=True))
                     "host": row["host"],
                     "stopped_status": sealed(
                         row["stopped_status"], name, "stopped-status"
+                    ),
+                    "network_quarantine_receipt": sealed(
+                        row["network_quarantine_receipt"],
+                        name,
+                        "network-quarantine-receipt",
                     ),
                     "quarantine_status": sealed(
                         row["quarantine_status"], name, "quarantine-status"
@@ -909,6 +1703,7 @@ print(json.dumps(value,sort_keys=True))
             "all_controlled_stopped_at": all_stopped,
             "challenge": challenge,
             "authenticated_prefence_height_cross_proof": authenticated_wrapper,
+            "quarantine_generation_ledger": generation_wrapper,
             "network_quarantine_challenge": challenge_wrapper,
             "quarantine_stability_proof": stability_wrapper,
             "nodes": bundle_nodes,
@@ -946,6 +1741,7 @@ print(json.dumps(value,sort_keys=True))
                 "observed_max_height": public_receipt["legacy_public_max_height"],
             },
             "authenticated_prefence_height_cross_proof_sha256": sha(canonical(cross_proof)),
+            "quarantine_generation_ledger_sha256": generation_wrapper["sha256"],
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "network_quarantine_stability_proof_sha256": stability_wrapper["sha256"],
             "network_quarantine_challenge": challenge,
@@ -1007,6 +1803,7 @@ print(json.dumps(value,sort_keys=True))
             "legacy_maintenance_boundary": boundary,
             "legacy_maintenance_boundary_sha256": sha(boundary_payload),
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
+            "quarantine_generation_ledger_sha256": generation_wrapper["sha256"],
             "nodes": nodes,
             "remote_helper_path": f"/root/.arc-recovery-helpers/{freeze['remote_helper_sha256']}/archive-node.sh",
             "remote_helper_sha256": freeze["remote_helper_sha256"],
@@ -1020,6 +1817,20 @@ print(json.dumps(value,sort_keys=True))
             self.offline_stop.with_name(self.offline_stop.name + ".sha256"),
             f"{sha(payload)}  {self.offline_stop.name}\n".encode(),
             0o400,
+        )
+
+    def rebuild_late_fork_source_set(self) -> None:
+        sidecar = self.late_fork_source_set.with_name(
+            self.late_fork_source_set.name + ".sha256"
+        )
+        for path in (self.late_fork_source_set, sidecar):
+            if path.exists() or path.is_symlink():
+                path.unlink()
+        builder.late_fork.build_source_set(
+            self.boundary,
+            sha(self.boundary.read_bytes()),
+            self.late_fork_source_set,
+            sha((SCRIPT_DIR / "legacy-late-fork-interlock.py").read_bytes()),
         )
 
     def rewrite_boundary(self, mutate, *, update_embedded: bool = True) -> None:
@@ -1058,6 +1869,301 @@ print(json.dumps(value,sort_keys=True))
                 0o400,
             )
 
+    def write_union_maintenance(self, stopped_names: set[str]) -> None:
+        """Rewrite the canonical active fixture as an exact mixed-state union."""
+
+        bundle = json.loads(self.bundle.read_text())
+        boundary = json.loads(self.boundary.read_text())
+        generation = bundle["quarantine_generation_ledger"]["value"]
+        result_value = generation["rounds"][0]["result"]["value"]
+        stopped_artifacts = {}
+        for index, transition_wrapper in enumerate(result_value["transitions"]):
+            active_transition = transition_wrapper["value"]
+            name = active_transition["node"]
+            if name not in stopped_names:
+                continue
+            stable_head = copy.deepcopy(active_transition["stable_head"])
+            fence = builder.quarantine_rounds.wrap(
+                {
+                    "schema": "arc.recovery.fixture-persistent-restart-fence.v1",
+                    "node": name,
+                    "host": active_transition["host"],
+                }
+            )
+            live_capture_sha = f"{index + 6100:064x}"
+            persisted = {
+                "schema": builder.quarantine_rounds.PERSISTED_STOPPED_SCHEMA,
+                "node": name,
+                "host": active_transition["host"],
+                "head": stable_head,
+                "source_pair_role": "preauthorization-boundary",
+                "live_source_capture_sha256": live_capture_sha,
+                "source_inputs": {
+                    "source_pair_role": "preauthorization-boundary",
+                    "live_source_capture_sha256": live_capture_sha,
+                },
+            }
+            persisted_wrapper = builder.quarantine_rounds.wrap(persisted)
+            transition = {
+                "schema": builder.quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA,
+                "node": name,
+                "host": active_transition["host"],
+                "stable_head": stable_head,
+                "persistent_restart_fence": fence,
+                "persisted_head": persisted_wrapper,
+            }
+            transition_wrapper = builder.quarantine_rounds.wrap(transition)
+            result_value["transitions"][index] = transition_wrapper
+            current = builder.quarantine_rounds.wrap(
+                {
+                    "stable_head": stable_head,
+                    "persistent_restart_fence_sha256": fence["sha256"],
+                }
+            )
+            stopped_artifacts[name] = {
+                "transition": transition_wrapper,
+                "persisted": persisted_wrapper,
+                "current": current,
+                "fence_sha256": fence["sha256"],
+            }
+        generation["rounds"][0]["result"] = builder.quarantine_rounds.wrap(
+            result_value
+        )
+        bundle["quarantine_generation_ledger"] = builder.quarantine_rounds.wrap(
+            generation
+        )
+        transition_wrappers = {
+            wrapper["value"]["node"]: wrapper
+            for wrapper in result_value["transitions"]
+        }
+        active_names = [
+            name for name, _host in builder.FLEET if name not in stopped_names
+        ]
+        stability = bundle["quarantine_stability_proof"]["value"]
+        stability["nodes"] = [
+            row for row in stability["nodes"] if row["node"] in active_names
+        ]
+        stability["fleet_heads"] = [
+            row for row in stability["fleet_heads"] if row["node"] in active_names
+        ]
+        stability["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        stability["active_transition_sha256s"] = [
+            {"node": name, "sha256": transition_wrappers[name]["sha256"]}
+            for name in active_names
+        ]
+        if active_names:
+            stability.update(
+                {
+                    "interval_seconds": 120,
+                    "sample_count": 2,
+                    "monotonic_elapsed_ns": 120_000_000_000,
+                }
+            )
+        else:
+            stability.update(
+                {
+                    "interval_seconds": 0,
+                    "sample_count": 0,
+                    "monotonic_elapsed_ns": 0,
+                }
+            )
+        bundle["quarantine_stability_proof"] = builder.quarantine_rounds.wrap(
+            stability
+        )
+
+        bundle_nodes = {row["node"]: row for row in bundle["nodes"]}
+        for name in stopped_names:
+            artifacts = stopped_artifacts[name]
+            bundle_nodes[name] = {
+                "node": name,
+                "host": dict(builder.FLEET)[name],
+                "transition_kind": (
+                    builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "transition_receipt": artifacts["transition"],
+                "current_status": artifacts["current"],
+                "persisted_head": artifacts["persisted"],
+            }
+        bundle["nodes"] = [bundle_nodes[name] for name, _host in builder.FLEET]
+
+        inventory = []
+
+        def reseal(wrapper: dict, node: str, role: str) -> dict:
+            value = wrapper["value"]
+            payload = canonical(value)
+            root = sha(payload)
+            inventory.append(
+                {"node": node, "role": role, "sha256": root, "size": len(payload)}
+            )
+            return {"value": value, "sha256": root}
+
+        for field, role in (
+            ("authenticated_prefence_height_cross_proof", "authenticated-prefence-height-cross-proof"),
+            ("quarantine_generation_ledger", "quarantine-generation-ledger"),
+            ("network_quarantine_challenge", "network-quarantine-challenge"),
+            ("quarantine_stability_proof", "network-quarantine-stability-proof"),
+        ):
+            bundle[field] = reseal(bundle[field], "fleet", role)
+        active_specs = (
+            ("stopped_status", "stopped-status"),
+            ("network_quarantine_receipt", "network-quarantine-receipt"),
+            ("quarantine_status", "quarantine-status"),
+            ("quarantine_monitor", "network-quarantine-monitor"),
+            ("post_proof_quarantine_status", "post-proof-quarantine-status"),
+            ("external_quarantine_proof", "external-quarantine-proof"),
+            ("public_cross_proof", "public-cross-proof"),
+            ("persisted_head", "persisted-head"),
+        )
+        for node_row in bundle["nodes"]:
+            specs = (
+                (
+                    ("transition_receipt", "transition-receipt"),
+                    ("current_status", "current-status"),
+                    ("persisted_head", "persisted-head"),
+                )
+                if node_row.get("transition_kind")
+                == builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                else active_specs
+            )
+            for field, role in specs:
+                node_row[field] = reseal(node_row[field], node_row["node"], role)
+        bundle["object_inventory"] = inventory
+        bundle["aggregate_root_sha256"] = sha(
+            canonical(
+                {
+                    "schema": "arc.recovery.legacy-maintenance-evidence-inventory.v1",
+                    "objects": inventory,
+                }
+            )
+        )
+        bundle_payload = canonical(bundle)
+        bundle_sha = sha(bundle_payload)
+        write(self.bundle, bundle_payload, 0o400)
+        write(
+            self.bundle.with_name(self.bundle.name + ".sha256"),
+            f"{bundle_sha}  {self.bundle.name}\n".encode(),
+            0o400,
+        )
+
+        boundary_nodes = {row["node"]: row for row in boundary["nodes"]}
+        for name in stopped_names:
+            prior = boundary_nodes[name]
+            artifacts = stopped_artifacts[name]
+            stable_head = artifacts["transition"]["value"]["stable_head"]
+            boundary_nodes[name] = {
+                "node": name,
+                "host": prior["host"],
+                "origin": prior["origin"],
+                "transition_kind": (
+                    builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "authenticated_prefence_proof_sha256": prior[
+                    "authenticated_prefence_proof_sha256"
+                ],
+                "transition_receipt_sha256": artifacts["transition"]["sha256"],
+                "current_status_sha256": artifacts["current"]["sha256"],
+                "persistent_restart_fence_sha256": artifacts["fence_sha256"],
+                "stable_head": {
+                    "tuple": stable_head,
+                    "evidence_sha256": artifacts["transition"]["sha256"],
+                },
+                "final_persisted_head": {
+                    "tuple": stable_head,
+                    "evidence_sha256": artifacts["persisted"]["sha256"],
+                },
+            }
+        boundary["nodes"] = [boundary_nodes[name] for name, _host in builder.FLEET]
+        rows_by_node = {}
+        for row in boundary["evidence_heights"]:
+            rows_by_node.setdefault(row["node"], {})[row["label"]] = row
+        common_labels = (
+            "public_info_before", "public_latest", "public_info_after",
+            "authenticated_info_before", "authenticated_latest",
+            "authenticated_info_after", "authenticated_conservative_floor",
+        )
+        evidence_heights = []
+        for name, _host in builder.FLEET:
+            if name not in stopped_names:
+                evidence_heights.extend(rows_by_node[name].values())
+                continue
+            evidence_heights.extend(
+                copy.deepcopy(rows_by_node[name][label]) for label in common_labels
+            )
+            artifacts = stopped_artifacts[name]
+            stable_height = artifacts["transition"]["value"]["stable_head"]["height"]
+            evidence_heights.extend(
+                (
+                    {
+                        "node": name,
+                        "label": "transition_stable_head",
+                        "height": stable_height,
+                        "evidence_sha256": artifacts["transition"]["sha256"],
+                    },
+                    {
+                        "node": name,
+                        "label": "final_persisted_head",
+                        "height": stable_height,
+                        "evidence_sha256": artifacts["persisted"]["sha256"],
+                    },
+                )
+            )
+        boundary["evidence_heights"] = evidence_heights
+        boundary["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        boundary["network_quarantine_stability_proof_sha256"] = bundle[
+            "quarantine_stability_proof"
+        ]["sha256"]
+        boundary["legacy_maintenance_evidence_bundle_sha256"] = bundle_sha
+        boundary["observed_cutoff_height"] = max(
+            row["height"] for row in evidence_heights
+        )
+        boundary["legacy_public_max_height"] = boundary["observed_cutoff_height"] + 128
+        boundary_payload = canonical(boundary)
+        boundary_sha = sha(boundary_payload)
+        write(self.boundary, boundary_payload, 0o400)
+        write(
+            self.boundary.with_name(self.boundary.name + ".sha256"),
+            f"{boundary_sha}  {self.boundary.name}\n".encode(),
+            0o400,
+        )
+        self.rebuild_late_fork_source_set()
+
+        offline = json.loads(self.offline_stop.read_text())
+        offline_nodes = {row["node"]: row for row in offline["nodes"]}
+        final_bundle_nodes = {row["node"]: row for row in bundle["nodes"]}
+        for name in stopped_names:
+            bundle_node = final_bundle_nodes[name]
+            offline_nodes[name] = {
+                "node": name,
+                "host": dict(builder.FLEET)[name],
+                "transition_kind": (
+                    builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                ),
+                "transition_receipt_sha256": bundle_node[
+                    "transition_receipt"
+                ]["sha256"],
+                "current_status_sha256": bundle_node["current_status"]["sha256"],
+                "persisted_head_sha256": bundle_node["persisted_head"]["sha256"],
+            }
+        offline["nodes"] = [offline_nodes[name] for name, _host in builder.FLEET]
+        offline["legacy_maintenance_boundary"] = boundary
+        offline["legacy_maintenance_boundary_sha256"] = boundary_sha
+        offline["legacy_maintenance_evidence_bundle_sha256"] = bundle_sha
+        offline["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        offline_payload = canonical(offline)
+        write(self.offline_stop, offline_payload, 0o400)
+        write(
+            self.offline_stop.with_name(self.offline_stop.name + ".sha256"),
+            f"{sha(offline_payload)}  {self.offline_stop.name}\n".encode(),
+            0o400,
+        )
+        self.write_validator_receipts()
+
     def remote_verification(
         self,
         args: argparse.Namespace,
@@ -1068,6 +2174,8 @@ print(json.dumps(value,sort_keys=True))
         **_staged,
     ) -> dict:
         freeze = json.loads(self.freeze.read_text())
+        bundle = json.loads(self.bundle.read_text())
+        bundle_by_node = {row["node"]: row for row in bundle["nodes"]}
         capture = builder.rollout.capture_id_for_freeze_plan_hash(freeze_sha)
         now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1075,21 +2183,47 @@ print(json.dumps(value,sort_keys=True))
         for (node, host), frozen, remote in zip(
             builder.FLEET, freeze["nodes"], self.remote_stop_nodes
         ):
-            status = {
-                "schema": "arc.recovery.offline-stop-challenged-status.v1",
-                "capture_id": capture,
-                "node": node,
-                "host": host,
-                "freeze_plan_sha256": freeze_sha,
-                "validator_address": frozen["validator_address"],
-                "stake": frozen["stake"],
-                "stopped": True,
-                "restart_fenced": True,
-                "stop_schema": "arc.recovery.offline-stop.v4",
-                "stop_complete_sha256": remote["stop_complete_sha256"],
-                "stop_files_sha256": remote["stop_files_sha256"],
-                "challenge": challenge,
-            }
+            bundle_node = bundle_by_node[node]
+            if (
+                bundle_node.get("transition_kind")
+                == builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+            ):
+                current = copy.deepcopy(bundle_node["current_status"]["value"])
+                current["observed_at"] = timestamp
+                status = {
+                    "schema": (
+                        "arc.recovery.quarantine-persistently-stopped-"
+                        "challenged-status.v1"
+                    ),
+                    "capture_id": capture,
+                    "freeze_plan_sha256": freeze_sha,
+                    "node": node,
+                    "host": host,
+                    "transition_kind": (
+                        builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                    ),
+                    "transition_receipt": copy.deepcopy(
+                        bundle_node["transition_receipt"]
+                    ),
+                    "current_status": builder.quarantine_rounds.wrap(current),
+                    "challenge": challenge,
+                }
+            else:
+                status = {
+                    "schema": "arc.recovery.offline-stop-challenged-status.v1",
+                    "capture_id": capture,
+                    "node": node,
+                    "host": host,
+                    "freeze_plan_sha256": freeze_sha,
+                    "validator_address": frozen["validator_address"],
+                    "stake": frozen["stake"],
+                    "stopped": True,
+                    "restart_fenced": True,
+                    "stop_schema": "arc.recovery.offline-stop.v4",
+                    "stop_complete_sha256": remote["stop_complete_sha256"],
+                    "stop_files_sha256": remote["stop_files_sha256"],
+                    "challenge": challenge,
+                }
             rows.append(
                 {
                     "node": node,
@@ -1921,6 +3055,84 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuilderError, "already exists"):
             builder.prearchive(self.fixture.args())
 
+    def build_union_fixture(self, stopped_names: set[str]) -> tuple[dict, str]:
+        self.fixture.write_union_maintenance(stopped_names)
+        boundary = json.loads(self.fixture.boundary.read_text())
+        first = dt.datetime.strptime(
+            boundary["first_quarantine_started_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        all_stopped = dt.datetime.strptime(
+            boundary["all_controlled_stopped_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+        state = {
+            "capture_id": builder.rollout.capture_id_for_freeze_plan_hash(
+                self.fixture.freeze_sha
+            ),
+            "freeze_plan_sha256": self.fixture.freeze_sha,
+            "first_secured_at": first,
+            "all_nodes_secured_at": first,
+            "legacy_cutoff_height": 0,
+        }
+        with (
+            mock.patch.object(
+                builder.quarantine_rounds,
+                "validate_generation_ledger",
+                return_value=state,
+            ),
+            mock.patch.object(
+                builder.quarantine_rounds,
+                "validate_prior_fenced_status",
+                return_value=all_stopped,
+            ),
+            mock.patch.object(
+                builder.quarantine_rounds,
+                "validate_node_transition",
+                side_effect=lambda transition, **_kwargs: {
+                    "kind": (
+                        builder.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                    ),
+                    "node": transition["node"],
+                    "host": transition["host"],
+                },
+            ),
+        ):
+            return self.fixture.build()
+
+    def test_prearchive_accepts_exact_three_active_three_stopped_union(self) -> None:
+        value, _digest = self.build_union_fixture({"lhr", "nrt", "sgp"})
+        bundle = json.loads(self.fixture.bundle.read_text())
+        stability = bundle["quarantine_stability_proof"]["value"]
+        self.assertEqual(
+            [row["node"] for row in stability["nodes"]],
+            ["nyc", "lax", "ams"],
+        )
+        self.assertEqual(
+            value["chain"]["legacy_maintenance_evidence_bundle_sha256"],
+            sha(self.fixture.bundle.read_bytes()),
+        )
+
+    def test_prearchive_accepts_exact_all_stopped_zero_sample_union(self) -> None:
+        value, _digest = self.build_union_fixture(
+            {name for name, _host in builder.FLEET}
+        )
+        bundle = json.loads(self.fixture.bundle.read_text())
+        stability = bundle["quarantine_stability_proof"]["value"]
+        self.assertEqual(stability["nodes"], [])
+        self.assertEqual(stability["fleet_heads"], [])
+        self.assertEqual(stability["active_transition_sha256s"], [])
+        self.assertEqual(
+            (
+                stability["interval_seconds"],
+                stability["sample_count"],
+                stability["monotonic_elapsed_ns"],
+            ),
+            (0, 0, 0),
+        )
+        self.assertEqual(
+            value["chain"]["legacy_maintenance_evidence_bundle_sha256"],
+            sha(self.fixture.bundle.read_bytes()),
+        )
+
     def test_private_input_stage_is_create_only_and_breaks_caller_path_replacement(self) -> None:
         args = self.fixture.args()
         original_binary = self.fixture.binary.read_bytes()
@@ -1971,7 +3183,10 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             value["legacy_public_max_height"] = 1_000_127
 
         self.fixture.rewrite_boundary(raise_only_authenticated_height)
-        with self.assertRaisesRegex(builder.BuilderError, "boundary authenticated height differs"):
+        with self.assertRaisesRegex(
+            builder.BuilderError,
+            "evidence-height ledger differs from its retained proofs",
+        ):
             builder.prearchive(self.fixture.args())
 
         self.tearDown(); self.setUp()
@@ -1996,12 +3211,133 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuilderError, "schema differs"):
             builder.prearchive(self.fixture.args())
 
-    def test_prearchive_rejects_stale_tampered_duplicate_symlink_and_wrong_commit(self) -> None:
-        self.fixture.write_height(stale=True)
-        with self.assertRaisesRegex(builder.BuilderError, "stale"):
+    def test_post_freeze_builder_accepts_historical_receipt_at_exact_300_second_boundary(self) -> None:
+        public_completed = (
+            dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            - dt.timedelta(hours=2)
+        )
+        self.fixture.write_height(completed_at=public_completed)
+        self.fixture.write_offline_stop(
+            fleet_started_at=public_completed + dt.timedelta(seconds=1),
+            fleet_completed_at=public_completed + dt.timedelta(seconds=2),
+            first_quarantine_at=public_completed + dt.timedelta(seconds=300),
+            all_stopped_at=public_completed + dt.timedelta(seconds=301),
+            boundary_created_at=public_completed + dt.timedelta(seconds=302),
+        )
+        self.fixture.rebuild_late_fork_source_set()
+        self.fixture.write_validator_receipts()
+
+        value, _digest = self.fixture.build()
+        self.assertEqual(
+            value["chain"]["legacy_public_max_height"], 137635
+        )
+
+    def test_post_freeze_builder_rejects_301_seconds_with_recomputed_seals(self) -> None:
+        public_completed = (
+            dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            - dt.timedelta(hours=2)
+        )
+        self.fixture.write_height(completed_at=public_completed)
+        # Rebuild every dependent cross-proof, bundle wrapper, inventory root,
+        # boundary, embedded boundary, sidecar, and late-fork root.  Rehashing
+        # an internally coherent stale timeline must not bypass the 300s gate.
+        self.fixture.write_offline_stop(
+            fleet_started_at=public_completed + dt.timedelta(seconds=1),
+            fleet_completed_at=public_completed + dt.timedelta(seconds=2),
+            first_quarantine_at=public_completed + dt.timedelta(seconds=301),
+            all_stopped_at=public_completed + dt.timedelta(seconds=302),
+            boundary_created_at=public_completed + dt.timedelta(seconds=303),
+        )
+        self.fixture.rebuild_late_fork_source_set()
+        self.fixture.write_validator_receipts()
+
+        with self.assertRaisesRegex(builder.BuilderError, "outside its authorized deadline"):
+            builder.prearchive(self.fixture.args())
+
+    def test_post_freeze_builder_rejects_after_quarantine_and_reordered_brackets(self) -> None:
+        base = (
+            dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            - dt.timedelta(hours=2)
+        )
+        public_completed = base + dt.timedelta(seconds=3)
+        self.fixture.write_height(completed_at=public_completed)
+        self.fixture.write_offline_stop(
+            fleet_started_at=public_completed,
+            fleet_completed_at=public_completed,
+            first_quarantine_at=base + dt.timedelta(seconds=2),
+            all_stopped_at=base + dt.timedelta(seconds=4),
+            boundary_created_at=base + dt.timedelta(seconds=5),
+        )
+        self.fixture.rebuild_late_fork_source_set()
+        with self.assertRaisesRegex(
+            builder.BuilderError,
+            "outside its authorized deadline|timeline is not ordered|"
+            "nft apply intent was prepared after",
+        ):
             builder.prearchive(self.fixture.args())
 
         self.tearDown(); self.setUp()
+        self.fixture.write_height(completed_at=base)
+        self.fixture.write_offline_stop(
+            fleet_started_at=base + dt.timedelta(seconds=2),
+            fleet_completed_at=base + dt.timedelta(seconds=1),
+            first_quarantine_at=base + dt.timedelta(seconds=3),
+            all_stopped_at=base + dt.timedelta(seconds=4),
+            boundary_created_at=base + dt.timedelta(seconds=5),
+        )
+        self.fixture.rebuild_late_fork_source_set()
+        with self.assertRaisesRegex(
+            builder.BuilderError,
+            "timestamps are reversed|completed before start",
+        ):
+            builder.prearchive(self.fixture.args())
+
+    def test_capture_timeline_rejects_mismatched_receipt_binding_with_recomputed_wrapper(self) -> None:
+        height = json.loads(self.fixture.height.read_text())
+        bundle = json.loads(self.fixture.bundle.read_text())
+        boundary = json.loads(self.fixture.boundary.read_text())
+        offline = json.loads(self.fixture.offline_stop.read_text())
+        cross = copy.deepcopy(offline["legacy_height_cross_proof"])
+        cross["legacy_public_height_receipt_sha256"] = "f" * 64
+        cross_sha = sha(canonical(cross))
+        offline["legacy_height_cross_proof"] = copy.deepcopy(cross)
+        bundle["authenticated_prefence_height_cross_proof"] = {
+            "value": copy.deepcopy(cross),
+            "sha256": cross_sha,
+        }
+        boundary["authenticated_prefence_height_cross_proof_sha256"] = cross_sha
+
+        with self.assertRaisesRegex(builder.BuilderError, "capture timeline binding differs"):
+            builder.validate_sealed_legacy_height_capture_timeline(
+                args=self.fixture.args(),
+                freeze_sha=self.fixture.freeze_sha,
+                height_receipt=height,
+                height_receipt_sha=sha(self.fixture.height.read_bytes()),
+                evidence_bundle=bundle,
+                boundary=boundary,
+                offline_stop=offline,
+            )
+
+    def test_final_height_recheck_rejects_same_maximum_byte_substitution(self) -> None:
+        original_side_effect = builder.execute_installed_key_verifier.side_effect
+
+        def mutate_same_maximum(args, manifest):
+            value = json.loads(args.legacy_public_height_receipt.read_text())
+            value["origins"][0]["info_before_body_sha256"] = "e" * 64
+            write(args.legacy_public_height_receipt, canonical(value), 0o400)
+            return self.fixture.installed_key_proof(args, manifest)
+
+        builder.execute_installed_key_verifier.side_effect = mutate_same_maximum
+        try:
+            with self.assertRaisesRegex(
+                builder.BuilderError,
+                "legacy public-height receipt changed before prearchive publication",
+            ):
+                builder.prearchive(self.fixture.args())
+        finally:
+            builder.execute_installed_key_verifier.side_effect = original_side_effect
+
+    def test_prearchive_rejects_tampered_duplicate_symlink_and_wrong_commit(self) -> None:
         metadata = json.loads(self.fixture.build_metadata.read_text())
         metadata["commit"] = "7" * 40
         write(self.fixture.build_metadata, json.dumps(metadata, sort_keys=True, indent=2).encode() + b"\n", 0o444)
@@ -2226,7 +3562,17 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         )
 
     def test_remote_stop_verification_rejects_replay_partial_wrong_host_and_duplicate_key(self) -> None:
+        def reset_fixture() -> None:
+            # Every failed prearchive attempt intentionally leaves its private,
+            # content-addressed input stage behind.  Adversarial cases must use
+            # fresh source bytes and a fresh stage so one rejection cannot mask
+            # the next case with the stage-identity guard.
+            self.tearDown()
+            self.setUp()
+
         def rejected(mutator, message):
+            reset_fixture()
+
             def response(*args, **kwargs):
                 value = self.fixture.remote_verification(*args, **kwargs)
                 mutator(value)
@@ -2256,6 +3602,7 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             "topology differs",
         )
 
+        reset_fixture()
         original_known_hosts = self.fixture.known_hosts.read_bytes()
         lines = original_known_hosts.decode("ascii").splitlines()
         fields = lines[1].split(" ")
@@ -2265,18 +3612,22 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(builder.BuilderError, "repeats an Ed25519 host key"):
             builder.prearchive(self.fixture.args())
 
+        reset_fixture()
+        original_known_hosts = self.fixture.known_hosts.read_bytes()
         wrong_ip = original_known_hosts.replace(b"149.28.32.76 ", b"192.0.2.99 ", 1)
         write(self.fixture.known_hosts, wrong_ip, 0o400)
         with self.assertRaisesRegex(builder.BuilderError, "nyc address differs"):
             builder.prearchive(self.fixture.args())
 
+        reset_fixture()
+        original_known_hosts = self.fixture.known_hosts.read_bytes()
         malformed = original_known_hosts.decode("ascii").splitlines()
         malformed[0] = " ".join((*malformed[0].split(" ")[:2], "not-base64!"))
         write(self.fixture.known_hosts, ("\n".join(malformed) + "\n").encode(), 0o400)
         with self.assertRaisesRegex(builder.BuilderError, "not canonical base64"):
             builder.prearchive(self.fixture.args())
 
-        write(self.fixture.known_hosts, original_known_hosts, 0o400)
+        reset_fixture()
         real_known_hosts = self.fixture.root / "real-known-hosts"
         self.fixture.known_hosts.rename(real_known_hosts)
         self.fixture.known_hosts.symlink_to(real_known_hosts)

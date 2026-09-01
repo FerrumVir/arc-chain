@@ -12,6 +12,47 @@
 import { expect, test } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
+const COMMUNITY_WORKER = `0x${"11".repeat(32)}`;
+const REWARD_TX = `0x${"44".repeat(32)}`;
+const REWARD_JOB = `0x${"55".repeat(32)}`;
+const RECEIPT_URL = `/community/reward_receipt/${REWARD_TX}`;
+const BLOCK_HASH = `0x${"77".repeat(32)}`;
+
+function canonicalReceipt(
+  status:
+    | "pending_mined_receipt"
+    | "mined_success"
+    | "mined_failed"
+    | "receipt_unavailable",
+  patch: Record<string, unknown> = {},
+) {
+  const included = status !== "pending_mined_receipt";
+  const successful = status === "mined_success";
+  return {
+    status,
+    tx_type: "0x25",
+    tx_hash: REWARD_TX,
+    job_id: REWARD_JOB,
+    worker: COMMUNITY_WORKER,
+    submitted: true,
+    included,
+    confirmed: successful,
+    success:
+      status === "mined_success"
+        ? true
+        : status === "mined_failed"
+          ? false
+          : null,
+    block_height: included ? 123_470 : null,
+    block_hash: included ? BLOCK_HASH : null,
+    index: included ? 0 : null,
+    reward_base: successful ? 2_500_000_000 : null,
+    reward_arc: successful ? 2.5 : null,
+    receipt_url: RECEIPT_URL,
+    ...patch,
+  };
+}
+
 const COORD_PAYLOAD = {
   success: true,
   request_id: "0xtestrequest",
@@ -44,7 +85,7 @@ const COORD_PAYLOAD = {
 
 const COMMUNITY_PAYLOAD = {
   success: true,
-  routed_via: `community:0x${"11".repeat(32)}`,
+  routed_via: `community:${COMMUNITY_WORKER}`,
   inference: {
     input: "Biggest planet?",
     output: " Jupiter.",
@@ -71,13 +112,19 @@ const COMMUNITY_PAYLOAD = {
   settlement: {
     status: "pending_mined_receipt",
     tx_type: "0x25",
-    tx_hash: `0x${"44".repeat(32)}`,
-    job_id: `0x${"55".repeat(32)}`,
+    tx_hash: REWARD_TX,
+    job_id: REWARD_JOB,
+    worker: COMMUNITY_WORKER,
     submitted: true,
     included: false,
     confirmed: false,
-    reward_arc: 2.5,
-    receipt_url: `/community/reward_receipt/0x${"44".repeat(32)}`,
+    success: null,
+    block_height: null,
+    block_hash: null,
+    index: null,
+    reward_base: null,
+    reward_arc: null,
+    receipt_url: RECEIPT_URL,
   },
 };
 
@@ -126,6 +173,13 @@ test.describe("Inference - community-first coordinator routing", () => {
           height: 1,
           validators: 1,
         }),
+      }),
+    );
+    await page.route("**/community/reward_receipt/**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(canonicalReceipt("pending_mined_receipt")),
       }),
     );
 
@@ -213,6 +267,13 @@ test.describe("Inference - community-first coordinator routing", () => {
         }),
       }),
     );
+    await page.route("**/community/reward_receipt/**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(canonicalReceipt("pending_mined_receipt")),
+      }),
+    );
 
     await page.goto("/");
     await page.getByTestId("nav-inference").click();
@@ -232,7 +293,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     await expect(evidence).toContainText("authenticated quorum verified");
     const settlement = page.getByTestId("community-settlement");
     await expect(settlement).toContainText(
-      "0x25 submitted; not earned until a successful mined receipt",
+      "0x25 submitted; waiting for an independently fetched mined receipt",
     );
     await expect(page.getByTestId("inference-result")).toContainText(
       "0x25 reward tx",
@@ -254,7 +315,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("btn-lookup-reward").click();
     await expect(page.getByTestId("network-screen")).toBeVisible();
     await expect(page.getByTestId("tx-lookup-input")).toHaveValue(
-      `0x${"44".repeat(32)}`,
+      REWARD_TX,
     );
   });
 
@@ -277,6 +338,7 @@ test.describe("Inference - community-first coordinator routing", () => {
             tx_type: "0x16",
             included: true,
             confirmed: true,
+            success: true,
           },
         }),
       }),
@@ -299,7 +361,57 @@ test.describe("Inference - community-first coordinator routing", () => {
     await expect(page.getByTestId("btn-lookup-reward")).toHaveCount(0);
   });
 
-  test("a complete mined 0x25 receipt is shown as the exact confirmed protocol reward", async ({
+  test("submitted=false states say exactly that no 0x25 was submitted", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    let receiptFetches = 0;
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...COMMUNITY_PAYLOAD,
+          settlement: {
+            ...COMMUNITY_PAYLOAD.settlement,
+            status: "approval_not_ready",
+            submitted: false,
+          },
+        }),
+      }),
+    );
+    await page.route("**/community/reward_receipt/**", (route) => {
+      receiptFetches += 1;
+      return route.fulfill({ status: 500, body: "must not poll" });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("The largest planet is");
+    await page.getByTestId("btn-run-inference").click();
+
+    const settlement = page.getByTestId("community-settlement");
+    await expect(settlement).toContainText(
+      "No 0x25 was submitted (approval not ready); no ARC reward can be confirmed",
+    );
+    await expect(settlement).not.toContainText(
+      "submission did not bind the exact transaction",
+    );
+    await expect(settlement).toHaveAttribute(
+      "data-receipt-status",
+      "approval_not_ready",
+    );
+    await expect(page.getByTestId("btn-lookup-reward")).toHaveCount(0);
+    await expect(page.getByTestId("inference-result")).not.toContainText(
+      "0x25 reward tx",
+    );
+    expect(receiptFetches).toBe(0);
+  });
+
+  test("a submission claim remains provisional while the pinned receipt moves pending to success", async ({
     page,
   }) => {
     await seedOnboarded(page);
@@ -317,29 +429,144 @@ test.describe("Inference - community-first coordinator routing", () => {
             status: "mined_success",
             included: true,
             confirmed: true,
+            success: true,
+            reward_base: 2_500_000_000,
+            reward_arc: 2.5,
           },
         }),
       }),
     );
+    let receiptFetches = 0;
+    await page.route("**/community/reward_receipt/**", (route) => {
+      receiptFetches += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(
+          canonicalReceipt(
+            receiptFetches === 1 ? "pending_mined_receipt" : "mined_success",
+          ),
+        ),
+      });
+    });
 
     await page.goto("/");
     await page.getByTestId("nav-inference").click();
     await page.getByTestId("inference-prompt").fill("The largest planet is");
     await page.getByTestId("btn-run-inference").click();
 
-    await expect(page.getByTestId("community-settlement")).toContainText(
-      "2.5 ARC confirmed for the serving worker by a successful mined 0x25 receipt",
+    const settlement = page.getByTestId("community-settlement");
+    await expect(settlement).toContainText(
+      "waiting for an independently fetched mined receipt",
     );
+    await expect(settlement).toContainText(
+      "2.5 ARC confirmed for the serving worker by an independently fetched successful mined 0x25 receipt",
+      { timeout: 8_000 },
+    );
+    expect(receiptFetches).toBeGreaterThanOrEqual(2);
+  });
+
+  test("an independently fetched receipt can move pending to mined_failed without crediting ARC", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(COMMUNITY_PAYLOAD),
+      }),
+    );
+    let receiptFetches = 0;
+    await page.route("**/community/reward_receipt/**", (route) => {
+      receiptFetches += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(
+          canonicalReceipt(
+            receiptFetches === 1 ? "pending_mined_receipt" : "mined_failed",
+          ),
+        ),
+      });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("The largest planet is");
+    await page.getByTestId("btn-run-inference").click();
+
+    const settlement = page.getByTestId("community-settlement");
+    await expect(settlement).toContainText(
+      "waiting for an independently fetched mined receipt",
+    );
+    await expect(settlement).toContainText(
+      "0x25 receipt was mined but failed; no ARC reward was earned",
+      { timeout: 8_000 },
+    );
+    await expect(settlement).toHaveAttribute("data-receipt-status", "mined_failed");
+    await expect(settlement).not.toContainText("confirmed for the serving worker");
+  });
+
+  test("a canonical receipt_unavailable state is distinct from a mined failure", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(COMMUNITY_PAYLOAD),
+      }),
+    );
+    let receiptFetches = 0;
+    await page.route("**/community/reward_receipt/**", (route) => {
+      receiptFetches += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(canonicalReceipt("receipt_unavailable")),
+      });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("The largest planet is");
+    await page.getByTestId("btn-run-inference").click();
+
+    const settlement = page.getByTestId("community-settlement");
+    await expect(settlement).toContainText(
+      "Reward receipt unavailable; ARC earnings cannot be confirmed",
+    );
+    await expect(settlement).toHaveAttribute(
+      "data-receipt-status",
+      "receipt_unavailable",
+    );
+    await expect(settlement).not.toContainText("mined but failed");
+    await page.waitForTimeout(3_300);
+    expect(receiptFetches).toBe(1);
   });
 
   for (const invalid of [
-    { label: "non-mined status", patch: { status: "pending_mined_receipt" } },
-    { label: "missing submitted flag", patch: { submitted: false } },
-    { label: "wrong protocol amount", patch: { reward_arc: 25 } },
-    { label: "malformed transaction hash", patch: { tx_hash: "0x44" } },
-    { label: "malformed job identity", patch: { job_id: "not-a-job-hash" } },
+    { label: "wrong worker", patch: { worker: `0x${"12".repeat(32)}` } },
+    { label: "missing worker", patch: { worker: undefined } },
+    { label: "success false under mined_success", patch: { success: false } },
+    {
+      label: "receipt URL for another transaction",
+      patch: { receipt_url: `/community/reward_receipt/0x${"66".repeat(32)}` },
+    },
+    { label: "wrong base-unit reward", patch: { reward_base: 2_500_000_001 } },
+    { label: "missing block height", patch: { block_height: undefined } },
+    { label: "corrupt block hash", patch: { block_hash: "0x77" } },
+    { label: "negative transaction index", patch: { index: -1 } },
   ]) {
-    test(`an internally inconsistent 0x25 receipt fails closed: ${invalid.label}`, async ({
+    test(`an independently fetched 0x25 receipt fails closed: ${invalid.label}`, async ({
       page,
     }) => {
       await seedOnboarded(page);
@@ -350,16 +577,14 @@ test.describe("Inference - community-first coordinator routing", () => {
         route.fulfill({
           status: 200,
           contentType: "application/json",
-          body: JSON.stringify({
-            ...COMMUNITY_PAYLOAD,
-            settlement: {
-              ...COMMUNITY_PAYLOAD.settlement,
-              status: "mined_success",
-              included: true,
-              confirmed: true,
-              ...invalid.patch,
-            },
-          }),
+          body: JSON.stringify(COMMUNITY_PAYLOAD),
+        }),
+      );
+      await page.route("**/community/reward_receipt/**", (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(canonicalReceipt("mined_success", invalid.patch)),
         }),
       );
 
@@ -368,7 +593,15 @@ test.describe("Inference - community-first coordinator routing", () => {
       await page.getByTestId("inference-prompt").fill("The largest planet is");
       await page.getByTestId("btn-run-inference").click();
 
-      await expect(page.getByTestId("community-settlement")).not.toContainText(
+      const settlement = page.getByTestId("community-settlement");
+      await expect(settlement).toContainText(
+        "Reward receipt unavailable; ARC earnings cannot be confirmed",
+      );
+      await expect(settlement).toHaveAttribute(
+        "data-receipt-status",
+        "receipt_unavailable",
+      );
+      await expect(settlement).not.toContainText(
         "confirmed for the serving worker",
       );
     });

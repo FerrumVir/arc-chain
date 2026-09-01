@@ -175,6 +175,7 @@ pub struct ConfirmedRewardReceipt {
     pub block_hash: String,
     pub reward_base: u64,
     pub reward_arc: f64,
+    pub receipt_url: String,
     pub recovery_epoch: Option<u64>,
     pub validator_set_id: Option<u64>,
 }
@@ -217,6 +218,11 @@ pub struct Earnings {
     pub receipt_source: Option<String>,
     /// Whether the selected host reports archival state.
     pub archive_mode: Option<bool>,
+    /// Explicit backend assertion that archive history is complete from the
+    /// canonical v3 recovery boundary.
+    pub history_complete_since_recovery: Option<bool>,
+    /// Exact backend-declared reward-history boundary/window.
+    pub history_scope: Option<String>,
     /// True when these numbers came from the chain's `/worker/earnings`
     /// endpoint. False means they were synthesized locally and should be
     /// labelled as an estimate.
@@ -386,12 +392,29 @@ pub struct InferenceSettlement {
     pub tx_hash: String,
     #[serde(default)]
     pub job_id: String,
+    /// Exact worker identity bound into the 0x25 transaction body. The UI
+    /// must match this against both `routed_via` and the independently fetched
+    /// canonical receipt before presenting a reward as confirmed.
+    #[serde(default)]
+    pub worker: String,
     #[serde(default)]
     pub submitted: bool,
     #[serde(default)]
     pub included: bool,
     #[serde(default)]
     pub confirmed: bool,
+    /// `Some(true)` only for a successful mined receipt, `Some(false)` for a
+    /// mined failure, and `None` while no receipt exists.
+    #[serde(default)]
+    pub success: Option<bool>,
+    #[serde(default)]
+    pub block_height: Option<u64>,
+    #[serde(default)]
+    pub block_hash: Option<String>,
+    #[serde(default)]
+    pub index: Option<u64>,
+    #[serde(default)]
+    pub reward_base: Option<u64>,
     #[serde(default)]
     pub reward_arc: Option<f64>,
     #[serde(default)]

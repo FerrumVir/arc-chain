@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +26,9 @@ OUTPUT_HASH = "0x" + "6" * 64
 class ProbeHandler(BaseHTTPRequestHandler):
     profile = CANONICAL_PROFILE
     replay = False
+    replay_mined = False
+    settlement_patch: dict[str, Any] = {}
+    settlement_drop: set[str] = set()
     post_requests: list[dict[str, Any]] = []
 
     def log_message(self, _format: str, *_args: Any) -> None:
@@ -61,25 +65,49 @@ class ProbeHandler(BaseHTTPRequestHandler):
             return
         self.post_requests.append(request)
         if self.replay:
+            settlement = {
+                "status": "mined_success" if self.replay_mined else "pending_mined_receipt",
+                "tx_type": "0x25",
+                "tx_hash": TX_HASH,
+                "job_id": JOB_ID,
+                "worker": WORKER,
+                "validator_approvals": 5,
+                "submitted": True,
+                "included": self.replay_mined,
+                "confirmed": self.replay_mined,
+                "success": True if self.replay_mined else None,
+                "receipt_url": f"/community/reward_receipt/{TX_HASH}",
+            }
+            settlement.update(self.settlement_patch)
+            for field in self.settlement_drop:
+                settlement.pop(field, None)
             self.send_json(
                 {
                     "success": True,
                     "idempotent_replay": True,
                     "recovery_probe_id": request["recovery_probe_id"],
                     "job_id": JOB_ID,
-                    "settlement": {
-                        "status": "pending_mined_receipt",
-                        "tx_type": "0x25",
-                        "tx_hash": TX_HASH,
-                        "job_id": JOB_ID,
-                        "worker": WORKER,
-                        "validator_approvals": 5,
-                        "submitted": True,
-                        "included": False,
-                    },
+                    "settlement": settlement,
                 }
             )
             return
+        settlement = {
+            "status": "pending_mined_receipt",
+            "tx_type": "0x25",
+            "tx_hash": TX_HASH,
+            "job_id": JOB_ID,
+            "worker": WORKER,
+            "validator_approvals": 5,
+            "required_validator_approvals": 5,
+            "submitted": True,
+            "included": False,
+            "confirmed": False,
+            "success": None,
+            "receipt_url": f"/community/reward_receipt/{TX_HASH}",
+        }
+        settlement.update(self.settlement_patch)
+        for field in self.settlement_drop:
+            settlement.pop(field, None)
         self.send_json(
             {
                 "success": True,
@@ -101,16 +129,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
                     "signatures_required_per_quorum": 2,
                     "replicas_contacted_per_quorum": 3,
                 },
-                "settlement": {
-                    "status": "pending_mined_receipt",
-                    "tx_type": "0x25",
-                    "tx_hash": TX_HASH,
-                    "job_id": JOB_ID,
-                    "validator_approvals": 5,
-                    "required_validator_approvals": 5,
-                    "submitted": True,
-                    "included": False,
-                },
+                "settlement": settlement,
             }
         )
 
@@ -134,6 +153,9 @@ class CommunityRewardProbeTests(unittest.TestCase):
             thread.join(timeout=2)
         ProbeHandler.profile = CANONICAL_PROFILE
         ProbeHandler.replay = False
+        ProbeHandler.replay_mined = False
+        ProbeHandler.settlement_patch = {}
+        ProbeHandler.settlement_drop = set()
         ProbeHandler.post_requests = []
 
     def run_probe(self, *extra_args: str) -> subprocess.CompletedProcess[str]:
@@ -186,6 +208,55 @@ class CommunityRewardProbeTests(unittest.TestCase):
             {"tx_hash": TX_HASH, "job_id": JOB_ID, "worker": WORKER},
         )
         self.assertEqual(len(ProbeHandler.post_requests), 1)
+
+    def test_retry_accepts_only_a_complete_successful_mined_state(self) -> None:
+        ProbeHandler.replay = True
+        ProbeHandler.replay_mined = True
+        result = self.run_probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"tx_hash": TX_HASH, "job_id": JOB_ID, "worker": WORKER},
+        )
+
+    def test_retry_rejects_receipt_unavailable_without_waiting_for_timeout(self) -> None:
+        ProbeHandler.replay = True
+        ProbeHandler.settlement_patch = {
+            "status": "receipt_unavailable",
+            "included": True,
+            "confirmed": False,
+            "success": None,
+        }
+        started = time.monotonic()
+        result = self.run_probe()
+        elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("receipt is unavailable", result.stderr)
+        self.assertLess(elapsed, 3.0, "terminal receipt loss must fail before polling timeout")
+
+    def test_inconsistent_transaction_evidence_fails_closed(self) -> None:
+        cases = [
+            (False, {"submitted": False}, set()),
+            (False, {"confirmed": True}, set()),
+            (False, {"success": True}, set()),
+            (False, {"receipt_url": f"/community/reward_receipt/0x{'9' * 64}"}, set()),
+            (False, {"worker": "0x" + "9" * 64}, set()),
+            (False, {}, {"worker"}),
+            (False, {}, {"success"}),
+            (True, {"tx_type": "0x16"}, set()),
+            (True, {"included": True}, set()),
+            (True, {"success": False}, set()),
+        ]
+        for replay, patch, dropped in cases:
+            with self.subTest(replay=replay, patch=patch, dropped=dropped):
+                ProbeHandler.replay = replay
+                ProbeHandler.settlement_patch = patch
+                ProbeHandler.settlement_drop = dropped
+                ProbeHandler.post_requests = []
+                result = self.run_probe()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
 
     def test_tampered_probe_identity_fails_before_network_mutation(self) -> None:
         result = self.run_probe("--recovery-probe-id", "0x" + "f" * 64)

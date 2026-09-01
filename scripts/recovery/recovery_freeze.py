@@ -1468,8 +1468,10 @@ def validate_pinned_freeze_plan(
     budget = _require_uint(
         drive["daily_upload_budget_bytes"], "Drive daily upload budget", positive=True
     )
-    if budget > 700 * 1024**3:
-        raise FreezeValidationError("Drive daily upload budget exceeds 700 GiB")
+    if budget > 700_000_000_000:
+        raise FreezeValidationError(
+            "Drive daily upload budget exceeds the 700 GB decimal operational ceiling"
+        )
     if drive["dedicated_no_other_upload_writers_attested"] is not True:
         raise FreezeValidationError("Drive uploader exclusivity is not attested")
     if 3 * sum(node.value()["data_bytes"] for node in nodes) + 32 * 1024**3 > budget:

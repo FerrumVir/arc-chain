@@ -167,6 +167,47 @@ def sealed_coordinator(origins: list[str], rollout_sha256: str) -> str:
     return origins[int.from_bytes(digest[:8], "big") % len(origins)]
 
 
+def require_reward_transaction_state(
+    settlement: dict[str, Any],
+    field: str,
+    allowed_statuses: set[str],
+) -> str:
+    """Validate the complete fail-closed 0x25 receipt state machine."""
+    status = settlement.get("status")
+    if status not in allowed_statuses:
+        fail(f"{field}.status is not an allowed transaction state: {status!r}")
+    if settlement.get("tx_type") != "0x25":
+        fail(f"{field}.tx_type must be '0x25'")
+    expected = {
+        "pending_mined_receipt": {
+            "submitted": True,
+            "included": False,
+            "confirmed": False,
+            "success": None,
+        },
+        "mined_success": {
+            "submitted": True,
+            "included": True,
+            "confirmed": True,
+            "success": True,
+        },
+        "mined_failed": {
+            "submitted": True,
+            "included": True,
+            "confirmed": False,
+            "success": False,
+        },
+    }[status]
+    for name, wanted in expected.items():
+        if name not in settlement or settlement[name] is not wanted:
+            fail(f"{field}.{name} expected {wanted!r}, got {settlement.get(name)!r}")
+    tx_hash = require_hash(settlement.get("tx_hash"), f"{field}.tx_hash")
+    expected_url = f"/community/reward_receipt/{tx_hash}"
+    if settlement.get("receipt_url") != expected_url:
+        fail(f"{field}.receipt_url differs from its exact transaction")
+    return tx_hash
+
+
 def evidence_from_inference(
     value: Any, origin: str, expected_probe_id: str
 ) -> dict[str, str]:
@@ -205,21 +246,20 @@ def evidence_from_inference(
         fail("verification did not contact all three sealed replicas per range/position")
 
     settlement = require_object(body.get("settlement"), f"{origin} settlement evidence")
-    exact = {
-        "status": "pending_mined_receipt",
-        "tx_type": "0x25",
-        "submitted": True,
-        "included": False,
-    }
-    for field, expected in exact.items():
-        if settlement.get(field) != expected:
-            fail(f"settlement.{field} expected {expected!r}, got {settlement.get(field)!r}")
+    tx_hash = require_reward_transaction_state(
+        settlement,
+        "settlement",
+        {"pending_mined_receipt"},
+    )
+    settlement_worker = require_hash(settlement.get("worker"), "settlement.worker")
+    if settlement_worker != worker_id:
+        fail("settlement.worker differs from the community worker that served inference")
     require_int(settlement.get("validator_approvals"), "settlement.validator_approvals", 5)
     if settlement.get("required_validator_approvals") != 5:
         fail("settlement does not commit to the five-of-six approval rule")
 
     return {
-        "tx_hash": require_hash(settlement.get("tx_hash"), "settlement.tx_hash"),
+        "tx_hash": tx_hash,
         "job_id": require_hash(settlement.get("job_id"), "settlement.job_id"),
         "worker": worker_id,
     }
@@ -241,17 +281,37 @@ def evidence_from_replay(
     latest: Any = body.get("settlement")
     last_error = "settlement has not exposed a transaction"
     while time.monotonic() < deadline:
+        if isinstance(latest, dict) and latest.get("status") == "mined_failed":
+            fail(f"{origin} recovery reward transaction mined unsuccessfully")
+        if isinstance(latest, dict) and latest.get("status") == "receipt_unavailable":
+            fail(f"{origin} recovery reward receipt is unavailable")
         try:
             settlement = require_object(latest, f"{origin} recovery settlement")
             if require_hash(settlement.get("job_id"), "settlement.job_id") != job_id:
                 fail(f"{origin} replay settlement changed job identity")
-            if settlement.get("status") == "mined_failed":
-                fail(f"{origin} recovery reward transaction mined unsuccessfully")
             if settlement.get("status") in {"pending_mined_receipt", "mined_success"}:
+                tx_hash = require_reward_transaction_state(
+                    settlement,
+                    "settlement",
+                    {"pending_mined_receipt", "mined_success"},
+                )
+                settlement_worker = require_hash(
+                    settlement.get("worker"), "settlement.worker"
+                )
+                body_worker = body.get("worker")
+                if body_worker is not None:
+                    routed_worker = require_hash(
+                        require_object(body_worker, "worker").get("worker_id"),
+                        "worker.worker_id",
+                    )
+                    if settlement_worker != routed_worker:
+                        fail("replay settlement.worker differs from routed worker evidence")
+                    if body.get("routed_via") != f"community:{routed_worker}":
+                        fail("replay routed_via differs from its worker evidence")
                 return {
-                    "tx_hash": require_hash(settlement.get("tx_hash"), "settlement.tx_hash"),
+                    "tx_hash": tx_hash,
                     "job_id": job_id,
-                    "worker": require_hash(settlement.get("worker"), "settlement.worker"),
+                    "worker": settlement_worker,
                 }
             last_error = f"status is {settlement.get('status')!r}"
         except ProbeError as error:

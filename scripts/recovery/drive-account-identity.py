@@ -80,8 +80,8 @@ def _trim_ascii(raw: bytearray, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
-def _selected_remote_token(raw: bytearray, remote_name: str) -> str:
-    """Parse only enough of rclone's selected-remote INI to extract its token."""
+def _selected_remote_credentials(raw: bytearray, remote_name: str) -> tuple[str, str]:
+    """Hash the custom client and extract the bearer from one selected config."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", remote_name):
         raise IdentityError("unsafe-remote-name")
 
@@ -89,6 +89,8 @@ def _selected_remote_token(raw: bytearray, remote_name: str) -> str:
     selected = False
     keys = set()
     backend_type = None
+    client_id_range = None
+    client_secret_range = None
     token_range = None
     service_account_present = False
     cursor = 0
@@ -132,6 +134,10 @@ def _selected_remote_token(raw: bytearray, remote_name: str) -> str:
                 backend_type = bytes(raw[value_start:value_end]).decode("ascii")
             except UnicodeError as error:
                 raise IdentityError("invalid-selected-config") from error
+        elif key == "client_id":
+            client_id_range = (value_start, value_end)
+        elif key == "client_secret":
+            client_secret_range = (value_start, value_end)
         elif key == "token":
             token_range = (value_start, value_end)
         elif key in ("service_account_file", "service_account_credentials"):
@@ -145,13 +151,39 @@ def _selected_remote_token(raw: bytearray, remote_name: str) -> str:
         raise IdentityError("selected-config-not-drive")
     if service_account_present:
         raise IdentityError("service-account-config-forbidden")
+    if client_id_range is None or client_id_range[0] == client_id_range[1]:
+        raise IdentityError("selected-config-client-id-missing")
+    if client_secret_range is None or client_secret_range[0] == client_secret_range[1]:
+        raise IdentityError("selected-config-client-secret-missing")
     if token_range is None or token_range[0] == token_range[1]:
         raise IdentityError("selected-config-token-missing")
 
+    client_id_bytes = bytearray(raw[client_id_range[0] : client_id_range[1]])
+    client_secret_bytes = bytearray(
+        raw[client_secret_range[0] : client_secret_range[1]]
+    )
     token_bytes = bytearray(raw[token_range[0] : token_range[1]])
+    client_hash = None
     token = None
     access_token = None
     try:
+        if (
+            not 1 <= len(client_id_bytes) <= 16 * 1024
+            or client_id_bytes == b"XXX"
+            or b"\x00" in client_id_bytes
+        ):
+            raise IdentityError("selected-config-client-id-invalid")
+        try:
+            client_id_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise IdentityError("selected-config-client-id-invalid") from error
+        if (
+            not 1 <= len(client_secret_bytes) <= 16 * 1024
+            or client_secret_bytes == b"XXX"
+            or b"\x00" in client_secret_bytes
+        ):
+            raise IdentityError("selected-config-client-secret-invalid")
+        client_hash = hashlib.sha256(client_id_bytes).hexdigest()
         try:
             token = json.loads(token_bytes, object_pairs_hook=_reject_duplicate_keys)
         except (UnicodeError, json.JSONDecodeError) as error:
@@ -169,21 +201,22 @@ def _selected_remote_token(raw: bytearray, remote_name: str) -> str:
             raise IdentityError("selected-config-access-token-invalid")
         if not isinstance(token_type, str) or token_type.casefold() != "bearer":
             raise IdentityError("selected-config-token-type-invalid")
-        return access_token
+        return client_hash, access_token
     finally:
         if isinstance(token, dict):
             token.clear()
-        if token_bytes is not None:
-            for index in range(len(token_bytes)):
-                token_bytes[index] = 0
+        for sensitive in (client_id_bytes, client_secret_bytes, token_bytes):
+            for index in range(len(sensitive)):
+                sensitive[index] = 0
+        client_hash = None
         token = None
         access_token = None
 
 
-def read_selected_remote_token(remote_name: str) -> str:
+def read_selected_remote_credentials(remote_name: str) -> tuple[str, str]:
     raw = _read_stdin_bounded()
     try:
-        return _selected_remote_token(raw, remote_name)
+        return _selected_remote_credentials(raw, remote_name)
     finally:
         for index in range(len(raw)):
             raw[index] = 0
@@ -347,13 +380,14 @@ def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("drive-account-identity: expected one selected remote name", file=sys.stderr)
         return 2
+    client_hash = None
     access_token = None
     account_hash = None
     permission_hash = None
     try:
-        access_token = read_selected_remote_token(argv[1])
+        client_hash, access_token = read_selected_remote_credentials(argv[1])
         account_hash, permission_hash = query_drive_identity(access_token)
-        print(account_hash, permission_hash)
+        print(client_hash, account_hash, permission_hash)
         return 0
     except IdentityError as error:
         print(f"drive-account-identity: {error.code}", file=sys.stderr)
@@ -362,6 +396,7 @@ def main(argv: list[str]) -> int:
         print("drive-account-identity: internal-error", file=sys.stderr)
         return 1
     finally:
+        client_hash = None
         access_token = None
         account_hash = None
         permission_hash = None

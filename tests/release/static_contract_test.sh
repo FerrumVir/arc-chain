@@ -1772,6 +1772,10 @@ production_manifest_builder_is_release_gated() {
         'ssh_known_hosts' \
         'MAX_OFFLINE_STOP_VERIFICATION_AGE_SECONDS = 300' \
         'MAX_OFFLINE_STOP_VERIFICATION_DURATION_MS = 120_000' \
+        'MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS = 300' \
+        'load_intrinsic_legacy_public_height_receipt' \
+        'validate_sealed_legacy_height_capture_timeline' \
+        'quarantine_generation_ledger_sha256' \
         'CADDY_LINUX_AMD64_SHA256' \
         'ARCHIVE_FINALIZATION_FIELDS' \
         'prearchive_projection_digest' \
@@ -1808,6 +1812,8 @@ production_manifest_builder_is_release_gated() {
         '--ssh-sha256' \
         'reviewed Python path differs from /usr/bin/python3 resolution' \
         'arc.recovery.offline-stop-remote-verification.v1' \
+        'first-quarantine public-height authorization timeline is not ordered' \
+        'first-quarantine public-height receipt exceeded the 300-second live boundary' \
         'ssh-known-hosts'
     do
         grep -Fq -- "$required" "$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh" \

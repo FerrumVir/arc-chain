@@ -277,22 +277,41 @@ test("different-height samples cannot be called consistent", () => {
   assert.equal(audit.state, "unknown");
 });
 
+const canonicalRewardActivity = (overrides = {}) => ({
+  schema: "arc.inference.activity.v1",
+  record_kind: "mined_community_inference_reward",
+  source: "chain_receipt",
+  mined: true,
+  receipt_status: "success",
+  success: true,
+  computed: true,
+  paid: true,
+  earned: true,
+  submitted: true,
+  included: true,
+  confirmed: true,
+  tx_type: "CommunityInferenceReward",
+  tx_type_code: "0x25",
+  tx_hash: hex("d"),
+  job_id: hex("c"),
+  worker: hex("b"),
+  receipt_url: `/community/reward_receipt/0x${hex("d")}`,
+  block_height: H + 3,
+  block_hash: hex("a"),
+  index: 0,
+  reward_base: 2_500_000_000,
+  reward_arc: 2.5,
+  payment: {
+    status: "earned",
+    receipt_backed: true,
+    reward_base: 2_500_000_000,
+    reward_arc: 2.5,
+  },
+  ...overrides,
+});
+
 test("reward earnings require a successful mined receipt", () => {
-  const result = network.classifyReceipt({
-    schema: "arc.inference.activity.v1",
-    record_kind: "mined_community_inference_reward",
-    source: "chain_receipt",
-    mined: true,
-    receipt_status: "success",
-    success: true,
-    computed: true,
-    paid: true,
-    earned: true,
-    tx_type: "CommunityInferenceReward",
-    tx_type_code: "0x25",
-    tx_hash: hex("d"),
-    block_height: H + 3,
-  });
+  const result = network.classifyReceipt(canonicalRewardActivity());
   assert.equal(result.rewardEarned, true);
   assert.equal(result.category, "reward");
   assert.equal(result.inferenceConfirmed, true);
@@ -307,20 +326,7 @@ test("submitted rewards are not earnings", () => {
 });
 
 test("reward-like names and incomplete canonical reward identities never prove payment", () => {
-  const common = {
-    schema: "arc.inference.activity.v1",
-    record_kind: "mined_community_inference_reward",
-    source: "chain_receipt",
-    mined: true,
-    receipt_status: "success",
-    success: true,
-    computed: true,
-    paid: true,
-    earned: true,
-    tx_type_code: "0x25",
-    tx_hash: hex("d"),
-    block_height: H + 3,
-  };
+  const common = canonicalRewardActivity({ tx_type: undefined });
   for (const tx_type of ["InferenceRewardBogus", "CommunityRewardPreview"]) {
     const result = network.classifyReceipt({ ...common, tx_type });
     assert.equal(result.category, "transaction");
@@ -330,23 +336,28 @@ test("reward-like names and incomplete canonical reward identities never prove p
   }
   const missingRecordKind = network.classifyReceipt({ ...common, record_kind: undefined, tx_type: "CommunityInferenceReward" });
   assert.equal(missingRecordKind.paymentConfirmed, false);
+  for (const patch of [
+    { submitted: false },
+    { included: false },
+    { confirmed: false },
+    { success: false },
+    { receipt_url: `/community/reward_receipt/0x${hex("e")}` },
+    { worker: undefined },
+    { job_id: "not-a-hash" },
+    { block_hash: undefined },
+    { index: -1 },
+    { reward_base: 2_499_999_999 },
+    { reward_arc: 2.49 },
+    { payment: { status: "earned", receipt_backed: true, reward_base: 2_500_000_000, reward_arc: 2.49 } },
+  ]) {
+    const result = network.classifyReceipt({ ...common, tx_type: "CommunityInferenceReward", ...patch });
+    assert.equal(result.paymentConfirmed, false);
+    assert.equal(result.rewardEarned, false);
+  }
 });
 
 test("canonical payment evidence requires a valid 32-byte transaction hash", () => {
-  const common = {
-    schema: "arc.inference.activity.v1",
-    record_kind: "mined_community_inference_reward",
-    source: "chain_receipt",
-    mined: true,
-    receipt_status: "success",
-    success: true,
-    computed: true,
-    paid: true,
-    earned: true,
-    tx_type: "CommunityInferenceReward",
-    tx_type_code: "0x25",
-    block_height: H + 3,
-  };
+  const common = canonicalRewardActivity({ tx_hash: undefined });
   for (const tx_hash of [undefined, "not-a-hash", hex("d").slice(2)]) {
     const result = network.classifyReceipt({ ...common, tx_hash });
     assert.equal(result.txHash, null);

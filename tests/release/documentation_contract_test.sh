@@ -13,6 +13,9 @@ WALKTHROUGH="$REPO_ROOT/docs/COMMUNITY-NODE-WALKTHROUGH.md"
 ROLLOUT="$REPO_ROOT/docs/VALIDATOR-FLEET-ROLLOUT.md"
 RECOVERY_README="$REPO_ROOT/scripts/recovery/README.md"
 ARCHIVE_TOOL="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
+DRIVE_PREFREEZE_GATE="$REPO_ROOT/scripts/recovery/verify-drive-prefreeze.sh"
+DRIVE_IDENTITY_HELPER="$REPO_ROOT/scripts/recovery/drive-account-identity.py"
+DRIVE_PREFREEZE_TEST="$REPO_ROOT/tests/release/drive_prefreeze_gate_test.sh"
 CANARY_RUNBOOK="$REPO_ROOT/docs/MACOS-PRETAG-COMMUNITY-CANARY.md"
 CANARY_HELPER="$REPO_ROOT/scripts/release/macos-community-canary.py"
 VAULT_HELPER="$REPO_ROOT/scripts/release/restore-validator-vault.py"
@@ -37,6 +40,11 @@ require_literal() {
         printf '%s: %s\n' "$message" "$literal"
         return 1
     }
+}
+
+first_literal_line() {
+    local file="$1" literal="$2"
+    grep -nF -- "$literal" "$file" | head -n 1 | cut -d: -f1
 }
 
 candidate_version_is_consistent() {
@@ -175,6 +183,12 @@ production_origins_and_evidence_are_exact() {
         'README does not define fail-closed projected earnings' || return 1
     require_literal "$WALKTHROUGH" '/community/reward_receipt/$ARC_REWARD_TX' \
         'walkthrough does not poll the exact reward receipt endpoint' || return 1
+    require_literal "$WALKTHROUGH" 'mined_failed|receipt_unavailable)' \
+        'walkthrough does not stop on the exact terminal reward failure states' || return 1
+    require_literal "$WALKTHROUGH" '.submitted==true and .included==true' \
+        'walkthrough does not require submitted and included receipt evidence' || return 1
+    require_literal "$WALKTHROUGH" '.receipt_url==( "/community/reward_receipt/" + .tx_hash )' \
+        'walkthrough does not bind receipt_url to the exact transaction' || return 1
 
     require_literal "$README" 'SHA-pinned Caddy 2.11.4' \
         'README omits the exact candidate direct-IP TLS gateway' || return 1
@@ -356,22 +370,22 @@ activation_and_archived_guides_fail_closed_in_copy() {
 
 readme_counts_and_desktop_secret_copy_match_the_tree() {
     local rust_lines rust_tests
-    rust_lines="$(find "$REPO_ROOT/crates" "$REPO_ROOT/agents" "$REPO_ROOT/relayer" \
-        -type f -name '*.rs' -print0 | xargs -0 wc -l | awk 'END { print $1 }')"
-    rust_tests="$(find "$REPO_ROOT/crates" "$REPO_ROOT/agents" "$REPO_ROOT/relayer" \
-        -type f -name '*.rs' -print0 | xargs -0 grep -Eh \
-        '^[[:space:]]*#\[(tokio::)?test' | wc -l | tr -d ' ')"
-    [ "$rust_lines" -ge 175000 ] || {
-        printf 'README 175K+ Rust badge exceeds current measured source lines: %s\n' "$rust_lines"
+    rust_lines="$(cd "$REPO_ROOT" && git ls-files -z -- '*.rs' ':(exclude)vendor/**' | \
+        xargs -0 wc -l | awk 'END { print $1 }')"
+    rust_tests="$(cd "$REPO_ROOT" && git ls-files -z -- '*.rs' ':(exclude)vendor/**' | \
+        xargs -0 grep -Eh '^[[:space:]]*#\[(tokio::)?test' | wc -l | tr -d ' ')"
+    [ "$rust_lines" -ge 196000 ] || {
+        printf 'README 196K+ Rust badge exceeds current measured non-vendored source lines: %s\n' "$rust_lines"
         return 1
     }
-    [ "$rust_tests" -ge 1800 ] || {
-        printf 'README 1,800+ Rust-test badge exceeds current defined tests: %s\n' "$rust_tests"
+    [ "$rust_tests" -ge 1900 ] || {
+        printf 'README 1,900+ Rust-test badge exceeds current non-vendored defined tests: %s\n' "$rust_tests"
         return 1
     }
     for literal in \
-        'more than 175,000 physical lines of Rust' \
-        'More than 1,800 Rust test functions' \
+        'more than 196,000 physical lines of checked-in,' \
+        'More than 1,900 Rust test functions' \
+        'non-vendored Rust across ARC' \
         'plus one narrowly' \
         'vendored `wasmer-derive` workspace member'
     do
@@ -482,7 +496,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
         -name '*.spec.ts' | wc -l | tr -d ' ')"
     assert_equals 20 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '211 tests in' \
+    require_literal "$DESKTOP_README" '225 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
     require_literal "$DESKTOP_README" '20 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
@@ -499,7 +513,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '211 tests in 20 files' "$playwright_inventory" \
+        assert_equals '225 tests in 20 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 
@@ -633,14 +647,23 @@ hardened_canary_and_vault_commands_match_current_parsers() {
             'validator rollout omits required vault proof option' || return 1
     done
     help="$(python3 "$VAULT_HELPER" install --help)" || return 1
-    for option in --ssh-identity --ssh-identity-sha256
+    for option in \
+        --legacy-maintenance-evidence-bundle \
+        --legacy-maintenance-evidence-bundle-sidecar \
+        --legacy-maintenance-evidence-bundle-sha256 \
+        --legacy-maintenance-boundary \
+        --legacy-maintenance-boundary-sidecar \
+        --legacy-maintenance-boundary-sha256 \
+        --ssh-identity --ssh-identity-sha256
     do
         printf '%s\n' "$help" | grep -Fq -- "$option" || {
             printf 'vault install parser omits documented option: %s\n' "$option"
             return 1
         }
         require_literal "$ROLLOUT" "$option" \
-            'validator rollout omits explicit SSH identity option' || return 1
+            'validator rollout omits required vault install option' || return 1
+        require_literal "$RECOVERY_README" "$option" \
+            'recovery README omits required vault install option' || return 1
     done
     if grep -Eq -- '--use-ssh-agent|--arc-cli-build-metadata|--arc-cli-sha256|--genesis-sha256' \
         "$ROLLOUT"; then
@@ -715,6 +738,630 @@ recovery_archive_commands_are_exact_and_resumable() {
                 'operator docs omit the exact nginx/Caddy security boundary' || return 1
         done
     done
+
+    for literal in \
+        'scripts/recovery/legacy-public-height.py sample' \
+        '--timeout-seconds 10' \
+        'scripts/release/select-pretag-artifacts.py' \
+        'scripts/release/verify-pretag-run-and-artifacts.sh' \
+        'scripts/release/materialize-pretag-artifacts.py' \
+        'arc.recovery.pretag-artifact-input-set.v1' \
+        '/etc/ssl/certs/ca-certificates.crt' \
+        '527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9' \
+        'b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9' \
+        'offline_signer "$signing_binary" recovery sign' \
+        'offline_signer "$arc_node_linux" recovery verify' \
+        '/proc/self/fd/9 --config /proc/self/fd/8' \
+        '--expected-prearchive-rollout-sha256' \
+        '--output "$finalizer_attempt"'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits an exact protected materialization/finalization command' \
+            || return 1
+    done
+    for literal in \
+        '/secure/operator/arc-offline-stop-evidence.json' \
+        '/secure/operator/arc-validator-maintenance-ed25519' \
+        '/secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json' \
+        '/secure/operator/arc-recovery-final.lock.json'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits a canonical operator path' || return 1
+        require_literal "$ROLLOUT" "$literal" \
+            'validator rollout omits a canonical operator path' || return 1
+    done
+    if grep -Eq '/secure/operator/(offline-stop-evidence\.json|arc-validator-key-install\.json|id_arc_recovery_ed25519|arc-recovery\.final(\.lock)?\.json)' \
+        "$RECOVERY_README" "$ROLLOUT"; then
+        printf 'operator runbooks retain a contradictory pre-normalization path\n'
+        return 1
+    fi
+}
+
+operator_recovery_commands_are_linux_pinned_and_ordered() {
+    local file literal pair count line previous audit_block
+
+    (
+        local procedure_file rollout_file
+        procedure_file="$(mktemp)" || exit 1
+        rollout_file="$(mktemp)" || exit 1
+        trap 'rm -f -- "$procedure_file" "$rollout_file"' EXIT
+        python3 - "$RECOVERY_README" "$procedure_file" <<'PY' || exit 1
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+begin = "<!-- BEGIN EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->"
+end = "<!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->"
+if source.count(begin) != 1 or source.count(end) != 1:
+    raise SystemExit("executable production procedure markers are absent or duplicated")
+region = source.split(begin, 1)[1].split(end, 1)[0]
+blocks = []
+inside = False
+current = []
+for line in region.splitlines():
+    if line == "```bash":
+        if inside:
+            raise SystemExit("nested bash fence in executable production procedure")
+        inside = True
+        current = []
+    elif line == "```" and inside:
+        inside = False
+        blocks.append("\n".join(current) + "\n")
+    elif inside:
+        current.append(line)
+if inside or not blocks:
+    raise SystemExit("unterminated or empty executable production procedure")
+embedded_python = 0
+for block_index, block in enumerate(blocks):
+    lines = block.splitlines()
+    cursor = 0
+    while cursor < len(lines):
+        if re.search(r"<<'PY'\s*$", lines[cursor]):
+            try:
+                end_cursor = lines.index("PY", cursor + 1)
+            except ValueError:
+                raise SystemExit(f"unclosed embedded Python in bash block {block_index}") from None
+            compile(
+                "\n".join(lines[cursor + 1 : end_cursor]) + "\n",
+                f"executable-runbook-block-{block_index}-python-{cursor}",
+                "exec",
+            )
+            embedded_python += 1
+            cursor = end_cursor
+        cursor += 1
+if embedded_python != 6:
+    raise SystemExit(f"expected six compiled embedded Python programs, got {embedded_python}")
+pathlib.Path(sys.argv[2]).write_text(
+    "#!/usr/bin/env bash\n" + "\n".join(blocks), encoding="utf-8"
+)
+
+# ShellCheck catches variables that are never assigned, but it deliberately
+# performs flow-insensitive assignment discovery.  The production procedure is
+# run with `set -u`, so independently reject a parameter expansion that appears
+# lexically before its definition.  Ignore quoted heredoc bodies and single-
+# quoted jq/Python programs because those dollars are not shell expansions.
+combined = "\n".join(blocks)
+if not combined.startswith("set -Eeuo pipefail\n"):
+    raise SystemExit("executable production procedure does not enable nounset first")
+signer_start_marker = "offline_signer_python='"
+signer_end_marker = "'\noffline_signer()"
+if combined.count(signer_start_marker) != 1 or combined.count(signer_end_marker) != 1:
+    raise SystemExit("offline signer Python assignment is absent or duplicated")
+signer_source = combined.split(signer_start_marker, 1)[1].split(signer_end_marker, 1)[0]
+compile(signer_source, "executable-runbook-offline-signer", "exec")
+
+def undefined_before_definition(program):
+    defined = {
+        "IFS", "OLDPWD", "OPTARG", "OPTIND", "PPID", "PWD", "RANDOM",
+        "SECONDS", "UID", "EUID",
+    }
+    single_quoted = False
+    heredoc = None
+    undefined = []
+    for line_number, original in enumerate(program.splitlines(), 1):
+        if heredoc is not None:
+            if original == heredoc:
+                heredoc = None
+            continue
+        if original.lstrip().startswith("#"):
+            continue
+        visible = []
+        escaped = False
+        for character in original:
+            if escaped:
+                visible.append(" ")
+                escaped = False
+            elif character == "\\" and not single_quoted:
+                visible.append(" ")
+                escaped = True
+            elif character == "'":
+                single_quoted = not single_quoted
+                visible.append(" ")
+            elif single_quoted:
+                visible.append(" ")
+            else:
+                visible.append(character)
+        shell = "".join(visible)
+        references = []
+        for match in re.finditer(
+            r"\$(?:\{[#!]?(?P<braced>[A-Za-z_][A-Za-z0-9_]*)[^}]*\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
+            shell,
+        ):
+            references.append(match.group("braced") or match.group("plain"))
+        for name in references:
+            if name not in defined:
+                undefined.append((line_number, name, original.strip()))
+
+        assignment = re.match(
+            r"\s*(?:(?:export|readonly)\s+)?([A-Za-z_][A-Za-z0-9_]*)=", shell
+        )
+        if assignment:
+            defined.add(assignment.group(1))
+        loop = re.search(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b", shell)
+        if loop:
+            defined.add(loop.group(1))
+        read = re.search(r"\bread(?:\s+-[A-Za-z]+)*\s+([^;<>&|]+)", shell)
+        if read:
+            for token in read.group(1).split():
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
+                    defined.add(token)
+        local = re.search(r"\blocal\s+(.+)", shell)
+        if local:
+            for token in local.group(1).split():
+                name = token.split("=", 1)[0]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    defined.add(name)
+        marker = re.search(
+            r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", original
+        )
+        if marker:
+            heredoc = marker.group(2)
+    if single_quoted or heredoc is not None:
+        raise SystemExit("static nounset audit encountered an unterminated quote or heredoc")
+    return undefined
+
+undefined = undefined_before_definition(combined)
+if undefined:
+    details = "; ".join(
+        f"line {line}: ${name} in {source!r}" for line, name, source in undefined
+    )
+    raise SystemExit(f"shell variable used before definition under set -u: {details}")
+
+# Prove the order checker itself fails when a real required assignment is
+# removed; this prevents a flow-insensitive regression from making the test
+# green merely because the variable is assigned somewhere later in the file.
+assignment = "protected_main_sha='<exact 40-character protected-main SHA after merge>'"
+if combined.count(assignment) != 1:
+    raise SystemExit("protected-main assignment is absent or duplicated")
+mutated = combined.replace(assignment, "# mutation: assignment removed", 1)
+if not any(name == "protected_main_sha" for _line, name, _source in undefined_before_definition(mutated)):
+    raise SystemExit("definition-before-use audit false-passed its protected-main mutation")
+
+def one(marker):
+    matches = [(index, block) for index, block in enumerate(blocks) if marker in block]
+    if len(matches) != 1:
+        raise SystemExit(f"expected one cohesive bash block for {marker!r}, got {len(matches)}")
+    return matches[0]
+
+def require(block, marker, *tokens):
+    start = block.find(marker)
+    if start < 0:
+        raise SystemExit(f"command marker is absent: {marker}")
+    command = block[start:]
+    for token in tokens:
+        if token not in command:
+            raise SystemExit(f"{marker} command omits cohesive token: {token}")
+
+def require_order(block, *tokens):
+    positions = [block.find(token) for token in tokens]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise SystemExit(f"cohesive command order differs: {tokens!r}")
+
+initial = one("scripts/release/materialize-pretag-artifacts.py")
+restore = one("scripts/release/restore-validator-vault.py restore")
+capture = one("scripts/recovery/archive-fleet-to-drive.sh prepare-writers")
+install = one("scripts/release/restore-validator-vault.py install")
+export = one('"$arc_node_linux" recovery export')
+sign = one('offline_signer "$signing_binary" recovery sign')
+verify = one('offline_signer "$arc_node_linux" recovery verify')
+prearchive = one("scripts/recovery/build-production-manifest.py prearchive")
+archive = one("scripts/recovery/archive-fleet-to-drive.sh seal \\")
+downloads = one('\ndownload_root="$(\n')
+finalize = one("scripts/recovery/build-production-manifest.py finalize")
+frontend = one("scripts/recovery/recovery_rollout.py frontend-config")
+ordered = [initial[0], restore[0], capture[0], install[0], export[0], sign[0],
+           verify[0], prearchive[0], archive[0], downloads[0], finalize[0], frontend[0]]
+if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
+    raise SystemExit("executable production bash blocks are absent or out of mandatory order")
+
+require(
+    initial[1], "arc_install_or_reuse_exact() {",
+    "arc_git() {", "GIT_CONFIG_NOSYSTEM=1", "arc_git clone", "checkout --detach", "diff-index --quiet HEAD --",
+    "status --porcelain=v1 --untracked-files=all", "validator-vault-rewrap.yml",
+    "expected exactly one live exact-run rewrap artifact", "os.O_EXCL | os.O_NOFOLLOW",
+    'test "$artifact_size" -le 4294967296',
+    '/usr/bin/head --bytes="$((artifact_size + 1))"',
+    "canonical_receipt", 'payloads["REWRAP-RECEIPT.json"] != canonical_receipt',
+    'create(receipt_output, payloads["REWRAP-RECEIPT.json"])', "cms_sha256=\"$(",
+    "os.O_RDONLY | os.O_NOFOLLOW",
+    "canonical output exists with different bytes; preserve both and stop",
+)
+require(
+    restore[1], "scripts/release/restore-validator-vault.py restore",
+    '--cms "$cms_path"', '--expected-cms-sha256 "$cms_sha256"',
+    '--rewrap-receipt "$rewrap_receipt"', '--source-main-sha "$protected_main_sha"',
+    '--raw-actions-zip "$pretag_raw_root/headless-linux-x86_64/actions.zip"',
+    '--pretag-run-id "$pretag_run_id"', '--pretag-run-attempt "$pretag_run_attempt"',
+    '--pretag-artifact-id "$pretag_linux_x86_64_artifact_id"',
+    '--restore-certificate /secure/operator/restore.cert.pem',
+    '--restore-private-key /secure/operator/restore.key.pem',
+    '--output-dir /secure/operator/arc-v0.8-validator-restore',
+)
+require(
+    install[1], "scripts/release/restore-validator-vault.py install",
+    '--legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle"',
+    '--legacy-maintenance-evidence-bundle-sidecar "$legacy_maintenance_evidence_bundle_sidecar"',
+    '--legacy-maintenance-evidence-bundle-sha256 "$legacy_maintenance_evidence_bundle_sha256"',
+    '--legacy-maintenance-boundary "$legacy_maintenance_boundary"',
+    '--legacy-maintenance-boundary-sidecar "$legacy_maintenance_boundary_sidecar"',
+    '--legacy-maintenance-boundary-sha256 "$legacy_maintenance_boundary_sha256"',
+    '--offline-stop-evidence "$offline_stop_evidence"',
+    '--offline-stop-evidence-sidecar "$offline_stop_evidence_sidecar"',
+    '--offline-stop-evidence-sha256 "$offline_stop_evidence_sha256"',
+    '--known-hosts "$known_hosts"', '--known-hosts-sha256 "$known_hosts_sha256"',
+    '--ssh-identity "$ssh_identity"', '--ssh-identity-sha256 "$ssh_identity_sha256"',
+    '--receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json',
+)
+require(
+    export[1], "reference_pair=/secure/operator/reference-pair",
+    '"state.snapshot.lz4"', "1_160_246",
+    "ecb4e39d45e6711cffcd78183851587e4deb37ad63163f541ef6c1f821a4ce47",
+    '"state.wal"', "83_385_625",
+    "3820e112af1684567f0336abe73ae9aafc4228d0e02a5fccb1ff32f64dfed44c",
+    '"latest.json"',
+    "0c9bcafd99375de7e3167c271350279c4d267dd9cf91de37aa830a2b817f80af",
+    '"snapshot-info.json"',
+    "98f327fb9c4405cd0f6e7c31052d571a024738df5bf6987ad78d9b1ba5856b49",
+    'read_locked(root_fd, "SHA256SUMS", 324)',
+    "reference_source_consensus_round=9774808", "reference_block_height=137145",
+    "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+    "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+    '"$arc_node_linux" recovery export',
+    'candidate_attempt_root="$(', '--output "$candidate_attempt"',
+    'arc_install_or_reuse_exact "$candidate_attempt" "$candidate_checkpoint"',
+    'candidate_checkpoint_sha256="$(arc_sha256 "$candidate_checkpoint")"',
+    '--source-consensus-round "$reference_source_consensus_round"',
+)
+require_order(
+    export[1],
+    'candidate_attempt_root="$(',
+    '"$arc_node_linux" recovery export',
+    'chmod 0400 "$candidate_attempt"',
+    'arc_install_or_reuse_exact "$candidate_attempt" "$candidate_checkpoint"',
+)
+require(
+    sign[1], "unset GH_TOKEN", 'signing_unshare=/usr/bin/unshare',
+    '"$signing_unshare" --net --', 'interfaces != {"lo"}',
+    'with os.scandir("/proc/self/fd") as entries:',
+    'os.close(descriptor)', 'if error.errno != errno.EBADF:',
+    'offline_signer "$signing_binary" recovery inspect',
+    'offline_signer "$signing_binary" recovery sign',
+    'signing_attempt_root="$(',
+    'outgoing_checkpoint="$signing_attempt_root/candidate.signed-$((index + 1)).arcchkpt"',
+    'arc_install_or_reuse_exact "$incoming_checkpoint" "$recovery_checkpoint"',
+)
+require_order(
+    sign[1],
+    'offline_signer "$signing_binary" recovery inspect',
+    'offline_signer "$signing_binary" recovery sign',
+    'arc_install_or_reuse_exact "$incoming_checkpoint" "$recovery_checkpoint"',
+)
+require(
+    prearchive[1], "prearchive_output=/secure/operator/arc-recovery.prearchive.json",
+    'prearchive_result="$(',
+    '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/build-production-manifest.py prearchive',
+    'production_stage_root=/secure/operator/production-input-stage-v0.8.0',
+    '--stage-root "$production_stage_root"',
+    '--source-snapshot "$reference_pair/state.snapshot.lz4"',
+    '--source-wal "$reference_pair/state.wal"',
+    'prearchive_existing=0', 'elif [ "$prearchive_existing" = 3 ]; then',
+    'builder.load_private_rollout(manifest_path)',
+    'with builder.stable_artifact_identity_window(value):',
+    'partial prearchive output/stage set exists',
+    'locked_sha256="$(', '"${prearchive_output##*/}"',
+)
+if prearchive[1].count('locked_sha256="$(') != 2:
+    raise SystemExit("prearchive new/reuse branches do not both define locked_sha256")
+if archive[1].count(
+    '--validator-public-keys /secure/operator/production-input-stage-v0.8.0/validator-public-keys.json'
+) != 2:
+    raise SystemExit("archive plan/execute do not both use the staged validator-public-key bytes")
+if archive[1].count(
+    '--validator-install-receipt /secure/operator/production-input-stage-v0.8.0/private/VALIDATOR-KEY-INSTALL-RECEIPT.json'
+) != 2 or archive[1].count(
+    '--vault-restore-receipt /secure/operator/production-input-stage-v0.8.0/private/VALIDATOR-VAULT-RESTORE-RECEIPT.json'
+) != 2:
+    raise SystemExit("archive plan/execute do not both use the staged private receipt bytes")
+require(
+    downloads[1], 'download_root="$(',
+    '/usr/bin/mktemp -d "/secure/operator/downloaded.$capture_id.XXXXXXXX"',
+    'set -o noclobber', '--count=16777217',
+)
+require(
+    finalize[1], 'final_manifest=/secure/operator/arc-recovery-final.lock.json',
+    '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/build-production-manifest.py finalize',
+    '--complete "$download_root/COMPLETE.json"',
+    '--archive-manifest "$download_root/ARCHIVE-MANIFEST.json"',
+    '--archive-manifest-sidecar "$download_root/ARCHIVE-MANIFEST.json.sha256"',
+    '--sha256sums "$download_root/SHA256SUMS"',
+    '--drive-archive-seal-prefreeze "$download_root/drive-archive-seal-prefreeze.json"',
+    '--drive-archive-seal-attempt "$download_root/drive-archive-seal-attempt.json"',
+    '--github-gist-write-canary "$download_root/github-gist-write-canary.json"',
+    '--output "$finalizer_attempt"',
+    'finalizer_attempt_root="$(',
+    'arc_install_or_reuse_exact "$finalizer_attempt_sidecar" "$final_manifest_sidecar"',
+    'arc_install_or_reuse_exact "$finalizer_attempt" "$final_manifest"',
+    'final_rollout_sha256="$(' , 'legacy_wal_policy="$(' ,
+    '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py run', '--execute',
+    '--reward-evidence-output "$reward_evidence"',
+)
+if finalize[1].count(
+    'arc_install_or_reuse_exact "$finalizer_attempt_sidecar" "$final_manifest_sidecar"'
+) != 1 or finalize[1].count(
+    'arc_install_or_reuse_exact "$finalizer_attempt" "$final_manifest"'
+) != 1:
+    raise SystemExit("finalizer attempt outputs are not each installed exactly once")
+rollout_calls = [
+    match.start()
+    for match in re.finditer(
+        re.escape('"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py run'),
+        finalize[1],
+    )
+]
+if len(rollout_calls) != 2:
+    raise SystemExit("final rollout block must contain exactly one plan and one execute call")
+require_order(
+    finalize[1],
+    '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/build-production-manifest.py finalize',
+    'final_rollout_sha256="$(',
+    'arc_install_or_reuse_exact "$finalizer_attempt_sidecar" "$final_manifest_sidecar"',
+    'arc_install_or_reuse_exact "$finalizer_attempt" "$final_manifest"',
+    'legacy_wal_policy="$(',
+    '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py run',
+    'ARC_RECOVERY_GO="GO $final_rollout_sha256',
+)
+if not rollout_calls[0] < finalize[1].find('ARC_RECOVERY_GO="GO $final_rollout_sha256') < rollout_calls[1]:
+    raise SystemExit("final rollout execute authorization is not between plan and execute calls")
+require(
+    frontend[1], '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py frontend-config',
+    '--manifest "$final_manifest"', '--reward-evidence "$reward_evidence"',
+    '--output "$frontend_config"', 'arc-network.recovered.json.sha256',
+)
+if frontend[1].count(
+    '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py frontend-config'
+) != 1:
+    raise SystemExit("frontend config generator must execute exactly once")
+PY
+        python3 - "$ROLLOUT" "$rollout_file" <<'PY' || exit 1
+import pathlib
+import sys
+
+blocks = []
+current = []
+inside = False
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if line == "```bash":
+        if inside:
+            raise SystemExit("nested bash fence in validator rollout")
+        inside = True
+        current = []
+    elif line == "```" and inside:
+        inside = False
+        blocks.append("\n".join(current) + "\n")
+    elif inside:
+        current.append(line)
+if inside or not blocks:
+    raise SystemExit("unterminated or absent validator-rollout bash fences")
+pathlib.Path(sys.argv[2]).write_text(
+    "#!/usr/bin/env bash\n" + "\n".join(blocks), encoding="utf-8"
+)
+PY
+        bash -n "$procedure_file" "$rollout_file" || exit 1
+        shellcheck -S warning --exclude=SC2016,SC2034,SC2155 \
+            "$procedure_file" "$rollout_file" || exit 1
+    ) || return 1
+
+    if grep -Fq -- 'config redacted' "$DRIVE_PREFREEZE_GATE"; then
+        printf 'production Drive gate still reads the client identity from redacted output\n'
+        return 1
+    fi
+    for literal in \
+        '"$RCLONE_BIN" config show "$REMOTE_NAME"' \
+        "grep -Eq '^[0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{64}$'" \
+        'POST_CLIENT_SHA="${POST_IDENTITY%% *}"' \
+        'effective OAuth client changed during Drive prefreeze execution'
+    do
+        require_literal "$DRIVE_PREFREEZE_GATE" "$literal" \
+            'Drive gate no longer binds one three-hash in-memory identity stream' || return 1
+    done
+    require_literal "$DRIVE_IDENTITY_HELPER" \
+        'print(client_hash, account_hash, permission_hash)' \
+        'Drive identity helper no longer emits exactly the three public hashes' || return 1
+    for literal in \
+        'Real rclone v1.75.0 redacts both OAuth client fields' \
+        'FAKE_REDACTED_CLIENT=true' \
+        'FAKE_REDACTED_CLIENT_SECRET=true' \
+        'FAKE_CLIENT_SWITCH=true' \
+        'config redacted capability-drive'
+    do
+        require_literal "$DRIVE_PREFREEZE_TEST" "$literal" \
+            'Drive prefreeze regression test omits real redaction or client drift' || return 1
+    done
+
+    for file in "$RECOVERY_README" "$ROLLOUT"; do
+        for literal in \
+            'export PATH=/secure/operator/tools:/usr/bin:/bin' \
+            '/etc/ssl/certs/ca-certificates.crt' \
+            '6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238' \
+            '/secure/operator/tools/openssl-3.0.13' \
+            '724acbe911513d13f52bae0b8969b20336cd8618fc67898a6bf7847bf1a270ad' \
+            '/secure/operator/tools/libssl.so.3' \
+            '0c0f298a5b4b44526d20a07d126a55bf44b85eaab053b2b0118e5d806d28ea13' \
+            '/secure/operator/tools/libcrypto.so.3' \
+            'd6fc1bc9de29c55fc905f77edba1ccc7c7a50b32bd2bb9086b0d0b00104eafc4' \
+            '/secure/operator/tools/ssh' \
+            '47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6' \
+            '/secure/operator/tools/scp' \
+            '92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144' \
+            '/usr/bin/python3.12' \
+            '8295ee25cfdb239f3e165afceda7f46de73e2b606ff0e2e3d8623e3facd30acc' \
+            '.artifacts["linux-x86_64"].headless.id' \
+            '/secure/operator/arc-v0.8-validator-restore/validator-public-keys.json'
+        do
+            require_literal "$file" "$literal" \
+                'operator runbook omits an exact Ubuntu path, hash, or materialized input' \
+                || return 1
+        done
+        if grep -Eq '/private/etc/ssl/cert[.]pem|/opt/homebrew/' "$file"; then
+            printf 'Ubuntu operator runbook retains a macOS proof/runtime path: %s\n' "$file"
+            return 1
+        fi
+    done
+
+    for literal in \
+        '/secure/operator/tools/gh' \
+        'c1be595a7357120e28886922c050fed34ad347c36adf37370ad91d4972a416d5' \
+        'f3f9aff817f9766029e50adf9a7963c169e475b8f10c7927823568a0d9443db7' \
+        '97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d' \
+        '9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a' \
+        '73c7bd17ff0e6e52331a5adf7574e492f137ef52f9b288908413901f33c723b1' \
+        '29a77804fd021a47d43afaf1c51c2a877c66ff56699e1d3173be6d57536b8e3b' \
+        '700000000000' \
+        '50000000000-byte (50 GB) safety margin' \
+        '750000000000-byte (750 GB decimal)' \
+        'https://developers.google.com/workspace/drive/api/guides/limits' \
+        'I ATTEST 700000000000 BYTES REMAIN AND ARC IS THE ONLY DRIVE UPLOAD WRITER THIS QUOTA WINDOW' \
+        '51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb' \
+        'checkout --detach "$protected_main_sha"' \
+        'status --porcelain=v1 --untracked-files=all' \
+        '.github/workflows/validator-vault-rewrap.yml' \
+        'bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9' \
+        '6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43' \
+        '/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/arc-node-linux-x86_64' \
+        '/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/genesis.toml' \
+        'scripts/recovery/legacy-validator-set-40m.json.sha256' \
+        'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW' \
+        '1615413b0cad59eedc8f9aa8ce41427e866f4b868f5b2148be48a1d722d7a3db' \
+        '17238873' \
+        "test \"\$(/usr/bin/tar -tzf \"\$caddy_archive\")\" = \"\$(printf 'LICENSE\\nREADME.md\\ncaddy')\"" \
+        '/proc/self/fd/9 --config /proc/self/fd/8'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits a create-only input or Linux archive/download invariant' \
+            || return 1
+    done
+
+    if grep -Eq '751619276800|750 GiB|700 GiB' \
+        "$RECOVERY_README" "$DRIVE_PREFREEZE_GATE"; then
+        printf 'Drive recovery policy retains a binary-unit quota above the decimal cap\n'
+        return 1
+    fi
+
+    for literal in \
+        '700000000000 bytes (700 GB decimal)' \
+        '50000000000 bytes (50 GB)' \
+        'https://developers.google.com/workspace/drive/api/guides/limits'
+    do
+        require_literal "$ROLLOUT" "$literal" \
+            'validator rollout omits the reviewed decimal Drive quota boundary' \
+            || return 1
+    done
+
+    for pair in \
+        '["headless","linux-x86_64"]' \
+        '["headless","linux-arm64"]' \
+        '["headless","macos-arm64"]' \
+        '["headless","macos-x86_64"]' \
+        '["headless","windows-x86_64"]' \
+        '["desktop","linux-x86_64"]' \
+        '["desktop","macos-arm64"]' \
+        '["desktop","macos-x86_64"]' \
+        '["desktop","windows-x86_64"]'
+    do
+        count="$(grep -Fc -- "$pair" "$RECOVERY_README")"
+        if [ "$count" -lt 2 ]; then
+            printf 'pre-tag selection/input-set commands do not carry both shapes for %s\n' "$pair"
+            return 1
+        fi
+    done
+    require_literal "$RECOVERY_README" 'artifact_id: $s.artifacts[$platform][$kind].id' \
+        'pre-tag input set does not bind the selected artifact ID' || return 1
+    require_literal "$RECOVERY_README" 'raw_actions_zip:' \
+        'pre-tag input set does not bind the raw Actions response' || return 1
+
+    previous=0
+    for literal in \
+        'scripts/release/materialize-pretag-artifacts.py' \
+        'scripts/release/restore-validator-vault.py restore' \
+        'scripts/recovery/archive-fleet-to-drive.sh prepare-writers' \
+        'scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan' \
+        $'scripts/recovery/archive-fleet-to-drive.sh capture \\' \
+        'scripts/release/restore-validator-vault.py install' \
+        $'"$arc_node_linux" recovery export \\' \
+        $'offline_signer "$signing_binary" recovery sign \\' \
+        $'scripts/recovery/build-production-manifest.py prearchive \\' \
+        $'scripts/recovery/archive-fleet-to-drive.sh seal \\'
+    do
+        line="$(first_literal_line "$RECOVERY_README" "$literal")"
+        if [ -z "$line" ] || [ "$line" -le "$previous" ]; then
+            printf 'recovery command is absent or out of mandatory order: %s\n' "$literal"
+            return 1
+        fi
+        previous="$line"
+    done
+
+    previous="$(first_literal_line "$ROLLOUT" 'Only after this successful capture')"
+    line="$(first_literal_line "$ROLLOUT" $'"$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/restore-validator-vault.py install \\')"
+    if [ -z "$previous" ] || [ -z "$line" ] || [ "$line" -le "$previous" ]; then
+        printf 'validator rollout places vault install before the successful capture boundary\n'
+        return 1
+    fi
+
+    count="$(grep -Fc -- '--validator-public-keys /secure/operator/production-input-stage-v0.8.0/validator-public-keys.json' "$RECOVERY_README")"
+    assert_equals 2 "$count" \
+        'archive plan and execute do not both use the staged validator manifest' || return 1
+
+    for literal in \
+        'signing_keys=(' \
+        'test "${#signing_keys[@]}" = 5' \
+        'NYC.validator-key.json' 'LAX.validator-key.json' 'AMS.validator-key.json' \
+        'LHR.validator-key.json' 'NRT.validator-key.json' \
+        'protected build-metadata hash' \
+        $'(cd /secure/operator && \\' \
+        '/usr/bin/sha256sum --check --strict arc-network.recovered.json.sha256)'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits the isolated five-key or frontend-sidecar contract' \
+            || return 1
+    done
+
+    audit_block="$(awk '
+        /A later read-only audit can use externally captured evidence:/ { capture=1; lines=0 }
+        capture { print; lines += 1; if (lines == 8) exit }
+    ' "$RECOVERY_README")"
+    printf '%s\n' "$audit_block" \
+        | grep -Fq -- '--manifest /secure/operator/arc-recovery-final.lock.json' || {
+        printf 'final reward audit still targets the pre-final recovery manifest\n'
+        return 1
+    }
+
+    if grep -Eq -- \
+        '/secure/operator/pretag-linux-x86_64/arc-node|--genesis /secure/operator/genesis[.]toml|--validator-public-keys /secure/operator/validator-public-keys[.]json|five physically separate signing stations|never gather five private keys|shasum -a 256 -c /secure/operator/arc-network[.]recovered[.]json[.]sha256' \
+        "$RECOVERY_README"; then
+        printf 'recovery README retains a stale materialization, signing, or sidecar command\n'
+        return 1
+    fi
 }
 
 run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
@@ -730,5 +1377,6 @@ run_test 'community support, permissions, and block-history answers stay actiona
 run_test 'candidate facts remain source-bound and dated without unsupported floors' factual_candidate_copy_matches_source_and_release_gates
 run_test 'hardened canary and vault runbooks match their current command parsers' hardened_canary_and_vault_commands_match_current_parsers
 run_test 'recovery archive commands pin tools, external intent, and exact rollout journals' recovery_archive_commands_are_exact_and_resumable
+run_test 'operator recovery commands are Ubuntu-pinned, create-only, and ordered' operator_recovery_commands_are_linux_pinned_and_ordered
 
 finish_tests

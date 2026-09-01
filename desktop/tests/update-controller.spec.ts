@@ -94,6 +94,7 @@ test.describe("UpdateController", () => {
           return null;
         },
         prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
         abortRelaunch: async () => {},
         relaunch: async () => {},
       },
@@ -134,6 +135,7 @@ test.describe("UpdateController", () => {
           return pending.promise;
         },
         prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
         abortRelaunch: async () => {},
         relaunch: async () => {},
       },
@@ -186,6 +188,9 @@ test.describe("UpdateController", () => {
       prepareRelaunch: async () => {
         restartOrder.push("stop-node");
       },
+      beginHandoff: async () => {
+        restartOrder.push("handoff");
+      },
       abortRelaunch: async () => {
         restartOrder.push("abort");
       },
@@ -210,6 +215,7 @@ test.describe("UpdateController", () => {
     expect(restartOrder).toEqual([
       "stop-node",
       "download",
+      "handoff",
       "install",
       "relaunch",
     ]);
@@ -225,7 +231,7 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  test("aborts the fence when download/signature verification fails before install", async () => {
+  test("runs native abort-and-resume when signature verification fails before handoff", async () => {
     let relaunchCalls = 0;
     let installCalls = 0;
     const order: string[] = [];
@@ -243,6 +249,9 @@ test.describe("UpdateController", () => {
       }),
       prepareRelaunch: async () => {
         order.push("prepare");
+      },
+      beginHandoff: async () => {
+        order.push("handoff");
       },
       abortRelaunch: async () => {
         order.push("abort");
@@ -268,6 +277,106 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
+  test("waits for native abort-and-resume before reporting a retryable download failure", async () => {
+    const resumed = deferred<void>();
+    const order: string[] = [];
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.0",
+        download: async () => {
+          order.push("download-cancelled");
+          throw new Error("download cancelled");
+        },
+        install: async () => {
+          order.push("install");
+        },
+      }),
+      prepareRelaunch: async () => {
+        order.push("prepare-stop");
+      },
+      beginHandoff: async () => {
+        order.push("handoff");
+      },
+      abortRelaunch: async () => {
+        order.push("abort-resume-start");
+        await resumed.promise;
+        order.push("abort-resume-complete");
+      },
+      relaunch: async () => {
+        order.push("app-relaunch");
+      },
+    });
+
+    await controller.checkForUpdates("manual");
+    let resolved = false;
+    const installing = controller.installAvailableUpdate().then((snapshot) => {
+      resolved = true;
+      return snapshot;
+    });
+    while (!order.includes("abort-resume-start")) await Promise.resolve();
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(order).toEqual([
+      "prepare-stop",
+      "download-cancelled",
+      "abort-resume-start",
+    ]);
+
+    resumed.resolve();
+    const snapshot = await installing;
+    expect(order).toEqual([
+      "prepare-stop",
+      "download-cancelled",
+      "abort-resume-start",
+      "abort-resume-complete",
+    ]);
+    expect(snapshot).toMatchObject({
+      phase: "error",
+      restartRequired: false,
+      error: "download cancelled",
+    });
+    controller.dispose();
+  });
+
+  test("reports a safe stopped state when native abort-and-resume fails", async () => {
+    let installCalls = 0;
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.0",
+        download: async () => {
+          throw new Error("signature rejected");
+        },
+        install: async () => {
+          installCalls += 1;
+        },
+      }),
+      prepareRelaunch: async () => {},
+      beginHandoff: async () => {},
+      abortRelaunch: async () => {
+        throw new Error(
+          "could not safely restore the exact pre-update node; the node remains stopped, the update lifecycle fence remains active, and a manual restart is required",
+        );
+      },
+      relaunch: async () => {},
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+
+    expect(installCalls).toBe(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      restartRequired: false,
+      canInstall: false,
+    });
+    expect(controller.getSnapshot().message).toContain("node remains stopped");
+    expect(controller.getSnapshot().message).toContain("restart it manually");
+    expect(controller.getSnapshot().error).toContain("manual restart is required");
+    controller.dispose();
+  });
+
   test("keeps the native fence after install invocation rejects", async () => {
     const order: string[] = [];
     const controller = createUpdateController({
@@ -285,6 +394,9 @@ test.describe("UpdateController", () => {
       prepareRelaunch: async () => {
         order.push("prepare");
       },
+      beginHandoff: async () => {
+        order.push("handoff");
+      },
       abortRelaunch: async () => {
         order.push("abort");
         throw new Error("install rejection must never abort the fence");
@@ -297,7 +409,7 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
 
-    expect(order).toEqual(["prepare", "download", "install"]);
+    expect(order).toEqual(["prepare", "download", "handoff", "install"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "ready",
       restartRequired: true,
@@ -305,6 +417,47 @@ test.describe("UpdateController", () => {
       error: "bundle rename failed after mutation began",
     });
     expect(controller.getSnapshot().message).toContain("node remains safely stopped");
+    controller.dispose();
+  });
+
+  test("never aborts or resumes after native updater handoff begins", async () => {
+    const order: string[] = [];
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.0",
+        download: async () => {
+          order.push("download");
+        },
+        install: async () => {
+          order.push("install");
+        },
+      }),
+      prepareRelaunch: async () => {
+        order.push("prepare");
+      },
+      beginHandoff: async () => {
+        order.push("handoff");
+        throw new Error("updater IPC disconnected after native commit");
+      },
+      abortRelaunch: async () => {
+        order.push("abort-resume");
+      },
+      relaunch: async () => {
+        order.push("relaunch");
+      },
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+
+    expect(order).toEqual(["prepare", "download", "handoff"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "ready",
+      restartRequired: true,
+      canInstall: false,
+      error: "updater IPC disconnected after native commit",
+    });
     controller.dispose();
   });
 
@@ -325,6 +478,9 @@ test.describe("UpdateController", () => {
       }),
       prepareRelaunch: async () => {
         throw new Error("old arc-node pid 4312 did not exit");
+      },
+      beginHandoff: async () => {
+        throw new Error("handoff must not run when prepare failed");
       },
       abortRelaunch: async () => {
         throw new Error("abort must not run when prepare failed");
@@ -369,6 +525,7 @@ test.describe("UpdateController", () => {
         },
       }),
       prepareRelaunch: async () => {},
+      beginHandoff: async () => {},
       abortRelaunch: async () => {},
       relaunch: async () => {},
     });
@@ -404,6 +561,7 @@ test.describe("UpdateController", () => {
         };
       },
       prepareRelaunch: async () => {},
+      beginHandoff: async () => {},
       abortRelaunch: async () => {
         throw new Error("successful install must keep its fence");
       },
@@ -432,6 +590,8 @@ test.describe("UpdateController", () => {
   test("does not overlap install with a candidate-replacing check", async () => {
     let oldInstalls = 0;
     let newInstalls = 0;
+    let prepareCalls = 0;
+    let handoffCalls = 0;
     const nextCheck = deferred<UpdateCandidate | null>();
     let checkCalls = 0;
     const controller = createUpdateController({
@@ -449,7 +609,12 @@ test.describe("UpdateController", () => {
         }
         return nextCheck.promise;
       },
-      prepareRelaunch: async () => {},
+      prepareRelaunch: async () => {
+        prepareCalls += 1;
+      },
+      beginHandoff: async () => {
+        handoffCalls += 1;
+      },
       abortRelaunch: async () => {},
       relaunch: async () => {},
     });
@@ -479,6 +644,8 @@ test.describe("UpdateController", () => {
     expect(firstInstall).toBe(secondInstall);
     await firstInstall;
     expect(newInstalls).toBe(1);
+    expect(prepareCalls).toBe(1);
+    expect(handoffCalls).toBe(1);
     controller.dispose();
   });
 
@@ -493,6 +660,7 @@ test.describe("UpdateController", () => {
           return null;
         },
         prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
         abortRelaunch: async () => {},
         relaunch: async () => {},
       },

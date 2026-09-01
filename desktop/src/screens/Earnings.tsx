@@ -39,6 +39,11 @@ export function Earnings() {
   // must not be relabelled as "no receipt."
   const hasConfirmedRewards =
     earnings?.fromChain === true && earnings.attestations > 0;
+  const hasCompleteCanonicalHistory =
+    earnings?.archiveMode === true &&
+    earnings.historyCompleteSinceRecovery === true &&
+    earnings.historyScope ===
+      "complete canonical reward history since the v3 recovery boundary";
 
   return (
     <div className="main-inner" data-testid="earnings-screen">
@@ -80,7 +85,9 @@ export function Earnings() {
         </Card>
       ) : !hasConfirmedRewards ? (
         <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-empty">
-          <CardHeader title="No reward receipts retained by this host" />
+          <CardHeader title={hasCompleteCanonicalHistory
+            ? "No mined reward receipts in canonical v3 history"
+            : "No reward receipts retained by this host"} />
           <div
             style={{
               color: "var(--text-secondary)",
@@ -89,10 +96,9 @@ export function Earnings() {
             }}
           >
             <p style={{ marginTop: 0 }}>
-              This is a confirmed zero in the selected host&apos;s current
-              retained receipt window—not proof that this address has never
-              earned a reward. Older rows can be pruned, and a non-archive
-              host&apos;s in-memory index can be empty after restart.
+              {hasCompleteCanonicalHistory
+                ? "This archive-backed host has no successful mined reward receipt for this address since the canonical v3 recovery boundary. It is a confirmed gross-reward zero for that chain segment, not a claim about wallet transfers or any earlier legacy history."
+                : "This is a confirmed zero in the selected host's current retained receipt window—not proof that this address has never earned a reward. Older rows can be pruned on a non-archive host."}
             </p>
             <p>
               A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
@@ -163,7 +169,11 @@ export function Earnings() {
             </div>
           </Card>
           <Card>
-            <div className="stat-label">Retained by selected host</div>
+            <div className="stat-label">
+              {hasCompleteCanonicalHistory
+                ? "Gross mined rewards · canonical v3"
+                : "Retained by selected host"}
+            </div>
             <div
               className="big-number gradient"
               style={{ marginTop: "var(--space-2)" }}
@@ -181,10 +191,9 @@ export function Earnings() {
                 lineHeight: 1.5,
               }}
             >
-              Current in-memory receipt window, not lifetime earnings.
-              {earnings.archiveMode === false
-                ? " This selected host is non-archive; older rows may be pruned or absent after restart."
-                : " Archive mode does not make this host-local view a wallet lifetime ledger."}
+              {hasCompleteCanonicalHistory
+                ? "Archive-backed successful 0x25 receipts since the v3 recovery boundary. Gross rewards are not the same as the wallet's current balance after spending or transfers."
+                : "Current host-retained receipt window; older rows may be pruned. This is not lifetime earnings."}
             </div>
           </Card>
           <Card>

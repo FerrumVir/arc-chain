@@ -4,12 +4,12 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-HARD_DAILY_UPLOAD_LIMIT_BYTES=$((750 * 1024 * 1024 * 1024))
+HARD_DAILY_UPLOAD_LIMIT_BYTES=750000000000
 GOOGLE_DRIVE_OBJECT_LIMIT_BYTES=5000000000000
 CANARY_BYTES=$((8 * 1024 * 1024))
 REVIEWED_RCLONE_VERSION="v1.75.0"
 DRIVE_ACCOUNT_HELPER="$SCRIPT_DIR/drive-account-identity.py"
-DRIVE_ACCOUNT_HELPER_SHA256="c2dcff0b64690a52560011cb4f465c3b4d8a684843cd6b275d62347a1db7f4b1"
+DRIVE_ACCOUNT_HELPER_SHA256="04d79584c48909407c0c841cac9a81ef9857030a09085837ef41074c7adc5bb4"
 TEMP_ROOT=""
 CANARY_REMOTE=""
 CANARY_PRESENT=false
@@ -61,15 +61,19 @@ The expected root hash is SHA256(exact remote-root UTF-8 bytes). These values
 are identifiers, not OAuth client secrets or tokens.
 
 The gate requires the reviewed rclone v1.75.0. It refreshes the selected
-remote with a read-only `rclone about`, then pipes `rclone config show` only to
-a hash-pinned local helper. That helper calls the fixed Google Drive v3
+remote with a read-only `rclone about`, then pipes one decrypted selected-remote
+`rclone config show` stream directly to a hash-pinned local helper. From that
+single in-memory stream the helper hashes the custom OAuth client ID, consumes
+the bearer token, and calls the fixed Google Drive v3
 `about?fields=user(emailAddress,permissionId,me)` endpoint with verified TLS.
-OAuth material and raw account fields are never written to a receipt or file.
+OAuth material and raw client/account/permission fields are never written to a
+receipt, temporary file, argv, environment variable, or log.
 
 `--daily-upload-budget-bytes` is the independently reviewed *remaining* budget
 for this dedicated ARC uploader in its current Google quota window, capped here
-at 750 GiB. Google Drive does not expose the remaining daily-upload counter;
-do not assert a fresh budget unless this account has no other upload writers.
+at 750 GB (750,000,000,000 bytes, decimal). Google Drive does not expose the
+remaining daily-upload counter; do not assert a fresh budget unless this
+account has no other upload writers.
 EOF
 }
 
@@ -254,40 +258,7 @@ if "rclone config show [<remote>] [flags]" not in value:
 PY
 }
 
-inspect_custom_client() {
-    local config_path="$1" remote_name="$2"
-    python3 - "$config_path" "$remote_name" <<'PY'
-import configparser
-import hashlib
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-remote = sys.argv[2]
-parser = configparser.ConfigParser(interpolation=None, strict=True)
-try:
-    parser.read_string(path.read_text(encoding="utf-8"))
-except (OSError, UnicodeError, configparser.Error) as error:
-    raise SystemExit(f"redacted rclone config is invalid: {error}")
-if parser.sections() != [remote]:
-    raise SystemExit("redacted rclone config does not contain exactly the selected remote")
-section = parser[remote]
-if section.get("type", "").strip() != "drive":
-    raise SystemExit("selected remote is not a Google Drive backend")
-client_id = section.get("client_id", "").strip()
-if not client_id or client_id == "XXX":
-    raise SystemExit("selected remote does not have an inspectable custom OAuth client_id")
-client_secret = section.get("client_secret", "").strip()
-if client_secret != "XXX":
-    raise SystemExit("selected remote lacks a configured redacted OAuth client secret")
-for key in ("service_account_file", "service_account_credentials"):
-    if section.get(key, "").strip():
-        raise SystemExit("service-account Drive configuration is outside this OAuth gate")
-print(hashlib.sha256(client_id.encode("utf-8")).hexdigest())
-PY
-}
-
-inspect_drive_account() {
+inspect_drive_identity() {
     local label="$1" result rclone_stderr helper_stderr
     [ -f "$DRIVE_ACCOUNT_HELPER" ] && [ ! -L "$DRIVE_ACCOUNT_HELPER" ] || \
         die "Drive account identity helper is missing, non-regular, or a symlink"
@@ -309,7 +280,7 @@ inspect_drive_account() {
         die "rclone account configuration stream emitted stderr; warnings are fatal before fleet freeze"
     [ ! -s "$helper_stderr" ] || \
         die "Drive account identity helper emitted stderr"
-    printf '%s\n' "$result" | grep -Eq '^[0-9a-f]{64} [0-9a-f]{64}$' || \
+    printf '%s\n' "$result" | grep -Eq '^[0-9a-f]{64} [0-9a-f]{64} [0-9a-f]{64}$' || \
         die "Drive account identity helper returned an invalid result"
     printf '%s\n' "$result"
 }
@@ -487,7 +458,7 @@ require_hash "$EXPECTED_ACCOUNT_SHA" "expected account hash"
 require_uint "$DAILY_BUDGET" "daily upload budget"
 [ "$DAILY_BUDGET" -gt 0 ] || die "daily upload budget must be positive"
 [ "$DAILY_BUDGET" -le "$HARD_DAILY_UPLOAD_LIMIT_BYTES" ] || \
-    die "daily upload budget exceeds the 750 GiB Google Drive hard policy ceiling"
+    die "daily upload budget exceeds the 750 GB (750,000,000,000 byte) Google Drive hard policy ceiling"
 
 validate_remote_root "$REMOTE_ROOT" || die "remote root is unsafe"
 REMOTE_NAME="${REMOTE_ROOT%%:*}"
@@ -525,13 +496,6 @@ run_rclone_clean "config-show capability inspection" "$TEMP_ROOT/config-show-hel
     config show --help
 inspect_config_show_capability "$TEMP_ROOT/config-show-help"
 
-run_rclone_clean "configuration inspection" "$TEMP_ROOT/config.redacted" \
-    config redacted "$REMOTE_NAME"
-ACTUAL_CLIENT_SHA="$(inspect_custom_client "$TEMP_ROOT/config.redacted" "$REMOTE_NAME")"
-require_hash "$ACTUAL_CLIENT_SHA" "effective OAuth client-id hash"
-[ "$ACTUAL_CLIENT_SHA" = "$EXPECTED_CLIENT_SHA" ] || \
-    die "effective OAuth client differs from the reviewed ARC client"
-
 # This benign read is deliberately first: rclone refreshes an expired OAuth
 # access token and persists the refreshed selected-remote token before the
 # credential bytes are streamed in memory to the fixed Drive API helper.
@@ -541,11 +505,16 @@ run_rclone_clean "capacity inspection" "$TEMP_ROOT/about-before.json" \
 FREE_BEFORE="$(inspect_free_bytes "$TEMP_ROOT/about-before.json")"
 require_uint "$FREE_BEFORE" "Drive free-byte capacity"
 
-ACTUAL_IDENTITY="$(inspect_drive_account "inspection")"
-ACTUAL_ACCOUNT_SHA="${ACTUAL_IDENTITY%% *}"
-ACTUAL_PERMISSION_SHA="${ACTUAL_IDENTITY#* }"
+ACTUAL_IDENTITY="$(inspect_drive_identity "inspection")"
+ACTUAL_CLIENT_SHA="${ACTUAL_IDENTITY%% *}"
+ACTUAL_IDENTITY_REST="${ACTUAL_IDENTITY#* }"
+ACTUAL_ACCOUNT_SHA="${ACTUAL_IDENTITY_REST%% *}"
+ACTUAL_PERMISSION_SHA="${ACTUAL_IDENTITY_REST#* }"
+require_hash "$ACTUAL_CLIENT_SHA" "effective OAuth client-id hash"
 require_hash "$ACTUAL_ACCOUNT_SHA" "effective Drive account hash"
 require_hash "$ACTUAL_PERMISSION_SHA" "effective Drive permission-id hash"
+[ "$ACTUAL_CLIENT_SHA" = "$EXPECTED_CLIENT_SHA" ] || \
+    die "effective OAuth client differs from the reviewed ARC client"
 [ "$ACTUAL_ACCOUNT_SHA" = "$EXPECTED_ACCOUNT_SHA" ] || \
     die "effective Drive account differs from the reviewed ARC account"
 
@@ -594,11 +563,6 @@ if [ "$MODE" = execute ]; then
         "$TEMP_ROOT/rclone-version-after" version
     [ "$(inspect_rclone_version "$TEMP_ROOT/rclone-version-after")" = "$ACTUAL_RCLONE_VERSION" ] || \
         die "rclone version changed during Drive prefreeze execution"
-    run_rclone_clean "post-canary configuration inspection" \
-        "$TEMP_ROOT/config-after.redacted" config redacted "$REMOTE_NAME"
-    [ "$(inspect_custom_client "$TEMP_ROOT/config-after.redacted" "$REMOTE_NAME")" = "$ACTUAL_CLIENT_SHA" ] || \
-        die "effective OAuth client changed during Drive prefreeze execution"
-
     run_rclone_clean "post-canary capacity inspection" "$TEMP_ROOT/about-after.json" \
         about "$REMOTE_ROOT" --json --contimeout 10s --timeout 20s \
         --retries 2 --low-level-retries 2
@@ -607,9 +571,13 @@ if [ "$MODE" = execute ]; then
     [ "$FREE_AFTER" -ge "$ARCHIVE_RESERVATION_BYTES" ] || \
         die "Drive free-byte capacity fell below the archive reservation after canary"
 
-    POST_IDENTITY="$(inspect_drive_account "post-canary inspection")"
-    POST_ACCOUNT_SHA="${POST_IDENTITY%% *}"
-    POST_PERMISSION_SHA="${POST_IDENTITY#* }"
+    POST_IDENTITY="$(inspect_drive_identity "post-canary inspection")"
+    POST_CLIENT_SHA="${POST_IDENTITY%% *}"
+    POST_IDENTITY_REST="${POST_IDENTITY#* }"
+    POST_ACCOUNT_SHA="${POST_IDENTITY_REST%% *}"
+    POST_PERMISSION_SHA="${POST_IDENTITY_REST#* }"
+    [ "$POST_CLIENT_SHA" = "$ACTUAL_CLIENT_SHA" ] || \
+        die "effective OAuth client changed during Drive prefreeze execution"
     [ "$POST_ACCOUNT_SHA" = "$ACTUAL_ACCOUNT_SHA" ] || \
         die "effective Drive account changed during Drive prefreeze execution"
     [ "$POST_PERMISSION_SHA" = "$ACTUAL_PERMISSION_SHA" ] || \

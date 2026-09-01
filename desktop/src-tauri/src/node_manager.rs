@@ -2,6 +2,7 @@ use crate::paths;
 use crate::types::{DataMigrationNotice, LogEntry, NodeConfig};
 use anyhow::Context as _;
 use fs2::FileExt as _;
+use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
@@ -70,6 +71,119 @@ struct DesktopShutdownControl {
 pub struct ManagedLifecycleLock {
     data_dir: PathBuf,
     _file: std::fs::File,
+}
+
+#[derive(Clone)]
+struct ExactLaunchFile {
+    path: PathBuf,
+    sha256: [u8; 32],
+}
+
+impl ExactLaunchFile {
+    fn capture(path: &Path, name: &str) -> anyhow::Result<Self> {
+        let path = path.canonicalize().with_context(|| {
+            format!(
+                "cannot canonicalize managed launch {name} {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()),
+            "managed launch {name} is not a regular file: {}",
+            path.display()
+        );
+        Ok(Self {
+            sha256: regular_file_sha256(&path)
+                .with_context(|| format!("cannot hash managed launch {name} {}", path.display()))?,
+            path,
+        })
+    }
+
+    fn verify(&self, name: &str) -> anyhow::Result<PathBuf> {
+        let path = self.path.canonicalize().with_context(|| {
+            format!(
+                "previously running managed-node {name} is unavailable: {}",
+                self.path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            path == self.path,
+            "previously running managed-node {name} path changed"
+        );
+        anyhow::ensure!(
+            std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()),
+            "previously running managed-node {name} is not a regular file"
+        );
+        anyhow::ensure!(
+            regular_file_sha256(&path)? == self.sha256,
+            "previously running managed-node {name} bytes changed during the update attempt"
+        );
+        Ok(path)
+    }
+}
+
+#[derive(Clone)]
+struct ManagedLaunchPlan {
+    config: NodeConfig,
+    validator_keyfile: ExactLaunchFile,
+    binary: ExactLaunchFile,
+    seeds: ExactLaunchFile,
+    genesis: ExactLaunchFile,
+}
+
+impl ManagedLaunchPlan {
+    fn capture(
+        config: &NodeConfig,
+        validator_keyfile: &Path,
+        binary: &Path,
+        resources: &TestnetResources,
+    ) -> anyhow::Result<Self> {
+        let (seeds, genesis) = required_testnet_resources(resources)?;
+        Ok(Self {
+            config: config.clone(),
+            validator_keyfile: ExactLaunchFile::capture(validator_keyfile, "validator key")?,
+            binary: ExactLaunchFile::capture(binary, "executable")?,
+            seeds: ExactLaunchFile::capture(seeds, "seed identity")?,
+            genesis: ExactLaunchFile::capture(genesis, "genesis identity")?,
+        })
+    }
+
+    fn verify(
+        &self,
+        lifecycle_lock: &ManagedLifecycleLock,
+    ) -> anyhow::Result<(PathBuf, PathBuf, TestnetResources)> {
+        let data_dir = resolve_data_dir(&self.config.data_dir)
+            .canonicalize()
+            .context("cannot canonicalize the previously running managed-node data directory")?;
+        lifecycle_lock.ensure_data_dir(&data_dir)?;
+        let validator_keyfile = self.validator_keyfile.verify("validator key")?;
+        let binary = self.binary.verify("executable")?;
+        let seeds_file = self.seeds.verify("seed identity")?;
+        let genesis_file = self.genesis.verify("genesis identity")?;
+        Ok((
+            validator_keyfile,
+            binary,
+            TestnetResources {
+                seeds_file: Some(seeds_file),
+                genesis_file: Some(genesis_file),
+            },
+        ))
+    }
+}
+
+fn regular_file_sha256(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    anyhow::ensure!(file.metadata()?.is_file(), "file is not regular");
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 impl ManagedLifecycleLock {
@@ -585,6 +699,11 @@ struct StopSummary {
     forced: usize,
 }
 
+struct StopLifecycleOutcome {
+    lifecycle_lock: Option<ManagedLifecycleLock>,
+    stopped: usize,
+}
+
 fn finish_legacy_reconciliation(
     slot: &mut Option<LegacyWindowsStopContext>,
     attempted: Option<LegacyWindowsStopContext>,
@@ -650,6 +769,18 @@ pub struct NodeManager {
     /// a second GUI from starting a new writer after Stop has returned to the
     /// WebView but before the updater has replaced and relaunched the app.
     update_lifecycle_lock: Option<ManagedLifecycleLock>,
+    /// Exact launch identity captured only after a managed child successfully
+    /// spawns. A pre-handoff updater abort may consume this plan to restore
+    /// the node that was running before Prepare, without consulting mutable
+    /// WebView settings or re-resolving a different executable.
+    active_launch_plan: Option<ManagedLaunchPlan>,
+    /// Present only while Prepare has stopped a previously running owned node.
+    /// It is consumed by the atomic abort-and-resume transaction, or retained
+    /// with the update lock when a safe resume cannot be proven.
+    update_restart_plan: Option<ManagedLaunchPlan>,
+    /// One-way native boundary set immediately before the updater installer is
+    /// invoked. Once set, abort is forbidden even if install() rejects.
+    update_handoff_started: bool,
     managed_data_dir: Option<PathBuf>,
     durability_failure: Option<String>,
     legacy_windows_stop_context: Option<LegacyWindowsStopContext>,
@@ -812,6 +943,9 @@ impl NodeManager {
             shutdown_control: None,
             lifecycle_lock: None,
             update_lifecycle_lock: None,
+            active_launch_plan: None,
+            update_restart_plan: None,
+            update_handoff_started: false,
             managed_data_dir: None,
             durability_failure: None,
             legacy_windows_stop_context: None,
@@ -969,6 +1103,30 @@ impl NodeManager {
         resources: &TestnetResources,
         lifecycle_lock: ManagedLifecycleLock,
     ) -> anyhow::Result<()> {
+        self.start_while_lifecycle_locked(
+            config,
+            validator_keyfile,
+            resources,
+            &lifecycle_lock,
+            None,
+        )
+        .await?;
+        self.lifecycle_lock = Some(lifecycle_lock);
+        Ok(())
+    }
+
+    /// Spawn while borrowing the caller's already-held lifecycle lock. The
+    /// updater abort path uses this form so a failed resume can put the exact
+    /// same guard back into `update_lifecycle_lock` without ever opening a
+    /// cross-GUI writer race.
+    async fn start_while_lifecycle_locked(
+        &mut self,
+        config: &NodeConfig,
+        validator_keyfile: &Path,
+        resources: &TestnetResources,
+        lifecycle_lock: &ManagedLifecycleLock,
+        resume_plan: Option<&ManagedLaunchPlan>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.update_lifecycle_lock.is_none(),
             "a signed desktop update is installing; refusing to start arc-node until this GUI relaunches"
@@ -1005,7 +1163,16 @@ impl NodeManager {
         let recovery_launch = !arc_crypto::secret_file::desktop_shutdown_lifecycle_state(&data_dir)
             .context("cannot inspect managed-node lifecycle before executable selection")?
             .is_clear();
-        let binary = if recovery_launch {
+        let verified_resume = resume_plan
+            .map(|plan| plan.verify(lifecycle_lock))
+            .transpose()?;
+        let binary = if let Some((_, binary, _)) = verified_resume.as_ref() {
+            anyhow::ensure!(
+                !recovery_launch,
+                "cannot resume the pre-update node while its durable shutdown receipt is unresolved"
+            );
+            persist_managed_executable_identity(&data_dir, binary)?
+        } else if recovery_launch {
             // The new GUI environment may not retain the ARC_NODE_BIN/PATH/dev
             // resolution that launched the fenced process. Recover from the
             // private durable exact path selected before that process spawned;
@@ -1020,8 +1187,21 @@ impl NodeManager {
                 binary.display()
             );
         }
-        let stable_resources = materialize_stable_testnet_resources(&data_dir, resources)?;
+        let stable_resources = if let Some((_, _, exact_resources)) = verified_resume.as_ref() {
+            exact_resources.clone()
+        } else {
+            materialize_stable_testnet_resources(&data_dir, resources)?
+        };
         let (seeds_file, genesis_file) = required_testnet_resources(&stable_resources)?;
+        let validator_keyfile = if let Some((exact_validator_keyfile, _, _)) = verified_resume {
+            anyhow::ensure!(
+                exact_validator_keyfile == validator_keyfile.canonicalize()?,
+                "pre-update validator identity path does not match the running node"
+            );
+            exact_validator_keyfile
+        } else {
+            validator_keyfile.to_path_buf()
+        };
         let supports_desktop_shutdown =
             binary_supports_flag(&binary, "--desktop-shutdown-token-file");
         if !supports_desktop_shutdown {
@@ -1106,7 +1286,7 @@ impl NodeManager {
             // Keeping it persistent preserves the node/reward address across
             // desktop and machine restarts.
             .arg("--validator-key-file")
-            .arg(validator_keyfile)
+            .arg(&validator_keyfile)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(control) = shutdown_control.as_ref() {
@@ -1213,6 +1393,12 @@ impl NodeManager {
             cmd.arg("--model").arg(model);
         }
 
+        // Capture every launch identity before arming the shutdown receipt or
+        // spawning. Nothing after a successful spawn may fail before the
+        // Child handle and its exact restart plan are installed in `self`.
+        let launch_plan =
+            ManagedLaunchPlan::capture(config, &validator_keyfile, &binary, &stable_resources)?;
+
         push_log(
             &self.logs,
             "info",
@@ -1271,8 +1457,8 @@ impl NodeManager {
         self.rpc_port = rpc_port;
         self.started_at = Some(Instant::now());
         self.shutdown_control = shutdown_control;
-        self.lifecycle_lock = Some(lifecycle_lock);
         self.active_worker_threads = config.worker_threads.filter(|n| *n > 0);
+        self.active_launch_plan = Some(launch_plan);
 
         // Drain stdout/stderr into the log ring.
         if let Some(stdout) = child.stdout.take() {
@@ -1328,6 +1514,7 @@ impl NodeManager {
                 self.shutdown_control = None;
                 self.lifecycle_lock = None;
                 self.active_worker_threads = None;
+                self.active_launch_plan = None;
                 if !was_stopping {
                     let code = status.code();
                     let message = format!(
@@ -1393,6 +1580,7 @@ impl NodeManager {
             self.lifecycle_lock = None;
             self.started_at = None;
             self.active_worker_threads = None;
+            self.active_launch_plan = None;
             *self.crash_info.lock().await = None;
         }
         Ok(stopped)
@@ -1408,6 +1596,7 @@ impl NodeManager {
                 self.started_at = None;
                 self.active_worker_threads = None;
                 self.lifecycle_lock = None;
+                self.active_launch_plan = None;
             }
             Ok(None) | Err(_) => {
                 self.child = Some(child);
@@ -1416,9 +1605,7 @@ impl NodeManager {
         }
     }
 
-    async fn stop_and_retain_lifecycle_lock(
-        &mut self,
-    ) -> anyhow::Result<Option<ManagedLifecycleLock>> {
+    async fn stop_and_retain_lifecycle_lock(&mut self) -> anyhow::Result<StopLifecycleOutcome> {
         anyhow::ensure!(
             self.update_lifecycle_lock.is_none(),
             "a signed desktop update already owns the managed-node lifecycle fence"
@@ -1511,11 +1698,14 @@ impl NodeManager {
         // Return the still-live guard so callers performing a local mutation
         // or update can extend the same transaction without a release/reopen
         // gap. Plain Stop drops it immediately after this function returns.
-        Ok(lifecycle_lock)
+        Ok(StopLifecycleOutcome {
+            lifecycle_lock,
+            stopped,
+        })
     }
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {
-        drop(self.stop_and_retain_lifecycle_lock().await?);
+        drop(self.stop_and_retain_lifecycle_lock().await?.lifecycle_lock);
         Ok(())
     }
 
@@ -1524,6 +1714,7 @@ impl NodeManager {
     pub async fn stop_for_local_mutation(&mut self) -> anyhow::Result<ManagedLifecycleLock> {
         self.stop_and_retain_lifecycle_lock()
             .await?
+            .lifecycle_lock
             .ok_or_else(|| anyhow::anyhow!("managed node data directory is not configured"))
     }
 
@@ -1539,23 +1730,80 @@ impl NodeManager {
             // install() without re-proving that boundary. The controller
             // coalesces legitimate concurrent clicks, so fail closed until a
             // successful abort releases the existing fence or this GUI exits.
+            anyhow::bail!("a signed desktop update already owns the managed-node lifecycle fence");
+        }
+        anyhow::ensure!(
+            !self.update_handoff_started && self.update_restart_plan.is_none(),
+            "a prior desktop update lifecycle transaction is unresolved"
+        );
+
+        // Capture the exact launch before Stop consumes the child state. If a
+        // running owned node somehow lacks this post-spawn identity, do not
+        // stop it: an updater failure could not restore what was running.
+        let owned_was_running = self.child.is_some();
+        let restart_plan = if owned_was_running {
+            Some(self.active_launch_plan.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "running managed node has no exact native launch identity; refusing the update boundary"
+                )
+            })?)
+        } else {
+            None
+        };
+        let outcome = self.stop_and_retain_lifecycle_lock().await?;
+        let lifecycle_lock = outcome
+            .lifecycle_lock
+            .ok_or_else(|| anyhow::anyhow!("managed node data directory is not configured"))?;
+
+        // A restarted GUI normally reconciles detached children during app
+        // startup, before the updater can run. If one appears here, or if
+        // duplicate managed writers were drained, retain the fence and fail
+        // closed: there is no single exact owned launch to restore.
+        if outcome.stopped > 0 && (restart_plan.is_none() || outcome.stopped != 1) {
+            self.update_lifecycle_lock = Some(lifecycle_lock);
             anyhow::bail!(
-                "a signed desktop update already owns the managed-node lifecycle fence"
+                "update preparation stopped {count} managed node process(es) but cannot prove one exact owned launch to restore; the node remains stopped and the lifecycle fence remains active",
+                count = outcome.stopped
             );
         }
-        let lifecycle_lock = self.stop_for_local_mutation().await?;
+        self.update_restart_plan = restart_plan;
+        self.update_handoff_started = false;
         self.update_lifecycle_lock = Some(lifecycle_lock);
         Ok(())
     }
 
-    /// Release an updater fence only after a rejected/cancelled install, and
-    /// only after re-proving that no owned or detached writer exists and the
-    /// authenticated lifecycle receipt is clear. Successful installation never
-    /// calls this: a relaunch failure must stay fenced until manual GUI exit.
+    /// Commit the irreversible updater handoff immediately before the signed
+    /// installer is invoked. A frontend or IPC failure after this call must
+    /// never route through the pre-install abort-and-resume path.
+    pub fn begin_update_handoff(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.update_lifecycle_lock.is_some(),
+            "cannot begin updater handoff without a prepared lifecycle fence"
+        );
+        anyhow::ensure!(
+            self.child.is_none(),
+            "cannot begin updater handoff while an owned node is live"
+        );
+        anyhow::ensure!(
+            !self.update_handoff_started,
+            "updater handoff has already begun"
+        );
+        self.update_handoff_started = true;
+        Ok(())
+    }
+
+    /// Abort only after download/signature/preparation rejects before native
+    /// handoff, and only after re-proving that no owned or detached writer
+    /// exists and the authenticated lifecycle receipt is clear. If Prepare
+    /// stopped an owned node, restore its exact launch under the same guard.
     pub async fn abort_update_relaunch(&mut self) -> anyhow::Result<()> {
         if self.update_lifecycle_lock.is_none() {
             return Ok(());
         }
+        anyhow::ensure!(
+            !self.update_handoff_started,
+            "cannot abort or resume the old node after updater handoff has begun"
+        );
         anyhow::ensure!(
             self.child.is_none(),
             "cannot release update lifecycle fence while an owned node is live"
@@ -1580,8 +1828,50 @@ impl NodeManager {
             }
             .into());
         }
-        self.update_lifecycle_lock = None;
-        Ok(())
+
+        let Some(restart_plan) = self.update_restart_plan.take() else {
+            // The node was already stopped before Prepare. Release only the
+            // updater fence and preserve that stopped state.
+            self.update_lifecycle_lock = None;
+            self.update_handoff_started = false;
+            return Ok(());
+        };
+        let lifecycle_lock = self
+            .update_lifecycle_lock
+            .take()
+            .expect("checked update lifecycle lock above");
+        let resources = TestnetResources {
+            seeds_file: Some(restart_plan.seeds.path.clone()),
+            genesis_file: Some(restart_plan.genesis.path.clone()),
+        };
+        let result = self
+            .start_while_lifecycle_locked(
+                &restart_plan.config,
+                &restart_plan.validator_keyfile.path,
+                &resources,
+                &lifecycle_lock,
+                Some(&restart_plan),
+            )
+            .await;
+        match result {
+            Ok(()) => {
+                // Convert the same continuously-held OS lock from updater
+                // ownership back into ordinary child-lifecycle ownership.
+                self.lifecycle_lock = Some(lifecycle_lock);
+                self.update_handoff_started = false;
+                Ok(())
+            }
+            Err(error) => {
+                // Keep both the exact plan and the same lock so a failed
+                // identity/preflight/spawn cannot open a cross-GUI writer
+                // window or be mistaken for a harmless download error.
+                self.update_lifecycle_lock = Some(lifecycle_lock);
+                self.update_restart_plan = Some(restart_plan);
+                Err(error.context(
+                    "could not safely restore the exact pre-update node; the node remains stopped, the update lifecycle fence remains active, and a manual restart is required",
+                ))
+            }
+        }
     }
 
     pub async fn restart(
@@ -3553,10 +3843,183 @@ mod tests {
         // releases the guard, after which a second GUI may own the lifecycle.
         installer_gui.abort_update_relaunch().await.unwrap();
         assert!(installer_gui.update_lifecycle_lock.is_none());
+        assert!(installer_gui.child.is_none());
         competing_gui.prepare_update_relaunch().await.unwrap();
         assert!(competing_gui.update_lifecycle_lock.is_some());
         competing_gui.abort_update_relaunch().await.unwrap();
+        assert!(competing_gui.child.is_none());
         drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn updater_handoff_is_a_one_way_native_fence() {
+        let root = resource_test_dir("updater-one-way-handoff");
+        let configured = root.join("data-v3").to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+
+        manager.prepare_update_relaunch().await.unwrap();
+        manager.begin_update_handoff().unwrap();
+        let error = manager
+            .abort_update_relaunch()
+            .await
+            .expect_err("post-handoff abort must never resume the old node");
+        assert!(error
+            .to_string()
+            .contains("after updater handoff has begun"));
+        assert!(manager.update_lifecycle_lock.is_some());
+        assert!(manager.child.is_none());
+
+        // Process exit is the only release after handoff.
+        drop(manager);
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn updater_resume_plan_binds_exact_config_identity_resources_and_binary_bytes() {
+        let root = resource_test_dir("updater-exact-resume-plan");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let lock = acquire_managed_lifecycle_lock(&configured).unwrap();
+        let binary = root.join("arc-node");
+        let validator_key = root.join("validator.json");
+        let seeds = root.join("testnet-seeds.txt");
+        let genesis = root.join("genesis.toml");
+        std::fs::write(&binary, b"exact executable bytes").unwrap();
+        std::fs::write(&validator_key, b"exact validator identity").unwrap();
+        std::fs::write(&seeds, b"seed.example:9001\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\nname='arc-testnet'\n").unwrap();
+        let config = NodeConfig {
+            data_dir: configured,
+            rpc_port: 19_090,
+            p2p_port: 19_091,
+            worker_threads: Some(3),
+            ..NodeConfig::default()
+        };
+        let plan = ManagedLaunchPlan::capture(
+            &config,
+            &validator_key,
+            &binary,
+            &TestnetResources {
+                seeds_file: Some(seeds),
+                genesis_file: Some(genesis),
+            },
+        )
+        .unwrap();
+        let (verified_key, verified_binary, verified_resources) = plan.verify(&lock).unwrap();
+        assert_eq!(verified_key, validator_key.canonicalize().unwrap());
+        assert_eq!(verified_binary, binary.canonicalize().unwrap());
+        assert_eq!(plan.config.rpc_port, 19_090);
+        assert_eq!(plan.config.p2p_port, 19_091);
+        assert_eq!(plan.config.worker_threads, Some(3));
+        assert!(required_testnet_resources(&verified_resources).is_ok());
+
+        std::fs::write(&binary, b"different executable bytes").unwrap();
+        assert!(plan
+            .verify(&lock)
+            .unwrap_err()
+            .to_string()
+            .contains("executable bytes changed"));
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn updater_resume_fixture(label: &str) -> (PathBuf, String, NodeManager, ManagedLaunchPlan) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = resource_test_dir(label);
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let binary = root.join("arc-node-fixture");
+        let validator_key = root.join("validator.json");
+        let seeds = root.join("testnet-seeds.txt");
+        let genesis = root.join("genesis.toml");
+        std::fs::write(
+            &binary,
+            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file'\n  exit 0\nfi\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&validator_key, b"exact validator identity").unwrap();
+        std::fs::write(&seeds, b"seed.example:9001\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\nname='arc-testnet'\n").unwrap();
+        let config = NodeConfig {
+            role: "observer".into(),
+            model_path: None,
+            data_dir: configured.clone(),
+            rpc_port: 29_090,
+            p2p_port: 29_091,
+            worker_threads: None,
+            ..NodeConfig::default()
+        };
+        let resources = TestnetResources {
+            seeds_file: Some(seeds),
+            genesis_file: Some(genesis),
+        };
+        let plan =
+            ManagedLaunchPlan::capture(&config, &validator_key, &binary, &resources).unwrap();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        manager.update_lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
+        manager.update_restart_plan = Some(plan.clone());
+        (root, configured, manager, plan)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_download_abort_atomically_resumes_the_exact_pre_update_node() {
+        let (root, configured, mut manager, _plan) =
+            updater_resume_fixture("updater-atomic-resume");
+
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.child.is_some());
+        assert!(manager.lifecycle_lock.is_some());
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(manager.update_restart_plan.is_none());
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "the same lifecycle guard must remain continuously owned by the resumed child"
+        );
+
+        let mut child = manager.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.shutdown_control = None;
+        manager.lifecycle_lock = None;
+        manager.active_launch_plan = None;
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_download_abort_retains_fence_when_exact_resume_identity_changed() {
+        let (root, configured, mut manager, plan) =
+            updater_resume_fixture("updater-resume-failure");
+        std::fs::write(&plan.binary.path, b"tampered while download was in flight").unwrap();
+
+        let error = manager
+            .abort_update_relaunch()
+            .await
+            .expect_err("changed executable must block automatic resume");
+        let detail = error.to_string();
+        assert!(detail.contains("node remains stopped"), "{detail}");
+        assert!(detail.contains("manual restart is required"), "{detail}");
+        assert!(manager.child.is_none());
+        assert!(manager.lifecycle_lock.is_none());
+        assert!(manager.update_lifecycle_lock.is_some());
+        assert!(manager.update_restart_plan.is_some());
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "resume failure must retain the updater lifecycle fence"
+        );
+
+        drop(manager);
         std::fs::remove_dir_all(root).unwrap();
     }
 

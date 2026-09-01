@@ -193,6 +193,10 @@ pub async fn fetch_status(
 /// evidence fields, and all three rollout/readiness booleans. Any missing,
 /// ambiguous, or internally inconsistent field fails closed.
 const RETAINED_EARNINGS_SOURCE: &str = "scan of this node's in-memory full_transactions map";
+const ARCHIVE_EARNINGS_SCOPE: &str =
+    "complete canonical reward history since the v3 recovery boundary";
+const RETAINED_EARNINGS_SCOPE: &str = "this node's bounded retained reward-receipt window";
+const EARNINGS_HISTORY_DOMAIN: &str = "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
 
 fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     let normalized_hash = |value: &Value| {
@@ -200,6 +204,7 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         is_tx_hash(&bare).then(|| format!("0x{bare}"))
     };
     let total_rewards = v.get("total_rewards")?.as_u64()?;
+    let response_address = normalized_hash(v.get("address")?)?;
     let confirmed_count = v.get("confirmed_receipt_count")?.as_u64()?;
     if confirmed_count != total_rewards {
         return None;
@@ -223,6 +228,19 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         return None;
     }
     let archive_mode = v.get("archive_mode")?.as_bool()?;
+    let history_complete_since_recovery = v.get("history_complete_since_recovery")?.as_bool()?;
+    let history_scope = v.get("history_scope")?.as_str()?;
+    let history_domain = v.get("history_domain")?.as_str()?;
+    if history_domain != EARNINGS_HISTORY_DOMAIN {
+        return None;
+    }
+    if (archive_mode
+        && (!history_complete_since_recovery || history_scope != ARCHIVE_EARNINGS_SCOPE))
+        || (!archive_mode
+            && (history_complete_since_recovery || history_scope != RETAINED_EARNINGS_SCOPE))
+    {
+        return None;
+    }
 
     let effective = v.get("community_rewards_v1_enabled")?.as_bool()?;
     let protocol_active = v.get("community_rewards_v1_protocol_active")?.as_bool()?;
@@ -242,7 +260,12 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     let mut receipt_tx_hashes = std::collections::HashSet::new();
     let mut receipt_job_ids = std::collections::HashSet::new();
     for receipt in receipt_values {
-        if receipt.get("tx_type")?.as_str()? != "0x25" || !receipt.get("success")?.as_bool()? {
+        if receipt.get("tx_type")?.as_str()? != "0x25"
+            || !receipt.get("submitted")?.as_bool()?
+            || !receipt.get("included")?.as_bool()?
+            || !receipt.get("confirmed")?.as_bool()?
+            || !receipt.get("success")?.as_bool()?
+        {
             return None;
         }
         let reward_arc = receipt.get("reward_arc")?.as_f64()?;
@@ -256,8 +279,16 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         receipt_base_sum = receipt_base_sum.checked_add(reward_base)?;
         let tx_hash = normalized_hash(receipt.get("tx_hash")?)?;
         let job_id = normalized_hash(receipt.get("job_id")?)?;
+        let worker = normalized_hash(receipt.get("worker")?)?;
+        if worker != response_address {
+            return None;
+        }
         let block_hash = normalized_hash(receipt.get("block_hash")?)?;
         if !receipt_tx_hashes.insert(tx_hash.clone()) || !receipt_job_ids.insert(job_id.clone()) {
+            return None;
+        }
+        let expected_receipt_url = format!("/community/reward_receipt/{tx_hash}");
+        if receipt.get("receipt_url")?.as_str()? != expected_receipt_url {
             return None;
         }
         confirmed_receipts.push(ConfirmedRewardReceipt {
@@ -267,6 +298,7 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
             block_hash,
             reward_base,
             reward_arc,
+            receipt_url: expected_receipt_url,
             recovery_epoch: receipt.get("recovery_epoch").and_then(Value::as_u64),
             validator_set_id: receipt.get("validator_set_id").and_then(Value::as_u64),
         });
@@ -304,10 +336,8 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     // The host's numeric field is only a candidate. Exact, unique successful
     // mined 0x25 rows above establish the observation count used by the local
     // minimum-history gate; a raw count alone never unlocks a projection.
-    let observation_gate = projection_observation_gate(
-        v,
-        u64::try_from(confirmed_receipts.len()).ok()?,
-    );
+    let observation_gate =
+        projection_observation_gate(v, u64::try_from(confirmed_receipts.len()).ok()?);
     let projected_daily_arc = observation_gate
         .is_none()
         .then_some(host_projected_daily_arc)
@@ -350,6 +380,8 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         unavailable_reason: None,
         receipt_source: Some(receipt_source.to_string()),
         archive_mode: Some(archive_mode),
+        history_complete_since_recovery: Some(history_complete_since_recovery),
+        history_scope: Some(history_scope.to_string()),
         from_chain: true,
     })
 }
@@ -361,6 +393,12 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
 /// rather than converted into ARC.
 ///
 /// `address` is the user's hex address (with or without `0x` prefix).
+fn earnings_response_matches_worker(value: &Value, requested_address: &str) -> bool {
+    let requested = strip_0x(requested_address);
+    let response = value.get("address").and_then(Value::as_str).map(strip_0x);
+    is_tx_hash(&requested) && response.as_deref() == Some(requested.as_str())
+}
+
 pub async fn fetch_earnings(
     http: &reqwest::Client,
     base_url: &str,
@@ -373,6 +411,14 @@ pub async fn fetch_earnings(
     };
     let path = format!("/worker/earnings/{}", addr.trim_start_matches("0x"));
     let fetched = get_detailed(http, &format!("{}{}", base_url, path)).await;
+    if let Fetched::Ok(value) = &fetched {
+        if !earnings_response_matches_worker(value, addr) {
+            return unavailable_earnings(format!(
+                "{} answered {}, but the earnings response was not bound to the requested worker address.",
+                base_url, path
+            ));
+        }
+    }
     earnings_from_fetched(base_url, &path, fetched)
 }
 
@@ -437,10 +483,23 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
                     && v.get("computed").and_then(Value::as_bool) == Some(true);
                 let typed = match v.get("record_kind").and_then(Value::as_str) {
                     Some("mined_community_inference_reward") => {
+                        let tx_hash = v
+                            .get("tx_hash")
+                            .and_then(Value::as_str)
+                            .map(strip_0x)
+                            .filter(|hash| is_tx_hash(hash));
                         v.get("tx_type").and_then(Value::as_str) == Some("CommunityInferenceReward")
                             && v.get("tx_type_code").and_then(Value::as_str) == Some("0x25")
                             && v.get("paid").and_then(Value::as_bool) == Some(true)
                             && v.get("earned").and_then(Value::as_bool) == Some(true)
+                            && v.get("submitted").and_then(Value::as_bool) == Some(true)
+                            && v.get("included").and_then(Value::as_bool) == Some(true)
+                            && v.get("confirmed").and_then(Value::as_bool) == Some(true)
+                            && tx_hash.is_some_and(|hash| {
+                                let expected = format!("/community/reward_receipt/0x{hash}");
+                                v.get("receipt_url").and_then(Value::as_str)
+                                    == Some(expected.as_str())
+                            })
                     }
                     Some("mined_inference_attestation") => {
                         v.get("tx_type").and_then(Value::as_str) == Some("InferenceAttestation")
@@ -656,6 +715,8 @@ fn unavailable_earnings(reason: impl Into<String>) -> Earnings {
         unavailable_reason: Some(reason.into()),
         receipt_source: None,
         archive_mode: None,
+        history_complete_since_recovery: None,
+        history_scope: None,
         from_chain: false,
     }
 }
@@ -1003,6 +1064,11 @@ fn parse_inference_settlement(v: &Value) -> Option<InferenceSettlement> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        worker: settlement
+            .get("worker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         submitted: settlement
             .get("submitted")
             .and_then(Value::as_bool)
@@ -1015,6 +1081,14 @@ fn parse_inference_settlement(v: &Value) -> Option<InferenceSettlement> {
             .get("confirmed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        success: settlement.get("success").and_then(Value::as_bool),
+        block_height: settlement.get("block_height").and_then(Value::as_u64),
+        block_hash: settlement
+            .get("block_hash")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        index: settlement.get("index").and_then(Value::as_u64),
+        reward_base: settlement.get("reward_base").and_then(Value::as_u64),
         reward_arc,
         receipt_url: settlement
             .get("receipt_url")
@@ -1022,6 +1096,232 @@ fn parse_inference_settlement(v: &Value) -> Option<InferenceSettlement> {
             .unwrap_or("")
             .to_string(),
     })
+}
+
+fn is_canonical_hash32(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_community_receipt_expectation(
+    tx_hash: &str,
+    job_id: &str,
+    worker: &str,
+    receipt_url: &str,
+) -> Result<(), String> {
+    for (label, value) in [
+        ("transaction hash", tx_hash),
+        ("job identity", job_id),
+        ("worker identity", worker),
+    ] {
+        if !is_canonical_hash32(value) {
+            return Err(format!(
+                "reward receipt unavailable: expected {label} is not canonical 0x-prefixed lowercase hex"
+            ));
+        }
+    }
+    let exact_url = format!("/community/reward_receipt/{tx_hash}");
+    if receipt_url != exact_url {
+        return Err(
+            "reward receipt unavailable: submitted receipt URL is not bound to its transaction hash"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Parse only the canonical community reward receipt contract, bound to the
+/// exact identity tuple returned by the inference coordinator. This parser is
+/// intentionally stricter than the provisional `/inference/run` adapter: a
+/// missing field, cross-job/cross-worker response, or impossible state matrix
+/// is an unavailable receipt, never evidence of earnings.
+fn parse_community_reward_receipt_value(
+    value: &Value,
+    expected_tx_hash: &str,
+    expected_job_id: &str,
+    expected_worker: &str,
+    expected_receipt_url: &str,
+) -> Result<InferenceSettlement, String> {
+    validate_community_receipt_expectation(
+        expected_tx_hash,
+        expected_job_id,
+        expected_worker,
+        expected_receipt_url,
+    )?;
+    let exact_string = |field: &str, expected: &str| -> Result<(), String> {
+        if value.get(field).and_then(Value::as_str) == Some(expected) {
+            Ok(())
+        } else {
+            Err(format!(
+                "reward receipt unavailable: canonical response {field} did not exactly match the submitted identity"
+            ))
+        }
+    };
+    exact_string("tx_type", "0x25")?;
+    exact_string("tx_hash", expected_tx_hash)?;
+    exact_string("job_id", expected_job_id)?;
+    exact_string("worker", expected_worker)?;
+    exact_string("receipt_url", expected_receipt_url)?;
+
+    let status = value.get("status").and_then(Value::as_str).ok_or_else(|| {
+        "reward receipt unavailable: canonical response omitted status".to_string()
+    })?;
+    let submitted = value.get("submitted").and_then(Value::as_bool);
+    let included = value.get("included").and_then(Value::as_bool);
+    let confirmed = value.get("confirmed").and_then(Value::as_bool);
+    let success_value = value.get("success").ok_or_else(|| {
+        "reward receipt unavailable: canonical response omitted success".to_string()
+    })?;
+    let success = if success_value.is_null() {
+        None
+    } else {
+        Some(success_value.as_bool().ok_or_else(|| {
+            "reward receipt unavailable: canonical response success was not boolean or null"
+                .to_string()
+        })?)
+    };
+    let reward_value = value.get("reward_arc").ok_or_else(|| {
+        "reward receipt unavailable: canonical response omitted reward_arc".to_string()
+    })?;
+    let reward_arc = if reward_value.is_null() {
+        None
+    } else {
+        Some(
+            reward_value
+                .as_f64()
+                .filter(|amount| amount.is_finite())
+                .ok_or_else(|| {
+                    "reward receipt unavailable: canonical reward_arc was not finite".to_string()
+                })?,
+        )
+    };
+    let reward_base_value = value.get("reward_base").ok_or_else(|| {
+        "reward receipt unavailable: canonical response omitted reward_base".to_string()
+    })?;
+    let reward_base = if reward_base_value.is_null() {
+        None
+    } else {
+        Some(reward_base_value.as_u64().ok_or_else(|| {
+            "reward receipt unavailable: canonical reward_base was not a nonnegative integer"
+                .to_string()
+        })?)
+    };
+    let block_height = value.get("block_height").and_then(Value::as_u64);
+    let block_hash = value
+        .get("block_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| is_canonical_hash32(hash))
+        .map(ToString::to_string);
+    let index = value.get("index").and_then(Value::as_u64);
+    let included_evidence_valid = block_height.is_some() && block_hash.is_some() && index.is_some();
+    let pending_has_no_inclusion = value.get("block_height").is_none_or(Value::is_null)
+        && value.get("block_hash").is_none_or(Value::is_null)
+        && value.get("index").is_none_or(Value::is_null);
+
+    let matrix_valid = match status {
+        "pending_mined_receipt" => {
+            submitted == Some(true)
+                && included == Some(false)
+                && confirmed == Some(false)
+                && success.is_none()
+                && reward_base.is_none()
+                && reward_arc.is_none()
+                && pending_has_no_inclusion
+        }
+        "mined_success" => {
+            submitted == Some(true)
+                && included == Some(true)
+                && confirmed == Some(true)
+                && success == Some(true)
+                && reward_base == Some(arc_types::economics::INFERENCE_ATTESTATION_REWARD)
+                && reward_arc == Some(2.5)
+                && included_evidence_valid
+        }
+        "mined_failed" => {
+            submitted == Some(true)
+                && included == Some(true)
+                && confirmed == Some(false)
+                && success == Some(false)
+                && reward_base.is_none()
+                && reward_arc.is_none()
+                && included_evidence_valid
+        }
+        "receipt_unavailable" => {
+            submitted == Some(true)
+                && included == Some(true)
+                && confirmed == Some(false)
+                && success.is_none()
+                && reward_base.is_none()
+                && reward_arc.is_none()
+                && included_evidence_valid
+        }
+        _ => false,
+    };
+    if !matrix_valid {
+        return Err(format!(
+            "reward receipt unavailable: canonical response has an invalid {status} state matrix"
+        ));
+    }
+
+    Ok(InferenceSettlement {
+        status: status.to_string(),
+        tx_type: "0x25".to_string(),
+        tx_hash: expected_tx_hash.to_string(),
+        job_id: expected_job_id.to_string(),
+        worker: expected_worker.to_string(),
+        submitted: submitted == Some(true),
+        included: included == Some(true),
+        confirmed: confirmed == Some(true),
+        success,
+        block_height,
+        block_hash,
+        index,
+        reward_base,
+        reward_arc,
+        receipt_url: expected_receipt_url.to_string(),
+    })
+}
+
+/// Fetch one exact receipt from the coordinator that accepted/served the
+/// inference. The command layer allowlists and pins `source_host`; this layer
+/// performs one GET with no coordinator fallback and proves the response's
+/// complete identity and state matrix before returning it to the WebView.
+pub async fn fetch_community_reward_receipt(
+    http: &reqwest::Client,
+    source_host: &str,
+    tx_hash: &str,
+    job_id: &str,
+    worker: &str,
+    receipt_url: &str,
+) -> Result<InferenceSettlement, String> {
+    validate_community_receipt_expectation(tx_hash, job_id, worker, receipt_url)?;
+    if source_host.ends_with('/') {
+        return Err(
+            "reward receipt unavailable: pinned coordinator origin was not canonical".to_string(),
+        );
+    }
+    let response = http
+        .get(format!("{source_host}{receipt_url}"))
+        .send()
+        .await
+        .map_err(|error| {
+            format!("reward receipt unavailable from pinned coordinator {source_host}: {error}")
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "reward receipt unavailable from pinned coordinator {source_host}: HTTP {status}"
+        ));
+    }
+    let value: Value = response.json().await.map_err(|error| {
+        format!(
+            "reward receipt unavailable from pinned coordinator {source_host}: invalid JSON ({error})"
+        )
+    })?;
+    parse_community_reward_receipt_value(&value, tx_hash, job_id, worker, receipt_url)
 }
 
 /// Parse the common `/inference/run` envelope. Community verification and
@@ -1185,7 +1485,10 @@ pub async fn run_inference(
         "[inference/run] ✓ response: {}",
         serde_json::to_string(&v).unwrap_or_default()
     );
-    parse_inference_run_value(&v, None, false)
+    // Keep the exact local origin that answered this request. If it returned a
+    // provisional community settlement, receipt polling must stay pinned to
+    // this host just as remote coordinator polling does.
+    parse_inference_run_value(&v, Some(base_url), false)
 }
 
 /// Milestone A: fall back to a seed coordinator's `/inference/run_consensus`
@@ -1794,13 +2097,24 @@ pub async fn fetch_earnings_projection(
         }
     };
 
-    let Some(confirmed) = confirmed_earnings_from_value(v) else {
+    let response_matches_worker = earnings_response_matches_worker(v, &addr);
+    let Some(confirmed) = response_matches_worker
+        .then(|| confirmed_earnings_from_value(v))
+        .flatten()
+    else {
         return EarningsProjection {
             source_host: base_url.to_string(),
-            unavailable: Some(format!(
-                "{} answered {}, but did not provide the candidate mined-0x25 receipt and reward-readiness contract. Legacy inference-count arithmetic is not projected as earnings.",
-                base_url, path
-            )),
+            unavailable: Some(if response_matches_worker {
+                format!(
+                    "{} answered {}, but did not provide the candidate mined-0x25 receipt and reward-readiness contract. Legacy inference-count arithmetic is not projected as earnings.",
+                    base_url, path
+                )
+            } else {
+                format!(
+                    "{} answered {}, but the earnings response was not bound to the requested worker address.",
+                    base_url, path
+                )
+            }),
             reward_per_attestation: None,
             reward_rate_source: "unknown".to_string(),
             community_rewards_enabled: None,
@@ -2448,9 +2762,11 @@ mod chain_read_tests {
                 "tx_type": "0x25",
                 "tx_hash": reward_hash,
                 "job_id": format!("0x{}", "44".repeat(32)),
+                "worker": format!("0x{}", "11".repeat(32)),
                 "submitted": true,
                 "included": false,
                 "confirmed": false,
+                "success": null,
                 "reward_arc": 2.5,
                 "receipt_url": "/community/reward_receipt/test"
             }
@@ -2470,10 +2786,120 @@ mod chain_read_tests {
         let settlement = parsed.settlement.expect("typed reward settlement");
         assert_eq!(settlement.tx_type, "0x25");
         assert_eq!(settlement.tx_hash, reward_hash);
+        assert_eq!(settlement.worker, format!("0x{}", "11".repeat(32)));
         assert!(settlement.submitted);
         assert!(!settlement.included);
         assert!(!settlement.confirmed);
+        assert_eq!(settlement.success, None);
         assert_eq!(settlement.reward_arc, Some(2.5));
+    }
+
+    fn canonical_reward_receipt(status: &str) -> Value {
+        let (included, confirmed, success, reward_base, reward_arc) = match status {
+            "pending_mined_receipt" => (false, false, Value::Null, Value::Null, Value::Null),
+            "mined_success" => (true, true, json!(true), json!(2_500_000_000u64), json!(2.5)),
+            "mined_failed" => (true, false, json!(false), Value::Null, Value::Null),
+            "receipt_unavailable" => (true, false, Value::Null, Value::Null, Value::Null),
+            other => panic!("unsupported test status {other}"),
+        };
+        json!({
+            "status": status,
+            "tx_type": "0x25",
+            "tx_hash": format!("0x{}", "44".repeat(32)),
+            "job_id": format!("0x{}", "55".repeat(32)),
+            "worker": format!("0x{}", "11".repeat(32)),
+            "submitted": true,
+            "included": included,
+            "confirmed": confirmed,
+            "success": success,
+            "block_height": if included { json!(123) } else { Value::Null },
+            "block_hash": if included { json!(format!("0x{}", "77".repeat(32))) } else { Value::Null },
+            "index": if included { json!(0) } else { Value::Null },
+            "reward_base": reward_base,
+            "reward_arc": reward_arc,
+            "receipt_url": format!("/community/reward_receipt/0x{}", "44".repeat(32)),
+        })
+    }
+
+    fn parse_test_reward_receipt(value: &Value) -> Result<InferenceSettlement, String> {
+        parse_community_reward_receipt_value(
+            value,
+            &format!("0x{}", "44".repeat(32)),
+            &format!("0x{}", "55".repeat(32)),
+            &format!("0x{}", "11".repeat(32)),
+            &format!("/community/reward_receipt/0x{}", "44".repeat(32)),
+        )
+    }
+
+    #[test]
+    fn canonical_reward_receipt_accepts_only_the_four_exact_state_matrices() {
+        for status in [
+            "pending_mined_receipt",
+            "mined_success",
+            "mined_failed",
+            "receipt_unavailable",
+        ] {
+            let parsed = parse_test_reward_receipt(&canonical_reward_receipt(status))
+                .unwrap_or_else(|error| panic!("{status} should be valid: {error}"));
+            assert_eq!(parsed.status, status);
+            assert_eq!(parsed.worker, format!("0x{}", "11".repeat(32)));
+        }
+
+        let mut success_false = canonical_reward_receipt("mined_success");
+        success_false["success"] = json!(false);
+        assert!(parse_test_reward_receipt(&success_false)
+            .unwrap_err()
+            .contains("invalid mined_success state matrix"));
+
+        let mut wrong_reward_base = canonical_reward_receipt("mined_success");
+        wrong_reward_base["reward_base"] = json!(2_500_000_001u64);
+        assert!(parse_test_reward_receipt(&wrong_reward_base).is_err());
+    }
+
+    #[test]
+    fn canonical_reward_receipt_rejects_wrong_or_missing_worker_and_url_migration() {
+        let mut wrong_worker = canonical_reward_receipt("mined_success");
+        wrong_worker["worker"] = json!(format!("0x{}", "12".repeat(32)));
+        assert!(parse_test_reward_receipt(&wrong_worker)
+            .unwrap_err()
+            .contains("worker"));
+
+        let mut missing_worker = canonical_reward_receipt("mined_success");
+        missing_worker.as_object_mut().unwrap().remove("worker");
+        assert!(parse_test_reward_receipt(&missing_worker)
+            .unwrap_err()
+            .contains("worker"));
+
+        let mut wrong_url = canonical_reward_receipt("mined_success");
+        wrong_url["receipt_url"] =
+            json!(format!("/community/reward_receipt/0x{}", "66".repeat(32)));
+        assert!(parse_test_reward_receipt(&wrong_url)
+            .unwrap_err()
+            .contains("receipt_url"));
+    }
+
+    #[test]
+    fn canonical_reward_receipt_requires_uncorrupted_block_inclusion_evidence() {
+        for field in ["block_height", "block_hash", "index"] {
+            let mut missing = canonical_reward_receipt("mined_success");
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                parse_test_reward_receipt(&missing).is_err(),
+                "missing {field} must fail closed"
+            );
+        }
+
+        let mut negative_height = canonical_reward_receipt("mined_failed");
+        negative_height["block_height"] = json!(-1);
+        assert!(parse_test_reward_receipt(&negative_height).is_err());
+
+        let mut corrupt_hash = canonical_reward_receipt("receipt_unavailable");
+        corrupt_hash["block_hash"] = json!(format!("0x{}", "gg".repeat(32)));
+        assert!(parse_test_reward_receipt(&corrupt_hash).is_err());
+
+        let mut pending_with_block = canonical_reward_receipt("pending_mined_receipt");
+        pending_with_block["block_height"] = json!(123);
+        assert!(parse_test_reward_receipt(&pending_with_block).is_err());
     }
 
     #[test]
@@ -2675,6 +3101,7 @@ mod chain_read_tests {
 
     fn candidate_earnings_value() -> Value {
         json!({
+            "address": format!("0x{}", "99".repeat(32)),
             "total_rewards": 2,
             "estimated_total_arc": 5.0,
             "confirmed_receipt_count": 2,
@@ -2685,9 +3112,14 @@ mod chain_read_tests {
                     "tx_type": "0x25",
                     "tx_hash": format!("0x{}", "aa".repeat(32)),
                     "job_id": format!("0x{}", "01".repeat(32)),
+                    "worker": format!("0x{}", "99".repeat(32)),
                     "block_height": 123_461,
                     "block_hash": format!("0x{}", "10".repeat(32)),
+                    "submitted": true,
+                    "included": true,
+                    "confirmed": true,
                     "success": true,
+                    "receipt_url": format!("/community/reward_receipt/0x{}", "aa".repeat(32)),
                     "reward_base": 2_500_000_000u64,
                     "reward_arc": 2.5,
                     "recovery_epoch": 1,
@@ -2697,9 +3129,14 @@ mod chain_read_tests {
                     "tx_type": "0x25",
                     "tx_hash": format!("0x{}", "ab".repeat(32)),
                     "job_id": format!("0x{}", "02".repeat(32)),
+                    "worker": format!("0x{}", "99".repeat(32)),
                     "block_height": 123_462,
                     "block_hash": format!("0x{}", "11".repeat(32)),
+                    "submitted": true,
+                    "included": true,
+                    "confirmed": true,
                     "success": true,
+                    "receipt_url": format!("/community/reward_receipt/0x{}", "ab".repeat(32)),
                     "reward_base": 2_500_000_000u64,
                     "reward_arc": 2.5,
                     "recovery_epoch": 1,
@@ -2710,6 +3147,9 @@ mod chain_read_tests {
                 "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
             "source": RETAINED_EARNINGS_SOURCE,
             "archive_mode": false,
+            "history_complete_since_recovery": false,
+            "history_scope": RETAINED_EARNINGS_SCOPE,
+            "history_domain": EARNINGS_HISTORY_DOMAIN,
             "today_arc": Value::Null,
             "projected_daily_arc": Value::Null,
             "projected_daily_unavailable_reason": "a single receipt window cannot establish a forecast",
@@ -2733,9 +3173,14 @@ mod chain_read_tests {
                 "tx_type": "0x25",
                 "tx_hash": format!("0x{}", "ac".repeat(32)),
                 "job_id": format!("0x{}", "03".repeat(32)),
+                "worker": format!("0x{}", "99".repeat(32)),
                 "block_height": 123_463,
                 "block_hash": format!("0x{}", "12".repeat(32)),
+                "submitted": true,
+                "included": true,
+                "confirmed": true,
                 "success": true,
+                "receipt_url": format!("/community/reward_receipt/0x{}", "ac".repeat(32)),
                 "reward_base": 2_500_000_000u64,
                 "reward_arc": 2.5,
                 "recovery_epoch": 1,
@@ -2766,8 +3211,7 @@ mod chain_read_tests {
         value["projected_daily_arc"] = json!(7.5);
         value["projected_daily_unavailable_reason"] = Value::Null;
         value["observed_window_first_timestamp_ms"] = json!(1_700_000_000_000u64);
-        value["observed_window_last_timestamp_ms"] =
-            json!(1_700_000_000_000u64 + window_ms);
+        value["observed_window_last_timestamp_ms"] = json!(1_700_000_000_000u64 + window_ms);
         value
     }
 
@@ -2789,7 +3233,11 @@ mod chain_read_tests {
         paid["tx_type_code"] = json!("0x25");
         paid["paid"] = json!(true);
         paid["earned"] = json!(true);
+        paid["submitted"] = json!(true);
+        paid["included"] = json!(true);
+        paid["confirmed"] = json!(true);
         paid["tx_hash"] = json!(format!("0x{}", "22".repeat(32)));
+        paid["receipt_url"] = json!(format!("/community/reward_receipt/0x{}", "22".repeat(32)));
         paid["worker"] = json!(format!("0x{worker}"));
         paid["from"] = json!(format!("0x{}", "ff".repeat(32)));
 
@@ -2808,10 +3256,15 @@ mod chain_read_tests {
         let mut mislabeled = paid.clone();
         mislabeled["paid"] = json!(false);
         mislabeled["tx_hash"] = json!(format!("0x{}", "55".repeat(32)));
+        let mut unconfirmed = paid.clone();
+        unconfirmed["confirmed"] = json!(false);
+        unconfirmed["tx_hash"] = json!(format!("0x{}", "66".repeat(32)));
+        unconfirmed["receipt_url"] =
+            json!(format!("/community/reward_receipt/0x{}", "66".repeat(32)));
 
         let parsed = attestations_from_value(
             &json!({
-                "activities": [paid, claim, failed, mislabeled],
+                "activities": [paid, claim, failed, mislabeled, unconfirmed],
                 "attestations": [{"tx_hash": format!("0x{}", "66".repeat(32)), "success": true}],
             }),
             Some(&format!("0x{worker}")),
@@ -2851,6 +3304,29 @@ mod chain_read_tests {
             Some(RETAINED_EARNINGS_SOURCE)
         );
         assert_eq!(earnings.archive_mode, Some(false));
+        assert_eq!(earnings.history_complete_since_recovery, Some(false));
+        assert_eq!(
+            earnings.history_scope.as_deref(),
+            Some(RETAINED_EARNINGS_SCOPE)
+        );
+    }
+
+    #[test]
+    fn earnings_response_identity_must_match_the_requested_worker() {
+        let value = candidate_earnings_value();
+        let worker = format!("0x{}", "99".repeat(32));
+        assert!(earnings_response_matches_worker(&value, &worker));
+        assert!(earnings_response_matches_worker(
+            &value,
+            &worker.to_ascii_uppercase()
+        ));
+        assert!(!earnings_response_matches_worker(
+            &value,
+            &format!("0x{}", "98".repeat(32))
+        ));
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("address");
+        assert!(!earnings_response_matches_worker(&missing, &worker));
     }
 
     #[test]
@@ -2971,9 +3447,14 @@ mod chain_read_tests {
                 "tx_type": "0x25",
                 "tx_hash": format!("0x{}", "ac".repeat(32)),
                 "job_id": format!("0x{}", "03".repeat(32)),
+                "worker": format!("0x{}", "99".repeat(32)),
                 "block_height": 123_463,
                 "block_hash": format!("0x{}", "12".repeat(32)),
+                "submitted": true,
+                "included": true,
+                "confirmed": true,
                 "success": true,
+                "receipt_url": format!("/community/reward_receipt/0x{}", "ac".repeat(32)),
                 "reward_base": 2_500_000_000u64,
                 "reward_arc": 2.5,
                 "recovery_epoch": 1,
@@ -3042,6 +3523,52 @@ mod chain_read_tests {
         let mut wrong_type = candidate_earnings_value();
         wrong_type["confirmed_receipts"][0]["tx_type"] = json!("0x16");
         assert!(confirmed_earnings_from_value(&wrong_type).is_none());
+
+        let mut wrong_worker = candidate_earnings_value();
+        wrong_worker["confirmed_receipts"][0]["worker"] = json!(format!("0x{}", "98".repeat(32)));
+        assert!(confirmed_earnings_from_value(&wrong_worker).is_none());
+
+        let mut missing_address = candidate_earnings_value();
+        missing_address.as_object_mut().unwrap().remove("address");
+        assert!(confirmed_earnings_from_value(&missing_address).is_none());
+
+        for field in ["submitted", "included", "confirmed"] {
+            let mut missing_truth = candidate_earnings_value();
+            missing_truth["confirmed_receipts"][0][field] = json!(false);
+            assert!(
+                confirmed_earnings_from_value(&missing_truth).is_none(),
+                "{field}=false must fail closed"
+            );
+        }
+        let mut wrong_url = candidate_earnings_value();
+        wrong_url["confirmed_receipts"][0]["receipt_url"] =
+            json!(format!("/community/reward_receipt/0x{}", "ff".repeat(32)));
+        assert!(confirmed_earnings_from_value(&wrong_url).is_none());
+    }
+
+    #[test]
+    fn archive_history_claim_requires_the_exact_recovery_scope() {
+        let mut archive = candidate_earnings_value();
+        archive["archive_mode"] = json!(true);
+        archive["history_complete_since_recovery"] = json!(true);
+        archive["history_scope"] = json!(ARCHIVE_EARNINGS_SCOPE);
+        archive["history_domain"] = json!(EARNINGS_HISTORY_DOMAIN);
+        archive["confirmed_receipts"][0]["recovery_epoch"] = json!(1);
+        archive["confirmed_receipts"][1]["recovery_epoch"] = json!(7);
+        let parsed = confirmed_earnings_from_value(&archive)
+            .expect("the explicit archive recovery scope is valid");
+        assert_eq!(parsed.total_arc, 5.0);
+        assert_eq!(parsed.archive_mode, Some(true));
+        assert_eq!(parsed.history_complete_since_recovery, Some(true));
+
+        archive["history_complete_since_recovery"] = json!(false);
+        assert!(confirmed_earnings_from_value(&archive).is_none());
+        archive["history_complete_since_recovery"] = json!(true);
+        archive["history_scope"] = json!("retained window");
+        assert!(confirmed_earnings_from_value(&archive).is_none());
+        archive["history_scope"] = json!(ARCHIVE_EARNINGS_SCOPE);
+        archive["history_domain"] = json!("current recovery epoch only");
+        assert!(confirmed_earnings_from_value(&archive).is_none());
     }
 
     #[test]

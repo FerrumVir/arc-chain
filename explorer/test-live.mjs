@@ -28,7 +28,12 @@ const config = network.normalizeConfig(await loadRawConfig(configTarget));
 assert.ok(config.checkpoint, "live explorer gate requires an approved recovery checkpoint");
 const resolver = network.createCanonicalResolver(config);
 const checkpoint = config.checkpoint;
-const checkpointAudit = await explorer.verifyRecoveryCheckpoint({ resolver, fetchImpl: fetch });
+const [checkpointAudit, maintenanceAudit] = await Promise.all([
+  explorer.verifyRecoveryCheckpoint({ resolver, fetchImpl: fetch }),
+  network.auditMaintenanceInterlock({ resolver, fetchImpl: fetch }),
+]);
+assert.equal(maintenanceAudit.state, "healthy", `maintenance interlock is ${maintenanceAudit.state}: ${maintenanceAudit.reason ?? "no reason"}`);
+assert.equal(maintenanceAudit.samples.length, 6, "live explorer gate requires all six maintenance interlocks");
 assert.equal(checkpointAudit.state, "verified", `exact recovery checkpoint proof is ${checkpointAudit.state}: ${checkpointAudit.reason ?? "no reason"}`);
 
 const legacy = await explorer.queryBlock({ resolver, fetchImpl: fetch, height: checkpoint.height, sourceId: "canonical", checkpointAudit });

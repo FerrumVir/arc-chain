@@ -24,9 +24,10 @@ fn permission_error(message: impl Into<String>) -> io::Error {
 /// Create a brand-new private regular file without following links.
 ///
 /// The target must not already exist. Unix files are born and revalidated at
-/// mode 0600. Windows files are born with a protected DACL granting full
-/// control only to the current user, LocalSystem, and Administrators, then
-/// owner and DACL are revalidated through the returned handle.
+/// mode 0600. Windows files are born owned by the current user with a protected
+/// DACL granting full control only to that user, LocalSystem, and
+/// Administrators, then owner and DACL are revalidated through the returned
+/// handle.
 pub fn create_new_private(path: &Path) -> io::Result<File> {
     platform::create_new_private(path)
 }
@@ -1590,6 +1591,43 @@ mod tests {
         drop(open_private_owned_migration(&inherited).unwrap());
         open_private(&inherited).unwrap();
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_new_private_objects_are_owned_by_the_exact_user_sid() {
+        let root = TestDir::new("windows-explicit-user-owner");
+        let private_directory = root.0.join("private");
+        create_new_private_directory(&private_directory).unwrap();
+        assert!(
+            platform::directory_owner_is_current_user_for_test(&private_directory).unwrap(),
+            "private-directory creation must override an administrator token's group default owner"
+        );
+        validate_private_directory(&private_directory).unwrap();
+
+        let private_file = private_directory.join("secret");
+        drop(create_new_private(&private_file).unwrap());
+        assert!(
+            platform::file_owner_is_current_user_for_test(&private_file).unwrap(),
+            "private-file creation must override an administrator token's group default owner"
+        );
+        open_private(&private_file).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_policy_rejects_every_sid_outside_the_explicit_trust_set() {
+        let user = "S-1-5-21-111-222-333-1001";
+        assert!(platform::owner_policy_accepts_for_test(user, user).unwrap());
+        assert!(
+            platform::owner_policy_accepts_for_test("S-1-5-32-544", user).unwrap(),
+            "Administrators is already an explicit full-control DACL trustee"
+        );
+        assert!(!platform::owner_policy_accepts_for_test("S-1-5-32-545", user).unwrap());
+        assert!(!platform::owner_policy_accepts_for_test("S-1-5-18", user).unwrap());
+        assert!(
+            !platform::owner_policy_accepts_for_test("S-1-5-21-111-222-333-1002", user).unwrap()
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -1767,7 +1805,11 @@ mod platform {
     fn private_security_attributes() -> io::Result<(LocalAllocation, SECURITY_ATTRIBUTES)> {
         let user = current_user_sid()?;
         let user_text = sid_string(user.as_ptr())?;
-        let sddl = format!("D:P(A;;FA;;;{user_text})(A;;FA;;;SY)(A;;FA;;;BA)");
+        // An administrator token's Windows default-owner SID is normally the
+        // built-in Administrators group, not its TOKEN_USER SID. Pin the owner
+        // explicitly so every newly created ARC secret remains owned by the
+        // exact account even when the process is elevated.
+        let sddl = format!("O:{user_text}D:P(A;;FA;;;{user_text})(A;;FA;;;SY)(A;;FA;;;BA)");
         let sddl = wide(std::ffi::OsStr::new(&sddl))?;
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         // SAFETY: input is NUL-terminated and output receives a LocalAlloc
@@ -1903,6 +1945,10 @@ mod platform {
     fn equal_sid(left: PSID, right: PSID) -> bool {
         // SAFETY: both pointers refer to validated SID allocations.
         unsafe { EqualSid(left, right) != 0 }
+    }
+
+    fn owner_matches_private_policy(owner: PSID, current_user: PSID, administrators: PSID) -> bool {
+        !owner.is_null() && (equal_sid(owner, current_user) || equal_sid(owner, administrators))
     }
 
     pub(super) fn validate_private(file: &File, path: &Path) -> io::Result<()> {
@@ -2057,6 +2103,7 @@ mod platform {
 
     fn validate_private_owner(file: &File, path: &Path, object: &str) -> io::Result<()> {
         let current_user = current_user_sid()?;
+        let administrators = parse_sid("S-1-5-32-544")?;
         let mut owner: PSID = null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         // SAFETY: the handle remains owned by `file`; GetSecurityInfo returns
@@ -2077,9 +2124,14 @@ mod platform {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _descriptor_guard = LocalAllocation(descriptor);
-        if owner.is_null() || !equal_sid(owner, current_user.as_ptr()) {
+        // Windows deliberately uses BUILTIN\Administrators as the default
+        // owner for administrator tokens. Accepting that one group does not
+        // expand this module's trust boundary: the protected DACL below
+        // already grants that exact SID full control. Every other group or
+        // account owner remains rejected.
+        if !owner_matches_private_policy(owner, current_user.as_ptr(), administrators.0) {
             return Err(permission_error(format!(
-                "private {object} is not owned by the current Windows user: {}",
+                "private {object} is not owned by the current Windows user or trusted Administrators group: {}",
                 path.display()
             )));
         }
@@ -2190,9 +2242,9 @@ mod platform {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _descriptor_guard = LocalAllocation(descriptor);
-        if owner.is_null() || !equal_sid(owner, current_user.as_ptr()) {
+        if !owner_matches_private_policy(owner, current_user.as_ptr(), administrators.0) {
             return Err(permission_error(format!(
-                "private {object} is not owned by the current Windows user: {}",
+                "private {object} is not owned by the current Windows user or trusted Administrators group: {}",
                 path.display()
             )));
         }
@@ -2264,5 +2316,55 @@ mod platform {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn owner_policy_accepts_for_test(owner: &str, user: &str) -> io::Result<bool> {
+        let owner = parse_sid(owner)?;
+        let user = parse_sid(user)?;
+        let administrators = parse_sid("S-1-5-32-544")?;
+        Ok(owner_matches_private_policy(
+            owner.0,
+            user.0,
+            administrators.0,
+        ))
+    }
+
+    #[cfg(test)]
+    fn handle_owner_is_current_user_for_test(handle: &File) -> io::Result<bool> {
+        let current_user = current_user_sid()?;
+        let mut owner: PSID = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: the object handle remains live and GetSecurityInfo owns
+        // the returned LocalAlloc descriptor until the guard below is dropped.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle().cast::<c_void>(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor_guard = LocalAllocation(descriptor);
+        Ok(!owner.is_null() && equal_sid(owner, current_user.as_ptr()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn directory_owner_is_current_user_for_test(path: &Path) -> io::Result<bool> {
+        let directory = open_private_directory_raw(path)?;
+        handle_owner_is_current_user_for_test(&directory)
+    }
+
+    #[cfg(test)]
+    pub(super) fn file_owner_is_current_user_for_test(path: &Path) -> io::Result<bool> {
+        let file = open_private_raw(path)?;
+        handle_owner_is_current_user_for_test(&file)
     }
 }

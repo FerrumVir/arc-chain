@@ -73,7 +73,7 @@ def connection_factory(outcomes, requests, timeouts, contexts):
 
 
 class SelectedConfigTests(unittest.TestCase):
-    def test_extracts_only_selected_drive_bearer_token(self):
+    def test_hashes_custom_client_and_extracts_selected_drive_bearer(self):
         raw = bytearray(
             b"[arc-recovery-drive]\n"
             b"type = drive\n"
@@ -83,20 +83,33 @@ class SelectedConfigTests(unittest.TestCase):
             b"\"token_type\":\"Bearer\",\"refresh_token\":\"private-refresh\"}\n"
         )
         self.assertEqual(
-            MODULE._selected_remote_token(raw, "arc-recovery-drive"),
-            "fresh-access-token",
+            MODULE._selected_remote_credentials(raw, "arc-recovery-drive"),
+            (digest("custom.apps.googleusercontent.com"), "fresh-access-token"),
         )
 
     def test_rejects_extra_section_duplicate_token_and_service_account(self):
         fixtures = (
-            b"[wanted]\ntype=drive\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n[other]\n",
-            b"[wanted]\ntype=drive\ntoken={\"access_token\":\"a\",\"access_token\":\"b\",\"token_type\":\"Bearer\"}\n",
-            b"[wanted]\ntype=drive\nservice_account_file=/private/key\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
+            b"[wanted]\ntype=drive\nclient_id=id\nclient_secret=secret\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n[other]\n",
+            b"[wanted]\ntype=drive\nclient_id=id\nclient_secret=secret\ntoken={\"access_token\":\"a\",\"access_token\":\"b\",\"token_type\":\"Bearer\"}\n",
+            b"[wanted]\ntype=drive\nclient_id=id\nclient_secret=secret\nservice_account_file=/private/key\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
         )
         for fixture in fixtures:
             with self.subTest(fixture=fixture):
                 with self.assertRaises(MODULE.IdentityError):
-                    MODULE._selected_remote_token(bytearray(fixture), "wanted")
+                    MODULE._selected_remote_credentials(bytearray(fixture), "wanted")
+
+    def test_missing_redacted_or_tampered_custom_client_fails_closed(self):
+        fixtures = (
+            b"[wanted]\ntype=drive\nclient_secret=secret\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
+            b"[wanted]\ntype=drive\nclient_id=XXX\nclient_secret=secret\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
+            b"[wanted]\ntype=drive\nclient_id=id\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
+            b"[wanted]\ntype=drive\nclient_id=id\nclient_secret=XXX\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
+            b"[wanted]\ntype=drive\nclient_id=id\x00suffix\nclient_secret=secret\ntoken={\"access_token\":\"a\",\"token_type\":\"Bearer\"}\n",
+        )
+        for fixture in fixtures:
+            with self.subTest(fixture=fixture):
+                with self.assertRaises(MODULE.IdentityError):
+                    MODULE._selected_remote_credentials(bytearray(fixture), "wanted")
 
 
 class DriveAboutTests(unittest.TestCase):

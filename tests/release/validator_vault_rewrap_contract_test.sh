@@ -82,9 +82,13 @@ one_shot_workflow_is_exact_main_protected_and_create_only() {
         return 1
     fi
     clear_line="$(printf '%s\n' "$secret_step" | grep -nF '          clear_secret_material' | tail -1 | cut -d: -f1)"
-    receipt_line="$(printf '%s\n' "$secret_step" | grep -nF '          /usr/bin/jq -n' | cut -d: -f1)"
+    receipt_line="$(printf '%s\n' "$secret_step" | grep -nF '          /usr/bin/jq -cS -n' | cut -d: -f1)"
     if [ -z "$clear_line" ] || [ -z "$receipt_line" ] || [ "$clear_line" -ge "$receipt_line" ]; then
         printf 'validator-vault plaintext is not cleared before post-secret receipt processing\n'
+        return 1
+    fi
+    if printf '%s\n' "$secret_step" | grep -Fq '          /usr/bin/jq -n'; then
+        printf 'validator-vault receipt can still be emitted as noncanonical pretty JSON\n'
         return 1
     fi
 }

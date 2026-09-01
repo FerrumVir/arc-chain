@@ -1,6 +1,6 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
-use crate::{hardware, identity, paths, rpc_client, AppState};
+use crate::{hardware, identity, paths, rpc_client, AppState, CommunityReceiptRoute};
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use ssh_key::{PublicKey, SshSig};
@@ -378,16 +378,28 @@ pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()
         .map_err(|error| format!("could not establish the native update lifecycle fence: {error}"))
 }
 
+/// Seal the one-way native updater boundary immediately before invoking the
+/// signed installer. From this point the old node cannot be resumed by an
+/// abort command, even if installer IPC later rejects or disconnects.
+#[tauri::command]
+pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
+    let mut node = state.node.lock().await;
+    node.begin_update_handoff()
+        .map_err(|error| format!("could not commit the native updater handoff: {error}"))
+}
+
 /// Release a prepared native update fence only when the signed installer
-/// rejects/cancels before accepting bundle mutation. Successful installation
+/// rejects/cancels before accepting bundle mutation. If Prepare stopped one
+/// exact owned node, this same native transaction resumes that exact launch
+/// while continuously retaining its lifecycle lock. Successful installation
 /// deliberately has no release path in the old GUI: relaunch or manual quit
 /// must end that process before another node can start.
 #[tauri::command]
 pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
     let mut node = state.node.lock().await;
-    node.abort_update_relaunch()
-        .await
-        .map_err(|error| format!("could not safely release the failed-update fence: {error}"))
+    node.abort_update_relaunch().await.map_err(|error| {
+        format!("could not safely abort the update and restore the prior node state: {error}")
+    })
 }
 
 #[tauri::command]
@@ -1045,6 +1057,89 @@ async fn coordinator_candidates(state: &AppState) -> Vec<String> {
     ordered
 }
 
+fn community_receipt_source_is_pinned(source_host: &str, local_host: &str) -> bool {
+    source_host == local_host || COORDINATOR_HOSTS.contains(&source_host)
+}
+
+async fn pin_community_receipt_route(
+    state: &AppState,
+    source_host: &str,
+    result: &InferenceResult,
+) {
+    let Some(settlement) = result.settlement.as_ref() else {
+        return;
+    };
+    let mut routes = state.community_receipt_routes.lock().await;
+    // Keep the in-memory pin set bounded without evicting the receipt just
+    // returned. This state is session-local and only supports visible results.
+    if routes.len() >= 512 && !routes.contains_key(&settlement.tx_hash) {
+        if let Some(oldest_arbitrary_key) = routes.keys().next().cloned() {
+            routes.remove(&oldest_arbitrary_key);
+        }
+    }
+    routes.insert(
+        settlement.tx_hash.clone(),
+        CommunityReceiptRoute {
+            source_host: source_host.to_string(),
+            job_id: settlement.job_id.clone(),
+            worker: settlement.worker.clone(),
+            receipt_url: settlement.receipt_url.clone(),
+        },
+    );
+}
+
+/// Independently read one canonical 0x25 receipt from the exact host that
+/// served the inference. The WebView cannot turn this into an arbitrary URL
+/// fetch or silently migrate a receipt lookup to another seed: only the exact
+/// current loopback node or a compiled-in coordinator origin is accepted, and
+/// `rpc_client` performs one identity-bound GET with redirects disabled.
+#[tauri::command]
+pub async fn fetch_community_reward_receipt(
+    state: State<'_, AppState>,
+    source_host: String,
+    tx_hash: String,
+    job_id: String,
+    worker: String,
+    receipt_url: String,
+) -> CmdResult<InferenceSettlement> {
+    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    if !community_receipt_source_is_pinned(&source_host, &local_host) {
+        return Err(
+            "reward receipt unavailable: source host is not the exact local node or a compiled-in ARC coordinator"
+                .to_string(),
+        );
+    }
+    let pinned = state
+        .community_receipt_routes
+        .lock()
+        .await
+        .get(&tx_hash)
+        .cloned()
+        .ok_or_else(|| {
+            "reward receipt unavailable: no native inference route is pinned for this transaction"
+                .to_string()
+        })?;
+    if pinned.source_host != source_host
+        || pinned.job_id != job_id
+        || pinned.worker != worker
+        || pinned.receipt_url != receipt_url
+    {
+        return Err(
+            "reward receipt unavailable: requested identity differs from the native inference route pin"
+                .to_string(),
+        );
+    }
+    rpc_client::fetch_community_reward_receipt(
+        &state.http,
+        &source_host,
+        &tx_hash,
+        &job_id,
+        &worker,
+        &receipt_url,
+    )
+    .await
+}
+
 /// Run inference on the local node.
 ///
 /// Kept as its own command so the UI can show "served by your machine"
@@ -1071,6 +1166,7 @@ pub async fn run_inference(
     )
     .await?;
     result.served_locally = true;
+    pin_community_receipt_route(&state, &host, &result).await;
     Ok(result)
 }
 
@@ -1119,6 +1215,7 @@ pub async fn run_inference_via_coordinator(
         {
             Ok(mut r) => {
                 r.served_locally = *host == local_prefix;
+                pin_community_receipt_route(&state, host, &r).await;
                 return Ok(r);
             }
             Err(e) => last_err = e,
@@ -1143,7 +1240,10 @@ fn direct_inference_error_must_not_retry(error: &str) -> bool {
 
 #[cfg(test)]
 mod inference_retry_tests {
-    use super::direct_inference_error_must_not_retry;
+    use super::{
+        community_receipt_source_is_pinned, direct_inference_error_must_not_retry,
+        COORDINATOR_HOSTS,
+    };
 
     #[test]
     fn claimed_or_terminal_direct_failures_never_retry_elsewhere() {
@@ -1158,6 +1258,28 @@ mod inference_retry_tests {
         ));
         assert!(!direct_inference_error_must_not_retry(
             "connection refused before dispatch"
+        ));
+    }
+
+    #[test]
+    fn reward_receipt_source_is_exactly_allowlisted_without_prefix_or_path_matches() {
+        let local = "http://127.0.0.1:9090";
+        assert!(community_receipt_source_is_pinned(local, local));
+        assert!(community_receipt_source_is_pinned(
+            COORDINATOR_HOSTS[0],
+            local
+        ));
+        assert!(!community_receipt_source_is_pinned(
+            "https://149.28.32.76.evil.example",
+            local
+        ));
+        assert!(!community_receipt_source_is_pinned(
+            "https://149.28.32.76/community/reward_receipt/anything",
+            local
+        ));
+        assert!(!community_receipt_source_is_pinned(
+            "http://127.0.0.1:9091",
+            local
         ));
     }
 }
@@ -1194,6 +1316,7 @@ pub async fn run_inference_via_coordinator_direct(
         {
             Ok(mut r) => {
                 r.served_locally = *host == local_prefix;
+                pin_community_receipt_route(&state, host, &r).await;
                 return Ok(r);
             }
             Err(e) if direct_inference_error_must_not_retry(&e) => return Err(e),

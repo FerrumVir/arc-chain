@@ -347,10 +347,14 @@ class CanaryFixture:
 
 class MacosCommunityCanaryTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(prefix="arc-canary-contract-")
-        # macOS exposes /var as a symlink to /private/var.  Production inputs
-        # intentionally reject every symlinked ancestry component, so fixtures
-        # use the canonical path too.
+        # Linux normally places TemporaryDirectory under world-writable /tmp,
+        # which the production canary deliberately rejects for operator inputs.
+        # Keep the hermetic fixture under the canonical operator home instead;
+        # TemporaryDirectory still owns and removes the isolated 0700 leaf.
+        fixture_parent = Path.home().resolve(strict=True)
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix=".arc-canary-contract-", dir=fixture_parent
+        )
         self.fixture = CanaryFixture(Path(self.temporary.name).resolve())
         self.patches = (
             mock.patch.object(

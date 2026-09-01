@@ -470,6 +470,20 @@ class FreezePlanTests(unittest.TestCase):
         with self.assertRaisesRegex(rf.FreezeValidationError, "digest differs"):
             rf.validate_pinned_freeze_plan(raw + b" ", hashlib.sha256(raw).hexdigest())
 
+    def test_drive_budget_uses_decimal_operational_ceiling(self) -> None:
+        at_ceiling = plan_value()
+        at_ceiling["drive_prefreeze"]["daily_upload_budget_bytes"] = 700_000_000_000
+        raw = rf.canonical_json_bytes(at_ceiling)
+        rf.validate_pinned_freeze_plan(raw, hashlib.sha256(raw).hexdigest())
+
+        above_ceiling = plan_value()
+        above_ceiling["drive_prefreeze"]["daily_upload_budget_bytes"] = 700_000_000_001
+        raw = rf.canonical_json_bytes(above_ceiling)
+        with self.assertRaisesRegex(
+            rf.FreezeValidationError, "700 GB decimal operational ceiling"
+        ):
+            rf.validate_pinned_freeze_plan(raw, hashlib.sha256(raw).hexdigest())
+
     def test_unknown_fields_and_duplicate_node_identities_fail_closed(self) -> None:
         variants: list[dict[str, object]] = []
         unknown = plan_value()

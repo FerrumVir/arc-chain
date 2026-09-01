@@ -76,7 +76,13 @@ path/device/inode and all preparation evidence, plus the exact
 `arc-drive-arc:ARC Chain Recovery v0.8` root, ARC custom OAuth client-ID hash,
 account hash, prefreeze-gate hash, remaining dedicated-uploader budget, and
 capacity reservation. The legacy shared-client `arc-drive` remote cannot
-authorize production. Run `capture` in plan mode first. Execution
+authorize production. ARC's executable ceiling is 700000000000 bytes (700 GB decimal),
+leaving 50000000000 bytes (50 GB) below Google's 750000000000-byte
+per-24-hour upload cap documented in the
+[official Drive API limits](https://developers.google.com/workspace/drive/api/guides/limits).
+The operator must attest that this is the independently checked remaining
+budget and that ARC is the account's only uploader for the quota window. Run
+`capture` in plan mode first. Execution
 requires exactly
 `ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256> CAPTURE <capture-id>"`;
 the capture ID is deterministically derived from the freeze-plan digest.
@@ -86,11 +92,16 @@ reviewed rclone v1.75.0, whose version is recorded in the receipt. The gate
 first uses a benign `rclone about` to refresh the selected OAuth configuration,
 then streams `rclone config show <selected-remote>` only into a hash-pinned,
 isolated helper. It does not use backend-dependent `rclone config userinfo`.
-The helper performs the bounded verified-TLS Drive v3 request
+From that same in-memory decrypted stream the helper requires and hashes the
+unredacted custom client ID, rejects a missing/redacted client or client secret,
+then performs the bounded verified-TLS Drive v3 request
 `GET /drive/v3/about?fields=user(emailAddress,permissionId,me)`, requires
 `me=true` plus exactly one normalized email and permission ID, and releases
-only their hashes. No token, client secret, raw account field, or raw API body
-is placed in argv, environment, logs, durable temporary storage, or receipts.
+only the client/account/permission hashes. No token, client secret, raw client
+ID, raw account field, or raw API body is placed in argv, environment, logs,
+durable temporary storage, or receipts. Real rclone v1.75.0 redacts `client_id`
+as well as `client_secret` in `config redacted`, so that command is not an
+identity source and the production gate never calls it.
 
 After the exact authorization, execute mode repeats the gate immediately
 before the first writer signal and must immutable-create, download and
@@ -98,7 +109,8 @@ hash-verify, permanently delete, and prove absence of one unique 8 MiB root
 canary. It then repeats the rclone-version, ARC OAuth client, account,
 permission identity, and capacity checks before persisting an
 `arc.recovery.drive-prefreeze.v1` receipt. Any rclone warning or mismatch,
-including an account or permission-ID switch around the canary, is a hard stop.
+including a client, account, or permission-ID switch around the canary, is a
+hard stop.
 
 Immediately after the verified canary and before the first cgroup freeze,
 restart-fence commit, or signal, execute mode takes exactly three bounded
@@ -119,6 +131,30 @@ All six create-only `arc.recovery.legacy-live-observations.v1` trees must be
 fsynced and reverified before any signal. They are labelled `diagnostic`,
 `noncanonical`, and `nonreward`; endpoint failures do not invent data, but
 failure to durably write a receipt aborts before the freeze.
+
+Those diagnostic observations are not the recovery source. Before each live
+target's first restart-effective dependency or nft mutation, the quarantine
+round creates a role-tagged `preauthorization-boundary` source pair. A
+production data directory and its sibling may contain no snapshot; operators
+must not wait until after stop or assume a pre-existing snapshot. The helper
+proves that the loopback `/sync/snapshot` listener belongs to the exact sealed
+writer PID/boot/start/executable/argv/cgroup, journals every request in an
+immutable attempt, copies and hashes the snapshot-selected fixed WAL prefix,
+allows only an append-only source suffix, and repeats until the pinned offline
+loader strictly replays the pair and proves the capture head plus ancestry
+bounds. A receipt fsynced before its selector is recovered without issuing a
+second request. Round authorization heights cannot exceed that captured head.
+
+After a node crosses quarantine and two stability samples agree, it takes a
+second pair tagged `post-quarantine-final-export` while public and
+inter-validator ingress remain denied. The writer/listener identity must be
+unchanged and the captured head must equal the stable quarantined tuple and
+cover all authenticated bounds. This final role, receipt hash, and head bind
+the stop intent, stop receipt, persisted head, and normal export. Only a
+controlled persistently-stopped transition with no complete final receipt may
+fall back to the initial role; its complete final WAL is preserved separately
+and any later complete suffix is explicitly
+`archived_noncanonical_post_capture_suffix`.
 
 After the Drive gate, the helper installs exact volatile lifecycle safety and
 uses cgroup v2 as the only quiescence mechanism. It freezes and inode-checks
@@ -171,7 +207,9 @@ verification. The original legacy data directory stays in place;
 it is content-sealed by repeated hashing, not mounted read-only and not copied
 into a second full local tree. Changed, missing, unexpected, cross-device,
 symlink, or special-file content fails closed. The legacy `/sync/snapshot`
-endpoint is not trusted as a state barrier.
+endpoint is never trusted alone as a state barrier; only its sealed-writer-
+owned response paired to a fixed WAL prefix and accepted by strict offline
+replay is eligible. No snapshot request occurs after stop.
 
 ## 2. Verify every rotated validator identity offline
 
@@ -223,21 +261,57 @@ ID/name/server digest/size. The helper then privately derives the exact
 `arc-cli`, `BUILD-METADATA.json`, and complete genesis from the two verified
 archive layers; caller-selected unpacked files or local receipts never
 authorize a restore. The output path must be a new absolute directory; an
-existing path is never merged or replaced.
+existing path is never merged or replaced. Before running this block, complete
+the protected pre-tag selection/download/materialization block in the recovery
+README; `PRETAG-SELECTION.json` and the raw Actions ZIP below are its verified
+outputs.
 
 ```bash
+set -Eeuo pipefail
 umask 077
+export PATH=/secure/operator/tools:/usr/bin:/bin
+export ARC_RECOVERY_PYTHON_PATH=/usr/bin/python3.12
+export ARC_RECOVERY_PYTHON_SHA256=8295ee25cfdb239f3e165afceda7f46de73e2b606ff0e2e3d8623e3facd30acc
+test -f "$ARC_RECOVERY_PYTHON_PATH" && test ! -L "$ARC_RECOVERY_PYTHON_PATH"
+printf '%s  %s\n' "$ARC_RECOVERY_PYTHON_SHA256" "$ARC_RECOVERY_PYTHON_PATH" \
+  | /usr/bin/sha256sum --check --strict
 export ARC_PROOF_CURL='/usr/bin/curl'
-export ARC_PROOF_CA_BUNDLE='/private/etc/ssl/cert.pem'
-export ARC_PROOF_CURL_SHA256="$(/usr/bin/shasum -a 256 "$ARC_PROOF_CURL" | /usr/bin/cut -d ' ' -f 1)"
-export ARC_PROOF_CA_BUNDLE_SHA256="$(/usr/bin/shasum -a 256 "$ARC_PROOF_CA_BUNDLE" | /usr/bin/cut -d ' ' -f 1)"
+export ARC_PROOF_CA_BUNDLE='/etc/ssl/certs/ca-certificates.crt'
+export ARC_PROOF_CURL_SHA256=da9cc597d6473e31d7e3f4d5e2198509010164b48be96e97b87b788655146631
+export ARC_PROOF_CA_BUNDLE_SHA256=6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238
+printf '%s  %s\n' "$ARC_PROOF_CURL_SHA256" "$ARC_PROOF_CURL" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_PROOF_CA_BUNDLE_SHA256" "$ARC_PROOF_CA_BUNDLE" \
+  | /usr/bin/sha256sum --check --strict
 
-python3 scripts/release/restore-validator-vault.py restore \
-  --cms /secure/operator/arc-validator-keys-v0.8.0.tar.cms \
+pretag_selection_json=/secure/operator/PRETAG-SELECTION.json
+cms_path=/secure/operator/arc-validator-keys-v0.8.0.tar.cms
+rewrap_receipt=/secure/operator/REWRAP-RECEIPT.json
+test -f "$cms_path" && test ! -L "$cms_path"
+test -f "$rewrap_receipt" && test ! -L "$rewrap_receipt"
+cms_sha256="$(/usr/bin/jq -er '.cms_sha256' "$rewrap_receipt")"
+protected_main_sha="$(/usr/bin/jq -er '.source_commit' "$rewrap_receipt")"
+pretag_run_id="$(/usr/bin/jq -er '.run_id' "$pretag_selection_json")"
+pretag_run_attempt="$(/usr/bin/jq -er '.run_attempt' "$pretag_selection_json")"
+[[ "$cms_sha256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$protected_main_sha" =~ ^[0-9a-f]{40}$ ]]
+[[ "$pretag_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$pretag_run_attempt" =~ ^[1-9][0-9]*$ ]]
+printf '%s  %s\n' "$cms_sha256" "$cms_path" \
+  | /usr/bin/sha256sum --check --strict
+test "$(/usr/bin/git rev-parse HEAD)" = "$protected_main_sha"
+pretag_linux_x86_64_artifact_id="$(
+  /usr/bin/jq -er '.artifacts["linux-x86_64"].headless.id' \
+    "$pretag_selection_json"
+)"
+[[ "$pretag_linux_x86_64_artifact_id" =~ ^[1-9][0-9]*$ ]]
+
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/restore-validator-vault.py restore \
+  --cms "$cms_path" \
   --expected-cms-sha256 "$cms_sha256" \
-  --rewrap-receipt /secure/operator/REWRAP-RECEIPT.json \
+  --rewrap-receipt "$rewrap_receipt" \
   --source-main-sha "$protected_main_sha" \
-  --raw-actions-zip /secure/pretag/headless-linux-x86_64-actions.zip \
+  --raw-actions-zip /secure/pretag/raw-v0.8.0/headless-linux-x86_64/actions.zip \
   --pretag-run-id "$pretag_run_id" \
   --pretag-run-attempt "$pretag_run_attempt" \
   --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
@@ -247,17 +321,17 @@ python3 scripts/release/restore-validator-vault.py restore \
   --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
   --restore-certificate /secure/operator/restore.cert.pem \
   --restore-private-key /secure/operator/restore.key.pem \
-  --openssl /opt/homebrew/Cellar/openssl@3/3.6.3/bin/openssl \
-  --openssl-sha256 05d34e15209fe2cc68faa813cbae5a9d607441c7498a953c2fa5916fccc32854 \
-  --openssl-libssl /opt/homebrew/Cellar/openssl@3/3.6.3/lib/libssl.3.dylib \
-  --openssl-libssl-sha256 4a466b82b563ce7bcf90062811ca36c8d57ce5f7fca22333dd68b2f7f41ee7ba \
-  --openssl-libcrypto /opt/homebrew/Cellar/openssl@3/3.6.3/lib/libcrypto.3.dylib \
-  --openssl-libcrypto-sha256 c853c9fefb6d391ab52d8db288b21c106db98e22efd148f2812cb7c27531cd41 \
+  --openssl /secure/operator/tools/openssl-3.0.13 \
+  --openssl-sha256 724acbe911513d13f52bae0b8969b20336cd8618fc67898a6bf7847bf1a270ad \
+  --openssl-libssl /secure/operator/tools/libssl.so.3 \
+  --openssl-libssl-sha256 0c0f298a5b4b44526d20a07d126a55bf44b85eaab053b2b0118e5d806d28ea13 \
+  --openssl-libcrypto /secure/operator/tools/libcrypto.so.3 \
+  --openssl-libcrypto-sha256 d6fc1bc9de29c55fc905f77edba1ccc7c7a50b32bd2bb9086b0d0b00104eafc4 \
   --output-dir /secure/operator/arc-v0.8-validator-restore
 ```
 
-Those are the reviewed local Homebrew 3.6.3 executable/library identities for
-this recovery. A different operating system or OpenSSL build requires a new
+Those are the reviewed Ubuntu x86_64 OpenSSL 3.0.13 executable/library
+identities for this recovery. A different operating system or OpenSSL build requires a new
 explicit path-and-hash review; neither `PATH` nor an unpinned loader dependency
 is accepted. The helper copies all three into a private create-new runtime,
 executes the copied binary directly with a sanitized environment, and proves
@@ -289,34 +363,9 @@ protected-main commit, freeze plan and sidecar, capture ID, remote-helper path
 and SHA-256, and ordered stop-complete/files/status/argv roots for the fixed
 NYC/LAX/AMS/LHR/NRT/SGP hosts.
 
-```bash
-python3 scripts/release/restore-validator-vault.py install \
-  --restore-receipt /secure/operator/arc-v0.8-validator-restore/RESTORE-RECEIPT.json \
-  --source-main-sha "$protected_main_sha" \
-  --raw-actions-zip /secure/pretag/headless-linux-x86_64-actions.zip \
-  --pretag-run-id "$pretag_run_id" \
-  --pretag-run-attempt "$pretag_run_attempt" \
-  --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
-  --curl "$ARC_PROOF_CURL" \
-  --curl-sha256 "$ARC_PROOF_CURL_SHA256" \
-  --ca-bundle "$ARC_PROOF_CA_BUNDLE" \
-  --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
-  --freeze-plan /secure/operator/arc-freeze.lock.json \
-  --freeze-plan-sidecar /secure/operator/arc-freeze.lock.json.sha256 \
-  --freeze-plan-sha256 "$freeze_sha256" \
-  --offline-stop-evidence /secure/operator/offline-stop-evidence.json \
-  --offline-stop-evidence-sidecar /secure/operator/offline-stop-evidence.json.sha256 \
-  --offline-stop-evidence-sha256 "$offline_stop_evidence_sha256" \
-  --known-hosts /secure/operator/arc-validator-known-hosts \
-  --known-hosts-sha256 "$known_hosts_sha256" \
-  --ssh-identity /secure/operator/arc-validator-maintenance-ed25519 \
-  --ssh-identity-sha256 "$ssh_identity_sha256" \
-  --ssh /usr/bin/ssh \
-  --ssh-sha256 75ae4b414b57e0c52ad1cb24a9d7dae2496071fdf153c7fc8e94db3c9c4b0faa \
-  --scp /usr/bin/scp \
-  --scp-sha256 46079e23e675b6876b502e6d0c2f8cb75af6d80abd70ed44a0d429ed3b110eba \
-  --receipt-output /secure/operator/arc-validator-key-install.json
-```
+The exact executable `install` block appears in section 5 immediately after
+the capture that creates these artifacts. It is intentionally not adjacent to
+`restore`: restoring private bytes does not authorize remote delivery.
 
 The known-hosts source must be an operator-owned, single-link mode-`0400` file
 with exactly six canonical, ordered literal-IP `ssh-ed25519` records for
@@ -581,7 +630,11 @@ data directories, proves the selected legacy block H and v3 transition H+1,
 requires advancing same-height hash/root convergence, restarts one validator
 at a time, and checks the configured reward policy. Receipt mode additionally
 requires the exact successful mined `0x25` receipt and receipt-backed worker
-earnings on all six.
+earnings on all six. Production runtime argv force protected `--archive` mode
+on every selectable public validator. After both canaries mine, the harness
+restarts all six again one at a time and re-proves the exact receipts and
+`archive_mode=true`, so a desktop fresh-host election cannot silently fall
+back to a pruned earnings view.
 
 ## 5. Execute the coordinated v3 cutover
 
@@ -595,18 +648,66 @@ in a tight batch before the sixth. Since v2 and v3 are mutually incompatible,
 do not interpret the maintenance boundary as permission to mix protocols or
 lower quorum.
 
+The executable order is normative: complete protected pre-tag materialization
+and vault `restore`; create-only materialize and verify
+`/secure/operator/legacy-validator-set-40m.json` from the exact protected
+checkout as shown in the recovery README; then prepare/freeze/capture; run
+vault `install`; export and sign the checkpoint; build the prearchive; and only
+then seal the Drive archive. The public key input is
+`/secure/operator/arc-v0.8-validator-restore/validator-public-keys.json`, and
+the materialized binary/genesis are under
+`/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/`. Do not
+substitute a hand-copied top-level file for any of those paths.
+
 1. Announce a maintenance window and stop ordinary submissions.
 2. Execute the separately sealed freeze plan with the exact `FREEZE
    <freeze-plan-sha256> CAPTURE <capture-id>` authorization. Before any stop,
    require the sealed ARC OAuth remote/root preflight receipt and the successful
    8 MiB write/read/hash/delete canary receipt. Persist and verify the systemd
-   start fence, prior enablement evidence, and durable stop intent.
+   start fence, prior enablement evidence, and durable stop intent. Capture is
+   a bounded sequence of immutable mixed-state quarantine rounds, because six
+   remote nft boundaries cannot be atomic. Every round starts by authenticating
+   the exact partition of already fenced nodes and still-live targets. It takes
+   a fresh public `/info`, `/block/latest`, `/info` bracket and fresh
+   authenticated loopback cross-proof only for those live targets, while each
+   already-fenced node supplies a fresh capture-bound status inside the same
+   observation bracket. The authorization deadline is exactly 300 seconds
+   after that round's public sample completes. Immediately before each target's
+   nft apply, the remote helper proves that exact authorization hash, node,
+   writer identity, and deadline and writes a create-only applied receipt.
+   Before the first restart-effective dependency, that authorization also binds
+   the exact `preauthorization-boundary` capture described in section 1; this
+   explicitly covers production sources with no snapshot in the data directory
+   or its sibling. After quarantine stability and before stop, every still-live
+   node must complete the distinct `post-quarantine-final-export` capture.
+   A crash may therefore leave a valid mixed state: the immutable round result
+   records whichever target subset crossed nft, and the next round freshly
+   samples only the remaining live nodes. A zero-progress attempt is never
+   appended to the transition ledger and may be resampled. A positive round is
+   never rewritten or reused as authorization for a later target. Each node may
+   cross live-to-fenced exactly once, so at most six positive rounds exist. The
+   final generation ledger must cover all six nodes and sets the legacy cutoff
+   to the maximum public height observed across all authorized rounds. There is
+   no global all-six latch and no assumption that one local commit implies one
+   remote mutation.
+   The selected supervisor dependency is the first restart-effective persistent
+   write. A natural same-boot exit before it remains resample/restart eligible.
+   After it, a stopped terminal requires authorization expiry and two stable
+   checks that the writer, supervisor, alternative activation sources, and
+   pending jobs are absent while all exact dependencies are effective; it
+   records unknown cause/no signal rather than fabricating a reboot. The final
+   maintenance evidence is a tagged active/stopped union, and an all-stopped
+   generation uses an explicit empty active sample set rather than an
+   empty-input stability claim.
 3. For NYC then LAX, freeze the exact cgroup-v2 supervisor subtree. For a
    detached writer, transiently freeze its audited root-session parent, move
    the sole writer into a newly created, locally frozen, inode-bound
    `arc-recovery-writer` child, durably seal that leaf, then thaw/release the
    parent. Require all four high-priority volatile control masks and the durable
-   barrier arm before unlinking and fsyncing the allow marker. Send only pidfd
+   barrier arm before unlinking and fsyncing the allow marker. Before any
+   frozen writer is thawed, install and prove the durable capture-bound
+   maintenance fence on all six hosts, covering legacy RPC/P2P ingress and
+   egress while retaining pinned SSH and exact loopback inspection. Send only pidfd
    `SIGTERM` while each target remains frozen. Follow the two-stage v2 chain:
    persist writer TERM/thaw intent, directly thaw the owned leaf, prove the
    writer terminal twice and seal that receipt while the supervisor remains
@@ -625,6 +726,71 @@ lower quorum.
    sidecar: all six fixed node-to-host identities, exact `stop.complete` and
 `stop.files.sha256` roots, hash-pinned helper, and full stopped-status
 argv/output hashes must verify before any new validator key is installed.
+   Only after this successful capture, run the following exact vault `install`
+   block, including both maintenance artifacts, both sidecars, all three
+   derived artifact hashes, and the reviewed Ubuntu SSH/SCP paths and hashes.
+   Its create-only `VALIDATOR-KEY-INSTALL-RECEIPT.json` must exist before
+   checkpoint export or prearchive construction.
+
+   ```bash
+   legacy_maintenance_evidence_bundle=/secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-evidence-bundle.json
+   legacy_maintenance_evidence_bundle_sidecar="$legacy_maintenance_evidence_bundle.sha256"
+   legacy_maintenance_evidence_bundle_sha256="$(/usr/bin/sha256sum "$legacy_maintenance_evidence_bundle" | /usr/bin/awk '{print $1}')"
+   legacy_maintenance_boundary=/secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-boundary.json
+   legacy_maintenance_boundary_sidecar="$legacy_maintenance_boundary.sha256"
+   legacy_maintenance_boundary_sha256="$(/usr/bin/sha256sum "$legacy_maintenance_boundary" | /usr/bin/awk '{print $1}')"
+   offline_stop_evidence=/secure/operator/arc-offline-stop-evidence.json
+   offline_stop_evidence_sidecar="$offline_stop_evidence.sha256"
+   offline_stop_evidence_sha256="$(/usr/bin/sha256sum "$offline_stop_evidence" | /usr/bin/awk '{print $1}')"
+   known_hosts=/secure/operator/arc-validator-known-hosts
+   known_hosts_sha256=97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d
+   ssh_identity=/secure/operator/arc-validator-maintenance-ed25519
+   ssh_identity_sha256=9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a
+   printf '%s  %s\n' "$known_hosts_sha256" "$known_hosts" \
+     | /usr/bin/sha256sum --check --strict
+   printf '%s  %s\n' "$ssh_identity_sha256" "$ssh_identity" \
+     | /usr/bin/sha256sum --check --strict
+   printf '%s  %s\n' \
+     47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6 \
+     /secure/operator/tools/ssh | /usr/bin/sha256sum --check --strict
+   printf '%s  %s\n' \
+     92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144 \
+     /secure/operator/tools/scp | /usr/bin/sha256sum --check --strict
+
+   "$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/restore-validator-vault.py install \
+     --restore-receipt /secure/operator/arc-v0.8-validator-restore/RESTORE-RECEIPT.json \
+     --source-main-sha "$protected_main_sha" \
+     --raw-actions-zip /secure/pretag/raw-v0.8.0/headless-linux-x86_64/actions.zip \
+     --pretag-run-id "$pretag_run_id" \
+     --pretag-run-attempt "$pretag_run_attempt" \
+     --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
+     --curl "$ARC_PROOF_CURL" \
+     --curl-sha256 "$ARC_PROOF_CURL_SHA256" \
+     --ca-bundle "$ARC_PROOF_CA_BUNDLE" \
+     --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
+     --freeze-plan /secure/operator/arc-freeze.lock.json \
+     --freeze-plan-sidecar /secure/operator/arc-freeze.lock.json.sha256 \
+     --freeze-plan-sha256 "$freeze_sha256" \
+     --legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle" \
+     --legacy-maintenance-evidence-bundle-sidecar "$legacy_maintenance_evidence_bundle_sidecar" \
+     --legacy-maintenance-evidence-bundle-sha256 "$legacy_maintenance_evidence_bundle_sha256" \
+     --legacy-maintenance-boundary "$legacy_maintenance_boundary" \
+     --legacy-maintenance-boundary-sidecar "$legacy_maintenance_boundary_sidecar" \
+     --legacy-maintenance-boundary-sha256 "$legacy_maintenance_boundary_sha256" \
+     --offline-stop-evidence "$offline_stop_evidence" \
+     --offline-stop-evidence-sidecar "$offline_stop_evidence_sidecar" \
+     --offline-stop-evidence-sha256 "$offline_stop_evidence_sha256" \
+     --known-hosts "$known_hosts" \
+     --known-hosts-sha256 "$known_hosts_sha256" \
+     --ssh-identity "$ssh_identity" \
+     --ssh-identity-sha256 "$ssh_identity_sha256" \
+     --ssh /secure/operator/tools/ssh \
+     --ssh-sha256 47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6 \
+     --scp /secure/operator/tools/scp \
+     --scp-sha256 92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144 \
+     --receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json
+   ```
+
    Treat that local receipt and its mode bits as integrity only, never as proof
    of origin. Prearchive additionally requires an operator-reviewed mode-0400
    known-hosts file containing one unique Ed25519 key for each exact fixed IP
@@ -648,16 +814,28 @@ argv/output hashes must verify before any new validator key is installed.
    not create a second full local data-tree copy. Confirm each capture inventory
    binds the immutable pre-freeze observation root/receipt and that all three
    outcomes remain labelled diagnostic, noncanonical, and nonreward.
-5. Use `arc-node recovery export --data-dir <reference-pair> --snapshot
-   <reference-pair/state.snapshot.lz4> --legacy-validator-set
-   <legacy-validator-set-40m.json> ...` to reproduce the candidate from the
-   independently preserved shared reference pair. Successful export—not
+5. Run the recovery README's exact root/mode/size/SHA-256, four-row
+   `SHA256SUMS`, and metadata verification for the independently preserved
+   shared reference pair first. It binds block height 137145, block hash
+   `8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90`,
+   and state root
+   `d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d`.
+   Source consensus round 9774808 is distinct recovery metadata, not the block
+   height. Then use `arc-node recovery export --data-dir <reference-pair>
+   --snapshot <reference-pair/state.snapshot.lz4> --legacy-validator-set
+   <legacy-validator-set-40m.json> ...` to reproduce the candidate from that
+   exact pair. Successful export—not
    endpoint metadata or a later validator capture—must prove that the decoded
    snapshot H/root equals its complete WAL block/checkpoint boundary.
    The audited legacy WAL needs the explicit `--allow-unbound-legacy-wal`
    exception because it predates the genesis network hash; record that fact.
-6. Sign the accepted candidate offline with the required 5-of-6 recovery
-   quorum and run `scripts/recovery/build-production-manifest.py prearchive`
+6. In the one reviewed, root-only operator enclave that contains the six-key
+   restored vault, isolate networking for the signing window and sequentially
+   sign the accepted candidate with five distinct named keyfiles. Re-hash the
+   exact materialized Linux binary against protected build metadata before
+   every `recovery sign`; leave the sixth key unused and require final
+   `recovery verify` to prove both five identities and strict-stake quorum.
+   Then run `scripts/recovery/build-production-manifest.py prearchive`
    with the exact protected-main pre-tag Linux x86_64 node/CLI/build metadata,
    sealed freeze and public-height/offline-stop receipts, genesis/public and
    legacy validator sets, standalone `--legacy-maintenance-evidence-bundle`,
@@ -671,7 +849,20 @@ argv/output hashes must verify before any new validator key is installed.
    or deploys those staged bytes. The builder—not a hand-authored
    draft—seals the **prearchive** production manifest and sidecar at mode 0400. Its
    `complete_sha256`, `archive_manifest_sha256`, `sha256sums_sha256`, and
-   `prearchive_rollout_sha256` fields must all be 64 zeroes.
+   `prearchive_rollout_sha256` fields must all be 64 zeroes. The post-stop
+   builder never compares historical round receipts with its current wall
+   clock, because the official origins are intentionally offline and cannot be
+   safely resampled. At entry and immediately before its create-only write it
+   instead revalidates every immutable authorization/result pair in the
+   quarantine generation ledger: exact prior-fenced/live partition, fresh
+   target-only public and authenticated brackets, prior-fenced statuses inside
+   the bracket, each nft apply at or before its round deadline, monotonic
+   live-to-fenced transitions with positive progress, and final coverage of all
+   six nodes. It also binds `first_nft_applied_at`, `all_nodes_fenced_at`, and
+   the maximum public height across all rounds into the maintenance boundary.
+   Thus a delayed but correctly sealed post-freeze build remains valid, while a
+   stale target authorization, skipped/duplicate node, zero-progress ledger
+   entry, reordered round, or rebound evidence fails closed.
 7. Run `archive-fleet-to-drive.sh seal` in plan mode, then execute it only with
    the exact `ARC_RECOVERY_GO="GO <prearchive-rollout-sha256> FREEZE
    <freeze-plan-sha256> CAPTURE <capture-id> DEST
@@ -712,13 +903,17 @@ argv/output hashes must verify before any new validator key is installed.
    `drive-archive-seal-attempt.json` through required argument
    `--drive-archive-seal-attempt`, and archived
    `github-gist-write-canary.json` through required argument
-   `--github-gist-write-canary`. The finalizer creates the final
-   rollout and sidecar at mode 0400 by changing only the four archive roots
+   `--github-gist-write-canary`. The finalizer creates
+   `/secure/operator/arc-recovery-final.lock.json` and its sidecar at mode 0400
+   by changing only the four archive roots
    from step 6. Its canonical projection with those four fields
    reset to zero must hash exactly to the archived prearchive digest.
-10. Install the exact checksummed candidate and approved genesis/checkpoint on
-   every host; install the host's new keyfile separately. The new release and
-   data paths must be disjoint and non-nested with the preserved legacy source.
+10. Confirm the final manifest stages the exact checksummed candidate and
+   approved genesis/checkpoint for every host. The host keyfiles were already
+   installed create-only after capture in step 3 and are represented here only
+   by the sealed install receipt; do not deliver them again. The new release
+   and data paths must be disjoint and non-nested with the preserved legacy
+   source.
 11. Run the finalized production plan, then execute only with
    `--go-hash <final-rollout-sha256> --archive-manifest-sha256
    <verified-archive-manifest-sha256>` and the exact
@@ -746,17 +941,14 @@ argv/output hashes must verify before any new validator key is installed.
 12. Confirm public address, keyfile source, protocol v3, genesis/checkpoint,
    binary checksum, connected authenticated stake, and advancing chain on
    every host.
-13. Before any frozen writer is thawed for SIGTERM, install and prove the
-   durable capture-bound maintenance fence on all six hosts. It must isolate
-   legacy RPC and P2P ingress **and** egress (including established/source-port
-   replies, TCP 9090, UDP 9091 and redirected UDP 443, IPv4/IPv6) while keeping
-   SSH, exact loopback inspection, and persistence across reboot; public ARC
-   surfaces on ports 80/3100 must be unreachable or serve proved maintenance.
-   Take stable authenticated loopback heads, stop concurrently, then run the
-   hash-pinned `arc-node recovery export` offline against each final captured
-   snapshot/WAL and bind its exact height/hash/state root. Define the official
-   six-origin cutoff as the maximum of pre-fence public observations, six
-   stable fenced heads, and six final persisted heads. Seal
+13. Re-verify the capture-bound maintenance fence that was installed before
+   any frozen writer was thawed in step 3. Its sealed proof must cover legacy
+   RPC and P2P ingress **and** egress (including established/source-port
+   replies, TCP 9090, UDP 9091 and redirected UDP 443, IPv4/IPv6), retained SSH,
+   exact loopback inspection, reboot persistence, stable authenticated heads,
+   and the hash-pinned offline export of every final captured snapshot/WAL.
+   Define the official six-origin cutoff as the maximum of pre-fence public
+   observations, six stable fenced heads, and six final persisted heads. Seal
    `global_absence_claimed=false`, the exact official-origin set, late-fork
    maintenance policy, and `continuity_safety_margin=128`; set
    `chain.legacy_public_max_height` to cutoff plus that operational margin.
@@ -766,20 +958,34 @@ argv/output hashes must verify before any new validator key is installed.
    v3 nodes to converge on the same height/hash/root strictly above the sealed
    threshold and continue advancing through restarts and final publication.
 14. In receipt mode, supply `--reward-evidence-output` before plan/preflight.
+   Before submitting anything, fsync the six-node-agreed complete all-v3
+   earnings baseline for every worker the sealed coordinator could select.
+   Immediately re-prove that durable history and require the current selectable
+   worker set to be a subset of the sealed set; this same GET-only check runs
+   after a baseline-only crash resume, so a new worker or unrelated receipt
+   aborts before ordinal one.
    Submit one real one-token job, wait (with the bounded rollout poll) until all
    six report the same `mined_success` 0x25 receipt, then submit the second.
    Require distinct transaction hashes, job IDs, block heights, and block
    hashes for the same worker. Each receipt must be exactly 2.5 ARC =
-   2,500,000,000 base units; all six earnings indexes must show exactly 5 ARC
-   gross in this fresh two-canary window. Because two immediate receipts are
-   not a valid rate sample, all six must report null observed rate and null
+   2,500,000,000 base units. Every baseline block hash, transaction index, and
+   receipt identity must remain,
+   post-canary count must equal baseline + 2, and lifetime gross must equal
+   baseline + 5 ARC with no third new row. Only the empty-baseline case ends at
+   exactly two receipts; there, all six must report null observed rate and null
    `projected_daily_arc`, with both reasons exactly
-   `collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries`. Any numeric
-   two-canary rate/projection fails closed. The tool then
-   writes the two identities as a create-only, mode-0444, rollout-SHA-bound
-   evidence file and checksum. Same-height/different-hash results are a fork,
+   `collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries`. For a nonempty
+   baseline, the complete all-v3 timestamp window controls projection truth: a
+   window shorter than 24 hours remains null with the canonical short-window
+   reason; a valid window must expose the exact observed rate, and any numeric
+   projection must equal that rate times 2.5 ARC. The tool then writes the two
+   identities and selected pre-canary baseline as a create-only, mode-0444,
+   rollout-SHA-bound v2 evidence file and checksum. It then restarts all six archive validators one
+   at a time, requires continued fleet advancement, and re-proves both receipt
+   rows from every restarted process. Same-height/different-hash results are a fork,
    not two blocks, and fail closed. Frontend publication may proceed with the
-   honest null projection and must not synthesize a forecast.
+   honest null projection when projection inputs are unavailable and must not
+   synthesize a forecast.
 15. Let the authorized rollout automatically deploy every sealed
    `valid_noncanonical_fork`: it re-verifies the live stopped captures before
    mutation, stages only hash-indexed evidence on that validator's local disk,
@@ -837,7 +1043,10 @@ sealed once after all six maintenance gateways are installed but before any v3
 start, then freshly sealed again after public promotion. A service restart
 proves protected certificate-storage reuse only. The rollout does not wait
 days and does not claim to have observed renewal; continuous expiry/renewal
-monitoring is still required after handoff. The gateway also installs a request/rate-limit filter
+monitoring is still required after handoff. ARI remains authoritative whenever
+the CA supplies renewal timing; `renewal_window_ratio 0.5` is the generated
+fallback and corresponds to roughly 80 hours remaining for a 160-hour leaf.
+The gateway also installs a request/rate-limit filter
 reachable only over a permission-sealed Unix socket, strict body limits,
 security headers, an exact GitHub Pages CORS origin,
 and a reviewed path allowlist. Public preflight terminates at Caddy; internal
@@ -857,7 +1066,11 @@ and validator shard routes—uses nginx `auth_request`; stopping the interlock i
 runtime-proved to deny both classes before any v3 process starts. Generated
 Caddy configs require `admin off` and contain zero `forward_auth` handlers.
 The distribution nginx unit remains stopped/disabled and its preserved config
-is never loaded. The nginx package is not held: a replacement fails the next
+is never loaded. This is not an all-host ports-empty precondition: the reviewed
+LAX baseline has nginx active and enabled with one public port-80 listener and
+no port-443 listener. The rollout records that baseline, stops/disables it
+before Caddy, and rollback restores the exact active/enabled and 80/443 listener
+counts. The nginx package is not held: a replacement fails the next
 preflight/restart closed. Update it only by changing the reviewed version and
 binary pins in protected code and rerunning the security tests and receipt,
 never by an ad-hoc per-host hold/unhold or upgrade.

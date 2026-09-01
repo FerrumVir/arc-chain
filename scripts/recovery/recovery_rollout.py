@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shlex
@@ -35,12 +36,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import quarantine_rounds
+
 
 SCHEMA = "arc.recovery.rollout.v1"
 COMMUNITY_REWARD_BASE = 2_500_000_000
+REWARD_EVIDENCE_MAX_BYTES = 64 * 1024 * 1024
 PROJECTION_COLLECTING_REASON = (
     "collecting data: a projection needs at least 3 successful mined reward "
     "receipts spanning at least 24 hours, not the initial one or two rollout canaries"
+)
+PROJECTION_WINDOW_COLLECTING_REASON = (
+    "collecting data: this host has not supplied a valid confirmed-receipt window "
+    "spanning at least 24 hours"
+)
+ARCHIVE_EARNINGS_SCOPE = (
+    "complete canonical reward history since the v3 recovery boundary"
+)
+EARNINGS_HISTORY_DOMAIN = (
+    "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows "
+    "retain their own recovery_epoch, validator_set_id, and transaction_domain"
 )
 HEX_32_RE = re.compile(r"^(?:0x)?[0-9a-f]{64}$")
 LOWER_HEX_32_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -48,6 +67,7 @@ SAFE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 SAFE_REMOTE_RE = re.compile(r"^[A-Za-z0-9_./:@+=,-]+$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 PROTECTED_FLAGS = {
+    "--archive",
     "--approved-recovery-manifest-hash",
     "--allow-insecure-community-rpc",
     "--auto-shard-join",
@@ -146,6 +166,7 @@ CADDY_VERSION = "v2.11.4"
 CADDY_LINUX_AMD64_SHA256 = "b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9"
 TLS_MAX_LEAF_LIFETIME_SECONDS = 160 * 60 * 60
 TLS_MIN_REMAINING_VALIDITY_SECONDS = 48 * 60 * 60
+TLS_RENEWAL_WINDOW_RATIO = 0.5
 # Uniform Ubuntu 24.04 (Noble) production fleet security boundary.  The
 # interlock lives in nginx auth_request specifically to avoid Caddy
 # GHSA-6365-7ppr-5r92; never accept an unversioned apt candidate or a binary
@@ -154,6 +175,7 @@ NGINX_PACKAGE_VERSION = "1.24.0-2ubuntu7.17"
 NGINX_LINUX_AMD64_SHA256 = "1f16b72bea2f44e5d04fe6cf9e3e4b0dec53a82c50c7c1533c302a8ecaeccacf"
 RECOVERY_PROBE_PREFIX = b"ARC-RCV-PROBE1\0\0"
 RECOVERY_PROBE_ID_DOMAIN = b"ARC-recovery-reward-probe-id-v1\0"
+RECOVERY_PROBE_COORDINATOR_DOMAIN = b"ARC-recovery-reward-probe-coordinator-v1\0"
 DEFAULT_PUBLIC_POST_PATHS = (
     "/inference/run",
     "/inference/run_consensus",
@@ -387,7 +409,8 @@ def validate_public_tls_evidence(
         (
             "schema", "rollout_manifest_sha256", "phase", "node", "host",
             "caddy_version", "caddy_binary_sha256", "acme_directory",
-            "acme_profile", "verification_host", "san_ip_addresses",
+            "acme_profile", "renewal_window_ratio", "verification_host",
+            "san_ip_addresses",
             "san_dns_names", "issuer_organization", "leaf_sha256",
             "not_before_unix", "not_after_unix", "lifetime_seconds",
             "remaining_validity_seconds", "verified_at_unix",
@@ -433,6 +456,7 @@ def validate_public_tls_evidence(
         or evidence["caddy_binary_sha256"] != CADDY_LINUX_AMD64_SHA256
         or evidence["acme_directory"] != LETS_ENCRYPT_PRODUCTION_DIRECTORY
         or evidence["acme_profile"] != "shortlived"
+        or evidence["renewal_window_ratio"] != TLS_RENEWAL_WINDOW_RATIO
         or evidence["verification_host"] != host
         or evidence["san_ip_addresses"] != [host]
         or evidence["san_dns_names"] != []
@@ -875,28 +899,102 @@ def validate_manifest(
                 fail("manifest offline-stop verification topology differs from the fixed fleet")
             if not isinstance(stop_node["status_sha256"], str) or not LOWER_HEX_32_RE.fullmatch(stop_node["status_sha256"]):
                 fail("manifest offline-stop verification status hash is malformed")
-            status = require_keys(
-                stop_node["status"],
-                f"manifest.provenance.offline_stop_verification.nodes[{index}].status",
-                (
-                    "schema", "capture_id", "node", "host", "freeze_plan_sha256",
-                    "validator_address", "stake", "stopped", "restart_fenced", "stop_schema",
-                    "stop_complete_sha256", "stop_files_sha256", "challenge",
-                ),
-            )
-            if status["schema"] != "arc.recovery.offline-stop-challenged-status.v1":
-                fail("manifest offline-stop challenged status schema is unsupported")
-            if status["stop_schema"] != "arc.recovery.offline-stop.v4" or status["stopped"] is not True or status["restart_fenced"] is not True:
-                fail("manifest offline-stop challenged status is not stopped and fenced")
-            if (status["node"], status["host"]) != (expected_node, expected_host):
-                fail("manifest offline-stop challenged status topology differs")
-            for key in ("capture_id", "freeze_plan_sha256", "validator_address", "stop_complete_sha256", "stop_files_sha256", "challenge"):
-                if not isinstance(status[key], str) or not LOWER_HEX_32_RE.fullmatch(status[key]):
-                    fail(f"manifest offline-stop challenged status {key} is malformed")
-            required_int(status["stake"], "manifest offline-stop challenged status stake", minimum=1)
-            for key in ("capture_id", "freeze_plan_sha256", "challenge"):
-                if status[key] != stop_verification[key]:
-                    fail(f"manifest offline-stop challenged status {key} differs from its envelope")
+            raw_status = stop_node["status"]
+            if not isinstance(raw_status, dict):
+                fail("manifest offline-stop challenged status is not an object")
+            if raw_status.get("schema") == (
+                "arc.recovery.quarantine-persistently-stopped-challenged-status.v1"
+            ):
+                status = require_keys(
+                    raw_status,
+                    f"manifest.provenance.offline_stop_verification.nodes[{index}].status",
+                    (
+                        "schema", "capture_id", "freeze_plan_sha256", "node", "host",
+                        "transition_kind", "transition_receipt", "current_status", "challenge",
+                    ),
+                )
+                if (
+                    status["transition_kind"]
+                    != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                    or (status["node"], status["host"])
+                    != (expected_node, expected_host)
+                ):
+                    fail("manifest persistently-stopped challenged status topology/kind differs")
+                for key in ("capture_id", "freeze_plan_sha256", "challenge"):
+                    if (
+                        not isinstance(status[key], str)
+                        or not LOWER_HEX_32_RE.fullmatch(status[key])
+                        or status[key] != stop_verification[key]
+                    ):
+                        fail(
+                            f"manifest persistently-stopped challenged status {key} "
+                            "differs from its envelope"
+                        )
+                transition_wrapper = require_keys(
+                    status["transition_receipt"],
+                    "manifest persistently-stopped transition wrapper",
+                    ("value", "sha256"),
+                )
+                current_wrapper = require_keys(
+                    status["current_status"],
+                    "manifest persistently-stopped current-status wrapper",
+                    ("value", "sha256"),
+                )
+                for label, wrapper in (
+                    ("transition", transition_wrapper),
+                    ("current status", current_wrapper),
+                ):
+                    if (
+                        not isinstance(wrapper["value"], dict)
+                        or not isinstance(wrapper["sha256"], str)
+                        or LOWER_HEX_32_RE.fullmatch(wrapper["sha256"]) is None
+                        or sha256_bytes(canonical_bytes(wrapper["value"]))
+                        != wrapper["sha256"]
+                    ):
+                        fail(
+                            f"manifest persistently-stopped {label} wrapper is not reproducible"
+                        )
+                try:
+                    normalized = quarantine_rounds.validate_node_transition(
+                        transition_wrapper["value"], node=expected_node
+                    )
+                    quarantine_rounds.validate_prior_fenced_status(
+                        current_wrapper["value"],
+                        transition=transition_wrapper["value"],
+                        transition_sha256=transition_wrapper["sha256"],
+                    )
+                except quarantine_rounds.QuarantineRoundError as error:
+                    fail(f"manifest persistently-stopped challenged status is invalid: {error}")
+                if (
+                    normalized.get("kind")
+                    != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                    or (normalized.get("node"), normalized.get("host"))
+                    != (expected_node, expected_host)
+                ):
+                    fail("manifest persistently-stopped challenged transition differs")
+            else:
+                status = require_keys(
+                    raw_status,
+                    f"manifest.provenance.offline_stop_verification.nodes[{index}].status",
+                    (
+                        "schema", "capture_id", "node", "host", "freeze_plan_sha256",
+                        "validator_address", "stake", "stopped", "restart_fenced", "stop_schema",
+                        "stop_complete_sha256", "stop_files_sha256", "challenge",
+                    ),
+                )
+                if status["schema"] != "arc.recovery.offline-stop-challenged-status.v1":
+                    fail("manifest offline-stop challenged status schema is unsupported")
+                if status["stop_schema"] != "arc.recovery.offline-stop.v4" or status["stopped"] is not True or status["restart_fenced"] is not True:
+                    fail("manifest offline-stop challenged status is not stopped and fenced")
+                if (status["node"], status["host"]) != (expected_node, expected_host):
+                    fail("manifest offline-stop challenged status topology differs")
+                for key in ("capture_id", "freeze_plan_sha256", "validator_address", "stop_complete_sha256", "stop_files_sha256", "challenge"):
+                    if not isinstance(status[key], str) or not LOWER_HEX_32_RE.fullmatch(status[key]):
+                        fail(f"manifest offline-stop challenged status {key} is malformed")
+                required_int(status["stake"], "manifest offline-stop challenged status stake", minimum=1)
+                for key in ("capture_id", "freeze_plan_sha256", "challenge"):
+                    if status[key] != stop_verification[key]:
+                        fail(f"manifest offline-stop challenged status {key} differs from its envelope")
             if sha256_bytes(canonical_bytes(status)) != stop_node["status_sha256"]:
                 fail("manifest offline-stop challenged status hash is not reproducible")
         archive = require_keys(
@@ -1778,7 +1876,8 @@ def verify_legacy_maintenance_stage_payloads(
         (
             "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
             "first_quarantine_started_at", "all_controlled_stopped_at", "challenge",
-            "authenticated_prefence_height_cross_proof", "network_quarantine_challenge",
+            "authenticated_prefence_height_cross_proof", "quarantine_generation_ledger",
+            "network_quarantine_challenge",
             "quarantine_stability_proof", "nodes", "object_inventory",
             "aggregate_root_sha256",
         ),
@@ -1823,6 +1922,43 @@ def verify_legacy_maintenance_stage_payloads(
         role="authenticated-prefence-height-cross-proof",
         label="legacy maintenance authenticated pre-fence proof",
     )
+    generation_ledger, generation_ledger_sha = sealed(
+        bundle["quarantine_generation_ledger"],
+        node="fleet", role="quarantine-generation-ledger",
+        label="legacy maintenance quarantine generation ledger",
+    )
+    try:
+        generation_state = quarantine_rounds.validate_generation_ledger(generation_ledger)
+    except quarantine_rounds.QuarantineRoundError as error:
+        fail(f"legacy maintenance quarantine generation ledger differs: {error}")
+    if (generation_state["capture_id"] != capture_id
+            or generation_state["freeze_plan_sha256"] != freeze_sha):
+        fail("legacy maintenance quarantine generation identity differs")
+    generation_transitions_by_node: dict[str, dict[str, Any]] = {}
+    generation_transition_wrappers_by_node: dict[str, dict[str, Any]] = {}
+    for round_wrapper in generation_ledger["rounds"]:
+        for transition_wrapper in round_wrapper["result"]["value"]["transitions"]:
+            transition_value = transition_wrapper["value"]
+            if transition_value["node"] in generation_transitions_by_node:
+                fail("legacy maintenance quarantine generation secures a node twice")
+            generation_transitions_by_node[transition_value["node"]] = transition_value
+            generation_transition_wrappers_by_node[transition_value["node"]] = (
+                transition_wrapper
+            )
+    if set(generation_transitions_by_node) != {name for name, _host in PRODUCTION_FLEET}:
+        fail("legacy maintenance quarantine generation does not cover the fleet")
+    active_fleet = [
+        (name, host) for name, host in PRODUCTION_FLEET
+        if generation_transitions_by_node[name].get("schema")
+        == quarantine_rounds.NODE_APPLIED_SCHEMA
+    ]
+    stopped_fleet = [
+        (name, host) for name, host in PRODUCTION_FLEET
+        if generation_transitions_by_node[name].get("schema")
+        == quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA
+    ]
+    if len(active_fleet) + len(stopped_fleet) != REQUIRED_VALIDATORS:
+        fail("legacy maintenance quarantine generation contains an unsupported transition kind")
     challenge_value, challenge_sha = sealed(
         bundle["network_quarantine_challenge"],
         node="fleet",
@@ -1853,8 +1989,9 @@ def verify_legacy_maintenance_stage_payloads(
         (
             "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
             "challenge", "interval_seconds", "sample_count", "started_at",
-            "completed_at", "monotonic_elapsed_ns", "fleet_heads", "nodes",
-            "global_absence_claimed",
+            "completed_at", "monotonic_elapsed_ns",
+            "quarantine_generation_ledger_sha256", "active_transition_sha256s",
+            "fleet_heads", "nodes", "global_absence_claimed",
         ),
     )
     stability_started = exact_utc(
@@ -1863,33 +2000,56 @@ def verify_legacy_maintenance_stage_payloads(
     stability_completed = exact_utc(
         stability["completed_at"], "legacy maintenance stability completed_at"
     )
+    elapsed_ns = required_int(
+        stability["monotonic_elapsed_ns"],
+        "legacy maintenance stability monotonic elapsed nanoseconds",
+    )
     if (
         stability["schema"]
         != "arc.recovery.legacy-network-quarantine-stability.v1"
         or any(stability.get(field) != expected for field, expected in common_identity.items())
         or stability["challenge"] != challenge
-        or stability["interval_seconds"] != 120
-        or stability["sample_count"] != 2
+        or stability["quarantine_generation_ledger_sha256"] != generation_ledger_sha
+        or stability["active_transition_sha256s"]
+        != [
+            {
+                "node": name,
+                "sha256": generation_transition_wrappers_by_node[name]["sha256"],
+            }
+            for name, _host in active_fleet
+        ]
         or stability["global_absence_claimed"] is not False
-        or required_int(
-            stability["monotonic_elapsed_ns"],
-            "legacy maintenance stability monotonic elapsed nanoseconds",
-            minimum=120_000_000_000,
-        )
-        < 120_000_000_000
         or not first_quarantine <= stability_started <= stability_completed <= all_stopped
     ):
         fail("legacy maintenance quarantine stability proof identity/window differs")
+    if active_fleet:
+        if (
+            stability["interval_seconds"] != 120
+            or stability["sample_count"] != 2
+            or elapsed_ns < 120_000_000_000
+        ):
+            fail("legacy maintenance quarantine stability interval is below 120 seconds")
+    elif (
+        stability["interval_seconds"] != 0
+        or stability["sample_count"] != 0
+        or elapsed_ns != 0
+    ):
+        fail("all-stopped maintenance evidence must not claim an active stability sample")
 
     stability_rows = stability["nodes"]
     stability_heads = stability["fleet_heads"]
     if (
         not isinstance(stability_rows, list)
         or not isinstance(stability_heads, list)
-        or len(stability_rows) != REQUIRED_VALIDATORS
-        or len(stability_heads) != REQUIRED_VALIDATORS
+        or [(row.get("node"), row.get("host")) for row in stability_rows]
+        != active_fleet
+        or [(row.get("node"), row.get("host")) for row in stability_heads]
+        != active_fleet
     ):
-        fail("legacy maintenance quarantine stability proof must contain exact six rows")
+        fail(
+            "legacy maintenance quarantine stability proof must contain the exact "
+            "active transition subset"
+        )
     status_fields = (
         "schema", "capture_id", "node", "freeze_plan_sha256", "receipt_sha256",
         "table", "rule_counters", "counter_snapshot_sha256",
@@ -1906,7 +2066,7 @@ def verify_legacy_maintenance_stage_payloads(
     stability_samples_by_node: dict[str, list[tuple[dict[str, Any], str]]] = {}
     stability_receipt_by_node: dict[str, str] = {}
     for index, ((node, host), raw_row, raw_fleet_head) in enumerate(
-        zip(PRODUCTION_FLEET, stability_rows, stability_heads)
+        zip(active_fleet, stability_rows, stability_heads)
     ):
         row = require_keys(
             raw_row,
@@ -2097,8 +2257,10 @@ def verify_legacy_maintenance_stage_payloads(
     if not isinstance(bundle_nodes, list) or len(bundle_nodes) != REQUIRED_VALIDATORS:
         fail("legacy maintenance evidence bundle must contain exactly six nodes")
     sealed_nodes: dict[str, dict[str, tuple[dict[str, Any], str]]] = {}
+    transition_kinds_by_node: dict[str, str] = {}
     wrapper_specs = (
         ("stopped_status", "stopped-status"),
+        ("network_quarantine_receipt", "network-quarantine-receipt"),
         ("quarantine_status", "quarantine-status"),
         ("quarantine_monitor", "network-quarantine-monitor"),
         ("post_proof_quarantine_status", "post-proof-quarantine-status"),
@@ -2107,6 +2269,81 @@ def verify_legacy_maintenance_stage_payloads(
         ("persisted_head", "persisted-head"),
     )
     for index, ((node, host), raw_node) in enumerate(zip(PRODUCTION_FLEET, bundle_nodes)):
+        transition = generation_transitions_by_node[node]
+        if transition.get("schema") == quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA:
+            row = require_keys(
+                raw_node,
+                f"stopped legacy maintenance bundle node {index}",
+                (
+                    "node", "host", "transition_kind", "transition_receipt",
+                    "current_status", "persisted_head",
+                ),
+            )
+            if (
+                (row["node"], row["host"]) != (node, host)
+                or row["transition_kind"]
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+            ):
+                fail("stopped legacy maintenance evidence bundle topology/kind differs")
+            transition_value, transition_sha = sealed(
+                row["transition_receipt"], node=node, role="transition-receipt",
+                label=f"legacy maintenance {node} stopped transition receipt",
+            )
+            if (
+                row["transition_receipt"]
+                != generation_transition_wrappers_by_node[node]
+                or transition_value != transition
+            ):
+                fail(
+                    f"legacy maintenance {node} stopped transition does not byte-match "
+                    "the generation ledger"
+                )
+            current_status, current_status_sha = sealed(
+                row["current_status"], node=node, role="current-status",
+                label=f"legacy maintenance {node} stopped current status",
+            )
+            try:
+                observed = quarantine_rounds.validate_prior_fenced_status(
+                    current_status,
+                    transition=transition_value,
+                    transition_sha256=transition_sha,
+                )
+            except quarantine_rounds.QuarantineRoundError as error:
+                fail(f"legacy maintenance {node} stopped current status differs: {error}")
+            if observed.strftime("%Y-%m-%dT%H:%M:%SZ") > all_stopped:
+                fail(f"legacy maintenance {node} stopped status postdates the boundary")
+            persisted_value, persisted_sha = sealed(
+                row["persisted_head"], node=node, role="persisted-head",
+                label=f"legacy maintenance {node} stopped persisted head",
+            )
+            if row["persisted_head"] != transition_value.get("persisted_head"):
+                fail(
+                    f"legacy maintenance {node} stopped persisted head differs from "
+                    "its transition"
+                )
+            if (
+                persisted_value.get("head") != transition_value.get("stable_head")
+                or persisted_value.get("source_pair_role")
+                != "preauthorization-boundary"
+                or not isinstance(persisted_value.get("source_inputs"), dict)
+                or persisted_value["source_inputs"].get("source_pair_role")
+                != "preauthorization-boundary"
+                or persisted_value.get("live_source_capture_sha256")
+                != persisted_value["source_inputs"].get("live_source_capture_sha256")
+                or current_status.get("stable_head") != transition_value.get("stable_head")
+                or current_status.get("persistent_restart_fence_sha256")
+                != transition_value.get("persistent_restart_fence", {}).get("sha256")
+            ):
+                fail(f"legacy maintenance {node} stopped source/head/fence projection differs")
+            sealed_nodes[node] = {
+                "transition_receipt": (transition_value, transition_sha),
+                "current_status": (current_status, current_status_sha),
+                "persisted_head": (persisted_value, persisted_sha),
+            }
+            transition_kinds_by_node[node] = (
+                quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+            )
+            continue
         row = require_keys(
             raw_node,
             f"legacy maintenance bundle node {index}",
@@ -2127,6 +2364,7 @@ def verify_legacy_maintenance_stage_payloads(
             ):
                 fail(f"legacy maintenance {node} {field} identity differs")
             sealed_nodes[node][field] = (inner, digest)
+        transition_kinds_by_node[node] = quarantine_rounds.ACTIVE_TRANSITION_KIND
 
     inventory = bundle["object_inventory"]
     if inventory != derived_inventory:
@@ -2150,6 +2388,7 @@ def verify_legacy_maintenance_stage_payloads(
             "first_quarantine_started_at", "all_controlled_stopped_at", "created_at",
             "official_origin_scope", "legacy_public_height_receipt",
             "authenticated_prefence_height_cross_proof_sha256",
+            "quarantine_generation_ledger_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
             "network_quarantine_stability_proof_sha256",
             "network_quarantine_challenge",
@@ -2176,6 +2415,12 @@ def verify_legacy_maintenance_stage_payloads(
         fail("legacy maintenance boundary does not bind the exact evidence bundle")
     if boundary["authenticated_prefence_height_cross_proof_sha256"] != authenticated_sha:
         fail("legacy maintenance boundary authenticated proof root differs from the bundle")
+    if boundary["quarantine_generation_ledger_sha256"] != generation_ledger_sha:
+        fail("legacy maintenance boundary generation-ledger root differs from the bundle")
+    if (exact_utc(boundary["first_quarantine_started_at"], "legacy first secured transition")
+            != generation_state["first_secured_at"].strftime("%Y-%m-%dT%H:%M:%SZ")
+            or boundary["observed_cutoff_height"] < generation_state["legacy_cutoff_height"]):
+        fail("legacy maintenance boundary does not derive from quarantine generations")
     if boundary["network_quarantine_stability_proof_sha256"] != stability_sha:
         fail("legacy maintenance boundary stability proof root differs from the bundle")
     if boundary["network_quarantine_challenge"] != challenge:
@@ -2273,12 +2518,18 @@ def verify_legacy_maintenance_stage_payloads(
     boundary_nodes = boundary["nodes"]
     if not isinstance(boundary_nodes, list) or len(boundary_nodes) != REQUIRED_VALIDATORS:
         fail("legacy maintenance boundary must contain exactly six nodes")
-    boundary_node_fields = (
+    active_boundary_node_fields = (
         "node", "host", "origin", "public_observation",
         "authenticated_prefence_proof_sha256", "network_quarantine_receipt_sha256",
         "quarantine_status_sha256", "post_proof_quarantine_status_sha256",
         "external_quarantine_proof_sha256", "public_cross_proof_sha256",
         "initial_post_quarantine_head", "post_quarantine_head", "final_persisted_head",
+    )
+    stopped_boundary_node_fields = (
+        "node", "host", "origin", "transition_kind",
+        "authenticated_prefence_proof_sha256", "transition_receipt_sha256",
+        "current_status_sha256", "persistent_restart_fence_sha256",
+        "stable_head", "final_persisted_head",
     )
 
     def observation(value: Any, label: str) -> tuple[int, str]:
@@ -2296,10 +2547,14 @@ def verify_legacy_maintenance_stage_payloads(
     for index, ((node, host), raw_boundary_node, authenticated_row, public_origin) in enumerate(
         zip(PRODUCTION_FLEET, boundary_nodes, authenticated_rows, public_origins)
     ):
+        is_stopped = (
+            transition_kinds_by_node[node]
+            == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+        )
         row = require_keys(
             raw_boundary_node,
             f"legacy maintenance boundary node {index}",
-            boundary_node_fields,
+            stopped_boundary_node_fields if is_stopped else active_boundary_node_fields,
         )
         if (row["node"], row["host"], row["origin"]) != (
             node,
@@ -2340,7 +2595,93 @@ def verify_legacy_maintenance_stage_payloads(
             ),
         }
         wrappers = sealed_nodes[node]
+        if is_stopped:
+            if row["transition_kind"] \
+                    != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+                fail(f"legacy maintenance {node} stopped boundary kind differs")
+            transition_value, transition_sha = wrappers["transition_receipt"]
+            current_status_value, current_status_sha = wrappers["current_status"]
+            persisted_value, persisted_sha = wrappers["persisted_head"]
+            expected_roots = {
+                "authenticated_prefence_proof_sha256": auth_row["proof_sha256"],
+                "transition_receipt_sha256": transition_sha,
+                "current_status_sha256": current_status_sha,
+                "persistent_restart_fence_sha256": transition_value[
+                    "persistent_restart_fence"
+                ]["sha256"],
+            }
+            if any(row.get(field) != wanted for field, wanted in expected_roots.items()):
+                fail(f"legacy maintenance {node} stopped boundary roots differ")
+            stable_height, stable_evidence = observation(
+                row["stable_head"], f"legacy maintenance {node} stopped stable head"
+            )
+            persisted_height, persisted_evidence = observation(
+                row["final_persisted_head"],
+                f"legacy maintenance {node} stopped persisted head",
+            )
+            if (
+                row["stable_head"]["tuple"] != transition_value.get("stable_head")
+                or stable_evidence != transition_sha
+                or row["final_persisted_head"]["tuple"] != persisted_value.get("head")
+                or persisted_evidence != persisted_sha
+                or row["final_persisted_head"]["tuple"] != row["stable_head"]["tuple"]
+                or current_status_value.get("stable_head") != row["stable_head"]["tuple"]
+                or current_status_value.get("persistent_restart_fence_sha256")
+                != row["persistent_restart_fence_sha256"]
+            ):
+                fail(f"legacy maintenance {node} stopped boundary projection differs")
+            public_heights = {
+                "public_info_before": required_int(
+                    public_origin.get("info_before_height"),
+                    f"legacy maintenance {node} public before height",
+                ),
+                "public_latest": required_int(
+                    public_origin.get("latest_block_height"),
+                    f"legacy maintenance {node} public latest height",
+                ),
+                "public_info_after": required_int(
+                    public_origin.get("info_after_height"),
+                    f"legacy maintenance {node} public after height",
+                ),
+            }
+            for label in ("public_info_before", "public_latest", "public_info_after"):
+                expected_height_rows.append(
+                    {
+                        "node": node, "label": label,
+                        "height": public_heights[label],
+                        "evidence_sha256": artifacts[
+                            "legacy_public_height_receipt"
+                        ]["sha256"],
+                    }
+                )
+            for label in (
+                "authenticated_info_before", "authenticated_latest",
+                "authenticated_info_after", "authenticated_conservative_floor",
+            ):
+                expected_height_rows.append(
+                    {
+                        "node": node, "label": label,
+                        "height": authenticated_heights[label],
+                        "evidence_sha256": auth_row["proof_sha256"],
+                    }
+                )
+            expected_height_rows.extend(
+                (
+                    {
+                        "node": node, "label": "transition_stable_head",
+                        "height": stable_height, "evidence_sha256": stable_evidence,
+                    },
+                    {
+                        "node": node, "label": "final_persisted_head",
+                        "height": persisted_height, "evidence_sha256": persisted_evidence,
+                    },
+                )
+            )
+            continue
         stopped_value = wrappers["stopped_status"][0]
+        network_receipt_value, network_receipt_sha = wrappers[
+            "network_quarantine_receipt"
+        ]
         status_value = wrappers["quarantine_status"][0]
         monitor_value = wrappers["quarantine_monitor"][0]
         post_status_value = wrappers["post_proof_quarantine_status"][0]
@@ -2353,6 +2694,8 @@ def verify_legacy_maintenance_stage_payloads(
             or stopped_value.get("restart_fenced") is not True
             or status_value.get("schema")
             != "arc.recovery.legacy-network-quarantine-status.v1"
+            or network_receipt_value.get("schema")
+            != "arc.recovery.legacy-network-quarantine.v1"
             or status_value.get("active") is not True
             or status_value.get("enabled") is not True
             or monitor_value.get("schema")
@@ -2371,18 +2714,143 @@ def verify_legacy_maintenance_stage_payloads(
             != "arc.recovery.legacy-network-quarantine-public-cross-proof.v1"
             or persisted_value.get("schema") != "arc.recovery.persisted-legacy-head.v1"
             or persisted_value.get("source_main_commit") != source_commit
+            or persisted_value.get("source_pair_role")
+            != "post-quarantine-final-export"
             or persisted_value.get("writer_stopped") is not True
             or persisted_value.get("restart_barrier_active") is not True
             or persisted_value.get("network_quarantine_active") is not True
             or persisted_value.get("global_absence_claimed") is not False
         ):
             fail(f"legacy maintenance {node} retained object policy differs")
+        exact_hash(
+            persisted_value.get("final_source_capture_sha256"),
+            f"legacy maintenance {node} final source capture root",
+        )
+        exact_hash(
+            persisted_value.get("stop_after_round_receipt_sha256"),
+            f"legacy maintenance {node} stop-after-round receipt root",
+        )
+        selected_source_head = require_keys(
+            persisted_value.get("selected_source_head"),
+            f"legacy maintenance {node} selected source head",
+            ("height", "block_hash", "state_root"),
+        )
+        persisted_head = require_keys(
+            persisted_value.get("head"),
+            f"legacy maintenance {node} persisted head",
+            ("height", "block_hash", "state_root"),
+        )
+        for label, value_head in (
+            ("selected source", selected_source_head),
+            ("persisted", persisted_head),
+        ):
+            required_int(
+                value_head["height"],
+                f"legacy maintenance {node} {label} head height",
+                minimum=1,
+            )
+            exact_hash(
+                value_head["block_hash"],
+                f"legacy maintenance {node} {label} head block hash",
+            )
+            exact_hash(
+                value_head["state_root"],
+                f"legacy maintenance {node} {label} head state root",
+            )
+        if selected_source_head != persisted_head:
+            fail(f"legacy maintenance {node} selected final source head differs")
+        archived_wal = require_keys(
+            persisted_value.get("archived_final_wal"),
+            f"legacy maintenance {node} archived final WAL",
+            (
+                "path", "sha256", "size", "file_identity",
+                "selected_prefix_bytes", "selected_prefix_sha256",
+                "post_capture_suffix_bytes", "post_capture_suffix_sha256",
+                "post_capture_suffix_classification", "preserved_by",
+            ),
+        )
+        archived_path = archived_wal["path"]
+        if (
+            not isinstance(archived_path, str)
+            or not Path(archived_path).is_absolute()
+            or os.path.normpath(archived_path) != archived_path
+        ):
+            fail(f"legacy maintenance {node} archived final WAL path differs")
+        archive_size = required_int(
+            archived_wal["size"],
+            f"legacy maintenance {node} archived final WAL size",
+            minimum=1,
+        )
+        archive_identity = require_keys(
+            archived_wal["file_identity"],
+            f"legacy maintenance {node} archived final WAL identity",
+            ("device", "inode", "size", "mode"),
+        )
+        for field in ("device", "inode", "size"):
+            required_int(
+                archive_identity[field],
+                f"legacy maintenance {node} archived final WAL identity {field}",
+                minimum=1,
+            )
+        required_int(
+            archive_identity["mode"],
+            f"legacy maintenance {node} archived final WAL identity mode",
+        )
+        selected_bytes = required_int(
+            archived_wal["selected_prefix_bytes"],
+            f"legacy maintenance {node} archived final WAL selected prefix bytes",
+            minimum=1,
+        )
+        suffix_bytes = required_int(
+            archived_wal["post_capture_suffix_bytes"],
+            f"legacy maintenance {node} archived final WAL suffix bytes",
+        )
+        if (
+            exact_hash(
+                archived_wal["sha256"],
+                f"legacy maintenance {node} archived final WAL root",
+            )
+            != archived_wal["sha256"]
+            or archive_identity["size"] != archive_size
+            or selected_bytes
+            != required_int(
+                persisted_value.get("state_wal_size"),
+                f"legacy maintenance {node} selected WAL size",
+                minimum=1,
+            )
+            or archived_wal["selected_prefix_sha256"]
+            != exact_hash(
+                persisted_value.get("state_wal_sha256"),
+                f"legacy maintenance {node} selected WAL root",
+            )
+            or archive_size != selected_bytes + suffix_bytes
+            or archived_wal["preserved_by"]
+            != "complete-content-indexed-stopped-legacy-source-v4"
+        ):
+            fail(f"legacy maintenance {node} archived final WAL binding differs")
+        if suffix_bytes == 0:
+            if (
+                archived_wal["post_capture_suffix_sha256"] is not None
+                or archived_wal["post_capture_suffix_classification"] != "none"
+            ):
+                fail(f"legacy maintenance {node} empty archived WAL suffix differs")
+        elif (
+            exact_hash(
+                archived_wal["post_capture_suffix_sha256"],
+                f"legacy maintenance {node} archived final WAL suffix root",
+            )
+            != archived_wal["post_capture_suffix_sha256"]
+            or archived_wal["post_capture_suffix_classification"]
+            != "archived_noncanonical_post_capture_suffix"
+        ):
+            fail(f"legacy maintenance {node} archived final WAL suffix policy differs")
         receipt_sha = exact_hash(
             status_value.get("receipt_sha256"),
             f"legacy maintenance {node} quarantine receipt root",
         )
         if (
             row["network_quarantine_receipt_sha256"] != receipt_sha
+            or network_receipt_sha != receipt_sha
             or monitor_value.get("network_quarantine_receipt_sha256") != receipt_sha
             or post_status_value.get("receipt_sha256") != receipt_sha
             or external_value.get("network_quarantine_receipt_sha256") != receipt_sha
@@ -2391,6 +2859,30 @@ def verify_legacy_maintenance_stage_payloads(
             or stability_receipt_by_node[node] != receipt_sha
         ):
             fail(f"legacy maintenance {node} quarantine receipt chain differs")
+        transition_value = generation_transitions_by_node[node]
+        if transition_value.get("schema") != quarantine_rounds.NODE_APPLIED_SCHEMA:
+            fail(
+                f"legacy maintenance active evidence cannot represent the "
+                f"persistently-stopped transition at {node}"
+            )
+        network_head = network_receipt_value.get("loopback_head")
+        if (
+            transition_value.get("network_quarantine_receipt")
+                != {"value": network_receipt_value, "sha256": network_receipt_sha}
+            or transition_value.get("network_quarantine_receipt_sha256")
+                != network_receipt_sha
+            or transition_value.get("owned_ruleset_stateless_sha256")
+                != status_value.get("owned_ruleset_stateless_sha256")
+            or transition_value.get("nft_policy_source_sha256")
+                != network_receipt_value.get("file_sha256", {}).get("policy.nft")
+            or not isinstance(network_head, dict)
+            or transition_value.get("stable_head") != {
+                "height": network_head.get("latest_height"),
+                "block_hash": network_head.get("block_hash"),
+                "state_root": network_head.get("state_root"),
+            }
+        ):
+            fail(f"legacy maintenance {node} generation/evidence roots differ")
         interpreter = require_keys(
             monitor_value.get("semantic_interpreter"),
             f"legacy maintenance {node} semantic interpreter",
@@ -2552,39 +3044,32 @@ def verify_legacy_maintenance_stage_payloads(
             )
         )
 
-    height_labels = (
-        "public_info_before", "public_latest", "public_info_after",
-        "authenticated_info_before", "authenticated_latest", "authenticated_info_after",
-        "authenticated_conservative_floor", "initial_post_quarantine_head",
-        "public_cross_info_after", "post_quarantine_head",
-        "quarantine_stability_sample_0", "quarantine_stability_sample_1",
-        "final_persisted_head",
-    )
     height_rows = boundary["evidence_heights"]
-    if not isinstance(height_rows, list) or len(height_rows) != REQUIRED_VALIDATORS * len(height_labels):
-        fail("legacy maintenance evidence-height ledger is not exact six-by-thirteen")
+    if not isinstance(height_rows, list) or len(height_rows) != len(expected_height_rows):
+        fail("legacy maintenance evidence-height row count differs by transition kind")
     observed_heights: list[int] = []
-    for index, raw_height in enumerate(height_rows):
+    normalized_height_rows: list[dict[str, Any]] = []
+    for index, (raw_height, expected) in enumerate(zip(height_rows, expected_height_rows)):
         row = require_keys(
             raw_height,
             f"legacy maintenance evidence-height row {index}",
             ("node", "label", "height", "evidence_sha256"),
         )
-        node_index, label_index = divmod(index, len(height_labels))
-        if (row["node"], row["label"]) != (
-            PRODUCTION_FLEET[node_index][0],
-            height_labels[label_index],
-        ):
-            fail("legacy maintenance evidence-height order differs")
-        observed_heights.append(
-            required_int(row["height"], f"legacy maintenance evidence-height row {index}")
-        )
-        exact_hash(
-            row["evidence_sha256"],
-            f"legacy maintenance evidence-height row {index} root",
-        )
-    if height_rows != expected_height_rows:
-        fail("legacy maintenance evidence-height ledger differs from its retained proofs")
+        normalized = {
+            "node": row["node"],
+            "label": row["label"],
+            "height": required_int(
+                row["height"], f"legacy maintenance evidence-height row {index}"
+            ),
+            "evidence_sha256": exact_hash(
+                row["evidence_sha256"],
+                f"legacy maintenance evidence-height row {index} root",
+            ),
+        }
+        if normalized != expected:
+            fail("legacy maintenance evidence-height ledger differs from its retained proofs")
+        observed_heights.append(normalized["height"])
+        normalized_height_rows.append(normalized)
     cutoff = required_int(
         boundary["observed_cutoff_height"], "legacy maintenance observed cutoff"
     )
@@ -2700,6 +3185,7 @@ def verify_legacy_maintenance_stage_payloads(
             "all_controlled_stopped_at", "legacy_height_cross_proof",
             "legacy_maintenance_boundary", "legacy_maintenance_boundary_sha256",
             "legacy_maintenance_evidence_bundle_sha256", "nodes",
+            "quarantine_generation_ledger_sha256",
         ),
     )
     if offline["schema"] != "arc.validator-vault.offline-stop-evidence.v2":
@@ -2712,6 +3198,7 @@ def verify_legacy_maintenance_stage_payloads(
         or offline["legacy_maintenance_boundary_sha256"] != boundary_sha
         or offline["legacy_maintenance_boundary"] != boundary
         or offline["legacy_maintenance_evidence_bundle_sha256"] != bundle_sha
+        or offline["quarantine_generation_ledger_sha256"] != generation_ledger_sha
         or offline["legacy_height_cross_proof"] != authenticated
     ):
         fail("offline-stop evidence does not embed the exact maintenance bundle/boundary")
@@ -2723,6 +3210,94 @@ def verify_legacy_maintenance_stage_payloads(
         != list(PRODUCTION_FLEET)
     ):
         fail("offline-stop evidence topology differs from the exact six")
+    remote_by_name = {
+        row["node"]: row
+        for row in provenance["offline_stop_verification"]["nodes"]
+    }
+    active_offline_fields = (
+        "node", "host", "validator_address", "stake", "stop_complete_sha256",
+        "stop_files_sha256", "stopped_status_sha256",
+        "stopped_status_argv_sha256",
+    )
+    stopped_offline_fields = (
+        "node", "host", "transition_kind", "transition_receipt_sha256",
+        "current_status_sha256", "persisted_head_sha256",
+    )
+    for index, ((node, host), raw_offline) in enumerate(
+        zip(PRODUCTION_FLEET, offline_nodes)
+    ):
+        if (
+            transition_kinds_by_node[node]
+            == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+        ):
+            offline_row = require_keys(
+                raw_offline,
+                f"offline-stop stopped node {index}",
+                stopped_offline_fields,
+            )
+            wrappers = sealed_nodes[node]
+            if (
+                offline_row["transition_kind"]
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or offline_row["transition_receipt_sha256"]
+                != wrappers["transition_receipt"][1]
+                or offline_row["current_status_sha256"]
+                != wrappers["current_status"][1]
+                or offline_row["persisted_head_sha256"]
+                != wrappers["persisted_head"][1]
+            ):
+                fail(
+                    f"offline-stop {node} stopped roots differ from the tagged "
+                    "maintenance evidence"
+                )
+            remote_status = remote_by_name[node]["status"]
+            if (
+                remote_status.get("schema")
+                != "arc.recovery.quarantine-persistently-stopped-challenged-status.v1"
+                or remote_status.get("transition_receipt")
+                != generation_transition_wrappers_by_node[node]
+                or remote_status["transition_receipt"].get("sha256")
+                != offline_row["transition_receipt_sha256"]
+            ):
+                fail(
+                    f"fresh offline-stop {node} stopped transition differs from "
+                    "the sealed offline/bundle evidence"
+                )
+            continue
+        offline_row = require_keys(
+            raw_offline,
+            f"offline-stop active node {index}",
+            active_offline_fields,
+        )
+        stopped_status, stopped_status_sha = sealed_nodes[node]["stopped_status"]
+        for field in (
+            "stop_complete_sha256", "stop_files_sha256",
+            "stopped_status_sha256", "stopped_status_argv_sha256",
+        ):
+            exact_hash(offline_row[field], f"offline-stop {node} {field}")
+        if (
+            stopped_status.get("validator_address")
+            != offline_row["validator_address"]
+            or stopped_status.get("stake") != offline_row["stake"]
+            or offline_row["stopped_status_sha256"] != stopped_status_sha
+            or stopped_status.get("stop_complete_sha256")
+            != offline_row["stop_complete_sha256"]
+            or stopped_status.get("stop_files_sha256")
+            != offline_row["stop_files_sha256"]
+        ):
+            fail(f"offline-stop {node} active roots/identity differ from the bundle")
+        remote_status = remote_by_name[node]["status"]
+        if (
+            remote_status.get("schema")
+            != "arc.recovery.offline-stop-challenged-status.v1"
+            or remote_status.get("stop_complete_sha256")
+            != offline_row["stop_complete_sha256"]
+            or remote_status.get("stop_files_sha256")
+            != offline_row["stop_files_sha256"]
+        ):
+            fail(
+                f"fresh offline-stop {node} active status differs from the sealed stop roots"
+            )
 
 
 def load_legacy_interlock_interpreters(
@@ -3749,6 +4324,238 @@ class ReceiptEvidence:
         return cls(*(f"0x{bare_hash(body[key], f'reward evidence.{key}')}" for key in ("tx_hash", "job_id", "worker")))
 
 
+@dataclass(frozen=True, order=True)
+class CanonicalEarningsReceipt:
+    """The consensus fields that make one historical 0x25 row immutable."""
+
+    block_height: int
+    index: int
+    tx_hash: str
+    job_id: str
+    worker: str
+    model_id: str
+    input_hash: str
+    output_hash: str
+    assignment_epoch: str
+    recovery_epoch: int
+    validator_set_id: int
+    transaction_domain: str
+    block_hash: str
+    reward_base: int
+
+    @classmethod
+    def from_value(
+        cls,
+        value: Any,
+        *,
+        worker: str,
+        expected_reward_base: int,
+        field: str,
+    ) -> "CanonicalEarningsReceipt":
+        if not isinstance(value, dict):
+            fail(f"{field} must be an object")
+        normalized_worker = f"0x{bare_hash(value.get('worker'), f'{field}.worker')}"
+        if normalized_worker != f"0x{bare_hash(worker, 'earnings baseline worker')}":
+            fail(f"{field}.worker differs from the requested worker")
+        tx_hash = f"0x{bare_hash(value.get('tx_hash'), f'{field}.tx_hash')}"
+        reward_base = required_int(value.get("reward_base"), f"{field}.reward_base")
+        reward_arc = value.get("reward_arc")
+        if reward_base != expected_reward_base:
+            fail(f"{field}.reward_base differs from the exact protocol reward")
+        if (
+            isinstance(reward_arc, bool)
+            or not isinstance(reward_arc, (int, float))
+            or float(reward_arc) != reward_base / 1_000_000_000
+        ):
+            fail(f"{field}.reward_arc differs from its exact base-unit amount")
+        if (
+            value.get("tx_type") != "0x25"
+            or value.get("submitted") is not True
+            or value.get("included") is not True
+            or value.get("confirmed") is not True
+            or value.get("success") is not True
+        ):
+            fail(f"{field} is not a successful submitted/included/confirmed 0x25 receipt")
+        if value.get("receipt_url") != f"/community/reward_receipt/{tx_hash}":
+            fail(f"{field}.receipt_url differs from its exact transaction")
+        return cls(
+            block_height=required_int(value.get("block_height"), f"{field}.block_height"),
+            index=required_int(value.get("index"), f"{field}.index"),
+            tx_hash=tx_hash,
+            job_id=f"0x{bare_hash(value.get('job_id'), f'{field}.job_id')}",
+            worker=normalized_worker,
+            model_id=f"0x{bare_hash(value.get('model_id'), f'{field}.model_id')}",
+            input_hash=f"0x{bare_hash(value.get('input_hash'), f'{field}.input_hash')}",
+            output_hash=f"0x{bare_hash(value.get('output_hash'), f'{field}.output_hash')}",
+            assignment_epoch=f"0x{bare_hash(value.get('assignment_epoch'), f'{field}.assignment_epoch')}",
+            recovery_epoch=required_int(value.get("recovery_epoch"), f"{field}.recovery_epoch"),
+            validator_set_id=required_int(value.get("validator_set_id"), f"{field}.validator_set_id"),
+            transaction_domain=f"0x{bare_hash(value.get('transaction_domain'), f'{field}.transaction_domain')}",
+            block_hash=f"0x{bare_hash(value.get('block_hash'), f'{field}.block_hash')}",
+            reward_base=reward_base,
+        )
+
+    def to_value(self) -> dict[str, Any]:
+        return {
+            "block_height": self.block_height,
+            "index": self.index,
+            "tx_hash": self.tx_hash,
+            "job_id": self.job_id,
+            "worker": self.worker,
+            "model_id": self.model_id,
+            "input_hash": self.input_hash,
+            "output_hash": self.output_hash,
+            "assignment_epoch": self.assignment_epoch,
+            "recovery_epoch": self.recovery_epoch,
+            "validator_set_id": self.validator_set_id,
+            "transaction_domain": self.transaction_domain,
+            "block_hash": self.block_hash,
+            "reward_base": self.reward_base,
+        }
+
+
+@dataclass(frozen=True)
+class RewardEarningsBaseline:
+    worker: str
+    confirmed_gross_earnings_base: int
+    confirmed_receipts: tuple[CanonicalEarningsReceipt, ...]
+
+    @property
+    def confirmed_receipt_count(self) -> int:
+        return len(self.confirmed_receipts)
+
+    @classmethod
+    def from_earnings(
+        cls,
+        value: Any,
+        *,
+        worker: str,
+        expected_reward_base: int = COMMUNITY_REWARD_BASE,
+        field: str = "earnings baseline",
+    ) -> "RewardEarningsBaseline":
+        if not isinstance(value, dict):
+            fail(f"{field} must be an object")
+        normalized_worker = f"0x{bare_hash(worker, 'earnings baseline worker')}"
+        if f"0x{bare_hash(value.get('address'), f'{field}.address')}" != normalized_worker:
+            fail(f"{field}.address differs from the requested worker")
+        if value.get("archive_mode") is not True:
+            fail(f"{field} is not backed by durable archive history")
+        if (
+            value.get("history_complete_since_recovery") is not True
+            or value.get("history_scope") != ARCHIVE_EARNINGS_SCOPE
+            or value.get("history_domain") != EARNINGS_HISTORY_DOMAIN
+        ):
+            fail(f"{field} does not expose the complete canonical all-v3 history domain")
+        rows = value.get("confirmed_receipts")
+        if not isinstance(rows, list):
+            fail(f"{field}.confirmed_receipts must be an array")
+        receipts = tuple(
+            sorted(
+                (
+                    CanonicalEarningsReceipt.from_value(
+                        row,
+                        worker=normalized_worker,
+                        expected_reward_base=expected_reward_base,
+                        field=f"{field}.confirmed_receipts[{index}]",
+                    )
+                    for index, row in enumerate(rows)
+                )
+            )
+        )
+        count = required_int(
+            value.get("confirmed_receipt_count"),
+            f"{field}.confirmed_receipt_count",
+        )
+        if count != len(receipts):
+            fail(f"{field}.confirmed_receipt_count differs from its canonical rows")
+        if len({row.tx_hash for row in receipts}) != len(receipts):
+            fail(f"{field} repeats a receipt transaction hash")
+        if len({row.job_id for row in receipts}) != len(receipts):
+            fail(f"{field} repeats a receipt job id")
+        gross_base = required_int(
+            value.get("confirmed_gross_earnings_base"),
+            f"{field}.confirmed_gross_earnings_base",
+        )
+        if gross_base != sum(row.reward_base for row in receipts):
+            fail(f"{field}.confirmed_gross_earnings_base differs from its canonical rows")
+        gross_arc = value.get("confirmed_gross_earnings_arc")
+        if (
+            isinstance(gross_arc, bool)
+            or not isinstance(gross_arc, (int, float))
+            or float(gross_arc) != gross_base / 1_000_000_000
+        ):
+            fail(f"{field}.confirmed_gross_earnings_arc differs from its exact base-unit total")
+        return cls(normalized_worker, gross_base, receipts)
+
+    @classmethod
+    def from_value(cls, value: Any) -> "RewardEarningsBaseline":
+        body = require_keys(
+            value,
+            "reward earnings baseline",
+            (
+                "worker",
+                "confirmed_receipt_count",
+                "confirmed_gross_earnings_base",
+                "confirmed_receipts",
+            ),
+        )
+        worker = f"0x{bare_hash(body['worker'], 'reward earnings baseline.worker')}"
+        rows = body["confirmed_receipts"]
+        if not isinstance(rows, list):
+            fail("reward earnings baseline.confirmed_receipts must be an array")
+        synthetic = {
+            "address": worker,
+            "archive_mode": True,
+            "history_complete_since_recovery": True,
+            "history_scope": ARCHIVE_EARNINGS_SCOPE,
+            "history_domain": EARNINGS_HISTORY_DOMAIN,
+            "confirmed_receipt_count": body["confirmed_receipt_count"],
+            "confirmed_gross_earnings_base": body["confirmed_gross_earnings_base"],
+            "confirmed_gross_earnings_arc": (
+                required_int(
+                    body["confirmed_gross_earnings_base"],
+                    "reward earnings baseline.confirmed_gross_earnings_base",
+                )
+                / 1_000_000_000
+            ),
+            "confirmed_receipts": [
+                {
+                    **row,
+                    "tx_type": "0x25",
+                    "submitted": True,
+                    "included": True,
+                    "confirmed": True,
+                    "success": True,
+                    "reward_arc": required_int(
+                        row.get("reward_base") if isinstance(row, dict) else None,
+                        "reward earnings baseline receipt.reward_base",
+                    )
+                    / 1_000_000_000,
+                    "receipt_url": (
+                        "/community/reward_receipt/0x"
+                        + bare_hash(
+                            row.get("tx_hash") if isinstance(row, dict) else None,
+                            "reward earnings baseline receipt.tx_hash",
+                        )
+                    ),
+                }
+                for row in rows
+            ],
+        }
+        baseline = cls.from_earnings(synthetic, worker=worker)
+        if baseline.to_value() != body:
+            fail("reward earnings baseline is not canonical")
+        return baseline
+
+    def to_value(self) -> dict[str, Any]:
+        return {
+            "worker": self.worker,
+            "confirmed_receipt_count": self.confirmed_receipt_count,
+            "confirmed_gross_earnings_base": self.confirmed_gross_earnings_base,
+            "confirmed_receipts": [row.to_value() for row in self.confirmed_receipts],
+        }
+
+
 def validate_distinct_receipt_evidence(evidence: Sequence[ReceiptEvidence]) -> None:
     if len(evidence) != 2:
         fail("reward canary gate requires exactly two mined receipt evidence objects")
@@ -3773,17 +4580,37 @@ def recovery_probe_id_for_rollout(rollout_sha256: str, ordinal: int) -> str:
     return f"0x{(RECOVERY_PROBE_PREFIX + digest[:16]).hex()}"
 
 
+@dataclass(frozen=True)
+class RewardProgressState:
+    earnings_baselines: tuple[RewardEarningsBaseline, ...]
+    receipts: tuple[ReceiptEvidence, ...]
+
+
+@dataclass(frozen=True)
+class RewardEvidenceBundle:
+    earnings_baseline: RewardEarningsBaseline
+    receipts: tuple[ReceiptEvidence, ...]
+
+
 def reward_progress_payload(
-    rollout_sha256: str, evidence: Sequence[ReceiptEvidence]
+    rollout_sha256: str,
+    evidence: Sequence[ReceiptEvidence],
+    earnings_baselines: Sequence[RewardEarningsBaseline] = (),
 ) -> bytes:
     if len(evidence) > 2:
         fail("reward evidence progress cannot contain more than two receipts")
     if len(evidence) == 2:
         validate_distinct_receipt_evidence(evidence)
+    ordered_baselines = tuple(sorted(earnings_baselines, key=lambda item: item.worker))
+    if len({item.worker for item in ordered_baselines}) != len(ordered_baselines):
+        fail("reward evidence progress repeats an earnings baseline worker")
+    if evidence and not any(item.worker == evidence[0].worker for item in ordered_baselines):
+        fail("reward evidence progress lacks the pre-canary baseline for its worker")
     return canonical_bytes(
         {
-            "schema": "arc.recovery.reward-evidence-progress.v1",
+            "schema": "arc.recovery.reward-evidence-progress.v2",
             "rollout_sha256": rollout_sha256,
+            "earnings_baselines": [item.to_value() for item in ordered_baselines],
             "receipts": [
                 {
                     "ordinal": ordinal,
@@ -3802,19 +4629,27 @@ def reward_progress_payload(
 
 def parse_reward_progress_payload(
     payload: bytes, expected_rollout_sha256: str
-) -> list[ReceiptEvidence]:
+) -> RewardProgressState:
     try:
         body = require_keys(
             json.loads(payload.decode("utf-8")),
             "reward evidence progress",
-            ("schema", "rollout_sha256", "receipts"),
+            ("schema", "rollout_sha256", "earnings_baselines", "receipts"),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"cannot read reward evidence progress: {error}")
-    if body["schema"] != "arc.recovery.reward-evidence-progress.v1":
+    if body["schema"] != "arc.recovery.reward-evidence-progress.v2":
         fail("reward evidence progress schema is unsupported")
     if body["rollout_sha256"] != expected_rollout_sha256:
         fail("reward evidence progress is bound to a different rollout")
+    baseline_rows = body["earnings_baselines"]
+    if not isinstance(baseline_rows, list):
+        fail("reward evidence progress earnings_baselines must be an array")
+    baselines = tuple(RewardEarningsBaseline.from_value(row) for row in baseline_rows)
+    if tuple(sorted(baselines, key=lambda item: item.worker)) != baselines:
+        fail("reward evidence progress earnings baselines are not canonically ordered")
+    if len({item.worker for item in baselines}) != len(baselines):
+        fail("reward evidence progress repeats an earnings baseline worker")
     rows = body["receipts"]
     if not isinstance(rows, list) or len(rows) > 2:
         fail("reward evidence progress receipts must be an array of length 0..2")
@@ -3845,24 +4680,26 @@ def parse_reward_progress_payload(
         )
     if len(evidence) == 2:
         validate_distinct_receipt_evidence(evidence)
-    if payload != reward_progress_payload(expected_rollout_sha256, evidence):
+    if payload != reward_progress_payload(
+        expected_rollout_sha256, evidence, baselines
+    ):
         fail("reward evidence progress is not canonical")
-    return evidence
+    return RewardProgressState(baselines, tuple(evidence))
 
 
 def parse_reward_evidence_payload(
     payload: bytes, expected_rollout_sha256: str
-) -> list[ReceiptEvidence]:
+) -> RewardEvidenceBundle:
     """Parse only the unique canonical byte representation for this rollout."""
     try:
         body = require_keys(
             json.loads(payload.decode("utf-8")),
             "reward evidence file",
-            ("schema", "rollout_sha256", "receipts"),
+            ("schema", "rollout_sha256", "earnings_baseline", "receipts"),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"cannot read reward evidence: {error}")
-    if body["schema"] != "arc.recovery.reward-evidence.v1":
+    if body["schema"] != "arc.recovery.reward-evidence.v2":
         fail("reward evidence file schema is unsupported")
     if body["rollout_sha256"] != expected_rollout_sha256:
         fail("reward evidence file is bound to a different rollout")
@@ -3871,10 +4708,14 @@ def parse_reward_evidence_payload(
         fail("reward evidence file receipts must be an array")
     evidence = [ReceiptEvidence.from_value(row) for row in rows]
     validate_distinct_receipt_evidence(evidence)
+    baseline = RewardEarningsBaseline.from_value(body["earnings_baseline"])
+    if baseline.worker != evidence[0].worker:
+        fail("reward evidence baseline belongs to a different worker")
     expected = canonical_bytes(
         {
-            "schema": "arc.recovery.reward-evidence.v1",
+            "schema": "arc.recovery.reward-evidence.v2",
             "rollout_sha256": expected_rollout_sha256,
+            "earnings_baseline": baseline.to_value(),
             "receipts": [
                 {
                     "tx_hash": item.tx_hash,
@@ -3887,7 +4728,7 @@ def parse_reward_evidence_payload(
     )
     if payload != expected:
         fail("reward evidence file is not canonical")
-    return evidence
+    return RewardEvidenceBundle(baseline, tuple(evidence))
 
 
 class RecoveryRollout:
@@ -3918,6 +4759,8 @@ class RecoveryRollout:
         self.reward_evidence_reservation: tuple[int, int] | None = None
         self.existing_reward_evidence: list[ReceiptEvidence] | None = None
         self.reward_evidence_progress: list[ReceiptEvidence] = []
+        self.reward_earnings_baselines: dict[str, RewardEarningsBaseline] = {}
+        self.reward_earnings_baseline: RewardEarningsBaseline | None = None
         self.rollback_journal = rollback_journal
         self.rollback_journal_reserved = False
         self.rollback_journal_state = "unreserved"
@@ -5223,8 +6066,14 @@ class RecoveryRollout:
         peers = [candidate["p2p_advertise"] for candidate in self.validators if candidate["name"] != node["name"]]
         community_origins = [candidate["rpc_url"] for candidate in self.validators]
         inference_args: list[str] = []
+        history_args: list[str] = []
         if self.manifest["mode"] == "production":
             inference_args = ["--model", node["model_path"]]
+            # Every public host can be selected by the desktop's fresh-host
+            # resolver. Keep the exact mined 0x25 receipt history on all six
+            # so earnings and 24-hour projections cannot depend on which
+            # healthy replica answers first.
+            history_args = ["--archive"]
             for start, end in node["shard_ranges"]:
                 inference_args.extend(("--shard-range", f"{start}:{end}"))
         rpc_args = ["--rpc", node["rpc_listen"]]
@@ -5250,6 +6099,7 @@ class RecoveryRollout:
             "--validator-set-id",
             str(self.chain["validator_set_id"]),
             *(flag for origin in community_origins for flag in ("--community-rpc-url", origin)),
+            *history_args,
             *inference_args,
             *node["extra_args"],
         ]
@@ -6642,11 +7492,153 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             fail(f"reward probe did not emit one JSON evidence object: {error}")
         return ReceiptEvidence.from_value(body)
 
+    def _reward_baseline_candidate_workers(self) -> list[str]:
+        reward = self.checks["reward"]
+        if "probe_argv" not in reward:
+            return [ReceiptEvidence.from_value(reward["receipts"][0]).worker]
+
+        coordinator_digest = hashlib.sha256(
+            RECOVERY_PROBE_COORDINATOR_DOMAIN + bytes.fromhex(self.digest)
+        ).digest()
+        coordinator = self.validators[
+            int.from_bytes(coordinator_digest[:8], "big") % len(self.validators)
+        ]
+        scoreboard = self._http_json(coordinator, "/workers/scoreboard?limit=500")
+        if not isinstance(scoreboard, dict):
+            fail(f"{coordinator['name']} worker scoreboard is not an object")
+        eligible = required_int(
+            scoreboard.get("eligible_inference_workers"),
+            f"{coordinator['name']} scoreboard.eligible_inference_workers",
+            minimum=1,
+        )
+        coordinator_name = coordinator["name"]
+        coordinator_model_id = "0x" + bare_hash(
+            scoreboard.get("coordinator_model_id"),
+            f"{coordinator_name} scoreboard.coordinator_model_id",
+        )
+        registry = self._http_json(coordinator, "/community/list")
+        if not isinstance(registry, dict):
+            fail(f"{coordinator_name} community worker registry is not an object")
+        rows = registry.get("workers")
+        if not isinstance(rows, list):
+            fail(f"{coordinator_name} community worker registry workers is not an array")
+        if required_int(
+            registry.get("count"), f"{coordinator_name} community registry.count"
+        ) != len(rows):
+            fail(f"{coordinator_name} community worker count differs from its rows")
+        candidates: set[str] = set()
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                fail(f"{coordinator_name} community workers[{index}] is not an object")
+            capabilities = row.get("capabilities")
+            if not isinstance(capabilities, list) or not all(
+                isinstance(capability, str) for capability in capabilities
+            ):
+                fail(f"{coordinator_name} community workers[{index}].capabilities is invalid")
+            model_id = row.get("model_id")
+            if (
+                "inference" in capabilities
+                and model_id is not None
+                and row.get("execution_profile") == CANONICAL_EXECUTION_PROFILE
+            ):
+                normalized_model_id = "0x" + bare_hash(
+                    model_id, f"{coordinator_name} community worker model_id"
+                )
+                if normalized_model_id == coordinator_model_id:
+                    candidates.add(
+                        "0x"
+                        + bare_hash(
+                            row.get("worker_id"),
+                            f"{coordinator_name} community worker_id",
+                        )
+                    )
+        if len(candidates) < eligible:
+            fail(
+                f"{coordinator['name']} scoreboard hides an eligible inference worker; "
+                "cannot seal every possible pre-canary earnings baseline"
+            )
+        if not candidates:
+            fail(f"{coordinator['name']} has no pre-canary reward worker candidate")
+        return sorted(candidates)
+
+    def capture_reward_earnings_baselines(self) -> None:
+        """Seal six-replica all-v3 history before a canary can be submitted."""
+        if self.reward_earnings_baselines:
+            return
+        baselines: list[RewardEarningsBaseline] = []
+        for worker in self._reward_baseline_candidate_workers():
+            observations = [
+                RewardEarningsBaseline.from_earnings(
+                    self._http_json(node, f"/worker/earnings/{worker}"),
+                    worker=worker,
+                    expected_reward_base=self.checks["reward"]["expected_reward_base"],
+                    field=f"{node['name']} pre-canary earnings",
+                )
+                for node in self.validators
+            ]
+            if any(observation != observations[0] for observation in observations[1:]):
+                fail(
+                    f"validators disagree on the complete canonical all-v3 earnings "
+                    f"baseline for {worker}"
+                )
+            baselines.append(observations[0])
+        self.persist_reward_earnings_baselines(baselines)
+        total_rows = sum(item.confirmed_receipt_count for item in baselines)
+        self.say(
+            "PASS fsynced six-node agreed pre-canary all-v3 earnings baselines "
+            f"for {len(baselines)} possible worker(s), retaining {total_rows} receipt row(s)"
+        )
+
+    def reprove_reward_earnings_baselines_before_probe(self) -> None:
+        """Close the crash/resume gap immediately before probe ordinal one."""
+        if not self.reward_earnings_baselines:
+            fail("pre-canary reward earnings baseline has not been sealed")
+        selectable = set(self._reward_baseline_candidate_workers())
+        if not selectable.issubset(self.reward_earnings_baselines):
+            fail(
+                "a newly selectable reward worker lacks a pre-canary earnings baseline; "
+                "refusing to issue a canary"
+            )
+        for worker, baseline in sorted(self.reward_earnings_baselines.items()):
+            observations = [
+                RewardEarningsBaseline.from_earnings(
+                    self._http_json(node, f"/worker/earnings/{worker}"),
+                    worker=worker,
+                    expected_reward_base=self.checks["reward"]["expected_reward_base"],
+                    field=f"{node['name']} immediate pre-probe earnings",
+                )
+                for node in self.validators
+            ]
+            if any(observation != baseline for observation in observations):
+                fail(
+                    f"the durable pre-canary earnings baseline for {worker} changed "
+                    "before probe ordinal one"
+                )
+        self.say(
+            "PASS immediately re-proved the durable all-v3 earnings baselines and "
+            "selectable-worker set before probe ordinal one"
+        )
+
+    def _select_reward_earnings_baseline(
+        self, evidence: Sequence[ReceiptEvidence]
+    ) -> RewardEarningsBaseline:
+        if not evidence:
+            fail("cannot select a reward earnings baseline without canary evidence")
+        worker = evidence[0].worker
+        baseline = self.reward_earnings_baselines.get(worker)
+        if baseline is None:
+            fail("reward canary worker was not sealed in the pre-canary earnings baseline")
+        if self.reward_earnings_baseline not in (None, baseline):
+            fail("reward canary evidence changed the selected pre-canary worker")
+        self.reward_earnings_baseline = baseline
+        return baseline
+
     def prove_reward_receipt(
         self, evidence: ReceiptEvidence, ordinal: int | None = None
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, int]:
         reward = self.checks["reward"]
         expected_base = reward["expected_reward_base"]
+        expected_arc = expected_base / 1_000_000_000
         policies = [self._policy(node) for node in self.validators]
         expected_domain = bare_hash(policies[0]["transaction_domain"], "reward domain")
         expected_set = bare_hash(policies[0]["validator_set_commitment"], "validator set commitment")
@@ -6661,6 +7653,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     exact = {
                         "status": "mined_success",
                         "tx_type": "0x25",
+                        "submitted": True,
                         "included": True,
                         "confirmed": True,
                         "success": True,
@@ -6685,35 +7678,219 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     for key, wanted in hashes.items():
                         if bare_hash(receipt.get(key), f"{node['name']} receipt {key}") != bare_hash(wanted, key):
                             fail(f"{node['name']} reward receipt {key} differs")
+                    expected_receipt_url = (
+                        "/community/reward_receipt/0x"
+                        + bare_hash(evidence.tx_hash, "receipt tx_hash")
+                    )
+                    if receipt.get("receipt_url") != expected_receipt_url:
+                        fail(f"{node['name']} reward receipt URL differs from its exact transaction")
+                    reward_arc = receipt.get("reward_arc")
+                    if (
+                        isinstance(reward_arc, bool)
+                        or not isinstance(reward_arc, (int, float))
+                        or float(reward_arc) != expected_arc
+                    ):
+                        fail(
+                            f"{node['name']} reward receipt ARC amount differs from its exact base-unit amount"
+                        )
                     if required_int(receipt.get("validator_approvals"), "receipt.validator_approvals") < REQUIRED_APPROVALS:
                         fail(f"{node['name']} reward receipt has fewer than five validator approvals")
-                    required_int(receipt.get("block_height"), "receipt.block_height", minimum=self.chain["transition_height"])
-                    bare_hash(receipt.get("block_hash"), "receipt.block_hash")
-                receipt_blocks = {(receipt["block_height"], bare_hash(receipt["block_hash"], "block hash")) for receipt in receipts}
-                if len(receipt_blocks) != 1:
-                    fail("validators disagree on the reward receipt block")
-                receipt_block = next(iter(receipt_blocks))
+                    block_height = required_int(
+                        receipt.get("block_height"),
+                        "receipt.block_height",
+                        minimum=self.chain["transition_height"],
+                    )
+                    block_hash = bare_hash(receipt.get("block_hash"), "receipt.block_hash")
+                    receipt_index = required_int(receipt.get("index"), "receipt.index")
+
+                    block = self._unwrap_block(
+                        self._http_json(node, f"/block/{block_height}")
+                    )
+                    header = block.get("header")
+                    if not isinstance(header, dict):
+                        fail(f"{node['name']} reward block response has no header")
+                    if required_int(header.get("height"), "reward block.header.height") != block_height:
+                        fail(f"{node['name']} reward block height differs from its receipt")
+                    if bare_hash(block.get("hash"), "reward block.hash") != block_hash:
+                        fail(f"{node['name']} reward receipt block hash differs from the canonical block")
+                    tx_hashes = block.get("tx_hashes")
+                    block_tx_count = required_int(
+                        header.get("tx_count"),
+                        "reward block.header.tx_count",
+                        minimum=1,
+                    )
+                    if (
+                        not isinstance(tx_hashes, list)
+                        or len(tx_hashes) != block_tx_count
+                        or receipt_index >= len(tx_hashes)
+                        or bare_hash(
+                            tx_hashes[receipt_index],
+                            "reward block indexed transaction hash",
+                        )
+                        != bare_hash(evidence.tx_hash, "reward evidence tx_hash")
+                    ):
+                        fail(
+                            f"{node['name']} reward block does not contain the transaction at receipt.index"
+                        )
+
+                    tx_page = self._http_json(
+                        node,
+                        f"/block/{block_height}/txs?offset={receipt_index}&limit=1",
+                    )
+                    if not isinstance(tx_page, dict):
+                        fail(f"{node['name']} reward block transaction page is not an object")
+                    transactions = tx_page.get("transactions")
+                    if (
+                        required_int(
+                            tx_page.get("block_height"),
+                            "reward block transactions.block_height",
+                        )
+                        != block_height
+                        or required_int(
+                            tx_page.get("tx_count"),
+                            "reward block transactions.tx_count",
+                            minimum=1,
+                        )
+                        != block_tx_count
+                        or required_int(
+                            tx_page.get("offset"),
+                            "reward block transactions.offset",
+                        )
+                        != receipt_index
+                        or required_int(
+                            tx_page.get("limit"),
+                            "reward block transactions.limit",
+                            minimum=1,
+                        )
+                        != 1
+                        or required_int(
+                            tx_page.get("returned"),
+                            "reward block transactions.returned",
+                        )
+                        != 1
+                        or not isinstance(transactions, list)
+                        or len(transactions) != 1
+                        or not isinstance(transactions[0], dict)
+                        or required_int(
+                            transactions[0].get("index"),
+                            "reward block transaction.index",
+                        )
+                        != receipt_index
+                        or bare_hash(
+                            transactions[0].get("hash"),
+                            "reward block transaction.hash",
+                        )
+                        != bare_hash(evidence.tx_hash, "reward evidence tx_hash")
+                    ):
+                        fail(
+                            f"{node['name']} reward transaction page does not bind receipt.index to the transaction"
+                        )
+                receipt_locations = {
+                    (
+                        required_int(
+                            receipt.get("block_height"),
+                            "receipt.block_height",
+                        ),
+                        bare_hash(receipt.get("block_hash"), "block hash"),
+                        required_int(receipt.get("index"), "receipt.index"),
+                    )
+                    for receipt in receipts
+                }
+                if len(receipt_locations) != 1:
+                    fail(
+                        "validators disagree on the reward receipt block or transaction index"
+                    )
+                receipt_location = next(iter(receipt_locations))
                 for node in self.validators:
                     earnings = self._http_json(node, f"/worker/earnings/{evidence.worker}")
                     if not isinstance(earnings, dict):
                         fail(f"{node['name']} worker earnings is not an object")
+                    if bare_hash(
+                        earnings.get("address"), "earnings.address"
+                    ) != bare_hash(evidence.worker, "reward evidence.worker"):
+                        fail(f"{node['name']} worker earnings address differs from the requested worker")
+                    if earnings.get("archive_mode") is not True:
+                        fail(
+                            f"{node['name']} worker earnings is not backed by durable archive history"
+                        )
+                    if (
+                        earnings.get("history_complete_since_recovery") is not True
+                        or earnings.get("history_scope") != ARCHIVE_EARNINGS_SCOPE
+                        or earnings.get("history_domain") != EARNINGS_HISTORY_DOMAIN
+                    ):
+                        fail(
+                            f"{node['name']} worker earnings does not bind archive history to the canonical v3 recovery boundary"
+                        )
                     if required_int(earnings.get("confirmed_receipt_count"), "earnings.confirmed_receipt_count") < 1:
                         fail(f"{node['name']} worker earnings omitted the mined receipt")
                     if required_int(earnings.get("confirmed_gross_earnings_base"), "earnings.confirmed_gross_earnings_base") < expected_base:
                         fail(f"{node['name']} worker earnings undercount the confirmed reward")
                     rows = earnings.get("confirmed_receipts")
-                    if not isinstance(rows, list) or not any(
-                        isinstance(row, dict)
-                        and row.get("success") is True
-                        and bare_hash(row.get("tx_hash"), "earnings receipt tx_hash") == bare_hash(evidence.tx_hash, "tx_hash")
-                        and bare_hash(row.get("job_id"), "earnings receipt job_id") == bare_hash(evidence.job_id, "job_id")
-                        and required_int(row.get("block_height"), "earnings receipt block_height") == receipt_block[0]
-                        and bare_hash(row.get("block_hash"), "earnings receipt block_hash") == receipt_block[1]
-                        for row in rows
+                    if not isinstance(rows, list):
+                        fail(f"{node['name']} earnings confirmed_receipts is not an array")
+                    normalized_rows: list[tuple[str, str, Mapping[str, Any]]] = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            fail(f"{node['name']} earnings contains a non-object receipt")
+                        normalized_rows.append(
+                            (
+                                bare_hash(
+                                    row.get("tx_hash"),
+                                    "earnings receipt tx_hash",
+                                ),
+                                bare_hash(
+                                    row.get("job_id"),
+                                    "earnings receipt job_id",
+                                ),
+                                row,
+                            )
+                        )
+                    target_rows = [
+                        row
+                        for tx_hash, job_id, row in normalized_rows
+                        if tx_hash == bare_hash(evidence.tx_hash, "tx_hash")
+                        and job_id == bare_hash(evidence.job_id, "job_id")
+                    ]
+                    if len(target_rows) != 1:
+                        fail(
+                            f"{node['name']} earnings lacks one unique receipt for the exact reward transaction and job"
+                        )
+                    target = target_rows[0]
+                    target_arc = target.get("reward_arc")
+                    if (
+                        target.get("tx_type") != "0x25"
+                        or target.get("submitted") is not True
+                        or target.get("included") is not True
+                        or target.get("confirmed") is not True
+                        or target.get("success") is not True
+                        or required_int(
+                            target.get("block_height"),
+                            "earnings receipt block_height",
+                        )
+                        != receipt_location[0]
+                        or bare_hash(
+                            target.get("block_hash"),
+                            "earnings receipt block_hash",
+                        )
+                        != receipt_location[1]
+                        or required_int(
+                            target.get("index"),
+                            "earnings receipt index",
+                        )
+                        != receipt_location[2]
+                        or target.get("receipt_url") != expected_receipt_url
+                        or required_int(
+                            target.get("reward_base"),
+                            "earnings receipt reward_base",
+                        )
+                        != expected_base
+                        or isinstance(target_arc, bool)
+                        or not isinstance(target_arc, (int, float))
+                        or float(target_arc) != expected_arc
                     ):
                         fail(f"{node['name']} earnings lacks the exact successful 0x25 receipt")
                 self.say(f"PASS mined 0x25 reward receipt {evidence.tx_hash} and worker earnings agree on all six validators")
-                return receipt_block
+                return receipt_location
             except RolloutError as error:
                 last_error = str(error)
                 time.sleep(self.checks["poll_interval_seconds"])
@@ -6722,103 +7899,158 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
     def prove_reward_projection(
         self,
         evidence: Sequence[ReceiptEvidence],
-        receipt_blocks: Sequence[tuple[int, str]],
+        receipt_blocks: Sequence[tuple[int, str, int]],
     ) -> None:
         validate_distinct_receipt_evidence(evidence)
         if (
             len(receipt_blocks) != 2
             or len(set(receipt_blocks)) != 2
-            or len({height for height, _ in receipt_blocks}) != 2
+            or len({height for height, _, _ in receipt_blocks}) != 2
         ):
             fail("the two reward receipts must be mined in two distinct blocks")
+        baseline = self._select_reward_earnings_baseline(evidence)
         expected_base = self.checks["reward"]["expected_reward_base"]
-        expected_gross_base = 2 * expected_base
+        expected_count = baseline.confirmed_receipt_count + 2
+        expected_gross_base = baseline.confirmed_gross_earnings_base + 2 * expected_base
         expected_reward_arc = expected_base / 1_000_000_000
         expected_gross_arc = expected_gross_base / 1_000_000_000
+        agreed_post_history: RewardEarningsBaseline | None = None
         for node in self.validators:
             earnings = self._http_json(node, f"/worker/earnings/{evidence[0].worker}")
-            if not isinstance(earnings, dict):
-                fail(f"{node['name']} worker earnings is not an object")
-            if required_int(
-                earnings.get("confirmed_receipt_count"),
-                "earnings.confirmed_receipt_count",
-            ) != 2:
-                fail(f"{node['name']} earnings must contain exactly the two rollout canary receipts")
-            gross_base = required_int(
-                earnings.get("confirmed_gross_earnings_base"),
-                "earnings.confirmed_gross_earnings_base",
+            current = RewardEarningsBaseline.from_earnings(
+                earnings,
+                worker=evidence[0].worker,
+                expected_reward_base=expected_base,
+                field=f"{node['name']} post-canary earnings",
             )
-            if gross_base != expected_gross_base:
-                fail(f"{node['name']} earnings does not prove exactly 5 ARC gross from two canaries")
-            gross_arc = earnings.get("confirmed_gross_earnings_arc")
-            if (
-                isinstance(gross_arc, bool)
-                or not isinstance(gross_arc, (int, float))
-                or float(gross_arc) != expected_gross_arc
-            ):
-                fail(f"{node['name']} earnings ARC gross does not equal the exact base-unit total")
-            rows = earnings.get("confirmed_receipts")
-            if not isinstance(rows, list) or len(rows) != 2:
-                fail(f"{node['name']} earnings must expose exactly two confirmed receipt rows")
-            normalized_rows: list[tuple[str, str, int, str, Mapping[str, Any]]] = []
-            for row in rows:
-                if not isinstance(row, dict):
-                    fail(f"{node['name']} earnings contains a non-object receipt")
-                normalized_rows.append(
-                    (
-                        bare_hash(row.get("tx_hash"), "earnings receipt tx_hash"),
-                        bare_hash(row.get("job_id"), "earnings receipt job_id"),
-                        required_int(row.get("block_height"), "earnings receipt block_height"),
-                        bare_hash(row.get("block_hash"), "earnings receipt block_hash"),
-                        row,
-                    )
+            if agreed_post_history is None:
+                agreed_post_history = current
+            elif current != agreed_post_history:
+                fail("validators disagree on the canonical post-canary all-v3 earnings history")
+            if current.confirmed_receipt_count != expected_count:
+                fail(
+                    f"{node['name']} earnings must retain the baseline plus exactly two new rollout canaries"
                 )
-            if len({row[0] for row in normalized_rows}) != len(normalized_rows):
-                fail(f"{node['name']} earnings repeats a receipt transaction hash")
-            if len({row[1] for row in normalized_rows}) != len(normalized_rows):
-                fail(f"{node['name']} earnings repeats a receipt job id")
+            if current.confirmed_gross_earnings_base != expected_gross_base:
+                fail(
+                    f"{node['name']} earnings gross must equal the preserved baseline plus exactly 5 ARC"
+                )
+            if expected_gross_arc != current.confirmed_gross_earnings_base / 1_000_000_000:
+                fail(f"{node['name']} earnings ARC gross does not equal the exact base-unit total")
+            current_rows = set(current.confirmed_receipts)
+            baseline_rows = set(baseline.confirmed_receipts)
+            if not baseline_rows.issubset(current_rows):
+                fail(f"{node['name']} earnings dropped or changed a pre-canary historical receipt")
+            canary_rows: list[CanonicalEarningsReceipt] = []
             for item, expected_block in zip(evidence, receipt_blocks):
                 matches = [
                     row
-                    for row in normalized_rows
-                    if row[0] == bare_hash(item.tx_hash, "evidence tx_hash")
-                    and row[1] == bare_hash(item.job_id, "evidence job_id")
+                    for row in current.confirmed_receipts
+                    if row.tx_hash == item.tx_hash and row.job_id == item.job_id
                 ]
                 if len(matches) != 1:
                     fail(f"{node['name']} earnings lacks one unique exact demo receipt")
                 row = matches[0]
                 if (
-                    (row[2], row[3])
-                    != (expected_block[0], bare_hash(expected_block[1], "receipt block hash"))
-                    or row[4].get("success") is not True
-                    or required_int(row[4].get("reward_base"), "earnings receipt reward_base")
-                    != expected_base
-                    or isinstance(row[4].get("reward_arc"), bool)
-                    or not isinstance(row[4].get("reward_arc"), (int, float))
-                    or float(row[4]["reward_arc"]) != expected_reward_arc
+                    (row.block_height, row.block_hash, row.index)
+                    != (
+                        expected_block[0],
+                        f"0x{bare_hash(expected_block[1], 'receipt block hash')}",
+                        expected_block[2],
+                    )
+                    or row.worker != item.worker
+                    or row.reward_base != expected_base
                 ):
                     fail(f"{node['name']} earnings demo receipt fields differ from mined evidence")
+                canary_rows.append(row)
+            if baseline_rows & set(canary_rows):
+                fail(f"{node['name']} rollout canary was already present in the pre-canary baseline")
+            if current_rows != baseline_rows | set(canary_rows):
+                fail(f"{node['name']} earnings contains a non-baseline, non-canary receipt")
+
+            if not isinstance(earnings, dict):
+                fail(f"{node['name']} worker earnings is not an object")
             rate = earnings.get("attestations_per_day_observed")
+            rate_reason = earnings.get("attestations_per_day_unavailable_reason")
             projection = earnings.get("projected_daily_arc")
-            if rate is not None:
-                fail(f"{node['name']} invents an observed daily rate from two rollout canaries")
-            if projection is not None:
-                fail(f"{node['name']} invents projected_daily_arc from two rollout canaries")
-            if earnings.get("attestations_per_day_unavailable_reason") != PROJECTION_COLLECTING_REASON:
-                fail(f"{node['name']} observed rate lacks the canonical collecting-data reason")
-            if earnings.get("projected_daily_unavailable_reason") != PROJECTION_COLLECTING_REASON:
-                fail(f"{node['name']} projection lacks the canonical collecting-data reason")
+            projection_reason = earnings.get("projected_daily_unavailable_reason")
+            if expected_count < 3:
+                if rate is not None or projection is not None:
+                    fail(f"{node['name']} invents a rate or projection from fewer than three receipts")
+                if rate_reason != PROJECTION_COLLECTING_REASON:
+                    fail(f"{node['name']} observed rate lacks the canonical collecting-data reason")
+                if projection_reason != PROJECTION_COLLECTING_REASON:
+                    fail(f"{node['name']} projection lacks the canonical collecting-data reason")
+                continue
+
+            first_timestamp = earnings.get("observed_window_first_timestamp_ms")
+            last_timestamp = earnings.get("observed_window_last_timestamp_ms")
+            valid_window = (
+                isinstance(first_timestamp, int)
+                and not isinstance(first_timestamp, bool)
+                and isinstance(last_timestamp, int)
+                and not isinstance(last_timestamp, bool)
+                and last_timestamp > first_timestamp
+                and last_timestamp - first_timestamp >= 86_400_000
+            )
+            if valid_window:
+                if (
+                    isinstance(rate, bool)
+                    or not isinstance(rate, (int, float))
+                    or not math.isfinite(float(rate))
+                    or float(rate) < 0
+                    or rate_reason is not None
+                ):
+                    fail(f"{node['name']} does not expose the receipt-derived observed rate")
+                exact_rate = (expected_count - 1) * 86_400_000 / (
+                    last_timestamp - first_timestamp
+                )
+                if not math.isclose(float(rate), exact_rate, rel_tol=1e-12, abs_tol=1e-12):
+                    fail(f"{node['name']} observed rate differs from its timestamp window")
+            else:
+                if rate is not None or rate_reason != PROJECTION_WINDOW_COLLECTING_REASON:
+                    fail(f"{node['name']} observed rate does not truthfully report its short window")
+
+            projection_numeric = (
+                not isinstance(projection, bool)
+                and isinstance(projection, (int, float))
+                and math.isfinite(float(projection))
+                and float(projection) >= 0
+            )
+            if projection_numeric:
+                if projection_reason is not None or not valid_window:
+                    fail(f"{node['name']} projected_daily_arc is not backed by a valid observed window")
+                assert isinstance(rate, (int, float)) and not isinstance(rate, bool)
+                if not math.isclose(
+                    float(projection),
+                    float(rate) * expected_reward_arc,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                ):
+                    fail(f"{node['name']} projected_daily_arc differs from observed rate × 2.5 ARC")
+            elif projection is not None:
+                fail(f"{node['name']} projected_daily_arc is neither null nor a finite nonnegative number")
+            elif not isinstance(projection_reason, str) or not projection_reason.strip():
+                fail(f"{node['name']} null projected_daily_arc lacks an unavailable reason")
         self.say(
-            "PASS two distinct mined receipts prove exactly 5 ARC gross while the daily "
-            "rate and projection remain canonical collecting-data nulls on all six validators"
+            "PASS all six validators retained the exact all-v3 earnings baseline plus two "
+            "distinct 2.5 ARC receipts; gross increased by exactly 5 ARC and projection state is truthful"
         )
 
     def prove_two_reward_receipts(self) -> list[ReceiptEvidence]:
         if self.checks["reward"]["mode"] != "receipt":
             return []
+        # This durable six-replica snapshot is deliberately before the first
+        # probe invocation. A resumed journal reuses it instead of moving the
+        # baseline forward to include a canary that already reached consensus.
+        self.capture_reward_earnings_baselines()
         evidence = list(self.reward_evidence_progress)
+        if not evidence:
+            self.reprove_reward_earnings_baselines_before_probe()
         if len(evidence) == 2:
             validate_distinct_receipt_evidence(evidence)
+        if evidence:
+            self._select_reward_earnings_baseline(evidence)
         receipt_blocks = [
             self.prove_reward_receipt(item, ordinal)
             for ordinal, item in enumerate(evidence, 1)
@@ -6832,6 +8064,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             if item is None:
                 fail("receipt mode did not produce receipt evidence")
             evidence.append(item)
+            self._select_reward_earnings_baseline(evidence)
             if len(evidence) == 2:
                 validate_distinct_receipt_evidence(evidence)
             self.persist_reward_evidence_progress(evidence)
@@ -6864,10 +8097,12 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         validate_distinct_receipt_evidence(evidence)
         if self.reward_evidence_output is None:
             fail("receipt-mode execution requires --reward-evidence-output")
+        baseline = self._select_reward_earnings_baseline(evidence)
         payload = canonical_bytes(
             {
-                "schema": "arc.recovery.reward-evidence.v1",
+                "schema": "arc.recovery.reward-evidence.v2",
                 "rollout_sha256": self.digest,
+                "earnings_baseline": baseline.to_value(),
                 "receipts": [
                     {
                         "tx_hash": item.tx_hash,
@@ -7000,7 +8235,11 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         self._atomic_replace_reward_reservation(
             sidecar,
             sidecar_fd,
-            reward_progress_payload(self.digest, evidence),
+            reward_progress_payload(
+                self.digest,
+                evidence,
+                tuple(self.reward_earnings_baselines.values()),
+            ),
             sidecar_payload,
         )
         os.close(sidecar_fd)
@@ -7009,31 +8248,15 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         self.say(f"PASS create-only rollout-bound reward evidence {output} sha256={digest}")
         return digest
 
-    def persist_reward_evidence_progress(
-        self, evidence: Sequence[ReceiptEvidence]
+    def _replace_reward_progress(
+        self, previous_payload: bytes, next_payload: bytes
     ) -> None:
-        if self.reward_evidence_output is None:
-            fail("receipt-mode execution requires --reward-evidence-output")
-        if self.reward_evidence_reservation is None:
-            self.reserve_reward_evidence_output()
-        if self.existing_reward_evidence is not None:
-            if list(evidence) != self.existing_reward_evidence:
-                fail("reward progress differs from finalized evidence")
-            return
-        if self.reward_evidence_reservation is None:
+        if self.reward_evidence_output is None or self.reward_evidence_reservation is None:
             fail("reward evidence reservation was not established")
-        previous = list(self.reward_evidence_progress)
-        next_evidence = list(evidence)
-        if len(next_evidence) != len(previous) + 1 or next_evidence[:-1] != previous:
-            fail("reward evidence progress must advance by exactly one receipt")
-        if len(next_evidence) == 2:
-            validate_distinct_receipt_evidence(next_evidence)
         output_fd, progress_fd = self.reward_evidence_reservation
         sidecar = self.reward_evidence_output.with_name(
             self.reward_evidence_output.name + ".sha256"
         )
-        previous_payload = reward_progress_payload(self.digest, previous)
-        next_payload = reward_progress_payload(self.digest, next_evidence)
         self._atomic_replace_reward_reservation(
             sidecar,
             progress_fd,
@@ -7051,7 +8274,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             opened = os.fstat(replacement)
             visible = sidecar.lstat()
             contents, mode = self._read_open_regular(
-                replacement, sidecar, 64 * 1024
+                replacement, sidecar, REWARD_EVIDENCE_MAX_BYTES
             )
             if (
                 stat.S_ISLNK(visible.st_mode)
@@ -7066,6 +8289,64 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             os.close(replacement)
             raise
         self.reward_evidence_reservation = (output_fd, replacement)
+
+    def persist_reward_earnings_baselines(
+        self, baselines: Sequence[RewardEarningsBaseline]
+    ) -> None:
+        if self.reward_evidence_output is None:
+            fail("receipt-mode execution requires --reward-evidence-output")
+        if self.reward_evidence_reservation is None:
+            self.reserve_reward_evidence_output()
+        ordered = tuple(sorted(baselines, key=lambda item: item.worker))
+        if not ordered:
+            fail("pre-canary reward earnings baseline set cannot be empty")
+        if len({item.worker for item in ordered}) != len(ordered):
+            fail("pre-canary reward earnings baseline repeats a worker")
+        existing = tuple(
+            sorted(self.reward_earnings_baselines.values(), key=lambda item: item.worker)
+        )
+        if existing:
+            if ordered != existing:
+                fail("pre-canary reward earnings baseline differs from the durable journal")
+            return
+        if self.existing_reward_evidence is not None:
+            fail("finalized reward evidence is missing its durable earnings baseline")
+        if self.reward_evidence_progress:
+            fail("cannot capture an earnings baseline after a reward canary")
+        previous_payload = reward_progress_payload(self.digest, [], ())
+        next_payload = reward_progress_payload(self.digest, [], ordered)
+        self._replace_reward_progress(previous_payload, next_payload)
+        self.reward_earnings_baselines = {item.worker: item for item in ordered}
+
+    def persist_reward_evidence_progress(
+        self, evidence: Sequence[ReceiptEvidence]
+    ) -> None:
+        if self.reward_evidence_output is None:
+            fail("receipt-mode execution requires --reward-evidence-output")
+        if self.reward_evidence_reservation is None:
+            self.reserve_reward_evidence_output()
+        if self.existing_reward_evidence is not None:
+            if list(evidence) != self.existing_reward_evidence:
+                fail("reward progress differs from finalized evidence")
+            return
+        if self.reward_evidence_reservation is None:
+            fail("reward evidence reservation was not established")
+        if not self.reward_earnings_baselines:
+            fail("reward evidence cannot advance before the pre-canary earnings baseline")
+        previous = list(self.reward_evidence_progress)
+        next_evidence = list(evidence)
+        if len(next_evidence) != len(previous) + 1 or next_evidence[:-1] != previous:
+            fail("reward evidence progress must advance by exactly one receipt")
+        if len(next_evidence) == 2:
+            validate_distinct_receipt_evidence(next_evidence)
+        baselines = tuple(self.reward_earnings_baselines.values())
+        previous_payload = reward_progress_payload(
+            self.digest, previous, baselines
+        )
+        next_payload = reward_progress_payload(
+            self.digest, next_evidence, baselines
+        )
+        self._replace_reward_progress(previous_payload, next_payload)
         self.reward_evidence_progress = next_evidence
         self.say(
             f"PASS fsynced reward evidence progress {len(next_evidence)}/2"
@@ -7134,7 +8415,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                         (path, marker, details.st_dev, details.st_ino)
                     )
                     contents, mode = self._read_open_regular(
-                        fd, path, 64 * 1024
+                        fd, path, REWARD_EVIDENCE_MAX_BYTES
                     )
                 except FileExistsError:
                     try:
@@ -7142,7 +8423,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     except OSError as error:
                         fail(f"cannot safely open reward evidence target {path}: {error}")
                     contents, mode = self._read_open_regular(
-                        fd, path, 64 * 1024
+                        fd, path, REWARD_EVIDENCE_MAX_BYTES
                     )
                     opened = os.fstat(fd)
                     visible = path.lstat()
@@ -7165,7 +8446,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             sidecar_is_marker = (
                 sidecar_mode == 0o600 and sidecar_bytes == markers[1]
             )
-            sidecar_progress: list[ReceiptEvidence] | None = None
+            sidecar_progress: RewardProgressState | None = None
             if (
                 sidecar_mode == 0o600
                 and not sidecar_is_marker
@@ -7181,7 +8462,11 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     markers[0],
                     markers[1]
                     if sidecar_is_marker
-                    else reward_progress_payload(self.digest, sidecar_progress or []),
+                    else reward_progress_payload(
+                        self.digest,
+                        sidecar_progress.receipts,
+                        sidecar_progress.earnings_baselines,
+                    ),
                 )
                 for index, path in enumerate(paths):
                     fd = descriptors[index]
@@ -7192,7 +8477,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                         fail(f"cannot reopen reward evidence reservation {path}: {error}")
                     replacement_details = os.fstat(replacement)
                     contents, mode = self._read_open_regular(
-                        replacement, path, 64 * 1024
+                        replacement, path, REWARD_EVIDENCE_MAX_BYTES
                     )
                     if (
                         (replacement_details.st_dev, replacement_details.st_ino)
@@ -7219,7 +8504,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     replacement_details = os.fstat(replacement)
                     visible = sidecar.lstat()
                     contents, mode = self._read_open_regular(
-                        replacement, sidecar, 64 * 1024
+                        replacement, sidecar, REWARD_EVIDENCE_MAX_BYTES
                     )
                     if (
                         stat.S_ISLNK(visible.st_mode)
@@ -7232,11 +8517,15 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                         os.close(replacement)
                         fail("reward evidence progress changed while initializing")
                     descriptors[1] = replacement
-                    sidecar_progress = []
+                    sidecar_progress = RewardProgressState((), ())
                 self.reward_evidence_reservation = (
                     descriptors[0], descriptors[1]
                 )
-                self.reward_evidence_progress = list(sidecar_progress or [])
+                progress = sidecar_progress or RewardProgressState((), ())
+                self.reward_evidence_progress = list(progress.receipts)
+                self.reward_earnings_baselines = {
+                    item.worker: item for item in progress.earnings_baselines
+                }
                 return
 
             if output_is_marker:
@@ -7245,7 +8534,12 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                 )
             if output_mode not in (0o444, 0o600):
                 fail("finalized reward evidence JSON has unsafe permissions")
-            evidence = parse_reward_evidence_payload(output_bytes, self.digest)
+            bundle = parse_reward_evidence_payload(output_bytes, self.digest)
+            evidence = list(bundle.receipts)
+            self.reward_earnings_baseline = bundle.earnings_baseline
+            self.reward_earnings_baselines = {
+                bundle.earnings_baseline.worker: bundle.earnings_baseline
+            }
             expected_payload, digest, expected_sidecar = (
                 self._reward_evidence_payload(evidence)
             )
@@ -7253,17 +8547,21 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                 fail("finalized reward evidence JSON differs from canonical bytes")
 
             if sidecar_progress is not None:
-                if sidecar_progress != evidence:
+                if list(sidecar_progress.receipts) != evidence:
                     fail("finalized reward evidence differs from its progress journal")
+                if bundle.earnings_baseline not in sidecar_progress.earnings_baselines:
+                    fail("finalized reward evidence baseline differs from its progress journal")
                 progress_fd = descriptors[1]
                 opened = os.fstat(progress_fd)
                 replacement = os.open(sidecar, os.O_RDWR | nofollow)
                 replacement_details = os.fstat(replacement)
                 contents, mode = self._read_open_regular(
-                    replacement, sidecar, 64 * 1024
+                    replacement, sidecar, REWARD_EVIDENCE_MAX_BYTES
                 )
                 expected_progress = reward_progress_payload(
-                    self.digest, sidecar_progress
+                    self.digest,
+                    sidecar_progress.receipts,
+                    sidecar_progress.earnings_baselines,
                 )
                 if (
                     (replacement_details.st_dev, replacement_details.st_ino)
@@ -7361,6 +8659,45 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         # Re-check immediately before a caller may treat verification as a
         # publication signal; missing/lagging replicas fail closed.
         self.prove_visible_height_continuity()
+
+    def prove_reward_history_survives_production_restarts(
+        self, evidence: Sequence[ReceiptEvidence]
+    ) -> None:
+        """Restart every public replica and re-prove the exact mined history.
+
+        Desktop host selection may choose any fresh validator, so archive
+        durability is a six-replica contract.  The first restart pass happens
+        before reward canaries exist and cannot prove their persistence; this
+        second pass is intentionally after both distinct 0x25 receipts are
+        mined and sealed.
+        """
+        if self.manifest["mode"] != "production":
+            fail("reward-history restart proof is production-only")
+        validate_distinct_receipt_evidence(evidence)
+        for restart_index, node in enumerate(self.validators, 31):
+            before = self.wait_convergence()[0]
+            self._rollback_journal_event(
+                restart_index, "EARNINGS-RESTART", "STARTED", node=node
+            )
+            self.production_service(node, "restart")
+            self.wait_nodes_ready(timeout=self.checks["restart_timeout_seconds"])
+            self.prove_production_runtime_inventory()
+            after = self.wait_convergence(
+                minimum_height=before + self.checks["min_height_advance"],
+                timeout=self.checks["restart_timeout_seconds"],
+            )
+            self._rollback_journal_event(
+                restart_index, "EARNINGS-RESTART", "COMPLETE", node=node
+            )
+            self.say(
+                f"PASS {node['name']} retained archive earnings across restart; "
+                f"fleet advanced #{before} -> #{after[0]}"
+            )
+        self.verify_live(evidence)
+        self.say(
+            "PASS all six archive validators retained both exact mined 0x25 "
+            "receipts across independent production restarts"
+        )
 
     def import_local(self, node: Mapping[str, Any]) -> None:
         if Path(node["data_dir"]).exists():
@@ -7787,6 +9124,10 @@ WantedBy=multi-user.target
 
 {node['host']} {{
     tls {{
+        # Keep a three-day fallback recovery margin for this 160-hour leaf if
+        # ACME Renewal Information is temporarily unavailable.  ARI remains
+        # authoritative when the issuer supplies a renewal window.
+        renewal_window_ratio {TLS_RENEWAL_WINDOW_RATIO}
         issuer acme {LETS_ENCRYPT_PRODUCTION_DIRECTORY} {{
             profile shortlived
             disable_tlsalpn_challenge
@@ -7902,6 +9243,10 @@ WantedBy=multi-user.target
     # short-lived ACME profile and HTTP-01 explicitly so rollout never depends
     # on a shared wildcard-DNS operator or Caddy's local-IP CA fallback.
     tls {{
+        # Keep a three-day fallback recovery margin for this 160-hour leaf if
+        # ACME Renewal Information is temporarily unavailable.  ARI remains
+        # authoritative when the issuer supplies a renewal window.
+        renewal_window_ratio {TLS_RENEWAL_WINDOW_RATIO}
         issuer acme {LETS_ENCRYPT_PRODUCTION_DIRECTORY} {{
             profile shortlived
             disable_tlsalpn_challenge
@@ -10273,15 +11618,16 @@ printf '%s' "$payload"
             node,
             "set -eu\n"
             + self.remote_semantic_python_prelude(node)
-            + r'''host=$1 node=$2 rollout=$3 phase=$4 caddy=$5 caddy_sha=$6 caddy_version=$7
+            + r'''host=$1 node=$2 rollout=$3 phase=$4 caddy=$5 caddy_sha=$6 caddy_version=$7 renewal_ratio=$8
 test -f "$caddy" && test ! -L "$caddy"
 test "$(stat -c %U:%G:%a:%h "$caddy")" = root:arc-caddy:550:1
 printf '%s  %s\n' "$caddy_sha" "$caddy" | sha256sum --check --strict
 test "$("$caddy" version | awk '{print $1}')" = "$caddy_version"
-arc_semantic_python - "$host" "$node" "$rollout" "$phase" "$caddy_sha" "$caddy_version" <<'PY'
+arc_semantic_python - "$host" "$node" "$rollout" "$phase" "$caddy_sha" "$caddy_version" "$renewal_ratio" <<'PY'
 import hashlib,ipaddress,json,re,socket,ssl,sys,time
 
-host,node,rollout,phase,caddy_sha,caddy_version=sys.argv[1:]
+host,node,rollout,phase,caddy_sha,caddy_version,renewal_ratio=sys.argv[1:]
+renewal_ratio=float(renewal_ratio)
 if str(ipaddress.ip_address(host))!=host or ipaddress.ip_address(host).version!=4:
     raise SystemExit('TLS verification host is not canonical IPv4')
 context=ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
@@ -10337,6 +11683,7 @@ value={
     'caddy_binary_sha256':caddy_sha,
     'acme_directory':'https://acme-v02.api.letsencrypt.org/directory',
     'acme_profile':'shortlived',
+    'renewal_window_ratio':renewal_ratio,
     'verification_host':host,
     'san_ip_addresses':ip_sans,
     'san_dns_names':dns_sans,
@@ -10366,6 +11713,7 @@ arc_semantic_python_revalidate
                 f"{root}/caddy",
                 CADDY_LINUX_AMD64_SHA256,
                 CADDY_VERSION,
+                str(TLS_RENEWAL_WINDOW_RATIO),
             ),
             timeout=60,
         )
@@ -10409,6 +11757,7 @@ arc_semantic_python_revalidate
             "phase": phase,
             "maximum_leaf_lifetime_seconds": TLS_MAX_LEAF_LIFETIME_SECONDS,
             "minimum_remaining_validity_seconds": TLS_MIN_REMAINING_VALIDITY_SECONDS,
+            "renewal_window_ratio": TLS_RENEWAL_WINDOW_RATIO,
             "renewal_observed": False,
             "evidence_scope": "fresh-verified-handshake-and-https-probe-not-renewal",
             "nodes": [evidence[node["name"]] for node in self.validators],
@@ -12182,8 +13531,8 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
             evidence = self.prove_or_resume_two_reward_receipts()
             if evidence and not resumed_evidence:
                 self.persist_reward_evidence(evidence)
+            self.prove_reward_history_survives_production_restarts(evidence)
             self._rollback_journal_event(20, "REWARD-PROOF", "COMPLETE")
-            self.prove_visible_height_continuity()
         except BaseException as original:
             rollback_cause: BaseException = original
             if self.public_gate_intent_sha256 is not None:
@@ -12213,7 +13562,7 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
 
 def parse_evidence_file(
     path: Path, expected_rollout_sha256: str
-) -> list[ReceiptEvidence]:
+) -> RewardEvidenceBundle:
     try:
         payload = path.read_bytes()
     except OSError as error:
@@ -12340,9 +13689,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             fail("receipt-mode rollout requires --reward-evidence-output before preflight or mutation")
         if args.command == "frontend-config":
-            evidence = (
+            evidence_bundle = (
                 parse_evidence_file(args.reward_evidence, digest)
                 if args.reward_evidence is not None
+                else None
+            )
+            if evidence_bundle is not None:
+                rollout.reward_earnings_baseline = evidence_bundle.earnings_baseline
+                rollout.reward_earnings_baselines = {
+                    evidence_bundle.earnings_baseline.worker:
+                    evidence_bundle.earnings_baseline
+                }
+            evidence = (
+                list(evidence_bundle.receipts)
+                if evidence_bundle is not None
                 else None
             )
             config_digest = write_frontend_config(
@@ -12382,9 +13742,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             fail("existing rollback journal did not enter a terminal recovery state")
         if args.command == "verify":
-            evidence = (
+            evidence_bundle = (
                 parse_evidence_file(args.reward_evidence, digest)
                 if args.reward_evidence
+                else None
+            )
+            if evidence_bundle is not None:
+                rollout.reward_earnings_baseline = evidence_bundle.earnings_baseline
+                rollout.reward_earnings_baselines = {
+                    evidence_bundle.earnings_baseline.worker:
+                    evidence_bundle.earnings_baseline
+                }
+            evidence = (
+                list(evidence_bundle.receipts)
+                if evidence_bundle is not None
                 else None
             )
             if evidence is not None and manifest["checks"]["reward"]["mode"] != "receipt":

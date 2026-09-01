@@ -12,7 +12,7 @@ export async function seedOnboarded(page: Page) {
           // No seedPhrase: the store no longer accepts one, and
           // scrubIdentity() would strip it on load anyway. See
           // seedOnboardedLegacy() for a fixture that still has it.
-          address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
+          address: "99".repeat(32),
           publicKey:
             "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
           createdAt: Date.now(),
@@ -45,7 +45,7 @@ export async function seedOnboardedLegacy(page: Page) {
       JSON.stringify({
         onboarded: true,
         identity: {
-          address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
+          address: "99".repeat(32),
           publicKey:
             "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
           seedPhrase:
@@ -210,7 +210,7 @@ export async function seedOnboardedWithoutConfig(page: Page) {
       JSON.stringify({
         onboarded: true,
         identity: {
-          address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
+          address: "99".repeat(32),
           publicKey:
             "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
           createdAt: Date.now(),

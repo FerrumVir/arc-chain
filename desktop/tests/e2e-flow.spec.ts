@@ -192,7 +192,7 @@ test.describe("Recovery phrase never reaches localStorage", () => {
     expect(stored).not.toContain("galaxy stellar quantum");
 
     // The address survives - only the signing material is dropped.
-    expect(stored).toContain("arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p");
+    expect(stored).toContain("99".repeat(32));
   });
 
   test("the removed on-chain inference mode is coerced to coordinator", async ({
@@ -483,15 +483,18 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
 
   test("updater fences download/install separately and startup adopts only an exact version", () => {
     expect(commands).toMatch(/pub async fn prepare_update_relaunch/);
+    expect(commands).toMatch(/pub async fn begin_update_handoff/);
     expect(commands).toMatch(/pub async fn abort_update_relaunch/);
     expect(lib).toContain("commands::prepare_update_relaunch");
+    expect(lib).toContain("commands::begin_update_handoff");
     expect(lib).toContain("commands::abort_update_relaunch");
     expect(updater).toContain("prepareRelaunch: api.prepareUpdateRelaunch");
+    expect(updater).toContain("beginHandoff: api.beginUpdateHandoff");
     expect(updater).toContain("abortRelaunch: api.abortUpdateRelaunch");
     expect(updater).toContain("update.download(");
     expect(updater).toContain("install: () => update.install()");
     expect(updater).not.toContain("downloadAndInstall");
-    expect(updateController).toContain("prepared && !installInvoked");
+    expect(updateController).toContain("prepared && !handoffStarted");
     expect(updateController).not.toContain("downloadAndInstall");
     expect(commands).toContain("LocalNodeCompatibility::Incompatible");
     expect(lib).toContain("probe_local_node_compatibility");

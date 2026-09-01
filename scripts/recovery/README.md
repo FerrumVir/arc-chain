@@ -79,7 +79,10 @@ probe response. The exact leaf digest/times and these results are sealed in
 the rollback journal. Issuance and future renewal still require public ACME
 and inbound port 80. The bounded rollout proves issuance and restart reuse; it
 does **not** wait days or claim that renewal was observed. Ongoing renewal
-monitoring remains an operator obligation. Only the six validator
+monitoring remains an operator obligation. ACME Renewal Information (ARI)
+remains authoritative when the CA supplies it; the generated Caddy config's
+`renewal_window_ratio 0.5` is only the fallback schedule, corresponding to
+roughly 80 hours remaining on a 160-hour leaf. Only the six validator
 IPs may reach the signed internal approval path or the shard announce, forward,
 and cleanup paths. Shard destinations are bound to these six explicit HTTPS
 origins and responses are authenticated by active validator keys. Unknown paths
@@ -119,8 +122,11 @@ will display any canonical/public health state.
 Production currently requires audited root-owned SSH/service operation because
 the gateway binds ports 80/443 and the validator keys remain mode `0600`.
 Existing system nginx state/listeners are recorded before it is stopped and
-disabled; its configuration is preserved. Another process still holding 80 or
-443 is a hard stop.
+disabled; its configuration is preserved. Do not assume both ports start
+empty: the reviewed LAX baseline has distribution nginx active and enabled on
+public port 80 with no port-443 listener. The rollout must stop/disable that
+exact baseline before Caddy and rollback must restore it exactly. Any
+unaccounted process still holding 80 or 443 is a hard stop.
 
 ## Seal and inspect the plan
 
@@ -230,12 +236,21 @@ The orchestrator:
    every one-at-a-time restart;
 11. proves reward-policy agreement and, when selected, two sequential,
    successful mined `0x25` receipts with distinct transaction hashes, job IDs,
-   block heights, and block hashes; then proves the same worker has exactly
-   2.5 ARC (2,500,000,000 base units) per receipt and exactly 5 ARC gross in
-   the two-receipt canary window. All six must also return null observed rate
-   and null `projected_daily_arc` with the canonical `collecting data` reason:
-   a projection requires at least three successful mined receipts spanning at
-   least 24 hours, not the initial one or two rollout canaries.
+   block heights, and block hashes. Before the first canary, it fsyncs the
+   six-node-agreed complete all-v3 earnings baseline for every worker the
+   sealed coordinator could select. The final gate retains every baseline row,
+   adds exactly the two 2.5 ARC (2,500,000,000 base-unit) canaries, and requires
+   lifetime gross to increase by exactly 5 ARC. A zero-row baseline therefore
+   ends at exactly two receipts / 5 ARC and must expose the canonical null
+   collecting-data state. A nonempty baseline keeps its historical rows and
+   uses the full receipt/timestamp window: a numeric rate is valid only with at
+   least three receipts spanning 24 hours, and a numeric projection must equal
+   that observed rate times 2.5 ARC; otherwise a concrete unavailable reason is
+   required. Every production
+   validator is launched with protected `--archive` history retention, every
+   earnings response must report `archive_mode=true`, and the tool then
+   restarts all six one at a time and re-proves both exact receipts before it
+   can complete.
 
 Do not reuse the 2026-08-27 README observation as the final public ceiling.
 The sealed maintenance evidence bundle retains the official-six pre-fence
@@ -279,11 +294,727 @@ sources, canonical `Names`/`Id`/empty-`Following` alias closure, selected and
 alternative unit states, and activation edges. A validator in the exact
 `/user.slice/user-0.slice/session-N.scope` root-session shape is recorded as a
 detached writer instead of being falsely treated as the systemd `MainPID`.
-The v5 plan also binds the ARC Drive gate bytes, exact remote root,
-hashed custom OAuth client ID, hashed account, reviewed remaining daily upload
-budget, and the operator's dedicated-uploader attestation:
+The production blocks in this section are one ordered procedure: materialize
+and re-prove the protected pre-tag release, restore the six-key vault, create
+the verified legacy validator-set copy, prepare/freeze/capture, install the six
+keys, export/sign/checkpoint, build the prearchive, and only then archive. Do
+not run a later block before an earlier one has completed. Run the blocks in
+one reviewed root shell so the verified path/hash variables persist; after a
+shell restart, re-establish them from the sealed files and rerun every
+preceding read-only verification instead of copying values from history.
+
+Materialize the protected pre-tag inputs on the reviewed Ubuntu x86_64 operator
+enclave first. The nine `actions.zip` files are raw GitHub Actions responses,
+not inner release archives. The PATH is intentional: the enclave's reviewed
+`gh` is not on Ubuntu's default PATH, and the verification helper invokes
+`gh` by its bare name. Before entering the shell, dispatch
+`.github/workflows/validator-vault-rewrap.yml` from that same protected-main
+SHA with source-ciphertext SHA-256
+`bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9`,
+restore-certificate SHA-256
+`6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43`,
+and confirmation `REWRAP ARC VALIDATOR VAULT <protected-main-sha>`. After the
+release-environment approval and successful completion, record its exact run
+ID and attempt. The procedure proves that workflow/run/commit tuple and the
+live one-day artifact through the API before it downloads anything. The
+workflow emits the receipt with canonical `jq -cS`; the procedure validates
+both that exact byte encoding and every field, then copies those authenticated
+artifact bytes unchanged into the create-only restore input. No semantic field
+or replacement receipt is accepted from the operator.
+
+<!-- BEGIN EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->
 
 ```bash
+set -Eeuo pipefail
+test "$(uname -s)" = Linux
+test "$(uname -m)" = x86_64
+test "$(id -u)" = 0
+umask 077
+export PATH=/secure/operator/tools:/usr/bin:/bin
+protected_main_sha='<exact 40-character protected-main SHA after merge>'
+pretag_run_id='<exact successful release-signing-preflight run ID>'
+pretag_run_attempt='<exact successful run attempt>'
+vault_rewrap_run_id='<exact successful validator-vault-rewrap run ID>'
+vault_rewrap_run_attempt='<exact successful rewrap run attempt>'
+[[ "$protected_main_sha" =~ ^[0-9a-f]{40}$ ]]
+[[ "$pretag_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$pretag_run_attempt" =~ ^[1-9][0-9]*$ ]]
+[[ "$vault_rewrap_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$vault_rewrap_run_attempt" =~ ^[1-9][0-9]*$ ]]
+
+arc_sha256() {
+  /usr/bin/sha256sum -- "$1" | /usr/bin/awk '{print $1}'
+}
+export ARC_RECOVERY_SSH_USER=root
+export ARC_RECOVERY_PYTHON_PATH=/usr/bin/python3.12
+export ARC_RECOVERY_PYTHON_SHA256=8295ee25cfdb239f3e165afceda7f46de73e2b606ff0e2e3d8623e3facd30acc
+test -f "$ARC_RECOVERY_PYTHON_PATH" && test ! -L "$ARC_RECOVERY_PYTHON_PATH"
+export ARC_RECOVERY_SSH_KNOWN_HOSTS=/secure/operator/arc-validator-known-hosts
+export ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256=97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d
+export ARC_RECOVERY_SSH_IDENTITY=/secure/operator/arc-validator-maintenance-ed25519
+export ARC_RECOVERY_SSH_IDENTITY_SHA256=9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a
+export ARC_RECOVERY_SSH_SHA256=47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6
+export ARC_RECOVERY_SCP_SHA256=92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144
+export ARC_RECOVERY_RCLONE_PATH=/secure/operator/tools/rclone
+export ARC_RECOVERY_RCLONE_SHA256=f3f9aff817f9766029e50adf9a7963c169e475b8f10c7927823568a0d9443db7
+export ARC_RECOVERY_RCLONE_CONFIG=/secure/operator/rclone-arc.conf
+export ARC_RECOVERY_GH_PATH=/secure/operator/tools/gh
+export ARC_RECOVERY_GH_SHA256=c1be595a7357120e28886922c050fed34ad347c36adf37370ad91d4972a416d5
+export ARC_RECOVERY_GITHUB_LOGIN=FerrumVir
+
+arc_install_or_reuse_exact() {
+  local completed_path="$1"
+  local canonical_path="$2"
+  "$ARC_RECOVERY_PYTHON_PATH" -I - "$completed_path" "$canonical_path" <<'PY'
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+completed = pathlib.Path(sys.argv[1])
+canonical = pathlib.Path(sys.argv[2])
+if (
+    not completed.is_absolute()
+    or not canonical.is_absolute()
+    or completed == canonical
+    or completed.name in {"", ".", ".."}
+    or canonical.name in {"", ".", ".."}
+):
+    raise SystemExit("completed and canonical outputs must be distinct absolute files")
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+completed_parent = os.open(completed.parent, directory_flags)
+canonical_parent = os.open(canonical.parent, directory_flags)
+
+def require_parent(descriptor, label):
+    details = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or (details.st_uid, details.st_gid) != (0, 0)
+        or stat.S_IMODE(details.st_mode) & 0o022
+    ):
+        raise SystemExit(f"{label} parent is not protected root storage")
+
+def open_locked(parent, name, label):
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError as error:
+        raise SystemExit(f"cannot open {label} without following links: {error}") from None
+    details = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or (details.st_uid, details.st_gid, stat.S_IMODE(details.st_mode))
+        != (0, 0, 0o400)
+        or details.st_nlink < 1
+        or details.st_size < 1
+    ):
+        os.close(descriptor)
+        raise SystemExit(f"{label} is not a nonempty root-owned mode-0400 regular file")
+    return descriptor
+
+def identity(details):
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_uid,
+        details.st_gid,
+        details.st_nlink,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+def digest(descriptor, label):
+    before = os.fstat(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    value = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        value.update(chunk)
+    if identity(before) != identity(os.fstat(descriptor)):
+        raise SystemExit(f"{label} changed while it was hashed")
+    return value.hexdigest(), before.st_size
+
+try:
+    require_parent(completed_parent, "completed-output")
+    require_parent(canonical_parent, "canonical-output")
+    completed_fd = open_locked(completed_parent, completed.name, "completed output")
+    os.fsync(completed_fd)
+    os.fsync(completed_parent)
+    created = False
+    try:
+        try:
+            canonical_fd = open_locked(canonical_parent, canonical.name, "canonical output")
+        except SystemExit:
+            try:
+                os.link(
+                    completed.name,
+                    canonical.name,
+                    src_dir_fd=completed_parent,
+                    dst_dir_fd=canonical_parent,
+                    follow_symlinks=False,
+                )
+                os.fsync(canonical_parent)
+                created = True
+            except FileExistsError:
+                pass
+            canonical_fd = open_locked(canonical_parent, canonical.name, "canonical output")
+        try:
+            completed_digest, completed_size = digest(completed_fd, "completed output")
+            canonical_digest, canonical_size = digest(canonical_fd, "canonical output")
+            if (completed_size, completed_digest) != (canonical_size, canonical_digest):
+                raise SystemExit(
+                    "canonical output exists with different bytes; preserve both and stop"
+                )
+        finally:
+            os.close(canonical_fd)
+    finally:
+        os.close(completed_fd)
+finally:
+    os.close(completed_parent)
+    os.close(canonical_parent)
+print("created" if created else "reused-exact")
+PY
+}
+
+for protected_file in \
+  "$ARC_RECOVERY_PYTHON_PATH" \
+  /usr/bin/ssh /usr/bin/scp \
+  /secure/operator/tools/ssh /secure/operator/tools/scp \
+  "$ARC_RECOVERY_RCLONE_PATH" "$ARC_RECOVERY_GH_PATH"
+do
+  test -f "$protected_file" && test ! -L "$protected_file"
+done
+printf '%s  %s\n' "$ARC_RECOVERY_PYTHON_SHA256" "$ARC_RECOVERY_PYTHON_PATH" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_SHA256" /usr/bin/ssh \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SCP_SHA256" /usr/bin/scp \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_SHA256" /secure/operator/tools/ssh \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SCP_SHA256" /secure/operator/tools/scp \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_RCLONE_SHA256" "$ARC_RECOVERY_RCLONE_PATH" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_GH_SHA256" "$ARC_RECOVERY_GH_PATH" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256" \
+  "$ARC_RECOVERY_SSH_KNOWN_HOSTS" | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_IDENTITY_SHA256" \
+  "$ARC_RECOVERY_SSH_IDENTITY" | /usr/bin/sha256sum --check --strict
+test "$(/usr/bin/stat --format='%a:%h' "$ARC_RECOVERY_SSH_KNOWN_HOSTS")" = 400:1
+test "$(/usr/bin/stat --format='%a:%h' "$ARC_RECOVERY_SSH_IDENTITY")" = 400:1
+test -f "$ARC_RECOVERY_RCLONE_CONFIG" && test ! -L "$ARC_RECOVERY_RCLONE_CONFIG"
+test "$(/usr/bin/stat --format='%a:%h' "$ARC_RECOVERY_RCLONE_CONFIG")" = 600:1
+rclone_config_sha256="$(arc_sha256 "$ARC_RECOVERY_RCLONE_CONFIG")"
+[[ "$rclone_config_sha256" =~ ^[0-9a-f]{64}$ ]]
+test -f /secure/operator/restore.cert.pem \
+  && test ! -L /secure/operator/restore.cert.pem
+test -f /secure/operator/restore.key.pem \
+  && test ! -L /secure/operator/restore.key.pem
+test "$(/usr/bin/stat --format='%a:%h' /secure/operator/restore.cert.pem)" = 600:1
+test "$(/usr/bin/stat --format='%a:%h' /secure/operator/restore.key.pem)" = 600:1
+printf '%s  %s\n' \
+  6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43 \
+  /secure/operator/restore.cert.pem | /usr/bin/sha256sum --check --strict
+
+GH_TOKEN="$(
+  "$ARC_RECOVERY_GH_PATH" auth token --hostname github.com \
+    --user "$ARC_RECOVERY_GITHUB_LOGIN"
+)"
+test -n "$GH_TOKEN"
+export GH_TOKEN
+test "$("$ARC_RECOVERY_GH_PATH" api /user --jq .login)" = \
+  "$ARC_RECOVERY_GITHUB_LOGIN"
+test "$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/branches/main \
+  --jq .commit.sha)" = "$protected_main_sha"
+
+git_home="$(/usr/bin/mktemp -d /secure/operator/git-home.XXXXXXXX)"
+operator_checkout="$(
+  /usr/bin/mktemp -d "/secure/operator/arc-chain.$protected_main_sha.XXXXXXXX"
+)"
+arc_git() {
+  /usr/bin/env -i HOME="$git_home" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 /usr/bin/git "$@"
+}
+arc_git clone --no-tags --filter=blob:none --no-checkout --single-branch \
+  --branch main -- https://github.com/FerrumVir/arc-chain.git "$operator_checkout"
+test "$(arc_git -C "$operator_checkout" remote get-url origin)" = \
+  https://github.com/FerrumVir/arc-chain.git
+test "$(arc_git -C "$operator_checkout" rev-parse refs/remotes/origin/main)" = \
+  "$protected_main_sha"
+arc_git -C "$operator_checkout" checkout --detach "$protected_main_sha"
+test "$(arc_git -C "$operator_checkout" rev-parse HEAD)" = "$protected_main_sha"
+arc_git -C "$operator_checkout" diff-index --quiet HEAD --
+test -z "$(arc_git -C "$operator_checkout" status --porcelain=v1 --untracked-files=all)"
+cd "$operator_checkout"
+test "$PWD" = "$operator_checkout"
+
+rewrap_download_root="$(
+  /usr/bin/mktemp -d "/secure/operator/vault-rewrap.$vault_rewrap_run_id.XXXXXXXX"
+)"
+rewrap_run_json="$rewrap_download_root/RUN.json"
+rewrap_artifacts_json="$rewrap_download_root/ARTIFACTS.json"
+rewrap_raw_zip="$rewrap_download_root/actions.zip"
+(
+  set -o noclobber
+  gh api "repos/FerrumVir/arc-chain/actions/runs/$vault_rewrap_run_id" \
+    > "$rewrap_run_json"
+)
+jq -e \
+  --arg commit "$protected_main_sha" \
+  --argjson run_id "$vault_rewrap_run_id" \
+  --argjson run_attempt "$vault_rewrap_run_attempt" '
+    .id == $run_id
+    and .run_attempt == $run_attempt
+    and .event == "workflow_dispatch"
+    and .status == "completed"
+    and .conclusion == "success"
+    and .head_branch == "main"
+    and .head_sha == $commit
+    and .path == ".github/workflows/validator-vault-rewrap.yml"
+    and .repository.full_name == "FerrumVir/arc-chain"
+    and .head_repository.full_name == "FerrumVir/arc-chain"
+  ' "$rewrap_run_json" >/dev/null
+(
+  set -o noclobber
+  gh api --paginate \
+    "repos/FerrumVir/arc-chain/actions/runs/$vault_rewrap_run_id/artifacts?per_page=100" \
+    --jq '.artifacts[]' | jq -s '{artifacts: .}' > "$rewrap_artifacts_json"
+)
+rewrap_artifact_prefix="arc-validator-vault-rewrap-$protected_main_sha-6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43-"
+rewrap_artifact_json="$(
+  jq -cer \
+    --arg prefix "$rewrap_artifact_prefix" \
+    --arg commit "$protected_main_sha" \
+    --argjson run_id "$vault_rewrap_run_id" '
+      [.artifacts[]
+       | select(
+           .expired == false
+           and (.name | test("^" + $prefix + "[0-9a-f]{64}$"))
+           and (.digest | test("^sha256:[0-9a-f]{64}$"))
+           and .workflow_run.id == $run_id
+           and .workflow_run.head_branch == "main"
+           and .workflow_run.head_sha == $commit
+         )]
+      | if length == 1 then .[0]
+        else error("expected exactly one live exact-run rewrap artifact") end
+    ' "$rewrap_artifacts_json"
+)"
+rewrap_artifact_id="$(jq -er '.id' <<<"$rewrap_artifact_json")"
+rewrap_artifact_name="$(jq -er '.name' <<<"$rewrap_artifact_json")"
+rewrap_artifact_digest="$(jq -er '.digest | sub("^sha256:"; "")' \
+  <<<"$rewrap_artifact_json")"
+rewrap_artifact_size="$(jq -er '.size_in_bytes' <<<"$rewrap_artifact_json")"
+[[ "$rewrap_artifact_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$rewrap_artifact_digest" =~ ^[0-9a-f]{64}$ ]]
+[[ "$rewrap_artifact_size" =~ ^[1-9][0-9]*$ ]]
+test "$rewrap_artifact_size" -le 4194304
+(
+  set -o noclobber
+  gh api -H 'Accept: application/vnd.github+json' \
+    "repos/FerrumVir/arc-chain/actions/artifacts/$rewrap_artifact_id/zip" \
+    | /usr/bin/head --bytes="$((rewrap_artifact_size + 1))" > "$rewrap_raw_zip"
+)
+chmod 0400 "$rewrap_run_json" "$rewrap_artifacts_json" "$rewrap_raw_zip"
+printf '%s  %s\n' "$rewrap_artifact_digest" "$rewrap_raw_zip" \
+  | /usr/bin/sha256sum --check --strict
+test "$(/usr/bin/stat --format='%s' "$rewrap_raw_zip")" = \
+  "$rewrap_artifact_size"
+
+cms_path=/secure/operator/arc-validator-keys-v0.8.0.tar.cms
+rewrap_receipt=/secure/operator/REWRAP-RECEIPT.json
+test ! -e "$cms_path"
+test ! -e "$rewrap_receipt"
+cms_sha256="$(
+  /usr/bin/python3.12 -I - \
+    "$rewrap_raw_zip" "$rewrap_download_root" "$rewrap_artifact_name" \
+    "$protected_main_sha" "$cms_path" "$rewrap_receipt" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+import zipfile
+
+zip_path, root_raw, artifact_name, commit, cms_output_raw, receipt_output_raw = sys.argv[1:]
+root = pathlib.Path(root_raw)
+cms_output = pathlib.Path(cms_output_raw)
+receipt_output = pathlib.Path(receipt_output_raw)
+expected_names = {
+    "arc-validator-keys-v0.8.0.tar.cms": 2 * 1024 * 1024,
+    "REWRAP-RECEIPT.json": 64 * 1024,
+    "SHA256SUMS": 1024,
+}
+expected_cert = "6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43"
+expected_source = "bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9"
+expected_cms = artifact_name.rsplit("-", 1)[-1]
+if len(expected_cms) != 64 or any(c not in "0123456789abcdef" for c in expected_cms):
+    raise SystemExit("rewrap artifact name does not end in one lowercase SHA-256")
+
+payloads = {}
+with zipfile.ZipFile(zip_path, "r") as archive:
+    infos = archive.infolist()
+    if len(infos) != len(expected_names) or {item.filename for item in infos} != set(expected_names):
+        raise SystemExit("rewrap Actions ZIP does not contain the exact three flat files")
+    if len({item.filename.casefold() for item in infos}) != len(infos):
+        raise SystemExit("rewrap Actions ZIP contains a case-folding collision")
+    for item in infos:
+        kind = stat.S_IFMT(item.external_attr >> 16)
+        if (
+            item.filename != pathlib.PurePosixPath(item.filename).name
+            or item.is_dir()
+            or item.flag_bits & 1
+            or kind not in (0, stat.S_IFREG)
+            or not 0 < item.file_size <= expected_names[item.filename]
+        ):
+            raise SystemExit("rewrap Actions ZIP member violates the bounded regular-file contract")
+        payload = archive.read(item)
+        if len(payload) != item.file_size:
+            raise SystemExit("rewrap Actions ZIP member changed size while read")
+        payloads[item.filename] = payload
+
+cms = payloads["arc-validator-keys-v0.8.0.tar.cms"]
+cms_sha = hashlib.sha256(cms).hexdigest()
+if cms_sha != expected_cms:
+    raise SystemExit("rewrap CMS bytes differ from the artifact-name digest")
+if payloads["SHA256SUMS"] != (
+    f"{cms_sha}  arc-validator-keys-v0.8.0.tar.cms\n".encode("ascii")
+):
+    raise SystemExit("rewrap SHA256SUMS does not bind exactly the CMS member")
+try:
+    receipt = json.loads(payloads["REWRAP-RECEIPT.json"])
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit("rewrap receipt is not valid UTF-8 JSON") from error
+expected_receipt = {
+    "schema": "arc.validator-vault-rewrap.v1",
+    "source_commit": commit,
+    "source_ciphertext_sha256": expected_source,
+    "restore_cert_sha256": expected_cert,
+    "cms_sha256": cms_sha,
+    "key_transport": "RSA-OAEP-SHA256",
+    "content_encryption": "AES-256-GCM",
+}
+if receipt != expected_receipt:
+    raise SystemExit("rewrap receipt differs from the exact authorized tuple")
+canonical_receipt = (
+    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("utf-8")
+if payloads["REWRAP-RECEIPT.json"] != canonical_receipt:
+    raise SystemExit("rewrap receipt bytes are not the canonical restore encoding")
+
+def create(path, payload):
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+create(cms_output, cms)
+create(receipt_output, payloads["REWRAP-RECEIPT.json"])
+print(cms_sha)
+PY
+)"
+[[ "$cms_sha256" =~ ^[0-9a-f]{64}$ ]]
+printf '%s  %s\n' "$cms_sha256" "$cms_path" \
+  | /usr/bin/sha256sum --check --strict
+test "$(/usr/bin/stat --format='%a:%h' "$cms_path")" = 600:1
+test "$(/usr/bin/stat --format='%a:%h' "$rewrap_receipt")" = 600:1
+
+pretag_api_json=/secure/operator/PRETAG-ARTIFACTS-API.json
+pretag_selection_json=/secure/operator/PRETAG-SELECTION.json
+pretag_raw_root=/secure/pretag/raw-v0.8.0
+pretag_input_set=/secure/operator/PRETAG-ARTIFACT-INPUT-SET.json
+test ! -e "$pretag_api_json"
+test ! -e "$pretag_selection_json"
+test ! -e "$pretag_raw_root"
+test ! -e "$pretag_input_set"
+install -d -m 0700 "$pretag_raw_root"
+
+(
+  set -o noclobber
+  gh api --paginate \
+    "repos/FerrumVir/arc-chain/actions/runs/$pretag_run_id/artifacts?per_page=100" \
+    --jq '.artifacts[]' | jq -s '{artifacts: .}' > "$pretag_api_json"
+)
+(
+  set -o noclobber
+  "$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/select-pretag-artifacts.py \
+    --api-json "$pretag_api_json" \
+    --repository FerrumVir/arc-chain \
+    --commit "$protected_main_sha" \
+    --run-id "$pretag_run_id" \
+    --run-attempt "$pretag_run_attempt" > "$pretag_selection_json"
+)
+chmod 0400 "$pretag_api_json" "$pretag_selection_json"
+pretag_artifacts_json="$(jq -cS '.artifacts' "$pretag_selection_json")"
+pretag_linux_x86_64_artifact_id="$(
+  jq -er '.artifacts["linux-x86_64"].headless.id' "$pretag_selection_json"
+)"
+[[ "$pretag_linux_x86_64_artifact_id" =~ ^[1-9][0-9]*$ ]]
+scripts/release/verify-pretag-run-and-artifacts.sh \
+  FerrumVir/arc-chain \
+  "$protected_main_sha" \
+  "$pretag_run_id" \
+  "$pretag_run_attempt" \
+  "$pretag_artifacts_json"
+
+while IFS=$'\t' read -r kind platform artifact_id artifact_digest artifact_size; do
+  group_root="$pretag_raw_root/$kind-$platform"
+  raw_zip="$group_root/actions.zip"
+  [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+  [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+  [[ "$artifact_size" =~ ^[1-9][0-9]*$ ]]
+  test "$artifact_size" -le 4294967296
+  install -d -m 0700 "$group_root"
+  (
+    set -o noclobber
+    gh api -H 'Accept: application/vnd.github+json' \
+      "repos/FerrumVir/arc-chain/actions/artifacts/$artifact_id/zip" \
+      | /usr/bin/head --bytes="$((artifact_size + 1))" > "$raw_zip"
+  )
+  chmod 0400 "$raw_zip"
+  printf '%s  %s\n' "${artifact_digest#sha256:}" "$raw_zip" \
+    | /usr/bin/sha256sum --check --strict
+  test "$(/usr/bin/stat --format='%s' "$raw_zip")" = "$artifact_size"
+done < <(
+  jq -r '
+    .artifacts as $a
+    | [["headless","linux-x86_64"],
+       ["headless","linux-arm64"],
+       ["headless","macos-arm64"],
+       ["headless","macos-x86_64"],
+       ["headless","windows-x86_64"],
+       ["desktop","linux-x86_64"],
+       ["desktop","macos-arm64"],
+       ["desktop","macos-x86_64"],
+       ["desktop","windows-x86_64"]][]
+    | .[0] as $kind | .[1] as $platform
+    | [$kind, $platform, ($a[$platform][$kind].id | tostring),
+       $a[$platform][$kind].digest,
+       ($a[$platform][$kind].size_in_bytes | tostring)]
+    | @tsv
+  ' "$pretag_selection_json"
+)
+
+(
+  set -o noclobber
+  jq -cnS \
+    --slurpfile selected "$pretag_selection_json" \
+    --arg repository FerrumVir/arc-chain \
+    --arg commit "$protected_main_sha" \
+    --argjson run_id "$pretag_run_id" \
+    --argjson run_attempt "$pretag_run_attempt" \
+    --arg raw_root "$pretag_raw_root" '
+      $selected[0] as $s
+      | [["headless","linux-x86_64"],
+         ["headless","linux-arm64"],
+         ["headless","macos-arm64"],
+         ["headless","macos-x86_64"],
+         ["headless","windows-x86_64"],
+         ["desktop","linux-x86_64"],
+         ["desktop","macos-arm64"],
+         ["desktop","macos-x86_64"],
+         ["desktop","windows-x86_64"]] as $groups
+      | {
+          schema: "arc.recovery.pretag-artifact-input-set.v1",
+          repository: $repository,
+          commit: $commit,
+          run_id: $run_id,
+          run_attempt: $run_attempt,
+          artifacts: ($groups | map(
+            .[0] as $kind | .[1] as $platform
+            | {
+                kind: $kind,
+                platform: $platform,
+                artifact_id: $s.artifacts[$platform][$kind].id,
+                raw_actions_zip:
+                  ($raw_root + "/" + $kind + "-" + $platform + "/actions.zip")
+              }
+          ))
+        }
+    ' > "$pretag_input_set"
+)
+chmod 0400 "$pretag_input_set"
+unset GH_TOKEN
+
+pretag_materialized=/secure/operator/pretag-materialized-v0.8.0
+test ! -e "$pretag_materialized"
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/materialize-pretag-artifacts.py \
+  --downloads-root "$pretag_raw_root/headless-linux-x86_64" \
+  --output-dir "$pretag_materialized" \
+  --repository FerrumVir/arc-chain \
+  --commit "$protected_main_sha" \
+  --run-id "$pretag_run_id" \
+  --run-attempt "$pretag_run_attempt" \
+  --version 0.8.0 \
+  --selection-json "$pretag_artifacts_json" \
+  --only headless:linux-x86_64 \
+  --retain-build-metadata
+arc_node_linux=/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/arc-node-linux-x86_64
+operator_genesis=/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/genesis.toml
+pretag_build_metadata=/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/BUILD-METADATA.json
+test -x "$arc_node_linux" && test ! -L "$arc_node_linux"
+test -f "$operator_genesis" && test ! -L "$operator_genesis"
+arc_node_linux_sha256="$(jq -er '.files["arc-node-linux-x86_64"]' "$pretag_build_metadata")"
+genesis_sha256="$(jq -er '.files["genesis.toml"]' "$pretag_build_metadata")"
+printf '%s  %s\n' "$arc_node_linux_sha256" "$arc_node_linux" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$genesis_sha256" "$operator_genesis" \
+  | /usr/bin/sha256sum --check --strict
+```
+
+Restore the vault with the exact Ubuntu proof/runtime bytes provisioned in the
+enclave. Any digest mismatch stops before CMS decryption.
+
+```bash
+ARC_PROOF_CURL=/usr/bin/curl
+ARC_PROOF_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ARC_PROOF_CURL_SHA256=da9cc597d6473e31d7e3f4d5e2198509010164b48be96e97b87b788655146631
+ARC_PROOF_CA_BUNDLE_SHA256=6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238
+printf '%s  %s\n' "$ARC_PROOF_CURL_SHA256" "$ARC_PROOF_CURL" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_PROOF_CA_BUNDLE_SHA256" "$ARC_PROOF_CA_BUNDLE" \
+  | /usr/bin/sha256sum --check --strict
+
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/restore-validator-vault.py restore \
+  --cms "$cms_path" \
+  --expected-cms-sha256 "$cms_sha256" \
+  --rewrap-receipt "$rewrap_receipt" \
+  --source-main-sha "$protected_main_sha" \
+  --raw-actions-zip "$pretag_raw_root/headless-linux-x86_64/actions.zip" \
+  --pretag-run-id "$pretag_run_id" \
+  --pretag-run-attempt "$pretag_run_attempt" \
+  --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
+  --curl "$ARC_PROOF_CURL" \
+  --curl-sha256 "$ARC_PROOF_CURL_SHA256" \
+  --ca-bundle "$ARC_PROOF_CA_BUNDLE" \
+  --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
+  --restore-certificate /secure/operator/restore.cert.pem \
+  --restore-private-key /secure/operator/restore.key.pem \
+  --openssl /secure/operator/tools/openssl-3.0.13 \
+  --openssl-sha256 724acbe911513d13f52bae0b8969b20336cd8618fc67898a6bf7847bf1a270ad \
+  --openssl-libssl /secure/operator/tools/libssl.so.3 \
+  --openssl-libssl-sha256 0c0f298a5b4b44526d20a07d126a55bf44b85eaab053b2b0118e5d806d28ea13 \
+  --openssl-libcrypto /secure/operator/tools/libcrypto.so.3 \
+  --openssl-libcrypto-sha256 d6fc1bc9de29c55fc905f77edba1ccc7c7a50b32bd2bb9086b0d0b00104eafc4 \
+  --output-dir /secure/operator/arc-v0.8-validator-restore
+
+validator_public_keys=/secure/operator/arc-v0.8-validator-restore/validator-public-keys.json
+test -f "$validator_public_keys" && test ! -L "$validator_public_keys"
+validator_public_keys_sha256="$(/usr/bin/sha256sum "$validator_public_keys" | /usr/bin/awk '{print $1}')"
+```
+
+Create the legacy-set operator input only from the exact protected checkout.
+Both tracked blobs and their tracked checksum must verify before an
+`O_EXCL|O_NOFOLLOW` copy is created.
+
+```bash
+test "$(arc_git rev-parse HEAD)" = "$protected_main_sha"
+legacy_source="$PWD/scripts/recovery/legacy-validator-set-40m.json"
+legacy_source_sidecar="$legacy_source.sha256"
+test "$(arc_git hash-object "$legacy_source")" = \
+  "$(arc_git rev-parse "$protected_main_sha:scripts/recovery/legacy-validator-set-40m.json")"
+test "$(arc_git hash-object "$legacy_source_sidecar")" = \
+  "$(arc_git rev-parse "$protected_main_sha:scripts/recovery/legacy-validator-set-40m.json.sha256")"
+(cd scripts/recovery && /usr/bin/sha256sum --check --strict legacy-validator-set-40m.json.sha256)
+legacy_validator_set=/secure/operator/legacy-validator-set-40m.json
+/usr/bin/python3.12 -I - "$legacy_source" "$legacy_validator_set" <<'PY'
+import os, stat, sys
+source, destination = sys.argv[1:]
+source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(source_fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("legacy validator source is not a regular file")
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o400,
+    )
+    try:
+        while True:
+            chunk = os.read(source_fd, 65536)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+finally:
+    os.close(source_fd)
+PY
+test -f "$legacy_validator_set" && test ! -L "$legacy_validator_set"
+test "$(/usr/bin/stat --format='%a' "$legacy_validator_set")" = 400
+legacy_validator_set_sha256="$(/usr/bin/sha256sum "$legacy_validator_set" | /usr/bin/awk '{print $1}')"
+test "$legacy_validator_set_sha256" = 1615413b0cad59eedc8f9aa8ce41427e866f4b868f5b2148be48a1d722d7a3db
+```
+
+The v5 plan also binds the ARC Drive gate bytes, exact remote root,
+hashed custom OAuth client ID, hashed account, reviewed remaining daily upload
+budget, and the operator's dedicated-uploader attestation. The 700000000000-byte
+(700 GB decimal) reservation leaves a 50000000000-byte (50 GB) safety margin
+below Google's 750000000000-byte (750 GB decimal) per-24-hour upload cap in the
+[official Drive API limits](https://developers.google.com/workspace/drive/api/guides/limits).
+It is valid only after the operator has checked the current quota window and
+confirmed that no other process, host, scheduled job, or human will upload
+through this Google account until ARC finishes. The typed phrase is the
+operational attestation for those two facts; the flag alone is not evidence
+that they were reviewed. Only now prepare, freeze, and capture the six legacy
+writers:
+
+```bash
+drive_client_id_sha256=73c7bd17ff0e6e52331a5adf7574e492f137ef52f9b288908413901f33c723b1
+drive_account_sha256=29a77804fd021a47d43afaf1c51c2a877c66ff56699e1d3173be6d57536b8e3b
+drive_daily_upload_budget_bytes=700000000000
+drive_quota_attestation_phrase='I ATTEST 700000000000 BYTES REMAIN AND ARC IS THE ONLY DRIVE UPLOAD WRITER THIS QUOTA WINDOW'
+printf 'Type exactly: %s\n> ' "$drive_quota_attestation_phrase" >/dev/tty
+IFS= read -r drive_quota_attestation </dev/tty
+test "$drive_quota_attestation" = "$drive_quota_attestation_phrase"
+unset drive_quota_attestation
+
+# Re-prove every canonical pre-capture transport byte immediately before the
+# first archive orchestrator process. The mutable OAuth config is not assigned
+# a stale reviewed hash; its selected client/account are proven by the gate.
+printf '%s  %s\n' "$ARC_RECOVERY_PYTHON_SHA256" "$ARC_RECOVERY_PYTHON_PATH" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256" \
+  "$ARC_RECOVERY_SSH_KNOWN_HOSTS" | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_IDENTITY_SHA256" \
+  "$ARC_RECOVERY_SSH_IDENTITY" | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_SHA256" /usr/bin/ssh \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SCP_SHA256" /usr/bin/scp \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_RCLONE_SHA256" "$ARC_RECOVERY_RCLONE_PATH" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_GH_SHA256" "$ARC_RECOVERY_GH_PATH" \
+  | /usr/bin/sha256sum --check --strict
+test "$(arc_sha256 "$ARC_RECOVERY_RCLONE_CONFIG")" = "$rclone_config_sha256"
+
 scripts/recovery/archive-fleet-to-drive.sh prepare-writers \
   --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
   --output /secure/operator/arc-writers.lock.json \
@@ -306,37 +1037,117 @@ scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
   --attest-dedicated-drive-uploader \
   --output /secure/operator/arc-freeze.lock.json
 
+# Copy these exact values from the successful seal-freeze-plan output. Sample
+# while all six legacy HTTPS origins are still live and immediately before the
+# capture plan/execute pair; the receipt is create-only and cannot be refreshed
+# in place.
+freeze_sha256='<freeze-plan hash printed by seal-freeze-plan>'
+capture_id='<capture id printed by seal-freeze-plan>'
+[[ "$freeze_sha256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$capture_id" =~ ^[0-9a-f]{64}$ ]]
+legacy_height_result="$(
+  "$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/legacy-public-height.py sample \
+    --source-main "$protected_main_sha" \
+    --freeze-plan /secure/operator/arc-freeze.lock.json \
+    --freeze-plan-sha256 "$freeze_sha256" \
+    --output /secure/operator/legacy-public-height.json \
+    --timeout-seconds 10
+)"
+legacy_public_height_sha256="$(
+  printf '%s' "$legacy_height_result" \
+    | "$ARC_RECOVERY_PYTHON_PATH" -I -c 'import json,sys; print(json.load(sys.stdin)["receipt_sha256"])'
+)"
+[[ "$legacy_public_height_sha256" =~ ^[0-9a-f]{64}$ ]]
+printf 'legacy public-height receipt sha256=%s capture=%s\n' \
+  "$legacy_public_height_sha256" "$capture_id"
+
 scripts/recovery/archive-fleet-to-drive.sh capture \
   --freeze-plan /secure/operator/arc-freeze.lock.json \
   --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
   --legacy-public-height-receipt-sha256 "$legacy_public_height_sha256" \
-  --inspector-binary /secure/operator/pretag-linux-x86_64/arc-node \
-  --inspector-binary-sha256 "$inspector_binary_sha256" \
-  --genesis /secure/operator/genesis.toml \
+  --inspector-binary "$arc_node_linux" \
+  --inspector-binary-sha256 "$arc_node_linux_sha256" \
+  --genesis "$operator_genesis" \
   --genesis-sha256 "$genesis_sha256" \
-  --validator-public-keys /secure/operator/validator-public-keys.json \
+  --validator-public-keys "$validator_public_keys" \
   --validator-public-keys-sha256 "$validator_public_keys_sha256" \
-  --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
+  --legacy-validator-set "$legacy_validator_set" \
   --legacy-validator-set-sha256 "$legacy_validator_set_sha256" \
   --offline-stop-evidence-output /secure/operator/arc-offline-stop-evidence.json
 
-freeze_sha256='<freeze-plan hash printed by seal-freeze-plan>'
-capture_id='<capture id printed by seal-freeze-plan>'
 ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
   scripts/recovery/archive-fleet-to-drive.sh capture \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
     --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
     --legacy-public-height-receipt-sha256 "$legacy_public_height_sha256" \
-    --inspector-binary /secure/operator/pretag-linux-x86_64/arc-node \
-    --inspector-binary-sha256 "$inspector_binary_sha256" \
-    --genesis /secure/operator/genesis.toml \
+    --inspector-binary "$arc_node_linux" \
+    --inspector-binary-sha256 "$arc_node_linux_sha256" \
+    --genesis "$operator_genesis" \
     --genesis-sha256 "$genesis_sha256" \
-    --validator-public-keys /secure/operator/validator-public-keys.json \
+    --validator-public-keys "$validator_public_keys" \
     --validator-public-keys-sha256 "$validator_public_keys_sha256" \
-    --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
+    --legacy-validator-set "$legacy_validator_set" \
     --legacy-validator-set-sha256 "$legacy_validator_set_sha256" \
     --offline-stop-evidence-output /secure/operator/arc-offline-stop-evidence.json \
     --execute
+```
+
+Install the restored keys only after that successful capture. All three
+maintenance artifacts and sidecars are required by the current parser; their
+digests are derived from the just-created bytes, not copied from an earlier
+attempt.
+
+```bash
+legacy_maintenance_evidence_bundle=/secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-evidence-bundle.json
+legacy_maintenance_evidence_bundle_sidecar="$legacy_maintenance_evidence_bundle.sha256"
+legacy_maintenance_evidence_bundle_sha256="$(/usr/bin/sha256sum "$legacy_maintenance_evidence_bundle" | /usr/bin/awk '{print $1}')"
+legacy_maintenance_boundary=/secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-boundary.json
+legacy_maintenance_boundary_sidecar="$legacy_maintenance_boundary.sha256"
+legacy_maintenance_boundary_sha256="$(/usr/bin/sha256sum "$legacy_maintenance_boundary" | /usr/bin/awk '{print $1}')"
+offline_stop_evidence=/secure/operator/arc-offline-stop-evidence.json
+offline_stop_evidence_sidecar="$offline_stop_evidence.sha256"
+offline_stop_evidence_sha256="$(/usr/bin/sha256sum "$offline_stop_evidence" | /usr/bin/awk '{print $1}')"
+known_hosts="$ARC_RECOVERY_SSH_KNOWN_HOSTS"
+known_hosts_sha256="$ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256"
+ssh_identity="$ARC_RECOVERY_SSH_IDENTITY"
+ssh_identity_sha256="$ARC_RECOVERY_SSH_IDENTITY_SHA256"
+printf '%s  %s\n' "$known_hosts_sha256" "$known_hosts" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ssh_identity_sha256" "$ssh_identity" \
+  | /usr/bin/sha256sum --check --strict
+
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/release/restore-validator-vault.py install \
+  --restore-receipt /secure/operator/arc-v0.8-validator-restore/RESTORE-RECEIPT.json \
+  --source-main-sha "$protected_main_sha" \
+  --raw-actions-zip "$pretag_raw_root/headless-linux-x86_64/actions.zip" \
+  --pretag-run-id "$pretag_run_id" \
+  --pretag-run-attempt "$pretag_run_attempt" \
+  --pretag-artifact-id "$pretag_linux_x86_64_artifact_id" \
+  --curl "$ARC_PROOF_CURL" \
+  --curl-sha256 "$ARC_PROOF_CURL_SHA256" \
+  --ca-bundle "$ARC_PROOF_CA_BUNDLE" \
+  --ca-bundle-sha256 "$ARC_PROOF_CA_BUNDLE_SHA256" \
+  --freeze-plan /secure/operator/arc-freeze.lock.json \
+  --freeze-plan-sidecar /secure/operator/arc-freeze.lock.json.sha256 \
+  --freeze-plan-sha256 "$freeze_sha256" \
+  --legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle" \
+  --legacy-maintenance-evidence-bundle-sidecar "$legacy_maintenance_evidence_bundle_sidecar" \
+  --legacy-maintenance-evidence-bundle-sha256 "$legacy_maintenance_evidence_bundle_sha256" \
+  --legacy-maintenance-boundary "$legacy_maintenance_boundary" \
+  --legacy-maintenance-boundary-sidecar "$legacy_maintenance_boundary_sidecar" \
+  --legacy-maintenance-boundary-sha256 "$legacy_maintenance_boundary_sha256" \
+  --offline-stop-evidence "$offline_stop_evidence" \
+  --offline-stop-evidence-sidecar "$offline_stop_evidence_sidecar" \
+  --offline-stop-evidence-sha256 "$offline_stop_evidence_sha256" \
+  --known-hosts "$known_hosts" \
+  --known-hosts-sha256 "$known_hosts_sha256" \
+  --ssh-identity "$ssh_identity" \
+  --ssh-identity-sha256 "$ssh_identity_sha256" \
+  --ssh /secure/operator/tools/ssh \
+  --ssh-sha256 47adf415134df7eff017e9557634696ba6b2a09f5a3bb1436d91d99b8a1cd5a6 \
+  --scp /secure/operator/tools/scp \
+  --scp-sha256 92608e03bd81bf6cd96697ce3379fdf6a4c9bdba6a699f16bcc80cf0f49ce144 \
+  --receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json
 ```
 
 After all six exact writers are stopped, `capture` re-runs the hash-pinned
@@ -373,10 +1184,12 @@ Account identity does not use backend-dependent `rclone config userinfo`.
 After a benign `rclone about` refreshes the OAuth grant, the gate pipes the
 decrypted configuration for exactly the selected remote directly into its
 hash-pinned isolated helper; it never writes that stream to disk. The helper
-uses verified TLS and bounded retries/timeouts for exactly
+hash-binds the unredacted custom client ID from that same in-memory stream,
+then uses verified TLS and bounded retries/timeouts for exactly
 `GET https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,permissionId,me)`.
 It requires `me=true`, one normalized email, and one permission ID, and emits
-only their SHA-256 hashes. Access/refresh tokens, client secret, raw email, raw
+only the client/account/permission SHA-256 hashes. Access/refresh tokens,
+client secret, raw client ID, raw email, raw
 permission ID, and API body are absent from argv, environment, logs, durable
 temporary files, and the receipt.
 
@@ -413,6 +1226,68 @@ explicitly `diagnostic`, `noncanonical`, and `nonreward`. All six receipt trees
 and indexes must be durably written and reverified before the first writer
 signal; endpoint errors are evidence, while inability to durably write a
 receipt stops the fleet freeze.
+
+The remote quarantine itself is a crash-safe sequence of immutable mixed-state
+rounds, not a global all-six latch. Each round authenticates the current exact
+partition of already-fenced nodes and still-live targets, freshly samples and
+cross-proves only those live targets, and binds fresh capture-bound status for
+every already-fenced node inside the same bracket. Its authorization expires
+exactly 300 seconds after the public sample completes. Immediately before each
+target's nft apply, the helper proves that round hash and deadline and writes a
+create-only node-applied receipt. A crash may leave any positive subset fenced;
+the immutable result records that subset and a later round freshly authorizes
+only the remainder. Zero-progress attempts stay outside the ledger and may be
+resampled; positive rounds are never rewritten, and no node may cross twice.
+The completed generation ledger has at most six rounds, covers all six nodes,
+and derives the legacy cutoff as the maximum public height across every round.
+This permits honest mixed-state resume without pretending that one local
+commit proves one remote mutation.
+
+Before a live target may cross its first restart-effective systemd dependency
+or nft boundary, the round captures an exact source pair with immutable role
+`preauthorization-boundary`. Production data directories and their siblings
+are allowed to contain no snapshot at all; that is the expected no-existing-
+snapshot case, not a reason to defer capture until after stop. The helper first
+proves that the loopback `/sync/snapshot` listener socket belongs to the sealed
+writer PID, boot ID, start ticks, executable, argv, and cgroup. Each request is
+recorded in a create-only attempt directory. The pinned inspector then copies
+and hashes exactly the WAL prefix selected by that snapshot, permits only an
+append-only source suffix during the copy, and selects the pair only after
+strict offline replay reproduces the head and every authenticated/public
+ancestry bound. A failed request, a snapshot with no exact complete WAL
+boundary, a changed prefix, or a non-append-only WAL causes a retained failed
+attempt and a new request. A crash after the complete attempt receipt is
+fsynced but before `selected.json` reuses that exact receipt without another
+snapshot request; a complete selector is also revalidated byte-for-byte.
+Authorization heights may never exceed the selected capture head.
+
+For a node that remains active behind the full-host quarantine, two stable
+post-quarantine samples precede a second exact capture with immutable role
+`post-quarantine-final-export`. Its listener/writer identity must be unchanged,
+its head must equal the stable quarantined tuple and cover every authenticated
+bound, and public plus inter-validator ingress must still be denied. The final
+capture receipt hash, role, and head are bound into the stop intent, stop
+receipt, persisted-head evidence, and export selection; normal active export
+never selects the earlier pair. If a target becomes persistently stopped
+before any complete final receipt exists, only its exact tagged stopped
+transition may select the `preauthorization-boundary` pair. The archive still
+preserves the complete final WAL and labels every later complete suffix
+`archived_noncanonical_post_capture_suffix`; it does not silently advance the
+selected snapshot boundary or call that suffix uncommitted.
+
+The first restart-effective write is always the selected live supervisor's
+dependency drop-in, followed by the remaining reviewed activation sources,
+dispatcher/unit, daemon reload, enablement, sync, and the persistent barrier
+receipt. Before that first dependency, natural writer absence remains eligible
+for a fresh sample or ordinary supervisor restart. After it, a same-boot
+persistently-stopped terminal is accepted only after authorization expiry, two
+stable samples proving the writer, selected supervisor, alternatives, and
+pending jobs absent, and exact fail-closed dependency effectiveness. It records
+cause `unknown` with no signal; it is not rewritten as a reboot. Fleet evidence
+is a tagged union: active nodes retain their full fenced status and final
+source role, while stopped nodes bind their exact transition, fresh current
+status, and persisted-head roots. An all-stopped generation has an explicit
+empty active stability set, never a fabricated empty-input stability claim.
 
 Execution installs exact volatile lifecycle-safety overlays, then uses cgroup
 v2 freezing as the only quiescence mechanism. It inode-checks and freezes the
@@ -479,75 +1354,483 @@ most 10M unstopped stake, below quorum. Divergent dynamic RPC identities are
 recorded as untrusted external forks, never folded into a false claim that the
 vulnerable old network is globally halted.
 
-After all six writers are proven PID-free, each capture binds the original
-legacy data directory's path, device, inode, complete regular-file index, final
-state/DAG WAL bytes, external snapshot identity, and persistent fence evidence.
-The exact source remains in place and is repeatedly re-hashed; it is content-
-sealed, not OS-read-only, and no second full local data tree is created. The
-helper never uses SIGKILL or the racy legacy live-snapshot RPC. It rejects
-changed, missing, unexpected, cross-device, symlink, or special-file content.
+After all six writers are proven PID-free, each offline capture binds the
+original legacy data directory's path, device, inode, complete regular-file
+index, complete final state/DAG WAL bytes, the already sealed selected live
+snapshot/fixed-prefix pair, and persistent fence evidence. The exact source
+remains in place and is repeatedly re-hashed; it is content-sealed, not
+OS-read-only, and no second full local data tree is created. No snapshot is
+requested after stop. The earlier live `/sync/snapshot` response was never
+trusted by itself: only the writer-owned, fixed-prefix, strictly replayed pair
+is eligible. The helper never uses SIGKILL and rejects changed, missing,
+unexpected, cross-device, symlink, or special-file content.
 
-The sealed prearchive production manifest carries the independently preserved
-exact-height source snapshot and its paired reference WAL as SHA-256-bound
-artifacts. Build
-the unsigned candidate from that pair using the exact recovery exporter;
-successful export decodes the snapshot, recomputes its account/storage/code
-root, and requires it to equal the complete WAL block/checkpoint boundary:
+Pin the exact Ubuntu curl and CA bytes used for the builder's anonymous GitHub
+proof, then acquire the reviewed stock Caddy binary. Keep the download
+directory until final archive verification completes.
 
 ```bash
-arc-node recovery export \
-  --data-dir /secure/operator/reference-pair \
-  --snapshot /secure/operator/reference-pair/state.snapshot.lz4 \
-  --genesis /secure/operator/genesis.toml \
-  --validator-public-keys /secure/operator/validator-public-keys.json \
-  --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
-  --output /secure/operator/candidate.arcchkpt \
-  --source-consensus-round 9774808 \
+system_curl=/usr/bin/curl
+system_ca_bundle=/etc/ssl/certs/ca-certificates.crt
+system_curl_sha256=da9cc597d6473e31d7e3f4d5e2198509010164b48be96e97b87b788655146631
+system_ca_bundle_sha256=6d84ab71cb726c0641b0af84303c316e3fa50db941dc8507d09045eb2fa5d238
+printf '%s  %s\n' "$system_curl_sha256" "$system_curl" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$system_ca_bundle_sha256" "$system_ca_bundle" \
+  | /usr/bin/sha256sum --check --strict
+
+caddy_download_root="$(mktemp -d /secure/operator/caddy-v2.11.4.XXXXXXXX)"
+caddy_archive="$caddy_download_root/caddy_2.11.4_linux_amd64.tar.gz"
+caddy_binary=/secure/operator/caddy-2.11.4-linux-amd64
+test ! -e "$caddy_binary"
+/usr/bin/env -i HOME="$caddy_download_root" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+  "$system_curl" -q --silent --show-error --fail --location --max-redirs 3 \
+  --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --cacert "$system_ca_bundle" --config /dev/null --proxy '' --noproxy '*' \
+  --connect-timeout 10 --max-time 180 --max-filesize 17238873 \
+  --output "$caddy_archive" \
+  'https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz'
+printf '%s  %s\n' \
+  527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9 \
+  "$caddy_archive" | /usr/bin/sha256sum --check --strict
+test "$(/usr/bin/stat --format='%s' "$caddy_archive")" = 17238873
+test "$(/usr/bin/tar -tzf "$caddy_archive")" = "$(printf 'LICENSE\nREADME.md\ncaddy')"
+/usr/bin/tar --extract --gzip --file "$caddy_archive" \
+  --directory "$caddy_download_root" --no-same-owner --no-same-permissions -- caddy
+test -f "$caddy_download_root/caddy" && test ! -L "$caddy_download_root/caddy"
+chmod 0500 "$caddy_download_root/caddy"
+/bin/ln "$caddy_download_root/caddy" "$caddy_binary"
+printf '%s  %s\n' \
+  b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e12809416c7ac64d9 \
+  "$caddy_binary" | /usr/bin/sha256sum --check --strict
+test "$("$caddy_binary" version | /usr/bin/awk '{print $1}')" = v2.11.4
+```
+
+
+The sealed prearchive production manifest carries the independently preserved
+block-height-137145 source snapshot and its paired reference WAL as
+SHA-256-bound artifacts. Source consensus round `9774808` is distinct recovery
+checkpoint metadata; it is not the block height. Before export, prove the exact
+root-owned pair, its two metadata records, and the complete four-row
+`SHA256SUMS` mapping. Then build the unsigned candidate with the exact recovery
+exporter; successful export decodes the snapshot, recomputes its
+account/storage/code root, and requires it to equal the complete WAL
+block/checkpoint boundary:
+
+```bash
+reference_pair=/secure/operator/reference-pair
+reference_source_consensus_round=9774808
+reference_block_height=137145
+"$ARC_RECOVERY_PYTHON_PATH" -I - \
+  "$reference_pair" "$reference_block_height" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected_height = int(sys.argv[2])
+expected_files = {
+    "state.snapshot.lz4": (
+        1_160_246,
+        "ecb4e39d45e6711cffcd78183851587e4deb37ad63163f541ef6c1f821a4ce47",
+    ),
+    "state.wal": (
+        83_385_625,
+        "3820e112af1684567f0336abe73ae9aafc4228d0e02a5fccb1ff32f64dfed44c",
+    ),
+    "latest.json": (
+        687,
+        "0c9bcafd99375de7e3167c271350279c4d267dd9cf91de37aa830a2b817f80af",
+    ),
+    "snapshot-info.json": (
+        138,
+        "98f327fb9c4405cd0f6e7c31052d571a024738df5bf6987ad78d9b1ba5856b49",
+    ),
+}
+
+def reject_duplicates(pairs):
+    value = {}
+    for key, child in pairs:
+        if key in value:
+            raise SystemExit(f"reference metadata duplicates key {key!r}")
+        value[key] = child
+    return value
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+def read_locked(root_fd, name, size, digest=None):
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=root_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode))
+            != (0, 0, 0o400)
+            or before.st_nlink != 1
+            or before.st_size != size
+        ):
+            raise SystemExit(f"reference-pair identity differs for {name}")
+        payload = bytearray()
+        while len(payload) <= size:
+            chunk = os.read(descriptor, min(1024 * 1024, size + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) != size or identity(before) != identity(os.fstat(descriptor)):
+            raise SystemExit(f"reference-pair file changed while read: {name}")
+        if digest is not None and hashlib.sha256(payload).hexdigest() != digest:
+            raise SystemExit(f"reference-pair SHA-256 differs for {name}")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    root_metadata = os.fstat(root_fd)
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or root_metadata.st_gid != 0
+        or stat.S_IMODE(root_metadata.st_mode) & 0o022
+    ):
+        raise SystemExit("reference-pair directory is not protected root storage")
+    payloads = {
+        name: read_locked(root_fd, name, size, digest)
+        for name, (size, digest) in expected_files.items()
+    }
+    sums = read_locked(root_fd, "SHA256SUMS", 324)
+finally:
+    os.close(root_fd)
+
+if not sums.endswith(b"\n") or b"\r" in sums:
+    raise SystemExit("reference-pair SHA256SUMS is not canonical LF text")
+rows = {}
+for line in sums.decode("ascii").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
+    if match is None or match.group(2) in rows:
+        raise SystemExit("reference-pair SHA256SUMS has malformed or duplicate rows")
+    rows[match.group(2)] = match.group(1)
+if rows != {name: digest for name, (_size, digest) in expected_files.items()}:
+    raise SystemExit("reference-pair SHA256SUMS differs from the reviewed four-file map")
+
+latest = json.loads(payloads["latest.json"], object_pairs_hook=reject_duplicates)
+snapshot = json.loads(
+    payloads["snapshot-info.json"], object_pairs_hook=reject_duplicates
+)
+header = latest.get("header") if isinstance(latest, dict) else None
+expected_state_root = "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+if (
+    set(latest) != {"header", "tx_hashes", "hash"}
+    or not isinstance(header, dict)
+    or header.get("height") != expected_height
+    or header.get("state_root") != expected_state_root
+    or latest.get("hash")
+    != "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+):
+    raise SystemExit("reference latest metadata differs at the recovery boundary")
+if snapshot != {
+    "account_count": 78_025,
+    "available": True,
+    "height": expected_height,
+    "state_root": "0x" + expected_state_root,
+}:
+    raise SystemExit("reference snapshot metadata differs at the recovery boundary")
+PY
+
+candidate_checkpoint=/secure/operator/candidate.arcchkpt
+candidate_attempt_root="$(
+  /usr/bin/mktemp -d /secure/operator/candidate-export.XXXXXXXX
+)"
+candidate_attempt="$candidate_attempt_root/candidate.arcchkpt"
+test ! -e "$candidate_attempt"
+"$arc_node_linux" recovery export \
+  --data-dir "$reference_pair" \
+  --snapshot "$reference_pair/state.snapshot.lz4" \
+  --genesis "$operator_genesis" \
+  --validator-public-keys "$validator_public_keys" \
+  --legacy-validator-set "$legacy_validator_set" \
+  --output "$candidate_attempt" \
+  --source-consensus-round "$reference_source_consensus_round" \
   --created-at-unix-ms 1787857623000 \
   --recovery-epoch 1 \
   --validator-set-id 1 \
   --allow-unbound-legacy-wal
+chmod 0400 "$candidate_attempt"
+arc_install_or_reuse_exact "$candidate_attempt" "$candidate_checkpoint"
+test -f "$candidate_checkpoint" && test ! -L "$candidate_checkpoint"
+test "$(/usr/bin/stat --format='%a' "$candidate_checkpoint")" = 400
+candidate_checkpoint_sha256="$(arc_sha256 "$candidate_checkpoint")"
+[[ "$candidate_checkpoint_sha256" =~ ^[0-9a-f]{64}$ ]]
 ```
 
 The last flag is necessary for the audited legacy WAL, which predates the
 authenticated genesis network hash. It is never implicit: both checkpoint
 creation and final archive sealing require the operator to state it, and the
-binding evidence records that exception. Sign the accepted candidate offline,
-then build the prearchive production manifest only from protected-main and
-sealed evidence inputs. The builder derives every chain, topology, gateway,
-artifact, check, destination, and zero archive-root field:
+binding evidence records that exception.
+
+Export always targets a fresh attempt directory first. The canonical
+`candidate.arcchkpt` is installed with a create-new hard link only after the
+export is complete and durable. A retry re-exports from the pinned pair and may
+reuse the canonical path only when a no-follow, stable hash proves byte-for-byte
+equality; a different or malformed existing file stops without replacement.
+Keep the attempt directory as the resume/audit copy.
+
+`recovery sign` is the supported 5-of-6 collection primitive. The feasible
+signing topology is the one reviewed, root-only operator enclave that already
+contains all six restored vault keyfiles. After its required artifact proofs,
+capture, and remote key installation are complete, isolate that enclave from
+the network for the signing window. The wrapper below verifies the reviewed
+Ubuntu `unshare` bytes, creates a new network namespace for every ARC signer
+subprocess, proves `/proc/net/dev` exposes only loopback, proves there is no
+IPv4 route or non-loopback IPv6 route, closes every inherited descriptor above
+standard input/output/error, and only then `execve`s the hash-pinned ARC binary
+with a four-variable clean environment. `GH_TOKEN` is removed before
+any checkpoint inspection or signature. Five distinct reviewed keyfiles sign
+in sequence; the sixth remains an unused recovery member. Every invocation
+rechecks the exact Linux binary against the protected build-metadata hash,
+retains earlier records, adds only that key's signature, and creates a new
+checkpoint path. The final `recovery verify` authenticates both the five
+identities and strict-stake supermajority.
 
 ```bash
-scripts/recovery/build-production-manifest.py prearchive \
-  --source-main-sha "$protected_main_sha" \
-  --pretag-run-id "$pretag_run_id" \
-  --pretag-run-attempt "$pretag_run_attempt" \
-  --pretag-artifact-input-set /secure/operator/PRETAG-ARTIFACT-INPUT-SET.json \
-  --curl /usr/bin/curl \
-  --curl-sha256 "$system_curl_sha256" \
-  --ca-bundle /private/etc/ssl/cert.pem \
-  --ca-bundle-sha256 "$system_ca_bundle_sha256" \
-  --freeze-plan /secure/operator/arc-freeze.lock.json \
-  --freeze-plan-sha256 "$freeze_sha256" \
-  --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
-  --legacy-maintenance-evidence-bundle /secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-evidence-bundle.json \
-  --legacy-maintenance-boundary /secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-boundary.json \
-  --legacy-late-fork-source-set /secure/operator/arc-offline-stop-evidence.json.legacy-late-fork-source-set.json \
-  --offline-stop-evidence /secure/operator/arc-offline-stop-evidence.json \
-  --ssh-known-hosts /secure/operator/arc-validator-known-hosts \
-  --ssh-identity /secure/operator/id_arc_recovery_ed25519 \
-  --validator-vault-restore-receipt /secure/operator/vault/RESTORE-RECEIPT.json \
-  --validator-key-install-receipt /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json \
-  --validator-public-keys /secure/operator/validator-public-keys.json \
-  --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
-  --checkpoint /secure/operator/recovery.arcchkpt \
-  --source-snapshot /secure/operator/reference-pair/state.snapshot.lz4 \
-  --source-wal /secure/operator/reference-pair/state.wal \
-  --caddy /secure/operator/caddy-2.11.4-linux-amd64 \
-  --reward-probe "$PWD/scripts/recovery/community-reward-probe.py" \
-  --stage-root /secure/operator/production-input-stage-v0.8.0 \
-  --acme-email tj@arc.ai \
-  --output /secure/operator/arc-recovery.prearchive.json
+set -Eeuo pipefail
+umask 077
+unset GH_TOKEN
+signing_unshare=/usr/bin/unshare
+signing_unshare_sha256=51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb
+test -f "$signing_unshare" && test ! -L "$signing_unshare"
+printf '%s  %s\n' "$signing_unshare_sha256" "$signing_unshare" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_PYTHON_SHA256" "$ARC_RECOVERY_PYTHON_PATH" \
+  | /usr/bin/sha256sum --check --strict
+signing_home="$(/usr/bin/mktemp -d /secure/operator/offline-signing-home.XXXXXXXX)"
+signing_attempt_root="$(
+  /usr/bin/mktemp -d /secure/operator/checkpoint-signing.XXXXXXXX
+)"
+offline_signer_python='import errno, os, pathlib, sys
+interfaces = {
+    line.split(":", 1)[0].strip()
+    for line in pathlib.Path("/proc/net/dev").read_text(encoding="ascii").splitlines()[2:]
+    if line.strip()
+}
+ipv4_routes = pathlib.Path("/proc/net/route").read_text(encoding="ascii").splitlines()[1:]
+ipv6_routes = pathlib.Path("/proc/net/ipv6_route").read_text(encoding="ascii").splitlines()
+if interfaces != {"lo"} or any(line.strip() for line in ipv4_routes):
+    raise SystemExit("offline signer has a non-loopback interface or IPv4 route")
+if any(line.split()[-1] != "lo" for line in ipv6_routes if line.split()):
+    raise SystemExit("offline signer has a non-loopback IPv6 route")
+argv = sys.argv[1:]
+if not argv or not os.path.isabs(argv[0]):
+    raise SystemExit("offline signer executable is not absolute")
+with os.scandir("/proc/self/fd") as entries:
+    inherited = [int(entry.name) for entry in entries if int(entry.name) > 2]
+for descriptor in inherited:
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+os.execve(argv[0], argv, {"HOME": os.environ["HOME"], "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})'
+offline_signer() {
+  printf '%s  %s\n' "$signing_unshare_sha256" "$signing_unshare" \
+    | /usr/bin/sha256sum --check --strict
+  "$signing_unshare" --net -- /usr/bin/env -i \
+    HOME="$signing_home" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    "$ARC_RECOVERY_PYTHON_PATH" -I -c "$offline_signer_python" "$@" </dev/null
+}
+signing_binary="$arc_node_linux"
+printf '%s  %s\n' "$arc_node_linux_sha256" "$signing_binary" \
+  | /usr/bin/sha256sum --check --strict
+signing_keys=(
+  /secure/operator/arc-v0.8-validator-restore/keys/NYC.validator-key.json
+  /secure/operator/arc-v0.8-validator-restore/keys/LAX.validator-key.json
+  /secure/operator/arc-v0.8-validator-restore/keys/AMS.validator-key.json
+  /secure/operator/arc-v0.8-validator-restore/keys/LHR.validator-key.json
+  /secure/operator/arc-v0.8-validator-restore/keys/NRT.validator-key.json
+)
+test "${#signing_keys[@]}" = 5
+for signing_key in "${signing_keys[@]}"; do
+  test -f "$signing_key" && test ! -L "$signing_key"
+  test "$(/usr/bin/stat --format='%a' "$signing_key")" = 600
+done
+incoming_checkpoint="$candidate_checkpoint"
+checkpoint_manifest_hash="$(
+  offline_signer "$signing_binary" recovery inspect \
+    --checkpoint "$incoming_checkpoint" \
+    | "$ARC_RECOVERY_PYTHON_PATH" -I -c 'import json,sys; print(json.load(sys.stdin)["manifest_hash"])'
+)"
+[[ "$checkpoint_manifest_hash" =~ ^0x[0-9a-f]{64}$ ]]
+checkpoint_approval_phrase="APPROVE CHECKPOINT $checkpoint_manifest_hash"
+printf 'After all six operators compare it out of band, type exactly: %s\n> ' \
+  "$checkpoint_approval_phrase" >/dev/tty
+IFS= read -r checkpoint_approval </dev/tty
+test "$checkpoint_approval" = "$checkpoint_approval_phrase"
+unset checkpoint_approval
+for index in "${!signing_keys[@]}"; do
+  signing_key="${signing_keys[$index]}"
+  outgoing_checkpoint="$signing_attempt_root/candidate.signed-$((index + 1)).arcchkpt"
+  test ! -e "$outgoing_checkpoint"
+  printf '%s  %s\n' "$arc_node_linux_sha256" "$signing_binary" \
+    | /usr/bin/sha256sum --check --strict
+  offline_signer "$signing_binary" recovery sign \
+    --checkpoint "$incoming_checkpoint" \
+    --genesis "$operator_genesis" \
+    --approved-manifest-hash "$checkpoint_manifest_hash" \
+    --validator-key-file "$signing_key" \
+    --output "$outgoing_checkpoint" \
+    --recovery-epoch 1 \
+    --validator-set-id 1
+  chmod 0400 "$outgoing_checkpoint"
+  incoming_checkpoint="$outgoing_checkpoint"
+done
+recovery_checkpoint=/secure/operator/recovery.arcchkpt
+arc_install_or_reuse_exact "$incoming_checkpoint" "$recovery_checkpoint"
+test -f "$recovery_checkpoint" && test ! -L "$recovery_checkpoint"
+test "$(/usr/bin/stat --format='%a' "$recovery_checkpoint")" = 400
+```
+
+After the fifth distinct signer, the completed signing attempt is installed at
+the create-only `/secure/operator/recovery.arcchkpt` path. A retry may reuse
+that path only if a fresh deterministic five-key signing pass is byte-identical;
+otherwise both copies are preserved and the procedure stops. Verify the
+canonical file against both the five-identity and strict-stake supermajorities
+with the same protected-main binary. This final verification, not a filename or
+signature count copied from a signer, is the acceptance boundary:
+
+```bash
+[[ "$checkpoint_manifest_hash" =~ ^0x[0-9a-f]{64}$ ]]
+offline_signer "$arc_node_linux" recovery verify \
+  --checkpoint "$recovery_checkpoint" \
+  --genesis "$operator_genesis" \
+  --approved-manifest-hash "$checkpoint_manifest_hash" \
+  --recovery-epoch 1 \
+  --validator-set-id 1
+test "$(arc_sha256 "$recovery_checkpoint")" = \
+  "$(arc_sha256 "$incoming_checkpoint")"
+```
+
+Build the prearchive production manifest only from protected-main and sealed
+evidence inputs. The builder derives every chain, topology, gateway, artifact,
+check, destination, and zero archive-root field:
+
+```bash
+prearchive_output=/secure/operator/arc-recovery.prearchive.json
+prearchive_sidecar="$prearchive_output.sha256"
+production_stage_root=/secure/operator/production-input-stage-v0.8.0
+prearchive_existing=0
+for prearchive_path in \
+  "$prearchive_output" "$prearchive_sidecar" "$production_stage_root"
+do
+  if [ -e "$prearchive_path" ] || [ -L "$prearchive_path" ]; then
+    prearchive_existing=$((prearchive_existing + 1))
+  fi
+done
+if [ "$prearchive_existing" = 0 ]; then
+  prearchive_result="$(
+    "$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/build-production-manifest.py prearchive \
+      --source-main-sha "$protected_main_sha" \
+      --pretag-run-id "$pretag_run_id" \
+      --pretag-run-attempt "$pretag_run_attempt" \
+      --pretag-artifact-input-set "$pretag_input_set" \
+      --curl "$system_curl" \
+      --curl-sha256 "$system_curl_sha256" \
+      --ca-bundle "$system_ca_bundle" \
+      --ca-bundle-sha256 "$system_ca_bundle_sha256" \
+      --freeze-plan /secure/operator/arc-freeze.lock.json \
+      --freeze-plan-sha256 "$freeze_sha256" \
+      --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
+      --legacy-maintenance-evidence-bundle /secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-evidence-bundle.json \
+      --legacy-maintenance-boundary /secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-boundary.json \
+      --legacy-late-fork-source-set /secure/operator/arc-offline-stop-evidence.json.legacy-late-fork-source-set.json \
+      --offline-stop-evidence /secure/operator/arc-offline-stop-evidence.json \
+      --ssh-known-hosts "$known_hosts" \
+      --ssh-identity "$ssh_identity" \
+      --validator-vault-restore-receipt /secure/operator/arc-v0.8-validator-restore/RESTORE-RECEIPT.json \
+      --validator-key-install-receipt /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json \
+      --validator-public-keys "$validator_public_keys" \
+      --legacy-validator-set "$legacy_validator_set" \
+      --checkpoint "$recovery_checkpoint" \
+      --source-snapshot "$reference_pair/state.snapshot.lz4" \
+      --source-wal "$reference_pair/state.wal" \
+      --caddy "$caddy_binary" \
+      --reward-probe "$PWD/scripts/recovery/community-reward-probe.py" \
+      --stage-root "$production_stage_root" \
+      --acme-email tj@arc.ai \
+      --output "$prearchive_output"
+  )"
+  locked_sha256="$(
+    printf '%s' "$prearchive_result" | /usr/bin/python3.12 -I -c '
+import json, sys
+value = json.load(sys.stdin)
+if set(value) != {"schema", "phase", "rollout_sha256", "output"}:
+    raise SystemExit("prearchive builder output fields differ")
+if value["schema"] != "arc.recovery.production-manifest-build.v1" or value["phase"] != "prearchive":
+    raise SystemExit("prearchive builder output identity differs")
+if value["output"] != "/secure/operator/arc-recovery.prearchive.json":
+    raise SystemExit("prearchive builder output path differs")
+print(value["rollout_sha256"])
+'
+  )"
+elif [ "$prearchive_existing" = 3 ]; then
+  test -f "$prearchive_output" && test ! -L "$prearchive_output"
+  test -f "$prearchive_sidecar" && test ! -L "$prearchive_sidecar"
+  test -d "$production_stage_root" && test ! -L "$production_stage_root"
+  locked_sha256="$(
+    "$ARC_RECOVERY_PYTHON_PATH" -I - \
+      "$prearchive_output" "$PWD/scripts/recovery" "$protected_main_sha" <<'PY'
+import importlib.util
+import pathlib
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+script_dir = pathlib.Path(sys.argv[2])
+expected_commit = sys.argv[3]
+sys.path.insert(0, str(script_dir))
+spec = importlib.util.spec_from_file_location(
+    "arc_production_manifest_builder",
+    script_dir / "build-production-manifest.py",
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load the protected production-manifest validator")
+builder = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = builder
+spec.loader.exec_module(builder)
+value, _payload, digest = builder.load_private_rollout(manifest_path)
+provenance = value.get("provenance")
+if not isinstance(provenance, dict) or provenance.get("source_main_commit") != expected_commit:
+    raise SystemExit("existing prearchive belongs to another protected-main commit")
+with builder.stable_artifact_identity_window(value):
+    pass
+print(digest)
+PY
+  )"
+else
+  printf '%s\n' \
+    'partial prearchive output/stage set exists; preserve it under a unique forensic path and stop' >&2
+  exit 1
+fi
+[[ "$locked_sha256" =~ ^[0-9a-f]{64}$ ]]
+printf '%s  %s\n' "$locked_sha256" "${prearchive_output##*/}" \
+  | /usr/bin/cmp --silent - "$prearchive_sidecar"
 ```
 
 `PRETAG-ARTIFACT-INPUT-SET.json` is mode 0400 canonical JSON. It names the
@@ -560,9 +1843,17 @@ build metadata, and payload hash. A shared set-level proof keeps the complete
 initial and final check within the anonymous API limit; the final branch query
 is last and every live root is sealed.
 
-The stage root must not exist. The builder creates it once at mode 0700, copies
+On the first attempt, none of the prearchive manifest, checksum sidecar, or
+stage root may exist. The builder creates the stage once at mode 0700, copies
 every semantic input through stable no-follow file descriptors, fsyncs each
-copy and a canonical stage manifest, then removes all directory write bits.
+copy and a canonical stage manifest, then removes all directory write bits. A
+complete retry tuple is reusable only after the current protected-main builder
+validates the canonical manifest/sidecar and reopens, hashes, and identity-checks
+the full read-only stage inventory. A one- or two-member partial tuple stops.
+Preserve every partial member by moving it with `mv --no-clobber` into a fresh
+root-owned `/secure/operator/incomplete-prearchive.XXXXXXXX` forensic directory,
+record its hashes, and then rerun all preceding read-only verification before a
+new attempt; never delete or overwrite it.
 Checkpoint inspection/reproduction, archive capture, and rollout use only
 these single-link staged nine raw release artifacts, proof sets, binary, CLI,
 checkpoint, snapshot/WAL, genesis,
@@ -604,50 +1895,50 @@ host because it executes the exact retained Linux x86_64 node. Its `complete_sha
 phase:
 
 ```bash
-arc_sha256() {
-  if [ -x /usr/bin/sha256sum ]; then /usr/bin/sha256sum "$1"
-  else /usr/bin/shasum -a 256 "$1"; fi | /usr/bin/awk '{print $1}'
-}
-export ARC_RECOVERY_SSH_USER=root
-# Copy this exact value from freeze.lock.json.operator_python_path. It must be
-# normalized, versioned on Ubuntu, and itself a non-symlink regular file.
-export ARC_RECOVERY_PYTHON_PATH=/usr/bin/python3.12
-test -f "$ARC_RECOVERY_PYTHON_PATH" && test ! -L "$ARC_RECOVERY_PYTHON_PATH"
-export ARC_RECOVERY_PYTHON_SHA256="$(arc_sha256 "$ARC_RECOVERY_PYTHON_PATH")"
+# The builder has now sealed copies of the two private SSH inputs. Switch only
+# those paths to the stage; every executable and its reviewed hash stays fixed.
 export ARC_RECOVERY_SSH_KNOWN_HOSTS=/secure/operator/production-input-stage-v0.8.0/private/known_hosts
-export ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256="$(arc_sha256 "$ARC_RECOVERY_SSH_KNOWN_HOSTS")"
+export ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256=97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d
 export ARC_RECOVERY_SSH_IDENTITY=/secure/operator/production-input-stage-v0.8.0/private/id_ed25519
-export ARC_RECOVERY_SSH_IDENTITY_SHA256="$(arc_sha256 "$ARC_RECOVERY_SSH_IDENTITY")"
-export ARC_RECOVERY_SSH_SHA256="$(arc_sha256 /usr/bin/ssh)"
-export ARC_RECOVERY_SCP_SHA256="$(arc_sha256 /usr/bin/scp)"
-export ARC_RECOVERY_RCLONE_PATH=/secure/operator/tools/rclone
-export ARC_RECOVERY_RCLONE_SHA256="$(arc_sha256 "$ARC_RECOVERY_RCLONE_PATH")"
-export ARC_RECOVERY_RCLONE_CONFIG=/secure/operator/rclone-arc.conf
-export ARC_RECOVERY_GH_PATH="$(/bin/realpath "$(command -v gh)")"
-test -f "$ARC_RECOVERY_GH_PATH" && test ! -L "$ARC_RECOVERY_GH_PATH"
-export ARC_RECOVERY_GH_SHA256="$(arc_sha256 "$ARC_RECOVERY_GH_PATH")"
-export ARC_RECOVERY_GITHUB_LOGIN=FerrumVir
-archive_work_root=/secure/operator/arc-archive-work
-install -d -m 0700 "$archive_work_root"
+export ARC_RECOVERY_SSH_IDENTITY_SHA256=9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a
+test "$(/usr/bin/stat --format='%a:%h' "$ARC_RECOVERY_SSH_KNOWN_HOSTS")" = 400:1
+test "$(/usr/bin/stat --format='%a:%h' "$ARC_RECOVERY_SSH_IDENTITY")" = 400:1
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256" \
+  "$ARC_RECOVERY_SSH_KNOWN_HOSTS" | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_IDENTITY_SHA256" \
+  "$ARC_RECOVERY_SSH_IDENTITY" | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_PYTHON_SHA256" "$ARC_RECOVERY_PYTHON_PATH" \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SSH_SHA256" /usr/bin/ssh \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_SCP_SHA256" /usr/bin/scp \
+  | /usr/bin/sha256sum --check --strict
+printf '%s  %s\n' "$ARC_RECOVERY_RCLONE_SHA256" "$ARC_RECOVERY_RCLONE_PATH" \
+  | /usr/bin/sha256sum --check --strict
+test "$(arc_sha256 "$ARC_RECOVERY_RCLONE_CONFIG")" = "$rclone_config_sha256"
+printf '%s  %s\n' "$ARC_RECOVERY_GH_SHA256" "$ARC_RECOVERY_GH_PATH" \
+  | /usr/bin/sha256sum --check --strict
+archive_work_root="$(
+  /usr/bin/mktemp -d "/secure/operator/arc-archive-work.$capture_id.XXXXXXXX"
+)"
 
 scripts/recovery/archive-fleet-to-drive.sh seal \
   --freeze-plan /secure/operator/arc-freeze.lock.json \
   --manifest /secure/operator/arc-recovery.prearchive.json \
-  --validator-public-keys /secure/operator/validator-public-keys.json \
+  --validator-public-keys /secure/operator/production-input-stage-v0.8.0/validator-public-keys.json \
   --validator-install-receipt /secure/operator/production-input-stage-v0.8.0/private/VALIDATOR-KEY-INSTALL-RECEIPT.json \
   --vault-restore-receipt /secure/operator/production-input-stage-v0.8.0/private/VALIDATOR-VAULT-RESTORE-RECEIPT.json \
   --finalization-intent /secure/operator/archive-finalization-intent.json \
   --work-root "$archive_work_root" \
   --allow-unbound-legacy-wal
 
-locked_sha256='<sealed prearchive rollout-manifest sha256>'
 destination='arc-drive-arc:ARC Chain Recovery v0.8/captures/'"$capture_id"
 destination_sha256="$(printf %s "$destination" | /usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin LANG=C LC_ALL=C "$ARC_RECOVERY_PYTHON_PATH" -I -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
 ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id DEST $destination_sha256 LEGACY_WAL UNBOUND" \
   scripts/recovery/archive-fleet-to-drive.sh seal \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
     --manifest /secure/operator/arc-recovery.prearchive.json \
-    --validator-public-keys /secure/operator/validator-public-keys.json \
+    --validator-public-keys /secure/operator/production-input-stage-v0.8.0/validator-public-keys.json \
     --validator-install-receipt /secure/operator/production-input-stage-v0.8.0/private/VALIDATOR-KEY-INSTALL-RECEIPT.json \
     --vault-restore-receipt /secure/operator/production-input-stage-v0.8.0/private/VALIDATOR-VAULT-RESTORE-RECEIPT.json \
     --finalization-intent /secure/operator/archive-finalization-intent.json \
@@ -720,35 +2011,184 @@ the same COMPLETE bytes. A changed latest Gist revision is irrelevant.
 Verify a destination before use:
 
 ```bash
+destination="arc-drive-arc:ARC Chain Recovery v0.8/captures/$capture_id"
 scripts/recovery/archive-fleet-to-drive.sh verify-complete \
-  --destination 'arc-drive-arc:ARC Chain Recovery v0.8/captures/<capture-id>'
+  --destination "$destination"
 ```
 
 An absent, non-canonical, mismatched, or tampered `COMPLETE.json`, manifest, or
-sidecar fails closed.
-
-Use the emitted `FINAL-ROLLOUT-ROOTS` values only as independently verified
-trust roots for separately downloaded archive evidence, then run:
+sidecar fails closed. `verify-complete` deliberately destroys its temporary
+downloads when it exits, so copy the four values from its single
+`FINAL-ROLLOUT-ROOTS` line and then materialize the finalizer inputs through the
+same hash-pinned rclone/config identities. Opening both on file descriptors
+keeps the exact reviewed inodes pinned across all seven downloads; the fresh
+mode-0700 directory has a capture-scoped `mktemp` suffix, so every retry gets a
+new path, and shell `noclobber` makes every local evidence file create-only.
+Each read is capped at one byte beyond the finalizer's 16 MiB JSON
+limit, so an oversized mutable remote object fails instead of consuming the
+operator volume without bound.
 
 ```bash
-scripts/recovery/build-production-manifest.py finalize \
-  --prearchive /secure/operator/arc-recovery.prearchive.json \
-  --complete /secure/operator/downloaded/COMPLETE.json \
-  --complete-sha256 "$complete_sha256" \
-  --archive-manifest /secure/operator/downloaded/ARCHIVE-MANIFEST.json \
-  --archive-manifest-sidecar /secure/operator/downloaded/ARCHIVE-MANIFEST.json.sha256 \
-  --archive-manifest-sha256 "$archive_manifest_sha256" \
-  --sha256sums /secure/operator/downloaded/SHA256SUMS \
-  --sha256sums-sha256 "$sha256sums_sha256" \
-  --drive-archive-seal-prefreeze /secure/operator/downloaded/drive-archive-seal-prefreeze.json \
-  --drive-archive-seal-attempt /secure/operator/downloaded/drive-archive-seal-attempt.json \
-  --github-gist-write-canary /secure/operator/downloaded/github-gist-write-canary.json \
-  --output /secure/operator/arc-recovery.final.json
+set -Eeuo pipefail
+complete_sha256='<FINAL-ROLLOUT-ROOTS complete_sha256>'
+archive_manifest_sha256='<FINAL-ROLLOUT-ROOTS archive_manifest_sha256>'
+sha256sums_sha256='<FINAL-ROLLOUT-ROOTS sha256sums_sha256>'
+prearchive_rollout_sha256='<FINAL-ROLLOUT-ROOTS prearchive_rollout_sha256>'
+for root in "$complete_sha256" "$archive_manifest_sha256" \
+  "$sha256sums_sha256" "$prearchive_rollout_sha256"; do
+  printf '%s\n' "$root" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+done
+test "$prearchive_rollout_sha256" = "$locked_sha256"
+test -f "$ARC_RECOVERY_RCLONE_PATH" && test ! -L "$ARC_RECOVERY_RCLONE_PATH"
+test -f "$ARC_RECOVERY_RCLONE_CONFIG" && test ! -L "$ARC_RECOVERY_RCLONE_CONFIG"
+rclone_config_sha256="$(arc_sha256 "$ARC_RECOVERY_RCLONE_CONFIG")"
+exec 8<"$ARC_RECOVERY_RCLONE_CONFIG"
+exec 9<"$ARC_RECOVERY_RCLONE_PATH"
+test "$(arc_sha256 /proc/self/fd/8)" = "$rclone_config_sha256"
+test "$(arc_sha256 /proc/self/fd/9)" = "$ARC_RECOVERY_RCLONE_SHA256"
+
+download_root="$(
+  /usr/bin/mktemp -d "/secure/operator/downloaded.$capture_id.XXXXXXXX"
+)"
+test -d "$download_root" && test ! -L "$download_root"
+test "$(/usr/bin/stat --format='%a:%h' "$download_root")" = 700:1
+install -d -m 0700 "$download_root/home"
+arc_pinned_rclone() {
+  /usr/bin/env -i \
+    HOME="$download_root/home" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    /proc/self/fd/9 --config /proc/self/fd/8 "$@"
+}
+for name in \
+  COMPLETE.json \
+  ARCHIVE-MANIFEST.json \
+  ARCHIVE-MANIFEST.json.sha256 \
+  SHA256SUMS \
+  drive-archive-seal-prefreeze.json \
+  drive-archive-seal-attempt.json \
+  github-gist-write-canary.json
+do
+  (
+    set -o noclobber
+    arc_pinned_rclone cat "$destination/$name" --count=16777217 \
+      > "$download_root/$name"
+  )
+  chmod 0400 "$download_root/$name"
+done
+test "$(arc_sha256 "$download_root/COMPLETE.json")" = "$complete_sha256"
+test "$(arc_sha256 "$download_root/ARCHIVE-MANIFEST.json")" = \
+  "$archive_manifest_sha256"
+test "$(arc_sha256 "$download_root/SHA256SUMS")" = "$sha256sums_sha256"
+printf '%s  %s\n' "$archive_manifest_sha256" ARCHIVE-MANIFEST.json \
+  | /usr/bin/cmp --silent - "$download_root/ARCHIVE-MANIFEST.json.sha256"
+
+# Recheck the complete remote object set against the same four independent
+# roots after the separate downloads. The finalizer below then verifies that
+# the three archived boundary receipts match ARCHIVE-MANIFEST/SHA256SUMS.
+scripts/recovery/archive-fleet-to-drive.sh verify-complete \
+  --destination "$destination" \
+  --expected-complete-sha256 "$complete_sha256" \
+  --expected-archive-manifest-sha256 "$archive_manifest_sha256" \
+  --expected-sha256sums-sha256 "$sha256sums_sha256" \
+  --expected-prearchive-rollout-sha256 "$prearchive_rollout_sha256"
+exec 8<&-
+exec 9<&-
 ```
 
-The finalizer changes **only** the prearchive manifest's four zero roots and
-creates a new mode-0400 manifest and sidecar without replacement. Validation
-resets those four fields to zero and requires the
+Use the emitted `FINAL-ROLLOUT-ROOTS` values only as independently verified
+trust roots for the separately downloaded archive evidence in that exact
+`$download_root`, then finalize, derive the final hash/policy from authenticated
+output, and perform the production plan and execute:
+
+```bash
+final_manifest=/secure/operator/arc-recovery-final.lock.json
+final_manifest_sidecar="$final_manifest.sha256"
+finalizer_attempt_root="$(
+  /usr/bin/mktemp -d /secure/operator/finalizer.XXXXXXXX
+)"
+finalizer_attempt="$finalizer_attempt_root/${final_manifest##*/}"
+finalizer_attempt_sidecar="$finalizer_attempt.sha256"
+test ! -e "$finalizer_attempt"
+test ! -e "$finalizer_attempt_sidecar"
+finalizer_result="$(
+  "$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/build-production-manifest.py finalize \
+    --prearchive "$prearchive_output" \
+    --complete "$download_root/COMPLETE.json" \
+    --complete-sha256 "$complete_sha256" \
+    --archive-manifest "$download_root/ARCHIVE-MANIFEST.json" \
+    --archive-manifest-sidecar "$download_root/ARCHIVE-MANIFEST.json.sha256" \
+    --archive-manifest-sha256 "$archive_manifest_sha256" \
+    --sha256sums "$download_root/SHA256SUMS" \
+    --sha256sums-sha256 "$sha256sums_sha256" \
+    --drive-archive-seal-prefreeze "$download_root/drive-archive-seal-prefreeze.json" \
+    --drive-archive-seal-attempt "$download_root/drive-archive-seal-attempt.json" \
+    --github-gist-write-canary "$download_root/github-gist-write-canary.json" \
+    --output "$finalizer_attempt"
+)"
+final_rollout_sha256="$(
+  printf '%s' "$finalizer_result" | /usr/bin/python3.12 -I -c '
+import json, sys
+value = json.load(sys.stdin)
+if set(value) != {"schema", "phase", "rollout_sha256", "output"}:
+    raise SystemExit("finalizer output fields differ")
+if value["schema"] != "arc.recovery.production-manifest-build.v1" or value["phase"] != "final":
+    raise SystemExit("finalizer output identity differs")
+if value["output"] != sys.argv[1]:
+    raise SystemExit("finalizer output path differs")
+print(value["rollout_sha256"])
+' "$finalizer_attempt"
+)"
+[[ "$final_rollout_sha256" =~ ^[0-9a-f]{64}$ ]]
+printf '%s  %s\n' "$final_rollout_sha256" "${finalizer_attempt##*/}" \
+  | /usr/bin/cmp --silent - "$finalizer_attempt_sidecar"
+# Install the checksum first and the manifest last. A killed attempt can leave
+# only a harmless sidecar; every retry recreates and compares both exact files.
+arc_install_or_reuse_exact "$finalizer_attempt_sidecar" "$final_manifest_sidecar"
+arc_install_or_reuse_exact "$finalizer_attempt" "$final_manifest"
+printf '%s  %s\n' "$final_rollout_sha256" "${final_manifest##*/}" \
+  | /usr/bin/cmp --silent - "$final_manifest_sidecar"
+test "$(arc_sha256 "$final_manifest")" = "$final_rollout_sha256"
+legacy_wal_policy="$(
+  /usr/bin/python3.12 -I - "$final_manifest" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+archive = value.get("archive")
+if not isinstance(archive, dict) or not isinstance(archive.get("allow_unbound_legacy_wal"), bool):
+    raise SystemExit("sealed final manifest lacks a boolean legacy-WAL policy")
+print("UNBOUND" if archive["allow_unbound_legacy_wal"] else "BOUND")
+PY
+)"
+case "$legacy_wal_policy" in BOUND|UNBOUND) ;; *) exit 1 ;; esac
+
+reward_evidence=/secure/operator/recovery-v3.reward-evidence.json
+rollback_journal=/secure/operator/rollback-final-rollout
+test ! -e "$reward_evidence"
+test ! -e "$reward_evidence.sha256"
+test ! -e "$rollback_journal"
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py run \
+  --manifest "$final_manifest" \
+  --reward-evidence-output "$reward_evidence" \
+  --rollback-journal "$rollback_journal"
+
+ARC_RECOVERY_GO="GO $final_rollout_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id ARCHIVE $archive_manifest_sha256 DEST $destination_sha256 LEGACY_WAL $legacy_wal_policy" \
+  "$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py run \
+    --manifest "$final_manifest" \
+    --execute \
+    --go-hash "$final_rollout_sha256" \
+    --archive-manifest-sha256 "$archive_manifest_sha256" \
+    --reward-evidence-output "$reward_evidence" \
+    --rollback-journal "$rollback_journal"
+test -f "$reward_evidence" && test ! -L "$reward_evidence"
+test -f "$reward_evidence.sha256" && test ! -L "$reward_evidence.sha256"
+(cd /secure/operator && \
+  /usr/bin/sha256sum --check --strict recovery-v3.reward-evidence.json.sha256)
+```
+
+The finalizer changes **only** the prearchive manifest's four zero roots. Every
+run writes a fresh mode-0400 attempt manifest and sidecar. The sidecar is
+create-installed first and the canonical manifest last; an existing canonical
+pair is accepted only when both fresh outputs are byte-identical, so a retry
+cannot silently reuse stale archive roots or replace history. Validation resets
+those four fields to zero and requires the
 resulting canonical bytes to hash to `prearchive_rollout_sha256`; a changed
 host, artifact, check, model, shard assignment, destination, or policy is not a
 finalization. The final `recovery_rollout.py run` first verifies the exact
@@ -837,12 +2277,16 @@ its CORS grant plus `Vary: Origin`, and an attacker origin must receive no CORS
 grant:
 
 ```bash
-python3 scripts/recovery/recovery_rollout.py frontend-config \
-  --manifest /secure/operator/arc-recovery.final.lock.json \
-  --reward-evidence /secure/operator/recovery-v3.reward-evidence.json \
-  --output /secure/operator/arc-network.recovered.json
-shasum -a 256 -c /secure/operator/arc-network.recovered.json.sha256
+frontend_config=/secure/operator/arc-network.recovered.json
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py frontend-config \
+  --manifest "$final_manifest" \
+  --reward-evidence "$reward_evidence" \
+  --output "$frontend_config"
+(cd /secure/operator && \
+  /usr/bin/sha256sum --check --strict arc-network.recovered.json.sha256)
 ```
+
+<!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->
 
 An air-gapped review may instead supply both `--archive-manifest` and
 `--archive-complete`; they must be canonical mode-read-only files matching the
@@ -883,8 +2327,8 @@ per-row INT8 execution profile, authenticated 2-of-3 verification for every
 range/position, five validator approvals, and a pending `0x25` transaction:
 
 ```bash
-probe=/absolute/path/to/scripts/recovery/community-reward-probe.py
-probe_sha256=$(shasum -a 256 "$probe" | awk '{print $1}')
+probe="$PWD/scripts/recovery/community-reward-probe.py"
+probe_sha256="$(/usr/bin/sha256sum "$probe" | /usr/bin/awk '{print $1}')"
 ```
 
 Bind those values into the draft before sealing:
@@ -912,22 +2356,39 @@ six coordinators for the rollout and never fails over to another coordinator.
 The namespaced probe identity is committed as the signed assignment epoch and
 has a consensus replay marker, so a retry rediscovers the same job/transaction
 across client or coordinator restarts and cannot pay through another
-coordinator. The reserved checksum file is a canonical, fsynced 0/1/2 progress
-journal until final evidence promotion; crashes after either receipt or during
+coordinator. Before invoking the probe, the rollout queries all six earnings
+indexes and fsyncs the complete canonical all-v3 history for every potentially
+eligible worker visible to that sealed coordinator (fixed-evidence mode has one
+known worker). The actual worker must belong to that pre-canary set. The
+reserved checksum file is a canonical, fsynced baseline-plus-0/1/2 progress
+journal until final evidence promotion; crashes after the baseline, either receipt, or during
 the earnings/projection-state check therefore re-prove GET-only state without
-issuing another reward.
+issuing another reward. Immediately before ordinal one, including after a
+baseline-only crash resume, the harness re-queries the selectable-worker set
+and all six earnings indexes: a new selectable worker or any changed baseline
+row aborts before the probe can issue a reward.
 A pending or failed transaction never passes. Both jobs use a real one-token request, but the first must reach
 `mined_success` on all six before the second is submitted. The receipts must
 land at two distinct heights (different hashes at one height are a fork, not
 two blocks), each carry at least five approvals, and reconcile on every
 `/worker/earnings/{worker}` response to exactly 2,500,000,000 base units / 2.5
-ARC apiece and exactly 5 ARC gross. Exactly two immediate receipts are not a
-rate sample: `attestations_per_day_observed` and `projected_daily_arc` must both
-remain null, and both unavailable reasons must exactly say
+ARC apiece. Every pre-canary baseline row—including its block hash, transaction
+index, recovery epoch, validator set, and transaction domain—must remain
+byte-for-byte canonical;
+the post-canary count must be baseline count + 2 and gross must be baseline
+gross + 5 ARC, with no third new row. For an empty baseline, exactly two
+immediate receipts are not a rate sample: `attestations_per_day_observed` and
+`projected_daily_arc` must both remain null, and both unavailable reasons must exactly say
 `collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries`. A numeric rate or
-forecast at this boundary fails closed. Counts, local observations, configured
-rates, and pending submissions are not earnings. Frontend publication may
-proceed with this honest null; it must not wait for or manufacture a forecast.
+forecast at that boundary fails closed. With a nonempty baseline, the full
+all-v3 history controls projection truth: fewer than 24 hours produces the
+canonical short-window null reason; a valid 24-hour-or-longer window must expose
+the exact timestamp-derived rate; and a numeric forecast, when issuance and
+budget state permit one, must equal that rate times 2.5 ARC. Otherwise the
+forecast stays null with a nonempty reason. Counts, local observations,
+configured rates, and pending submissions are not earnings. Frontend
+publication may proceed with an honest null; it must not wait for or manufacture
+a forecast.
 
 Before any receipt-mode plan or execution, choose the create-only output that
 will carry the two proven identities. The execute command printed by plan mode
@@ -938,15 +2399,17 @@ preserves this argument:
 ```
 
 The rollout writes that file and its `.sha256` sidecar mode `0444` only after
-both receipts and the six-node exact-gross/null-projection contract pass. Its JSON includes
-`schema: arc.recovery.reward-evidence.v1` and the exact rollout SHA-256. It is
-never reconstructed from chat output and is never overwritten.
+both receipts and the six-node baseline-retention/delta/projection contract
+pass. Its JSON includes `schema: arc.recovery.reward-evidence.v2`, the exact
+rollout SHA-256, both canary identities, and the selected worker's complete
+pre-canary earnings baseline. It is never reconstructed from chat output and
+is never overwritten.
 
 A later read-only audit can use externally captured evidence:
 
 ```bash
 python3 scripts/recovery/recovery_rollout.py verify \
-  --manifest /secure/operator/arc-recovery.lock.json \
+  --manifest /secure/operator/arc-recovery-final.lock.json \
   --reward-evidence /secure/operator/recovery-v3.reward-evidence.json
 ```
 

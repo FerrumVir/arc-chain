@@ -17,13 +17,19 @@ const defaultConfig = JSON.parse(readFileSync(join(here, "../shared/frontend/arc
 
 const H = 500;
 const hex = (char) => char.repeat(64);
+const HISTORY_DOMAIN = "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
 const rewardReceipt = (char, overrides = {}) => ({
   tx_type: "0x25",
   tx_hash: hex(char),
   job_id: hex(char === "f" ? "e" : (parseInt(char, 16) + 1).toString(16)),
+  worker: hex("a"),
   block_height: H + parseInt(char, 16),
   block_hash: hex(char === "e" ? "d" : (parseInt(char, 16) + 1).toString(16)),
+  submitted: true,
+  included: true,
+  confirmed: true,
   success: true,
+  receipt_url: `/community/reward_receipt/0x${hex(char)}`,
   reward_base: 2_500_000_000,
   reward_arc: 2.5,
   ...overrides,
@@ -33,8 +39,10 @@ const projectionWindow = {
   observed_window_last_timestamp_ms: 1_700_086_400_000,
 };
 const readyProjectionBody = (count = 3, overrides = {}) => {
-  const confirmed_receipts = ["1", "3", "5"].slice(0, count).map((char) => rewardReceipt(char));
+  const address = overrides.address ?? hex("a");
+  const confirmed_receipts = ["1", "3", "5"].slice(0, count).map((char) => rewardReceipt(char, { worker: address }));
   return {
+    address,
     confirmed_receipt_count: count,
     confirmed_receipts,
     confirmed_gross_earnings_arc: count * 2.5,
@@ -43,6 +51,10 @@ const readyProjectionBody = (count = 3, overrides = {}) => {
     community_rewards_v1_enabled: true,
     community_rewards_v1_protocol_active: true,
     community_rewards_v1_approval_collection_ready: true,
+    archive_mode: true,
+    history_complete_since_recovery: true,
+    history_scope: "complete canonical reward history since the v3 recovery boundary",
+    history_domain: HISTORY_DOMAIN,
     ...projectionWindow,
     ...overrides,
   };
@@ -228,9 +240,10 @@ await test("an unreachable configured replica leaves checkpoint status unknown",
 await test("inference feed includes only successful canonical mined receipts", async () => {
   const resolver = makeResolver();
   const rows = [
-    { schema: "arc.inference.activity.v1", record_kind: "mined_inference_attestation", source: "chain_receipt", mined: true, receipt_status: "success", success: true, computed: true, paid: false, earned: false, tx_type: "InferenceAttestation", tx_type_code: "0x16", block_height: H + 8, tx_hash: hex("7") },
-    { schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward", source: "chain_receipt", mined: true, receipt_status: "success", success: true, computed: true, paid: true, earned: true, tx_type: "CommunityInferenceReward", tx_type_code: "0x25", worker: hex("6"), block_height: H + 7, tx_hash: hex("6") },
-    { schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward", source: "chain_receipt", mined: true, receipt_status: "failed", success: false, computed: false, paid: false, earned: false, tx_type: "CommunityInferenceReward", tx_type_code: "0x25", worker: hex("6"), block_height: H + 6, tx_hash: hex("5") },
+    { schema: "arc.inference.activity.v1", record_kind: "mined_inference_attestation", source: "chain_receipt", mined: true, receipt_status: "success", success: true, computed: true, paid: false, earned: false, tx_type: "InferenceAttestation", tx_type_code: "0x16", block_height: H + 8, block_hash: hex("8"), index: 0, tx_hash: hex("7") },
+    { schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward", source: "chain_receipt", mined: true, receipt_status: "success", submitted: true, included: true, confirmed: true, success: true, computed: true, paid: true, earned: true, tx_type: "CommunityInferenceReward", tx_type_code: "0x25", worker: hex("6"), job_id: hex("b"), block_height: H + 7, block_hash: hex("c"), index: 0, tx_hash: hex("6"), reward_base: 2_500_000_000, reward_arc: 2.5, receipt_url: `/community/reward_receipt/0x${hex("6")}`, payment: { status: "earned", receipt_backed: true, reward_base: 2_500_000_000, reward_arc: 2.5 } },
+    { schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward", source: "chain_receipt", mined: true, receipt_status: "failed", submitted: true, included: true, confirmed: false, success: false, computed: false, paid: false, earned: false, tx_type: "CommunityInferenceReward", tx_type_code: "0x25", worker: hex("6"), block_height: H + 6, tx_hash: hex("5"), receipt_url: `/community/reward_receipt/0x${hex("5")}` },
+    { schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward", source: "chain_receipt", mined: true, receipt_status: "success", submitted: true, included: true, confirmed: false, success: true, computed: true, paid: true, earned: true, tx_type: "CommunityInferenceReward", tx_type_code: "0x25", worker: hex("6"), block_height: H + 6, tx_hash: hex("a"), receipt_url: `/community/reward_receipt/0x${hex("a")}` },
     { schema: "arc.inference.activity.v1", record_kind: "inference_observation", source: "local", mined: false, receipt_status: "absent", tx_type: "InferenceAttestation", block_height: H + 9, tx_hash: hex("8") },
     { schema: "arc.inference.activity.v1", record_kind: "mined_inference_attestation", source: "chain_receipt", mined: true, receipt_status: "success", success: true, computed: true, paid: false, earned: false, tx_type: "InferenceAttestation", tx_type_code: "0x16", block_height: H - 1, tx_hash: hex("9") },
     { schema: "arc.inference.activity.v1", record_kind: "mined_community_inference_reward", source: "chain_receipt", mined: true, receipt_status: "success", success: true, computed: true, paid: true, earned: true, tx_type: "InferenceRewardBogus", tx_type_code: "0x25", block_height: H + 5, tx_hash: hex("4") },
@@ -243,7 +256,7 @@ await test("inference feed includes only successful canonical mined receipts", a
   assert.equal(result.confirmed.length, 2);
   assert.equal(result.confirmed[0].receipt.txHash, hex("7"));
   assert.equal(result.confirmed[1].receipt.paymentConfirmed, true);
-  assert.equal(result.excluded, 7);
+  assert.equal(result.excluded, 8);
 });
 
 await test("missing worker earnings fields remain unavailable, never zero", () => {
@@ -274,6 +287,11 @@ await test("mined reward ARC and projection fail closed without exact successful
 
   for (const confirmed_receipts of [
     [rewardReceipt("1"), rewardReceipt("3", { success: false }), rewardReceipt("5")],
+    [rewardReceipt("1"), rewardReceipt("3", { worker: hex("b") }), rewardReceipt("5")],
+    [rewardReceipt("1"), rewardReceipt("3", { submitted: false }), rewardReceipt("5")],
+    [rewardReceipt("1"), rewardReceipt("3", { included: false }), rewardReceipt("5")],
+    [rewardReceipt("1"), rewardReceipt("3", { confirmed: false }), rewardReceipt("5")],
+    [rewardReceipt("1"), rewardReceipt("3", { receipt_url: `/community/reward_receipt/0x${hex("9")}` }), rewardReceipt("5")],
     [rewardReceipt("1"), rewardReceipt("3", { tx_type: "0x16" }), rewardReceipt("5")],
     [rewardReceipt("1"), rewardReceipt("3", { reward_base: 2_499_999_999 }), rewardReceipt("5")],
     [rewardReceipt("1"), rewardReceipt("3", { reward_arc: 2 }), rewardReceipt("5")],
@@ -301,6 +319,36 @@ await test("mined reward ARC and projection fail closed without exact successful
   assert.equal(forgedButInternallyConsistent.totalRewards, null);
   assert.equal(forgedButInternallyConsistent.confirmedGross, null);
   assert.equal(forgedButInternallyConsistent.projectedPerDay, null);
+});
+
+await test("archive labels require the exact canonical recovery-history contract", () => {
+  const valid = app.normalizeWorkerEarnings(readyProjectionBody(), {});
+  assert.equal(valid.archiveMode, true);
+  assert.equal(valid.historyContractConsistent, true);
+  for (const overrides of [
+    { history_complete_since_recovery: false },
+    { history_scope: "retained window" },
+    { archive_mode: true, history_scope: undefined },
+    { history_domain: "current recovery epoch only" },
+    { history_domain: undefined },
+  ]) {
+    const degraded = app.normalizeWorkerEarnings(readyProjectionBody(3, overrides), {});
+    assert.equal(degraded.archiveMode, false);
+    assert.equal(degraded.historyContractConsistent, false);
+    assert.equal(degraded.projectedPerDay, null);
+    assert.match(degraded.projectionReason, /history-scope contract/);
+  }
+});
+
+await test("archive lifetime earnings preserve exact receipts across recovery epochs", () => {
+  const body = readyProjectionBody();
+  body.confirmed_receipts[0].recovery_epoch = 1;
+  body.confirmed_receipts[0].validator_set_id = 3;
+  body.confirmed_receipts[1].recovery_epoch = 7;
+  body.confirmed_receipts[1].validator_set_id = 9;
+  const normalized = app.normalizeWorkerEarnings(body, {});
+  assert.equal(normalized.totalRewards, 3);
+  assert.equal(normalized.confirmedGross, 7.5);
 });
 
 await test("numeric projections require issuance, protocol, and approval readiness", () => {
@@ -375,7 +423,7 @@ await test("worker lookup is pinned to canonical v3 source and read-only endpoin
   const calls = [];
   const worker = hex("1");
   const fetchImpl = mockFetch({
-    [`https://v3-a.example.test/worker/earnings/${worker}`]: { body: { onchain_balance_arc: 4, confirmed_receipt_count: 2, confirmed_receipts: [rewardReceipt("1"), rewardReceipt("3")], confirmed_gross_earnings_arc: 5, projected_daily_arc: null, projected_daily_unavailable_reason: "insufficient observations" } },
+    [`https://v3-a.example.test/worker/earnings/${worker}`]: { body: { ...readyProjectionBody(2, { address: worker }), onchain_balance_arc: 4, total_rewards: 2, confirmed_gross_earnings_base: 5_000_000_000, confirmed_gross_earnings_arc: 5, projected_daily_arc: null, projected_daily_unavailable_reason: "insufficient observations" } },
     "https://v3-a.example.test/economics/rewards": { body: { attestation_reward_arc: 2.5 } },
   }, calls);
   const result = await app.loadWorkerEarnings({ resolver: makeResolver(), fetchImpl, workerId: `0x${worker}`, checkpointAudit: { state: "verified" } });
@@ -385,6 +433,22 @@ await test("worker lookup is pinned to canonical v3 source and read-only endpoin
   assert.equal(result.confirmedGross, 5);
   assert.ok(calls.every((call) => call.options.method === "GET"));
   assert.ok(calls.every((call) => call.url.startsWith("https://v3-a.example.test/")));
+});
+
+await test("worker lookup rejects a missing or mismatched response identity", async () => {
+  const worker = hex("1");
+  for (const address of [undefined, hex("2")]) {
+    const body = readyProjectionBody(2, { address: address ?? worker });
+    if (address === undefined) delete body.address;
+    const fetchImpl = mockFetch({
+      [`https://v3-a.example.test/worker/earnings/${worker}`]: { body },
+      "https://v3-a.example.test/economics/rewards": { body: {} },
+    });
+    await assert.rejects(
+      app.loadWorkerEarnings({ resolver: makeResolver(), fetchImpl, workerId: worker, checkpointAudit: { state: "verified" } }),
+      /not bound to the requested worker address/,
+    );
+  }
 });
 
 await test("worker IDs are validated before path construction", () => {

@@ -39,6 +39,10 @@ pub struct AppState {
     /// host. In-memory only — survives only for the lifetime of the process,
     /// which is fine because Tier 1 requests finalize in seconds.
     pub tier1_routes: Arc<Mutex<HashMap<String, String>>>,
+    /// Exact receipt identity + origin captured natively from a successful
+    /// inference response. Receipt polling must match this entry; an IPC caller
+    /// cannot select a different allowlisted seed after the fact.
+    pub community_receipt_routes: Arc<Mutex<HashMap<String, CommunityReceiptRoute>>>,
     /// The seed currently elected for chain reads, plus when it was elected.
     /// Re-probed on a TTL rather than per request — `node_status` polls every
     /// 1.5s and probing six seeds that often would be pointless load on a
@@ -56,6 +60,14 @@ pub struct AppState {
     /// this state; a WebView Start/Restart click cannot bypass a startup
     /// failure and replay an ambiguous legacy WAL.
     pub data_migration_error: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommunityReceiptRoute {
+    pub source_host: String,
+    pub job_id: String,
+    pub worker: String,
+    pub receipt_url: String,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -88,6 +100,7 @@ pub fn run() {
         data_dir: data_dir.clone(),
         http,
         tier1_routes: Arc::new(Mutex::new(HashMap::new())),
+        community_receipt_routes: Arc::new(Mutex::new(HashMap::new())),
         chain_host: Arc::new(Mutex::new(None)),
         wallet_write: Arc::new(Mutex::new(())),
         has_tray: has_tray.clone(),
@@ -488,6 +501,7 @@ pub fn run() {
             commands::start_node,
             commands::stop_node,
             commands::prepare_update_relaunch,
+            commands::begin_update_handoff,
             commands::abort_update_relaunch,
             commands::restart_node,
             commands::reset_peer_state,
@@ -513,6 +527,7 @@ pub fn run() {
             commands::run_inference,
             commands::run_inference_via_coordinator,
             commands::run_inference_via_coordinator_direct,
+            commands::fetch_community_reward_receipt,
             commands::tier1_submit,
             commands::tier1_result,
             commands::run_paid_inference,

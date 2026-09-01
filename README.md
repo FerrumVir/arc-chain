@@ -1,5 +1,5 @@
-![Rust](https://img.shields.io/badge/Rust-175K%2B_LOC-orange)
-![Tests](https://img.shields.io/badge/Rust_tests-1%2C800%2B_defined-brightgreen)
+![Rust](https://img.shields.io/badge/Rust-196K%2B_LOC-orange)
+![Tests](https://img.shields.io/badge/Rust_tests-1%2C900%2B_defined-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
 ![Inference](https://img.shields.io/badge/inference-CPU_KAT--verified-purple)
 ![Testnet](https://img.shields.io/badge/public_fleet-forked-red)
@@ -606,12 +606,13 @@ Users / AI Agents
 
 ## Codebase
 
-The current checkout contains more than 175,000 physical lines of Rust under
-`crates/`, `agents/`, and `relayer/`: 17 ARC packages, plus one narrowly
-vendored `wasmer-derive` workspace member. More than 1,800 Rust test functions
-are defined. These are source-tree counts, not test-pass claims; the commands
-below are the release evidence. Run the complete release gate from the
-repository root:
+The current checkout contains more than 196,000 physical lines of checked-in,
+non-vendored Rust across ARC's crates, agents, relayer, faucet, desktop backend,
+and integration tests: 17 ARC packages, plus one narrowly
+vendored `wasmer-derive` workspace member that is excluded from that line count.
+More than 1,900 Rust test functions are defined in the same non-vendored tree. These
+are source-tree counts, not test-pass claims; the commands below are the release
+evidence. Run the complete release gate from the repository root:
 
 ```bash
 ./scripts/ci_check.sh             # full release/security/integration/UI suite
@@ -857,14 +858,23 @@ rejects every request item that omits either the transaction signature or its
 public key; publishing these routes does not restore unsigned transaction
 submission.
 
-`/worker/earnings/{address}` returns confirmed mined `0x25` receipt rows from
-the selected host's current in-memory retained window; it is not a durable
-lifetime ledger. A non-archive host can prune older rows and can have an empty
-in-memory index after restart. The desktop therefore labels this value
-**Retained by selected host**, keeps a valid zero separate from an unavailable
-or malformed RPC response, and never turns a failed read into “0 ARC.”
-Projection is null with an explicit reason unless policy, retained history,
-treasury, and remaining consensus budget all permit one.
+`/worker/earnings/{address}` returns only confirmed mined `0x25` receipt rows.
+The v0.8 production rollout forces archive mode on all six selectable public
+validators, disables receipt/transaction/WAL pruning in that mode, requires
+`archive_mode=true` from every earnings response, and restarts every validator
+after the two rollout receipts are mined before re-proving both rows. Once that
+cutover passes, this is complete gross reward history since the v3 recovery
+boundary across every later recovery epoch—not a wallet's net balance after
+transfers or spending. The exact `history_domain` field makes that all-v3
+scope machine-checkable. Historical receipt rows retain their own
+`recovery_epoch`, `validator_set_id`, and `transaction_domain`; the matching
+top-level fields describe the current issuance/readiness context and need not
+equal older rows. The desktop
+keeps a valid zero separate from an unavailable or malformed RPC response and
+never turns a failed read into “0 ARC.” Projection is null with an explicit
+reason unless policy, confirmed history, treasury, and remaining consensus
+budget all permit one. These durability claims are still candidate behavior
+until the protected production cutover completes.
 
 The public v2 seeds still exhibit two known API bugs: `/models` double-counts
 replicated layer coverage, and `/worker/earnings/{addr}` reports display

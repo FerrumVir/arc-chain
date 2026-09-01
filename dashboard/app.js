@@ -17,6 +17,9 @@
   const PROJECTION_COLLECTING_REASON = "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries";
   const PROJECTION_WINDOW_REASON = "collecting data: this host has not supplied a valid confirmed-receipt window spanning at least 24 hours";
   const PROJECTION_RECEIPT_EVIDENCE_REASON = "confirmed mined 0x25 receipt evidence is unavailable or internally inconsistent";
+  const ARCHIVE_EARNINGS_SCOPE = "complete canonical reward history since the v3 recovery boundary";
+  const RETAINED_EARNINGS_SCOPE = "this node's bounded retained reward-receipt window";
+  const EARNINGS_HISTORY_DOMAIN = "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
 
   class RpcError extends Error {
     constructor(message, status, sourceId) {
@@ -222,15 +225,32 @@
 
   function normalizeWorkerEarnings(earnings, economics) {
     const balance = numberOrNull(earnings?.onchain_balance_arc, earnings?.balance_arc);
+    const earningsAddress = network.normalizeHex(earnings?.address, 32);
     const confirmedReceipts = Array.isArray(earnings?.confirmed_receipts) ? earnings.confirmed_receipts : null;
     const confirmedReceiptCount = integerOrNull(earnings?.confirmed_receipt_count);
     const confirmedGross = numberOrNull(earnings?.confirmed_gross_earnings_arc);
+    const historyCompleteSinceRecovery = earnings?.history_complete_since_recovery === true;
+    const historyScope = typeof earnings?.history_scope === "string" ? earnings.history_scope : null;
+    const historyDomain = typeof earnings?.history_domain === "string" ? earnings.history_domain : null;
+    const archiveMode = earnings?.archive_mode === true
+      && historyCompleteSinceRecovery
+      && historyScope === ARCHIVE_EARNINGS_SCOPE
+      && historyDomain === EARNINGS_HISTORY_DOMAIN;
+    const historyContractConsistent = historyDomain === EARNINGS_HISTORY_DOMAIN && (archiveMode || (
+      earnings?.archive_mode === false
+      && earnings?.history_complete_since_recovery === false
+      && historyScope === RETAINED_EARNINGS_SCOPE
+    ));
     const receiptTxHashes = new Set();
     const receiptJobIds = new Set();
     const confirmedReceiptGross = confirmedReceipts?.reduce((sum, receipt) => {
       if (!receipt || typeof receipt !== "object"
         || receipt.tx_type !== "0x25"
+        || receipt.submitted !== true
+        || receipt.included !== true
+        || receipt.confirmed !== true
         || receipt.success !== true
+        || network.normalizeHex(receipt.worker, 32) !== earningsAddress
         || !network.normalizeHex(receipt.tx_hash, 32)
         || !network.normalizeHex(receipt.job_id, 32)
         || !network.normalizeHex(receipt.block_hash, 32)
@@ -240,12 +260,14 @@
         || receipt.reward_arc !== COMMUNITY_REWARD_ARC) return Number.NaN;
       const txHash = network.normalizeHex(receipt.tx_hash, 32);
       const jobId = network.normalizeHex(receipt.job_id, 32);
+      if (receipt.receipt_url !== `/community/reward_receipt/0x${txHash}`) return Number.NaN;
       if (receiptTxHashes.has(txHash) || receiptJobIds.has(jobId)) return Number.NaN;
       receiptTxHashes.add(txHash);
       receiptJobIds.add(jobId);
       return sum + COMMUNITY_REWARD_ARC;
     }, 0) ?? null;
-    const receiptEvidenceConsistent = confirmedReceipts !== null
+    const receiptEvidenceConsistent = earningsAddress !== null
+      && confirmedReceipts !== null
       && confirmedReceiptCount !== null
       && confirmedReceipts.length === confirmedReceiptCount
       && confirmedGross !== null
@@ -276,6 +298,7 @@
       receiptEvidenceConsistent ? confirmedReceipts.length : null,
     );
     const projectedPerDay = receiptEvidenceConsistent
+      && historyContractConsistent
       && readiness === "ready"
       && observationGate === null
       && projectionValue !== null
@@ -284,14 +307,15 @@
       : null;
     let projectionReason = projectedPerDay === null ? hostProjectionReason : null;
     if (projectedPerDay === null && projectionReason === null) {
-      if (observationGate !== null) projectionReason = observationGate;
+      if (!historyContractConsistent) projectionReason = "the earnings endpoint did not provide a consistent canonical history-scope contract";
+      else if (observationGate !== null) projectionReason = observationGate;
       else if (readiness !== "ready" && rawProjection !== null && rawProjection !== undefined) {
         projectionReason = "reward issuance, protocol activation, and validator approval readiness are not all confirmed";
       } else if (rawProjection !== null && rawProjection !== undefined && projectionValue === null) {
         projectionReason = "the earnings endpoint supplied a malformed projection";
       }
     }
-    return { balance, totalRewards, confirmedGross: receiptEvidenceConsistent ? confirmedGross : null, confirmedReceipts, receiptEvidenceConsistent, observedRate, rewardPerAttestation, projectedPerDay, projectionReason, enabled, active, approvals, readiness, raw: earnings, economics };
+    return { earningsAddress, balance, totalRewards, confirmedGross: receiptEvidenceConsistent ? confirmedGross : null, confirmedReceipts, receiptEvidenceConsistent, archiveMode, historyCompleteSinceRecovery, historyScope, historyDomain, historyContractConsistent, observedRate, rewardPerAttestation, projectedPerDay, projectionReason, enabled, active, approvals, readiness, raw: earnings, economics };
   }
 
   function validateWorkerId(raw) {
@@ -313,6 +337,10 @@
       optionalRequest(fetchImpl, source, "/economics/rewards", { signal }),
     ]);
     if (!earnings.ok) throw earnings.error;
+    const responseAddress = network.normalizeHex(earnings.value?.address, 32);
+    if (responseAddress !== validated.value) {
+      throw new Error("The canonical earnings response was not bound to the requested worker address.");
+    }
     return { workerId: validated.value, source, ...normalizeWorkerEarnings(earnings.value, economics.ok ? economics.value : null) };
   }
 
@@ -458,7 +486,7 @@
       text(elements.workerRewards, formatArc(result.confirmedGross));
       text(elements.workerRewardsDetail, !result.receiptEvidenceConsistent
         ? "Mined reward ARC unavailable: retained 0x25 receipt evidence is incomplete or inconsistent"
-        : `${formatInteger(result.totalRewards)} successful retained 0x25 receipt${result.totalRewards === 1 ? "" : "s"}`);
+        : `${formatInteger(result.totalRewards)} successful ${result.archiveMode ? "archive-backed" : "retained"} 0x25 receipt${result.totalRewards === 1 ? "" : "s"}`);
       text(elements.workerRate, result.observedRate === null ? "—" : `${result.observedRate}/day`);
       text(elements.workerProjection, formatArc(result.projectedPerDay));
       const mapping = {

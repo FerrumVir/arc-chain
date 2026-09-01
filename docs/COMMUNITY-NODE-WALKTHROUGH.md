@@ -181,7 +181,14 @@ for ARC_PROBE in 1 2; do
       > "/tmp/arc-receipt-$ARC_PROBE.json"
     ARC_STATUS=$(jq -er '.status' "/tmp/arc-receipt-$ARC_PROBE.json")
     [ "$ARC_STATUS" = mined_success ] && break
-    case "$ARC_STATUS" in failed|rejected|pruned) exit 1 ;; esac
+    case "$ARC_STATUS" in
+      pending_mined_receipt) ;;
+      mined_failed|receipt_unavailable)
+        echo "reward ended in $ARC_STATUS; no ARC is confirmed" >&2
+        exit 1
+        ;;
+      *) echo "unknown reward receipt state: $ARC_STATUS" >&2; exit 1 ;;
+    esac
     [ "$SECONDS" -ge "$ARC_DEADLINE" ] && {
       echo "receipt did not mine inside the 180-second recording bound" >&2
       exit 1
@@ -217,12 +224,15 @@ has reached `mined_success`, as the loop above enforces.
 for ARC_PROBE in 1 2; do
   jq -e '
     .status=="mined_success" and .tx_type=="0x25" and
+    .submitted==true and .included==true and
     .confirmed==true and .success==true and
+    .receipt_url==( "/community/reward_receipt/" + .tx_hash ) and
     .reward_base==2500000000 and .reward_arc==2.5
   ' "/tmp/arc-receipt-$ARC_PROBE.json" >/dev/null
   jq '{status,tx_type,tx_hash,job_id,worker,model_id,input_hash,output_hash,
        recovery_epoch,validator_set_id,transaction_domain,
-       validator_approvals,included,confirmed,success,block_height,block_hash,
+       validator_approvals,submitted,included,confirmed,success,
+       block_height,block_hash,index,receipt_url,
        reward_base,reward_arc,evidence_source}' "/tmp/arc-receipt-$ARC_PROBE.json"
 done
 
@@ -236,7 +246,7 @@ jq -s -e '
 
 curl -fsS "$ARC_RPC/worker/earnings/$ARC_WORKER" \
   | tee /tmp/arc-earnings.json \
-  | jq '{onchain_balance_arc,confirmed_receipt_count,
+  | jq '{address,onchain_balance_arc,confirmed_receipt_count,
          confirmed_gross_earnings_base,confirmed_gross_earnings_arc,
          confirmed_receipts,attestations_per_day_observed,
          attestations_per_day_unavailable_reason,projected_daily_arc,
@@ -246,9 +256,14 @@ curl -fsS "$ARC_RPC/worker/earnings/$ARC_WORKER" \
          reward_is_customer_demand,
          reward_per_attestation_base,reward_per_attestation_arc,
          recovery_epoch,validator_set_id,stake_zero_eligible,
+         archive_mode,history_complete_since_recovery,history_scope,history_domain,
          last_reward_block,last_reward_tx_hash}'
 
 jq -e '
+  (.address|ascii_downcase|ltrimstr("0x"))==(env.ARC_WORKER|ascii_downcase|ltrimstr("0x")) and
+  .archive_mode==true and .history_complete_since_recovery==true and
+  .history_scope=="complete canonical reward history since the v3 recovery boundary" and
+  .history_domain=="all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain" and
   .confirmed_receipt_count==2 and
   .confirmed_gross_earnings_base==5000000000 and
   .confirmed_gross_earnings_arc==5 and
@@ -274,8 +289,12 @@ Narration:
 - `onchain_balance_arc` is the address’s actual current chain balance.
 - `confirmed_receipt_count` counts only successful, mined
   `CommunityInferenceReward` receipts visible in this node’s retained index.
-- `confirmed_receipts` provides the rows, including block and recovery-domain
-  bindings, that sum to `confirmed_gross_earnings_base`.
+- `confirmed_receipts` provides the rows, including exact block and
+  recovery-domain bindings, that sum to `confirmed_gross_earnings_base`.
+  Archive lifetime history begins at the initial v3 recovery boundary and
+  intentionally spans all later recovery epochs, so mixed per-row
+  `recovery_epoch`, `validator_set_id`, and `transaction_domain` values are
+  valid historical evidence rather than a mismatch.
 - `projected_daily_arc` appears only when an explicit active policy, confirmed
   receipt rate, funded treasury, and remaining block/epoch/worker/coordinator
   budgets support it. Otherwise it stays null and

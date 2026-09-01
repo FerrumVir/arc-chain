@@ -14,6 +14,7 @@ import type {
   HardwareInfo,
   Identity,
   InferenceResult,
+  InferenceSettlement,
   LogEntry,
   ModelTierInfo,
   NetworkOverview,
@@ -72,6 +73,12 @@ function settlementWriteUnavailable(flow: string): Error {
 
 const RETAINED_EARNINGS_SOURCE =
   "scan of this node's in-memory full_transactions map";
+const ARCHIVE_EARNINGS_SCOPE =
+  "complete canonical reward history since the v3 recovery boundary";
+const RETAINED_EARNINGS_SCOPE =
+  "this node's bounded retained reward-receipt window";
+const EARNINGS_HISTORY_DOMAIN =
+  "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
 
 function unavailableEarnings(unavailableReason: string): Earnings {
   return {
@@ -91,8 +98,16 @@ function unavailableEarnings(unavailableReason: string): Earnings {
     unavailableReason,
     receiptSource: null,
     archiveMode: null,
+    historyCompleteSinceRecovery: null,
+    historyScope: null,
     fromChain: false,
   };
+}
+
+function normalizeHash32(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const bare = value.replace(/^0x/i, "");
+  return /^[0-9a-fA-F]{64}$/.test(bare) ? `0x${bare.toLowerCase()}` : null;
 }
 
 /**
@@ -114,6 +129,10 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
   const approvalReady = o.community_rewards_v1_approval_collection_ready;
   const receiptSource = o.source;
   const archiveMode = o.archive_mode;
+  const historyCompleteSinceRecovery = o.history_complete_since_recovery;
+  const historyScope = o.history_scope;
+  const historyDomain = o.history_domain;
+  const responseAddress = normalizeHash32(o.address);
   if (
     typeof totalRewards !== "number" ||
     !Number.isSafeInteger(totalRewards) ||
@@ -133,18 +152,20 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     typeof protocolActive !== "boolean" ||
     typeof approvalReady !== "boolean" ||
     receiptSource !== RETAINED_EARNINGS_SOURCE ||
-    typeof archiveMode !== "boolean"
+    typeof archiveMode !== "boolean" ||
+    typeof historyCompleteSinceRecovery !== "boolean" ||
+    typeof historyScope !== "string" ||
+    historyDomain !== EARNINGS_HISTORY_DOMAIN ||
+    responseAddress === null ||
+    (archiveMode
+      ? historyCompleteSinceRecovery !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
+      : historyCompleteSinceRecovery !== false || historyScope !== RETAINED_EARNINGS_SCOPE)
   ) {
     return null;
   }
   if (effective && (!protocolActive || !approvalReady)) return null;
   let receiptBaseSum = 0;
   let receiptArcSum = 0;
-  const hash32 = (value: unknown): string | null => {
-    if (typeof value !== "string") return null;
-    const bare = value.replace(/^0x/i, "");
-    return /^[0-9a-fA-F]{64}$/.test(bare) ? `0x${bare.toLowerCase()}` : null;
-  };
   const receiptTxHashes = new Set<string>();
   const receiptJobIds = new Set<string>();
   const confirmedReceipts = [] as Earnings["confirmedReceipts"];
@@ -153,19 +174,25 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     const receipt = value as Record<string, unknown>;
     if (
       receipt.tx_type !== "0x25" ||
+      receipt.submitted !== true ||
+      receipt.included !== true ||
+      receipt.confirmed !== true ||
       receipt.success !== true ||
-      hash32(receipt.tx_hash) === null ||
-      hash32(receipt.job_id) === null ||
+      normalizeHash32(receipt.tx_hash) === null ||
+      normalizeHash32(receipt.job_id) === null ||
+      normalizeHash32(receipt.worker) !== responseAddress ||
       !Number.isSafeInteger(receipt.block_height) ||
       (receipt.block_height as number) < 0 ||
-      hash32(receipt.block_hash) === null ||
+      normalizeHash32(receipt.block_hash) === null ||
       receipt.reward_base !== 2_500_000_000 ||
       receipt.reward_arc !== 2.5
     ) {
       return null;
     }
-    const normalizedTxHash = hash32(receipt.tx_hash)!;
-    const normalizedJobId = hash32(receipt.job_id)!;
+    const normalizedTxHash = normalizeHash32(receipt.tx_hash)!;
+    const normalizedJobId = normalizeHash32(receipt.job_id)!;
+    const expectedReceiptUrl = `/community/reward_receipt/${normalizedTxHash}`;
+    if (receipt.receipt_url !== expectedReceiptUrl) return null;
     if (receiptTxHashes.has(normalizedTxHash) || receiptJobIds.has(normalizedJobId)) {
       return null;
     }
@@ -178,9 +205,10 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
       txHash: normalizedTxHash,
       jobId: normalizedJobId,
       blockHeight: receipt.block_height as number,
-      blockHash: hash32(receipt.block_hash)!,
+      blockHash: normalizeHash32(receipt.block_hash)!,
       rewardBase: receipt.reward_base as number,
       rewardArc: receipt.reward_arc,
+      receiptUrl: expectedReceiptUrl,
       recoveryEpoch:
         typeof receipt.recovery_epoch === "number"
           ? receipt.recovery_epoch
@@ -229,7 +257,7 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     o.last_reward_block >= 0
       ? o.last_reward_block
       : null;
-  const lastHash = hash32(o.last_reward_tx_hash);
+  const lastHash = normalizeHash32(o.last_reward_tx_hash);
   if (totalRewards > 0 && (lastBlock === null || lastHash === null)) return null;
   if (
     totalRewards > 0
@@ -260,6 +288,8 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     unavailableReason: null,
     receiptSource,
     archiveMode,
+    historyCompleteSinceRecovery,
+    historyScope,
     fromChain: true,
   };
 }
@@ -273,6 +303,177 @@ const COORDINATOR_HOSTS = [
   "https://202.182.107.41", // NRT
   "https://149.28.153.31", // SGP
 ];
+
+type CommunityRewardReceiptExpectation = {
+  sourceHost: string;
+  txHash: string;
+  jobId: string;
+  worker: string;
+  receiptUrl: string;
+};
+
+const liveCommunityReceiptRoutes = new Map<
+  string,
+  CommunityRewardReceiptExpectation
+>();
+
+function pinLiveCommunityReceiptRoute(result: InferenceResult): void {
+  const settlement = result.settlement;
+  if (!settlement || !result.coordinator) return;
+  const route = {
+    sourceHost: result.coordinator,
+    txHash: settlement.txHash,
+    jobId: settlement.jobId,
+    worker: settlement.worker,
+    receiptUrl: settlement.receiptUrl,
+  };
+  try {
+    validateCommunityRewardReceiptExpectation(route);
+  } catch {
+    return;
+  }
+  if (
+    liveCommunityReceiptRoutes.size >= 512 &&
+    !liveCommunityReceiptRoutes.has(route.txHash)
+  ) {
+    const first = liveCommunityReceiptRoutes.keys().next().value;
+    if (typeof first === "string") liveCommunityReceiptRoutes.delete(first);
+  }
+  liveCommunityReceiptRoutes.set(route.txHash, route);
+}
+
+function canonicalHash32(value: unknown): string | null {
+  const normalized = normalizeHash32(value);
+  return typeof value === "string" && value === normalized ? normalized : null;
+}
+
+function validateCommunityRewardReceiptExpectation(
+  expected: CommunityRewardReceiptExpectation,
+): void {
+  if (
+    canonicalHash32(expected.txHash) === null ||
+    canonicalHash32(expected.jobId) === null ||
+    canonicalHash32(expected.worker) === null
+  ) {
+    throw new Error(
+      "reward receipt unavailable: submitted transaction, job, and worker identities must be canonical lowercase hashes",
+    );
+  }
+  if (
+    expected.receiptUrl !==
+    `/community/reward_receipt/${expected.txHash}`
+  ) {
+    throw new Error(
+      "reward receipt unavailable: submitted receipt URL is not bound to its transaction hash",
+    );
+  }
+}
+
+/**
+ * Fail-closed adapter for the independently fetched canonical receipt. Every
+ * identity and boolean/null combination is exact; an impossible or partial
+ * state is not downgraded into a payment claim.
+ */
+function parseCommunityRewardReceiptBody(
+  body: unknown,
+  expected: CommunityRewardReceiptExpectation,
+): InferenceSettlement {
+  validateCommunityRewardReceiptExpectation(expected);
+  const value = asObject(body);
+  if (!value) {
+    throw new Error("reward receipt unavailable: pinned host returned invalid JSON");
+  }
+  for (const [field, exact] of [
+    ["tx_type", "0x25"],
+    ["tx_hash", expected.txHash],
+    ["job_id", expected.jobId],
+    ["worker", expected.worker],
+    ["receipt_url", expected.receiptUrl],
+  ] as const) {
+    if (value[field] !== exact) {
+      throw new Error(
+        `reward receipt unavailable: canonical response ${field} did not exactly match the submitted identity`,
+      );
+    }
+  }
+
+  const status = value.status;
+  const safeNonnegativeInteger = (candidate: unknown): candidate is number =>
+    typeof candidate === "number" &&
+    Number.isSafeInteger(candidate) &&
+    candidate >= 0;
+  const includedEvidence =
+    safeNonnegativeInteger(value.block_height) &&
+    canonicalHash32(value.block_hash) !== null &&
+    safeNonnegativeInteger(value.index);
+  const pendingHasNoInclusion =
+    (value.block_height === undefined || value.block_height === null) &&
+    (value.block_hash === undefined || value.block_hash === null) &&
+    (value.index === undefined || value.index === null);
+  const pending =
+    status === "pending_mined_receipt" &&
+    value.submitted === true &&
+    value.included === false &&
+    value.confirmed === false &&
+    value.success === null &&
+    value.reward_base === null &&
+    value.reward_arc === null &&
+    pendingHasNoInclusion;
+  const minedSuccess =
+    status === "mined_success" &&
+    value.submitted === true &&
+    value.included === true &&
+    value.confirmed === true &&
+    value.success === true &&
+    value.reward_base === 2_500_000_000 &&
+    value.reward_arc === MOCK_REWARD_PER_RECEIPT &&
+    includedEvidence;
+  const minedFailed =
+    status === "mined_failed" &&
+    value.submitted === true &&
+    value.included === true &&
+    value.confirmed === false &&
+    value.success === false &&
+    value.reward_base === null &&
+    value.reward_arc === null &&
+    includedEvidence;
+  const unavailable =
+    status === "receipt_unavailable" &&
+    value.submitted === true &&
+    value.included === true &&
+    value.confirmed === false &&
+    value.success === null &&
+    value.reward_base === null &&
+    value.reward_arc === null &&
+    includedEvidence;
+  if (!pending && !minedSuccess && !minedFailed && !unavailable) {
+    throw new Error(
+      `reward receipt unavailable: canonical response has an invalid ${String(status)} state matrix`,
+    );
+  }
+
+  return {
+    status: status as string,
+    txType: "0x25",
+    txHash: expected.txHash,
+    jobId: expected.jobId,
+    worker: expected.worker,
+    submitted: true,
+    included: value.included as boolean,
+    confirmed: value.confirmed as boolean,
+    success: value.success as boolean | null,
+    blockHeight: safeNonnegativeInteger(value.block_height)
+      ? value.block_height
+      : null,
+    blockHash: canonicalHash32(value.block_hash),
+    index: safeNonnegativeInteger(value.index) ? value.index : null,
+    rewardBase: safeNonnegativeInteger(value.reward_base)
+      ? value.reward_base
+      : null,
+    rewardArc: value.reward_arc as number | null,
+    receiptUrl: expected.receiptUrl,
+  };
+}
 
 /**
  * Per-command mock overrides, for tests only.
@@ -440,9 +641,33 @@ function parseInferenceRunBody(
           txType: stringField(settlementValue, "tx_type"),
           txHash: stringField(settlementValue, "tx_hash"),
           jobId: stringField(settlementValue, "job_id"),
+          worker: stringField(settlementValue, "worker"),
           submitted: settlementValue?.submitted === true,
           included: settlementValue?.included === true,
           confirmed: settlementValue?.confirmed === true,
+          success:
+            typeof settlementValue?.success === "boolean"
+              ? settlementValue.success
+              : null,
+          blockHeight:
+            typeof settlementValue?.block_height === "number" &&
+            Number.isSafeInteger(settlementValue.block_height) &&
+            settlementValue.block_height >= 0
+              ? settlementValue.block_height
+              : null,
+          blockHash: stringField(settlementValue, "block_hash") || null,
+          index:
+            typeof settlementValue?.index === "number" &&
+            Number.isSafeInteger(settlementValue.index) &&
+            settlementValue.index >= 0
+              ? settlementValue.index
+              : null,
+          rewardBase:
+            typeof settlementValue?.reward_base === "number" &&
+            Number.isSafeInteger(settlementValue.reward_base) &&
+            settlementValue.reward_base >= 0
+              ? settlementValue.reward_base
+              : null,
           rewardArc:
             typeof rewardArc === "number" &&
             Number.isFinite(rewardArc) &&
@@ -580,8 +805,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "generate_identity":
       return {
         address:
-          "arc1q" +
-          [...crypto.getRandomValues(new Uint8Array(20))]
+          [...crypto.getRandomValues(new Uint8Array(32))]
             .map((b) => b.toString(16).padStart(2, "0"))
             .join(""),
         publicKey:
@@ -703,6 +927,11 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (response.kind !== "ok") {
         return unavailableEarnings(reason(path, response)) as T;
       }
+      if (normalizeHash32(asObject(response.body)?.address) !== normalizeHash32(addr)) {
+        return unavailableEarnings(
+          `${base} answered ${path}, but the earnings response was not bound to the requested worker address.`,
+        ) as T;
+      }
       return (confirmedEarningsFromBody(response.body) ?? unavailableEarnings(
         `${base} answered ${path}, but did not provide the candidate mined-0x25 retained-receipt contract. Legacy or malformed inference-count arithmetic is not earnings.`,
       )) as T;
@@ -740,10 +969,18 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
               && v.computed === true;
             if (!common) return false;
             if (v.record_kind === "mined_community_inference_reward") {
+              const txHash = typeof v.tx_hash === "string"
+                ? v.tx_hash.replace(/^0x/i, "").toLowerCase()
+                : "";
               return v.tx_type === "CommunityInferenceReward"
                 && v.tx_type_code === "0x25"
                 && v.paid === true
-                && v.earned === true;
+                && v.earned === true
+                && v.submitted === true
+                && v.included === true
+                && v.confirmed === true
+                && /^[0-9a-f]{64}$/.test(txHash)
+                && v.receipt_url === `/community/reward_receipt/0x${txHash}`;
             }
             if (v.record_kind === "mined_inference_attestation") {
               return v.tx_type === "InferenceAttestation"
@@ -821,6 +1058,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "start_node":
     case "stop_node":
     case "prepare_update_relaunch":
+    case "begin_update_handoff":
     case "abort_update_relaunch":
     case "restart_node":
       return undefined as T;
@@ -972,7 +1210,52 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const v = await r.json();
       // liveBase() is 127.0.0.1 - this IS the local node, even when that
       // coordinator dispatches the actual compute to a community worker.
-      return parseInferenceRunBody(v, true) as T;
+      const result = parseInferenceRunBody(v, true, base);
+      pinLiveCommunityReceiptRoute(result);
+      return result as T;
+    }
+    case "fetch_community_reward_receipt": {
+      const expected = args as CommunityRewardReceiptExpectation;
+      validateCommunityRewardReceiptExpectation(expected);
+      if (
+        expected.sourceHost !== base &&
+        !COORDINATOR_HOSTS.includes(expected.sourceHost)
+      ) {
+        throw new Error(
+          "reward receipt unavailable: source host is not the exact local node or a compiled-in ARC coordinator",
+        );
+      }
+      const pinned = liveCommunityReceiptRoutes.get(expected.txHash);
+      if (
+        !pinned ||
+        pinned.sourceHost !== expected.sourceHost ||
+        pinned.jobId !== expected.jobId ||
+        pinned.worker !== expected.worker ||
+        pinned.receiptUrl !== expected.receiptUrl
+      ) {
+        throw new Error(
+          "reward receipt unavailable: requested identity differs from the browser-live inference route pin",
+        );
+      }
+      const response = await fetch(
+        `${expected.sourceHost}${expected.receiptUrl}`,
+        { redirect: "error" },
+      ).catch((error) => {
+        throw new Error(
+          `reward receipt unavailable from pinned coordinator ${expected.sourceHost}: ${String(error)}`,
+        );
+      });
+      if (!response.ok) {
+        throw new Error(
+          `reward receipt unavailable from pinned coordinator ${expected.sourceHost}: HTTP ${response.status}`,
+        );
+      }
+      const body = await response.json().catch(() => {
+        throw new Error(
+          `reward receipt unavailable from pinned coordinator ${expected.sourceHost}: invalid JSON`,
+        );
+      });
+      return parseCommunityRewardReceiptBody(body, expected) as T;
     }
     case "run_inference_via_coordinator": {
       const { prompt, maxTokens, k, chatTemplate } = args as {
@@ -1066,7 +1349,9 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             continue;
           }
           const v = await r.json();
-          return parseInferenceRunBody(v, false, host) as T;
+          const result = parseInferenceRunBody(v, false, host);
+          pinLiveCommunityReceiptRoute(result);
+          return result as T;
         } catch (e) {
           const message = `${host} → ${String(e)}`;
           if (directInferenceMustNotRetry(message)) throw e;
@@ -1205,6 +1490,12 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const d = await getDetailed(path);
       if (d.kind !== "ok") {
         return { ...empty, unavailable: reason(path, d) } as T;
+      }
+      if (normalizeHash32(asObject(d.body)?.address) !== normalizeHash32(addr)) {
+        return {
+          ...empty,
+          unavailable: `${base} answered ${path}, but the earnings response was not bound to the requested worker address.`,
+        } as T;
       }
       const confirmed = confirmedEarningsFromBody(d.body);
       if (!confirmed) {
@@ -1683,6 +1974,7 @@ const mockEarnings: Earnings = {
       blockHash: `0x${"10".repeat(32)}`,
       rewardBase: 2_500_000_000,
       rewardArc: 2.5,
+      receiptUrl: `/community/reward_receipt/0x${"aa".repeat(32)}`,
       recoveryEpoch: 1,
       validatorSetId: 1,
     },
@@ -1693,6 +1985,7 @@ const mockEarnings: Earnings = {
       blockHash: `0x${"11".repeat(32)}`,
       rewardBase: 2_500_000_000,
       rewardArc: 2.5,
+      receiptUrl: `/community/reward_receipt/0x${"ab".repeat(32)}`,
       recoveryEpoch: 1,
       validatorSetId: 1,
     },
@@ -1704,12 +1997,14 @@ const mockEarnings: Earnings = {
   unavailableReason: null,
   receiptSource: RETAINED_EARNINGS_SOURCE,
   archiveMode: false,
+  historyCompleteSinceRecovery: false,
+  historyScope: RETAINED_EARNINGS_SCOPE,
   fromChain: true,
 };
 
 // The mock deliberately exercises raw 0x16 claims, two distinct successful
 // mined 0x25 payment receipts, another worker's activity, and old-seed padding.
-const MOCK_ADDRESS = "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p";
+const MOCK_ADDRESS = "99".repeat(32);
 
 const mockAttestations: Attestation[] = [
   {
@@ -1877,7 +2172,7 @@ function seedMockLogs() {
   const now = Date.now();
   const entries: Array<[LogEntry["level"], string, number]> = [
     ["info", "arc-node v0.5.2 starting", 12_000],
-    ["info", "Loaded identity arc1qxy...8z3p", 11_800],
+    ["info", `Loaded identity ${MOCK_ADDRESS.slice(0, 8)}...${MOCK_ADDRESS.slice(-4)}`, 11_800],
     ["info", "Connecting to 8 testnet seeds", 11_500],
     ["ok", "Handshake complete with 149.28.32.76", 10_200],
     ["ok", "Handshake complete with 140.82.16.112", 10_100],
@@ -1990,6 +2285,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "prepare_update_relaunch":
       mockStartedAt = null;
+      return undefined as T;
+    case "begin_update_handoff":
       return undefined as T;
     case "abort_update_relaunch":
       return undefined as T;
@@ -2238,6 +2535,26 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         servedLocally: true,
       } as T;
     }
+    case "fetch_community_reward_receipt": {
+      const expected = args as CommunityRewardReceiptExpectation;
+      return parseCommunityRewardReceiptBody(
+        {
+          status: "pending_mined_receipt",
+          tx_type: "0x25",
+          tx_hash: expected.txHash,
+          job_id: expected.jobId,
+          worker: expected.worker,
+          submitted: true,
+          included: false,
+          confirmed: false,
+          success: null,
+          reward_base: null,
+          reward_arc: null,
+          receipt_url: expected.receiptUrl,
+        },
+        expected,
+      ) as T;
+    }
     case "run_inference_via_coordinator": {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 1200));
@@ -2438,6 +2755,7 @@ export const api = {
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
   stopNode: () => invoke<void>("stop_node"),
   prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),
+  beginUpdateHandoff: () => invoke<void>("begin_update_handoff"),
   abortUpdateRelaunch: () => invoke<void>("abort_update_relaunch"),
   restartNode: () => invoke<void>("restart_node"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
@@ -2502,6 +2820,25 @@ export const api = {
       prompt,
       maxTokens,
       chatTemplate,
+    }),
+  /**
+   * Independently fetch an exact 0x25 receipt from the host that served the
+   * inference. Native code pins/allowlists the origin and validates the full
+   * transaction, job, worker, URL, and state matrix.
+   */
+  fetchCommunityRewardReceipt: (
+    sourceHost: string,
+    txHash: string,
+    jobId: string,
+    worker: string,
+    receiptUrl: string,
+  ) =>
+    invoke<InferenceSettlement>("fetch_community_reward_receipt", {
+      sourceHost,
+      txHash,
+      jobId,
+      worker,
+      receiptUrl,
     }),
   // Write commands remain in the IPC surface for compatibility, but every
   // native/browser implementation rejects them before signing or network I/O.
