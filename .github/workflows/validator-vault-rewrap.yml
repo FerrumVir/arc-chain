@@ -405,6 +405,9 @@ jobs:
                       raise ValueError("file-directory hierarchy collision")
 
               keys = []
+              key_parent = None
+              inventory_parent = None
+              inventory_seen = False
               for name, (kind, parts, payload) in records.items():
                   if kind != "file":
                       continue
@@ -417,12 +420,26 @@ jobs:
                          base[1][-1].startswith("._") or not is_appledouble(payload):
                           raise ValueError("invalid AppleDouble metadata")
                       continue
+                  if basename == "PUBLIC-INVENTORY.json":
+                      if inventory_seen:
+                          raise ValueError("duplicate public inventory")
+                      inventory_seen = True
+                      inventory_parent = parts[:-1]
+                      continue
+                  if not basename.endswith(".key") or basename == ".key":
+                      raise ValueError("unexpected non-key vault member")
+                  if key_parent is None:
+                      key_parent = parts[:-1]
+                  elif key_parent != parts[:-1]:
+                      raise ValueError("key parent mismatch")
                   if len(payload) > MAX_KEY_BYTES:
                       raise ValueError("key size")
                   keys.append((name, payload))
 
               if len(keys) != 6 or sum(len(payload) for _, payload in keys) > MAX_KEY_FILE_BYTES:
                   raise ValueError("key count or aggregate size")
+              if inventory_seen and inventory_parent != key_parent:
+                  raise ValueError("public inventory parent mismatch")
               output = io.BytesIO()
               with tarfile.open(fileobj=output, mode="w:", format=tarfile.USTAR_FORMAT) as archive:
                   for name, payload in sorted(keys, key=lambda row: row[0].encode("utf-8")):

@@ -135,6 +135,18 @@ class ValidatorVaultArchiveTests(unittest.TestCase):
             (directory_sidecar, directory_sidecar_payload),
             (directory, b""),
         ]
+        inventory_payload = b'{"schema":"arc.validator-key-vault.public-inventory.v1"}\n'
+        inventory_sidecar, inventory_sidecar_payload = self.regular(
+            "private/._PUBLIC-INVENTORY.json", self.appledouble()
+        )
+        inventory, _ = self.regular(
+            "private/PUBLIC-INVENTORY.json", inventory_payload
+        )
+        self.macos_metadata(inventory_sidecar)
+        self.macos_metadata(inventory)
+        members.extend(
+            ((inventory_sidecar, inventory_sidecar_payload), (inventory, inventory_payload))
+        )
         expected: dict[str, bytes] = {}
         for index in range(1, 7):
             name = f"private/validator-{index}.key"
@@ -292,6 +304,23 @@ class ValidatorVaultArchiveTests(unittest.TestCase):
                 result, output = self.canonicalize(
                     self.archive([sidecar, *self.valid_members()])
                 )
+                self.assertNotEqual(result.returncode, 0, result)
+                self.assertFalse(output.exists())
+
+    def test_workflow_rejects_unrecognized_non_key_regular_files(self) -> None:
+        for name in (
+            "validator-keys/EXTRA.json",
+            "validator-keys/not-a-key.txt",
+            "outside.key",
+            "validator-keys/.key",
+        ):
+            with self.subTest(name=name):
+                members = [
+                    self.regular(f"validator-keys/validator-{index}.key")
+                    for index in range(1, 7)
+                ]
+                members.append(self.regular(name))
+                result, output = self.canonicalize(self.archive(members))
                 self.assertNotEqual(result.returncode, 0, result)
                 self.assertFalse(output.exists())
 

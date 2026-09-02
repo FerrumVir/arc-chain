@@ -43,6 +43,10 @@ one_shot_workflow_is_exact_main_protected_and_create_only() {
         '-in "$canonical_tar"' \
         'tarfile.USTAR_FORMAT' \
         'is_appledouble(payload)' \
+        'basename == "PUBLIC-INVENTORY.json"' \
+        'basename.endswith(".key")' \
+        'public inventory parent mismatch' \
+        'unexpected non-key vault member' \
         'archive.pax_headers' \
         'member.offset_data' \
         'os.O_EXCL' \
