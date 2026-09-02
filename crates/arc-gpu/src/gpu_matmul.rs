@@ -1014,7 +1014,12 @@ mod tests {
     }
 
     /// Benchmark: LLM-sized matmul (4096×4096) to measure Metal vs WGSL speedup.
+    ///
+    /// This opens multiple devices, dispatches large workloads, and temporarily
+    /// changes a process-global backend selector. Keep it out of parallel
+    /// libtest execution and run it explicitly on a provisioned GPU host.
     #[test]
+    #[ignore = "hardware benchmark; run explicitly with --ignored --test-threads=1"]
     fn bench_matmul_4096() {
         let n = 4096usize;
         // Need to create two separate GPU instances to compare WGSL vs Metal
@@ -1022,6 +1027,10 @@ mod tests {
         // Test correctness at LLM dimensions first
         match GpuMatmul::new(n, n) {
             Ok(gpu) => {
+                assert!(
+                    gpu.msl_pipeline.is_some(),
+                    "provisioned macOS GPU benchmark requires a compiled MSL pipeline"
+                );
                 let mut weights = vec![0i8; n * n];
                 let mut input = vec![0i8; n];
                 // Fill with small values to avoid overflow
@@ -1069,7 +1078,7 @@ mod tests {
                     std::env::set_var("ARC_FORCE_WGSL_BENCH", "1");
                 }
             }
-            Err(e) => println!("No GPU: {}", e),
+            Err(e) => panic!("provisioned GPU benchmark could not create its device: {e}"),
         }
 
         // WGSL-only benchmark + correctness comparison

@@ -281,7 +281,25 @@ jobs:
       - name: cargo check (all targets)
         run: cargo check --workspace --all-targets --locked
       - name: cargo test (lib)
+        if: runner.os != 'Windows'
         run: cargo test --workspace --lib --locked
+      # GitHub's Windows runners expose DX12 through the WARP software
+      # adapter. arc-gpu, arc-state, and arc-node all open GPU devices in unit
+      # tests; running those tests concurrently can terminate the entire test
+      # process with Windows exit code 2173 before libtest can name a failure.
+      # Keep every functional test blocking, but serialize the full Windows
+      # library gate so future GPU consumers inherit the same protection.
+      - name: cargo test (lib, serial on Windows WARP)
+        if: runner.os == 'Windows'
+        env:
+          RUST_BACKTRACE: '1'
+        run: cargo test --workspace --lib --locked -- --test-threads=1 --nocapture
+      # The 4096x4096 performance workload is ignored by the ordinary libtest
+      # gate so it cannot contend with functional device tests. Exercise it
+      # explicitly and serially on the Apple Silicon runner's real GPU.
+      - name: LLM-sized GPU benchmark (macOS hardware)
+        if: matrix.os == 'macos-15'
+        run: cargo test -p arc-gpu --lib --locked gpu_matmul::tests::bench_matmul_4096 -- --exact --ignored --test-threads=1 --nocapture
       - name: ARC node binary shutdown and startup tests
         run: cargo test -p arc-node --bin arc-node --locked -- --test-threads=1
       - name: Desktop-managed node graceful shutdown integration
