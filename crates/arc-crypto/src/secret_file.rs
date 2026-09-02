@@ -502,25 +502,6 @@ pub fn create_private_directory_tree(path: &Path) -> io::Result<()> {
                     ),
                 ));
             }
-            // On Windows, `Path::components` deliberately preserves dot
-            // segments following a verbatim (`\\?\`) prefix as `Normal`
-            // components.  Canonicalized temporary and operator paths use
-            // that prefix, so checking only `ParentDir` would let a lexical
-            // `..` reach the namespace walk and mutate a sibling before the
-            // caller is rejected.  Dot names are filesystem syntax rather
-            // than valid leaf names on every supported platform; reject both
-            // representations before inspecting or creating anything.
-            std::path::Component::Normal(value)
-                if value == std::ffi::OsStr::new(".") || value == std::ffi::OsStr::new("..") =>
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "private directory path must not contain dot segments: {}",
-                        path.display()
-                    ),
-                ));
-            }
             _ => normalized.push(component.as_os_str()),
         }
     }
@@ -1915,7 +1896,26 @@ mod tests {
     #[test]
     fn operator_private_directory_tree_rejects_parent_traversal_before_mutation() {
         let root = TestDir::new("operator-private-tree-parent");
-        let requested = root.0.join("missing").join("..").join("target");
+        // Append the lexical components without `PathBuf::push`/`join`.
+        // Windows normalizes dot segments while pushing onto a verbatim
+        // (`\\?\`) path, which would silently turn this negative fixture into
+        // the harmless sibling `root/target` before the function saw it.
+        // Operator input arrives as one raw OS string, so preserve that exact
+        // representation here and exercise the real parser boundary.
+        let mut requested = root.0.as_os_str().to_os_string();
+        requested.push(std::path::MAIN_SEPARATOR_STR);
+        requested.push("missing");
+        requested.push(std::path::MAIN_SEPARATOR_STR);
+        requested.push("..");
+        requested.push(std::path::MAIN_SEPARATOR_STR);
+        requested.push("target");
+        let requested = std::path::PathBuf::from(requested);
+        assert!(
+            requested
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+            "fixture must retain a lexical '..' component before the security boundary"
+        );
         #[cfg(unix)]
         let before = std::fs::metadata(&root.0).unwrap().permissions();
         let error = create_private_directory_tree(&requested)
