@@ -203,6 +203,7 @@ jobs:
           cache-dependency-path: |
             dashboard/package-lock.json
             desktop/package-lock.json
+            sdk/package-lock.json
             sdk/typescript/package-lock.json
             sdks/typescript/package-lock.json
 
@@ -225,7 +226,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          for package in dashboard desktop sdk/typescript sdks/typescript; do
+          for package in dashboard desktop sdk sdk/typescript sdks/typescript; do
             npm --prefix "$package" audit --package-lock-only --audit-level=low
           done
 

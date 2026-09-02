@@ -9,6 +9,7 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 GOLDEN_WORKFLOW="$REPO_ROOT/.github/workflows/golden-vectors.yml"
+DEPENDABOT_CONFIG="$REPO_ROOT/.github/dependabot.yml"
 ASSEMBLER="$REPO_ROOT/scripts/release/assemble-release.sh"
 SIGNING_KEY_BACKUP="$REPO_ROOT/scripts/release/backup-signing-keys.sh"
 INSTALLER="$REPO_ROOT/install.sh"
@@ -822,7 +823,8 @@ github_owned_actions_are_node24_exact_sha_allowlisted() {
 }
 
 release_supply_chain_and_npm_audits_are_blocking() {
-    local ci_audit_block manifest_count quality_block supply_block
+    local actual_dependabot_directories ci_audit_block expected_npm_directories
+    local manifest_count quality_block supply_block
     ci_audit_block="$(awk '
         /^  audit:/ { capture=1 }
         capture { print }
@@ -895,10 +897,32 @@ release_supply_chain_and_npm_audits_are_blocking() {
             return 1
         }
     printf '%s\n' "$quality_block" \
-        | grep -Fq 'for package in dashboard desktop sdk/typescript sdks/typescript; do' || {
-            printf 'release-quality npm audit loop does not enumerate all four lockfiles\n'
+        | grep -Fq 'for package in dashboard desktop sdk sdk/typescript sdks/typescript; do' || {
+            printf 'release-quality npm audit loop does not enumerate all five lockfiles\n'
             return 1
         }
+
+    expected_npm_directories="$(printf '%s\n' \
+        /dashboard \
+        /desktop \
+        /sdk \
+        /sdk/typescript \
+        /sdks/typescript \
+        | LC_ALL=C sort)"
+    actual_dependabot_directories="$(awk '
+        /package-ecosystem:[[:space:]]*npm/ { npm_entry=1; next }
+        npm_entry && /directory:/ {
+            sub(/^.*directory:[[:space:]]*/, "")
+            gsub(/["'\''[:space:]]/, "")
+            print
+            npm_entry=0
+        }
+    ' "$DEPENDABOT_CONFIG" | LC_ALL=C sort)"
+    if [ "$actual_dependabot_directories" != "$expected_npm_directories" ]; then
+        printf 'Dependabot npm coverage does not match the five tracked lockfile directories\nexpected:\n%s\nactual:\n%s\n' \
+            "$expected_npm_directories" "$actual_dependabot_directories"
+        return 1
+    fi
 }
 
 cross_arch_golden_vectors_gate_publication() {

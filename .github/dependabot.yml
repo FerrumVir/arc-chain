@@ -11,11 +11,25 @@ updates:
     # PR queue stays reviewable.
     open-pull-requests-limit: 5
 
+  # The public dashboard has its own independently locked build toolchain.
+  - package-ecosystem: npm
+    directory: /dashboard
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
   # The desktop app: 11 runtime deps (react, framer-motion, @tauri-apps/*)
   # in the process that holds validator identity material. This is the npm
   # surface that most needed watching and was not watched.
   - package-ecosystem: npm
     directory: /desktop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Verified present: sdk/package.json + package-lock.json.
+  - package-ecosystem: npm
+    directory: /sdk
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -48,8 +62,3 @@ updates:
 
 # REMOVED: `npm` at /explorer. explorer/ contains two static HTML files and
 # no package.json, so that entry watched nothing.
-#
-# NOT ADDED: /sdk (has package.json but no package-lock.json, so Dependabot
-# cannot resolve it). Also note three separate package.json files all
-# declare the name "@arc-chain/sdk" - resolve that collision before adding
-# more automation on top of them.
