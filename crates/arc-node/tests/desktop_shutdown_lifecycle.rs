@@ -15,6 +15,52 @@ const REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 // complete under slow CI I/O instead of weakening or bypassing them.
 const STARTUP_SHUTDOWN_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+#[cfg(windows)]
+fn acquire_managed_lifecycle_fixture(
+    data_dir: &std::path::Path,
+    session_nonce: &[u8; 32],
+) -> std::fs::File {
+    let data_namespace =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(data_dir).unwrap();
+    data_namespace.restore_interrupted().unwrap();
+    let control_dir = data_dir.join(CONTROL_DIR);
+    let control_namespace =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(&control_dir).unwrap();
+    control_namespace.restore_interrupted().unwrap();
+
+    // Match the desktop's production handoff: prove the child name first,
+    // then the parent name while no descendant handles are open, and retain
+    // the stable sibling guard until the in-directory owner lease is locked.
+    control_namespace.rebarrier_existing().unwrap();
+    drop(control_namespace);
+    data_namespace.rebarrier_existing().unwrap();
+
+    let proof_path =
+        arc_crypto::secret_file::desktop_lifecycle_namespace_proof_path(data_dir).unwrap();
+    let proof = arc_crypto::secret_file::desktop_lifecycle_namespace_proof(data_dir, session_nonce)
+        .unwrap();
+    arc_crypto::secret_file::durably_replace_private(&proof_path, &proof).unwrap();
+
+    let lifecycle_path =
+        control_dir.join(arc_crypto::secret_file::DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+    arc_crypto::secret_file::durably_replace_private(
+        &lifecycle_path,
+        &arc_crypto::secret_file::desktop_lifecycle_lock_payload(session_nonce),
+    )
+    .unwrap();
+    let owner_path =
+        control_dir.join(arc_crypto::secret_file::DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+    arc_crypto::secret_file::durably_replace_private(
+        &owner_path,
+        arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
+    )
+    .unwrap();
+    let owner = arc_crypto::secret_file::open_private_read_write(&owner_path).unwrap();
+    owner.try_lock().unwrap();
+    drop(data_namespace);
+    owner
+}
+
 fn publish_private_request(
     control_dir: &std::path::Path,
     pid: u32,
@@ -44,9 +90,12 @@ fn publish_private_request(
 /// Exercises the packaged Windows lifecycle channel as an actual process, not
 /// only through cfg/type checks. There is no test-only startup pause: a sparse
 /// model artifact supplies a production-shaped synchronous hash phase while a
-/// private request arrives at the data-dir lock boundary. The lifecycle worker
-/// must consume it, replay/open persistent state, complete the WAL durability
-/// barrier required by the prearmed receipt, and exit before network admission.
+/// private request arrives at the data-dir lock boundary. On Windows the
+/// fixture supplies the exact desktop namespace proof and live owner lease so
+/// the node exercises the same no-rename handoff as the packaged application.
+/// The lifecycle worker must consume the request, replay/open persistent state,
+/// complete the WAL durability barrier required by the prearmed receipt, and
+/// exit before network admission.
 #[test]
 fn private_desktop_request_stops_node_during_initialization() {
     let temp = tempfile::tempdir().unwrap();
@@ -72,6 +121,11 @@ fn private_desktop_request_stops_node_during_initialization() {
         &genesis_path,
     )
     .unwrap();
+    #[cfg(windows)]
+    let desktop_lifecycle_nonce = [0x5au8; 32];
+    #[cfg(windows)]
+    let desktop_lifecycle_owner =
+        acquire_managed_lifecycle_fixture(&data_dir, &desktop_lifecycle_nonce);
     let model_path = temp.path().join("startup-hash-fixture.gguf");
     let model = std::fs::File::create(&model_path).unwrap();
     model.set_len(256 * 1024 * 1024).unwrap();
@@ -107,6 +161,9 @@ fn private_desktop_request_stops_node_during_initialization() {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command
+            .arg("--desktop-lifecycle-nonce")
+            .arg(hex::encode(desktop_lifecycle_nonce));
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     let mut child = command.spawn().expect("spawn arc-node lifecycle fixture");
@@ -170,6 +227,8 @@ fn private_desktop_request_stops_node_during_initialization() {
         "network admission started after the startup shutdown edge: {logs}"
     );
     assert!(!control_dir.join(REQUEST_FILE).exists());
+    #[cfg(windows)]
+    drop(desktop_lifecycle_owner);
 }
 
 #[cfg(unix)]
