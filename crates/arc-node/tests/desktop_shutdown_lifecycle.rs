@@ -100,7 +100,7 @@ fn publish_private_request(
 fn private_desktop_request_stops_node_during_initialization() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("node-data");
-    std::fs::create_dir(&data_dir).unwrap();
+    arc_crypto::secret_file::secure_private_directory(&data_dir).unwrap();
     let control_dir = data_dir.join(CONTROL_DIR);
     arc_crypto::secret_file::secure_private_directory(&control_dir).unwrap();
     let token_file = control_dir.join(TOKEN_FILE);

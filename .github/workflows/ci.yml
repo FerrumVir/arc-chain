@@ -327,6 +327,9 @@ jobs:
           run_test cargo test -p arc-node --bin arc-node --locked \
             tests::recovery_archive_rebarriers_a_visible_archive_on_absent_source_retry \
             -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --test desktop_shutdown_lifecycle --locked \
+            private_desktop_request_stops_node_during_initialization \
+            -- --exact --test-threads=1 --nocapture
           exit "$failed"
       # Compile-check everything the test step does not build: the 15
       # [[bin]] targets in arc-bench (which produce the numbers in
