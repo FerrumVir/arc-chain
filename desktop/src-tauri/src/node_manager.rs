@@ -4139,15 +4139,24 @@ mod tests {
     /// UDP exclusion ranges.
     #[test]
     fn p2p_probe_is_udp_not_tcp() {
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let busy_udp = udp.local_addr().unwrap().port();
+        // Windows may allocate an ephemeral UDP port from a range that is
+        // excluded for TCP. Select the port through TCP first, then hold UDP
+        // on the same number so the fixture does not depend on the two
+        // protocols sharing an ephemeral-port allocation policy.
+        let (udp, busy_udp) = (0..128)
+            .find_map(|_| {
+                let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
+                let addr = tcp.local_addr().ok()?;
+                let udp = UdpSocket::bind(addr).ok()?;
+                drop(tcp);
+                tcp_available(addr.port()).then_some((udp, addr.port()))
+            })
+            .expect("should find a UDP-held port that remains TCP-available");
+        assert_eq!(udp.local_addr().unwrap().port(), busy_udp);
         assert!(!udp_available(busy_udp), "held UDP port must read as busy");
-        // The same port number is still free for TCP - the exact blind spot
-        // the old probe had.
-        assert!(
-            tcp_available(busy_udp),
-            "TCP on a UDP-busy port is typically free; this is why the probes must differ"
-        );
+        // The successful selection above observed tcp_available(port) while
+        // UDP held the same number, independently proving the exact blind spot
+        // in the old TCP-based P2P probe.
     }
 
     #[test]
