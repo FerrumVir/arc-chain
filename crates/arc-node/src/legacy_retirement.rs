@@ -12,15 +12,18 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{ArgGroup, Subcommand};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
-use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::fs::{Metadata, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -51,7 +54,9 @@ const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 250_000;
 const MAX_TREE_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_PROCESS_EXECUTABLE_HASHES: usize = 128;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_PROCESS_EXECUTABLE_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const LEGACY_PORTS: [u16; 2] = [9090, 3001];
 
@@ -239,6 +244,7 @@ struct ProcessObservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ProcessExecutableIdentity {
     device: u64,
     inode: u64,
@@ -247,6 +253,7 @@ struct ProcessExecutableIdentity {
     ctime_ns: i64,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ProcessExecutableIdentity {
     fn from_metadata(metadata: &Metadata) -> Self {
         let identity = metadata_identity(metadata);
@@ -271,6 +278,7 @@ impl ProcessExecutableIdentity {
 }
 
 #[derive(Default)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ProcessExecutableHashCacheState {
     records: HashMap<ProcessExecutableIdentity, FileRecord>,
     hash_operations: usize,
@@ -278,10 +286,12 @@ struct ProcessExecutableHashCacheState {
 }
 
 #[derive(Default)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ProcessExecutableHashCache {
     state: Mutex<ProcessExecutableHashCacheState>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ProcessExecutableHashCache {
     fn get_or_hash<F>(&self, identity: ProcessExecutableIdentity, hash: F) -> Result<FileRecord>
     where
@@ -331,6 +341,10 @@ impl ProcessExecutableHashCache {
             .hash_operations
     }
 }
+
+#[derive(Default)]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct ProcessExecutableHashCache;
 
 trait RetirementHost {
     fn now(&self) -> String;
@@ -2845,12 +2859,36 @@ fn system_matching_processes(
     executable_hashes: &ProcessExecutableHashCache,
     legacy_owner_uid: u32,
     data_dir: &str,
-    _executable_path: &str,
+    executable_path: &str,
     executable_size: u64,
     executable_sha256: &str,
 ) -> Result<Vec<ProcessObservation>> {
+    linux_matching_processes_for_pids(
+        system_all_process_ids()?,
+        executable_hashes,
+        legacy_owner_uid,
+        data_dir,
+        executable_path,
+        executable_size,
+        executable_sha256,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_matching_processes_for_pids<I>(
+    pids: I,
+    executable_hashes: &ProcessExecutableHashCache,
+    legacy_owner_uid: u32,
+    data_dir: &str,
+    _executable_path: &str,
+    executable_size: u64,
+    executable_sha256: &str,
+) -> Result<Vec<ProcessObservation>>
+where
+    I: IntoIterator<Item = u32>,
+{
     let mut matches = Vec::new();
-    for pid in system_all_process_ids()? {
+    for pid in pids {
         let root = PathBuf::from(format!("/proc/{pid}"));
         // Ownership is checked before exe/cmdline so an unprivileged verifier
         // never attempts protected reads from unrelated users' /proc entries.
@@ -6156,6 +6194,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let cache = ProcessExecutableHashCache::default();
         let started = std::time::Instant::now();
+        #[cfg(target_os = "linux")]
+        let scanned = linux_matching_processes_for_pids(
+            std::iter::once(child.id()),
+            &cache,
+            unsafe { libc::geteuid() },
+            "/private/tmp/arc-retirement-nonsemantic-data",
+            expected.path.as_str(),
+            expected.size,
+            &expected.sha256,
+        );
+        #[cfg(target_os = "macos")]
         let scanned = system_matching_processes(
             &cache,
             unsafe { libc::geteuid() },

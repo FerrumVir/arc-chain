@@ -4920,9 +4920,12 @@ mod tests {
         let lock_path = store.root().join(WRITE_LOCK_FILE);
         fs::write(&lock_path, b"stale owner from a dead process\n").unwrap();
         let recovered = StoreLock::acquire(store.root()).unwrap();
+        recovered.release().unwrap();
+        // Windows byte-range locks are mandatory. Inspect the durable owner
+        // evidence only after releasing the lease; contention was already
+        // proved above while the first owner remained live.
         let evidence = fs::read_to_string(&lock_path).unwrap();
         assert!(evidence.contains("arc.recovery.dag-wal-lock.v2"));
-        recovered.release().unwrap();
         assert!(
             lock_path.is_file(),
             "advisory lock inode is deliberately retained"

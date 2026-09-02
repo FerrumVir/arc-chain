@@ -31,6 +31,8 @@ const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
 const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str =
     arc_crypto::secret_file::DESKTOP_LIFECYCLE_LOCK_FILE_NAME;
+const DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME: &str =
+    arc_crypto::secret_file::DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME;
 const DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME: &str = "managed-executable.path";
 const DESKTOP_EXECUTABLE_IDENTITY_SCHEMA: &str = "arc.desktop.executable-path.v1";
 const DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES: u64 = 32 * 1024;
@@ -481,7 +483,12 @@ fn acquire_managed_lifecycle_lock_for_reconciliation(
         &lock_path,
         b"arc.desktop.lifecycle-lock.v1\n",
     )?;
-    let file = arc_crypto::secret_file::open_private_read_write(&lock_path)?;
+    let owner_path = control_dir.join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+    arc_crypto::secret_file::durably_publish_new_private(
+        &owner_path,
+        arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
+    )?;
+    let file = arc_crypto::secret_file::open_private_read_write(&owner_path)?;
     file.try_lock_exclusive().map_err(|error| {
         anyhow::anyhow!(
             "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
@@ -626,7 +633,12 @@ fn refresh_managed_lifecycle_namespace(
         &lock_path,
         &arc_crypto::secret_file::desktop_lifecycle_lock_payload(&session_nonce),
     )?;
-    let file = arc_crypto::secret_file::open_private_read_write(&lock_path)?;
+    let owner_path = control_dir.join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+    arc_crypto::secret_file::durably_replace_private(
+        &owner_path,
+        arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
+    )?;
+    let file = arc_crypto::secret_file::open_private_read_write(&owner_path)?;
     file.try_lock_exclusive().map_err(|error| {
         anyhow::anyhow!(
             "managed lifecycle ownership changed during namespace refresh for {}: {error}",

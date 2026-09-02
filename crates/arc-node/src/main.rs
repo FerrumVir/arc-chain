@@ -9663,7 +9663,16 @@ mod tests {
             )
             .unwrap()
         );
-        let lifecycle = arc_crypto::secret_file::open_private_read_write(&lifecycle_path).unwrap();
+        let owner_path =
+            control_dir.join(arc_crypto::secret_file::DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+        assert!(
+            arc_crypto::secret_file::durably_publish_new_private(
+                &owner_path,
+                arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
+            )
+            .unwrap()
+        );
+        let lifecycle = arc_crypto::secret_file::open_private_read_write(&owner_path).unwrap();
         lifecycle.try_lock().unwrap();
         (data_dir, lifecycle, session_nonce)
     }

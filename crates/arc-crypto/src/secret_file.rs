@@ -14,6 +14,7 @@ pub const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
 pub const DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME: &str = "shutdown-unproven";
 pub const DESKTOP_SHUTDOWN_ACK_FILE_NAME: &str = "shutdown-clean-ack";
 pub const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str = "lifecycle.lock";
+pub const DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME: &str = "lifecycle.owner.lock";
 pub const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_PREFIX: &str = "lifecycle.namespace-proof.v3-";
 const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_SCHEMA: &str = "arc.desktop.lifecycle-namespace.v3";
 const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_MAX_BYTES: u64 = 512;
@@ -903,6 +904,10 @@ pub fn desktop_lifecycle_lock_payload(session_nonce: &[u8; 32]) -> Vec<u8> {
     .into_bytes()
 }
 
+pub fn desktop_lifecycle_owner_lock_payload() -> &'static [u8] {
+    b"arc.desktop.lifecycle-owner-lock.v1\n"
+}
+
 fn valid_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -1060,21 +1065,26 @@ pub fn has_active_exact_desktop_lifecycle_namespace_proof(
     data_dir: &Path,
     session_nonce: &[u8; 32],
 ) -> io::Result<bool> {
-    let lifecycle_path = data_dir
-        .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
-        .join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
-    let mut lifecycle = match open_private_read_write(&lifecycle_path) {
+    let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    let lifecycle_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+    let owner_path = control_dir.join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+    let owner = match open_private_read_write(&owner_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    match lifecycle.try_lock() {
+    match owner.try_lock() {
         Ok(()) => {
-            lifecycle.unlock()?;
+            owner.unlock()?;
             Ok(false)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
+            // LockFileEx byte-range locks are mandatory on Windows, so a
+            // second handle cannot read a payload while the lease is live.
+            // The immutable session binding therefore lives in a separate
+            // private file; this owner file carries liveness only.
             let expected = desktop_lifecycle_lock_payload(session_nonce);
+            let mut lifecycle = open_private(&lifecycle_path)?;
             if lifecycle.metadata()?.len() != expected.len() as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2749,7 +2759,9 @@ mod tests {
             &desktop_lifecycle_lock_payload(&session_nonce),
         )
         .unwrap();
-        let lifecycle = open_private_read_write(&lifecycle_path).unwrap();
+        let owner_path = control_dir.join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+        durably_replace_private(&owner_path, desktop_lifecycle_owner_lock_payload()).unwrap();
+        let lifecycle = open_private_read_write(&owner_path).unwrap();
         lifecycle.try_lock().unwrap();
 
         assert!(
