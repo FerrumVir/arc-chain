@@ -1114,7 +1114,12 @@ mod tests {
             permissions.set_mode(permissions.mode() | 0o200);
         }
         #[cfg(not(unix))]
-        permissions.set_readonly(false);
+        {
+            // This branch is compiled only for Windows-like permission APIs;
+            // Clippy's world-writable warning applies to Unix mode bits.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+        }
         fs::set_permissions(path, permissions).unwrap();
     }
 

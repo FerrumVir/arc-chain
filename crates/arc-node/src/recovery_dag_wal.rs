@@ -3,9 +3,10 @@
 //! A generation is immutable and content addressed. Its manifest binds the
 //! recovery checkpoint/domain, the validator set, the canonical state baseline,
 //! the DAG cursors, and the exact retained record log. Publishing is two phase:
-//! all generation files and directories are fsynced first, then `CURRENT` is
-//! atomically replaced and the store directory is fsynced. Previous generations
-//! are never removed by this module.
+//! all generation files and namespace entries cross the platform durability
+//! barrier first, then `CURRENT` is atomically and durably replaced. Unix uses
+//! parent-directory fsync; Windows uses write-through namespace moves. Previous
+//! generations are never removed by ordinary generation publication.
 //!
 //! Every immutable generation owns `active-<generation-hash>.bin`. `CURRENT`
 //! selects both by the same hash. Active writes are whole checksummed batch
@@ -789,6 +790,11 @@ pub struct GenerationStore {
 }
 
 impl GenerationStore {
+    /// Construct a store rooted at one application-owned leaf. The immediate
+    /// parent must already exist; refusing to recursively invent missing
+    /// ancestors lets the sibling namespace lock durably prove the whole
+    /// store name on Windows instead of acknowledging state below an
+    /// unbarriered parent.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -822,6 +828,72 @@ impl GenerationStore {
         let generation = self.publish_generation(None, input, records, &mut observer)?;
         lock.release()?;
         Ok(generation)
+    }
+
+    /// Resume the one valid crash window where the deterministic sequence-zero
+    /// generation was published but `CURRENT` was not. No history is selected
+    /// unless the sole generation is the exact empty generation independently
+    /// derived by the caller for this recovery boundary.
+    pub fn resume_unselected_initial(
+        &self,
+        expected: &GenerationInput,
+    ) -> Result<Option<VerifiedGeneration>> {
+        validate_input(expected)?;
+        self.ensure_root()?;
+        let lock = StoreLock::acquire(&self.root)?;
+        let current_path = self.root.join(CURRENT_FILE);
+        match fs::symlink_metadata(&current_path) {
+            Ok(_) => {
+                return Err(GenerationError::Invalid(
+                    "cannot resume an unselected initial generation when CURRENT exists".into(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect", &current_path, error)),
+        }
+        if self.read_gc_anchor(&expected.binding)?.is_some() {
+            return Err(GenerationError::Invalid(
+                "unselected initial generation cannot coexist with a GC anchor".into(),
+            ));
+        }
+        let manifests = self.read_all_manifests(&expected.binding)?;
+        if manifests.is_empty() {
+            lock.release()?;
+            return Ok(None);
+        }
+        if manifests.len() != 1 {
+            return Err(GenerationError::Invalid(
+                "CURRENT-less recovery store must contain exactly one resumable initial generation"
+                    .into(),
+            ));
+        }
+        let (&hash, manifest) = manifests.iter().next().expect("one manifest exists");
+        if manifest.sequence != 0
+            || manifest.previous_generation.is_some()
+            || manifest.binding != expected.binding
+            || manifest.baseline_state != expected.baseline_state
+            || manifest.dag_cursor != expected.dag_cursor
+            || manifest.retained_records.limits != expected.retention_limits
+            || manifest.retained_records.record_count != 0
+            || manifest.retained_records.payload_bytes != 0
+            || manifest.retained_records.first_round.is_some()
+            || manifest.retained_records.last_round.is_some()
+        {
+            return Err(GenerationError::Invalid(
+                "unselected initial generation differs from the exact empty recovery boundary"
+                    .into(),
+            ));
+        }
+        let generation = self.verify_generation(hash, &expected.binding)?;
+        self.rebarrier_unselected_generation(generation.pin)?;
+        let generation = self.verify_generation(hash, &expected.binding)?;
+        self.ensure_empty_active_log(&generation)?;
+        fsync_directory(&self.root)?;
+        let mut observer = NoopObserver;
+        self.publish_pointer(&generation, &mut observer)?;
+        let selected = self.load_current(&expected.binding, Some(generation.pin))?;
+        lock.release()?;
+        Ok(Some(selected))
     }
 
     pub fn append<I>(
@@ -1333,6 +1405,13 @@ impl GenerationStore {
         // set, and only then require a clean audit.
         let manifests = self.read_all_manifests(expected_binding)?;
         validate_gc_anchor(&anchor, &current, &manifests)?;
+        let anchor_bytes = canonical_json(&anchor, "GC anchor")?;
+        replace_synced_file_durably(
+            &self.root.join(GC_ANCHOR_FILE),
+            &anchor_bytes,
+            "rebarrier GC anchor before recovery deletion",
+        )?;
+        self.recover_legacy_gc_active_dual_names(&anchor.pruned)?;
         self.validate_gc_target_namespaces(expected_binding, &anchor.pruned)?;
         let mut observer = NoopObserver;
         self.finish_gc_targets(&current, predecessor, &anchor.pruned, &mut observer)?;
@@ -1493,12 +1572,34 @@ impl GenerationStore {
         let current = self.verify_generation(actual.hash, &current_manifest.binding)?;
         let successor = self.verify_generation(successor_hash, &current.manifest.binding)?;
         validate_successor(&current, &successor.manifest)?;
+        self.rebarrier_unselected_generation(successor.pin)?;
+        let successor = self.verify_generation(successor_hash, &current.manifest.binding)?;
+        validate_successor(&current, &successor.manifest)?;
         self.ensure_empty_active_log(&successor)?;
         fsync_directory(&self.root)?;
         let mut observer = NoopObserver;
         self.publish_pointer(&successor, &mut observer)?;
         lock.release()?;
         Ok(successor)
+    }
+
+    /// Re-publish the exact selected pointer through every namespace barrier.
+    /// Startup uses this before creating an independent external pin so a
+    /// second crash cannot preserve the pin while losing a late-visible
+    /// `CURRENT` from the first crash.
+    pub fn rebarrier_current_pointer(
+        &self,
+        expected_binding: &RecoveryDagBinding,
+        expected_pin: GenerationPin,
+    ) -> Result<VerifiedGeneration> {
+        self.ensure_root()?;
+        let lock = StoreLock::acquire(&self.root)?;
+        let generation = self.load_current(expected_binding, Some(expected_pin))?;
+        let mut observer = NoopObserver;
+        self.publish_pointer(&generation, &mut observer)?;
+        let selected = self.load_current(expected_binding, Some(expected_pin))?;
+        lock.release()?;
+        Ok(selected)
     }
 
     fn publish_generation<I, O>(
@@ -1531,7 +1632,7 @@ impl GenerationStore {
         let pending = self.root.join(format!(".pending-{}", uuid::Uuid::new_v4()));
         create_private_directory(&pending)?;
 
-        let retained_records = write_record_log(
+        let retained_records = write_record_log_durably(
             &pending.join(RECORDS_FILE),
             input.retention_limits,
             &input.dag_cursor,
@@ -1555,7 +1656,7 @@ impl GenerationStore {
         let generation_hash =
             domain_hash("ARC recovery DAG generation manifest v1", &manifest_bytes);
         let manifest_path = pending.join(MANIFEST_FILE);
-        write_new_synced_file(&manifest_path, &manifest_bytes)?;
+        write_new_synced_file_durably(&manifest_path, &manifest_bytes)?;
         observer.reached(PublishPoint::ManifestSynced)?;
         fsync_directory(&pending)?;
         observer.reached(PublishPoint::GenerationDirectorySynced)?;
@@ -1566,8 +1667,7 @@ impl GenerationStore {
                 "content-addressed generation {generation_hash} already exists"
             )));
         }
-        fs::rename(&pending, &final_directory)
-            .map_err(|error| io_error("rename generation into", &final_directory, error))?;
+        rename_for_durable_publish(&pending, &final_directory, false, "rename generation into")?;
         observer.reached(PublishPoint::GenerationPublished)?;
         fsync_directory(&self.root)?;
         observer.reached(PublishPoint::RootAfterGenerationSynced)?;
@@ -1600,11 +1700,49 @@ impl GenerationStore {
         write_new_synced_file(&temporary, &pointer_bytes)?;
         observer.reached(PublishPoint::PointerFileSynced)?;
         let current = self.root.join(CURRENT_FILE);
-        fs::rename(&temporary, &current)
-            .map_err(|error| io_error("atomically replace", &current, error))?;
+        rename_for_durable_publish(&temporary, &current, true, "atomically replace")?;
         observer.reached(PublishPoint::PointerRenamed)?;
         fsync_directory(&self.root)?;
         observer.reached(PublishPoint::RootAfterPointerSynced)?;
+        Ok(())
+    }
+
+    /// Recover the only dual-name state an older Unix no-replace helper could
+    /// create: hard-linking an active log into its authorized GC tombstone and
+    /// crashing before unlinking the live name. Both names must identify the
+    /// exact same regular inode; otherwise ambiguity remains fail-closed.
+    fn recover_legacy_gc_active_dual_names(&self, targets: &[GenerationPin]) -> Result<()> {
+        for target in targets {
+            let active = self.active_log_path(*target);
+            let active_tombstone = self
+                .root
+                .join(format!(".gc-active-{}.bin", target.hash.to_hex()));
+            if !active.exists() || !active_tombstone.exists() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+
+                let live = regular_file_metadata(&active)?;
+                let tombstone = regular_file_metadata(&active_tombstone)?;
+                if live.dev() != tombstone.dev() || live.ino() != tombstone.ino() {
+                    return Err(GenerationError::Invalid(
+                        "GC active log exists as two different live/tombstone files".into(),
+                    ));
+                }
+                fs::remove_file(&active).map_err(|error| {
+                    io_error("finish legacy active-log GC rename", &active, error)
+                })?;
+                fsync_directory(&self.root)?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(GenerationError::Invalid(
+                    "GC target exists in both live and tombstone namespaces".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1670,8 +1808,7 @@ impl GenerationStore {
         write_new_synced_file(&temporary, &bytes)?;
         observer.reached(GcPoint::AnchorFileSynced)?;
         let destination = self.root.join(GC_ANCHOR_FILE);
-        fs::rename(&temporary, &destination)
-            .map_err(|error| io_error("atomically replace", &destination, error))?;
+        rename_for_durable_publish(&temporary, &destination, true, "atomically replace")?;
         observer.reached(GcPoint::AnchorRenamed)?;
         fsync_directory(&self.root)?;
         observer.reached(GcPoint::RootAfterAnchorSynced)
@@ -1705,47 +1842,81 @@ impl GenerationStore {
             }
             if generation.exists() {
                 ensure_real_directory(&generation)?;
-                fs::rename(&generation, &generation_tombstone).map_err(|error| {
-                    io_error(
-                        "rename generation GC tombstone",
-                        &generation_tombstone,
-                        error,
-                    )
-                })?;
+                rename_for_durable_publish(
+                    &generation,
+                    &generation_tombstone,
+                    false,
+                    "rename generation GC tombstone",
+                )?;
                 observer.reached(GcPoint::GenerationRenamed(*target))?;
                 fsync_directory(&self.root)?;
                 observer.reached(GcPoint::RootAfterGenerationRenameSynced(*target))?;
             }
             if active.exists() {
                 regular_file_metadata(&active)?;
-                fs::rename(&active, &active_tombstone).map_err(|error| {
-                    io_error("rename active-log GC tombstone", &active_tombstone, error)
-                })?;
+                rename_for_durable_publish(
+                    &active,
+                    &active_tombstone,
+                    false,
+                    "rename active-log GC tombstone",
+                )?;
                 observer.reached(GcPoint::ActiveLogRenamed(*target))?;
                 fsync_directory(&self.root)?;
                 observer.reached(GcPoint::RootAfterActiveLogRenameSynced(*target))?;
             }
             if generation_tombstone.exists() {
                 ensure_real_directory(&generation_tombstone)?;
-                fs::remove_dir_all(&generation_tombstone).map_err(|error| {
-                    io_error(
-                        "remove generation GC tombstone",
-                        &generation_tombstone,
-                        error,
-                    )
-                })?;
-                observer.reached(GcPoint::GenerationRemoved(*target))?;
-                fsync_directory(&self.root)?;
-                observer.reached(GcPoint::RootAfterGenerationRemoveSynced(*target))?;
+                let removed = match fs::remove_dir_all(&generation_tombstone) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    #[cfg(windows)]
+                    Err(error) => {
+                        // The write-through rename already retired the live
+                        // generation namespace. Antivirus/indexer locks may
+                        // delay physical directory removal; the fsynced GC
+                        // anchor authorizes an exact retry on next startup.
+                        tracing::warn!(path = %generation_tombstone.display(), %error, "deferring recovery DAG generation tombstone cleanup");
+                        false
+                    }
+                    #[cfg(not(windows))]
+                    Err(error) => {
+                        return Err(io_error(
+                            "remove generation GC tombstone",
+                            &generation_tombstone,
+                            error,
+                        ));
+                    }
+                };
+                if removed {
+                    observer.reached(GcPoint::GenerationRemoved(*target))?;
+                    fsync_directory(&self.root)?;
+                    observer.reached(GcPoint::RootAfterGenerationRemoveSynced(*target))?;
+                }
             }
             if active_tombstone.exists() {
                 regular_file_metadata(&active_tombstone)?;
-                fs::remove_file(&active_tombstone).map_err(|error| {
-                    io_error("remove active-log GC tombstone", &active_tombstone, error)
-                })?;
-                observer.reached(GcPoint::ActiveLogRemoved(*target))?;
-                fsync_directory(&self.root)?;
-                observer.reached(GcPoint::RootAfterActiveLogRemoveSynced(*target))?;
+                let removed = match fs::remove_file(&active_tombstone) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    #[cfg(windows)]
+                    Err(error) => {
+                        tracing::warn!(path = %active_tombstone.display(), %error, "deferring recovery DAG active-log tombstone cleanup");
+                        false
+                    }
+                    #[cfg(not(windows))]
+                    Err(error) => {
+                        return Err(io_error(
+                            "remove active-log GC tombstone",
+                            &active_tombstone,
+                            error,
+                        ));
+                    }
+                };
+                if removed {
+                    observer.reached(GcPoint::ActiveLogRemoved(*target))?;
+                    fsync_directory(&self.root)?;
+                    observer.reached(GcPoint::RootAfterActiveLogRemoveSynced(*target))?;
+                }
             }
         }
         Ok(())
@@ -1870,6 +2041,49 @@ impl GenerationStore {
         self.root.join(format!("active-{}.bin", pin.hash.to_hex()))
     }
 
+    fn rebarrier_unselected_generation(&self, pin: GenerationPin) -> Result<()> {
+        let generation = self.generation_path(pin.hash);
+        ensure_real_directory(&generation)?;
+        #[cfg(windows)]
+        {
+            // An unselected generation may have become visible even though a
+            // prior write-through rename reported a late error. Temporarily
+            // move it through one deterministic recovery namespace, then
+            // write-through move it back before CURRENT can depend on it. The
+            // locked startup path restores that exact intermediate if either
+            // move is interrupted.
+            let staging = self
+                .root
+                .join(format!(".generation-rebarrier-{}", pin.hash.to_hex()));
+            if staging.exists() {
+                return Err(GenerationError::Invalid(format!(
+                    "generation rebarrier staging already exists: {}",
+                    staging.display()
+                )));
+            }
+            rename_for_durable_publish(
+                &generation,
+                &staging,
+                false,
+                "stage unselected generation rebarrier",
+            )?;
+            fsync_directory(&self.root)?;
+            rename_for_durable_publish(
+                &staging,
+                &generation,
+                false,
+                "restore rebarriered unselected generation",
+            )?;
+            fsync_directory(&self.root)
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix generation publication already fsyncs the parent. Repeat
+            // that inexpensive barrier without creating a live-name gap.
+            fsync_directory(&self.root)
+        }
+    }
+
     fn create_empty_active_log(&self, generation: &VerifiedGeneration) -> Result<()> {
         let path = self.active_log_path(generation.pin);
         let header = ActiveLogHeader {
@@ -1878,7 +2092,7 @@ impl GenerationStore {
             limits: generation.manifest.retained_records.limits,
         };
         let bytes = encode_active_header(&header);
-        write_new_synced_file(&path, &bytes)
+        write_new_synced_file_durably(&path, &bytes)
     }
 
     fn ensure_empty_active_log(&self, generation: &VerifiedGeneration) -> Result<()> {
@@ -1886,6 +2100,12 @@ impl GenerationStore {
         if !path.exists() {
             return self.create_empty_active_log(generation);
         }
+        let header = ActiveLogHeader {
+            generation_pin: generation.pin,
+            binding: generation.manifest.binding.clone(),
+            limits: generation.manifest.retained_records.limits,
+        };
+        let bytes = encode_active_header(&header);
         let inspection = inspect_active_log(&path, generation)?;
         if inspection.suffix != TornSuffix::Clean
             || inspection.batch_count != 0
@@ -1896,21 +2116,61 @@ impl GenerationStore {
                 "unselected successor has a non-empty or torn active log".into(),
             ));
         }
-        Ok(())
+        // Re-publish the exact header through the durable replace primitive.
+        // This closes the retry window where an earlier namespace operation
+        // made the name visible but returned before its durability guarantee.
+        replace_synced_file_durably(&path, &bytes, "rebarrier empty active log")
     }
 
     fn ensure_root(&self) -> Result<()> {
-        if self.root.exists() {
-            ensure_real_directory(&self.root)?;
-            return Ok(());
-        }
-        let parent = self.root.parent().ok_or_else(|| {
-            GenerationError::Invalid("generation store path has no parent".into())
+        let parent = self
+            .root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        parent.canonicalize().map_err(|error| {
+            io_error(
+                "canonicalize existing generation-store parent",
+                parent,
+                error,
+            )
         })?;
-        ensure_real_directory(parent)?;
-        create_private_directory(&self.root)?;
-        fsync_directory(parent)?;
-        Ok(())
+        let namespace_lock =
+            arc_crypto::secret_file::acquire_private_directory_namespace_lock(&self.root)
+                .map_err(|error| io_error("lock generation-store namespace", &self.root, error))?;
+        // Restore before any absent-root check. Creating a fresh empty live
+        // root while the complete store is staged would strand chain history.
+        namespace_lock
+            .restore_interrupted()
+            .map_err(|error| io_error("restore generation-store namespace", &self.root, error))?;
+        if namespace_lock.target().exists() {
+            ensure_real_directory(namespace_lock.target())?;
+        }
+        arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target())
+            .map_err(|error| io_error("secure generation store", &self.root, error))
+    }
+
+    #[cfg(test)]
+    fn create_initial_with_observer<I, O>(
+        &self,
+        input: GenerationInput,
+        records: I,
+        observer: &mut O,
+    ) -> Result<VerifiedGeneration>
+    where
+        I: IntoIterator<Item = RetainedDagRecord>,
+        O: PublishObserver,
+    {
+        self.ensure_root()?;
+        let lock = StoreLock::acquire(&self.root)?;
+        if self.root.join(CURRENT_FILE).exists() || self.generation_directory_count()? != 0 {
+            return Err(GenerationError::Invalid(
+                "test initial generation store is not empty".into(),
+            ));
+        }
+        let result = self.publish_generation(None, input, records, observer);
+        lock.release()?;
+        result
     }
 
     #[cfg(test)]
@@ -1942,8 +2202,137 @@ struct StoreLock {
     released: bool,
 }
 
+#[derive(Clone, Copy)]
+enum IncompleteStoreArtifact {
+    File,
+    Directory,
+}
+
+fn uuid_staging_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+}
+
+fn incomplete_store_artifact(name: &str) -> Option<IncompleteStoreArtifact> {
+    if uuid_staging_name(name, ".pending-", "") {
+        return Some(IncompleteStoreArtifact::Directory);
+    }
+    if uuid_staging_name(name, ".CURRENT-", ".tmp")
+        || uuid_staging_name(name, ".GC-ANCHOR-", ".tmp")
+        || ["file", "replacement", "records"]
+            .iter()
+            .any(|label| uuid_staging_name(name, &format!(".arc-recovery-dag-{label}-"), ".tmp"))
+    {
+        return Some(IncompleteStoreArtifact::File);
+    }
+    None
+}
+
+fn generation_rebarrier_hash(name: &str) -> Option<Hash256> {
+    let value = name.strip_prefix(".generation-rebarrier-")?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Hash256::from_hex(value).ok()
+}
+
+fn restore_interrupted_generation_rebarriers(root: &Path) -> Result<()> {
+    let entries = fs::read_dir(root)
+        .map_err(|error| io_error("inspect generation rebarrier staging in", root, error))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| io_error("inspect generation rebarrier staging in", root, error))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(hash) = generation_rebarrier_hash(&name) else {
+            continue;
+        };
+        let staging = entry.path();
+        ensure_real_directory(&staging)?;
+        let generation = root.join(format!("gen-{}", hash.to_hex()));
+        if generation.exists() {
+            return Err(GenerationError::Invalid(format!(
+                "generation exists in both live and rebarrier namespaces: {}",
+                hash
+            )));
+        }
+        rename_for_durable_publish(
+            &staging,
+            &generation,
+            false,
+            "restore interrupted generation rebarrier",
+        )?;
+        fsync_directory(root)?;
+    }
+    Ok(())
+}
+
+/// Reclaim only names that ARC itself reserves for unpublished work. The
+/// advisory writer lock must already be held: without it, a second process
+/// could mistake an actively-written generation for a crash orphan.
+fn cleanup_incomplete_store_staging(root: &Path) -> Result<()> {
+    let entries = fs::read_dir(root)
+        .map_err(|error| io_error("inspect incomplete generation staging in", root, error))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| io_error("inspect incomplete generation staging in", root, error))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(kind) = incomplete_store_artifact(&name) else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_error("inspect incomplete generation staging", &path, error))?;
+        let valid_type = !metadata.file_type().is_symlink()
+            && match kind {
+                IncompleteStoreArtifact::File => metadata.is_file(),
+                IncompleteStoreArtifact::Directory => metadata.is_dir(),
+            };
+        if !valid_type {
+            return Err(GenerationError::Invalid(format!(
+                "recognized recovery DAG staging artifact has an invalid type: {}",
+                path.display()
+            )));
+        }
+        let removal = match kind {
+            IncompleteStoreArtifact::File => fs::remove_file(&path),
+            IncompleteStoreArtifact::Directory => fs::remove_dir_all(&path),
+        };
+        if let Err(error) = removal {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "deferring recovery DAG staging cleanup");
+            }
+            continue;
+        }
+        if let Err(error) = fsync_directory(root) {
+            // These names are never interpreted as live state. If a late
+            // namespace-barrier error permits resurrection, the next locked
+            // startup recognizes and removes the exact same name again.
+            tracing::warn!(path = %path.display(), %error, "recovery DAG staging cleanup barrier will be retried");
+        }
+    }
+    Ok(())
+}
+
 impl StoreLock {
     fn acquire(root: &Path) -> Result<Self> {
+        let namespace_lock =
+            arc_crypto::secret_file::acquire_private_directory_namespace_lock(root)
+                .map_err(|error| io_error("lock generation-store namespace", root, error))?;
+        namespace_lock
+            .restore_interrupted()
+            .map_err(|error| io_error("restore generation-store namespace", root, error))?;
+        arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target())
+            .map_err(|error| io_error("secure generation-store root", root, error))?;
+        let root = namespace_lock.target();
         let path = root.join(WRITE_LOCK_FILE);
         if path.exists() {
             regular_file_metadata(&path)?;
@@ -1973,6 +2362,11 @@ impl StoreLock {
                 return Err(io_error("acquire advisory lock on", &path, error));
             }
         }
+        namespace_lock
+            .rebarrier_existing()
+            .map_err(|error| io_error("rebarrier generation-store namespace", root, error))?;
+        restore_interrupted_generation_rebarriers(root)?;
+        cleanup_incomplete_store_staging(root)?;
         file.set_len(0)
             .map_err(|error| io_error("truncate", &path, error))?;
         file.seek(SeekFrom::Start(0))
@@ -2343,6 +2737,33 @@ fn record_payload_fingerprint(record: &RetainedDagRecord) -> Hash256 {
         "ARC recovery DAG record payload identity v1",
         &record.payload,
     )
+}
+
+fn write_record_log_durably<I>(
+    path: &Path,
+    limits: RetentionLimits,
+    cursor: &DagCursor,
+    records: I,
+) -> Result<RetainedRecordSet>
+where
+    I: IntoIterator<Item = RetainedDagRecord>,
+{
+    let staging = durable_staging_path(path, "records");
+    let retained = match write_record_log(&staging, limits, cursor, records) {
+        Ok(retained) => retained,
+        Err(error) => {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+    };
+    if let Err(error) =
+        rename_for_durable_publish(&staging, path, false, "publish retained record log")
+    {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    fsync_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(retained)
 }
 
 fn write_record_log<I>(
@@ -3133,21 +3554,21 @@ fn persist_exact_quarantine(
                 "existing active quarantine differs from the exact torn suffix".into(),
             ));
         }
+        // A prior publish can make the exact name visible and still return a
+        // late durability error. Replacing it with the same synced bytes makes
+        // the evidence namespace durable before the source can be truncated.
+        replace_synced_file_durably(path, bytes, "rebarrier active quarantine")?;
         return Ok(());
     }
-    let temporary = root.join(format!(".active-quarantine-{}.tmp", uuid::Uuid::new_v4()));
-    write_new_synced_file(&temporary, bytes)?;
-    match fs::hard_link(&temporary, path) {
+    match write_new_synced_file_durably(path, bytes) {
         Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temporary);
+        Err(GenerationError::Io { source, .. })
+            if source.kind() == io::ErrorKind::AlreadyExists =>
+        {
             return persist_exact_quarantine(root, path, bytes, expected_hash);
         }
-        Err(error) => return Err(io_error("publish quarantine as", path, error)),
+        Err(error) => return Err(error),
     }
-    fsync_directory(root)?;
-    fs::remove_file(&temporary)
-        .map_err(|error| io_error("remove quarantine temporary", &temporary, error))?;
     fsync_directory(root)?;
     let hasher = hash_file_into_hasher(
         path,
@@ -3238,11 +3659,28 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_private_file_mode(options: &mut OpenOptions) {
+/// Create a recovery directory and durably publish its name before returning.
+/// Production callers hold the node data-directory lock while this briefly
+/// rebarriers an existing root; standalone callers must provide equivalent
+/// semantic serialization.
+pub fn create_private_directory_durably(path: &Path) -> Result<()> {
+    let namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(path)
+        .map_err(|error| io_error("lock store directory namespace", path, error))?;
+    namespace_lock
+        .restore_interrupted()
+        .map_err(|error| io_error("restore store directory namespace", path, error))?;
+    arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target())
+        .map_err(|error| io_error("secure/create store directory", path, error))?;
+    namespace_lock
+        .rebarrier_existing()
+        .map_err(|error| io_error("rebarrier store directory namespace", path, error))
+}
+
+fn set_private_file_mode(_options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        _options.mode(0o600);
     }
 }
 
@@ -3259,11 +3697,166 @@ fn write_new_synced_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|error| io_error("fsync", path, error))
 }
 
+fn durable_staging_path(destination: &Path, label: &str) -> PathBuf {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".arc-recovery-dag-{label}-{}.tmp",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn write_new_synced_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    let staging = durable_staging_path(path, "file");
+    if let Err(error) = write_new_synced_file(&staging, bytes) {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) = rename_for_durable_publish(&staging, path, false, "publish synced file") {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    fsync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn replace_synced_file_durably(path: &Path, bytes: &[u8], operation: &'static str) -> Result<()> {
+    let staging = durable_staging_path(path, "replacement");
+    if let Err(error) = write_new_synced_file(&staging, bytes) {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) = rename_for_durable_publish(&staging, path, true, operation) {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    fsync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+    })?;
+    if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic create-only directory rename is unsupported on this Unix platform",
+    ))
+}
+
+/// Rename one already-synced recovery artifact into its live namespace.
+///
+/// Windows performs the namespace mutation with `MOVEFILE_WRITE_THROUGH`;
+/// Unix callers must fsync the destination parent after this returns.
+pub fn rename_for_durable_publish(
+    source: &Path,
+    destination: &Path,
+    replace_existing: bool,
+    operation: &'static str,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows exposes no documented parent-directory fsync. Its supported
+        // durability primitive is a write-through namespace move, which also
+        // works for same-volume directory publication.
+        arc_crypto::secret_file::windows_move_path_write_through(
+            source,
+            destination,
+            replace_existing,
+        )
+        .map_err(|error| io_error(operation, destination, error))?;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        if replace_existing {
+            return fs::rename(source, destination)
+                .map_err(|error| io_error(operation, destination, error));
+        }
+        // Linux and Darwin expose an atomic create-only rename for files and
+        // directories. Using one namespace operation avoids the dual-name
+        // crash state produced by hard-link-then-unlink publication.
+        rename_no_replace(source, destination)
+            .map_err(|error| io_error(operation, destination, error))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if !replace_existing && destination.exists() {
+            return Err(io_error(
+                operation,
+                destination,
+                io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists"),
+            ));
+        }
+        fs::rename(source, destination).map_err(|error| io_error(operation, destination, error))
+    }
+}
+
 fn fsync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .map_err(|error| io_error("open directory", path, error))?
-        .sync_all()
-        .map_err(|error| io_error("fsync directory", path, error))
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .map_err(|error| io_error("open directory", path, error))?
+            .sync_all()
+            .map_err(|error| io_error("fsync directory", path, error))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows namespace mutations use MoveFileExW with
+        // MOVEFILE_WRITE_THROUGH at the mutation site. Other non-Unix targets
+        // do not expose a portable directory-fsync primitive.
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn read_up_to<R: Read>(reader: &mut R, buffer: &mut [u8]) -> io::Result<usize> {
@@ -3300,6 +3893,120 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn locked_startup_reclaims_only_exact_incomplete_store_staging() {
+        let directory = TestDirectory::new("staging-cleanup");
+        let pending = directory
+            .0
+            .join(format!(".pending-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join(RECORDS_FILE), vec![7u8; 1024 * 1024]).unwrap();
+        let stale_files = [
+            directory
+                .0
+                .join(format!(".CURRENT-{}.tmp", uuid::Uuid::new_v4())),
+            directory
+                .0
+                .join(format!(".GC-ANCHOR-{}.tmp", uuid::Uuid::new_v4())),
+            directory.0.join(format!(
+                ".arc-recovery-dag-file-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+            directory.0.join(format!(
+                ".arc-recovery-dag-replacement-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+            directory.0.join(format!(
+                ".arc-recovery-dag-records-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+        ];
+        for path in &stale_files {
+            fs::write(path, b"incomplete internal staging").unwrap();
+        }
+        let unrelated = [
+            directory.0.join(".pending-not-a-uuid"),
+            directory.0.join(".CURRENT-not-a-uuid.tmp"),
+            directory.0.join(".arc-recovery-dag-records-not-a-uuid.tmp"),
+        ];
+        for path in &unrelated {
+            fs::write(path, b"operator file").unwrap();
+        }
+
+        StoreLock::acquire(&directory.0).unwrap().release().unwrap();
+        assert!(!pending.exists());
+        assert!(stale_files.iter().all(|path| !path.exists()));
+        assert!(unrelated.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn locked_startup_rejects_a_recognized_staging_name_with_wrong_type() {
+        let directory = TestDirectory::new("staging-type");
+        let invalid = directory
+            .0
+            .join(format!(".pending-{}", uuid::Uuid::new_v4()));
+        fs::write(&invalid, b"not a directory").unwrap();
+        assert!(matches!(
+            StoreLock::acquire(&directory.0),
+            Err(GenerationError::Invalid(message))
+                if message.contains("staging artifact has an invalid type")
+        ));
+    }
+
+    #[test]
+    fn locked_startup_restores_an_interrupted_generation_rebarrier() {
+        let directory = TestDirectory::new("generation-rebarrier-restore");
+        let hash = h(b"interrupted-generation-rebarrier");
+        let staging = directory
+            .0
+            .join(format!(".generation-rebarrier-{}", hash.to_hex()));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join(MANIFEST_FILE), b"preserved candidate").unwrap();
+
+        StoreLock::acquire(&directory.0).unwrap().release().unwrap();
+        let restored = directory.0.join(format!("gen-{}", hash.to_hex()));
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read(restored.join(MANIFEST_FILE)).unwrap(),
+            b"preserved candidate"
+        );
+    }
+
+    #[test]
+    fn generation_store_requires_an_existing_parent_then_secures_the_root() {
+        let directory = TestDirectory::new("nested-root");
+        let root = directory.0.join("missing").join("nested").join("store");
+        let store = GenerationStore::new(&root);
+        assert!(store.ensure_root().is_err());
+        assert!(!directory.0.join("missing").exists());
+
+        arc_crypto::secret_file::create_private_directory_tree(root.parent().unwrap()).unwrap();
+        store.ensure_root().unwrap();
+        assert!(root.is_dir());
+        arc_crypto::secret_file::validate_private_directory(&root).unwrap();
+        arc_crypto::secret_file::validate_private_directory(root.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generation_store_restores_a_staged_full_root_before_absent_create() {
+        let directory = TestDirectory::new("staged-full-root");
+        let root = directory.0.join("store");
+        arc_crypto::secret_file::create_private_directory_tree(&root).unwrap();
+        let sentinel = root.join("canonical-history");
+        fs::write(&sentinel, b"must not be stranded").unwrap();
+        let digest = arc_crypto::secret_file::namespace_path_digest(&root).unwrap();
+        let staged = directory.0.join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&root, &staged, false).unwrap();
+
+        let store = GenerationStore::new(&root);
+        store.ensure_root().unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must not be stranded");
+        assert!(!staged.exists());
     }
 
     fn h(label: &[u8]) -> Hash256 {
@@ -3342,6 +4049,49 @@ mod tests {
             RetainedDagRecord::dag_block(round, h(b"dag"), vec![4, 5, 6]),
             RetainedDagRecord::round_cursor(round + 1),
         ]
+    }
+
+    #[test]
+    fn durable_publish_moves_directories_and_replaces_files() {
+        let directory = TestDirectory::new("durable-publish");
+        let directly_published = directory.0.join("directly-published");
+        write_new_synced_file_durably(&directly_published, b"synced").unwrap();
+        assert_eq!(fs::read(directly_published).unwrap(), b"synced");
+
+        let source_directory = directory.0.join("source-directory");
+        let destination_directory = directory.0.join("destination-directory");
+        create_private_directory(&source_directory).unwrap();
+        write_new_synced_file(&source_directory.join("payload"), b"directory").unwrap();
+        rename_for_durable_publish(
+            &source_directory,
+            &destination_directory,
+            false,
+            "test publish directory",
+        )
+        .unwrap();
+        fsync_directory(&directory.0).unwrap();
+        assert_eq!(
+            fs::read(destination_directory.join("payload")).unwrap(),
+            b"directory"
+        );
+
+        let first = directory.0.join("first.tmp");
+        let second = directory.0.join("second.tmp");
+        let current = directory.0.join("CURRENT");
+        write_new_synced_file(&first, b"first").unwrap();
+        rename_for_durable_publish(&first, &current, false, "test publish file").unwrap();
+        let blocked = directory.0.join("blocked.tmp");
+        write_new_synced_file(&blocked, b"blocked").unwrap();
+        assert!(
+            rename_for_durable_publish(&blocked, &current, false, "test reject replacement",)
+                .is_err()
+        );
+        assert!(blocked.exists());
+        assert_eq!(fs::read(&current).unwrap(), b"first");
+        write_new_synced_file(&second, b"second").unwrap();
+        rename_for_durable_publish(&second, &current, true, "test replace file").unwrap();
+        fsync_directory(&directory.0).unwrap();
+        assert_eq!(fs::read(current).unwrap(), b"second");
     }
 
     fn replace_pointer(store: &GenerationStore, generation: &VerifiedGeneration) {
@@ -3524,6 +4274,41 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_gc_recovers_legacy_hard_link_dual_active_names() {
+        let parent = TestDirectory::new("gc-legacy-dual-active");
+        let store = GenerationStore::new(parent.0.join("store"));
+        let generations = five_generation_chain(&store);
+        let current = generations[4].pin;
+        let target = generations[0].pin;
+        let mut observer = FailingGcObserver {
+            fail_at: GcPoint::ActiveLogRenamed(target),
+            reached_failure: false,
+        };
+        store
+            .prune_ancestors_with_observer(&binding(), current, &mut observer)
+            .expect_err("fault observer must interrupt active-log GC");
+        assert!(observer.reached_failure);
+
+        let live = store.active_log_path(target);
+        let tombstone = store
+            .root
+            .join(format!(".gc-active-{}.bin", target.hash.to_hex()));
+        assert!(!live.exists());
+        assert!(tombstone.is_file());
+        fs::hard_link(&tombstone, &live).unwrap();
+        fsync_directory(&store.root).unwrap();
+
+        store.recover_interrupted_ancestor_gc(&binding()).unwrap();
+        let audit = store.audit(&binding()).unwrap();
+        assert_eq!(audit.current.pin, current);
+        assert_eq!(audit.generation_count, 2);
+        assert_eq!(audit.status, StoreAuditStatus::Clean);
+        assert!(!live.exists());
+        assert!(!tombstone.exists());
+    }
+
     #[test]
     fn external_pin_and_head_audit_detect_pointer_rollback() {
         let parent = TestDirectory::new("rollback");
@@ -3678,6 +4463,90 @@ mod tests {
                 PublishPoint::PointerRenamed,
                 PublishPoint::RootAfterPointerSynced,
             ]
+        );
+    }
+
+    #[test]
+    fn interrupted_initial_publication_resumes_only_the_exact_empty_boundary() {
+        for point in [
+            PublishPoint::GenerationPublished,
+            PublishPoint::RootAfterGenerationSynced,
+            PublishPoint::ActiveLogSynced,
+            PublishPoint::RootAfterActiveLogSynced,
+            PublishPoint::PointerFileSynced,
+        ] {
+            let parent = TestDirectory::new("resume-initial");
+            let store = GenerationStore::new(parent.0.join("store"));
+            let expected = input(10, 5, 20);
+            let mut observer = RecordingObserver {
+                fail_after: Some(point),
+                ..RecordingObserver::default()
+            };
+            assert!(matches!(
+                store.create_initial_with_observer(
+                    expected.clone(),
+                    std::iter::empty(),
+                    &mut observer,
+                ),
+                Err(GenerationError::InjectedFailure(failed)) if failed == point
+            ));
+            assert!(!store.root.join(CURRENT_FILE).exists());
+
+            let resumed = store
+                .resume_unselected_initial(&expected)
+                .unwrap()
+                .expect("published sequence-zero generation must resume");
+            assert_eq!(resumed.pin.sequence, 0);
+            let active = inspect_active_log(&store.active_log_path(resumed.pin), &resumed).unwrap();
+            assert_eq!(active.suffix, TornSuffix::Clean);
+            assert_eq!(active.total_file_bytes, ACTIVE_HEADER_BYTES);
+            assert_eq!(active.record_count, 0);
+            let audit = store.audit(&expected.binding).unwrap();
+            assert_eq!(audit.status, StoreAuditStatus::Clean);
+            assert_eq!(audit.generation_count, 1);
+            assert!(store.resume_unselected_initial(&expected).is_err());
+        }
+
+        let parent = TestDirectory::new("reject-nonempty-initial");
+        let store = GenerationStore::new(parent.0.join("store"));
+        let expected = input(10, 5, 20);
+        let mut observer = RecordingObserver {
+            fail_after: Some(PublishPoint::RootAfterGenerationSynced),
+            ..RecordingObserver::default()
+        };
+        assert!(
+            store
+                .create_initial_with_observer(expected.clone(), records(20), &mut observer)
+                .is_err()
+        );
+        assert!(store.resume_unselected_initial(&expected).is_err());
+        assert!(!store.root.join(CURRENT_FILE).exists());
+    }
+
+    #[test]
+    fn late_visible_initial_current_is_rebarriered_before_external_pinning() {
+        let parent = TestDirectory::new("rebarrier-initial-current");
+        let store = GenerationStore::new(parent.0.join("store"));
+        let expected = input(10, 5, 20);
+        let mut observer = RecordingObserver {
+            fail_after: Some(PublishPoint::PointerRenamed),
+            ..RecordingObserver::default()
+        };
+        assert!(matches!(
+            store
+                .create_initial_with_observer(expected.clone(), std::iter::empty(), &mut observer,),
+            Err(GenerationError::InjectedFailure(
+                PublishPoint::PointerRenamed
+            ))
+        ));
+        let visible = store.load_current(&expected.binding, None).unwrap();
+        let rebarriered = store
+            .rebarrier_current_pointer(&expected.binding, visible.pin)
+            .unwrap();
+        assert_eq!(rebarriered.pin, visible.pin);
+        assert_eq!(
+            store.audit(&expected.binding).unwrap().status,
+            StoreAuditStatus::Clean
         );
     }
 

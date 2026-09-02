@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -50,6 +50,166 @@ pub const LEGACY_RECOVERY_VALIDATOR_SET_SIZE: usize = 8;
 pub const LEGACY_RECOVERY_VALIDATOR_STAKE: u64 = 5_000_000;
 /// The canonical legacy validator-set total committed by the recovery input.
 pub const LEGACY_RECOVERY_TOTAL_STAKE: u64 = 40_000_000;
+
+fn checkpoint_destination_digest(path: &Path) -> Result<String, RecoveryError> {
+    Ok(arc_crypto::secret_file::namespace_path_digest(path)?)
+}
+
+#[cfg(windows)]
+fn checkpoint_namespace_rebarrier_path(path: &Path) -> Result<PathBuf, RecoveryError> {
+    let leaf = path.file_name().ok_or_else(|| {
+        RecoveryError::Invalid(format!(
+            "checkpoint destination has no leaf: {}",
+            path.display()
+        ))
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let canonical = parent.join(leaf);
+    Ok(parent.join(format!(
+        ".arc-recovery-package-{}.namespace-rebarrier",
+        checkpoint_destination_digest(&canonical)?
+    )))
+}
+
+struct CheckpointDestinationLock {
+    path: PathBuf,
+    staging: PathBuf,
+    #[cfg(windows)]
+    namespace_rebarrier: PathBuf,
+    _file: File,
+}
+
+impl CheckpointDestinationLock {
+    fn acquire(path: &Path) -> Result<Self, RecoveryError> {
+        let leaf = path.file_name().ok_or_else(|| {
+            RecoveryError::Invalid(format!(
+                "checkpoint destination has no leaf: {}",
+                path.display()
+            ))
+        })?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        let path = parent.join(leaf);
+        let digest = checkpoint_destination_digest(&path)?;
+        #[cfg(windows)]
+        let namespace_rebarrier = checkpoint_namespace_rebarrier_path(&path)?;
+        let lock_path = parent.join(format!(".arc-recovery-package-{digest}.lock"));
+        let file = match arc_crypto::secret_file::create_new_private(&lock_path) {
+            Ok(mut created) => {
+                created.write_all(b"arc.recovery.package-lock.v1\n")?;
+                created.sync_all()?;
+                drop(created);
+                arc_crypto::secret_file::open_private_read_write(&lock_path)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                arc_crypto::secret_file::open_private_read_write(&lock_path)?
+            }
+            Err(error) => return Err(RecoveryError::Io(error)),
+        };
+        file.lock()?;
+        Ok(Self {
+            path,
+            staging: parent.join(format!(".arc-recovery-package-{digest}.staging")),
+            #[cfg(windows)]
+            namespace_rebarrier,
+            _file: file,
+        })
+    }
+
+    fn restore_interrupted_namespace(&self) -> Result<(), RecoveryError> {
+        #[cfg(windows)]
+        {
+            let live = fs::symlink_metadata(&self.path);
+            let staged = fs::symlink_metadata(&self.namespace_rebarrier);
+            match (live, staged) {
+                (Ok(_), Ok(_)) => {
+                    return Err(RecoveryError::Invalid(format!(
+                        "checkpoint exists in both live and namespace-rebarrier locations: {}",
+                        self.path.display()
+                    )));
+                }
+                (Ok(metadata), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(RecoveryError::Invalid(format!(
+                            "checkpoint destination is not a regular file: {}",
+                            self.path.display()
+                        )));
+                    }
+                }
+                (Err(error), Ok(metadata)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(RecoveryError::Invalid(format!(
+                            "checkpoint namespace rebarrier is not a regular file: {}",
+                            self.namespace_rebarrier.display()
+                        )));
+                    }
+                    drop(arc_crypto::secret_file::open_private(
+                        &self.namespace_rebarrier,
+                    )?);
+                    arc_crypto::secret_file::windows_move_path_write_through(
+                        &self.namespace_rebarrier,
+                        &self.path,
+                        false,
+                    )?;
+                }
+                (Err(live), Err(staged))
+                    if live.kind() == std::io::ErrorKind::NotFound
+                        && staged.kind() == std::io::ErrorKind::NotFound => {}
+                (Err(error), _) | (_, Err(error)) => return Err(RecoveryError::Io(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn rebarrier_existing(&self) -> Result<(), RecoveryError> {
+        self.restore_interrupted_namespace()?;
+        let file = arc_crypto::secret_file::open_private_read_write(&self.path)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            arc_crypto::secret_file::windows_move_path_write_through(
+                &self.path,
+                &self.namespace_rebarrier,
+                false,
+            )?;
+            arc_crypto::secret_file::windows_move_path_write_through(
+                &self.namespace_rebarrier,
+                &self.path,
+                false,
+            )?;
+            drop(arc_crypto::secret_file::open_private(&self.path)?);
+        }
+        #[cfg(not(windows))]
+        sync_parent(&self.path)?;
+        Ok(())
+    }
+}
+
+fn restore_checkpoint_destination_if_interrupted(path: &Path) -> Result<(), RecoveryError> {
+    #[cfg(windows)]
+    {
+        let staging = checkpoint_namespace_rebarrier_path(path)?;
+        match fs::symlink_metadata(&staging) {
+            Ok(_) => {
+                let lock = CheckpointDestinationLock::acquire(path)?;
+                lock.restore_interrupted_namespace()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RecoveryError::Io(error)),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
 pub const RECOVERY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 0,
@@ -613,14 +773,99 @@ impl ArcCheckpoint {
     }
 
     pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), RecoveryError> {
-        let bytes =
+        let payload =
             bincode::serialize(self).map_err(|error| RecoveryError::Codec(error.to_string()))?;
-        let path = path.as_ref();
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        file.write_all(&ARCCHKPT_MAGIC)?;
-        file.write_all(&(bytes.len() as u64).to_be_bytes())?;
+        if payload.len() > ARCCHKPT_MAX_PAYLOAD_BYTES {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint payload is {} bytes; format-v1 safety limit is {ARCCHKPT_MAX_PAYLOAD_BYTES} bytes",
+                payload.len()
+            )));
+        }
+        let mut bytes = Vec::with_capacity(ARCCHKPT_MAGIC.len() + 8 + payload.len());
+        bytes.extend_from_slice(&ARCCHKPT_MAGIC);
+        bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        let destination_lock = CheckpointDestinationLock::acquire(path.as_ref())?;
+        destination_lock.restore_interrupted_namespace()?;
+        let path = destination_lock.path.as_path();
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(RecoveryError::Invalid(format!(
+                        "checkpoint destination is not a regular non-symlink file: {}",
+                        path.display()
+                    )));
+                }
+                let mut existing = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+                let existing_len = existing.metadata()?.len();
+                if existing_len != bytes.len() as u64 {
+                    return Err(RecoveryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "checkpoint destination already exists with different bytes: {}",
+                            path.display()
+                        ),
+                    )));
+                }
+                let mut comparison = [0u8; 64 * 1024];
+                for expected in bytes.chunks(comparison.len()) {
+                    existing.read_exact(&mut comparison[..expected.len()])?;
+                    if &comparison[..expected.len()] != expected {
+                        return Err(RecoveryError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "checkpoint destination already exists with different bytes: {}",
+                                path.display()
+                            ),
+                        )));
+                    }
+                }
+                let mut trailing = [0u8; 1];
+                if existing.read(&mut trailing)? != 0 {
+                    return Err(RecoveryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "checkpoint destination already exists with different bytes: {}",
+                            path.display()
+                        ),
+                    )));
+                }
+                // Only a byte-identical retry may migrate legacy permissions;
+                // a conflicting create-only destination is left untouched.
+                arc_crypto::secret_file::tighten_open_owned_private(&existing, path)?;
+                drop(existing);
+                // Re-prove the byte-identical name with a parent fsync on Unix
+                // or two constant-space write-through moves on Windows.
+                // Rewriting a 256 MiB checkpoint on every retry can fail
+                // exactly when recovery disk is tight.
+                destination_lock.rebarrier_existing()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RecoveryError::Io(error)),
+        }
+        // One deterministic destination-bound staging file makes repeated
+        // crashes disk-bounded. A partial prior attempt is truncated and
+        // reused under the persistent destination lock instead of allocating
+        // another checkpoint-sized UUID file.
+        let mut file =
+            match arc_crypto::secret_file::open_private_read_write(&destination_lock.staging) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    arc_crypto::secret_file::create_new_private(&destination_lock.staging)?
+                }
+                Err(error) => return Err(RecoveryError::Io(error)),
+            };
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        drop(file);
+        arc_crypto::secret_file::durably_publish_existing_private_no_replace(
+            &destination_lock.staging,
+            path,
+        )?;
+        sync_parent(path)?;
         Ok(())
     }
 
@@ -1476,7 +1721,8 @@ fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundar
                 let WalOp::SetBlock(_, block) = &entries[block_index].op else {
                     unreachable!("legacy block index is created only from SetBlock")
                 };
-                if block.header.state_root != *root
+                if (height != 0 || block.header.state_root != Hash256::ZERO)
+                    && block.header.state_root != *root
                     || entries[block_index + 1..index]
                         .iter()
                         .any(|candidate| legacy_post_root_state_mutation(&candidate.op))
@@ -1529,7 +1775,8 @@ fn exact_complete_legacy_boundary(
                 let WalOp::SetBlock(_, block) = &entries[block_index].op else {
                     unreachable!("legacy block index is created only from SetBlock")
                 };
-                if block.header.state_root != snapshot_root
+                if (snapshot_height != 0 || block.header.state_root != Hash256::ZERO)
+                    && block.header.state_root != snapshot_root
                     || entries[block_index + 1..index]
                         .iter()
                         .any(|candidate| legacy_post_root_state_mutation(&candidate.op))
@@ -1639,7 +1886,10 @@ fn validate_legacy_boundary(
                 "legacy canonical block {height} has no durable checkpoint"
             )));
         };
-        if checkpoint_index <= block_index || checkpoint_root != block.header.state_root {
+        if checkpoint_index <= block_index
+            || (height != 0 || block.header.state_root != Hash256::ZERO)
+                && checkpoint_root != block.header.state_root
+        {
             return Err(StateError::PersistenceError(format!(
                 "legacy block/checkpoint mismatch at height {height}"
             )));
@@ -1858,13 +2108,21 @@ fn plan_post_recovery_wal(
 ) -> Result<PostRecoveryWalPlan, StateError> {
     if read.entries.is_empty() {
         if read.original_bytes != 0 {
-            let reason = read
-                .torn_tail
-                .map(|tail| tail.stable_reason())
-                .unwrap_or("nonempty undecodable WAL");
-            return Err(StateError::PersistenceError(format!(
-                "post-recovery WAL contains bytes but no complete block checkpoint ({reason})"
-            )));
+            let reason = read.torn_tail.map_or_else(
+                || "uncommitted_bytes_before_first_checkpoint".to_string(),
+                |tail| tail.stable_reason().to_string(),
+            );
+            return Ok(PostRecoveryWalPlan {
+                entries: Vec::new(),
+                report: RecoveryWalRepairReport {
+                    recovery_wal_original_bytes: read.original_bytes,
+                    recovery_wal_accepted_prefix_bytes: 0,
+                    recovery_wal_quarantined_tail_bytes: read.original_bytes,
+                    recovery_wal_tail_reason: reason,
+                    recovery_wal_quarantine_path: None,
+                },
+                original_hash: read.original_hash,
+            });
         }
         return Ok(PostRecoveryWalPlan {
             entries: Vec::new(),
@@ -1946,9 +2204,30 @@ fn plan_post_recovery_wal(
     }
 
     let Some((checkpoint_index, checkpoint_height)) = latest_boundary else {
-        return Err(StateError::PersistenceError(
-            "post-recovery WAL has no complete block checkpoint".into(),
-        ));
+        // The signed recovery package plus canonical transition block is an
+        // independently authenticated byte-zero boundary. A crash during the
+        // first post-recovery block may therefore discard every physically
+        // valid/torn WAL byte after semantic validation above. Complete frame
+        // corruption and invalid heights/hashes still fail before this point.
+        let valid_entries = read.entries.len();
+        let reason = match read.torn_tail {
+            None => format!("uncommitted_valid_entries_before_first_checkpoint:{valid_entries}"),
+            Some(tail) => format!(
+                "uncommitted_valid_entries_before_first_checkpoint:{valid_entries};{}",
+                tail.stable_reason()
+            ),
+        };
+        return Ok(PostRecoveryWalPlan {
+            entries: Vec::new(),
+            report: RecoveryWalRepairReport {
+                recovery_wal_original_bytes: read.original_bytes,
+                recovery_wal_accepted_prefix_bytes: 0,
+                recovery_wal_quarantined_tail_bytes: read.original_bytes,
+                recovery_wal_tail_reason: reason,
+                recovery_wal_quarantine_path: None,
+            },
+            original_hash: read.original_hash,
+        });
     };
     let mut expected_height = transition_height.checked_add(1).ok_or_else(|| {
         StateError::PersistenceError("recovery transition height overflows u64".into())
@@ -2401,12 +2680,14 @@ impl StateDB {
                     .into(),
             ));
         }
-        let wal_path = wal_dir.join("state.wal");
-        if !wal_path.is_file() {
-            return Err(StateError::PersistenceError(format!(
-                "legacy recovery source has no state WAL at {wal_path:?}"
-            )));
-        }
+        let requested_wal_path = wal_dir.join("state.wal");
+        let wal_path = crate::wal::select_read_only_wal_path(&requested_wal_path).map_err(
+            |error| {
+                StateError::PersistenceError(format!(
+                    "failed to select the read-only legacy source WAL {requested_wal_path:?}: {error}"
+                ))
+            },
+        )?;
 
         let binding_path = wal_dir.join("genesis.network-hash");
         match fs::read_to_string(&binding_path) {
@@ -2632,10 +2913,11 @@ impl StateDB {
         network: RecoveryNetworkPolicy,
         import: Option<RecoveryImport>,
     ) -> Result<Self, StateError> {
-        let wal_dir = wal_dir.as_ref();
-        fs::create_dir_all(wal_dir).map_err(|error| {
-            StateError::PersistenceError(format!("failed to create {wal_dir:?}: {error}"))
-        })?;
+        let namespace_lock = crate::prepare_persistent_state_directory(wal_dir.as_ref())?;
+        let wal_dir = namespace_lock.target();
+        crate::cleanup_state_staging_files(wal_dir)?;
+        cleanup_recovery_staging_files(wal_dir)?;
+        restore_interrupted_stored_checkpoint_names(wal_dir)?;
         let marker_path = wal_dir.join(ACTIVE_RECOVERY_MARKER);
         let existing_marker = read_active_marker(&marker_path)?;
 
@@ -2652,8 +2934,13 @@ impl StateDB {
         };
 
         let Some(approved_hash) = approved_hash else {
+            reject_interrupted_checkpoint_staging_without_import(wal_dir)?;
             reject_orphaned_recovery_files(wal_dir)?;
-            return Self::with_genesis_persistent(prefunded, wal_dir, network.genesis_hash);
+            return Self::with_genesis_persistent_in_prepared_dir(
+                prefunded,
+                wal_dir,
+                network.genesis_hash,
+            );
         };
 
         let checkpoint_path = if let Some(requested) = import.as_ref() {
@@ -2661,6 +2948,11 @@ impl StateDB {
         } else {
             checkpoint_store_path(wal_dir, approved_hash)
         };
+        restore_checkpoint_destination_if_interrupted(&checkpoint_path).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "failed to restore interrupted checkpoint namespace {checkpoint_path:?}: {error}"
+            ))
+        })?;
         let checkpoint = ArcCheckpoint::read_from(&checkpoint_path)?;
         let trust = RecoveryTrustRoot {
             network: network.clone(),
@@ -2679,18 +2971,88 @@ impl StateDB {
         }
 
         let wal_path = wal_dir.join("state.wal");
-        if existing_marker.is_none() {
-            if wal_path.exists() {
+        let stored_path = checkpoint_store_path(wal_dir, approved_hash);
+        if existing_marker.is_none() && wal_path.exists() {
+            return Err(StateError::PersistenceError(format!(
+                "refusing ARCCHKPT activation over existing WAL {wal_path:?}; archive it and use a fresh data directory"
+            )));
+        }
+        let stored_was_present = stored_path.exists();
+        if !stored_was_present {
+            write_checkpoint_atomically(&checkpoint, &stored_path)?;
+        }
+        let stored_metadata = fs::symlink_metadata(&stored_path).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "failed to inspect stored recovery checkpoint {stored_path:?}: {error}"
+            ))
+        })?;
+        if stored_metadata.file_type().is_symlink() || !stored_metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "stored recovery checkpoint is not a regular non-symlink file: {stored_path:?}"
+            )));
+        }
+        let stored_checkpoint = ArcCheckpoint::read_from(&stored_path)?;
+        stored_checkpoint.verify(&trust)?;
+        if existing_marker.is_none() && stored_was_present {
+            // A previous write-through publication may have made the final
+            // name visible while reporting a late flush failure. Before a
+            // marker can make that name a permanent trust dependency, give
+            // the exact verified package a fresh namespace barrier. This is
+            // activation/retry-only, never a 256 MiB healthy-restart rewrite.
+            stored_checkpoint.write_to(&stored_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to rebarrier stored recovery checkpoint {stored_path:?}: {error}"
+                ))
+            })?;
+        } else {
+            // Healthy restarts avoid rewriting the bounded-but-large package.
+            // The marker could only have been published after the package's
+            // namespace barrier; repeat the file-data barrier and Unix parent
+            // fsync to detect media/permission failures before replay.
+            let stored_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&stored_path)
+                .map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "failed to open stored recovery checkpoint {stored_path:?}: {error}"
+                    ))
+                })?;
+            if !stored_file
+                .metadata()
+                .map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "failed to inspect stored recovery checkpoint {stored_path:?}: {error}"
+                    ))
+                })?
+                .is_file()
+            {
                 return Err(StateError::PersistenceError(format!(
-                    "refusing ARCCHKPT activation over existing WAL {wal_path:?}; archive it and use a fresh data directory"
+                    "stored recovery checkpoint is not a regular file: {stored_path:?}"
                 )));
             }
-            let stored_path = checkpoint_store_path(wal_dir, approved_hash);
-            if !stored_path.exists() {
-                write_checkpoint_atomically(&checkpoint, &stored_path)?;
-            }
+            stored_file.sync_all().map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to flush stored recovery checkpoint {stored_path:?}: {error}"
+                ))
+            })?;
+            drop(stored_file);
+            sync_parent(&stored_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to rebarrier stored recovery checkpoint {stored_path:?}: {error}"
+                ))
+            })?;
+        }
+        if existing_marker.is_none() {
             write_marker_atomically(&marker_path, approved_hash)?;
         }
+        let marker_bytes = format!("{}\n", approved_hash.to_hex());
+        arc_crypto::secret_file::durably_replace_private(&marker_path, marker_bytes.as_bytes())
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to rebarrier recovery marker {marker_path:?}: {error}"
+                ))
+            })?;
         Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), network.genesis_hash)?;
 
         let transition_height = checkpoint.manifest.source_height + 1;
@@ -2718,9 +3080,7 @@ impl StateDB {
 
         // Prove the selected physical prefix against the signed checkpoint and
         // its canonical state root before preserving or truncating any byte.
-        for entry in &wal_plan.entries {
-            staged.apply_wal_op(&entry.op);
-        }
+        staged.apply_verified_recovery_wal(&wal_plan.entries)?;
         staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         staged.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
 
@@ -2770,9 +3130,7 @@ impl StateDB {
 
         let state = StateDB::with_persistence(&wal_path)?;
         state.install_verified_checkpoint(&checkpoint)?;
-        for entry in &wal_plan.entries {
-            state.apply_wal_op(&entry.op);
-        }
+        state.apply_verified_recovery_wal(&wal_plan.entries)?;
         state.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         state.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
         Ok(state)
@@ -2848,6 +3206,35 @@ impl StateDB {
         Ok(())
     }
 
+    fn apply_verified_recovery_wal(&self, entries: &[crate::WalEntry]) -> Result<(), StateError> {
+        for entry in entries {
+            self.apply_wal_op(&entry.op);
+            let WalOp::Checkpoint(expected_root) = &entry.op else {
+                continue;
+            };
+            let block = self.get_block(entry.block_height).ok_or_else(|| {
+                StateError::PersistenceError(format!(
+                    "post-recovery checkpoint at height {} has no replayed block",
+                    entry.block_height
+                ))
+            })?;
+            if block.header.state_root != *expected_root {
+                return Err(StateError::PersistenceError(format!(
+                    "post-recovery block/checkpoint root mismatch at height {}: block {}, checkpoint {}",
+                    entry.block_height, block.header.state_root, expected_root
+                )));
+            }
+            let actual_root = self.compute_state_root();
+            if actual_root != *expected_root {
+                return Err(StateError::PersistenceError(format!(
+                    "post-recovery WAL state root mismatch at checkpoint height {}: checkpoint {}, replayed {}",
+                    entry.block_height, expected_root, actual_root
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn verify_recovery_restart(
         &self,
         entries: &[crate::WalEntry],
@@ -2917,6 +3304,70 @@ fn checkpoint_store_path(wal_dir: &Path, hash: Hash256) -> PathBuf {
     ))
 }
 
+fn restore_interrupted_stored_checkpoint_names(wal_dir: &Path) -> Result<(), StateError> {
+    #[cfg(windows)]
+    {
+        for entry in fs::read_dir(wal_dir).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "failed to inspect interrupted checkpoint namespaces in {wal_dir:?}: {error}"
+            ))
+        })? {
+            let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(digest) = name
+                .strip_prefix(".arc-recovery-package-")
+                .and_then(|value| value.strip_suffix(".namespace-rebarrier"))
+            else {
+                continue;
+            };
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                continue;
+            }
+            let staging = entry.path();
+            let metadata = fs::symlink_metadata(&staging)
+                .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StateError::PersistenceError(format!(
+                    "checkpoint namespace rebarrier is not a regular file: {staging:?}"
+                )));
+            }
+            drop(
+                arc_crypto::secret_file::open_private(&staging).map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "checkpoint namespace rebarrier is not private {staging:?}: {error}"
+                    ))
+                })?,
+            );
+            let checkpoint = ArcCheckpoint::read_from(&staging)?;
+            let destination = checkpoint_store_path(wal_dir, checkpoint.manifest_hash());
+            let expected = checkpoint_destination_digest(&destination).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to bind interrupted checkpoint namespace {staging:?}: {error}"
+                ))
+            })?;
+            if digest != expected {
+                // A standalone operator export may share this directory. Its
+                // destination-bound staging is unrelated to the active store.
+                continue;
+            }
+            restore_checkpoint_destination_if_interrupted(&destination).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to restore stored checkpoint {destination:?}: {error}"
+                ))
+            })?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = wal_dir;
+    Ok(())
+}
+
 fn read_active_marker(path: &Path) -> Result<Option<Hash256>, StateError> {
     match fs::read_to_string(path) {
         Ok(value) => Hash256::from_hex(value.trim())
@@ -2945,35 +3396,176 @@ fn reject_orphaned_recovery_files(wal_dir: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
+fn deterministic_checkpoint_staging_digest(name: &str) -> Option<&str> {
+    let digest = name
+        .strip_prefix(".arc-recovery-package-")?
+        .strip_suffix(".staging")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(digest)
+}
+
+fn reject_interrupted_checkpoint_staging_without_import(wal_dir: &Path) -> Result<(), StateError> {
+    for entry in fs::read_dir(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect interrupted checkpoint staging in {wal_dir:?}: {error}"
+        ))
+    })? {
+        let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if deterministic_checkpoint_staging_digest(&name).is_none() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "interrupted ARCCHKPT staging artifact is not a regular non-symlink file: {path:?}"
+            )));
+        }
+        drop(
+            arc_crypto::secret_file::open_private(&path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "interrupted ARCCHKPT staging artifact is not private {path:?}: {error}"
+                ))
+            })?,
+        );
+        // This can be either a fully fsynced package awaiting create-only
+        // publication or a partial package that `ArcCheckpoint::write_to`
+        // will safely truncate and reuse. Without an approved import there is
+        // no trust root with which to activate it, but silently initializing a
+        // normal genesis WAL would make the interrupted recovery impossible
+        // to resume in this directory.
+        return Err(StateError::PersistenceError(format!(
+            "interrupted ARCCHKPT package staging exists without recovery.active or an approved import: {path:?}; refusing normal genesis startup"
+        )));
+    }
+    Ok(())
+}
+
 fn write_checkpoint_atomically(
     checkpoint: &ArcCheckpoint,
     destination: &Path,
 ) -> Result<(), RecoveryError> {
-    let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    checkpoint.write_to(&temporary)?;
-    fs::rename(&temporary, destination)?;
-    sync_parent(destination)?;
-    Ok(())
+    // `ArcCheckpoint::write_to` already stages, fsyncs, publishes create-only,
+    // and rebarriers an identical retry. A second 256 MiB staging layer only
+    // doubles peak disk use and creates another orphan class.
+    checkpoint.write_to(destination)
 }
 
 fn write_marker_atomically(path: &Path, hash: Hash256) -> Result<(), RecoveryError> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    writeln!(file, "{}", hash.to_hex())?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
+    let temporary = durable_staging_path(path, "marker");
+    let write_result = (|| -> Result<(), RecoveryError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        writeln!(file, "{}", hash.to_hex())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = rename_for_durable_publish(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     sync_parent(path)?;
     Ok(())
 }
 
+fn durable_staging_path(destination: &Path, label: &str) -> PathBuf {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".arc-recovery-{label}-{}.tmp",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn cleanup_recovery_staging_files(wal_dir: &Path) -> Result<(), StateError> {
+    for entry in fs::read_dir(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect recovery staging directory {wal_dir:?}: {error}"
+        ))
+    })? {
+        let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let recognized = ["package", "checkpoint", "marker"].iter().any(|label| {
+            crate::uuid_staging_name(&name, &format!(".arc-recovery-{label}-"), ".tmp")
+        });
+        if !recognized {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "recovery staging artifact is not a regular file: {path:?}"
+            )));
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?path, %error, "deferring cleanup of incomplete recovery staging file");
+            }
+            continue;
+        }
+        if let Err(error) = sync_parent(&path) {
+            tracing::warn!(path = ?path, %error, "recovery staging cleanup barrier will be retried");
+        }
+    }
+    Ok(())
+}
+
+fn rename_for_durable_publish(source: &Path, destination: &Path) -> Result<(), RecoveryError> {
+    #[cfg(windows)]
+    {
+        // Windows has no documented parent-directory fsync. Publish the
+        // already-synced file through the supported write-through move so its
+        // live name is durable before activation can continue.
+        arc_crypto::secret_file::windows_move_path_write_through(source, destination, false)?;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        // A hard-link publication preserves create-new semantics under races;
+        // the caller fsyncs the shared parent after the staging name is gone.
+        fs::hard_link(source, destination)?;
+        fs::remove_file(source)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::rename(source, destination)?;
+        Ok(())
+    }
+}
+
 fn sync_parent(path: &Path) -> Result<(), RecoveryError> {
-    if let Some(parent) = path.parent() {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows publication is flushed by rename_for_durable_publish.
+        let _ = path;
     }
     Ok(())
 }
@@ -2995,6 +3587,154 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn durable_recovery_publish_moves_a_synced_file() {
+        let directory = temp_dir("durable-publish");
+        let staging = directory.join("staging");
+        let destination = directory.join("published");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .unwrap();
+        file.write_all(b"checkpoint").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        rename_for_durable_publish(&staging, &destination).unwrap();
+        sync_parent(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"checkpoint");
+
+        let blocked = directory.join("blocked");
+        fs::write(&blocked, b"blocked").unwrap();
+        assert!(rename_for_durable_publish(&blocked, &destination).is_err());
+        assert!(blocked.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"checkpoint");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_write_retry_rebarriers_identical_bytes_and_rejects_difference() {
+        let directory = temp_dir("checkpoint-write-retry");
+        let path = directory.join("candidate.arcchkpt");
+        let (checkpoint, _, _) = checkpoint();
+        checkpoint.write_to(&path).unwrap();
+        let first = fs::read(&path).unwrap();
+        checkpoint
+            .write_to(&path)
+            .expect("byte-identical retry must rebarrier and succeed");
+        assert_eq!(fs::read(&path).unwrap(), first);
+
+        let mut different = checkpoint;
+        different.payload.accounts[0].1.balance += 1;
+        assert!(different.write_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), first);
+
+        let oversized = directory.join("preexisting-oversized.arcchkpt");
+        let file = File::create(&oversized).unwrap();
+        file.set_len((ARCCHKPT_MAX_PAYLOAD_BYTES as u64) + 17)
+            .unwrap();
+        drop(file);
+        #[cfg(unix)]
+        let original_mode = {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+            fs::set_permissions(&oversized, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::metadata(&oversized).unwrap().mode() & 0o777
+        };
+        assert!(different.write_to(&oversized).is_err());
+        assert_eq!(
+            fs::metadata(&oversized).unwrap().len(),
+            (ARCCHKPT_MAX_PAYLOAD_BYTES as u64) + 17
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                fs::metadata(&oversized).unwrap().mode() & 0o777
+            },
+            original_mode,
+            "a conflicting create-only destination must not be permission-migrated"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_write_reuses_one_destination_bound_partial_staging_file() {
+        let directory = temp_dir("checkpoint-deterministic-staging");
+        let path = directory.join("candidate.arcchkpt");
+        let (checkpoint, _, _) = checkpoint();
+        let destination_lock = CheckpointDestinationLock::acquire(&path).unwrap();
+        let staging = destination_lock.staging.clone();
+        let mut partial = arc_crypto::secret_file::create_new_private(&staging).unwrap();
+        partial.write_all(b"partial checkpoint bytes").unwrap();
+        partial.sync_all().unwrap();
+        drop(partial);
+        drop(destination_lock);
+
+        checkpoint.write_to(&path).unwrap();
+        assert!(path.is_file());
+        assert!(
+            !staging.exists(),
+            "successful publication must consume deterministic staging"
+        );
+        let decoded = ArcCheckpoint::read_from(&path).unwrap();
+        assert_eq!(
+            bincode::serialize(&decoded).unwrap(),
+            bincode::serialize(&checkpoint).unwrap()
+        );
+        assert!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|name| !name.starts_with(".arc-recovery-package-") || name.ends_with(".lock")),
+            "checkpoint retries may leave only the one bounded lock sidecar"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_startup_cleanup_reclaims_only_exact_internal_staging_files() {
+        let directory = temp_dir("recovery-staging-cleanup");
+        let stale: Vec<_> = ["package", "checkpoint", "marker"]
+            .into_iter()
+            .map(|label| {
+                directory.join(format!(
+                    ".arc-recovery-{label}-{}.tmp",
+                    uuid::Uuid::new_v4()
+                ))
+            })
+            .collect();
+        for path in &stale {
+            fs::write(path, b"incomplete internal staging").unwrap();
+        }
+        let unrelated = directory.join(".arc-recovery-package-not-a-uuid.tmp");
+        fs::write(&unrelated, b"operator file").unwrap();
+
+        cleanup_recovery_staging_files(&directory).unwrap();
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert!(unrelated.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn deterministic_checkpoint_staging_grammar_is_exact() {
+        let digest = "a".repeat(64);
+        let exact = format!(".arc-recovery-package-{digest}.staging");
+        assert_eq!(
+            deterministic_checkpoint_staging_digest(&exact),
+            Some(digest.as_str())
+        );
+        for unrelated in [
+            format!("arc-recovery-package-{digest}.staging"),
+            format!(".arc-recovery-package-{}.staging", "a".repeat(63)),
+            format!(".arc-recovery-package-{}.staging", "A".repeat(64)),
+            format!(".arc-recovery-package-{digest}.staging.extra"),
+        ] {
+            assert!(deterministic_checkpoint_staging_digest(&unrelated).is_none());
+        }
     }
 
     fn validators() -> (Vec<KeyPair>, Vec<RecoveryValidator>) {
@@ -3154,6 +3894,43 @@ mod tests {
         (state, checkpoint, keys, policy, source_dir, active_dir)
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn recovery_constructor_restores_a_staged_full_root_before_startup_decisions() {
+        let (state, _checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("staged-full-root");
+        let block = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"staged-full-root-block",
+        );
+        let expected_root = state.get_state_root();
+        drop(state);
+
+        let digest = arc_crypto::secret_file::namespace_path_digest(&active_dir).unwrap();
+        let staged = active_dir.parent().unwrap().join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&active_dir, &staged, false)
+            .unwrap();
+        assert!(!active_dir.exists());
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), block.header.height);
+        assert_eq!(
+            restarted.get_block(block.header.height).unwrap().hash,
+            block.hash
+        );
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(!staged.exists());
+        drop(restarted);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
     fn commit_empty_recovery_block(
         state: &StateDB,
         producer: Address,
@@ -3186,6 +3963,49 @@ mod tests {
             .collect();
         quarantines.sort();
         quarantines
+    }
+
+    #[test]
+    fn recovery_bound_persistence_rejects_standalone_diff_and_event_boundaries() {
+        let (state, _checkpoint, _keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("standalone-boundary-rejection");
+        let wal_path = active_dir.join("state.wal");
+        let before_wal = fs::read(&wal_path).unwrap();
+        let before_root = state.get_state_root();
+        let diff = arc_types::StateDiff {
+            changes: Vec::new(),
+            new_root: before_root,
+        };
+        let error = state.apply_state_diff(&diff).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("standalone state-diff persistence is unavailable"),
+            "{error}"
+        );
+        state.store_event_logs(
+            state.height(),
+            vec![EventLog {
+                address: hash_bytes(b"recovery-event-address"),
+                topics: vec![hash_bytes(b"recovery-event-topic")],
+                data: b"must-not-be-persisted".to_vec(),
+                block_height: state.height(),
+                tx_hash: hash_bytes(b"recovery-event-transaction"),
+                log_index: 0,
+            }],
+        );
+        assert!(state.event_logs.is_empty());
+        state.try_sync_wal().unwrap();
+        assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.get_state_root(), before_root);
+        assert!(restarted.event_logs.is_empty());
+        drop(restarted);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
     }
 
     fn payload_with_one_canonical_transaction() -> RecoveryPayload {
@@ -4177,11 +4997,13 @@ mod tests {
     }
 
     #[test]
-    fn post_recovery_wal_without_any_checkpoint_stays_fatal() {
+    fn restart_quarantines_complete_first_block_without_a_checkpoint_to_empty_base() {
         let (state, checkpoint, keys, policy, source_dir, active_dir) =
             persistent_recovery_fixture("no-checkpoint");
         drop(state);
         let transition = checkpoint.manifest.transition_block().unwrap();
+        let expected_height = transition.header.height;
+        let expected_root = transition.header.state_root;
         let next_height = transition.header.height + 1;
         let uncommitted = Block::new(
             BlockHeader {
@@ -4205,14 +5027,161 @@ mod tests {
         drop(writer);
         let original = fs::read(&wal_path).unwrap();
 
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            transition.header.height,
+        )
+        .unwrap();
+        assert_eq!(planned.report.recovery_wal_accepted_prefix_bytes, 0);
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "uncommitted_valid_entries_before_first_checkpoint:1"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(restarted.get_block(next_height).is_none());
+        drop(restarted);
+        assert!(fs::read(&wal_path).unwrap().is_empty());
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read(&quarantines[0]).unwrap(), original);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_quarantines_a_torn_first_post_recovery_frame_to_empty_base() {
+        let (state, checkpoint, _, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("torn-first-frame");
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let expected_height = transition.header.height;
+        let expected_root = transition.header.state_root;
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"torn-first-frame").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let original = fs::read(&wal_path).unwrap();
+
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            transition.header.height,
+        )
+        .unwrap();
+        assert_eq!(planned.report.recovery_wal_accepted_prefix_bytes, 0);
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "truncated_wal_frame_payload"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        drop(restarted);
+        assert!(fs::read(&wal_path).unwrap().is_empty());
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read(&quarantines[0]).unwrap(), original);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_rejects_bad_intermediate_checkpoint_even_if_final_root_matches() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("bad-intermediate-root");
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let target = checkpoint.payload.accounts[0].0;
+        let original = state.get_account(&target).unwrap();
+        let final_root = state.get_state_root();
+        let mut changed = original.clone();
+        changed.balance = changed.balance.checked_add(1).unwrap();
+
+        let scratch = StateDB::new();
+        scratch.install_verified_checkpoint(&checkpoint).unwrap();
+        scratch.apply_wal_op(&WalOp::SetAccount(target, changed.clone()));
+        assert_ne!(
+            scratch.get_state_root(),
+            final_root,
+            "fixture mutation must change the recovery state root"
+        );
+
+        let first_height = transition.header.height + 1;
+        let first = Block::new(
+            BlockHeader {
+                height: first_height,
+                timestamp: 1_787_777_001_000,
+                parent_hash: transition.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                // Deliberately commit the pre-mutation root. The second block
+                // restores the account, so final-only replay validation would
+                // accept this invalid intermediate history.
+                state_root: final_root,
+                proof_hash: hash_bytes(b"bad-intermediate-root-first"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        let second_height = first_height + 1;
+        let second = Block::new(
+            BlockHeader {
+                height: second_height,
+                timestamp: 1_787_777_002_000,
+                parent_hash: first.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                state_root: final_root,
+                proof_hash: hash_bytes(b"bad-intermediate-root-second"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetAccount(target, changed), first_height);
+        writer.append(WalOp::SetBlock(first_height, first), first_height);
+        writer.append(WalOp::Checkpoint(final_root), first_height);
+        writer.append(WalOp::SetAccount(target, original), second_height);
+        writer.append(WalOp::SetBlock(second_height, second), second_height);
+        writer.append(WalOp::Checkpoint(final_root), second_height);
+        writer.sync().unwrap();
+        drop(writer);
+        let original_wal = fs::read(&wal_path).unwrap();
+
         let error = StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None)
             .err()
-            .expect("post-transition entries without a checkpoint must remain fatal");
+            .expect("an invalid intermediate recovery checkpoint must fail closed");
         assert!(
-            error.to_string().contains("no complete block checkpoint"),
+            error.to_string().contains(&format!(
+                "state root mismatch at checkpoint height {first_height}"
+            )),
             "{error}"
         );
-        assert_eq!(fs::read(&wal_path).unwrap(), original);
+        assert_eq!(fs::read(&wal_path).unwrap(), original_wal);
         assert!(recovery_wal_quarantines(&active_dir).is_empty());
 
         fs::remove_dir_all(source_dir).unwrap();
@@ -4887,6 +5856,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_loader_reads_staged_only_wal_without_repairing_its_namespace() {
+        let source_dir = temp_dir("legacy-staged-only-source");
+        let genesis_hash = hash_bytes(b"legacy-staged-only-genesis");
+        let state = StateDB::with_genesis_persistent(
+            &[(hash_bytes(b"legacy-staged-account"), 123)],
+            &source_dir,
+            genesis_hash,
+        )
+        .unwrap();
+        let (block, _) = state
+            .execute_block_verified_at(&[], hash_bytes(b"legacy-staged-producer"), 1)
+            .unwrap();
+        let root = block.header.state_root;
+        drop(state);
+
+        let live = source_dir.join("state.wal");
+        let staged = source_dir.join(".state.wal.namespace-rebarrier");
+        fs::rename(&live, &staged).unwrap();
+
+        let loaded =
+            StateDB::load_legacy_recovery_source(&source_dir, genesis_hash, false).unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(
+            !live.exists(),
+            "read-only capture must not restore the live name"
+        );
+        assert!(
+            staged.is_file(),
+            "read-only capture must retain staged evidence"
+        );
+
+        fs::remove_dir_all(source_dir).unwrap();
+    }
+
+    #[test]
     fn existing_legacy_wal_blocks_checkpoint_activation() {
         let (checkpoint, _, policy) = checkpoint();
         let source_dir = temp_dir("legacy-source");
@@ -4913,6 +5918,198 @@ mod tests {
                 .contains("refusing ARCCHKPT activation over existing WAL")
         );
         assert!(!active_dir.join(ACTIVE_RECOVERY_MARKER).exists());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn pre_marker_retry_rebarriers_an_existing_verified_checkpoint() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("pre-marker-retry-source");
+        let active_dir = temp_dir("pre-marker-retry-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        checkpoint.write_to(&stored).unwrap();
+        let expected = fs::read(&stored).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&stored, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert_eq!(fs::read(&stored).unwrap(), expected);
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    fn write_private_checkpoint_stage(destination: &Path, bytes: &[u8]) -> PathBuf {
+        let destination_lock = CheckpointDestinationLock::acquire(destination).unwrap();
+        let staging = destination_lock.staging.clone();
+        let mut file = arc_crypto::secret_file::create_new_private(&staging).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        drop(destination_lock);
+        staging
+    }
+
+    #[test]
+    fn complete_checkpoint_stage_fences_normal_startup_and_resumes_approved_import() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("complete-package-stage-source");
+        let active_dir = temp_dir("complete-package-stage-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        let staging = write_private_checkpoint_stage(&stored, &fs::read(&source).unwrap());
+        let staging_name = staging.file_name().unwrap().to_str().unwrap();
+        assert!(deterministic_checkpoint_staging_digest(staging_name).is_some());
+        assert!(fs::symlink_metadata(&staging).unwrap().is_file());
+        drop(arc_crypto::secret_file::open_private(&staging).unwrap());
+
+        let error =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .err()
+                .expect("an interrupted complete package must fence normal startup");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted ARCCHKPT package staging")
+        );
+        assert!(staging.is_file());
+        assert!(!stored.exists());
+        assert!(!active_dir.join("state.wal").exists());
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert!(!staging.exists());
+        assert!(stored.is_file());
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+        assert!(active_dir.join("state.wal").is_file());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn partial_checkpoint_stage_fences_normal_startup_and_resumes_approved_import() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("partial-package-stage-source");
+        let active_dir = temp_dir("partial-package-stage-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        let staging = write_private_checkpoint_stage(&stored, b"ARCCHKPT\0partial");
+        assert!(
+            deterministic_checkpoint_staging_digest(staging.file_name().unwrap().to_str().unwrap())
+                .is_some()
+        );
+        assert!(fs::symlink_metadata(&staging).unwrap().is_file());
+        drop(arc_crypto::secret_file::open_private(&staging).unwrap());
+
+        let error =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .err()
+                .expect("an interrupted partial package must fence normal startup");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted ARCCHKPT package staging")
+        );
+        assert_eq!(fs::read(&staging).unwrap(), b"ARCCHKPT\0partial");
+        assert!(!stored.exists());
+        assert!(!active_dir.join("state.wal").exists());
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert!(!staging.exists());
+        assert!(stored.is_file());
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+        assert!(active_dir.join("state.wal").is_file());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_only_stored_checkpoint_is_restored_before_orphan_decisions() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("staged-stored-checkpoint-source");
+        let active_dir = temp_dir("staged-stored-checkpoint-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        checkpoint.write_to(&stored).unwrap();
+        let staged = checkpoint_namespace_rebarrier_path(&stored).unwrap();
+        arc_crypto::secret_file::windows_move_path_write_through(&stored, &staged, false).unwrap();
+
+        let error =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .err()
+                .expect("an unapproved restored package must remain fail-closed");
+        assert!(error.to_string().contains("without recovery.active"));
+        assert!(stored.is_file());
+        assert!(!staged.exists());
+        assert!(!active_dir.join("state.wal").exists());
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
 
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();

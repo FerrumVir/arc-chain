@@ -13289,6 +13289,54 @@ fn settlement_journal_file(node: &NodeState, job_id: Hash256) -> Option<std::pat
         .map(|directory| directory.join(format!("{}.json", job_id.to_hex())))
 }
 
+#[cfg(windows)]
+fn move_file_write_through(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    // No REPLACE_EXISTING flag: settlement publication remains create-only.
+    // WRITE_THROUGH is the documented Windows durability primitive for the
+    // same-directory rename because directory handles cannot provide the Unix
+    // parent-fsync contract.
+    arc_crypto::secret_file::windows_move_path_write_through(source, destination, false)
+}
+
+#[cfg(windows)]
+fn replace_file_write_through(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    arc_crypto::secret_file::windows_move_path_write_through(source, destination, true)
+}
+
+fn publish_settlement_journal_file(
+    temporary: &std::path::Path,
+    final_path: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        move_file_write_through(temporary, final_path)
+    }
+    #[cfg(unix)]
+    {
+        // Hard-link publication is atomic and create-only on Unix; rename
+        // would silently replace an existing verified settlement under a
+        // concurrent/idempotent publisher.
+        std::fs::hard_link(temporary, final_path)?;
+        std::fs::remove_file(temporary)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if final_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "settlement journal destination already exists",
+            ));
+        }
+        std::fs::rename(temporary, final_path)
+    }
+}
+
 fn sync_directory(directory: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -13296,48 +13344,112 @@ fn sync_directory(directory: &std::path::Path) -> Result<(), String> {
             .and_then(|file| file.sync_all())
             .map_err(|error| format!("fsync settlement journal directory: {error}"))
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Windows requires FILE_FLAG_BACKUP_SEMANTICS to open a directory
-        // handle. FlushFileBuffers via `sync_all` is then the closest native
-        // equivalent to fsyncing the rename's parent directory.
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(directory)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| format!("flush settlement journal directory: {error}"))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
+        // Windows makes each live-name publication/removal durable with a
+        // write-through rename. Other non-Unix targets have no parent-fsync
+        // primitive exposed by std.
         let _ = directory;
         Ok(())
     }
 }
 
-fn ensure_settlement_journal_directory(directory: &std::path::Path) -> Result<(), String> {
-    if directory.exists() {
-        let metadata = std::fs::symlink_metadata(directory)
-            .map_err(|error| format!("inspect settlement journal directory: {error}"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err("settlement journal path is not a real directory".to_string());
-        }
-        return Ok(());
-    }
-    std::fs::create_dir(directory)
-        .map_err(|error| format!("create settlement journal directory: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("secure settlement journal directory: {error}"))?;
-    }
-    let parent = directory
+fn rebarrier_settlement_journal_file(
+    final_path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let directory = final_path
         .parent()
-        .ok_or_else(|| "settlement journal directory has no parent".to_string())?;
-    sync_directory(parent)
+        .ok_or_else(|| "settlement journal entry has no parent".to_string())?;
+    let temporary = directory.join(format!(
+        ".tmp-rebarrier-{}-{}",
+        final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("settlement"),
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = arc_crypto::secret_file::create_new_private(&temporary)
+        .map_err(|error| format!("create settlement rebarrier file: {error}"))?;
+    let result = (|| -> Result<(), String> {
+        file.write_all(bytes)
+            .map_err(|error| format!("write settlement rebarrier file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("fsync settlement rebarrier file: {error}"))?;
+        drop(file);
+        #[cfg(windows)]
+        replace_file_write_through(&temporary, final_path)
+            .map_err(|error| format!("replace settlement journal write-through: {error}"))?;
+        #[cfg(not(windows))]
+        std::fs::rename(&temporary, final_path)
+            .map_err(|error| format!("replace settlement journal entry: {error}"))?;
+        sync_directory(directory)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn remove_settlement_journal_file(path: &std::path::Path) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "settlement journal entry has no parent".to_string())?;
+    #[cfg(windows)]
+    {
+        // First remove the live name with a durable same-directory rename. A
+        // crash can resurrect only the ignored .tmp-* tombstone, never a
+        // settlement eligible for replay. Deleting the tombstone afterward is
+        // cleanup and is safely retried by journal replay after a crash.
+        let tombstone = directory.join(format!(
+            ".tmp-removed-{}-{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("settlement"),
+            uuid::Uuid::new_v4()
+        ));
+        move_file_write_through(path, &tombstone).map_err(|error| {
+            format!(
+                "durably remove settled journal entry {}: {error}",
+                path.display()
+            )
+        })?;
+        if let Err(error) = std::fs::remove_file(&tombstone)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            // The live settlement name is already durably gone. Keep this
+            // cleanup failure observable, but do not report the semantic
+            // removal as failed: replay ignores and retries every .tmp-* file.
+            tracing::warn!(path = %tombstone.display(), %error, "settlement tombstone cleanup deferred");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(path)
+            .map_err(|error| format!("remove settled journal entry {}: {error}", path.display()))?;
+    }
+    sync_directory(directory)
+}
+
+fn ensure_settlement_journal_directory(directory: &std::path::Path) -> Result<(), String> {
+    let namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(directory)
+            .map_err(|error| format!("lock settlement journal directory namespace: {error}"))?;
+    namespace_lock
+        .restore_interrupted()
+        .map_err(|error| format!("restore settlement journal directory namespace: {error}"))?;
+    arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target())
+        .map_err(|error| format!("secure settlement journal directory: {error}"))?;
+    // The process-lifetime node data lock serializes other ARC processes. The
+    // parent-sibling guard makes this directory rebarrier atomic; runtime
+    // callers additionally retain `community_verified_settlements_gate`
+    // through the following journal publication so no same-process publisher
+    // can observe the directory's brief Windows absent-name window.
+    namespace_lock
+        .rebarrier_existing()
+        .map_err(|error| format!("rebarrier settlement journal directory namespace: {error}"))
 }
 
 fn read_settlement_journal_file(
@@ -13410,14 +13522,19 @@ fn persist_verified_settlement_journal(
         payload_hash: community_payload_hash(payload)?,
         payload: payload.clone(),
     };
-    if final_path.exists() {
+    let rebarrier_existing = || -> Result<(), String> {
         let existing = read_settlement_journal_file(&final_path)?;
         if existing.payload_hash != record.payload_hash {
             return Err(
                 "settlement journal job already exists with different semantics".to_string(),
             );
         }
-        return Ok(());
+        let existing_bytes = serde_json::to_vec(&existing)
+            .map_err(|error| format!("encode existing settlement journal entry: {error}"))?;
+        rebarrier_settlement_journal_file(&final_path, &existing_bytes)
+    };
+    if final_path.exists() {
+        return rebarrier_existing();
     }
 
     let temporary = directory.join(format!(
@@ -13427,29 +13544,25 @@ fn persist_verified_settlement_journal(
     ));
     let bytes = serde_json::to_vec(&record)
         .map_err(|error| format!("encode settlement journal entry: {error}"))?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
+    let mut file = arc_crypto::secret_file::create_new_private(&temporary)
         .map_err(|error| format!("create settlement journal temporary file: {error}"))?;
-    let write_result = (|| -> Result<(), String> {
-        file.write_all(&bytes)
-            .map_err(|error| format!("write settlement journal entry: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("fsync settlement journal entry: {error}"))?;
-        std::fs::rename(&temporary, &final_path)
-            .map_err(|error| format!("publish settlement journal entry: {error}"))?;
-        sync_directory(directory)
-    })();
-    if write_result.is_err() {
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
         let _ = std::fs::remove_file(&temporary);
+        return Err(format!("write/fsync settlement journal entry: {error}"));
     }
-    write_result
+    drop(file);
+    match publish_settlement_journal_file(&temporary, &final_path) {
+        Ok(()) => sync_directory(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&temporary);
+            rebarrier_existing()
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(format!("publish settlement journal entry: {error}"))
+        }
+    }
 }
 
 fn remove_verified_settlement_journal(node: &NodeState, job_id: Hash256) -> Result<(), String> {
@@ -13459,12 +13572,70 @@ fn remove_verified_settlement_journal(node: &NodeState, job_id: Hash256) -> Resu
     if !path.exists() {
         return Ok(());
     }
-    std::fs::remove_file(&path)
-        .map_err(|error| format!("remove settled journal entry {}: {error}", path.display()))?;
-    let directory = path
-        .parent()
-        .ok_or_else(|| "settlement journal entry has no parent".to_string())?;
-    sync_directory(directory)
+    remove_settlement_journal_file(&path)
+}
+
+fn split_settlement_staging_uuid(value: &str) -> Option<&str> {
+    let uuid_start = value.len().checked_sub(36)?;
+    if uuid_start == 0 || value.as_bytes().get(uuid_start - 1) != Some(&b'-') {
+        return None;
+    }
+    let uuid = value.get(uuid_start..)?;
+    uuid::Uuid::parse_str(uuid).ok()?;
+    value.get(..uuid_start - 1)
+}
+
+fn canonical_settlement_job_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_settlement_journal_filename(value: &str) -> bool {
+    value
+        .strip_suffix(".json")
+        .is_some_and(canonical_settlement_job_hex)
+}
+
+fn reviewed_settlement_temporary_name(name: &str) -> bool {
+    if let Some(value) = name.strip_prefix(".tmp-rebarrier-") {
+        return split_settlement_staging_uuid(value)
+            .is_some_and(canonical_settlement_journal_filename);
+    }
+    if let Some(value) = name.strip_prefix(".tmp-removed-") {
+        return split_settlement_staging_uuid(value)
+            .is_some_and(canonical_settlement_journal_filename);
+    }
+    name.strip_prefix(".tmp-")
+        .and_then(split_settlement_staging_uuid)
+        .is_some_and(canonical_settlement_job_hex)
+}
+
+fn cleanup_settlement_temporary_file(path: &std::path::Path, name: &str) -> Result<(), String> {
+    if !reviewed_settlement_temporary_name(name) {
+        return Err(format!(
+            "unexpected settlement journal temporary file {name:?}"
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!("inspect incomplete settlement journal temporary file {name:?}: {error}")
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "settlement journal temporary file {name:?} is not a regular non-symlink file"
+        ));
+    }
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        // These exact names are never replayed as earned work. In particular,
+        // `.tmp-removed-*` has already crossed a write-through live-name
+        // retirement barrier on Windows, so an AV/indexer lock may defer only
+        // physical cleanup, never settlement semantics.
+        tracing::warn!(path = %path.display(), %error, "settlement journal temporary cleanup deferred");
+    }
+    Ok(())
 }
 
 fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, String> {
@@ -13484,9 +13655,7 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
             .to_str()
             .ok_or_else(|| "settlement journal contains a non-UTF8 filename".to_string())?;
         if name.starts_with(".tmp-") {
-            std::fs::remove_file(&path).map_err(|error| {
-                format!("remove incomplete settlement journal temporary file: {error}")
-            })?;
+            cleanup_settlement_temporary_file(&path, name)?;
             continue;
         }
         let expected_job = name
@@ -13504,7 +13673,7 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
         }
         let expired = record.payload.reward.expires_at_height < node.state.height();
         if expired || indexed_reward_for_job(node, expected_job)?.is_some() {
-            std::fs::remove_file(&path).map_err(|error| {
+            remove_settlement_journal_file(&path).map_err(|error| {
                 format!("remove expired/mined settlement journal entry {name:?}: {error}")
             })?;
             continue;
@@ -17252,17 +17421,33 @@ mod tests {
 
     #[tokio::test]
     async fn forward_shard_body_rejects_oversized_content_length_before_reading() {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            // Consume the complete request head before closing the socket. On
+            // Windows, dropping a TCP socket with unread peer data sends an
+            // abortive reset, which can race the client while it is parsing
+            // these response headers and obscure the behavior under test.
+            let mut request_head = Vec::with_capacity(1024);
+            loop {
+                let mut chunk = [0u8; 512];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request_head.extend_from_slice(&chunk[..read]);
+                assert!(request_head.len() <= 16 * 1024, "request head is bounded");
+                if request_head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 MAX_FORWARD_SHARD_RESPONSE_BYTES + 1
             );
             stream.write_all(header.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
         });
 
         let response = reqwest::get(format!("http://{addr}"))
@@ -17270,6 +17455,7 @@ mod tests {
             .expect("response headers");
         let error = read_forward_shard_body_limited(response).await.unwrap_err();
         assert!(error.contains("exceeds"));
+        server.await.unwrap();
     }
 
     // ── v0.7.0 community work queue / schema tests ─────────────────────
@@ -17584,6 +17770,103 @@ mod tests {
     }
 
     #[test]
+    fn settlement_journal_temporary_names_are_exactly_scoped() {
+        let hash = "11".repeat(32);
+        let uuid = "123e4567-e89b-12d3-a456-426614174000";
+        assert!(reviewed_settlement_temporary_name(&format!(
+            ".tmp-{hash}-{uuid}"
+        )));
+        assert!(reviewed_settlement_temporary_name(&format!(
+            ".tmp-rebarrier-{hash}.json-{uuid}"
+        )));
+        assert!(reviewed_settlement_temporary_name(&format!(
+            ".tmp-removed-{hash}.json-{uuid}"
+        )));
+        assert!(!reviewed_settlement_temporary_name(&format!(
+            ".tmp-{hash}-not-a-uuid"
+        )));
+        assert!(!reviewed_settlement_temporary_name(&format!(
+            ".tmp-removed-operator.txt-{uuid}"
+        )));
+        assert!(!reviewed_settlement_temporary_name(&format!(
+            ".tmp-{}-{uuid}",
+            "AA".repeat(32)
+        )));
+    }
+
+    #[test]
+    fn production_gated_identical_settlement_publishers_converge_on_one_journal() {
+        let temporary =
+            std::env::temp_dir().join(format!("arc-rpc-settlement-race-{}", uuid::Uuid::new_v4()));
+        let data_dir = temporary.join("state");
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(
+                &[],
+                &data_dir,
+                arc_crypto::hash_bytes(b"settlement-race-genesis"),
+            )
+            .unwrap(),
+        );
+        let node = Arc::new(build_node_state(
+            state,
+            Arc::new(Mempool::new(16)),
+            Hash256([61; 32]),
+            None,
+            0,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let job_id = Hash256([62; 32]);
+        let payload = Arc::new(test_verified_settlement_payload(job_id, 100));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let publishers: Vec<_> = (0..8u64)
+            .map(|offset| {
+                let node = node.clone();
+                let payload = payload.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // Mirror the production contract in
+                    // `retain_verified_settlement`: the same gate spans
+                    // directory restore/rebarrier and file publication. On
+                    // Windows, bypassing it would let a second helper move the
+                    // directory through an absent-name window while the first
+                    // publisher creates its private staging file.
+                    let _gate = node.community_verified_settlements_gate.lock();
+                    persist_verified_settlement_journal(&node, &payload, 1_000 + offset)
+                })
+            })
+            .collect();
+        for publisher in publishers {
+            publisher.join().unwrap().unwrap();
+        }
+        let path = settlement_journal_file(&node, job_id).unwrap();
+        let stored = read_settlement_journal_file(&path).unwrap();
+        assert_eq!(stored.payload.reward.job_id, job_id);
+        assert_eq!(
+            stored.payload_hash,
+            community_payload_hash(payload.as_ref()).unwrap()
+        );
+        let live_entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".json"))
+            })
+            .count();
+        assert_eq!(live_entries, 1);
+        drop(node);
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
     fn verified_settlement_journal_replays_idempotently_and_fails_closed_on_corruption() {
         let temporary = std::env::temp_dir().join(format!(
             "arc-rpc-settlement-journal-{}",
@@ -17619,12 +17902,29 @@ mod tests {
         retain_verified_settlement(&first, payload.clone()).unwrap();
         let journal_path = settlement_journal_file(&first, job_id).unwrap();
         assert!(journal_path.is_file());
+        let journal_directory = journal_path.parent().unwrap();
+        let final_name = journal_path.file_name().unwrap().to_str().unwrap();
+        let temporary_paths = [
+            journal_directory.join(format!(".tmp-{}-{}", job_id.to_hex(), uuid::Uuid::new_v4())),
+            journal_directory.join(format!(
+                ".tmp-rebarrier-{final_name}-{}",
+                uuid::Uuid::new_v4()
+            )),
+            journal_directory.join(format!(
+                ".tmp-removed-{final_name}-{}",
+                uuid::Uuid::new_v4()
+            )),
+        ];
+        for path in &temporary_paths {
+            std::fs::write(path, b"incomplete internal staging").unwrap();
+        }
 
         let replayed = make_node();
         assert_eq!(
             replay_verified_settlement_journal(&replayed).unwrap(),
             vec![job_id]
         );
+        assert!(temporary_paths.iter().all(|path| !path.exists()));
         assert_eq!(replayed.community_verified_settlements.len(), 1);
         retain_verified_settlement(&replayed, payload.clone()).unwrap();
         assert_eq!(replayed.community_verified_settlements.len(), 1);

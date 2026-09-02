@@ -15,6 +15,7 @@ use arc_node::{
         GenerationPin, GenerationStore, HARD_MAX_RETENTION_ROUND_SPAN,
         RecoveryDagBinding as GenerationDagBinding, RetainedDagRecord, RetainedRecordKind,
         RetentionLimits, StoreAuditStatus, TornSuffix, VerifiedGeneration,
+        create_private_directory_durably, rename_for_durable_publish,
     },
     rpc,
 };
@@ -1483,33 +1484,14 @@ fn write_recovery_dag_pin_atomically(
         recovery_manifest_hash: manifest_hash,
         generation,
     };
-    let bytes = serde_json::to_vec(&pin)?;
-    let temporary = data_dir.join(format!(
-        ".recovery-dag.{}.pin-{}.tmp",
-        manifest_hash.to_hex(),
-        uuid::Uuid::new_v4()
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("failed to create recovery DAG pin {}", temporary.display()))?;
-    if let Err(error) = (|| -> std::io::Result<()> {
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()
-    })() {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error).context("failed to durably write recovery DAG pin");
-    }
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("failed to activate recovery DAG pin {}", path.display()))?;
-    sync_directory(data_dir)
+    let mut bytes = serde_json::to_vec(&pin)?;
+    bytes.push(b'\n');
+    arc_crypto::secret_file::durably_replace_private(&path, &bytes).with_context(|| {
+        format!(
+            "failed to durably activate recovery DAG pin {}",
+            path.display()
+        )
+    })
 }
 
 /// Preserve recovered validator state exactly. Re-seeding the genesis set
@@ -1571,8 +1553,59 @@ fn sync_directory(path: &Path) -> Result<()> {
         .sync_all()
         .with_context(|| format!("failed to fsync directory {}", path.display()))?;
     #[cfg(not(unix))]
+    // Windows recovery namespace mutations use MoveFileExW with
+    // MOVEFILE_WRITE_THROUGH at each publication site; it has no documented
+    // equivalent of Unix parent-directory fsync.
     let _ = path;
     Ok(())
+}
+
+fn restore_legacy_dag_wal_and_read_round(dag_wal_path: &Path) -> Result<u64> {
+    let namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(dag_wal_path)
+            .with_context(|| {
+                format!(
+                    "failed to lock legacy DAG WAL directory namespace {}",
+                    dag_wal_path.display()
+                )
+            })?;
+    namespace_lock.restore_interrupted().with_context(|| {
+        format!(
+            "failed to restore interrupted legacy DAG WAL directory {}",
+            dag_wal_path.display()
+        )
+    })?;
+    arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target()).with_context(
+        || {
+            format!(
+                "failed to durably create legacy DAG WAL directory {}",
+                dag_wal_path.display()
+            )
+        },
+    )?;
+    // The process-lifetime node data lock is already held by this point; the
+    // parent-sibling namespace lock closes the absent-name race while the
+    // child directory is moved away and back.
+    namespace_lock.rebarrier_existing().with_context(|| {
+        format!(
+            "failed to rebarrier legacy DAG WAL directory namespace {}",
+            dag_wal_path.display()
+        )
+    })?;
+    // `WalWriter` can be interrupted while an existing Windows segment is in
+    // its deterministic write-through sibling. Restore every such segment
+    // before deriving the consensus round; restoring only when the writer is
+    // opened would leave the engine initialized from an incomplete view.
+    arc_state::wal::restore_interrupted_wal_namespace_rebarriers(namespace_lock.target())
+        .with_context(|| {
+            format!(
+                "failed to restore interrupted legacy DAG WAL namespace in {}",
+                dag_wal_path.display()
+            )
+        })?;
+    Ok(arc_state::latest_block_height_in_wal_dir(
+        namespace_lock.target(),
+    ))
 }
 
 /// Process-lifetime advisory lock for one node data directory. The lock file
@@ -1584,30 +1617,65 @@ struct NodeDataDirLock {
 }
 
 fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
-    match std::fs::symlink_metadata(data_dir) {
+    let parent = data_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "node data-directory parent {} must already exist; create the parent before starting ARC",
+            parent.display()
+        )
+    })?;
+    ensure!(
+        canonical_parent.is_dir(),
+        "node data-directory parent {} is not a directory",
+        parent.display()
+    );
+    // This lock remains addressable beside the data directory while the data
+    // directory itself moves away and back. An in-directory lock alone is not
+    // sufficient: a racing startup could otherwise create a second directory
+    // during that brief absent-name window.
+    let namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(
+        data_dir,
+    )
+    .with_context(|| {
+        format!(
+            "failed to lock node data-directory namespace {}",
+            data_dir.display()
+        )
+    })?;
+    namespace_lock.restore_interrupted().with_context(|| {
+        format!(
+            "failed to restore interrupted node data-directory namespace {}",
+            data_dir.display()
+        )
+    })?;
+    let locked_data_dir = namespace_lock.target();
+    match std::fs::symlink_metadata(locked_data_dir) {
         Ok(metadata) => ensure!(
             metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
             "node data directory {} must be a real directory",
-            data_dir.display()
+            locked_data_dir.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(data_dir).with_context(|| {
-                format!(
-                    "failed to create node data directory {}",
-                    data_dir.display()
-                )
-            })?;
-            let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
-            sync_directory(parent)?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("failed to inspect data directory {}", data_dir.display())
             });
         }
     }
+    // Run this on both first creation and every retry. A prior attempt may
+    // have made the leaf visible before its parent-directory fsync reported a
+    // late error; merely syncing a child lock file cannot prove the leaf name.
+    arc_crypto::secret_file::create_private_directory_tree(locked_data_dir).with_context(|| {
+        format!(
+            "failed to durably create or rebarrier private node data directory {}",
+            locked_data_dir.display()
+        )
+    })?;
 
-    let path = data_dir.join(".arc-node.lock");
+    let path = locked_data_dir.join(".arc-node.lock");
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
         ensure!(
             metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
@@ -1628,7 +1696,7 @@ fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
     file.try_lock().with_context(|| {
         format!(
             "node data directory {} is already locked by another ARC process",
-            data_dir.display()
+            locked_data_dir.display()
         )
     })?;
     file.set_len(0)
@@ -1639,32 +1707,37 @@ fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
     .with_context(|| format!("failed to write node data lock {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to fsync node data lock {}", path.display()))?;
-    sync_directory(data_dir)?;
+    namespace_lock.rebarrier_existing().with_context(|| {
+        format!(
+            "failed to durably rebarrier node data-directory name {}",
+            locked_data_dir.display()
+        )
+    })?;
+    sync_directory(locked_data_dir)?;
     Ok(NodeDataDirLock { _file: file })
 }
 
 fn write_recovery_dag_binding_atomically(path: &Path, binding: &RecoveryDagBinding) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("recovery DAG binding has no parent directory"))?;
-    let tmp = parent.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
-    let bytes = serde_json::to_vec_pretty(binding)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .with_context(|| format!("failed to create recovery DAG binding {}", tmp.display()))?;
-    if let Err(error) = (|| -> std::io::Result<()> {
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()
-    })() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).context("failed to durably write recovery DAG binding");
+    let mut bytes = serde_json::to_vec_pretty(binding)?;
+    bytes.push(b'\n');
+    match arc_crypto::secret_file::durably_publish_new_private(path, &bytes)
+        .with_context(|| format!("failed to publish recovery DAG binding {}", path.display()))?
+    {
+        true => Ok(()),
+        false => {
+            let stored = read_recovery_dag_binding(path)?;
+            ensure!(
+                stored == *binding,
+                "concurrently published recovery DAG binding differs from the signed checkpoint"
+            );
+            arc_crypto::secret_file::durably_replace_private(path, &bytes).with_context(|| {
+                format!(
+                    "failed to rebarrier recovery DAG binding {}",
+                    path.display()
+                )
+            })
+        }
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to activate recovery DAG binding {}", path.display()))?;
-    sync_directory(parent)
 }
 
 fn read_recovery_dag_binding(path: &Path) -> Result<RecoveryDagBinding> {
@@ -1686,77 +1759,298 @@ fn read_recovery_dag_binding(path: &Path) -> Result<RecoveryDagBinding> {
         .with_context(|| format!("invalid recovery DAG binding {}", path.display()))
 }
 
+fn recovery_dag_binding_random_staging_name(name: &str) -> bool {
+    let prefix = format!(".{RECOVERY_DAG_BINDING_FILE}.");
+    let Some(value) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let value = value
+        .strip_suffix(".tmp")
+        .or_else(|| value.strip_suffix(".replace"));
+    let Some(value) = value else {
+        return false;
+    };
+    let Some((pid, nonce)) = value.split_once('.') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.parse::<u32>().is_ok()
+        && nonce.len() == 64
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn cleanup_recovery_dag_binding_staging(path: &Path, wal_dir: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect recovery DAG binding staging {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "recovery DAG binding staging artifact {} must be a regular file",
+        path.display()
+    );
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), %error, "deferring recovery DAG binding staging cleanup");
+        }
+        return Ok(());
+    }
+    if let Err(error) = sync_directory(wal_dir) {
+        // The active binding never references a staging name. A late barrier
+        // error can only resurrect the exact inert artifact, which the next
+        // startup validates and retries.
+        tracing::warn!(path = %path.display(), %error, "recovery DAG binding staging cleanup barrier will be retried");
+    }
+    Ok(())
+}
+
 fn activate_recovery_dag_binding(wal_dir: &Path, binding: &RecoveryDagBinding) -> Result<()> {
     let binding_path = wal_dir.join(RECOVERY_DAG_BINDING_FILE);
     let binding_tmp_path = wal_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
     if binding_path.exists() {
-        ensure!(
-            !binding_tmp_path.exists(),
-            "recovery DAG WAL contains both active and staged binding files"
-        );
         let stored = read_recovery_dag_binding(&binding_path)?;
         ensure!(
             stored == *binding,
             "recovery DAG WAL binding differs from the signed active checkpoint"
         );
+        match std::fs::symlink_metadata(&binding_tmp_path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                    "staged recovery DAG binding must be a regular file"
+                );
+                // An unlink whose directory fsync reported a late failure can
+                // be resurrected after the verified active binding was
+                // published. A partial staged file or an identical complete
+                // one is harmless cleanup residue; only a different valid
+                // binding remains ambiguous and fails closed.
+                if let Ok(staged) = read_recovery_dag_binding(&binding_tmp_path) {
+                    ensure!(
+                        staged == *binding,
+                        "staged recovery DAG binding differs from the signed active checkpoint"
+                    );
+                }
+                cleanup_recovery_dag_binding_staging(&binding_tmp_path, wal_dir)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect staged recovery DAG binding {}",
+                        binding_tmp_path.display()
+                    )
+                });
+            }
+        }
+        let mut binding_bytes = serde_json::to_vec_pretty(binding)?;
+        binding_bytes.push(b'\n');
+        arc_crypto::secret_file::durably_replace_private(&binding_path, &binding_bytes)
+            .with_context(|| {
+                format!(
+                    "failed to rebarrier recovery DAG binding {}",
+                    binding_path.display()
+                )
+            })?;
+        for entry in std::fs::read_dir(wal_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if recovery_dag_binding_random_staging_name(&name) {
+                let path = entry.path();
+                cleanup_recovery_dag_binding_staging(&path, wal_dir)?;
+            }
+        }
         return Ok(());
     }
 
     let entries: Vec<_> = std::fs::read_dir(wal_dir)
         .with_context(|| format!("failed to inspect {}", wal_dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
-    if entries.is_empty() {
-        return write_recovery_dag_binding_atomically(&binding_path, binding);
+    let mut unrelated = Vec::new();
+    let mut staged_binding = false;
+    for entry in entries {
+        let path = entry.path();
+        if path == binding_tmp_path {
+            let staged = match read_recovery_dag_binding(&binding_tmp_path) {
+                Ok(staged) => staged,
+                Err(_) => {
+                    cleanup_recovery_dag_binding_staging(&binding_tmp_path, wal_dir)?;
+                    continue;
+                }
+            };
+            ensure!(
+                staged == *binding,
+                "staged recovery DAG binding differs from the signed active checkpoint"
+            );
+            staged_binding = true;
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if recovery_dag_binding_random_staging_name(&name) {
+            cleanup_recovery_dag_binding_staging(&path, wal_dir)?;
+            continue;
+        }
+        unrelated.push(path);
     }
-    if entries.len() == 1 && entries[0].path() == binding_tmp_path {
-        // The binding bytes are fully fsynced before their atomic rename. If
-        // power failed in that one window, accept only the exact deterministic
-        // bytes re-derived from the active ARCCHKPT, then finish the rename and
-        // directory fsync before creating any generation files.
-        let staged = read_recovery_dag_binding(&binding_tmp_path)?;
-        ensure!(
-            staged == *binding,
-            "staged recovery DAG binding differs from the signed active checkpoint"
+    if !unrelated.is_empty() {
+        bail!(
+            "recovery DAG WAL {} contains data without an active binding; refusing replay",
+            wal_dir.display()
         );
-        std::fs::rename(&binding_tmp_path, &binding_path)
-            .context("failed to activate the fsynced recovery DAG binding")?;
-        return sync_directory(wal_dir);
     }
-    bail!(
-        "recovery DAG WAL {} contains data without an active binding; refusing replay",
-        wal_dir.display()
-    )
+    if staged_binding {
+        rename_for_durable_publish(
+            &binding_tmp_path,
+            &binding_path,
+            false,
+            "activate staged recovery DAG binding",
+        )
+        .context("failed to activate the fsynced recovery DAG binding")?;
+        sync_directory(wal_dir)?;
+        return Ok(());
+    }
+    write_recovery_dag_binding_atomically(&binding_path, binding)
 }
 
 fn archive_legacy_dag_wal(data_dir: &Path, manifest_hash: Hash256) -> Result<Option<PathBuf>> {
-    let legacy = data_dir.join("dag-wal");
-    let metadata = match std::fs::symlink_metadata(&legacy) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let requested_legacy = data_dir.join("dag-wal");
+    let namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(&requested_legacy)
+            .with_context(|| {
+                format!(
+                    "failed to lock legacy DAG WAL directory namespace {}",
+                    requested_legacy.display()
+                )
+            })?;
+    namespace_lock.restore_interrupted().with_context(|| {
+        format!(
+            "failed to restore interrupted legacy DAG WAL directory {} before archival",
+            requested_legacy.display()
+        )
+    })?;
+    // Retain the parent-sibling namespace lock through the create-only archive
+    // rename so no startup can create a replacement live directory between
+    // restoration and archival.
+    let legacy = namespace_lock.target().to_path_buf();
+    let requested_archive = legacy
+        .parent()
+        .unwrap_or(data_dir)
+        .join(format!("dag-wal.pre-recovery-{}", manifest_hash.to_hex()));
+    let archive_namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(&requested_archive)
+            .with_context(|| {
+                format!(
+                    "failed to lock legacy DAG archive directory namespace {}",
+                    requested_archive.display()
+                )
+            })?;
+    archive_namespace_lock
+        .restore_interrupted()
+        .with_context(|| {
+            format!(
+                "failed to restore interrupted legacy DAG archive directory {}",
+                requested_archive.display()
+            )
+        })?;
+    let archive = archive_namespace_lock.target().to_path_buf();
+    let legacy_metadata = match std::fs::symlink_metadata(&legacy) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("failed to inspect legacy DAG WAL {}", legacy.display()));
         }
     };
+    let archive_metadata = match std::fs::symlink_metadata(&archive) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect legacy DAG archive {}", archive.display())
+            });
+        }
+    };
+    if let Some(metadata) = archive_metadata.as_ref() {
+        ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "legacy DAG archive {} must be a real directory",
+            archive.display()
+        );
+    }
+    match (legacy_metadata.as_ref(), archive_metadata.as_ref()) {
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            // A write-through source-to-archive rename can become visible but
+            // report a late flush error. Retry must prove that exact visible
+            // archive before publishing a recovery binding that depends on
+            // preservation of the legacy history.
+            arc_crypto::secret_file::create_private_directory_tree(&archive).with_context(
+                || {
+                    format!(
+                        "failed to secure visible legacy DAG archive {}",
+                        archive.display()
+                    )
+                },
+            )?;
+            archive_namespace_lock
+                .rebarrier_existing()
+                .with_context(|| {
+                    format!(
+                        "failed to rebarrier visible legacy DAG archive {}",
+                        archive.display()
+                    )
+                })?;
+            return Ok(Some(archive));
+        }
+        (Some(_), Some(_)) => {
+            bail!(
+                "both legacy DAG WAL {} and archive {} exist; refusing ambiguous recovery startup",
+                legacy.display(),
+                archive.display()
+            );
+        }
+        (Some(_), None) => {}
+    }
+    let metadata = legacy_metadata.expect("legacy metadata checked above");
     ensure!(
         metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
         "legacy DAG WAL {} must be a real directory before archival",
         legacy.display()
     );
-    let archive = data_dir.join(format!("dag-wal.pre-recovery-{}", manifest_hash.to_hex()));
-    ensure!(
-        !archive.exists(),
-        "both legacy DAG WAL {} and archive {} exist; refusing ambiguous recovery startup",
-        legacy.display(),
-        archive.display()
-    );
-    std::fs::rename(&legacy, &archive).with_context(|| {
+    rename_for_durable_publish(&legacy, &archive, false, "archive legacy recovery DAG WAL")
+        .with_context(|| {
+            format!(
+                "failed to archive legacy DAG WAL {} as {}",
+                legacy.display(),
+                archive.display()
+            )
+        })?;
+    arc_crypto::secret_file::create_private_directory_tree(&archive).with_context(|| {
         format!(
-            "failed to archive legacy DAG WAL {} as {}",
-            legacy.display(),
+            "failed to secure published legacy DAG archive {}",
             archive.display()
         )
     })?;
+    archive_namespace_lock
+        .rebarrier_existing()
+        .with_context(|| {
+            format!(
+                "failed to rebarrier published legacy DAG archive {}",
+                archive.display()
+            )
+        })?;
     sync_directory(data_dir)?;
     Ok(Some(archive))
 }
@@ -1844,18 +2138,19 @@ fn prepare_recovery_dag_startup(
             "recovery DAG WAL {} must be a real directory",
             wal_dir.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&wal_dir).with_context(|| {
-                format!("failed to create recovery DAG WAL {}", wal_dir.display())
-            })?;
-            sync_directory(data_dir)?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("failed to inspect recovery DAG WAL {}", wal_dir.display())
             });
         }
     }
+    create_private_directory_durably(&wal_dir).with_context(|| {
+        format!(
+            "failed to create/rebarrier recovery DAG WAL {}",
+            wal_dir.display()
+        )
+    })?;
 
     activate_recovery_dag_binding(&wal_dir, &binding)?;
 
@@ -2040,7 +2335,9 @@ fn initialize_recovery_generation_store(
                     && summary.active_suffix == TornSuffix::Clean,
                 "unpinned initial recovery DAG generation contains active history"
             );
-            generation
+            store
+                .rebarrier_current_pointer(&binding, generation.pin)
+                .context("failed to rebarrier unpinned initial recovery DAG CURRENT")?
         } else {
             let baseline = canonical_dag_baseline(state)?;
             ensure!(
@@ -2048,23 +2345,27 @@ fn initialize_recovery_generation_store(
                 "cannot initialize a new recovery DAG generation after canonical state advanced"
             );
             let initial_round = startup.binding.initial_consensus_round;
-            store
-                .create_initial(
-                    GenerationInput {
-                        binding: binding.clone(),
-                        baseline_state: baseline,
-                        dag_cursor: DagCursor {
-                            committed_block_count: 0,
-                            next_dag_round: initial_round,
-                            current_round: initial_round,
-                            retention_floor_round: initial_round,
-                            retention_ceiling_round: recovery_retention_ceiling(initial_round)?,
-                        },
-                        retention_limits: RetentionLimits::default(),
-                    },
-                    std::iter::empty(),
-                )
-                .context("failed to create initial recovery DAG generation")?
+            let initial_input = GenerationInput {
+                binding: binding.clone(),
+                baseline_state: baseline,
+                dag_cursor: DagCursor {
+                    committed_block_count: 0,
+                    next_dag_round: initial_round,
+                    current_round: initial_round,
+                    retention_floor_round: initial_round,
+                    retention_ceiling_round: recovery_retention_ceiling(initial_round)?,
+                },
+                retention_limits: RetentionLimits::default(),
+            };
+            match store
+                .resume_unselected_initial(&initial_input)
+                .context("failed to resume crash-interrupted initial recovery DAG generation")?
+            {
+                Some(generation) => generation,
+                None => store
+                    .create_initial(initial_input, std::iter::empty())
+                    .context("failed to create initial recovery DAG generation")?,
+            }
         };
         write_recovery_dag_pin_atomically(
             &startup.data_dir,
@@ -2105,6 +2406,18 @@ fn initialize_recovery_generation_store(
         }
         _ => bail!("recovery DAG generation audit found a fork or ambiguous rollback"),
     }
+    current = store
+        .rebarrier_current_pointer(&binding, current.pin)
+        .context("failed to rebarrier selected recovery DAG CURRENT")?;
+    // Re-publish the exact selected external pin after every validation and
+    // repair path. A prior replace can be visible despite a late namespace
+    // durability error; no live writer may open until this barrier succeeds.
+    write_recovery_dag_pin_atomically(
+        &startup.data_dir,
+        startup.binding.manifest_hash,
+        current.pin,
+    )
+    .context("failed to rebarrier selected recovery DAG external pin")?;
     Ok((store, current))
 }
 
@@ -4905,6 +5218,16 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
 
+    // The legacy peer snapshot protocol is not quorum-authenticated and is
+    // intentionally retired. Reject it before community model discovery,
+    // config loading, data-directory locking, genesis binding, or any network
+    // access so an invalid invocation cannot contaminate a fresh recovery dir.
+    if let Some(peer) = &cli.sync_from {
+        bail!(
+            "--sync-from {peer} uses the retired unauthenticated snapshot protocol; import the published quorum-certified ARCCHKPT with --recovery-checkpoint and --approved-recovery-manifest-hash"
+        );
+    }
+
     #[cfg(feature = "benchmark-tools")]
     if cli.benchmark && (cli.community || cli.community_mode) {
         bail!("--benchmark cannot be combined with community modes");
@@ -5714,72 +6037,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── State Sync Protocol (A5) - bootstrap from peer snapshot ─────
-    // Auto-sync: if this node has peers configured and state is fresh (height 0),
-    // automatically sync state from the first reachable peer. This allows new
-    // nodes to join an existing network without manual --sync-from.
-    let sync_peer = if cli.sync_from.is_some() {
-        cli.sync_from.clone()
-    } else if state.height() == 0 && !peers.is_empty() {
-        // Try each peer until one responds
-        // Quick check - try first 3 peers with 1s timeout each.
-        // Don't block startup for unreachable peers.
-        let mut found = None;
-        for peer_addr in peers.iter().take(3) {
-            let peer_rpc = peer_addr.replace(":9091", ":9090");
-            let url = format!("http://{}/health", peer_rpc);
-            match reqwest::Client::new()
-                .get(&url)
-                .timeout(std::time::Duration::from_secs(1))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!("Auto-sync: peer {} reachable", peer_rpc);
-                    found = Some(peer_rpc);
-                    break;
-                }
-                _ => continue,
-            }
-        }
-        found
-    } else {
-        None
-    };
-
-    if state.recovery_context().is_some() && sync_peer.is_some() {
-        bail!(
-            "legacy peer snapshot sync is forbidden after ARCCHKPT activation; recover only from the pinned local checkpoint plus its verified WAL"
-        );
-    }
-
-    if let Some(peer) = &sync_peer {
-        tracing::info!("Bootstrapping from peer: {}", peer);
-
-        let sync_mgr = arc_node::state_sync::StateSyncManager::new();
-        let mut startup_shutdown = Some(shutdown_rx.clone());
-        let sync_result = tokio::select! {
-            biased;
-            _ = wait_for_optional_runtime_shutdown(&mut startup_shutdown) => None,
-            result = sync_mgr.sync_from_peer(peer, &state) => Some(result),
-        };
-        match sync_result {
-            None => {
-                tracing::info!("State sync cancelled by startup shutdown request");
-            }
-            Some(Ok(height)) => {
-                tracing::info!("State sync complete, height = {}", height);
-            }
-            Some(Err(e)) => {
-                tracing::warn!(
-                    "Sync from peer failed ({}), continuing from genesis state",
-                    e
-                );
-                // Don't crash - the node will start from genesis and catch
-                // up via DAG consensus. This is fine for testnet.
-            }
-        }
-    }
     if complete_startup_shutdown_if_requested(
         &shutdown_requested,
         Some(state.as_ref()),
@@ -6202,13 +6459,7 @@ async fn main() -> Result<()> {
             // Preserve the segmented WAL compatibility path only for legacy
             // pre-recovery networks. Protocol-v3 startup above cannot reach it.
             let dag_wal_path = Path::new(&data_dir).join("dag-wal");
-            std::fs::create_dir_all(&dag_wal_path).with_context(|| {
-                format!(
-                    "failed to create legacy DAG WAL directory {}",
-                    dag_wal_path.display()
-                )
-            })?;
-            let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
+            let recovered_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
             if recovered_round > 0 {
                 // The highest WAL round does not prove that any earlier leader was
                 // committed. Preserve the commit cursor until an exact local commit
@@ -8896,6 +9147,160 @@ mod tests {
 
         std::fs::create_dir(&legacy).unwrap();
         assert!(archive_legacy_dag_wal(&data_dir, manifest_hash).is_err());
+        assert!(legacy.is_dir(), "a conflicting legacy WAL must remain live");
+        assert_eq!(
+            std::fs::read(archive.join("wal-00000000.bin")).unwrap(),
+            b"legacy-history",
+            "create-only archival must not replace the first preserved history"
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_archive_restores_a_staged_legacy_directory_before_existence_check() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-staged-legacy-dag-archive-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        arc_crypto::secret_file::create_private_directory_tree(&data_dir).unwrap();
+        let legacy = data_dir.join("dag-wal");
+        arc_crypto::secret_file::create_private_directory_tree(&legacy).unwrap();
+        std::fs::write(legacy.join("wal-00000000.bin"), b"preserved-history").unwrap();
+        let digest = arc_crypto::secret_file::namespace_path_digest(&legacy).unwrap();
+        let staged = data_dir.join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&legacy, &staged, false).unwrap();
+
+        let manifest_hash = hash_bytes(b"staged-legacy-archive-manifest");
+        let archive = archive_legacy_dag_wal(&data_dir, manifest_hash)
+            .unwrap()
+            .expect("staged legacy history must be restored and archived");
+        assert_eq!(
+            std::fs::read(archive.join("wal-00000000.bin")).unwrap(),
+            b"preserved-history"
+        );
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_archive_rebarriers_a_visible_archive_on_absent_source_retry() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-visible-legacy-dag-archive-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        arc_crypto::secret_file::create_private_directory_tree(&data_dir).unwrap();
+        let legacy = data_dir.join("dag-wal");
+        arc_crypto::secret_file::create_private_directory_tree(&legacy).unwrap();
+        std::fs::write(legacy.join("wal-00000000.bin"), b"late-visible-history").unwrap();
+        let manifest_hash = hash_bytes(b"visible-legacy-archive-manifest");
+        let archive = data_dir.join(format!("dag-wal.pre-recovery-{}", manifest_hash.to_hex()));
+        // Model the namespace state after a source-to-archive write-through
+        // move became visible but its caller observed a late error.
+        arc_crypto::secret_file::windows_move_path_write_through(&legacy, &archive, false).unwrap();
+        assert!(!legacy.exists());
+
+        let recovered = archive_legacy_dag_wal(&data_dir, manifest_hash)
+            .unwrap()
+            .expect("a visible exact archive must be verified on retry");
+        assert_eq!(recovered, archive);
+        assert_eq!(
+            std::fs::read(recovered.join("wal-00000000.bin")).unwrap(),
+            b"late-visible-history"
+        );
+        let digest = arc_crypto::secret_file::namespace_path_digest(&recovered).unwrap();
+        assert!(
+            !data_dir
+                .join(format!(
+                    ".arc-private-directory-namespace-{digest}.rebarrier"
+                ))
+                .exists()
+        );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_dag_round_discovery_restores_a_staged_latest_segment_first() {
+        let dag_wal_path = std::env::temp_dir().join(format!(
+            "arc-legacy-dag-staged-latest-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dag_wal_path).unwrap();
+        let older = dag_wal_path.join("wal-00000000.bin");
+        let latest = dag_wal_path.join("wal-00000001.bin");
+
+        let older_writer = arc_state::WalWriter::new(&older).unwrap();
+        older_writer.append(
+            arc_state::WalOp::Checkpoint(hash_bytes(b"older-segment")),
+            3,
+        );
+        older_writer.sync().unwrap();
+        drop(older_writer);
+
+        let latest_writer = arc_state::WalWriter::new(&latest).unwrap();
+        latest_writer.append(
+            arc_state::WalOp::Checkpoint(hash_bytes(b"latest-segment")),
+            7,
+        );
+        latest_writer.sync().unwrap();
+        drop(latest_writer);
+
+        let staged = dag_wal_path.join(".wal-00000001.bin.namespace-rebarrier");
+        std::fs::rename(&latest, &staged).unwrap();
+        assert_eq!(
+            arc_state::latest_block_height_in_wal_dir(&dag_wal_path),
+            3,
+            "the fixture must demonstrate the pre-fix consensus-round rewind"
+        );
+
+        assert_eq!(
+            restore_legacy_dag_wal_and_read_round(&dag_wal_path).unwrap(),
+            7
+        );
+        assert!(latest.is_file());
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(&dag_wal_path).unwrap();
+    }
+
+    #[test]
+    fn recovery_dag_pin_atomic_publication_replaces_only_the_selected_pin() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-pin-replace-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let manifest_hash = hash_bytes(b"pin-replacement-manifest");
+        let first = GenerationPin {
+            sequence: 1,
+            hash: hash_bytes(b"first-generation"),
+        };
+        let second = GenerationPin {
+            sequence: 2,
+            hash: hash_bytes(b"second-generation"),
+        };
+
+        write_recovery_dag_pin_atomically(&data_dir, manifest_hash, first).unwrap();
+        write_recovery_dag_pin_atomically(&data_dir, manifest_hash, second).unwrap();
+        assert_eq!(
+            read_recovery_dag_pin(&data_dir, manifest_hash)
+                .unwrap()
+                .unwrap()
+                .generation,
+            second,
+            "Windows pin rollover must use write-through replacement rather than a create-only rename"
+        );
+        assert_eq!(
+            std::fs::read_dir(&data_dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0,
+            "successful pin replacement must not strand a staging file"
+        );
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
@@ -8914,6 +9319,72 @@ mod tests {
             .expect("the persistent lock file must be reusable after owner exit");
         drop(second);
         std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn node_data_directory_requires_an_existing_operator_parent() {
+        let root = std::env::temp_dir().join(format!(
+            "arc-node-missing-parent-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = root.join("missing-parent").join("arc-data");
+        let error = acquire_node_data_dir_lock(&data_dir)
+            .err()
+            .expect("ARC must not acknowledge state under an unproved missing ancestor");
+        assert!(error.to_string().contains("parent"));
+        assert!(!root.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn node_data_directory_lock_restores_staged_only_history_before_open() {
+        let parent = std::env::temp_dir().join(format!(
+            "arc-node-staged-data-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        arc_crypto::secret_file::create_private_directory_tree(&parent).unwrap();
+        let data_dir = parent.join("arc-data");
+        arc_crypto::secret_file::create_private_directory_tree(&data_dir).unwrap();
+        std::fs::write(data_dir.join("history"), b"preserved").unwrap();
+        let digest = arc_crypto::secret_file::namespace_path_digest(&data_dir).unwrap();
+        let staged = parent.join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&data_dir, &staged, false)
+            .unwrap();
+
+        let lock = acquire_node_data_dir_lock(&data_dir).unwrap();
+        assert_eq!(
+            std::fs::read(data_dir.join("history")).unwrap(),
+            b"preserved"
+        );
+        assert!(!staged.exists());
+        drop(lock);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn recovery_dag_binding_staging_names_are_exactly_scoped() {
+        let nonce = "11".repeat(32);
+        assert!(recovery_dag_binding_random_staging_name(&format!(
+            ".{RECOVERY_DAG_BINDING_FILE}.1.{nonce}.tmp"
+        )));
+        assert!(recovery_dag_binding_random_staging_name(&format!(
+            ".{RECOVERY_DAG_BINDING_FILE}.4294967295.{nonce}.replace"
+        )));
+        assert!(!recovery_dag_binding_random_staging_name(&format!(
+            ".{RECOVERY_DAG_BINDING_FILE}.pid.{nonce}.tmp"
+        )));
+        assert!(!recovery_dag_binding_random_staging_name(&format!(
+            ".{RECOVERY_DAG_BINDING_FILE}.1.{}.tmp",
+            "AA".repeat(32)
+        )));
+        assert!(!recovery_dag_binding_random_staging_name(&format!(
+            ".{RECOVERY_DAG_BINDING_FILE}.1.{nonce}.operator.tmp"
+        )));
+        assert!(!recovery_dag_binding_random_staging_name(&format!(
+            ".{RECOVERY_DAG_BINDING_FILE}.new"
+        )));
     }
 
     #[test]
@@ -8948,6 +9419,102 @@ mod tests {
             binding
         );
 
+        let active_and_identical_staged_dir = data_dir.join("active-and-identical-staged");
+        std::fs::create_dir(&active_and_identical_staged_dir).unwrap();
+        let active_path = active_and_identical_staged_dir.join(RECOVERY_DAG_BINDING_FILE);
+        let resurrected_path =
+            active_and_identical_staged_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+        std::fs::write(&active_path, serde_json::to_vec_pretty(&binding).unwrap()).unwrap();
+        std::fs::write(
+            &resurrected_path,
+            serde_json::to_vec_pretty(&binding).unwrap(),
+        )
+        .unwrap();
+        let random_staging = [
+            active_and_identical_staged_dir.join(format!(
+                ".{RECOVERY_DAG_BINDING_FILE}.1.{}.tmp",
+                "11".repeat(32)
+            )),
+            active_and_identical_staged_dir.join(format!(
+                ".{RECOVERY_DAG_BINDING_FILE}.1.{}.replace",
+                "22".repeat(32)
+            )),
+        ];
+        for path in &random_staging {
+            std::fs::write(path, b"incomplete internal staging").unwrap();
+        }
+        let operator_file = active_and_identical_staged_dir
+            .join(format!(".{RECOVERY_DAG_BINDING_FILE}.operator.tmp"));
+        std::fs::write(&operator_file, b"operator file").unwrap();
+        activate_recovery_dag_binding(&active_and_identical_staged_dir, &binding).unwrap();
+        assert!(!resurrected_path.exists());
+        assert!(random_staging.iter().all(|path| !path.exists()));
+        assert!(operator_file.exists());
+        assert_eq!(read_recovery_dag_binding(&active_path).unwrap(), binding);
+
+        let active_and_partial_staged_dir = data_dir.join("active-and-partial-staged");
+        std::fs::create_dir(&active_and_partial_staged_dir).unwrap();
+        let active_path = active_and_partial_staged_dir.join(RECOVERY_DAG_BINDING_FILE);
+        let resurrected_path =
+            active_and_partial_staged_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+        std::fs::write(&active_path, serde_json::to_vec_pretty(&binding).unwrap()).unwrap();
+        std::fs::write(&resurrected_path, b"{\"format_version\":").unwrap();
+        activate_recovery_dag_binding(&active_and_partial_staged_dir, &binding).unwrap();
+        assert!(!resurrected_path.exists());
+        assert_eq!(read_recovery_dag_binding(&active_path).unwrap(), binding);
+
+        let active_and_mismatched_staged_dir = data_dir.join("active-and-mismatched-staged");
+        std::fs::create_dir(&active_and_mismatched_staged_dir).unwrap();
+        let active_path = active_and_mismatched_staged_dir.join(RECOVERY_DAG_BINDING_FILE);
+        let resurrected_path =
+            active_and_mismatched_staged_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+        std::fs::write(&active_path, serde_json::to_vec_pretty(&binding).unwrap()).unwrap();
+        std::fs::write(
+            &resurrected_path,
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            activate_recovery_dag_binding(&active_and_mismatched_staged_dir, &binding).is_err()
+        );
+        assert!(resurrected_path.exists());
+
+        let partial_dir = data_dir.join("partial-staged-crash");
+        std::fs::create_dir(&partial_dir).unwrap();
+        let partial_path = partial_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+        std::fs::write(&partial_path, b"{\"recovery_manifest_hash\":").unwrap();
+        activate_recovery_dag_binding(&partial_dir, &binding).unwrap();
+        assert!(!partial_path.exists());
+        assert_eq!(
+            read_recovery_dag_binding(&partial_dir.join(RECOVERY_DAG_BINDING_FILE)).unwrap(),
+            binding
+        );
+
+        for (label, unrelated_first) in [
+            ("staged-plus-unrelated-first", true),
+            ("staged-plus-unrelated-last", false),
+        ] {
+            let ambiguous_dir = data_dir.join(label);
+            std::fs::create_dir(&ambiguous_dir).unwrap();
+            let staged = ambiguous_dir.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+            let unrelated = ambiguous_dir.join(if unrelated_first {
+                "000-unrelated"
+            } else {
+                "zzz-unrelated"
+            });
+            if unrelated_first {
+                std::fs::write(&unrelated, b"preexisting DAG data").unwrap();
+            }
+            std::fs::write(&staged, serde_json::to_vec_pretty(&binding).unwrap()).unwrap();
+            if !unrelated_first {
+                std::fs::write(&unrelated, b"preexisting DAG data").unwrap();
+            }
+            let error = activate_recovery_dag_binding(&ambiguous_dir, &binding).unwrap_err();
+            assert!(error.to_string().contains("data without an active binding"));
+            assert!(staged.exists());
+            assert!(!ambiguous_dir.join(RECOVERY_DAG_BINDING_FILE).exists());
+        }
+
         let mismatched_dir = data_dir.join("mismatched-staged-crash");
         std::fs::create_dir(&mismatched_dir).unwrap();
         std::fs::write(
@@ -8956,6 +9523,36 @@ mod tests {
         )
         .unwrap();
         assert!(activate_recovery_dag_binding(&mismatched_dir, &binding).is_err());
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_dag_binding_publication_is_create_only_on_windows() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-binding-create-only-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join(RECOVERY_DAG_BINDING_FILE);
+        let binding = recovery_test_binding(arc_consensus::ConsensusDomain::new(
+            hash_bytes(b"binding-create-only-domain"),
+            7,
+            11,
+        ));
+        write_recovery_dag_binding_atomically(&path, &binding).unwrap();
+
+        let mut replacement = binding.clone();
+        replacement.validator_set_commitment = hash_bytes(b"unapproved-replacement");
+        assert!(
+            write_recovery_dag_binding_atomically(&path, &replacement).is_err(),
+            "a create-only recovery binding publication must refuse an existing live name"
+        );
+        assert_eq!(
+            read_recovery_dag_binding(&path).unwrap(),
+            binding,
+            "a refused publication must preserve the checkpoint-bound recovery domain"
+        );
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

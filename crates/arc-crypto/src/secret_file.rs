@@ -8,7 +8,7 @@
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
 pub const DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME: &str = "shutdown-unproven";
@@ -19,6 +19,184 @@ const DESKTOP_SHUTDOWN_RECEIPT_MAX_BYTES: u64 = 768;
 
 fn permission_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
+}
+
+/// Convert a filesystem path to an absolute Win32 extended-length path.
+///
+/// Raw `*W` APIs do not receive Rust std's automatic long-path normalization.
+/// Prefixing drive paths with `\\?\` and UNC paths with `\\?\UNC\` keeps ARC
+/// data directories working beyond legacy `MAX_PATH` without depending on a
+/// process manifest or machine-wide registry setting.
+#[cfg(windows)]
+pub fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::{Component, Prefix};
+
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows path must not be empty",
+        ));
+    }
+
+    // `std::path::absolute` delegates to GetFullPathNameW on Windows. Calling
+    // it before adding the extended-length prefix reintroduces the very
+    // MAX_PATH dependency this helper exists to avoid. Resolve ordinary
+    // relative paths by joining the already-absolute process directory and
+    // reject partially-qualified drive/root paths whose interpretation would
+    // otherwise require Win32 normalization.
+    let first = path.components().next();
+    if let Some(Component::Prefix(prefix)) = first {
+        match prefix.kind() {
+            Prefix::Disk(_)
+            | Prefix::UNC(_, _)
+            | Prefix::VerbatimUNC(_, _)
+            | Prefix::VerbatimDisk(_) => {}
+            Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows device/verbatim namespace paths are not valid ARC data paths",
+                ));
+            }
+        }
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        if matches!(first, Some(Component::Prefix(_) | Component::RootDir)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Windows data path must be fully qualified or ordinarily relative: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let current = std::env::current_dir()?;
+        if !current.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows current directory is not fully qualified",
+            ));
+        }
+        current.join(path)
+    };
+
+    let mut normalized = std::path::PathBuf::new();
+    let mut normal_depth = 0usize;
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if normal_depth == 0 || !normalized.pop() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Windows path escapes its filesystem root: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                normal_depth -= 1;
+            }
+            Component::Prefix(prefix) => {
+                match prefix.kind() {
+                    Prefix::Disk(_)
+                    | Prefix::UNC(_, _)
+                    | Prefix::VerbatimUNC(_, _)
+                    | Prefix::VerbatimDisk(_) => {}
+                    Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Windows device/verbatim namespace paths are not valid ARC data paths",
+                        ));
+                    }
+                }
+                normalized.push(component.as_os_str());
+            }
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(value) => {
+                // Verbatim paths intentionally disable Win32 dot-segment
+                // normalization. Canonicalized paths never contain these;
+                // reject caller-supplied ambiguous verbatim components.
+                if value == std::ffi::OsStr::new(".") || value == std::ffi::OsStr::new("..") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows verbatim data paths must not contain dot segments",
+                    ));
+                }
+                normalized.push(component.as_os_str());
+                normal_depth = normal_depth.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Windows path depth overflows")
+                })?;
+            }
+        }
+    }
+    if !normalized.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Windows path is not fully qualified: {}", path.display()),
+        ));
+    }
+    let encoded = normalized.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows path contains an interior NUL",
+        ));
+    }
+
+    const SLASH: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    let mut extended = if encoded.starts_with(&[SLASH, SLASH, QUESTION, SLASH]) {
+        encoded
+    } else if encoded.starts_with(&[SLASH, SLASH]) {
+        let mut value = vec![
+            SLASH,
+            SLASH,
+            QUESTION,
+            SLASH,
+            b'U' as u16,
+            b'N' as u16,
+            b'C' as u16,
+            SLASH,
+        ];
+        value.extend_from_slice(&encoded[2..]);
+        value
+    } else {
+        let mut value = vec![SLASH, SLASH, QUESTION, SLASH];
+        value.extend_from_slice(&encoded);
+        value
+    };
+    extended.push(0);
+    Ok(extended)
+}
+
+/// Move a file or directory through the documented Windows write-through
+/// namespace primitive, using extended-length absolute paths on both sides.
+#[cfg(windows)]
+pub fn windows_move_path_write_through(
+    source: &Path,
+    destination: &Path,
+    replace_existing: bool,
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = windows_extended_path(source)?;
+    let destination = windows_extended_path(destination)?;
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace_existing {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Create a brand-new private regular file without following links.
@@ -43,6 +221,27 @@ pub fn open_private(path: &Path) -> io::Result<File> {
 /// secret payload readers should keep using the read-only `open_private`.
 pub fn open_private_read_write(path: &Path) -> io::Result<File> {
     platform::open_private_read_write(path)
+}
+
+/// Open an existing owner-controlled private regular file for append without
+/// following links, tightening pre-hardening permissions through that exact
+/// handle before returning it. The returned handle uses kernel append
+/// semantics so a WAL writer cannot accidentally overwrite an existing tail.
+pub fn open_private_append_owned_migration(path: &Path) -> io::Result<File> {
+    platform::open_private_append_owned_migration(path)
+}
+
+/// Open an owner-controlled regular file for bounded comparison without
+/// following links or changing its existing permission boundary. Callers may
+/// subsequently tighten that exact handle only after proving idempotence.
+pub fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
+    platform::open_owned_nofollow_read(path)
+}
+
+/// Tighten an already-open, owner-verified regular file to ARC's private
+/// permission boundary. The handle is revalidated before any mutation.
+pub fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
+    platform::tighten_open_owned_private(file, path)
 }
 
 /// Revalidate the private-file contract through an already-open handle.
@@ -72,6 +271,319 @@ pub fn durably_remove_private_while_open(file: &File, path: &Path) -> io::Result
 /// directories use the same protected owner/DACL policy as private files.
 pub fn create_new_private_directory(path: &Path) -> io::Result<()> {
     platform::create_new_private_directory(path)
+}
+
+#[cfg(windows)]
+fn private_directory_namespace_rebarrier_path(path: &Path) -> io::Result<PathBuf> {
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private directory has no leaf: {}", path.display()),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private directory has no parent: {}", path.display()),
+        )
+    })?;
+    Ok(parent.join(format!(
+        ".arc-private-directory-namespace-{}.rebarrier",
+        namespace_path_digest(path)?
+    )))
+}
+
+/// Stable namespace identity for a target whose parent already exists.
+/// Windows resolves ordinary file names case-insensitively, so case-fold the
+/// leaf before hashing; otherwise `data-v3` and `Data-V3` could acquire
+/// different outer locks while referring to the same live/staged namespace.
+/// Conservative Unicode uppercasing may serialize a few distinct exotic
+/// names together, which is safe; it must never split names Windows aliases.
+pub fn namespace_path_digest(path: &Path) -> io::Result<String> {
+    let leaf = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("namespace target has no leaf: {}", path.display()),
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let mut hasher = Sha256::new();
+    update_path_hash(&mut hasher, &parent);
+    hasher.update([0xff]);
+    #[cfg(windows)]
+    hasher.update(leaf.to_string_lossy().to_uppercase().as_bytes());
+    #[cfg(not(windows))]
+    update_path_hash(&mut hasher, Path::new(leaf));
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Cross-process guard for publishing or rebarriering one private directory
+/// name. The lock lives beside the target, so it remains continuously
+/// addressable while the target itself moves through its deterministic
+/// Windows write-through intermediate.
+pub struct PrivateDirectoryNamespaceLock {
+    target: PathBuf,
+    _file: File,
+}
+
+impl PrivateDirectoryNamespaceLock {
+    /// Restore a staged-only directory before an absent-name creation check.
+    /// Callers must retain this guard through the following create/open step.
+    pub fn restore_interrupted(&self) -> io::Result<()> {
+        restore_private_directory_namespace_rebarrier(&self.target)
+    }
+
+    /// Re-prove an existing directory name after the caller has acquired the
+    /// semantic lock inside it. Holding both locks prevents a second process
+    /// from creating a split directory while the live name is briefly away.
+    pub fn rebarrier_existing(&self) -> io::Result<()> {
+        rebarrier_private_directory_namespace(&self.target)
+    }
+
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+}
+
+/// Acquire the deterministic parent-sibling lock for one directory target.
+/// The target may be absent, but its parent must already be a real directory.
+pub fn acquire_private_directory_namespace_lock(
+    target: &Path,
+) -> io::Result<PrivateDirectoryNamespaceLock> {
+    let leaf = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private directory must name a leaf: {}", target.display()),
+        )
+    })?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    validate_private_directory_parent(&parent)?;
+    let target = parent.join(leaf);
+    let lock_path = parent.join(format!(
+        ".arc-private-directory-namespace-{}.lock",
+        namespace_path_digest(&target)?
+    ));
+    let file = match create_new_private(&lock_path) {
+        Ok(mut created) => {
+            created.write_all(b"arc.private-directory.namespace-lock.v1\n")?;
+            created.sync_all()?;
+            drop(created);
+            // Reopen with share-write before taking the advisory lock. A
+            // CREATE_NEW handle is intentionally born exclusive on Windows;
+            // retaining it would make contenders fail at open instead of wait
+            // on the common kernel lock.
+            open_private_read_write(&lock_path)?
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_private_read_write(&lock_path)?
+        }
+        Err(error) => return Err(error),
+    };
+    // Namespace preparation is bounded to two same-parent moves. Waiting for
+    // an in-flight cooperating creator avoids surfacing spurious request
+    // failures when several settlement publishers initialize one directory.
+    file.lock()?;
+    Ok(PrivateDirectoryNamespaceLock {
+        target,
+        _file: file,
+    })
+}
+
+fn validate_private_directory_parent(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(permission_error(format!(
+            "private directory parent is not a real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn restore_private_directory_namespace_rebarrier(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let staging = private_directory_namespace_rebarrier_path(path)?;
+        let live = std::fs::symlink_metadata(path);
+        let staged = std::fs::symlink_metadata(&staging);
+        match (live, staged) {
+            (Ok(live), Ok(staged)) => {
+                if live.file_type().is_symlink()
+                    || !live.is_dir()
+                    || staged.file_type().is_symlink()
+                    || !staged.is_dir()
+                {
+                    return Err(permission_error(
+                        "private directory namespace contains a linked/non-directory object",
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "private directory exists in both live and rebarrier namespaces: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            (Ok(live), Err(error)) if error.kind() == io::ErrorKind::NotFound => {
+                if live.file_type().is_symlink() || !live.is_dir() {
+                    return Err(permission_error(format!(
+                        "private directory is linked or not a directory: {}",
+                        path.display()
+                    )));
+                }
+            }
+            (Err(error), Ok(staged)) if error.kind() == io::ErrorKind::NotFound => {
+                if staged.file_type().is_symlink() || !staged.is_dir() {
+                    return Err(permission_error(format!(
+                        "private directory rebarrier is linked or not a directory: {}",
+                        staging.display()
+                    )));
+                }
+                windows_move_path_write_through(&staging, path, false)?;
+                validate_private_directory(path)?;
+            }
+            (Err(live), Err(staged))
+                if live.kind() == io::ErrorKind::NotFound
+                    && staged.kind() == io::ErrorKind::NotFound => {}
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+
+fn rebarrier_private_directory_namespace(path: &Path) -> io::Result<()> {
+    restore_private_directory_namespace_rebarrier(path)?;
+    validate_private_directory(path)?;
+    #[cfg(windows)]
+    {
+        let staging = private_directory_namespace_rebarrier_path(path)?;
+        windows_move_path_write_through(path, &staging, false)?;
+        windows_move_path_write_through(&staging, path, false)?;
+        validate_private_directory(path)
+    }
+    #[cfg(not(windows))]
+    sync_parent_directory(path)
+}
+
+/// Create every missing component of a user-selected private directory tree.
+///
+/// The deepest existing ancestor is canonicalized first so platform aliases
+/// such as macOS `/var -> /private/var` do not make otherwise valid data paths
+/// unusable. Every newly-created component is then born private and its parent
+/// namespace is made durable by the platform primitive. The final component is
+/// always revalidated/tightened as an ARC-private directory.
+///
+/// Unlike [`secure_private_directory_tree`], this helper intentionally accepts
+/// links in the already-existing ancestor prefix. It is therefore appropriate
+/// for an operator-selected storage path, but not for a capability directory
+/// whose complete ancestor chain must be link-free.
+pub fn create_private_directory_tree(path: &Path) -> io::Result<()> {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "private directory path must not contain '..': {}",
+                        path.display()
+                    ),
+                ));
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    if normalized.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "private directory must name a leaf component: {}",
+                path.display()
+            ),
+        ));
+    }
+    let requested = if normalized.is_absolute() {
+        normalized
+    } else {
+        std::env::current_dir()?.join(normalized)
+    };
+    let mut missing_names = Vec::new();
+    let mut cursor = requested.as_path();
+    loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(metadata) => {
+                if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    return Err(permission_error(format!(
+                        "private directory tree contains a non-directory component: {}",
+                        cursor.display()
+                    )));
+                }
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "private directory has no existing ancestor: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                missing_names.push(name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "private directory has no existing ancestor: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut resolved = cursor.canonicalize()?;
+    if !resolved.is_dir() {
+        return Err(permission_error(format!(
+            "private directory ancestor is not a directory: {}",
+            resolved.display()
+        )));
+    }
+    for name in missing_names.iter().rev() {
+        resolved.push(name);
+        match create_new_private_directory(&resolved) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                secure_private_directory(&resolved)?;
+                // A prior attempt (or a racing creator) may have made this
+                // name visible but failed before its parent-directory barrier.
+                // Repeating that barrier makes retry success meaningful.
+                sync_parent_directory(&resolved)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    secure_private_directory(&resolved)?;
+    // This also covers the retry case where the requested leaf already
+    // existed when the walk began. On Windows the create/move and subsequent
+    // child publications use write-through namespace operations; the portable
+    // parent-sync abstraction is intentionally a no-op there.
+    sync_parent_directory(&resolved)
 }
 
 /// Open and validate an existing private directory through an OS handle.
@@ -171,16 +683,18 @@ pub fn secure_private_directory_tree(path: &Path) -> io::Result<()> {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 secure_private_directory(&resolved)?;
+                sync_parent_directory(&resolved)?;
             }
             Err(error) => return Err(error),
         }
     }
-    secure_private_directory(&resolved)
+    secure_private_directory(&resolved)?;
+    sync_parent_directory(&resolved)
 }
 
 /// Open a pre-hardening app secret file and migrate only an owner-controlled
-/// Windows DACL through the already-open handle. Unix remains strict and
-/// refuses an incorrectly owned or permissive file.
+/// permission boundary through the already-open handle. Unix tightens the mode
+/// to 0600 and strips a macOS ACL; Windows applies the protected private DACL.
 pub fn open_private_owned_migration(path: &Path) -> io::Result<File> {
     platform::open_private_owned_migration(path)
 }
@@ -199,6 +713,30 @@ pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Atomically publish one already-complete private file at an absent sibling
+/// name. The staging file is revalidated and fsynced through a writable handle
+/// before Unix hard-link/parent-fsync or Windows write-through move.
+pub fn durably_publish_existing_private_no_replace(
+    staging: &Path,
+    final_path: &Path,
+) -> io::Result<()> {
+    fn parent(path: &Path) -> &Path {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+    if parent(staging) != parent(final_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "durable private publication requires same-directory paths",
+        ));
+    }
+    let file = open_private_read_write(staging)?;
+    file.sync_all()?;
+    drop(file);
+    publish_private_no_replace(staging, final_path)
+}
+
 #[cfg(unix)]
 fn publish_private_no_replace(staging: &Path, final_path: &Path) -> io::Result<()> {
     std::fs::hard_link(staging, final_path)?;
@@ -208,31 +746,11 @@ fn publish_private_no_replace(staging: &Path, final_path: &Path) -> io::Result<(
 
 #[cfg(windows)]
 fn publish_private_no_replace(staging: &Path, final_path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    };
-    let staging_wide = wide(staging);
-    let final_wide = wide(final_path);
     // No REPLACE_EXISTING flag: publication is atomic create-only. The
     // write-through flag asks NTFS to flush the directory-entry mutation
     // before success is reported, closing the power-loss gap left by the
     // otherwise no-op Windows parent-directory fsync abstraction.
-    if unsafe {
-        MoveFileExW(
-            staging_wide.as_ptr(),
-            final_wide.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
+    windows_move_path_write_through(staging, final_path, false)?;
     let final_handle = open_private(final_path)?;
     validate_private(&final_handle, final_path)
 }
@@ -250,29 +768,7 @@ fn replace_private_write_through(staging: &Path, final_path: &Path) -> io::Resul
 
 #[cfg(windows)]
 fn replace_private_write_through(staging: &Path, final_path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    };
-    let staging_wide = wide(staging);
-    let final_wide = wide(final_path);
-    if unsafe {
-        MoveFileExW(
-            staging_wide.as_ptr(),
-            final_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
+    windows_move_path_write_through(staging, final_path, true)?;
     let final_handle = open_private(final_path)?;
     validate_private(&final_handle, final_path)
 }
@@ -595,6 +1091,13 @@ pub fn arm_desktop_shutdown_receipt(
                     "existing desktop shutdown receipt does not match this node identity",
                 ));
             }
+            drop(file);
+            // The preceding publication may have made this exact receipt
+            // visible while reporting a late parent-directory/write-through
+            // failure. The managed lifecycle lock serializes this bounded
+            // replacement, so retry success proves the unproven marker before
+            // the supervisor is allowed to spawn a node beneath it.
+            durably_replace_private(&receipt, expected.as_bytes())?;
             return Ok(DesktopShutdownReceiptArm {
                 nonce,
                 created_this_attempt: false,
@@ -651,6 +1154,11 @@ pub fn arm_desktop_shutdown_receipt(
                     "existing desktop shutdown receipt does not match this node identity",
                 ));
             }
+            drop(file);
+            // `Ok(false)` proves only that an identical publisher won the
+            // create-only race. Repeat the namespace barrier before treating
+            // that visible receipt as a durable launch fence.
+            durably_replace_private(&receipt, expected.as_bytes())?;
             Ok(DesktopShutdownReceiptArm {
                 nonce,
                 created_this_attempt: false,
@@ -1076,6 +1584,58 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_private_append_owned_migration(path: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(permission_error(format!(
+                "private file is not a regular file: {}",
+                path.display()
+            )));
+        }
+        validate_owner(&metadata, path, "file")?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        macos_acl::strip(&file)?;
+        validate_private(&file, path)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(permission_error(format!(
+                "owner-controlled file is not a regular file: {}",
+                path.display()
+            )));
+        }
+        validate_owner(&metadata, path, "file")?;
+        Ok(file)
+    }
+
+    pub(super) fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(permission_error(format!(
+                "owner-controlled file is not a regular file: {}",
+                path.display()
+            )));
+        }
+        validate_owner(&metadata, path, "file")?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        macos_acl::strip(file)?;
+        validate_private(file, path)
+    }
+
     pub(super) fn validate_private(file: &File, path: &Path) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -1293,6 +1853,66 @@ mod tests {
     }
 
     #[test]
+    fn operator_private_directory_tree_creates_nested_components_durably() {
+        let root = TestDir::new("operator-private-tree");
+        let nested = root.0.join("one").join("two").join("three");
+        create_private_directory_tree(&nested).unwrap();
+        for directory in [root.0.join("one"), root.0.join("one/two"), nested] {
+            validate_private_directory(&directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_directory_namespace_guard_preserves_children_across_rebarrier() {
+        let root = TestDir::new("directory-namespace-guard");
+        let requested = root.0.join("semantic-child");
+        let guard = acquire_private_directory_namespace_lock(&requested).unwrap();
+        guard.restore_interrupted().unwrap();
+        create_private_directory_tree(guard.target()).unwrap();
+        let payload = guard.target().join("history");
+        let mut file = create_new_private(&payload).unwrap();
+        file.write_all(b"canonical history").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        guard.rebarrier_existing().unwrap();
+        assert_eq!(std::fs::read(&payload).unwrap(), b"canonical history");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_namespace_guard_restores_staged_only_directory() {
+        let root = TestDir::new("directory-namespace-staged-only");
+        let requested = root.0.join("semantic-child");
+        let guard = acquire_private_directory_namespace_lock(&requested).unwrap();
+        create_private_directory_tree(guard.target()).unwrap();
+        let staging = private_directory_namespace_rebarrier_path(guard.target()).unwrap();
+        windows_move_path_write_through(guard.target(), &staging, false).unwrap();
+        assert!(!guard.target().exists());
+        guard.restore_interrupted().unwrap();
+        assert!(guard.target().is_dir());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn operator_private_directory_tree_rejects_parent_traversal_before_mutation() {
+        let root = TestDir::new("operator-private-tree-parent");
+        let requested = root.0.join("missing").join("..").join("target");
+        #[cfg(unix)]
+        let before = std::fs::metadata(&root.0).unwrap().permissions();
+        assert!(create_private_directory_tree(&requested).is_err());
+        assert!(!root.0.join("missing").exists());
+        assert!(!root.0.join("target").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&root.0).unwrap().permissions().mode() & 0o777,
+                before.mode() & 0o777
+            );
+        }
+    }
+
+    #[test]
     fn shutdown_marker_ack_lifecycle_is_exact_and_fail_closed() {
         let (dir, token, executable, genesis) = shutdown_fixture("receipt-lifecycle");
         let first = arm_desktop_shutdown_receipt(&dir.0, &token, &executable, &genesis).unwrap();
@@ -1318,6 +1938,33 @@ mod tests {
         );
         consume_desktop_shutdown_ack(&dir.0, &token, &first.nonce, &executable, &genesis).unwrap();
         assert!(desktop_shutdown_lifecycle_state(&dir.0).unwrap().is_clear());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_visible_shutdown_receipt_is_rebarriered_before_retry_success() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (dir, token, executable, genesis) = shutdown_fixture("receipt-visible-retry");
+        let first = arm_desktop_shutdown_receipt(&dir.0, &token, &executable, &genesis).unwrap();
+        let receipt = dir
+            .0
+            .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+            .join(DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME);
+        let original_inode = std::fs::metadata(&receipt).unwrap().ino();
+
+        let retried = arm_desktop_shutdown_receipt(&dir.0, &token, &executable, &genesis).unwrap();
+        assert!(!retried.created_this_attempt);
+        assert_eq!(retried.nonce, first.nonce);
+        assert_ne!(
+            std::fs::metadata(&receipt).unwrap().ino(),
+            original_inode,
+            "an existing visible receipt must cross a fresh replacement barrier"
+        );
+        assert!(
+            validate_desktop_shutdown_receipt(&dir.0, &token, &first.nonce, &executable, &genesis)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1370,6 +2017,30 @@ mod tests {
         durably_publish_new_private(&receipt, b"torn").unwrap();
         assert!(arm_desktop_shutdown_receipt(&dir.0, &token, &executable, &genesis).is_err());
         assert_eq!(std::fs::read(receipt).unwrap(), b"torn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_shutdown_receipt_is_rejected_without_mutating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, token, executable, genesis) = shutdown_fixture("receipt-linked-final");
+        let outside = dir.0.join("operator-owned-target");
+        std::fs::write(&outside, b"must remain untouched").unwrap();
+        let receipt = dir
+            .0
+            .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+            .join(DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME);
+        symlink(&outside, &receipt).unwrap();
+
+        assert!(arm_desktop_shutdown_receipt(&dir.0, &token, &executable, &genesis).is_err());
+        assert!(
+            std::fs::symlink_metadata(&receipt)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(outside).unwrap(), b"must remain untouched");
     }
 
     #[cfg(unix)]
@@ -1594,6 +2265,85 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_append_only_private_handle_can_cross_a_flush_barrier() {
+        let root = TestDir::new("windows-append-flush");
+        let directory = root.0.join("private");
+        create_private_directory_tree(&directory).unwrap();
+        let path = directory.join("state.wal");
+        assert!(durably_publish_new_private(&path, b"first").unwrap());
+
+        let mut file = open_private_append_owned_migration(&path).unwrap();
+        file.write_all(b"-second").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut contents = Vec::new();
+        open_private(&path)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"first-second");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extended_path_is_lexical_and_rejects_partial_or_device_paths() {
+        let decoded = |path: &str| {
+            let mut wide = super::windows_extended_path(Path::new(path)).unwrap();
+            assert_eq!(wide.pop(), Some(0));
+            String::from_utf16(&wide).unwrap()
+        };
+
+        assert_eq!(decoded(r"C:\arc\.\state\..\wal"), r"\\?\C:\arc\wal");
+        assert_eq!(
+            decoded(r"\\server\share\arc\..\state"),
+            r"\\?\UNC\server\share\state"
+        );
+        assert!(super::windows_extended_path(Path::new(r"C:relative")).is_err());
+        assert!(super::windows_extended_path(Path::new(r"\root-relative")).is_err());
+        assert!(super::windows_extended_path(Path::new(r"\\.\PhysicalDrive0")).is_err());
+        assert_eq!(decoded(r"\\?\C:\arc"), r"\\?\C:\arc");
+        assert!(
+            super::windows_extended_path(Path::new(r"\\?\GLOBALROOT\Device\Harddisk0")).is_err()
+        );
+
+        let relative = decoded(r"arc-relative\state.wal");
+        assert!(relative.starts_with(r"\\?\"));
+        assert!(relative.ends_with(r"\arc-relative\state.wal"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_publication_supports_extended_length_paths() {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let root = TestDir::new("windows-extended-private-path");
+        let component = |tag: char| std::iter::repeat_n(tag, 90).collect::<String>();
+        let deep = root
+            .0
+            .join(component('a'))
+            .join(component('b'))
+            .join(component('c'));
+        assert!(
+            deep.as_os_str().encode_wide().count() > 260,
+            "fixture must exceed legacy MAX_PATH"
+        );
+
+        // Directory and file creation exercise the SDDL/SID conversion too;
+        // those strings must remain raw UTF-16 rather than path-normalized.
+        create_private_directory_tree(&deep).unwrap();
+        validate_private_directory(&deep).unwrap();
+        let path = deep.join("state.wal");
+        assert!(durably_publish_new_private(&path, b"first").unwrap());
+        durably_replace_private(&path, b"second").unwrap();
+        let mut file = open_private(&path).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"second");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_new_private_objects_are_owned_by_the_exact_user_sid() {
         let root = TestDir::new("windows-explicit-user-owner");
         let private_directory = root.0.join("private");
@@ -1658,7 +2408,7 @@ mod platform {
     use super::*;
     use std::ffi::c_void;
     use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::ptr::{null, null_mut};
@@ -1679,8 +2429,8 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
-        WRITE_DAC,
+        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+        OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
@@ -1747,15 +2497,19 @@ mod platform {
     }
 
     fn wide(value: &std::ffi::OsStr) -> io::Result<Vec<u16>> {
-        let mut encoded: Vec<u16> = value.encode_wide().collect();
+        let mut encoded = value.encode_wide().collect::<Vec<_>>();
         if encoded.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Windows path contains an interior NUL",
+                "Windows string contains an interior NUL",
             ));
         }
         encoded.push(0);
         Ok(encoded)
+    }
+
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        super::windows_extended_path(path)
     }
 
     fn current_user_sid() -> io::Result<OwnedSid> {
@@ -1869,7 +2623,7 @@ mod platform {
 
     pub(super) fn create_new_private(path: &Path) -> io::Result<File> {
         let (descriptor_guard, attributes) = private_security_attributes()?;
-        let path_wide = wide(path.as_os_str())?;
+        let path_wide = wide_path(path)?;
         // SAFETY: all pointers remain alive for the call; CREATE_NEW prevents
         // overwrite and OPEN_REPARSE_POINT prevents traversal of a final link.
         let handle = unsafe {
@@ -1894,44 +2648,44 @@ mod platform {
     }
 
     pub(super) fn create_new_private_directory(path: &Path) -> io::Result<()> {
-        use rand::RngCore as _;
-        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-
-        let mut random = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut random);
-        let staging = path.with_file_name(format!(
-            ".{}.{}.{}.directory",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("private"),
-            std::process::id(),
-            hex::encode(random)
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        // A deterministic destination-bound staging name makes directory
+        // creation resumable and bounds crash residue to one empty directory.
+        // Callers that need to rebarrier an already-live semantic directory
+        // additionally hold `PrivateDirectoryNamespaceLock`.
+        let staging = parent.join(format!(
+            ".arc-private-directory-create-{}.staging",
+            super::namespace_path_digest(path)?
         ));
         let (descriptor_guard, attributes) = private_security_attributes()?;
-        let staging_wide = wide(staging.as_os_str())?;
+        let staging_wide = wide_path(&staging)?;
         // SAFETY: path and descriptor remain live for the call. CreateDirectoryW
         // fails if the staging path already exists and applies the protected
         // DACL before another process can open the directory.
         let created = unsafe { CreateDirectoryW(staging_wide.as_ptr(), &attributes) };
         drop(descriptor_guard);
         if created == 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
         }
         if let Err(error) = validate_private_directory(&staging) {
-            let _ = std::fs::remove_dir(&staging);
+            if created != 0 {
+                let _ = std::fs::remove_dir(&staging);
+            }
             return Err(error);
         }
-        let final_wide = wide(path.as_os_str())?;
-        if unsafe {
-            MoveFileExW(
-                staging_wide.as_ptr(),
-                final_wide.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            let error = io::Error::last_os_error();
-            let _ = std::fs::remove_dir(&staging);
+        if std::fs::read_dir(&staging)?.next().transpose()?.is_some() {
+            return Err(permission_error(format!(
+                "private directory creation staging is not empty: {}",
+                staging.display()
+            )));
+        }
+        if let Err(error) = super::windows_move_path_write_through(&staging, path, false) {
+            if created != 0 {
+                let _ = std::fs::remove_dir(&staging);
+            }
             return Err(error);
         }
         validate_private_directory(path)
@@ -1944,9 +2698,61 @@ mod platform {
     }
 
     pub(super) fn open_private_read_write(path: &Path) -> io::Result<File> {
-        let file = open_private_raw_with_access(path, GENERIC_READ | GENERIC_WRITE | READ_CONTROL)?;
+        let file = open_private_raw_with_access_and_share(
+            path,
+            GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
         validate_private(&file, path)?;
         Ok(file)
+    }
+
+    pub(super) fn open_private_append_owned_migration(path: &Path) -> io::Result<File> {
+        let file = open_private_raw_with_access(
+            path,
+            GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_WRITE_DATA) | READ_CONTROL | WRITE_DAC,
+        )?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "private file is not a non-reparse regular file: {}",
+                path.display()
+            )));
+        }
+        validate_private_owner(&file, path, "file")?;
+        if validate_private_security(&file, path, "file").is_err() {
+            apply_private_dacl(&file)?;
+        }
+        validate_private_security(&file, path, "file")?;
+        Ok(file)
+    }
+
+    pub(super) fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
+        let file = open_private_raw_with_access(path, GENERIC_READ | READ_CONTROL | WRITE_DAC)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "owner-controlled file is not a non-reparse regular file: {}",
+                path.display()
+            )));
+        }
+        validate_private_owner(&file, path, "file")?;
+        Ok(file)
+    }
+
+    pub(super) fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "owner-controlled file is not a non-reparse regular file: {}",
+                path.display()
+            )));
+        }
+        validate_private_owner(file, path, "file")?;
+        if validate_private_security(file, path, "file").is_err() {
+            apply_private_dacl(file)?;
+        }
+        validate_private_security(file, path, "file")
     }
 
     fn open_private_raw(path: &Path) -> io::Result<File> {
@@ -1954,14 +2760,26 @@ mod platform {
     }
 
     fn open_private_raw_with_access(path: &Path, desired_access: u32) -> io::Result<File> {
-        let path_wide = wide(path.as_os_str())?;
+        open_private_raw_with_access_and_share(
+            path,
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+        )
+    }
+
+    fn open_private_raw_with_access_and_share(
+        path: &Path,
+        desired_access: u32,
+        share_mode: u32,
+    ) -> io::Result<File> {
+        let path_wide = wide_path(path)?;
         // SAFETY: input is a live NUL-terminated path. OPEN_REPARSE_POINT
         // opens the link itself so validation can reject it.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
                 desired_access,
-                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                share_mode,
                 null(),
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1997,7 +2815,7 @@ mod platform {
 
     pub(super) fn remove_private_while_open(file: &File, path: &Path) -> io::Result<()> {
         validate_private(file, path)?;
-        let path_wide = wide(path.as_os_str())?;
+        let path_wide = wide_path(path)?;
         // The retained validated handle was opened with FILE_SHARE_DELETE.
         // DeleteFileW marks this exact still-existing name for deletion; a
         // CREATE_NEW publisher cannot install a replacement until the handle
@@ -2013,8 +2831,7 @@ mod platform {
     pub(super) fn durably_remove_private_while_open(file: &File, path: &Path) -> io::Result<()> {
         use rand::RngCore as _;
         use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, MOVEFILE_WRITE_THROUGH,
-            MoveFileExW,
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
 
         validate_private(file, path)?;
@@ -2028,18 +2845,7 @@ mod platform {
             std::process::id(),
             hex::encode(random)
         ));
-        let source_wide = wide(path.as_os_str())?;
-        let tombstone_wide = wide(tombstone.as_os_str())?;
-        if unsafe {
-            MoveFileExW(
-                source_wide.as_ptr(),
-                tombstone_wide.as_ptr(),
-                MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        super::windows_move_path_write_through(path, &tombstone, false)?;
 
         // Re-open the tombstone and compare stable volume/file indices with
         // the retained validated source handle before treating disappearance
@@ -2068,9 +2874,7 @@ mod platform {
         // Deletion is cleanup only. If it is interrupted, the uniquely named
         // private tombstone is fail-safe and cannot be mistaken for an armed
         // receipt or a clean ACK.
-        let _ = unsafe {
-            windows_sys::Win32::Storage::FileSystem::DeleteFileW(tombstone_wide.as_ptr())
-        };
+        let _ = std::fs::remove_file(&tombstone);
         Ok(())
     }
 
@@ -2087,7 +2891,7 @@ mod platform {
         path: &Path,
         desired_access: u32,
     ) -> io::Result<File> {
-        let path_wide = wide(path.as_os_str())?;
+        let path_wide = wide_path(path)?;
         // SAFETY: OPEN_REPARSE_POINT opens a final directory reparse point
         // itself; BACKUP_SEMANTICS permits opening a real directory handle.
         let handle = unsafe {

@@ -167,6 +167,11 @@ impl StateSyncManager {
         peer_rpc: &str,
         state: &Arc<StateDB>,
     ) -> Result<u64, SyncError> {
+        if state.is_persistent() {
+            return Err(SyncError::StateError(
+                arc_state::StateError::UnauthenticatedPersistentStateSync,
+            ));
+        }
         // 1. Fetch manifest
         let manifest = self.fetch_manifest(peer_rpc).await?;
         let total_chunks = manifest.total_chunks;
@@ -322,5 +327,31 @@ mod tests {
     #[test]
     fn test_sync_manager_creation() {
         let _mgr = StateSyncManager::new();
+    }
+
+    #[tokio::test]
+    async fn persistent_sync_rejects_before_contacting_a_peer() {
+        let directory = std::env::temp_dir().join(format!(
+            "arc-state-sync-persistent-reject-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(
+                &[],
+                &directory,
+                arc_crypto::hash_bytes(b"persistent-sync-reject"),
+            )
+            .unwrap(),
+        );
+        let error = StateSyncManager::new()
+            .sync_from_peer("this-peer-must-never-be-resolved.invalid:1", &state)
+            .await
+            .expect_err("persistent legacy snapshot sync must fail closed");
+        assert!(matches!(
+            error,
+            SyncError::StateError(arc_state::StateError::UnauthenticatedPersistentStateSync)
+        ));
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

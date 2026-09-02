@@ -197,10 +197,209 @@ impl ManagedLifecycleLock {
     }
 }
 
+fn validate_configured_directory_ancestry_no_link(path: &Path) -> anyhow::Result<()> {
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                let is_link = {
+                    use std::os::windows::fs::MetadataExt as _;
+                    metadata.file_attributes()
+                        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                        != 0
+                };
+                #[cfg(not(windows))]
+                let is_link = metadata.file_type().is_symlink();
+                anyhow::ensure!(
+                    !is_link && metadata.is_dir(),
+                    "managed data-directory ancestry contains a linked/non-directory component: {}",
+                    ancestor.display()
+                );
+            }
+            // The configured leaf may validly be absent. The existing parent
+            // requirement below still rejects a missing custom ancestor, while
+            // the managed-default helper may create exactly ~/.arc.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot inspect managed data-directory ancestry component {}",
+                        ancestor.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_managed_default_data_namespace(data_dir: &Path, managed_root: &Path) -> bool {
+    let expected = managed_root.join("data-v3");
+    if data_dir == expected {
+        return true;
+    }
+    let Some(data_leaf) = data_dir.file_name() else {
+        return false;
+    };
+    #[cfg(windows)]
+    let same_leaf = data_leaf.to_string_lossy().to_uppercase() == "DATA-V3";
+    #[cfg(not(windows))]
+    let same_leaf = data_leaf == std::ffi::OsStr::new("data-v3");
+    if !same_leaf {
+        return false;
+    }
+    let Some(data_parent) = data_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    // Compare the parent directory entries by the same stable identity used
+    // for their namespace locks. This catches Windows case variants without
+    // following a different custom leaf target. A missing custom ancestor is
+    // intentionally left to the existing custom-parent validation below.
+    matches!(
+        (
+            arc_crypto::secret_file::namespace_path_digest(data_parent),
+            arc_crypto::secret_file::namespace_path_digest(managed_root),
+        ),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
+fn prepare_first_launch_managed_root_at(
+    data_dir: &Path,
+    managed_root: &Path,
+) -> anyhow::Result<Option<arc_crypto::secret_file::PrivateDirectoryNamespaceLock>> {
+    if !is_managed_default_data_namespace(data_dir, managed_root) {
+        return Ok(None);
+    }
+    match std::fs::symlink_metadata(managed_root) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                "managed ARC root is not a regular non-link directory: {}",
+                managed_root.display()
+            );
+            match std::fs::symlink_metadata(data_dir) {
+                // Once the managed child exists, its own namespace/lifecycle
+                // protocol proves every subsequent startup. Before then, a
+                // visible root may be the late-visible result of a failed
+                // first publication and must be rebarriered below.
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // The packaged desktop owns exactly ~/.arc, whose immediate parent is the
+    // already-existing OS user home. Reserve and restore that one namespace
+    // before its first creation so a crash cannot strand the whole managed
+    // binary/data tree under a hidden Windows rebarrier name. Arbitrary custom
+    // data parents remain operator-owned and must already exist.
+    let namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(managed_root)
+            .with_context(|| {
+                format!(
+                    "cannot lock first-launch ARC root namespace {}",
+                    managed_root.display()
+                )
+            })?;
+    namespace_lock.restore_interrupted().with_context(|| {
+        format!(
+            "cannot restore interrupted first-launch ARC root {}",
+            managed_root.display()
+        )
+    })?;
+
+    match std::fs::symlink_metadata(managed_root) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                "managed ARC root is not a regular non-link directory: {}",
+                managed_root.display()
+            );
+            arc_crypto::secret_file::secure_private_directory(managed_root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            arc_crypto::secret_file::secure_private_directory(managed_root)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // Re-check after acquiring the root guard. Another first-launch process
+    // may have completed the child while this one waited. In that case its
+    // successful child creation depended on an already-proven root. When the
+    // child is still absent, repeat the root barrier now, including the retry
+    // where an earlier write-through move made the root visible but reported
+    // a late failure.
+    match std::fs::symlink_metadata(data_dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            namespace_lock.rebarrier_existing().with_context(|| {
+                format!(
+                    "cannot durably publish first-launch ARC root {}",
+                    managed_root.display()
+                )
+            })?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // Retain this guard through the data child and internal lifecycle-lock
+    // publication. Dropping it here would reopen a window in which another
+    // first-launch process could move the parent while this caller creates
+    // the child beneath it.
+    Ok(Some(namespace_lock))
+}
+
 pub fn acquire_managed_lifecycle_lock(
     configured_data_dir: &str,
 ) -> anyhow::Result<ManagedLifecycleLock> {
     let data_dir = resolve_data_dir(configured_data_dir);
+    // Validate the pathname exactly as configured before canonicalization or
+    // namespace-lock acquisition. Otherwise a custom symlinked parent is
+    // followed first and the lock sidecar mutates its external target before
+    // the later private-tree walk rejects the link.
+    validate_configured_directory_ancestry_no_link(&data_dir)?;
+    let _managed_root_namespace_lock =
+        prepare_first_launch_managed_root_at(&data_dir, &paths::arc_home())?;
+    let data_parent = data_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = data_parent.canonicalize().with_context(|| {
+        format!(
+            "managed data-directory parent {} must already exist; the installer or operator must create it before node start",
+            data_parent.display()
+        )
+    })?;
+    anyhow::ensure!(
+        canonical_parent.is_dir(),
+        "managed data-directory parent is not a directory: {}",
+        data_parent.display()
+    );
+    let data_namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(
+        &data_dir,
+    )
+    .with_context(|| {
+        format!(
+            "cannot lock managed data-directory namespace {}",
+            data_dir.display()
+        )
+    })?;
+    data_namespace_lock.restore_interrupted().with_context(|| {
+        format!(
+            "cannot restore interrupted managed data-directory namespace {}",
+            data_dir.display()
+        )
+    })?;
     arc_crypto::secret_file::secure_private_directory_tree(&data_dir).with_context(|| {
         format!(
             "cannot durably secure managed data directory before lifecycle lock: {}",
@@ -208,7 +407,32 @@ pub fn acquire_managed_lifecycle_lock(
         )
     })?;
     let data_dir = data_dir.canonicalize()?;
+    let locked_target = data_namespace_lock.target();
+    let same_namespace = data_dir == locked_target
+        || arc_crypto::secret_file::namespace_path_digest(&data_dir)?
+            == arc_crypto::secret_file::namespace_path_digest(locked_target)?;
+    anyhow::ensure!(
+        same_namespace,
+        "managed data directory resolved outside its locked namespace: {}",
+        data_dir.display()
+    );
     let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    let control_namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(&control_dir)
+            .with_context(|| {
+                format!(
+                    "cannot lock managed shutdown-control namespace {}",
+                    control_dir.display()
+                )
+            })?;
+    control_namespace_lock
+        .restore_interrupted()
+        .with_context(|| {
+            format!(
+                "cannot restore interrupted managed shutdown-control namespace {}",
+                control_dir.display()
+            )
+        })?;
     arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
     let lock_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
     arc_crypto::secret_file::durably_publish_new_private(
@@ -219,6 +443,25 @@ pub fn acquire_managed_lifecycle_lock(
     file.try_lock_exclusive().map_err(|error| {
         anyhow::anyhow!(
             "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    control_namespace_lock
+        .rebarrier_existing()
+        .with_context(|| {
+            format!(
+                "cannot rebarrier managed shutdown-control namespace {}",
+                control_dir.display()
+            )
+        })?;
+    // The control namespace guard lives inside the data directory. Release
+    // its Windows handle before rebarriering the parent data-directory name;
+    // the held lifecycle file and outer data namespace guard still serialize
+    // every cooperating desktop through the remaining publication step.
+    drop(control_namespace_lock);
+    data_namespace_lock.rebarrier_existing().with_context(|| {
+        format!(
+            "cannot rebarrier managed data-directory namespace {}",
             data_dir.display()
         )
     })?;
@@ -829,6 +1072,54 @@ fn read_bounded_bundle_resource(path: &Path, name: &str) -> anyhow::Result<Vec<u
     Ok(bytes)
 }
 
+fn stable_network_replacement_staging(path: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("network-resource")),
+    );
+    name.push(".arc-stable-network.replace");
+    path.with_file_name(name)
+}
+
+/// Replace one stable network resource through a deterministic, destination-
+/// bound staging file. The lifecycle and network namespace guards serialize
+/// this helper, so a crash can leave at most one bounded staging file per
+/// resource; a retry truncates and reuses it without touching unrelated files.
+fn durably_replace_stable_network_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if contents.is_empty() || contents.len() as u64 > DESKTOP_NETWORK_RESOURCE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stable network resource has an invalid bounded size",
+        ));
+    }
+    let staging = stable_network_replacement_staging(path);
+    let mut file = match arc_crypto::secret_file::open_private_read_write(&staging) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            arc_crypto::secret_file::create_new_private(&staging)?
+        }
+        Err(error) => return Err(error),
+    };
+    file.set_len(0)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+
+    #[cfg(windows)]
+    arc_crypto::secret_file::windows_move_path_write_through(&staging, path, true)?;
+    #[cfg(unix)]
+    {
+        std::fs::rename(&staging, path)?;
+        arc_crypto::secret_file::sync_parent_directory(path)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    std::fs::rename(&staging, path)?;
+
+    drop(arc_crypto::secret_file::open_private(path)?);
+    Ok(())
+}
+
 /// Copy the signed bundle network identity into stable private app data before
 /// the lifecycle receipt is armed. AppImage mount paths change every launch
 /// and package/manual updates can replace bundle resources; a crash-recovery
@@ -836,10 +1127,35 @@ fn read_bounded_bundle_resource(path: &Path, name: &str) -> anyhow::Result<Vec<u
 fn materialize_stable_testnet_resources(
     data_dir: &Path,
     bundle: &TestnetResources,
+    lifecycle_lock: &ManagedLifecycleLock,
 ) -> anyhow::Result<TestnetResources> {
-    let lifecycle = arc_crypto::secret_file::desktop_shutdown_lifecycle_state(data_dir)
+    let data_dir = data_dir.canonicalize().with_context(|| {
+        format!(
+            "cannot canonicalize managed data directory before network identity materialization: {}",
+            data_dir.display()
+        )
+    })?;
+    lifecycle_lock.ensure_data_dir(&data_dir)?;
+    let lifecycle = arc_crypto::secret_file::desktop_shutdown_lifecycle_state(&data_dir)
         .context("cannot inspect managed-node lifecycle before network identity materialization")?;
     let network_dir = data_dir.join(DESKTOP_NETWORK_IDENTITY_DIR_NAME);
+    let network_namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(&network_dir)
+            .with_context(|| {
+                format!(
+                    "cannot lock stable network identity namespace {}",
+                    network_dir.display()
+                )
+            })?;
+    network_namespace_lock
+        .restore_interrupted()
+        .with_context(|| {
+            format!(
+                "cannot restore interrupted stable network identity namespace {}",
+                network_dir.display()
+            )
+        })?;
+    let network_dir = network_namespace_lock.target().to_path_buf();
     let stable_seeds = network_dir.join(DESKTOP_STABLE_SEEDS_FILE_NAME);
     let stable_genesis = network_dir.join(DESKTOP_STABLE_GENESIS_FILE_NAME);
 
@@ -856,10 +1172,18 @@ fn materialize_stable_testnet_resources(
                 )
             },
         )?;
-        arc_crypto::secret_file::durably_replace_private(&stable_seeds, &seeds)
+        durably_replace_stable_network_file(&stable_seeds, &seeds)
             .context("cannot durably materialize stable signed seed identity")?;
-        arc_crypto::secret_file::durably_replace_private(&stable_genesis, &genesis)
+        durably_replace_stable_network_file(&stable_genesis, &genesis)
             .context("cannot durably materialize stable signed genesis identity")?;
+        network_namespace_lock
+            .rebarrier_existing()
+            .with_context(|| {
+                format!(
+                    "cannot rebarrier stable network identity namespace {}",
+                    network_dir.display()
+                )
+            })?;
     } else {
         // Never derive recovery identity from a new AppImage mount or replaced
         // application bundle. The old stable copy is immutable until the node
@@ -1190,7 +1514,7 @@ impl NodeManager {
         let stable_resources = if let Some((_, _, exact_resources)) = verified_resume.as_ref() {
             exact_resources.clone()
         } else {
-            materialize_stable_testnet_resources(&data_dir, resources)?
+            materialize_stable_testnet_resources(&data_dir, resources, lifecycle_lock)?
         };
         let (seeds_file, genesis_file) = required_testnet_resources(&stable_resources)?;
         let validator_keyfile = if let Some((exact_validator_keyfile, _, _)) = verified_resume {
@@ -3626,13 +3950,18 @@ fn udp_available(port: u16) -> bool {
     UdpSocket::bind(addr).is_ok()
 }
 
-fn choose_port_pair(preferred_rpc: u16, preferred_p2p: u16) -> anyhow::Result<(u16, u16)> {
+fn choose_port_pair_with_probes(
+    preferred_rpc: u16,
+    preferred_p2p: u16,
+    mut rpc_available: impl FnMut(u16) -> bool,
+    mut p2p_available: impl FnMut(u16) -> bool,
+) -> anyhow::Result<(u16, u16)> {
     // Try up to 5 offsets in +10 increments. RPC must be TCP-bindable and
     // P2P must be UDP-bindable.
     for i in 0..5 {
         let rpc = preferred_rpc.saturating_add(i * 10);
         let p2p = preferred_p2p.saturating_add(i * 10);
-        if tcp_available(rpc) && udp_available(p2p) {
+        if rpc_available(rpc) && p2p_available(p2p) {
             return Ok((rpc, p2p));
         }
     }
@@ -3643,6 +3972,10 @@ fn choose_port_pair(preferred_rpc: u16, preferred_p2p: u16) -> anyhow::Result<(u
         preferred_rpc,
         preferred_p2p
     ))
+}
+
+fn choose_port_pair(preferred_rpc: u16, preferred_p2p: u16) -> anyhow::Result<(u16, u16)> {
+    choose_port_pair_with_probes(preferred_rpc, preferred_p2p, tcp_available, udp_available)
 }
 
 impl Default for NodeManager {
@@ -3657,6 +3990,14 @@ fn _path_sanity(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn private_directory_rebarrier_staging(path: &Path) -> PathBuf {
+        path.parent().unwrap().join(format!(
+            ".arc-private-directory-namespace-{}.rebarrier",
+            arc_crypto::secret_file::namespace_path_digest(path).unwrap()
+        ))
+    }
 
     fn resource_test_dir(label: &str) -> PathBuf {
         // macOS exposes its temporary directory through `/var`, which is a
@@ -3758,7 +4099,7 @@ mod tests {
         let mount_b = root.join(".mount_B/resources");
         std::fs::create_dir_all(&mount_a).unwrap();
         std::fs::create_dir_all(&mount_b).unwrap();
-        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let lifecycle_lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
         let seeds_a = mount_a.join("testnet-seeds.txt");
         let genesis_a = mount_a.join("genesis.toml");
         std::fs::write(&seeds_a, b"seed-A\n").unwrap();
@@ -3769,6 +4110,7 @@ mod tests {
                 seeds_file: Some(seeds_a),
                 genesis_file: Some(genesis_a),
             },
+            &lifecycle_lock,
         )
         .unwrap();
         let stable_genesis = first.genesis_file.clone().unwrap();
@@ -3788,16 +4130,19 @@ mod tests {
                 seeds_file: Some(mount_b.join("testnet-seeds.txt")),
                 genesis_file: Some(mount_b.join("genesis.toml")),
             },
+            &lifecycle_lock,
         )
         .unwrap();
         assert_eq!(recovered.genesis_file.unwrap(), stable_genesis);
         assert_eq!(std::fs::read(stable_genesis).unwrap(), old_bytes);
+        drop(lifecycle_lock);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn managed_lifecycle_lock_serializes_desktop_processes() {
         let root = resource_test_dir("lifecycle-lock");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
         let configured = root.join("data-v3").to_string_lossy().into_owned();
         let first = acquire_managed_lifecycle_lock(&configured).unwrap();
         assert!(acquire_managed_lifecycle_lock(&configured).is_err());
@@ -3806,9 +4151,261 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn first_launch_prepares_only_the_managed_arc_root() {
+        let home = resource_test_dir("first-launch-root");
+        arc_crypto::secret_file::secure_private_directory_tree(&home).unwrap();
+        let managed_root = home.join(".arc");
+        let data = managed_root.join("data-v3");
+
+        let root_guard = prepare_first_launch_managed_root_at(&data, &managed_root)
+            .unwrap()
+            .expect("first launch must retain the managed-root namespace guard");
+        assert!(managed_root.is_dir());
+        let lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        assert!(data.is_dir());
+
+        drop(lock);
+        drop(root_guard);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_launch_rebarriers_a_visible_managed_root_before_creating_its_child() {
+        let home = resource_test_dir("first-launch-visible-root-retry");
+        arc_crypto::secret_file::secure_private_directory_tree(&home).unwrap();
+        let managed_root = home.join(".arc");
+        // A configured case variant still names the exact managed namespaces
+        // on Windows and therefore must participate in the outer-root fence.
+        let data = home.join(".ARC").join("DATA-V3");
+
+        // Model the observable state after MoveFileExW made the first root
+        // publication visible but reported a late write-through failure. A
+        // retry must not treat mere visibility as proof that the parent name
+        // is durable, and must retain its namespace guard through child
+        // creation.
+        arc_crypto::secret_file::secure_private_directory(&managed_root).unwrap();
+        let root_guard = prepare_first_launch_managed_root_at(&data, &managed_root)
+            .unwrap()
+            .expect("visible root without data must re-enter the namespace protocol");
+        assert_eq!(
+            arc_crypto::secret_file::namespace_path_digest(root_guard.target()).unwrap(),
+            arc_crypto::secret_file::namespace_path_digest(&managed_root).unwrap()
+        );
+        assert!(managed_root.is_dir());
+        assert!(!private_directory_rebarrier_staging(&managed_root).exists());
+
+        let lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        assert!(data.is_dir());
+        drop(lock);
+        drop(root_guard);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn custom_data_parent_must_already_exist() {
+        let root = resource_test_dir("custom-parent-missing");
+        let data = root.join("operator-owned").join("data-v3");
+
+        let error = match acquire_managed_lifecycle_lock(&data.to_string_lossy()) {
+            Ok(_) => panic!("custom missing parent must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must already exist"));
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_symlinked_parent_is_rejected_before_external_sidecar_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let root = resource_test_dir("custom-parent-link-no-mutation");
+        let outside = root.join("outside");
+        arc_crypto::secret_file::secure_private_directory_tree(&outside).unwrap();
+        let linked_parent = root.join("operator-owned");
+        symlink(&outside, &linked_parent).unwrap();
+        let data = linked_parent.join("data-v3");
+
+        let error = match acquire_managed_lifecycle_lock(&data.to_string_lossy()) {
+            Ok(_) => panic!("a linked custom parent must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("linked/non-directory"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "validation must not create a namespace-lock sidecar in the symlink target"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_lifecycle_lock_restores_staged_data_directory() {
+        let root = resource_test_dir("lifecycle-lock-staged-data");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let data = root.canonicalize().unwrap().join("data-v3");
+        let staged = private_directory_rebarrier_staging(&data);
+        arc_crypto::secret_file::secure_private_directory_tree(&staged).unwrap();
+
+        let lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        assert!(data.is_dir());
+        assert!(!staged.exists());
+        assert!(data
+            .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+            .join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME)
+            .is_file());
+
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_lifecycle_lock_restores_staged_control_directory() {
+        let root = resource_test_dir("lifecycle-lock-staged-control");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let data = data.canonicalize().unwrap();
+        let control = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        let staged = private_directory_rebarrier_staging(&control);
+        arc_crypto::secret_file::secure_private_directory_tree(&staged).unwrap();
+
+        let lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        assert!(control.is_dir());
+        assert!(!staged.exists());
+        assert!(control.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME).is_file());
+
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_lifecycle_lock_accepts_existing_case_variant_namespace() {
+        let root = resource_test_dir("lifecycle-lock-case-variant");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let canonical_data = data.canonicalize().unwrap();
+        let configured = root.join("DATA-V3");
+
+        let lock = acquire_managed_lifecycle_lock(&configured.to_string_lossy()).unwrap();
+        assert_eq!(lock.data_dir, canonical_data);
+        assert!(canonical_data
+            .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+            .join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME)
+            .is_file());
+
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_network_materialization_restores_staged_directory() {
+        let root = resource_test_dir("stable-network-staged-directory");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let data = root.join("data-v3");
+        let lifecycle_lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        let data = data.canonicalize().unwrap();
+        let network = data.join(DESKTOP_NETWORK_IDENTITY_DIR_NAME);
+        let staged = private_directory_rebarrier_staging(&network);
+        arc_crypto::secret_file::secure_private_directory_tree(&staged).unwrap();
+
+        let bundle = root.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let seeds = bundle.join("testnet-seeds.txt");
+        let genesis = bundle.join("genesis.toml");
+        std::fs::write(&seeds, b"seed.example:9001\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\nname='arc-testnet'\n").unwrap();
+        let stable = materialize_stable_testnet_resources(
+            &data,
+            &TestnetResources {
+                seeds_file: Some(seeds),
+                genesis_file: Some(genesis),
+            },
+            &lifecycle_lock,
+        )
+        .unwrap();
+
+        assert!(network.is_dir());
+        assert!(!staged.exists());
+        assert_eq!(
+            std::fs::read(stable.seeds_file.unwrap()).unwrap(),
+            b"seed.example:9001\n"
+        );
+        assert_eq!(
+            std::fs::read(stable.genesis_file.unwrap()).unwrap(),
+            b"[chain]\nname='arc-testnet'\n"
+        );
+
+        drop(lifecycle_lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stable_network_materialization_reuses_only_bounded_destination_staging() {
+        let root = resource_test_dir("stable-network-bounded-staging");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let data = root.join("data-v3");
+        let lifecycle_lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        let data = data.canonicalize().unwrap();
+        let network = data.join(DESKTOP_NETWORK_IDENTITY_DIR_NAME);
+        arc_crypto::secret_file::secure_private_directory_tree(&network).unwrap();
+        let stable_seeds = network.join(DESKTOP_STABLE_SEEDS_FILE_NAME);
+        let stable_genesis = network.join(DESKTOP_STABLE_GENESIS_FILE_NAME);
+        let seeds_staging = stable_network_replacement_staging(&stable_seeds);
+        let genesis_staging = stable_network_replacement_staging(&stable_genesis);
+        for staging in [&seeds_staging, &genesis_staging] {
+            let mut file = arc_crypto::secret_file::create_new_private(staging).unwrap();
+            file.write_all(b"partial crash residue").unwrap();
+            file.sync_all().unwrap();
+        }
+        let unrelated = network.join(".testnet-seeds.txt.operator.replace");
+        arc_crypto::secret_file::durably_publish_new_private(&unrelated, b"operator-owned\n")
+            .unwrap();
+
+        let bundle = root.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let seeds = bundle.join("testnet-seeds.txt");
+        let genesis = bundle.join("genesis.toml");
+        std::fs::write(&seeds, b"seed.example:9001\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\nname='arc-testnet'\n").unwrap();
+        let stable = materialize_stable_testnet_resources(
+            &data,
+            &TestnetResources {
+                seeds_file: Some(seeds),
+                genesis_file: Some(genesis),
+            },
+            &lifecycle_lock,
+        )
+        .unwrap();
+
+        assert!(!seeds_staging.exists());
+        assert!(!genesis_staging.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"operator-owned\n");
+        assert_eq!(
+            std::fs::read(stable.seeds_file.unwrap()).unwrap(),
+            b"seed.example:9001\n"
+        );
+        assert_eq!(
+            std::fs::read(stable.genesis_file.unwrap()).unwrap(),
+            b"[chain]\nname='arc-testnet'\n"
+        );
+
+        drop(lifecycle_lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn updater_fence_survives_ipc_window_and_failed_install_abort_releases_it() {
         let root = resource_test_dir("updater-lifecycle-window");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
         let configured = root.join("data-v3").to_string_lossy().into_owned();
         let mut installer_gui = NodeManager::new();
         installer_gui
@@ -3855,6 +4452,7 @@ mod tests {
     #[tokio::test]
     async fn updater_handoff_is_a_one_way_native_fence() {
         let root = resource_test_dir("updater-one-way-handoff");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
         let configured = root.join("data-v3").to_string_lossy().into_owned();
         let mut manager = NodeManager::new();
         manager.configure_managed_data_dir(&configured).unwrap();
@@ -4026,6 +4624,7 @@ mod tests {
     #[tokio::test]
     async fn local_mutation_guard_spans_exact_peer_cache_delete() {
         let root = resource_test_dir("peer-cache-mutation-window");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
         let data = root.join("data-v3");
         let configured = data.to_string_lossy().into_owned();
         let peers = data.join("known_peers.json");
@@ -4059,7 +4658,7 @@ mod tests {
         let bundle = root.join("bundle");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(&bundle).unwrap();
-        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let lifecycle_lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
         symlink(&outside, data.join(DESKTOP_NETWORK_IDENTITY_DIR_NAME)).unwrap();
         let seeds = bundle.join("testnet-seeds.txt");
         let genesis = bundle.join("genesis.toml");
@@ -4071,9 +4670,11 @@ mod tests {
                 seeds_file: Some(seeds),
                 genesis_file: Some(genesis),
             },
+            &lifecycle_lock,
         )
         .is_err());
         assert!(!outside.join(DESKTOP_STABLE_GENESIS_FILE_NAME).exists());
+        drop(lifecycle_lock);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4117,21 +4718,33 @@ mod tests {
 
     #[test]
     fn port_pair_probes_fallback() {
-        // Hold one unprivileged port busy. The probe tries offsets +0,+10,
-        // +20,+30,+40; with only one port taken, one of those falls
-        // through to an available slot.
-        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let busy = l1.local_addr().unwrap().port();
-        // Pair the busy RPC with a separate unprivileged p2p seed so the
-        // probe has a free-port window to land in.
-        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let p2p_seed = l2.local_addr().unwrap().port();
-        // Release l2 - we only wanted its assigned port number to feed in.
-        drop(l2);
-        let result = choose_port_pair(busy, p2p_seed);
-        assert!(result.is_ok(), "probe should find a free pair");
-        let (rpc, _p2p) = result.unwrap();
-        assert_ne!(rpc, busy, "should have picked a fallback rpc port");
+        // Exercise selection independently of the host ephemeral-port range
+        // and other parallel tests. Binding port 0 and then releasing one of
+        // the results left this regression racing every socket user on the
+        // machine, and high ephemeral allocations could also collapse several
+        // saturating +10 candidates onto 65535.
+        let preferred_rpc = 31_000;
+        let preferred_p2p = 31_001;
+        let mut rpc_probes = Vec::new();
+        let mut p2p_probes = Vec::new();
+        let result = choose_port_pair_with_probes(
+            preferred_rpc,
+            preferred_p2p,
+            |port| {
+                rpc_probes.push(port);
+                port != preferred_rpc
+            },
+            |port| {
+                p2p_probes.push(port);
+                true
+            },
+        )
+        .expect("the deterministic fallback probe should find its second pair");
+        assert_eq!(result, (preferred_rpc + 10, preferred_p2p + 10));
+        assert_eq!(rpc_probes, [preferred_rpc, preferred_rpc + 10]);
+        // Short-circuiting must not probe UDP for a pair whose RPC port is
+        // already unavailable.
+        assert_eq!(p2p_probes, [preferred_p2p + 10]);
     }
 
     /// The P2P listener is QUIC/UDP. A TCP bind on the same number proves
@@ -4161,16 +4774,29 @@ mod tests {
 
     #[test]
     fn choose_port_pair_skips_udp_busy_p2p() {
-        let rpc_l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let rpc = rpc_l.local_addr().unwrap().port();
-        drop(rpc_l);
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let busy_p2p = udp.local_addr().unwrap().port();
-        let (_, chosen_p2p) = choose_port_pair(rpc, busy_p2p).expect("should find a free pair");
-        assert_ne!(
-            chosen_p2p, busy_p2p,
+        let preferred_rpc = 32_000;
+        let preferred_p2p = 32_001;
+        let mut rpc_probes = Vec::new();
+        let mut p2p_probes = Vec::new();
+        let selected = choose_port_pair_with_probes(
+            preferred_rpc,
+            preferred_p2p,
+            |port| {
+                rpc_probes.push(port);
+                true
+            },
+            |port| {
+                p2p_probes.push(port);
+                port != preferred_p2p
+            },
+        );
+        assert_eq!(
+            selected.unwrap(),
+            (preferred_rpc + 10, preferred_p2p + 10),
             "must not hand back a UDP-busy p2p port"
         );
+        assert_eq!(rpc_probes, [preferred_rpc, preferred_rpc + 10]);
+        assert_eq!(p2p_probes, [preferred_p2p, preferred_p2p + 10]);
     }
 
     /// `--threads` must not report as supported just because

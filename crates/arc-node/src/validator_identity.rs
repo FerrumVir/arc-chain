@@ -9,7 +9,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, KeyPair};
 use serde::Deserialize;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::io::Read;
 #[cfg(all(test, unix))]

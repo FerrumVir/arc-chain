@@ -27,6 +27,7 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmer.workspace = true
 ed25519-dalek.workspace = true
+uuid.workspace = true
 libc = "0.2"
 
 [lints]

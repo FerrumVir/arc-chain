@@ -26,7 +26,6 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,6 +142,168 @@ pub enum StateError {
         expected: Hash256,
         computed: Hash256,
     },
+    #[error(
+        "unauthenticated legacy peer snapshots cannot mutate persistent state; use a quorum-certified ARCCHKPT import"
+    )]
+    UnauthenticatedPersistentStateSync,
+}
+
+fn uuid_staging_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+}
+
+fn internal_wal_target_name(name: &str) -> bool {
+    if name == "state.wal" || uuid_staging_name(name, ".state.wal.genesis-", ".tmp") {
+        return true;
+    }
+    let Some(segment) = name
+        .strip_prefix("wal-")
+        .and_then(|value| value.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    segment.len() == 8 && segment.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn wal_file_staging_name(name: &str, operation: &str) -> bool {
+    let Some(value) = name.strip_prefix('.') else {
+        return false;
+    };
+    let delimiter = format!(".{operation}-");
+    let Some((target, identifier)) = value.rsplit_once(&delimiter) else {
+        return false;
+    };
+    let Some(identifier) = identifier.strip_suffix(".tmp") else {
+        return false;
+    };
+    internal_wal_target_name(target) && uuid::Uuid::parse_str(identifier).is_ok()
+}
+
+fn state_staging_name(name: &str) -> bool {
+    if uuid_staging_name(name, ".state.wal.genesis-", ".tmp")
+        || uuid_staging_name(name, ".state.wal.quarantine-rebarrier-", "")
+        || wal_file_staging_name(name, "create")
+        || wal_file_staging_name(name, "rebarrier")
+    {
+        return true;
+    }
+    let Some(value) = name.strip_prefix(".state.wal.quarantine-tmp-") else {
+        return false;
+    };
+    let Some((pid, serial)) = value.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.parse::<u32>().is_ok()
+        && !serial.is_empty()
+        && serial.bytes().all(|byte| byte.is_ascii_digit())
+        && serial.parse::<u32>().is_ok_and(|serial| serial < 100)
+}
+
+fn cleanup_state_staging_files(wal_dir: &Path) -> Result<(), StateError> {
+    // Restore semantic WAL bytes before inspecting/deleting inert staging.
+    // On Windows a crash can occur while an existing live name is being moved
+    // through its deterministic write-through rebarrier sibling.
+    wal::restore_interrupted_wal_namespace_rebarriers(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to restore interrupted state WAL namespace in {wal_dir:?}: {error}"
+        ))
+    })?;
+    for entry in std::fs::read_dir(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect state staging directory {wal_dir:?}: {error}"
+        ))
+    })? {
+        let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !state_staging_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "state WAL staging artifact is not a regular file: {path:?}"
+            )));
+        }
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?path, %error, "deferring cleanup of incomplete state WAL staging file");
+            }
+            continue;
+        }
+        if let Err(error) = arc_crypto::secret_file::sync_parent_directory(&path) {
+            // The staging name is never interpreted as live state. If a late
+            // parent-fsync error lets it reappear, this exact cleanup retries.
+            tracing::warn!(path = ?path, %error, "state WAL staging cleanup barrier will be retried");
+        }
+    }
+    Ok(())
+}
+
+/// Restore, create, and durably prove one persistent-state directory leaf
+/// before any caller decides whether its binding/WAL history exists. The
+/// returned parent-sibling guard must stay live through those startup
+/// decisions so a second cooperating constructor cannot create a split root.
+pub(crate) fn prepare_persistent_state_directory(
+    requested: &Path,
+) -> Result<arc_crypto::secret_file::PrivateDirectoryNamespaceLock, StateError> {
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) if parent.is_dir() => {}
+        Ok(_) => {
+            return Err(StateError::PersistenceError(format!(
+                "persistent state parent is not a directory: {parent:?}"
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            arc_crypto::secret_file::create_private_directory_tree(parent).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to create persistent state parent {parent:?}: {error}"
+                ))
+            })?;
+        }
+        Err(error) => {
+            return Err(StateError::PersistenceError(format!(
+                "failed to inspect persistent state parent {parent:?}: {error}"
+            )));
+        }
+    }
+    let namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(
+        requested,
+    )
+    .map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to lock persistent state directory namespace {requested:?}: {error}"
+        ))
+    })?;
+    namespace_lock.restore_interrupted().map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to restore persistent state directory namespace {requested:?}: {error}"
+        ))
+    })?;
+    arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target()).map_err(
+        |error| {
+            StateError::PersistenceError(format!(
+                "failed to secure persistent state directory {requested:?}: {error}"
+            ))
+        },
+    )?;
+    namespace_lock.rebarrier_existing().map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to rebarrier persistent state directory namespace {requested:?}: {error}"
+        ))
+    })?;
+    Ok(namespace_lock)
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +681,11 @@ impl StateDB {
         self.wal.sync().map_err(Self::wal_state_error)
     }
 
+    /// Whether this database acknowledges mutations through a durable WAL.
+    pub fn is_persistent(&self) -> bool {
+        self.wal.directory().is_some()
+    }
+
     fn validate_next_protocol_block_admission(
         &self,
         transactions: &[Transaction],
@@ -695,21 +861,30 @@ impl StateDB {
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
     ) -> Result<Self, StateError> {
-        let wal_dir = wal_dir.as_ref();
+        let namespace_lock = prepare_persistent_state_directory(wal_dir.as_ref())?;
+        let result = Self::with_genesis_persistent_in_prepared_dir(
+            prefunded,
+            namespace_lock.target(),
+            expected_genesis_hash,
+        );
+        drop(namespace_lock);
+        result
+    }
 
-        // Ensure the data directory exists
-        std::fs::create_dir_all(wal_dir).map_err(|e| {
-            StateError::PersistenceError(format!("failed to create data dir {:?}: {}", wal_dir, e))
-        })?;
+    fn with_genesis_persistent_in_prepared_dir(
+        prefunded: &[(Address, u64)],
+        wal_dir: &Path,
+        expected_genesis_hash: Hash256,
+    ) -> Result<Self, StateError> {
+        cleanup_state_staging_files(wal_dir)?;
 
         let wal_path = wal_dir.join("state.wal");
         Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), expected_genesis_hash)?;
 
         if wal_path.exists() {
             // WAL exists - replay to recover state
+            let entries = Self::prepare_normal_wal_replay(&wal_path, prefunded)?;
             let state = Self::with_persistence(&wal_path)?;
-
-            let entries = wal::read_wal(&wal_path);
             let entry_count = entries.len();
             for entry in &entries {
                 state.apply_wal_op(&entry.op);
@@ -729,8 +904,12 @@ impl StateDB {
 
             Ok(state)
         } else {
-            // No WAL - fresh start with genesis accounts and persistence enabled
-            let state = Self::with_persistence(&wal_path)?;
+            // Build the complete genesis WAL at an inert staging name. The
+            // live state.wal name is published only after every configured
+            // account and the genesis block passed one fsync barrier.
+            let staging_path =
+                wal_dir.join(format!(".state.wal.genesis-{}.tmp", uuid::Uuid::new_v4()));
+            let mut state = Self::with_persistence(&staging_path)?;
 
             for (addr, balance) in prefunded {
                 let account = Account::new(*addr, *balance);
@@ -743,7 +922,32 @@ impl StateDB {
             let genesis = Block::genesis();
             state.blocks.insert(0, genesis.clone());
             state.wal.append(WalOp::SetBlock(0, genesis), 0);
-            state.durable_wal_barrier()?;
+            state
+                .wal
+                .append(WalOp::Checkpoint(state.get_state_root()), 0);
+            if let Err(error) = state.durable_wal_barrier() {
+                drop(state);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(error);
+            }
+            if let Err(error) = state.wal.shutdown() {
+                drop(state);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(Self::wal_state_error(error));
+            }
+            if let Err(error) = arc_crypto::secret_file::durably_publish_existing_private_no_replace(
+                &staging_path,
+                &wal_path,
+            ) {
+                drop(state);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(StateError::PersistenceError(format!(
+                    "failed to publish complete genesis WAL {:?}: {error}",
+                    wal_path
+                )));
+            }
+            state.wal = WalWriter::new(&wal_path)
+                .map_err(|error| StateError::PersistenceError(error.to_string()))?;
 
             tracing::info!(
                 "Fresh state initialized with {} genesis accounts, WAL at {:?}",
@@ -761,23 +965,34 @@ impl StateDB {
         expected: Hash256,
     ) -> Result<(), StateError> {
         let binding_path = wal_dir.join("genesis.network-hash");
+        let verify_existing = |value: &str| -> Result<(), StateError> {
+            let actual = Hash256::from_hex(value.trim()).map_err(|_| {
+                StateError::PersistenceError(format!(
+                    "invalid genesis binding in {:?}; refusing WAL replay",
+                    binding_path
+                ))
+            })?;
+            if actual != expected {
+                return Err(StateError::PersistenceError(format!(
+                    "data directory genesis mismatch: {:?} is bound to {}, configured genesis is {}; use a fresh data directory or an approved checkpoint migration",
+                    wal_dir,
+                    actual.to_hex(),
+                    expected.to_hex()
+                )));
+            }
+            Ok(())
+        };
         match std::fs::read_to_string(&binding_path) {
             Ok(value) => {
-                let actual = Hash256::from_hex(value.trim()).map_err(|_| {
-                    StateError::PersistenceError(format!(
-                        "invalid genesis binding in {:?}; refusing WAL replay",
-                        binding_path
-                    ))
-                })?;
-                if actual != expected {
-                    return Err(StateError::PersistenceError(format!(
-                        "data directory genesis mismatch: {:?} is bound to {}, configured genesis is {}; use a fresh data directory or an approved checkpoint migration",
-                        wal_dir,
-                        actual.to_hex(),
-                        expected.to_hex()
-                    )));
-                }
-                Ok(())
+                verify_existing(&value)?;
+                let contents = format!("{}\n", expected.to_hex());
+                arc_crypto::secret_file::durably_replace_private(&binding_path, contents.as_bytes())
+                    .map_err(|e| {
+                        StateError::PersistenceError(format!(
+                            "failed to rebarrier genesis binding {:?}: {}",
+                            binding_path, e
+                        ))
+                    })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && wal_exists => {
                 Err(StateError::PersistenceError(format!(
@@ -786,35 +1001,237 @@ impl StateDB {
                 )))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&binding_path)
-                    .map_err(|e| {
-                        StateError::PersistenceError(format!(
-                            "failed to create genesis binding {:?}: {}",
-                            binding_path, e
-                        ))
-                    })?;
-                writeln!(file, "{}", expected.to_hex()).map_err(|e| {
-                    StateError::PersistenceError(format!(
-                        "failed to write genesis binding {:?}: {}",
+                let contents = format!("{}\n", expected.to_hex());
+                match arc_crypto::secret_file::durably_publish_new_private(
+                    &binding_path,
+                    contents.as_bytes(),
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let value = std::fs::read_to_string(&binding_path).map_err(|e| {
+                            StateError::PersistenceError(format!(
+                                "failed to verify concurrently-created genesis binding {:?}: {}",
+                                binding_path, e
+                            ))
+                        })?;
+                        verify_existing(&value)?;
+                        arc_crypto::secret_file::durably_replace_private(
+                            &binding_path,
+                            contents.as_bytes(),
+                        )
+                        .map_err(|e| {
+                            StateError::PersistenceError(format!(
+                                "failed to rebarrier concurrently-created genesis binding {:?}: {}",
+                                binding_path, e
+                            ))
+                        })
+                    }
+                    Err(e) => Err(StateError::PersistenceError(format!(
+                        "failed to durably create genesis binding {:?}: {}",
                         binding_path, e
-                    ))
-                })?;
-                file.sync_all().map_err(|e| {
-                    StateError::PersistenceError(format!(
-                        "failed to sync genesis binding {:?}: {}",
-                        binding_path, e
-                    ))
-                })?;
-                Ok(())
+                    ))),
+                }
             }
             Err(error) => Err(StateError::PersistenceError(format!(
                 "failed to read genesis binding {:?}: {}",
                 binding_path, error
             ))),
         }
+    }
+
+    fn verify_complete_genesis_wal_prefix(
+        entries: &[WalEntry],
+        prefunded: &[(Address, u64)],
+    ) -> Result<(), StateError> {
+        let required = prefunded.len().checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("genesis WAL prefix length overflow".into())
+        })?;
+        if entries.len() < required {
+            return Err(StateError::PersistenceError(format!(
+                "state WAL has an incomplete genesis prefix: found {} entries, require {required}",
+                entries.len()
+            )));
+        }
+        let mut expected_accounts = prefunded
+            .iter()
+            .map(|(address, balance)| {
+                bincode::serialize(&(*address, Account::new(*address, *balance)))
+                    .map_err(|error| StateError::PersistenceError(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut actual_accounts = Vec::with_capacity(prefunded.len());
+        for (index, entry) in entries.iter().take(prefunded.len()).enumerate() {
+            let WalOp::SetAccount(actual_address, actual_account) = &entry.op else {
+                return Err(StateError::PersistenceError(format!(
+                    "state WAL genesis entry {index} is not the expected account"
+                )));
+            };
+            if entry.block_height != 0 {
+                return Err(StateError::PersistenceError(format!(
+                    "state WAL genesis account entry {index} differs from configured genesis"
+                )));
+            }
+            actual_accounts.push(
+                bincode::serialize(&(*actual_address, actual_account.clone()))
+                    .map_err(|error| StateError::PersistenceError(error.to_string()))?,
+            );
+        }
+        expected_accounts.sort();
+        actual_accounts.sort();
+        if actual_accounts != expected_accounts {
+            return Err(StateError::PersistenceError(
+                "state WAL genesis account set differs from configured genesis".into(),
+            ));
+        }
+        let genesis_entry = &entries[prefunded.len()];
+        let WalOp::SetBlock(height, block) = &genesis_entry.op else {
+            return Err(StateError::PersistenceError(
+                "state WAL genesis prefix omits the genesis block".into(),
+            ));
+        };
+        let actual = bincode::serialize(block)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let expected = bincode::serialize(&Block::genesis())
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if genesis_entry.block_height != 0 || *height != 0 || actual != expected {
+            return Err(StateError::PersistenceError(
+                "state WAL genesis block differs from configured genesis".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_normal_wal_replay(
+        wal_path: &Path,
+        prefunded: &[(Address, u64)],
+    ) -> Result<Vec<WalEntry>, StateError> {
+        let mut read = wal::read_repairable_wal_prefix(wal_path).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "state WAL contains non-repairable corruption; refusing replay: {error}"
+            ))
+        })?;
+        Self::verify_complete_genesis_wal_prefix(&read.entries, prefunded)?;
+        let genesis_boundary = prefunded
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| StateError::PersistenceError("genesis WAL boundary overflow".into()))?;
+        let mut accepted_entries = genesis_boundary;
+        let mut last_checkpoint_height = 0u64;
+        let mut previous_block_hash = Block::genesis().hash;
+        let mut pending_block: Option<(u64, Block)> = None;
+        let validation = Self::new();
+        for entry in read.entries.iter().take(genesis_boundary) {
+            validation.apply_wal_op(&entry.op);
+        }
+        for (index, entry) in read.entries.iter().enumerate().skip(genesis_boundary) {
+            match &entry.op {
+                WalOp::SetBlock(height, block) => {
+                    if pending_block.is_some() {
+                        return Err(StateError::PersistenceError(
+                            "state WAL contains two block records without an intervening checkpoint"
+                                .into(),
+                        ));
+                    }
+                    pending_block = Some((*height, block.clone()));
+                    validation.apply_wal_op(&entry.op);
+                }
+                WalOp::Checkpoint(root) => {
+                    let checkpoint_height = if let Some((height, block)) = pending_block.take() {
+                        let expected_height =
+                            last_checkpoint_height.checked_add(1).ok_or_else(|| {
+                                StateError::PersistenceError("state WAL height overflow".into())
+                            })?;
+                        if height != expected_height
+                            || entry.block_height != height
+                            || block.header.height != height
+                            || Block::compute_hash(&block.header) != block.hash
+                            || block.header.parent_hash != previous_block_hash
+                            || block.header.state_root != *root
+                        {
+                            return Err(StateError::PersistenceError(format!(
+                                "state WAL checkpoint at height {} is not the next canonical block boundary",
+                                entry.block_height
+                            )));
+                        }
+                        previous_block_hash = block.hash;
+                        last_checkpoint_height = height;
+                        height
+                    } else {
+                        // Some public persistence APIs durably commit auxiliary
+                        // rows or an authenticated state diff without adding a
+                        // second block. Their checkpoint must remain at the
+                        // current canonical height and commit the exact same
+                        // state-root domain; it can never advance or rewrite
+                        // block history.
+                        if entry.block_height != last_checkpoint_height {
+                            return Err(StateError::PersistenceError(format!(
+                                "state WAL standalone checkpoint height {} differs from current canonical height {}",
+                                entry.block_height, last_checkpoint_height
+                            )));
+                        }
+                        last_checkpoint_height
+                    };
+                    if validation.height() != checkpoint_height {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL checkpoint height {checkpoint_height} differs from replayed height {}",
+                            validation.height()
+                        )));
+                    }
+                    let actual_root = validation.get_state_root();
+                    if actual_root != *root {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL checkpoint root mismatch: expected {root}, replayed {actual_root}"
+                        )));
+                    }
+                    accepted_entries = index + 1;
+                }
+                _ => validation.apply_wal_op(&entry.op),
+            }
+        }
+        let accepted_bytes = *read
+            .frame_end_offsets
+            .get(accepted_entries.saturating_sub(1))
+            .ok_or_else(|| {
+                StateError::PersistenceError("genesis WAL byte boundary is missing".into())
+            })?;
+
+        let original_bytes = read.original_bytes;
+        let original_hash = read.original_hash;
+        let tail_reason = read
+            .torn_tail
+            .map(|tail| tail.stable_reason())
+            .unwrap_or("complete_uncheckpointed_suffix");
+        read.entries.truncate(accepted_entries);
+        if accepted_bytes < original_bytes {
+            let quarantine = wal::quarantine_and_truncate_wal_tail(
+                wal_path,
+                accepted_bytes,
+                original_bytes,
+                original_hash,
+            )
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to quarantine uncommitted state WAL tail: {error}"
+                ))
+            })?;
+            tracing::warn!(
+                accepted_bytes,
+                original_bytes,
+                reason = tail_reason,
+                quarantine = ?quarantine,
+                "quarantined state WAL bytes after the last durable checkpoint"
+            );
+        } else {
+            wal::verify_wal_file_identity(wal_path, original_bytes, original_hash).map_err(
+                |error| {
+                    StateError::PersistenceError(format!(
+                        "state WAL changed after validation; refusing replay: {error}"
+                    ))
+                },
+            )?;
+        }
+
+        Ok(read.entries)
     }
 
     /// Recover state from a snapshot and WAL replay.
@@ -857,6 +1274,7 @@ impl StateDB {
         match op {
             WalOp::SetAccount(addr, account) => {
                 self.accounts.insert(addr.0, account.clone());
+                self.dirty_accounts.insert(addr.0);
             }
             WalOp::SetStorage(addr, key, val) => {
                 self.storage
@@ -920,6 +1338,11 @@ impl StateDB {
                     self.validators.insert(address.0, *stake);
                 }
                 self.staking_pool.store(*staking_pool, Ordering::Release);
+            }
+            WalOp::SetRecoveryContext(context, activation_height) => {
+                *self.recovery_context.write() = Some(context.clone());
+                self.community_rewards_v1_activation_height
+                    .store(activation_height.unwrap_or(u64::MAX), Ordering::Release);
             }
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational - no state change
@@ -1233,13 +1656,27 @@ impl StateDB {
     /// Store event logs for a specific block height.
     pub fn store_event_logs(&self, height: u64, logs: Vec<arc_types::EventLog>) {
         if !logs.is_empty() {
+            if self.is_persistent() && self.recovery_context().is_some() {
+                // Recovery replay currently accepts only signed transition
+                // state followed by canonical SetBlock+Checkpoint boundaries.
+                // Do not emit a standalone durable record that this stricter
+                // planner would reject on the next restart.
+                tracing::error!(
+                    height,
+                    "standalone event-log persistence is unavailable on recovery-bound state; include logs in the canonical block commit"
+                );
+                return;
+            }
             let combined = {
                 let mut entry = self.event_logs.entry(height).or_default();
                 entry.extend(logs);
                 entry.clone()
             };
+            let checkpoint_height = self.height();
             self.wal
-                .append(WalOp::SetEventLogs(height, combined), height);
+                .append(WalOp::SetEventLogs(height, combined), checkpoint_height);
+            self.wal
+                .append(WalOp::Checkpoint(self.get_state_root()), checkpoint_height);
             if let Err(error) = self.durable_wal_barrier() {
                 tracing::error!(height, error = %error, "event logs were not durably persisted");
             }
@@ -8164,6 +8601,12 @@ impl StateDB {
             WalOp::SetValidatorState(validators, self.staking_pool.load(Ordering::Acquire)),
             height,
         );
+        if let Some(context) = self.recovery_context() {
+            self.wal.append(
+                WalOp::SetRecoveryContext(context, self.community_rewards_v1_activation_height()),
+                height,
+            );
+        }
     }
 
     /// Index a transaction's sender and recipient addresses for `account_txs` lookups.
@@ -9025,6 +9468,14 @@ impl StateDB {
     pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Result<Hash256, StateError> {
         use std::collections::HashSet;
 
+        if self.is_persistent() && self.recovery_context().is_some() {
+            return Err(StateError::PersistenceError(
+                "standalone state-diff persistence is unavailable on recovery-bound state; authenticate and commit the matching canonical block"
+                    .into(),
+            ));
+        }
+        self.require_healthy_wal()?;
+
         // Flush any state changes that predate this diff so rollback has a
         // stable root to restore. Reject ambiguous/malformed change sets before
         // the first write.
@@ -9100,6 +9551,7 @@ impl StateDB {
             );
         }
         self.wal.append(WalOp::Checkpoint(computed_root), height);
+        self.durable_wal_barrier()?;
         Ok(computed_root)
     }
 
@@ -9423,6 +9875,15 @@ impl StateDB {
     /// "state root mismatch" — the exact failure mode that stranded LHR at
     /// round 0 after every `--reset-state`.
     pub fn import_snapshot_chunk(&self, chunk: &StateSnapshot) -> Result<u32, StateError> {
+        // The legacy HTTP snapshot carries only self-hashes supplied by one
+        // peer: it has no validator quorum certificate, canonical block proof,
+        // storage/contracts, or crash-atomic activation record. It is useful
+        // only for ephemeral tests/benchmarks and must never overwrite a node
+        // whose state is expected to survive restart.
+        if self.is_persistent() {
+            return Err(StateError::UnauthenticatedPersistentStateSync);
+        }
+
         // Verify chunk proof: re-hash the chunk's account data and compare.
         let chunk_data = bincode::serialize(&chunk.accounts).expect("serializable");
         let computed_proof = hash_bytes(&chunk_data);
@@ -9541,6 +10002,9 @@ impl StateDB {
     /// to recompute the state root and verify integrity. Updates the internal
     /// block height to match the snapshot version.
     pub fn finalize_sync(&self, progress: &SyncProgress) -> Result<(), StateError> {
+        if self.is_persistent() {
+            return Err(StateError::UnauthenticatedPersistentStateSync);
+        }
         if !Self::is_sync_complete(progress) {
             return Err(StateError::SyncIncomplete {
                 received: progress.verified_chunks,
@@ -9699,6 +10163,328 @@ mod tests {
         assert!(error.contains("data directory genesis mismatch"), "{error}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_constructor_restores_a_staged_full_root_before_wal_discovery() {
+        let parent = persistent_test_dir("staged-full-root-parent");
+        arc_crypto::secret_file::create_private_directory_tree(&parent).unwrap();
+        let dir = parent.join("state");
+        let genesis_hash = hash_bytes(b"staged-full-root-genesis");
+        let prefunded = [(addr(1), 123)];
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        let (block, _) = state.execute_block(&[], addr(99)).unwrap();
+        let expected_root = state.get_state_root();
+        drop(state);
+
+        let digest = arc_crypto::secret_file::namespace_path_digest(&dir).unwrap();
+        let staged = parent.join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&dir, &staged, false).unwrap();
+        assert!(!dir.exists());
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 1);
+        assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(!staged.exists());
+        drop(restarted);
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn persistent_startup_reclaims_only_exact_state_wal_staging_files() {
+        let dir = persistent_test_dir("genesis-staging-cleanup");
+        arc_crypto::secret_file::create_private_directory_tree(&dir).unwrap();
+        let genesis_identifier = uuid::Uuid::new_v4();
+        let stale = [
+            dir.join(format!(".state.wal.genesis-{}.tmp", uuid::Uuid::new_v4())),
+            dir.join(format!(
+                ".state.wal.quarantine-rebarrier-{}",
+                uuid::Uuid::new_v4()
+            )),
+            dir.join(".state.wal.quarantine-tmp-1-0"),
+            dir.join(".state.wal.quarantine-tmp-4294967295-99"),
+            dir.join(format!(".state.wal.create-{}.tmp", uuid::Uuid::new_v4())),
+            dir.join(format!(
+                "..state.wal.genesis-{genesis_identifier}.tmp.create-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+            dir.join(format!(
+                ".wal-00000000.bin.create-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+            dir.join(format!(".state.wal.rebarrier-{}.tmp", uuid::Uuid::new_v4())),
+        ];
+        let unrelated = [
+            dir.join(".state.wal.genesis-not-a-uuid.tmp"),
+            dir.join(".state.wal.quarantine-rebarrier-not-a-uuid"),
+            dir.join(".state.wal.quarantine-tmp-1-100"),
+            dir.join(".state.wal.quarantine-tmp-pid-0"),
+            dir.join(format!(".operator.create-{}.tmp", uuid::Uuid::new_v4())),
+            dir.join(format!(
+                ".wal-000000000.bin.create-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+        ];
+        for path in &stale {
+            std::fs::write(path, b"incomplete internal state WAL staging").unwrap();
+        }
+        for path in &unrelated {
+            std::fs::write(path, b"operator file").unwrap();
+        }
+
+        let state = StateDB::with_genesis_persistent(
+            &[(addr(1), 123)],
+            &dir,
+            hash_bytes(b"genesis-staging-cleanup"),
+        )
+        .unwrap();
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert!(unrelated.iter().all(|path| path.exists()));
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_state_rejects_every_incomplete_genesis_wal_prefix() {
+        let prefunded = [(addr(1), 123), (addr(2), 456), (addr(3), 789)];
+        let genesis_hash = hash_bytes(b"genesis-prefix-crash");
+
+        for account_prefix in 0..=prefunded.len() {
+            let dir = persistent_test_dir(&format!("genesis-prefix-{account_prefix}"));
+            arc_crypto::secret_file::create_private_directory_tree(&dir).unwrap();
+            StateDB::verify_or_create_genesis_binding(&dir, false, genesis_hash).unwrap();
+            let wal_path = dir.join("state.wal");
+            let writer = WalWriter::new(&wal_path).unwrap();
+            for (address, balance) in prefunded.iter().take(account_prefix) {
+                writer.append(
+                    WalOp::SetAccount(*address, Account::new(*address, *balance)),
+                    0,
+                );
+            }
+            writer.sync().unwrap();
+            drop(writer);
+
+            let error = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash)
+                .err()
+                .expect("an incomplete genesis prefix must fail closed")
+                .to_string();
+            assert!(error.contains("incomplete genesis prefix"), "{error}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn persistent_genesis_account_order_is_configuration_order_independent() {
+        let dir = persistent_test_dir("genesis-order");
+        let genesis_hash = hash_bytes(b"genesis-order");
+        let original = [(addr(1), 123), (addr(2), 456), (addr(3), 789)];
+        let reordered = [original[2], original[0], original[1]];
+
+        drop(StateDB::with_genesis_persistent(&original, &dir, genesis_hash).unwrap());
+        let restarted = StateDB::with_genesis_persistent(&reordered, &dir, genesis_hash).unwrap();
+        for (address, balance) in original {
+            assert_eq!(restarted.get_account(&address).unwrap().balance, balance);
+        }
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_legacy_genesis_without_height_zero_checkpoint_still_restarts() {
+        let dir = persistent_test_dir("legacy-genesis-no-checkpoint");
+        let genesis_hash = hash_bytes(b"legacy-genesis-no-checkpoint");
+        let prefunded = [(addr(1), 123), (addr(2), 456)];
+        arc_crypto::secret_file::create_private_directory_tree(&dir).unwrap();
+        StateDB::verify_or_create_genesis_binding(&dir, false, genesis_hash).unwrap();
+        let writer = WalWriter::new(dir.join("state.wal")).unwrap();
+        for (address, balance) in prefunded {
+            writer.append(
+                WalOp::SetAccount(address, Account::new(address, balance)),
+                0,
+            );
+        }
+        writer.append(WalOp::SetBlock(0, Block::genesis()), 0);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(restarted.get_account(&addr(1)).unwrap().balance, 123);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_keeps_a_complete_checkpointed_block() {
+        let dir = persistent_test_dir("checkpointed-block-restart");
+        let genesis_hash = hash_bytes(b"checkpointed-block-restart");
+        let state =
+            StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, genesis_hash).unwrap();
+        let (block, _) = state.execute_block(&[], addr(99)).unwrap();
+        let root = state.get_state_root();
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 1);
+        assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(restarted.get_state_root(), root);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_keeps_a_same_height_state_diff_checkpoint() {
+        let dir = persistent_test_dir("same-height-state-diff-restart");
+        let genesis_hash = hash_bytes(b"same-height-state-diff-restart");
+        let prefunded = [(addr(1), 123)];
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+
+        let proposer = StateDB::with_genesis(&prefunded);
+        let mut changed = proposer.get_account(&addr(1)).unwrap();
+        changed.balance = 987;
+        proposer.update_account(&addr(1), changed);
+        let diff = proposer.export_state_diff(&[addr(1)]);
+        assert_eq!(state.apply_state_diff(&diff).unwrap(), diff.new_root);
+        drop(state);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(restarted.get_account(&addr(1)).unwrap().balance, 987);
+        assert_eq!(restarted.get_state_root(), diff.new_root);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_keeps_post_checkpoint_event_logs() {
+        let dir = persistent_test_dir("post-checkpoint-event-logs-restart");
+        let genesis_hash = hash_bytes(b"post-checkpoint-event-logs-restart");
+        let state = StateDB::with_genesis_persistent(&[], &dir, genesis_hash).unwrap();
+        let (block, _) = state.execute_block(&[], addr(99)).unwrap();
+        let log = arc_types::EventLog {
+            address: addr(7),
+            topics: vec![hash_bytes(b"event-topic")],
+            data: b"durable-event-data".to_vec(),
+            block_height: block.header.height,
+            tx_hash: hash_bytes(b"event-transaction"),
+            log_index: 3,
+        };
+        state.store_event_logs(block.header.height, vec![log.clone()]);
+        drop(state);
+
+        let restarted = StateDB::with_genesis_persistent(&[], &dir, genesis_hash).unwrap();
+        let restored = restarted
+            .event_logs
+            .get(&block.header.height)
+            .expect("event logs survive restart");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].address, log.address);
+        assert_eq!(restored[0].topics, log.topics);
+        assert_eq!(restored[0].data, log.data);
+        assert_eq!(restored[0].block_height, log.block_height);
+        assert_eq!(restored[0].tx_hash, log.tx_hash);
+        assert_eq!(restored[0].log_index, log.log_index);
+        drop(restored);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_quarantines_complete_uncheckpointed_suffix() {
+        let dir = persistent_test_dir("complete-uncheckpointed-suffix");
+        let genesis_hash = hash_bytes(b"complete-uncheckpointed-suffix");
+        let prefunded = [(addr(1), 123)];
+        drop(StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap());
+        let wal_path = dir.join("state.wal");
+        let accepted_bytes = std::fs::metadata(&wal_path).unwrap().len();
+        let writer = WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetAccount(addr(9), Account::new(addr(9), 999)), 1);
+        writer.sync().unwrap();
+        drop(writer);
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > accepted_bytes);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert!(restarted.get_account(&addr(9)).is_none());
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), accepted_bytes);
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("state.wal.quarantine-")
+                })
+                .count(),
+            1
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_quarantines_a_torn_final_frame() {
+        use std::io::Write as _;
+
+        let dir = persistent_test_dir("torn-final-frame");
+        let genesis_hash = hash_bytes(b"torn-final-frame");
+        let prefunded = [(addr(1), 123)];
+        drop(StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap());
+        let wal_path = dir.join("state.wal");
+        let accepted_bytes = std::fs::metadata(&wal_path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        file.write_all(&[0, 0]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), accepted_bytes);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unauthenticated_snapshot_sync_cannot_mutate_persistent_state_or_wal() {
+        let dir = persistent_test_dir("persistent-snapshot-rejection");
+        let genesis_hash = hash_bytes(b"persistent-snapshot-rejection");
+        let state =
+            StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, genesis_hash).unwrap();
+        let source = StateDB::with_genesis(&[(addr(9), 999)]);
+        let (manifest, chunks) = source.export_chunked_snapshot(100);
+        let before_root = state.get_state_root();
+        let before_wal = std::fs::read(dir.join("state.wal")).unwrap();
+
+        assert!(matches!(
+            state.import_snapshot_chunk(&chunks[0]),
+            Err(StateError::UnauthenticatedPersistentStateSync)
+        ));
+        let progress = StateDB::begin_sync(manifest);
+        assert!(matches!(
+            state.finalize_sync(&progress),
+            Err(StateError::UnauthenticatedPersistentStateSync)
+        ));
+        assert_eq!(state.height(), 0);
+        assert_eq!(state.get_state_root(), before_root);
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 123);
+        assert!(state.get_account(&addr(9)).is_none());
+        state.sync_wal();
+        assert_eq!(std::fs::read(dir.join("state.wal")).unwrap(), before_wal);
+
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
