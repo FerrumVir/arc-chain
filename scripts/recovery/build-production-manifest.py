@@ -324,6 +324,43 @@ def open_parent_directory(path: Path, label: str) -> tuple[int, str]:
         raise
 
 
+_SECURE_FILE_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_uid",
+    "st_gid",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+)
+
+
+def _secure_file_identity(details: os.stat_result) -> tuple[int, ...]:
+    return tuple(getattr(details, field) for field in _SECURE_FILE_IDENTITY_FIELDS)
+
+
+def _require_stable_secure_read_identity(
+    before: os.stat_result,
+    after: os.stat_result,
+    *,
+    observed_size: int,
+    label: str,
+    operation: str,
+) -> bool:
+    """Validate a held file descriptor and report ctime-only publication noise."""
+
+    before_identity = _secure_file_identity(before)
+    after_identity = _secure_file_identity(after)
+    if observed_size != before.st_size or before_identity != after_identity:
+        fail(f"{label} changed while it was {operation}")
+    if before.st_ctime_ns == after.st_ctime_ns:
+        return False
+    if after.st_ctime_ns < before.st_ctime_ns:
+        fail(f"{label} changed while it was {operation}")
+    return True
+
+
 def read_secure(
     path: Path,
     *,
@@ -360,15 +397,35 @@ def read_secure(
             remaining -= len(chunk)
         payload = b"".join(chunks)
         after = os.fstat(descriptor)
-        identity = lambda details: (
-            details.st_dev,
-            details.st_ino,
-            details.st_size,
-            details.st_mtime_ns,
-            details.st_ctime_ns,
-        )
-        if len(payload) != before.st_size or identity(before) != identity(after):
-            fail(f"{label} changed while it was read")
+        if _require_stable_secure_read_identity(
+            before,
+            after,
+            observed_size=len(payload),
+            label=label,
+            operation="read",
+        ):
+            # APFS can publish a delayed ctime after create/chmod or an
+            # xattr-only metadata update.  Re-read the same held no-follow FD
+            # exactly once and require byte-for-byte equality plus a stable
+            # security identity.  This is an independent content reproof, not
+            # a retry that can mask a moving source.
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            verification_chunks: list[bytes] = []
+            remaining = maximum_bytes + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                verification_chunks.append(chunk)
+                remaining -= len(chunk)
+            verified_payload = b"".join(verification_chunks)
+            verified = os.fstat(descriptor)
+            if (
+                verified_payload != payload
+                or _secure_file_identity(verified) != _secure_file_identity(before)
+                or verified.st_ctime_ns != after.st_ctime_ns
+            ):
+                fail(f"{label} changed during its ctime-only read recheck")
         return payload, before
     except OSError as error:
         fail(f"cannot securely read {label}: {error}")
@@ -401,16 +458,32 @@ def hash_secure(path: Path, label: str, *, executable: bool = False) -> tuple[st
             digest.update(chunk)
             size += len(chunk)
         after = os.fstat(descriptor)
-        identity = lambda details: (
-            details.st_dev,
-            details.st_ino,
-            details.st_size,
-            details.st_mtime_ns,
-            details.st_ctime_ns,
-        )
-        if size != before.st_size or identity(before) != identity(after):
-            fail(f"{label} changed while it was hashed")
-        return digest.hexdigest(), size
+        first_digest = digest.hexdigest()
+        if _require_stable_secure_read_identity(
+            before,
+            after,
+            observed_size=size,
+            label=label,
+            operation="hashed",
+        ):
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            verification_digest = hashlib.sha256()
+            verification_size = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                verification_digest.update(chunk)
+                verification_size += len(chunk)
+            verified = os.fstat(descriptor)
+            if (
+                verification_size != size
+                or verification_digest.hexdigest() != first_digest
+                or _secure_file_identity(verified) != _secure_file_identity(before)
+                or verified.st_ctime_ns != after.st_ctime_ns
+            ):
+                fail(f"{label} changed during its ctime-only hash recheck")
+        return first_digest, size
     except OSError as error:
         fail(f"cannot securely hash {label}: {error}")
     finally:
@@ -1367,8 +1440,17 @@ def create_private_seal(path: Path, value: Mapping[str, Any]) -> str:
                 offset = 0
                 while offset < len(body):
                     offset += os.write(descriptor, body[offset:])
-                os.fsync(descriptor)
                 os.fchmod(descriptor, 0o400)
+                os.fsync(descriptor)
+                sealed = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(sealed.st_mode)
+                    or sealed.st_uid != os.geteuid()
+                    or sealed.st_nlink != 1
+                    or stat.S_IMODE(sealed.st_mode) != 0o400
+                    or sealed.st_size != len(body)
+                ):
+                    fail("sealed output failed its file identity contract")
             finally:
                 os.close(descriptor)
         os.fsync(output_parent)

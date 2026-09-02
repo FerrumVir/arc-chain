@@ -29,6 +29,8 @@ const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
 const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
 const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str = "lifecycle.lock";
+const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME: &str = "lifecycle.namespace-proof";
+const DESKTOP_LIFECYCLE_NAMESPACE_PROOF: &[u8] = b"arc.desktop.lifecycle-namespace.v1\n";
 const DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME: &str = "managed-executable.path";
 const DESKTOP_EXECUTABLE_IDENTITY_SCHEMA: &str = "arc.desktop.executable-path.v1";
 const DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES: u64 = 32 * 1024;
@@ -195,6 +197,35 @@ impl ManagedLifecycleLock {
         );
         Ok(())
     }
+}
+
+fn has_exact_lifecycle_namespace_proof(control_dir: &Path) -> anyhow::Result<bool> {
+    let proof_path = control_dir.join(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME);
+    let mut proof = match arc_crypto::secret_file::open_private(&proof_path) {
+        Ok(proof) => proof,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot validate managed lifecycle namespace proof {}",
+                    proof_path.display()
+                )
+            });
+        }
+    };
+    anyhow::ensure!(
+        proof.metadata()?.len() == DESKTOP_LIFECYCLE_NAMESPACE_PROOF.len() as u64,
+        "managed lifecycle namespace proof has an invalid length: {}",
+        proof_path.display()
+    );
+    let mut actual = [0u8; DESKTOP_LIFECYCLE_NAMESPACE_PROOF.len()];
+    proof.read_exact(&mut actual)?;
+    anyhow::ensure!(
+        actual == DESKTOP_LIFECYCLE_NAMESPACE_PROOF,
+        "managed lifecycle namespace proof has invalid contents: {}",
+        proof_path.display()
+    );
+    Ok(true)
 }
 
 fn validate_configured_directory_ancestry_no_link(path: &Path) -> anyhow::Result<()> {
@@ -434,6 +465,56 @@ pub fn acquire_managed_lifecycle_lock(
             )
         })?;
     arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
+
+    // Windows cannot rename a directory while an open, byte-range-locked
+    // descendant exists. Rebarriering after locking `lifecycle.lock` therefore
+    // made every first acquisition fail with ERROR_ACCESS_DENIED, and doing it
+    // before every acquisition would make contenders fail before they reached
+    // the intended lifecycle-lock check. An exact private marker records that
+    // both directory names have already crossed their write-through barriers.
+    // Its publication comes last, so its presence is a durable proof that no
+    // future acquisition needs to move a potentially live managed directory.
+    let namespace_is_proven = has_exact_lifecycle_namespace_proof(&control_dir)?;
+    if !namespace_is_proven {
+        control_namespace_lock
+            .rebarrier_existing()
+            .with_context(|| {
+                format!(
+                    "cannot rebarrier managed shutdown-control namespace {}",
+                    control_dir.display()
+                )
+            })?;
+    }
+    // The control namespace guard lives inside the data directory. Release
+    // its Windows handle before rebarriering the parent data-directory name.
+    // The outer data namespace guard still serializes every cooperating
+    // desktop through proof publication and internal lifecycle-lock acquire.
+    drop(control_namespace_lock);
+    if !namespace_is_proven {
+        data_namespace_lock.rebarrier_existing().with_context(|| {
+            format!(
+                "cannot rebarrier managed data-directory namespace {}",
+                data_dir.display()
+            )
+        })?;
+        let proof_path = control_dir.join(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME);
+        arc_crypto::secret_file::durably_publish_new_private(
+            &proof_path,
+            DESKTOP_LIFECYCLE_NAMESPACE_PROOF,
+        )
+        .with_context(|| {
+            format!(
+                "cannot publish managed lifecycle namespace proof {}",
+                proof_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            has_exact_lifecycle_namespace_proof(&control_dir)?,
+            "managed lifecycle namespace proof disappeared during publication: {}",
+            proof_path.display()
+        );
+    }
+
     let lock_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
     arc_crypto::secret_file::durably_publish_new_private(
         &lock_path,
@@ -443,25 +524,6 @@ pub fn acquire_managed_lifecycle_lock(
     file.try_lock_exclusive().map_err(|error| {
         anyhow::anyhow!(
             "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
-            data_dir.display()
-        )
-    })?;
-    control_namespace_lock
-        .rebarrier_existing()
-        .with_context(|| {
-            format!(
-                "cannot rebarrier managed shutdown-control namespace {}",
-                control_dir.display()
-            )
-        })?;
-    // The control namespace guard lives inside the data directory. Release
-    // its Windows handle before rebarriering the parent data-directory name;
-    // the held lifecycle file and outer data namespace guard still serialize
-    // every cooperating desktop through the remaining publication step.
-    drop(control_namespace_lock);
-    data_namespace_lock.rebarrier_existing().with_context(|| {
-        format!(
-            "cannot rebarrier managed data-directory namespace {}",
             data_dir.display()
         )
     })?;
@@ -4145,9 +4207,64 @@ mod tests {
         arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
         let configured = root.join("data-v3").to_string_lossy().into_owned();
         let first = acquire_managed_lifecycle_lock(&configured).unwrap();
-        assert!(acquire_managed_lifecycle_lock(&configured).is_err());
+        let error = match acquire_managed_lifecycle_lock(&configured) {
+            Ok(_) => panic!("a second desktop must not acquire the managed lifecycle"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("another ARC desktop currently owns the managed node lifecycle"),
+            "an established namespace must reach the lifecycle-lock check: {error}"
+        );
         drop(first);
         drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_lifecycle_lock_migrates_pre_proof_lock_residue() {
+        let root = resource_test_dir("lifecycle-lock-pre-proof-residue");
+        let data = root.join("data-v3");
+        let control = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        arc_crypto::secret_file::secure_private_directory_tree(&control).unwrap();
+        arc_crypto::secret_file::durably_publish_new_private(
+            &control.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME),
+            b"arc.desktop.lifecycle-lock.v1\n",
+        )
+        .unwrap();
+
+        let lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
+        assert!(has_exact_lifecycle_namespace_proof(&control).unwrap());
+
+        drop(lock);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_lifecycle_lock_rejects_invalid_namespace_proof() {
+        let root = resource_test_dir("lifecycle-lock-invalid-proof");
+        let data = root.join("data-v3");
+        let control = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        arc_crypto::secret_file::secure_private_directory_tree(&control).unwrap();
+        arc_crypto::secret_file::durably_publish_new_private(
+            &control.join(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME),
+            b"arc.desktop.lifecycle-namespace.v2\n",
+        )
+        .unwrap();
+
+        let error = match acquire_managed_lifecycle_lock(&data.to_string_lossy()) {
+            Ok(_) => panic!("an invalid namespace proof must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("namespace proof has invalid contents"),
+            "unexpected error: {error}"
+        );
+        assert!(!control.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME).exists());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

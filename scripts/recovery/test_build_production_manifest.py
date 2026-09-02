@@ -3399,6 +3399,157 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         finally:
             os.close(destination_fd)
 
+    def test_secure_readers_reprove_ctime_only_noise_and_reject_moving_identity(
+        self,
+    ) -> None:
+        source = self.fixture.root / "secure-reader-source.bin"
+        payload = b"stable-secure-reader-source\n"
+        write(source, payload, 0o400)
+        source_details = source.stat()
+        real_fstat = builder.os.fstat
+
+        def staged_fstat(
+            ctime_deltas: tuple[int, ...], *, change_mode_on_call: int | None = None
+        ):
+            source_calls = 0
+
+            def inspect(descriptor: int):
+                nonlocal source_calls
+                details = real_fstat(descriptor)
+                if (
+                    details.st_dev == source_details.st_dev
+                    and details.st_ino == source_details.st_ino
+                ):
+                    source_calls += 1
+                    fields = {
+                        name: getattr(details, name)
+                        for name in (
+                            "st_dev",
+                            "st_ino",
+                            "st_mode",
+                            "st_uid",
+                            "st_gid",
+                            "st_nlink",
+                            "st_size",
+                            "st_atime_ns",
+                            "st_mtime_ns",
+                            "st_ctime_ns",
+                        )
+                    }
+                    delta_index = min(source_calls - 1, len(ctime_deltas) - 1)
+                    fields["st_ctime_ns"] += ctime_deltas[delta_index]
+                    if source_calls == change_mode_on_call:
+                        fields["st_mode"] ^= stat.S_IWUSR
+                    return types.SimpleNamespace(**fields)
+                return details
+
+            return inspect
+
+        for operation in ("read", "hash"):
+            with mock.patch.object(
+                builder.os,
+                "fstat",
+                side_effect=staged_fstat((0, 1, 1)),
+            ), mock.patch.object(
+                builder.os, "lseek", wraps=builder.os.lseek
+            ) as ctime_recheck:
+                if operation == "read":
+                    observed, _details = builder.read_secure(
+                        source,
+                        label="stable secure reader",
+                        maximum_bytes=1024,
+                        exact_mode=0o400,
+                        require_read_only=True,
+                    )
+                    self.assertEqual(observed, payload)
+                else:
+                    observed_sha, observed_size = builder.hash_secure(
+                        source, "stable secure hasher"
+                    )
+                    self.assertEqual(
+                        (observed_sha, observed_size), (sha(payload), len(payload))
+                    )
+            ctime_recheck.assert_called_once()
+
+        for operation in ("read", "hash"):
+            with mock.patch.object(
+                builder.os,
+                "fstat",
+                side_effect=staged_fstat((0, 0), change_mode_on_call=2),
+            ):
+                with self.assertRaisesRegex(
+                    builder.BuilderError,
+                    f"changed while it was {'read' if operation == 'read' else 'hashed'}",
+                ):
+                    if operation == "read":
+                        builder.read_secure(
+                            source,
+                            label="mode-changing secure reader",
+                            maximum_bytes=1024,
+                        )
+                    else:
+                        builder.hash_secure(source, "mode-changing secure hasher")
+
+        real_read = builder.os.read
+
+        def changed_content_read():
+            source_reads = 0
+
+            def read(descriptor: int, maximum_bytes: int) -> bytes:
+                nonlocal source_reads
+                details = real_fstat(descriptor)
+                chunk = real_read(descriptor, maximum_bytes)
+                if (
+                    details.st_dev == source_details.st_dev
+                    and details.st_ino == source_details.st_ino
+                ):
+                    source_reads += 1
+                    if source_reads == 3 and chunk:
+                        return bytes([chunk[0] ^ 1]) + chunk[1:]
+                return chunk
+
+            return read
+
+        for operation in ("read", "hash"):
+            with mock.patch.object(
+                builder.os,
+                "fstat",
+                side_effect=staged_fstat((0, 1, 1)),
+            ), mock.patch.object(
+                builder.os, "read", side_effect=changed_content_read()
+            ):
+                with self.assertRaisesRegex(
+                    builder.BuilderError,
+                    f"changed during its ctime-only {operation} recheck",
+                ):
+                    if operation == "read":
+                        builder.read_secure(
+                            source,
+                            label="content-changing secure reader",
+                            maximum_bytes=1024,
+                        )
+                    else:
+                        builder.hash_secure(source, "content-changing secure hasher")
+
+        for operation in ("read", "hash"):
+            with mock.patch.object(
+                builder.os,
+                "fstat",
+                side_effect=staged_fstat((0, 1, 2)),
+            ):
+                with self.assertRaisesRegex(
+                    builder.BuilderError,
+                    f"changed during its ctime-only {operation} recheck",
+                ):
+                    if operation == "read":
+                        builder.read_secure(
+                            source,
+                            label="moving-ctime secure reader",
+                            maximum_bytes=1024,
+                        )
+                    else:
+                        builder.hash_secure(source, "moving-ctime secure hasher")
+
     def test_maintenance_boundary_is_standalone_exact_and_cutoff_complete(self) -> None:
         def move_created(value: dict) -> None:
             created = dt.datetime.strptime(value["created_at"], "%Y-%m-%dT%H:%M:%SZ")
