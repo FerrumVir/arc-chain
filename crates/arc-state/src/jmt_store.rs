@@ -372,8 +372,14 @@ impl JmtStore {
             self.version.store(new_version, Ordering::SeqCst);
             let root = *self.root_hash.read();
             self.version_roots.insert(new_version, root);
-            // Copy root node key forward if it exists.
-            if let Some(prev) = self.root_keys.get(&(new_version - 1)) {
+            // Copy the value out before inserting into the same DashMap. Keeping a
+            // `get()` guard alive across `insert()` can self-deadlock whenever the
+            // old and new versions land in the same shard.
+            let previous_root_key = self
+                .root_keys
+                .get(&(new_version - 1))
+                .map(|prev| prev.clone());
+            if let Some(prev) = previous_root_key {
                 self.root_keys.insert(
                     new_version,
                     NodeKey {
@@ -1526,6 +1532,34 @@ mod tests {
         let root2 = store.commit();
         assert_eq!(root, root2, "empty commit must not change root");
         assert_eq!(store.version(), 2);
+    }
+
+    #[test]
+    fn test_repeated_empty_commits_do_not_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut store = JmtStore::new();
+            let addr = test_address(1);
+            store.put_account(addr, &test_account(addr, 100)).unwrap();
+            let expected_root = store.commit();
+
+            // Exercise enough distinct version keys to force repeated access to
+            // the same DashMap shards regardless of the map's randomized seed.
+            for _ in 0..1_024 {
+                assert_eq!(store.commit(), expected_root);
+            }
+
+            finished_tx.send(store.version()).unwrap();
+        });
+
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(1_025),
+            "repeated empty commits deadlocked"
+        );
     }
 
     // -----------------------------------------------------------------------
