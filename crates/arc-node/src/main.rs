@@ -9460,7 +9460,11 @@ mod tests {
         let recovered = archive_legacy_dag_wal(&data_dir, manifest_hash)
             .unwrap()
             .expect("a visible exact archive must be verified on retry");
-        assert_eq!(recovered, archive);
+        assert!(
+            arc_crypto::secret_file::same_private_directory_namespace(&recovered, &archive)
+                .unwrap(),
+            "the recovered archive must name the exact same Windows namespace despite extended or 8.3 path aliases"
+        );
         assert_eq!(
             std::fs::read(recovered.join("wal-00000000.bin")).unwrap(),
             b"late-visible-history"
