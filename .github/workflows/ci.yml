@@ -272,6 +272,59 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: test-${{ matrix.os }}
+      # Keep the native Windows namespace/durability cases ahead of every
+      # broad gate. If one regresses, CI must still attempt and name each
+      # exact primitive, recovery, startup, and history-preservation contract.
+      - name: Native Windows namespace and recovery regressions
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -uo pipefail
+          failed=0
+          run_test() { "$@" || failed=1; }
+
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_directory_rebarrier_requires_closed_descendant_handles \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_existing_8dot3_alias_is_rejected_before_namespace_derivation \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_existing_case_variants_share_one_namespace_and_sidecar \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_simultaneous_first_namespace_lock_waits_out_exclusive_create_handle \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::desktop_lifecycle_handoff_requires_active_matching_session \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --lib --locked \
+            recovery_dag_wal::tests::advisory_lock_contends_and_stale_regular_file_is_harmless \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::node_data_directory_lock_rejects_concurrent_owner_and_survives_stale_file \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::desktop_namespace_proof_allows_node_and_prepared_state_with_live_lifecycle_handle \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::live_desktop_handle_without_exact_namespace_proof_fails_closed \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::unlocked_lifecycle_ignores_stale_proof_and_runs_real_rebarrier \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::active_desktop_handoff_rejects_wrong_session_nonce \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::desktop_lifecycle_nonce_cli_is_strict_early_and_capability_visible \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::node_data_directory_lock_restores_staged_only_history_before_open \
+            -- --exact --test-threads=1 --nocapture
+          exit "$failed"
       # Compile-check everything the test step does not build: the 15
       # [[bin]] targets in arc-bench (which produce the numbers in
       # docs/BENCHMARK-RESULTS.md and were never compiled by CI), the
@@ -400,6 +453,38 @@ jobs:
         with:
           workspaces: desktop/src-tauri
           shared-key: desktop-tauri-${{ matrix.os }}
+      - name: Native Windows desktop lifecycle state-machine regressions
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -uo pipefail
+          failed=0
+          run_test() { "$@" || failed=1; }
+
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_serializes_desktop_processes \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::provisional_orphan_lease_cannot_launch_and_prepares_after_node_lock_reaps \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_migrates_v1_proof_and_lock_residue \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_rejects_invalid_namespace_proof \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_restores_staged_data_directory \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_restores_staged_control_directory \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_accepts_existing_case_variant_namespace \
+            -- --exact --test-threads=1 --nocapture
+          exit "$failed"
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
 
   # -------------------------------------------------------- desktop e2e ----

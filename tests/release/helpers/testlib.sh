@@ -27,6 +27,10 @@ run_test() {
     local name="$1"
     shift
     local detail_file status detail
+    if [ -n "${ARC_TEST_FILTER:-}" ] \
+        && ! printf '%s\n' "$name" | grep -Eq -- "$ARC_TEST_FILTER"; then
+        return 0
+    fi
     detail_file="$(mktemp "${TMPDIR:-/tmp}/arc-release-test.XXXXXX")"
     TESTS_RUN=$((TESTS_RUN + 1))
 

@@ -416,6 +416,10 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
         'headless guide does not require a fresh observer data directory' || return 1
     require_literal "$WALKTHROUGH" 'Validators need the approved canonical checkpoint migration instead.' \
         'walkthrough omits the validator checkpoint-only migration rule' || return 1
+    require_literal "$WALKTHROUGH" 'ARC_SERVICE_SCOPE=' \
+        'walkthrough hard-codes the wrong service manager for adopted v0.7 nodes' || return 1
+    require_literal "$WALKTHROUGH" 'system-user) sudo systemctl' \
+        'walkthrough omits the migrated Linux global-service scope' || return 1
     require_literal "$README" 'bind RPC to `127.0.0.1` only' \
         'README does not disclose the managed loopback-only RPC default' || return 1
     require_literal "$HEADLESS" 'bound only to `127.0.0.1`' \
@@ -424,12 +428,22 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
         'headless guide still describes a binary-only rollback' || return 1
     require_literal "$README" 'rollback is not a migration' \
         'README could present install rollback as persisted-state migration' || return 1
+    require_literal "$README" 'same-generation single-writer guard' \
+        'README could imply the v0.8 lock fences released v0.7 processes' || return 1
+    require_literal "$HEADLESS" 'Released v0.7 binaries acquire neither lock' \
+        'headless guide omits the cross-generation lock boundary' || return 1
+    require_literal "$ROLLOUT" 'released v0.7 validators do not acquire it' \
+        'validator runbook could treat the v0.8 lock as legacy quiescence' || return 1
+    require_literal "$DESKTOP_FIRST_RUN" 'released v0.7 binaries do not' \
+        'desktop first-run guide omits the cross-generation lock boundary' || return 1
 }
 
 community_support_and_history_copy_is_actionable() {
     for literal in \
         '### Community support answer sheet' \
         'Publishing v0.8.0 alone does not update them.' \
+        'intentionally not promoted to GitHub' \
+        'unsigned legacy updater is not allowed' \
         '[2–3 minute community-node walkthrough]' \
         '## Block-level history and explorer continuity' \
         'The recovery boundary is exactly `H+1`' \

@@ -8,6 +8,7 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 
 RETIRED_SCRIPTS=(
     "$REPO_ROOT/scripts/arc-watchdog.sh"
+    "$REPO_ROOT/scripts/arc-export-volatile-state.sh"
     "$REPO_ROOT/scripts/rolling-upgrade.sh"
     "$REPO_ROOT/scripts/arc-rolling-restart.sh"
     "$REPO_ROOT/scripts/arc-remote-relaunch.sh"
@@ -335,18 +336,48 @@ operator_docs_name_the_recovery_boundary() {
     assert_file_contains "$REPO_ROOT/scripts/README.md" \
         'There is no environment flag or command-line override' \
         'scripts README leaves an override ambiguous' || return 1
+    assert_file_contains "$REPO_ROOT/scripts/README.md" \
+        'scripts/recovery/recovery_rollout[.]py' \
+        'scripts README does not name the manifest-bound recovery tool' || return 1
     assert_file_contains "$REPO_ROOT/deploy/README.md" \
         'not an approved way' \
         'deploy README still presents v2 tooling as operational' || return 1
+    assert_file_contains "$REPO_ROOT/deploy/README.md" \
+        'scripts/recovery/recovery_rollout[.]py' \
+        'deploy README does not name the manifest-bound recovery tool' || return 1
     assert_file_contains "$REPO_ROOT/testnet/README.md" \
         'There is currently no supported “quick join” or validator-deployment command' \
         'testnet README still presents a live quick-join or validator deployment path' || return 1
     if grep -Eq \
-        'raw[.]githubusercontent[.]com|releases/latest|^[[:space:]]*curl.*[|][[:space:]]*(ba)?sh|--validator-seed|make[[:space:]]+(setup|restart|teardown)' \
+        'raw[.]githubusercontent[.]com/[^/]+/[^/]+/(main|master)/|releases/latest|^[[:space:]]*curl.*[|][[:space:]]*(ba)?sh|--validator-seed|make[[:space:]]+(setup|restart|teardown)' \
         "$REPO_ROOT/testnet/README.md" "$REPO_ROOT/deploy/README.md" "$REPO_ROOT/scripts/README.md"; then
         printf 'current operator docs still contain a raw-main/latest installer or retired command\n'
         return 1
     fi
+}
+
+historical_docs_are_non_operational_and_truthful() {
+    assert_file_contains "$REPO_ROOT/PLAN.md" \
+        '^# .*\(ARCHIVED\)$' \
+        'historical plan is not clearly archived at its title' || return 1
+    assert_file_not_contains "$REPO_ROOT/PLAN.md" \
+        'scripts/rolling-upgrade[.]sh|--reset-state' \
+        'historical plan still contains a runnable legacy reset or rolling command' || return 1
+    assert_file_contains "$REPO_ROOT/ARCHITECTURE.md" \
+        'ARCHIVED — NOT AN OPERATOR RUNBOOK OR CURRENT NETWORK STATUS' \
+        'historical architecture still presents itself as current authority' || return 1
+    assert_file_contains "$REPO_ROOT/ARCHITECTURE.md" \
+        'raw `0x16` events are not earnings' \
+        'historical architecture still implies a raw attestation is payment' || return 1
+    assert_file_not_contains "$REPO_ROOT/ARCHITECTURE.md" \
+        'earnings \(tx 0x16 events\)|credits the worker.*InferenceAttestation' \
+        'historical architecture retains the false raw-attestation reward path' || return 1
+    assert_file_contains "$REPO_ROOT/docs/SERO-DEMO.md" \
+        'ARCHIVED HISTORICAL MATERIAL — DO NOT USE AS A WALKTHROUGH' \
+        'historical Sero demo is not clearly archived' || return 1
+    assert_file_not_contains "$REPO_ROOT/docs/SERO-DEMO.md" \
+        'https?://[0-9]|curl|install-community-node[.]sh' \
+        'historical Sero demo still exposes a live IP or runnable installer command' || return 1
 }
 
 run_test 'legacy live/cloud scripts have an early unconditional retirement guard' \
@@ -369,5 +400,7 @@ run_test 'current shell and operator docs never execute code from mutable raw ma
     current_scripts_and_docs_forbid_mutable_remote_execution
 run_test 'operator docs describe the v3 recovery boundary without an override' \
     operator_docs_name_the_recovery_boundary
+run_test 'historical plans and demos cannot be mistaken for live operations' \
+    historical_docs_are_non_operational_and_truthful
 
 finish_tests

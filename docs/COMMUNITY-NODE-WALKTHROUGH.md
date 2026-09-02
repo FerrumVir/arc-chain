@@ -77,7 +77,7 @@ Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27
+ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -87,7 +87,7 @@ bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 
 The pinned installer SHA-256 is
-`355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27`.
+`4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151`.
 
 The protected source-tag installer resolves one exact semantic-versioned
 release and verifies the owner signature on `SHA256SUMS` before trusting any
@@ -112,34 +112,52 @@ and a pending adoption cannot authorize purge.
 ```bash
 "$HOME/.arc/bin/arc-node" --version
 curl -fsS http://127.0.0.1:9944/health | jq
-systemctl --user --no-pager status arc-node | sed -n '1,12p'
+ARC_SERVICE_SCOPE=$(sed -n 's/^service_scope=//p' "$HOME/.arc/install.conf")
+case "$ARC_SERVICE_SCOPE" in
+  user) systemctl --user --no-pager status arc-node ;;
+  system-user) sudo systemctl --no-pager status arc-node ;;
+  launchd) launchctl print "user/$(id -u)/network.arc.node" \
+    || launchctl print "gui/$(id -u)/network.arc.node" ;;
+  none) printf '%s\n' 'install-only mode: no service manager was configured' ;;
+  *) printf 'unknown service_scope: %s\n' "$ARC_SERVICE_SCOPE" >&2; exit 1 ;;
+esac
 ```
 
 Say the returned status out loud. A `degraded` response proves that the
 headless process and RPC started, not that the chain is synchronized or ready
 to pay inference rewards.
 
-For a system-wide install, use `sudo systemctl status arc-node`. On macOS use
-the `launchctl` commands in [HEADLESS_INSTALL.md](HEADLESS_INSTALL.md).
+The v0.7 Linux adoption records `service_scope=system-user`: its service is
+global even though its node and updater run as the original community user, so
+`systemctl --user` is wrong for that migrated topology. For a fresh system-wide
+install rooted at `/var/lib/arc-chain`, use `sudo systemctl status arc-node`.
 
 ## 1:00–1:25 — show this node's registration and real capacity
 
 ```bash
 export ARC_WORKER=$(curl -fsS http://127.0.0.1:9944/node/info | jq -er '.validator')
-curl -fsS "$ARC_RPC/community/list" \
+curl -fsS "$ARC_RPC/workers/scoreboard?limit=50" \
   | jq --arg worker "$ARC_WORKER" \
-      '{count,total_work_completed,community_rewards_v1_enabled,
-        community_rewards_v1_approval_collection_ready,community_rewards_v1_note,
+      '{count_visible,eligible_inference_workers,coordinator_model,
         this_node:[.workers[]|select(.worker_id==$worker)
-          |{worker_id,name,platform,model,work_completed}]}'
-test "$(curl -fsS "$ARC_RPC/community/list" \
+          |{worker_id,name,platform,model,model_id,execution_profile,
+            work_completed,success_count,failure_count,success_rate,
+            avg_ms_per_job}]}'
+test "$(curl -fsS "$ARC_RPC/workers/scoreboard?limit=50" \
   | jq --arg worker "$ARC_WORKER" '[.workers[]|select(.worker_id==$worker)]|length')" -eq 1
+curl -fsS "$ARC_RPC/community/reward_policy" \
+  | jq '{protocol_active,issuance_ready,readiness_unavailable_reason,
+         stake_zero_eligible,reward_arc,validator_approvals_required,
+         treasury_rewards_remaining,reward_program,earnings_evidence}'
 ```
 
-Point to the actual platform, loaded model, and server-authoritative completed
-work count. A heartbeat cannot reset or inflate this count. `ARC_WORKER` comes
-from this machine's authenticated `/node/info` identity; never select a
-convenient worker from the global list and present it as the local node.
+Point to the actual platform, exact model identity, server-authoritative success
+and failure counts, and the separate reward-readiness response. A heartbeat
+cannot reset or inflate these counts. The read-only scoreboard must be queried
+instead of legacy `/community/list`, whose GET handler prunes stale registry
+entries as a side effect. `ARC_WORKER` comes from this machine's authenticated
+`/node/info` identity; never select a convenient worker from the global list
+and present it as the local node.
 
 ## 1:25–2:05 — route two one-token inferences to the worker
 

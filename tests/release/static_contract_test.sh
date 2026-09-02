@@ -442,16 +442,16 @@ pretag_exact_byte_handoff_is_fail_closed() {
     count="$(grep -Fc \
         'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' \
         "$RELEASE_WORKFLOW")"
-    [ "$count" -eq 11 ] || {
-        printf 'tag workflow must contain four pre-tag plus seven isolated signing/publication evidence downloads; found %s\n' "$count"
+    [ "$count" -eq 12 ] || {
+        printf 'tag workflow must contain four pre-tag plus eight isolated recovery/signing/publication evidence downloads; found %s\n' "$count"
         return 1
     }
-    [ "$(grep -Fc 'skip-decompress: true' "$RELEASE_WORKFLOW")" -eq 4 ] || {
-        printf 'all four raw pre-tag downloads must preserve their server ZIPs\n'
+    [ "$(grep -Fc 'skip-decompress: true' "$RELEASE_WORKFLOW")" -eq 5 ] || {
+        printf 'all four raw pre-tag downloads plus the cutover handoff must preserve their server ZIPs\n'
         return 1
     }
-    [ "$(grep -Fc 'digest-mismatch: error' "$RELEASE_WORKFLOW")" -eq 11 ] || {
-        printf 'all eleven exact-ID downloads must fail on a server digest mismatch\n'
+    [ "$(grep -Fc 'digest-mismatch: error' "$RELEASE_WORKFLOW")" -eq 12 ] || {
+        printf 'all twelve exact-ID downloads must fail on a server digest mismatch\n'
         return 1
     }
     [ "$(grep -Fc 'Revalidate the selected run, attempt, IDs, and digests' \
@@ -550,10 +550,19 @@ raw_node_downloads_are_version_pinned() {
         printf 'installer does not bind binary downloads to its exact resolved tag\n'
         return 1
     fi
-    if grep -Eq '/releases\?per_page=|(^|[[:space:]])-r[[:space:]]+0-0' "$INSTALLER"; then
-        printf 'installer still walks releases or probes assets with Range requests instead of resolving one release metadata object\n'
+    if grep -Eq '(^|[[:space:]])-r[[:space:]]+0-0|/releases/latest' "$INSTALLER"; then
+        printf 'installer still trusts global latest or probes assets with Range requests\n'
         return 1
     fi
+    [ "$(grep -Fc 'releases?per_page=100' "$INSTALLER")" -eq 1 ] || {
+        printf 'installer does not use one bounded v0.8 channel-discovery page\n'
+        return 1
+    }
+    grep -Fq 'RELEASE_METADATA_URL="$API_ROOT/releases/tags/v$REQUESTED_VERSION"' \
+        "$INSTALLER" || {
+        printf 'channel discovery does not converge on one exact-tag metadata object\n'
+        return 1
+    }
 }
 
 updater_has_semver_downgrade_guard() {
@@ -1452,6 +1461,10 @@ release_secret_jobs_require_the_owner_environment() {
         'This privileged job deliberately has no checkout' \
         'artifact-ids: ${{ needs.manifest-sign.outputs.artifact_id }}' \
         'gh release upload "$RELEASE_TAG" release-files/*' \
+        '## Upgrading from v0.7.x' \
+        'The v0.8 `.arc-node.lock` is a same-generation guard' \
+        'fresh `data-v0.8/`' \
+        'fresh `data-v3*`' \
         'Upload the exact draft API evidence'
     do
         grep -Fq -- "$required" <<< "$publish_draft_block" || {
@@ -1474,7 +1487,7 @@ release_secret_jobs_require_the_owner_environment() {
         'needs: [validate, publish-draft, verify-draft-release]' \
         'The fresh mutation runner' \
         'cmp -s "$canonical_expected" "$canonical_current"' \
-        '-F draft=false -f make_latest=true' \
+        '-F draft=false -f make_latest=false' \
         'publication_attempted=true' \
         'for poll_attempt in {1..12}' \
         'if [ "$publication_attempted" != true ]; then' \
@@ -1720,7 +1733,7 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
         'repos/$GITHUB_REPOSITORY/branches/main' \
         'cmp -s "$canonical_expected" "$canonical_current"' \
         'gh api --method PATCH' \
-        '-F draft=false -f make_latest=true' \
+        '-F draft=false -f make_latest=false' \
         'publication_attempted=true' \
         'for poll_attempt in {1..12}' \
         'state is unconfirmed and cleanup is forbidden' \

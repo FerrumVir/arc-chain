@@ -24,25 +24,31 @@ upstream components vendored for reproducibility are identified under
 > from the exact release evidence and signed rollout receipts described below.
 > The default branch may receive a reviewed post-rollout status update.
 
-This README does not use the moving `latest` release as an install source. If
-the complete
+This README does not use the moving `latest` release as an install source. The
+immutable v0.8.x release is intentionally not promoted to GitHub's global
+`latest` channel while unsigned v0.7 updaters remain in the field. A first
+v0.7-to-v0.8 migration is therefore manual and pinned to the exact tag; the
+legacy updater is not a supported migration mechanism.
+
+If the complete
 [exact v0.8.0 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.0)
 shows every required asset, `SHA256SUMS`, and `SHA256SUMS.sig`, an
 SSH/EC2/VPS operator can run:
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27
+ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
+# Observer/router quickstart. Add a verified --model path to execute inference.
 bash install.sh --version 0.8.0
 ```
 
 Expected `install.sh` SHA-256 for this candidate:
-`355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27`.
+`4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
@@ -62,7 +68,7 @@ signing tools and never repository programs.
 |---|---|
 | Can an SSH-only EC2/VPS install ARC? | Not from public v0.7.11. The complete v0.8.0 release restores real headless `arc-node` assets for Linux amd64 and arm64; the GUI packages are not server binaries. |
 | Are Intel and Apple Silicon Macs supported? | The v0.8.0 contract builds separate Intel and Apple Silicon CLI and desktop assets. Treat those links as installable only when the exact immutable release exposes the complete signed asset set. |
-| Does automatic update work? | Public v0.7.11 saved the desktop preference but never scheduled checks. The v0.8.0 source-freeze candidate adds signed desktop checks after startup and every 24 hours, plus a transactional daily headless updater. Desktop updates still require confirmation; `.deb` and `.rpm` remain package-manager owned. |
+| Does automatic update work? | The first v0.7-to-v0.8 transition is manual and exact-tag pinned; the unsigned legacy updater is not allowed to perform that migration. Public v0.7.11 saved the desktop preference but never scheduled checks. The v0.8.0 source-freeze candidate adds signed desktop checks after startup and every 24 hours, plus a transactional daily headless updater. Desktop updates still require confirmation; `.deb` and `.rpm` remain package-manager owned. |
 | When are the seeds upgraded? | At the source freeze they had not been upgraded, and there is no honest calendar promise in this repository. Publishing v0.8.0 alone does not update them. Current deployment requires signed rollout receipts proving one coordinated, archive-bound checkpoint cutover and agreement by all six above the greatest block height users saw before maintenance. |
 | Can a stake-zero worker earn the configured 2.5 testnet ARC? | Stake zero is eligible, but registration and raw inference tx `0x16` pay nothing. Exact-model assignment, independent verification, five-of-six reward authorization, activation, treasury limits, and a successful mined `0x25` receipt are all required. At the source freeze, that payment path was not live on the public v2 fleet. |
 | What should a worker run? | A router needs no model or GPU. The current full-worker target is Llama-2-7B Q4_K_M (about 4 GB on disk). The release has no validated minimum-RAM claim yet: prove a complete model load and inference with OS/chain headroom on the target host. GPU is optional and hardware never guarantees work. |
@@ -182,7 +188,8 @@ computation claim and pays nothing.
 
 Version skew is real too: NYC runs v0.7.2, the other five run v0.7.9, and
 **nothing on the network runs v0.7.11** — that version exists only as a desktop
-bundle. See [`ALERTS.md`](ALERTS.md) for the current alert list.
+bundle. See [`ALERTS.md`](ALERTS.md) for the dated 2026-08-17 alert record;
+re-probe the fleet rather than treating it as current status.
 
 The concise evidence record is
 [`docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
@@ -250,7 +257,7 @@ never used by the initial install command.
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27
+ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -260,7 +267,7 @@ bash install.sh --version 0.8.0
 ```
 
 Expected `install.sh` SHA-256:
-`355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27`.
+`4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151`.
 
 The bootstrap installer comes from the owner-created protected source tag.
 It resolves an exact immutable, non-draft release, requires GitHub to identify
@@ -287,14 +294,19 @@ the installer will not silently claim a pre-existing unmarked directory. The
 only compatibility exception is an exact default `~/.arc` (or the system
 default `/var/lib/arc-chain`) containing a fully recognized, correctly owned,
 non-symlinked v0.7.x community-node layout beneath non-writable ancestors. It
-receives a path/data/version/service-manager/supervisor/port/model-bound,
-fsynced pending marker before any v0.8 replacement; custom roots and
+is processed only while the install lock is held: the unsigned updater is
+durably fenced first, the exact legacy inputs are archived and revalidated,
+then a path/data/version/service-manager/supervisor/port/model-bound pending
+marker is fsynced before any v0.8 replacement. Custom roots and
 partial/lookalike layouts remain blocked. The bridge recognizes only the real
 v0.7 Linux global units (`arc-node.service` plus the optional
 `arc-updater.service`/`.timer` pair), macOS labels `com.arc.inference` and
-`com.arc.updater`, or an exact live `node.pid` command. Ambiguous supervisors,
-changed directives, stale PIDs, symlinks, and unsafe `~/.arc` ancestors fail
-before reservation or release download.
+`com.arc.updater`, an exact live `node.pid` command, or v0.7.7's exact single
+no-root/no-sudo process that was historically started without a PID file. The
+latter's owner and complete argv are verified and its untracked topology is
+preserved for rollback. Ambiguous supervisors/processes, changed directives,
+stale PIDs, symlinks, and unsafe `~/.arc` ancestors fail before reservation or
+release download.
 Every uninstall requires the final marker's contents, owner, permissions, and
 path binding; a pending adoption marker is not an uninstall capability.
 `--uninstall --purge` validates the final marker again immediately before
@@ -307,20 +319,44 @@ genesis. Do not reuse a v0.7.11-or-earlier data directory. Back up an observer's
 identity and old data for forensics, then select a fresh `--data-dir`; validators
 require the approved canonical checkpoint migration. On a failed install or
 update, the installer restores every managed binary, network file, runner,
-config, identity file, service unit, and the prior service/timer state. That
-rollback is not a migration and never rewrites the model or chain data.
+config, identity file, and service unit. For an ordinary v0.8 transaction it
+also restores the prior service/timer state. A legacy unsigned updater is never
+re-enabled. After a durable v0.7 retirement intent exists, failure is
+deliberately fail-stopped: v0.7 stays stopped and fenced, and v0.8 cannot start
+without the matching offline-retirement receipt. Rollback never rewrites the
+model or chain data; rollback is not a migration.
 For the narrowly verified default v0.7.x layout, the installer automates this:
 it retains `data/`, the model, and the exact identity, archives the old
 version/seeds/genesis/identity under `legacy-v0.7-preserved/`, and configures
 fresh v0.8 state at `data-v0.8/`. It also retains verified custom RPC/P2P
 ports and the active model. On Linux, the historical root-owned global service
 is replaced with root-owned managed units whose node and checksummed updater
-both execute as the original community user; the old unsigned updater and its
-timer are stopped and removed before the binary changes. The one-time bridge
+both execute as the original community user; the old unsigned updater is
+fenced before release resolution, its archived inputs are revalidated, and
+the updater/timer are removed before the binary changes. The one-time bridge
 uses sudo, while later scheduled updates run as that user and signal only the
-owned node process. A failed bridge restores the exact old binary, unit files,
-and prior active/enabled state. Purge stays disabled while adoption is pending
-and becomes eligible only after the complete v0.8 transaction commits.
+owned node process. Before the retirement boundary, a failed bridge restores
+the exact old binary and unit files while leaving the unsigned updater fenced.
+After the create-only retirement intent, it never restarts v0.7. Purge stays
+disabled while adoption is pending and becomes eligible only after the complete
+v0.8 transaction commits.
+
+The v0.8 `.arc-node.lock` is a same-generation single-writer guard, not a
+v0.7-to-v0.8 migration fence. Released v0.7 binaries acquire neither the v0.8
+data lock nor its sibling namespace lock. The first upgrade must therefore stop
+the exact old node and updater and prove they are absent before any v0.8 node
+starts. A timeout is not a v0.7 drain: released v0.7 exits directly from its
+signal handler and has no admission-close/task-join barrier. The signed cutover
+policy therefore closes legacy admission at canonical height 137145, classifies
+unfinished legacy jobs as `expired_noncanonical_at_cutover`, and explicitly
+sets `legacy_exit_clean_claimed=false`. The installer authenticates that policy,
+the maintenance boundary, and the quorum recovery checkpoint; verifies all six
+exact v3 validators at height 137146 or later and the old claim/submit ports
+closed; writes a create-only retirement intent; sends TERM but never KILL; and
+requires a matching offline-retirement receipt before v0.8 starts. The old
+`data/` tree remains untouched for forensics, while canonical block-level
+history continues from the signed checkpoint in fresh `data-v0.8/` state. The
+presence of a new lock never makes mixed v0.7/v0.8 overlap safe.
 
 Useful server options:
 
@@ -355,11 +391,14 @@ requires the complete bundle for the installed platform, verifies it, and
 refuses equality or downgrade; do not add `--version 0.8.0` when the goal is to
 discover a later safe update.
 
-Managed macOS nodes receive a 4,420-second launchd `ExitTimeOut`. On the first
-upgrade from an older plist, the installer sends SIGTERM to the exact inspected
-node PID and waits for its graceful drain before unloading it. The scheduled
-updater remains loaded while it may be the process running that transaction,
-so auto-update cannot terminate itself halfway through replacement.
+Managed v0.8 macOS nodes receive a 4,420-second launchd `ExitTimeOut`, covering
+their admission-close, task-join, and final WAL-fsync barrier. A later
+v0.8-to-v0.8 update waits for that real quiescence barrier, and the signed
+scheduled updater remains loaded while it may be running the transaction. The
+one-time v0.7 bridge is different: it permanently fences the unsigned legacy
+updater and treats TERM-only process death as retirement evidence, never as a
+graceful-drain claim; the signed cutover and offline receipt govern whether
+v0.8 may start.
 
 Without `--model`, the node is an observer/router and will not execute local
 model inference. It still joins with `--stake 0 --community-mode`; stake-zero
@@ -803,13 +842,18 @@ Public GET paths carried verbatim in the sealed rollout manifest:
 `/inference/attestations`
 `/economics/rewards`
 `/faucet/status`
-`/community/list`
 `/community/reward_policy`
 `/workers/scoreboard`
 `/shards`
 `/models`
 `/models/shards`
 <!-- ARC_PUBLIC_GET_END -->
+
+`/community/list` remains an internal wire-compatibility handler, but it is not
+exposed by the protocol-v3 public gateway because its GET implementation prunes
+stale in-memory registrations. Dashboards, walkthroughs, health checks, and
+recovery probes use the read-only `/workers/scoreboard` endpoint and query
+`/community/reward_policy` separately for issuance readiness.
 
 The gateway also admits these strictly shaped public GET routes:
 

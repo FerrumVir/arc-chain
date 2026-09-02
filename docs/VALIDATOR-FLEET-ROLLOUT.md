@@ -10,6 +10,12 @@ reject one another because the meaning of consensus and reward messages
 changed. This is a coordinated quorum cutover, not a compatible rolling
 upgrade.
 
+The repaired `.arc-node.lock` is a same-generation v0.8 single-writer guard;
+released v0.7 validators do not acquire it. It is therefore not evidence that
+a legacy writer is quiescent and cannot make mixed v2/v3 overlap safe. Only the
+capture-bound cgroup freeze, persistent start fences, exact process/listener
+absence proofs, and fresh manifest-owned v3 data paths below authorize startup.
+
 The repository version is the **unreleased v0.8.0 recovery candidate**. Do
 not treat this checklist, a green local build, or a draft tag as evidence that
 v0.8.0 is published or running on any public seed.

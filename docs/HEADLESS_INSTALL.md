@@ -41,9 +41,14 @@ the owner-created protected source tag and pin the same version when running
 it. Keeping download and execution separate makes network errors visible and
 lets you inspect the script first.
 
+The v0.8.x release is intentionally not GitHub's global `latest` while legacy
+v0.7 updaters remain deployed. Those unsigned updaters are not a migration
+path: the first v0.7-to-v0.8 upgrade must use the exact protected tag and
+verified installer below.
+
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=355bbf283b028ffe16a4ebfbdc5cb5cd0e994b0874f368511c887aa735c8fd27
+ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -62,10 +67,12 @@ the release's namespaced Ed25519 `SHA256SUMS.sig` against its embedded owner
 public key before it downloads executable payloads or replaces any managed
 file. An unsigned checksum file is never an authenticity boundary.
 
-The installer does not resolve `releases/latest/download` for the programs. It
-first reads one release's metadata, requires GitHub to report that release as
-immutable, non-draft, and non-prerelease, requires the server-authenticated
-release author to be `github-actions[bot]`, validates a strict
+The installer does not resolve GitHub's global `latest` pointer for programs
+or updates. An unpinned v0.8 installer scans a bounded release page for the
+highest strict v0.8+ candidate, then resolves that one exact tag. It requires
+GitHub to report the exact release as immutable, non-draft, and
+non-prerelease, requires the server-authenticated release author to be
+`github-actions[bot]`, validates a strict
 `vMAJOR.MINOR.PATCH` tag and protected source commit, and downloads from that
 exact tag. It verifies the signature first, then the
 current platform's node and CLI plus seeds and genesis against `SHA256SUMS`; if
@@ -217,12 +224,14 @@ components, the v0.7.x binary/version pair, ARC genesis, seeds, identity, data,
 and optional updater/model match the recognized legacy layout. Custom roots
 and incomplete or hostile lookalikes fail before downloads or mutation.
 
-Before touching v0.7 files, that bridge fsyncs a pending marker bound to the
-exact install path, source version, fresh v0.8 data path, service scope,
-supervisor kind, RPC/P2P ports, and model path. It preserves the old
-configuration and supervisor definition under `legacy-v0.7-preserved/`, copies
-the exact identity to the protected v0.8 seed, leaves `data/` and the model
-unchanged, retains verified custom ports/model selection, and uses
+While holding the install lock, that bridge first durably disables the unsigned
+updater, archives the exact old configuration and supervisor definition under
+`legacy-v0.7-preserved/`, and revalidates the live inputs. It then fsyncs a
+pending marker bound to the exact install path, source version, fresh v0.8 data
+path, service scope, supervisor kind, RPC/P2P ports, and model path. This
+archive-first ordering cannot pin stale bytes behind a still-running updater.
+It copies the exact identity to the protected v0.8 seed, leaves `data/` and the
+model unchanged, retains verified custom ports/model selection, and uses
 `data-v0.8/` for fresh state. A crash resumes only the bound scope and
 configuration. The final purge-authorizing marker is promoted only after the
 complete v0.8 install transaction commits; a pending migration cannot purge
@@ -231,32 +240,69 @@ the directory.
 Supervisor adoption is deliberately exact. Linux accepts the historical
 root-owned `/etc/systemd/system/arc-node.service` and either both old
 `arc-updater` unit files or neither. macOS accepts `com.arc.inference` and the
-optional `com.arc.updater` LaunchAgent. A detached install requires a live
-`node.pid` whose inspected command is the recognized v0.7 invocation. Wrong
-users, extra lifecycle directives, partial updater pairs, changed labels or
-executables, ambiguous supervisors, stale/reused PIDs, symlinks, and
-group/world-writable ancestors fail before reservation or download.
+optional `com.arc.updater` LaunchAgent. A detached install normally requires a
+live `node.pid` whose owner and inspected command are the recognized v0.7
+invocation. The bridge also recognizes v0.7.7's historical Linux no-root,
+no-sudo fallback, which started exactly one process without writing
+`node.pid`; it proves that process's owner and complete argv, archives the
+untracked topology, retires it with TERM but never KILL, and preserves the
+absence of a PID file on
+rollback. Wrong users, multiple or ambiguous processes, extra lifecycle
+directives, partial updater pairs, changed labels or executables, stale/reused
+PIDs, symlinks, and group/world-writable ancestors fail before reservation or
+download.
+
+`.arc-node.lock` and its sibling namespace lock are v0.8 same-generation
+guards. Released v0.7 binaries acquire neither lock, so seeing a v0.8 lock file
+does not prove the old process or updater is gone. The first upgrade must stop
+and verify absence of the exact v0.7 node and legacy updater before starting
+v0.8. Never run the generations concurrently, even with separate data paths.
+
+Released v0.7 cannot prove quiescence: its signal handler exits immediately and
+does not close inference admission, join producer tasks, or establish a final
+WAL barrier. Waiting longer does not turn that behavior into a drain. The
+signed cutover policy instead fixes canonical height 137145, requires the v3
+fleet at height 137146 or later, records unfinished v0.7 work as
+`expired_noncanonical_at_cutover`, and explicitly sets
+`legacy_exit_clean_claimed=false`. Before TERM, the installer authenticates the
+policy, maintenance boundary, and quorum checkpoint, verifies all six exact v3
+validator identities agree on recovery epoch/set/checkpoint/domain/genesis, and
+checks that every old `:9090`/`:3001` claim/submit endpoint is closed. It then
+writes a create-only intent bound to the old binary, identity, supervisor PID,
+data tree, WAL, and signed release inputs. A read-only offline verifier must
+prove TERM-without-KILL death, stable process/listener absence, unchanged
+forensic data, and checkpoint-compatible replay before publishing the matching
+receipt. v0.8 cannot start without that receipt. Canonical block-level history
+continues from the signed checkpoint in fresh `data-v0.8/`; old `data/` remains
+untouched for forensics.
 
 For the common Linux `~/.arc` topology, the one-time migration uses sudo to
 retire the old global units transactionally. It replaces them with root-owned
 managed units, but both the node and signed updater execute as the original
 community user. The old unsigned `arc-auto-update.sh` and `arc-updater` timer
-are stopped and removed before the node binary changes, so they cannot later
-overwrite v0.8. Scheduled updates need no recurring sudo: the user-owned,
+are fenced before release resolution, their archived inputs are revalidated
+before the transaction, and they are removed before the node binary changes,
+so they cannot overwrite v0.8. Scheduled updates need no recurring sudo: the user-owned,
 checksummed installer replaces only user-owned ARC files and signals the exact
 owned node PID; systemd's root-owned `Restart=always` unit relaunches it. If
-any copy, service, or health step fails, rollback restores the exact v0.7
-binary/unit files and each prior active/enabled service and timer state.
+failure happens before the create-only retirement intent, rollback restores the
+exact v0.7 binary/unit files and prior node state but never re-enables the
+unsigned updater. After that intent, the machine remains stopped and fenced;
+v0.7 is never restarted, and v0.8 waits for the offline receipt.
 
-macOS uses the same durable drain contract. The managed node LaunchAgent sets
+Managed v0.8 macOS nodes use the same durable quiescence contract. The node
+LaunchAgent sets
 `ExitTimeOut=4420`, covering the 4,000-second public inference window, the
 300-second late-submit grace, and 120 seconds for task joins and WAL fsync.
-During the first upgrade from an older plist that lacks that key, the installer
-disables the exact verified label, sends SIGTERM to its inspected node PID, and
-waits for that process to exit before `bootout`; it therefore never relies on
-launchd's shorter system-defined default. A scheduled `network.arc.update` job
-is not unloaded while it may be running the installer itself. The updated
-plist remains at the same path and is picked up on the next login/bootstrap.
+On later v0.8 updates, the installer disables the exact verified label, sends
+SIGTERM to its inspected node PID, and waits for the real admission-close,
+task-join, and WAL barrier before `bootout`; it never relies on launchd's
+shorter default.
+A scheduled signed `network.arc.update` job is not unloaded while it may be
+running the installer itself. The one-time v0.7 bridge instead permanently
+fences `com.arc.updater` and treats TERM-only process death as retirement
+evidence—not as a graceful-drain claim—under the signed policy and offline
+receipt described above.
 
 ### v2 data directories are not upgrade inputs
 
@@ -285,7 +331,8 @@ root system install: its global unit files are root-owned, but programs,
 identity, data, node process, and updater process remain owned by the original
 community user. `install.conf` records the internal `system-user` scope so
 every later update follows that same boundary. During an update that
-unprivileged bridge sends SIGTERM only to its verified node PID, then follows
+unprivileged bridge (which is v0.8 after the one-time migration commits) sends
+SIGTERM only to its verified node PID, then follows
 the systemd unit through the complete graceful drain and `Restart=always`
 transition. The wait covers the node's 4,000-second inference window plus its
 300-second crash/late-submit grace for already-owned community work, its

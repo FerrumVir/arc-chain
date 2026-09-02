@@ -153,7 +153,6 @@ DEFAULT_PUBLIC_GET_PATHS = (
     "/inference/attestations",
     "/economics/rewards",
     "/faucet/status",
-    "/community/list",
     "/community/reward_policy",
     "/workers/scoreboard",
     "/shards",
@@ -7778,25 +7777,27 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             scoreboard.get("coordinator_model_id"),
             f"{coordinator_name} scoreboard.coordinator_model_id",
         )
-        registry = self._http_json(coordinator, "/community/list")
-        if not isinstance(registry, dict):
-            fail(f"{coordinator_name} community worker registry is not an object")
-        rows = registry.get("workers")
+        rows = scoreboard.get("workers")
         if not isinstance(rows, list):
-            fail(f"{coordinator_name} community worker registry workers is not an array")
+            fail(f"{coordinator_name} worker scoreboard workers is not an array")
         if required_int(
-            registry.get("count"), f"{coordinator_name} community registry.count"
+            scoreboard.get("count_visible"),
+            f"{coordinator_name} scoreboard.count_visible",
         ) != len(rows):
-            fail(f"{coordinator_name} community worker count differs from its rows")
+            fail(f"{coordinator_name} scoreboard visible count differs from its rows")
         candidates: set[str] = set()
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
-                fail(f"{coordinator_name} community workers[{index}] is not an object")
+                fail(f"{coordinator_name} scoreboard workers[{index}] is not an object")
             capabilities = row.get("capabilities")
             if not isinstance(capabilities, list) or not all(
                 isinstance(capability, str) for capability in capabilities
             ):
-                fail(f"{coordinator_name} community workers[{index}].capabilities is invalid")
+                fail(f"{coordinator_name} scoreboard workers[{index}].capabilities is invalid")
+            required_int(
+                row.get("work_completed"),
+                f"{coordinator_name} scoreboard workers[{index}].work_completed",
+            )
             model_id = row.get("model_id")
             if (
                 "inference" in capabilities
@@ -7804,14 +7805,14 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                 and row.get("execution_profile") == CANONICAL_EXECUTION_PROFILE
             ):
                 normalized_model_id = "0x" + bare_hash(
-                    model_id, f"{coordinator_name} community worker model_id"
+                    model_id, f"{coordinator_name} scoreboard worker model_id"
                 )
                 if normalized_model_id == coordinator_model_id:
                     candidates.add(
                         "0x"
                         + bare_hash(
                             row.get("worker_id"),
-                            f"{coordinator_name} community worker_id",
+                            f"{coordinator_name} scoreboard worker_id",
                         )
                     )
         if len(candidates) < eligible:
@@ -9759,7 +9760,7 @@ http {{
             proxy_pass_request_body off;
             proxy_set_header Content-Length "";
         }}
-        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|faucet/status|community/list|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
+        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|faucet/status|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
             auth_request /__arc_interlock_gate;
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;

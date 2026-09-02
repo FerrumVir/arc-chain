@@ -1,9 +1,13 @@
-# ARC Chain - Complete Architecture Reference
+# ARC Chain - Historical v0.5.3 Architecture Snapshot
 
-**READ THIS FIRST IN EVERY SESSION.** This is the authoritative reference for
-all infrastructure in the codebase. Every component listed here is REAL CODE
-that EXISTS and has been audited. Do NOT build new infrastructure without
-checking if it already exists here.
+> **ARCHIVED — NOT AN OPERATOR RUNBOOK OR CURRENT NETWORK STATUS.** This file
+> describes a v0.5.3-era design and contains historical implementation notes.
+> Validate every claim against current code and [`README.md`](README.md).
+> Never use legacy rolling, self-heal, restart, or reset procedures from this
+> snapshot. Current validator recovery is the fully quiesced, fenced,
+> manifest-bound checkpoint cutover in
+> [`docs/VALIDATOR-FLEET-ROLLOUT.md`](docs/VALIDATOR-FLEET-ROLLOUT.md) and
+> [`scripts/recovery/README.md`](scripts/recovery/README.md).
 
 ## Version: 0.5.3 | LOC: 99K+ | Crates: 16 | Tests: 1,211
 
@@ -217,20 +221,24 @@ into arc-node itself on port 9090.
 **File:** `crates/arc-node/src/rpc.rs`
 - `/community/register` + `/community/heartbeat` + `/community/list`
 - `/community/claim_work` — long-poll (30s) for whole-prompt inference jobs
-- `/community/submit_work` — accept result + worker-signed
-  `InferenceAttestation` tx, post on-chain
+- `/community/submit_work` — accept a worker-signed computation result. A raw
+  `InferenceAttestation` (`0x16`) is historical evidence only and pays nothing.
+  v3 payment requires a successfully mined, independently verified,
+  five-of-six-authorized `CommunityInferenceReward` (`0x25`) receipt.
 - `/inference/run` — smart router: prefers a community worker when
   one is online, falls back to the seed's local model
-- `/worker/earnings/:address` — chain-derived earnings (tx 0x16 events)
+- `/worker/earnings/:address` — confirmed mined `0x25` reward receipts only;
+  raw `0x16` events are not earnings
 
 ### Node Client (--community-mode)
 **File:** `crates/arc-node/src/main.rs`
 - Auto-register with every seed it peers with
-- Long-poll `/community/claim_work` (port 9090, with port 3001
-  fallback for the rolling-upgrade window)
+- Long-poll `/community/claim_work` on the supported coordinator endpoint.
+  Historical port-3001 compatibility is not permission for mixed-version
+  operation.
 - Compute locally via `model.generate()`
-- Sign + submit each result; the chain credits the worker's address
-  on `InferenceAttestation` finalization
+- Sign and submit each result; the worker is credited only when the authorized
+  `CommunityInferenceReward` (`0x25`) transaction is successfully mined
 
 ---
 
@@ -276,26 +284,29 @@ Key types for inference:
 | `arc-demo.sh` | End-to-end sharded inference demo |
 | `arc-verify.sh` | Third-party inference verifier |
 | `arc-bench.sh` | Reproducible factual benchmark |
-| `arc-self-heal.sh` + `.service` + `install-self-heal.sh` | On-host self-heal daemon (GH #30). Systemd unit on each seed; auto-restarts arc-node on RPC silence or consensus drift with shard flags preserved from `/proc/PID/cmdline`. |
-| `arc-watchdog.sh` | Legacy off-cluster watchdog - superseded by `arc-self-heal` on the hosts. |
-| `arc-health-check.sh` | Network-wide health probe |
-| `rolling-upgrade.sh` | Automated rolling deploy |
+| `arc-self-heal.sh` + `.service` + `install-self-heal.sh` | **Retired:** exits before service or process mutation. Installed legacy units remain disabled during recovery. |
+| `arc-watchdog.sh` | **Retired:** exits before SSH, process, or service mutation. |
+| `arc-health-check.sh` | **Retired:** a reachable process was not proof of shared-chain health. |
+| Legacy rolling deployment scripts | **Retired:** v2/v3 mixed operation is rejected; use only the coordinated recovery runbook. |
 
 ---
 
-## CRITICAL RULES FOR FUTURE SESSIONS
+## Current safety corrections to the historical snapshot
 
-1. **NEVER build new infrastructure without checking this doc first.**
-   As of v0.5.3, **ALL infrastructure is WIRED into the runtime:**
+1. **Treat this as history, not authority.** At v0.5.3 the document reported
+   the following infrastructure as wired into the runtime:
    VRF proposer selection, VRF inference committees, multi-model ShardRegistry,
    auto-sharding (compute_shard_plan), verification manager (commit-challenge),
    revenue config (fee splits), checkpoint registry, double-vote tracker,
    withholding detector, flash attention (online softmax), GPU embedding fix.
    The STARK prover is real but feature-gated (`--features stwo-prover`).
-   **Zero unwired items remain.**
+   That historical completeness claim must not substitute for current code,
+   release-gate, or live receipt verification.
 
-2. **NEVER restart all nodes at once.** Rolling upgrade only.
-   Exception: if all nodes are already dead.
+2. **Never perform a rolling public-validator upgrade.** v2 and v3 reject each
+   other. Fully quiesce and fence every old validator, preserve and verify the
+   canonical history through height H, then activate fresh v3 data paths using
+   the sealed checkpoint and manifest gates. Rollback never restarts v2.
 
 3. **NEVER download models in the install script.** Nodes join for
    consensus + TPS immediately. Models are optional for inference.

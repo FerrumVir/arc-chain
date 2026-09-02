@@ -14,8 +14,10 @@ RELEASE_COMMIT="${RELEASE_COMMIT:-}"
 REPOSITORY="${REPOSITORY:-FerrumVir/arc-chain}"
 RELEASE_DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 GENESIS_FILE="${GENESIS_FILE:-genesis.toml}"
+CUTOVER_HANDOFF_DIR="${CUTOVER_HANDOFF_DIR:-cutover-handoff}"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_VALIDATOR="$SCRIPT_DIR/validate-genesis.py"
+CUTOVER_ASSET_VALIDATOR="$SCRIPT_DIR/validate-cutover-derived-assets.py"
 
 die() {
     printf 'release assembly: %s\n' "$*" >&2
@@ -34,6 +36,8 @@ printf '%s\n' "$REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
 [ -f testnet-seeds.txt ] || die "testnet-seeds.txt is missing"
 [ -f "$GENESIS_FILE" ] || die "genesis file is missing: $GENESIS_FILE"
 [ -f "$GENESIS_VALIDATOR" ] || die "genesis validator is missing: $GENESIS_VALIDATOR"
+[ -d "$CUTOVER_HANDOFF_DIR" ] || die "protected cutover handoff is missing: $CUTOVER_HANDOFF_DIR"
+[ -f "$CUTOVER_ASSET_VALIDATOR" ] || die "cutover asset validator is missing: $CUTOVER_ASSET_VALIDATOR"
 command -v python3 >/dev/null 2>&1 || die "python3 is required to generate latest.json"
 
 # Validate before clearing or writing OUTPUT_DIR. A release may ship either a
@@ -191,6 +195,21 @@ copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-linux-x86_64" '*.rpm')" \
 copy_as install.sh install.sh
 copy_as testnet-seeds.txt testnet-seeds.txt
 copy_as "$GENESIS_FILE" genesis.toml
+
+# The full checkpoint stays on the protected recovery host. The separately
+# protected exact-main producer transports only three compact canonical assets;
+# the exact release binary independently reconstructs the signed manifest and
+# verifies every H/root/H+1/epoch/set and 5-of-6 certificate binding here.
+python3 "$CUTOVER_ASSET_VALIDATOR" \
+    --input-dir "$CUTOVER_HANDOFF_DIR" \
+    --output-dir "$OUTPUT_DIR" \
+    --verifier-binary "$OUTPUT_DIR/arc-node-linux-x86_64" \
+    --inspector-binary "$OUTPUT_DIR/arc-node-linux-x86_64" \
+    --genesis "$OUTPUT_DIR/genesis.toml" \
+    --repository "$REPOSITORY" \
+    --tag "$RELEASE_TAG" \
+    --commit "$RELEASE_COMMIT" \
+    || die "protected cutover assets failed recovery validation"
 
 VERSION="${RELEASE_TAG#v}"
 BASE_URL="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"

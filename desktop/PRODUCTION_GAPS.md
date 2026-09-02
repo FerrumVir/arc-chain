@@ -102,8 +102,14 @@ and "TJ's mom installs it from arcnetwork.ai and starts earning".
 
 ### ~~13. No auto-updater wired~~ → PARTIALLY RESOLVED
 
-- Plugin wired, endpoint pointed at `github.com/FerrumVir/arc-chain/releases/latest/download/latest.json`.
-- **TODO before first release**: `npx @tauri-apps/cli signer generate -w ~/.tauri/arc-desktop-key`, paste the public key into `tauri.conf.json > plugins.updater.pubkey`, and commit signed update artifacts with each release (`tauri build` respects `createUpdaterArtifacts: true`).
+- Historical implementation pointed the plugin at GitHub's global `latest`
+  manifest. The v0.8+ implementation instead selects a protected-publisher,
+  immutable release in native code and gives Tauri only its exact-tag
+  manifest, so legacy v0.7 headless timers can remain fenced off `latest`.
+- That alpha-era signing-key TODO is resolved in the v0.8 release contract:
+  the public key is embedded in `tauri.conf.json`, the private key remains in
+  the protected signing workflow, and release assembly verifies every updater
+  payload signature before publication.
 
 ### 14. Accessibility gaps
 

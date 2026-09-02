@@ -22,7 +22,7 @@
 > - [`docs/HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) — post-publication v0.8.0 server install
 > - [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) — gated recording script
 > - [`docs/VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) — blocking cutover checklist
-> - [`ALERTS.md`](../ALERTS.md) — what is broken on the live network right now
+> - [`ALERTS.md`](../ALERTS.md) — dated 2026-08-17 public-v2 alert evidence
 > - [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — archived public-v2 diagnostic runbook
 > - [`CLAUDE.md`](../CLAUDE.md) — live network table and safety rules
 > - [`docs/TESTNET_STATE_DIVERGENCE_2026-06-03.md`](TESTNET_STATE_DIVERGENCE_2026-06-03.md) — why the seeds are not one chain
@@ -191,7 +191,7 @@ is not yet accurate.
 
 ## What to look at first (refreshed 2026-08-17)
 
-1. **Read** [`ALERTS.md`](../ALERTS.md) — four active alerts, including block
+1. **Read** [`ALERTS.md`](../ALERTS.md) — four alerts observed on 2026-08-17, including block
    production stalled on 4 of 6 seeds for ~6 days.
 2. **Read** [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md)
    — the current gated recording run-of-show. `docs/DEMO-RUNBOOK.md` and

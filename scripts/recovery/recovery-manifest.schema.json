@@ -426,7 +426,6 @@
                 "/inference/attestations",
                 "/economics/rewards",
                 "/faucet/status",
-                "/community/list",
                 "/community/reward_policy",
                 "/workers/scoreboard",
                 "/shards",

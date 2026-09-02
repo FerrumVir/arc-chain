@@ -7,6 +7,7 @@ mod rpc_client;
 mod store;
 mod tray;
 mod types;
+mod updater_channel;
 mod wallet;
 
 use std::collections::HashMap;
@@ -535,6 +536,7 @@ pub fn run() {
             commands::ensure_binary,
             commands::get_autostart,
             commands::update_install_policy,
+            updater_channel::check_arc_update,
             commands::list_model_tiers,
             commands::recommended_tier,
             commands::existing_model_for_tier,

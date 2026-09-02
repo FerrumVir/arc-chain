@@ -1,9 +1,13 @@
-# ARC Chain — Active Alerts
+# ARC Chain — Alert Snapshot (2026-08-17)
 
 **Last checked:** 2026-08-17 (read-only probes of all six seeds)
 
-Four active alerts. This file previously read "No active alerts. All clear."
-while every item below was already true.
+> **Historical evidence, not current status.** Re-probe every configured origin
+> and verify signed rollout receipts before describing the network today. Do
+> not carry these v2 observations forward after a v3 cutover.
+
+Four alerts were active at that check. This file previously read "No active
+alerts. All clear." while every item below was already true.
 
 ---
 

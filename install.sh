@@ -14,15 +14,17 @@ umask 077
 REPOSITORY="${ARC_REPOSITORY:-FerrumVir/arc-chain}"
 API_ROOT="${ARC_GITHUB_API_ROOT:-https://api.github.com/repos/${REPOSITORY}}"
 DOWNLOAD_ROOT="${ARC_GITHUB_DOWNLOAD_ROOT:-https://github.com/${REPOSITORY}/releases/download}"
-# Background admission closes with SIGTERM, but already-owned community work
-# retains the 4,000-second public window plus its 300-second crash/late-submit
-# grace. Give task joins and the final WAL fsync another two minutes before
-# systemd may SIGKILL the node.
+# v0.8 closes admission, joins every producer/task, and then fsyncs the WAL.
+# Already-owned v0.8 community work retains the 4,000-second public window plus
+# its 300-second late-submit grace; reserve another two minutes for joins/fsync.
+# Released v0.7 binaries do not implement that barrier and are governed by the
+# separate recovered-fleet retirement gate below.
 GRACEFUL_STOP_TIMEOUT_SECS=4420
-# The managed v0.7 bridge cannot ask systemd to restart its root-owned unit:
+# The managed system-user bridge cannot ask systemd to restart its root-owned
+# replacement unit:
 # its updater deliberately runs as the unprivileged community user. It sends
 # SIGTERM to its own node and relies on Restart=always instead. Cover the
-# complete node drain plus RestartSec=5 and a bounded startup allowance.
+# v0.8 quiescence budget plus RestartSec=5 and a bounded startup allowance.
 SYSTEM_USER_RESTART_TIMEOUT_SECS=$((GRACEFUL_STOP_TIMEOUT_SECS + 30))
 
 # Community/reward RPC is explicit HTTPS configuration, separate from QUIC
@@ -36,7 +38,14 @@ COMMUNITY_RPC_ORIGINS=(
     https://202.182.107.41
     https://149.28.153.31
 )
-
+COMMUNITY_VALIDATOR_ADDRESSES=(
+    adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f
+    44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780
+    5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21
+    228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd
+    f03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f
+    f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b
+)
 REQUESTED_VERSION="${ARC_NODE_VERSION:-}"
 ARG_INSTALL_DIR=""
 ARG_DATA_DIR=""
@@ -286,8 +295,27 @@ LEGACY_USER_INSTALL_ROOT="$TARGET_HOME/.arc"
 LEGACY_SYSTEM_INSTALL_ROOT=/var/lib/arc-chain
 LEGACY_ADOPTION_CANDIDATE=false
 LEGACY_ADOPTION_ACTIVE=false
+LEGACY_ADOPTION_MARKER_NEEDS_CREATE=false
+LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=false
 LEGACY_SOURCE_VERSION=""
 LEGACY_PRESERVED_DIR="$ARC_DIR/legacy-v0.7-preserved"
+LEGACY_RETIREMENT_DIR="$LEGACY_PRESERVED_DIR/retirement-v0.8"
+LEGACY_RETIREMENT_RELEASE_DIR="$LEGACY_RETIREMENT_DIR/release"
+LEGACY_RETIREMENT_SUPERVISOR_BINDING="$LEGACY_RETIREMENT_DIR/supervisor-binding.json"
+LEGACY_RETIREMENT_INTENT="$LEGACY_RETIREMENT_DIR/retirement-intent.json"
+LEGACY_RETIREMENT_STOP_EVIDENCE="$LEGACY_RETIREMENT_DIR/stop-evidence.json"
+LEGACY_RETIREMENT_RECEIPT="$LEGACY_RETIREMENT_DIR/retirement-receipt.json"
+LEGACY_RETIREMENT_INTENT_DURABLE=false
+LEGACY_RETIREMENT_INTENT_SHA256=""
+LEGACY_RETIREMENT_STOP_EVIDENCE_SHA256=""
+LEGACY_RETIREMENT_RECEIPT_SHA256=""
+LEGACY_RETIREMENT_SUPERVISOR_BINDING_SHA256=""
+LEGACY_RETIREMENT_PROCESS_PID=""
+LEGACY_RETIREMENT_PROCESS_BOOT_ID=""
+LEGACY_RETIREMENT_PROCESS_START_TICKS=""
+LEGACY_RETIREMENT_ALREADY_OFFLINE=false
+LEGACY_RETIREMENT_OBSERVATION_STARTED_AT=""
+LEGACY_RETIREMENT_SUPERVISOR_MECHANISM=""
 SYSTEMD_UNIT_DIR=/etc/systemd/system
 LEGACY_LINUX_NODE_UNIT="$SYSTEMD_UNIT_DIR/arc-node.service"
 LEGACY_LINUX_UPDATER_SERVICE="$SYSTEMD_UNIT_DIR/arc-updater.service"
@@ -303,13 +331,10 @@ LEGACY_MARKER_P2P_PORT=""
 LEGACY_MARKER_MODEL_PATH=""
 LEGACY_DETACHED_PID=""
 LEGACY_DETACHED_WAS_RUNNING=false
+LEGACY_DETACHED_HAD_PID_FILE=false
 LEGACY_DETACHED_COMMUNITY_MODE=false
 LEGACY_LINUX_NODE_ACTIVE=false
 LEGACY_LINUX_NODE_ENABLED=false
-LEGACY_LINUX_UPDATER_ACTIVE=false
-LEGACY_LINUX_UPDATER_ENABLED=false
-LEGACY_LINUX_UPDATER_SERVICE_ACTIVE=false
-LEGACY_LINUX_UPDATER_SERVICE_ENABLED=false
 LEGACY_MAC_NODE_LOADED=false
 LEGACY_MAC_UPDATER_LOADED=false
 LEGACY_PARTIAL_RESUME=false
@@ -1197,29 +1222,35 @@ validate_legacy_macos_plists() {
     fi
 }
 
-validate_legacy_detached_process() {
-    local expected_uid pid_line line_count command_line legacy_rpc legacy_p2p legacy_model legacy_seed
+validate_legacy_detached_pid() {
+    local pid_line="$1" source_label="$2"
+    local expected_uid process_uid command_line command_line_count
+    local legacy_rpc legacy_p2p legacy_model legacy_seed
     local legacy_pair community_count expected_token_count actual_token_count
     if [ "$CURRENT_UID" -eq 0 ] && [ "$TARGET_USER" != root ]; then
         die "Adopt a user-owned detached v0.7 node without sudo so rollback can restore its process safely"
     fi
     expected_uid="$(legacy_expected_owner_uid)"
-    validate_owned_nonwritable_path "$LEGACY_NODE_PID_FILE" \
-        "detached node PID file" file "$expected_uid"
-    pid_line="$(sed -n '1p' "$LEGACY_NODE_PID_FILE")"
-    line_count="$(awk 'END { print NR + 0 }' "$LEGACY_NODE_PID_FILE")"
     case "$pid_line" in ''|*[!0-9]*) die "Legacy detached node PID is invalid" ;; esac
-    if ! { [ "$line_count" -eq 1 ] && [ "$pid_line" -gt 1 ]; }; then
-        die "Legacy detached node PID file is malformed"
-    fi
+    [ "$pid_line" -gt 1 ] \
+        || die "Legacy detached node PID is invalid"
     kill -0 "$pid_line" 2>/dev/null \
-        || die "Legacy detached node PID is stale; stop/clean it explicitly before adoption"
+        || die "Legacy detached node process disappeared during $source_label validation"
+    process_uid="$(ps -ww -p "$pid_line" -o uid= 2>/dev/null \
+        | awk 'NF { if (++count > 1 || $1 !~ /^[0-9]+$/ || NF != 1) exit 2; uid=$1 } END { if (count == 1) print uid; else exit 3 }')" \
+        || die "Could not prove the owner of the legacy detached node process"
+    [ "$process_uid" -eq "$expected_uid" ] \
+        || die "Legacy detached node process is owned by an unexpected user"
     command_line="$(ps -ww -p "$pid_line" -o command= 2>/dev/null)" \
         || die "Could not inspect the legacy detached node process"
+    command_line_count="$(printf '%s\n' "$command_line" | awk 'END { print NR + 0 }')"
+    [ "$command_line_count" -eq 1 ] \
+        || die "Legacy detached node command line is ambiguous"
     case "$command_line" in
         "$ARC_DIR/bin/arc-node"|"$ARC_DIR/bin/arc-node "*) ;;
-        *) die "Legacy node.pid identifies a different executable" ;;
+        *) die "Legacy $source_label identifies a different executable" ;;
     esac
+    LEGACY_DETACHED_COMMUNITY_MODE=false
     read_single_legacy_command_argument "$command_line" --rpc
     legacy_rpc="$LEGACY_ARGUMENT_VALUE"
     read_single_legacy_command_argument "$command_line" --p2p-port
@@ -1274,6 +1305,123 @@ validate_legacy_detached_process() {
     LEGACY_DETACHED_WAS_RUNNING=true
 }
 
+validate_legacy_detached_process() {
+    local expected_uid pid_line line_count
+    expected_uid="$(legacy_expected_owner_uid)"
+    validate_owned_nonwritable_path "$LEGACY_NODE_PID_FILE" \
+        "detached node PID file" file "$expected_uid"
+    pid_line="$(sed -n '1p' "$LEGACY_NODE_PID_FILE")"
+    line_count="$(awk 'END { print NR + 0 }' "$LEGACY_NODE_PID_FILE")"
+    case "$pid_line" in ''|*[!0-9]*) die "Legacy detached node PID is invalid" ;; esac
+    if ! { [ "$line_count" -eq 1 ] && [ "$pid_line" -gt 1 ]; }; then
+        die "Legacy detached node PID file is malformed"
+    fi
+    LEGACY_DETACHED_HAD_PID_FILE=true
+    validate_legacy_detached_pid "$pid_line" node.pid
+}
+
+LEGACY_UNTRACKED_PROCESS_FOUND=false
+discover_untracked_legacy_detached_process() {
+    local validate_found="${1:-true}"
+    local expected_uid process_rows pid process_uid command_line discovered_pid=""
+    local discovered_count=0
+    LEGACY_UNTRACKED_PROCESS_FOUND=false
+    expected_uid="$(legacy_expected_owner_uid)"
+    process_rows="$(ps -ww -axo pid=,uid=,command= 2>/dev/null)" \
+        || die "Could not enumerate processes while proving legacy v0.7 quiescence"
+    while read -r pid process_uid command_line; do
+        [ -n "$pid" ] || continue
+        case "$pid" in ''|*[!0-9]*)
+            die "Process enumeration returned an ambiguous PID row" ;;
+        esac
+        case "$process_uid" in ''|*[!0-9]*)
+            die "Process enumeration returned an ambiguous owner row" ;;
+        esac
+        case "$command_line" in
+            "$ARC_DIR/bin/arc-node"|"$ARC_DIR/bin/arc-node "*)
+                [ "$process_uid" -eq "$expected_uid" ] \
+                    || die "A legacy ARC node under $ARC_DIR is owned by an unexpected user"
+                discovered_count=$((discovered_count + 1))
+                discovered_pid="$pid" ;;
+        esac
+    done <<< "$process_rows"
+    [ "$discovered_count" -le 1 ] \
+        || die "Multiple untracked legacy ARC node processes are running; refusing ambiguous adoption"
+    if [ "$discovered_count" -eq 1 ]; then
+        if [ "$validate_found" = true ]; then
+            LEGACY_DETACHED_HAD_PID_FILE=false
+            validate_legacy_detached_pid "$discovered_pid" "untracked process"
+        fi
+        LEGACY_UNTRACKED_PROCESS_FOUND=true
+    fi
+}
+
+ensure_no_legacy_arc_processes() {
+    discover_untracked_legacy_detached_process false
+    [ "$LEGACY_UNTRACKED_PROCESS_FOUND" = false ] \
+        || die "A legacy ARC node process still owns the v0.7 runtime after graceful retirement"
+}
+
+configure_legacy_detached_restart_from_bound_state() {
+    local legacy_seed
+    legacy_seed="$(sed -n '1p' "$ARC_DIR/identity.seed")"
+    LEGACY_DETACHED_RESTART_ARGS=(
+        "$ARC_DIR/bin/arc-node"
+        --rpc "$RPC_PORT"
+        --p2p-port "$P2P_PORT"
+        --seeds-file "$ARC_DIR/seeds.txt"
+        --genesis "$ARC_DIR/genesis.toml"
+        --validator-seed "$legacy_seed"
+        --stake 0 --min-stake 0 --eth-rpc-port 0
+        --data-dir "$ARC_DIR/data"
+    )
+    [ -z "$MODEL_PATH" ] || LEGACY_DETACHED_RESTART_ARGS+=(--model "$MODEL_PATH")
+    [ "$LEGACY_DETACHED_COMMUNITY_MODE" = false ] \
+        || LEGACY_DETACHED_RESTART_ARGS+=(--community-mode)
+}
+
+legacy_detached_topology_expected() {
+    local pid_file
+    case "$LEGACY_SUPERVISOR_KIND" in
+        detached) pid_file=true ;;
+        detached-untracked) pid_file=false ;;
+        *) die "Internal detached topology error: $LEGACY_SUPERVISOR_KIND" ;;
+    esac
+    printf '%s\n' \
+        'arc-chain-legacy-detached-topology-v1' \
+        "pid_file=$pid_file" \
+        "community_mode=$LEGACY_DETACHED_COMMUNITY_MODE"
+}
+
+load_legacy_detached_topology_archive() {
+    local topology_file="$LEGACY_PRESERVED_DIR/legacy-detached-topology"
+    local expected_uid community_line observed_community=""
+    expected_uid="$(legacy_expected_owner_uid)"
+    validate_owned_nonwritable_path "$topology_file" \
+        "preserved detached topology" file "$expected_uid"
+    [ "$(sed -n '1p' "$topology_file")" = \
+        'arc-chain-legacy-detached-topology-v1' ] \
+        || die "Preserved detached topology has an unknown schema"
+    community_line="$(sed -n '3p' "$topology_file")"
+    case "$community_line" in
+        community_mode=true) observed_community=true ;;
+        community_mode=false) observed_community=false ;;
+        *) die "Preserved detached topology has an invalid community-mode value" ;;
+    esac
+    if [ "$LEGACY_DETACHED_WAS_RUNNING" = true ] \
+        && [ "$LEGACY_DETACHED_COMMUNITY_MODE" != "$observed_community" ]; then
+        die "Live detached process no longer matches its preserved topology"
+    fi
+    LEGACY_DETACHED_COMMUNITY_MODE="$observed_community"
+    cmp -s "$topology_file" <(legacy_detached_topology_expected) \
+        || die "Preserved detached topology does not match the adoption marker"
+    LEGACY_DETACHED_HAD_PID_FILE=false
+    [ "$LEGACY_SUPERVISOR_KIND" != detached ] \
+        || LEGACY_DETACHED_HAD_PID_FILE=true
+    LEGACY_DETACHED_WAS_RUNNING=true
+    configure_legacy_detached_restart_from_bound_state
+}
+
 prepare_legacy_supervisor() {
     local resume_mode="${1:-false}"
     local linux_node_present=false mac_node_present=false detached_present=false
@@ -1294,21 +1442,28 @@ prepare_legacy_supervisor() {
         [ "$linux_node_present" = true ] && detected_count=$((detected_count + 1))
         [ "$mac_node_present" = true ] && detected_count=$((detected_count + 1))
         [ "$detached_present" = true ] && detected_count=$((detected_count + 1))
+        if [ "$detected_count" -eq 0 ]; then
+            discover_untracked_legacy_detached_process
+            if [ "$LEGACY_UNTRACKED_PROCESS_FOUND" = true ]; then
+                detected_count=1
+                LEGACY_SUPERVISOR_KIND=detached-untracked
+            fi
+        fi
         [ "$detected_count" -le 1 ] \
             || die "Multiple legacy ARC supervisors are present; refusing an ambiguous adoption"
-        if [ "$linux_node_present" = true ]; then LEGACY_SUPERVISOR_KIND=linux-system
+        if [ "$LEGACY_SUPERVISOR_KIND" = detached-untracked ]; then :
+        elif [ "$linux_node_present" = true ]; then LEGACY_SUPERVISOR_KIND=linux-system
         elif [ "$mac_node_present" = true ]; then LEGACY_SUPERVISOR_KIND=macos-launchd
         elif [ "$detached_present" = true ]; then LEGACY_SUPERVISOR_KIND=detached
         else LEGACY_SUPERVISOR_KIND=none
         fi
     fi
 
-    # The pending marker is made durable before the legacy archive is
-    # published. A machine can therefore lose power with the marker present
-    # but no archive yet. In that narrow state, require the original bound
-    # supervisor source to still exist so resume can create an exact archive;
-    # once the archive exists, later transaction crash states may legitimately
-    # have already retired that source.
+    # Older installers published the pending marker before the legacy archive.
+    # Continue to accept that recoverable crash state, but new migrations first
+    # fence the unsigned updater beneath the install lock, publish the archive,
+    # and only then publish the marker. Once an archive exists, later
+    # transaction crash states may legitimately have retired the source.
     if [ "$resume_mode" = true ] \
         && ! legacy_path_present "$LEGACY_PRESERVED_DIR"; then
         case "$LEGACY_SUPERVISOR_KIND" in
@@ -1321,6 +1476,10 @@ prepare_legacy_supervisor() {
             detached)
                 [ "$detached_present" = true ] \
                     || die "Pending detached adoption has neither its original PID source nor its archive" ;;
+            detached-untracked)
+                discover_untracked_legacy_detached_process
+                [ "$LEGACY_UNTRACKED_PROCESS_FOUND" = true ] \
+                    || die "Pending untracked adoption has neither its original process nor its archive" ;;
         esac
     fi
 
@@ -1390,12 +1549,30 @@ prepare_legacy_supervisor() {
                 validate_legacy_detached_process
             elif [ "$resume_mode" != true ]; then
                 die "Legacy detached process disappeared before adoption was reserved"
+            else
+                discover_untracked_legacy_detached_process
+                [ "$LEGACY_UNTRACKED_PROCESS_FOUND" = false ] \
+                    || die "Pending PID-managed adoption acquired an untracked ARC process"
             fi
             if [ "$linux_node_present" != false ] \
                 || [ "$linux_updater_artifact" != false ] \
                 || [ "$mac_node_present" != false ] \
                 || [ "$mac_updater_artifact" != false ]; then
                 die "Pending detached adoption acquired a conflicting legacy supervisor"
+            fi ;;
+        detached-untracked)
+            [ "$detached_present" = false ] \
+                || die "Pending untracked adoption acquired a conflicting node.pid"
+            discover_untracked_legacy_detached_process
+            if [ "$LEGACY_UNTRACKED_PROCESS_FOUND" = false ] \
+                && [ "$resume_mode" != true ]; then
+                die "Legacy untracked process disappeared before adoption was reserved"
+            fi
+            if [ "$linux_node_present" != false ] \
+                || [ "$linux_updater_artifact" != false ] \
+                || [ "$mac_node_present" != false ] \
+                || [ "$mac_updater_artifact" != false ]; then
+                die "Pending untracked adoption acquired a conflicting legacy supervisor"
             fi ;;
         none)
             if [ "$linux_node_present" != false ] \
@@ -1404,7 +1581,10 @@ prepare_legacy_supervisor() {
                 || [ "$mac_updater_artifact" != false ] \
                 || [ "$detached_present" != false ]; then
                 die "Legacy supervisor artifacts do not match a supervisor-free adoption"
-            fi ;;
+            fi
+            discover_untracked_legacy_detached_process
+            [ "$LEGACY_UNTRACKED_PROCESS_FOUND" = false ] \
+                || die "Supervisor-free adoption acquired an untracked legacy ARC process" ;;
     esac
 
     if [ "$SERVICE_SCOPE" = system-user ]; then
@@ -1450,7 +1630,7 @@ validate_partial_managed_system_user_node_unit() {
     validate_owned_nonwritable_path "$SYSTEMD_UNIT_DIR/arc-node.service" \
         "partial managed system-user node unit" file 0
     validate_legacy_unit_directive_names "$SYSTEMD_UNIT_DIR/arc-node.service" \
-        'Description Wants After Type User Group WorkingDirectory ExecStart Restart RestartSec TimeoutStopSec UMask NoNewPrivileges PrivateTmp ProtectSystem ProtectKernelTunables ProtectKernelModules ProtectControlGroups RestrictSUIDSGID WantedBy' \
+        'Description Wants After Type User Group WorkingDirectory ExecStart Restart RestartSec TimeoutStopSec SendSIGKILL UMask NoNewPrivileges PrivateTmp ProtectSystem ProtectKernelTunables ProtectKernelModules ProtectControlGroups RestrictSUIDSGID WantedBy' \
         'partial managed system-user node unit'
     [ "$(grep -Fc '# ARC managed system-user node unit v1' \
         "$SYSTEMD_UNIT_DIR/arc-node.service")" -eq 1 ] \
@@ -1476,6 +1656,15 @@ validate_partial_managed_system_user_node_unit() {
     if [ "$(grep -Ec '^Restart=' "$SYSTEMD_UNIT_DIR/arc-node.service")" -ne 1 ] \
         || ! grep -Fqx 'Restart=always' "$SYSTEMD_UNIT_DIR/arc-node.service"; then
         die "Partial system-user node unit lacks the managed restart bridge"
+    fi
+    if [ "$(grep -Ec '^TimeoutStopSec=' "$SYSTEMD_UNIT_DIR/arc-node.service")" -ne 1 ] \
+        || ! grep -Fqx "TimeoutStopSec=$GRACEFUL_STOP_TIMEOUT_SECS" \
+            "$SYSTEMD_UNIT_DIR/arc-node.service"; then
+        die "Partial system-user node unit lacks the complete graceful-stop budget"
+    fi
+    if [ "$(grep -Ec '^SendSIGKILL=' "$SYSTEMD_UNIT_DIR/arc-node.service")" -ne 1 ] \
+        || ! grep -Fqx 'SendSIGKILL=no' "$SYSTEMD_UNIT_DIR/arc-node.service"; then
+        die "Partial system-user node unit may force-kill admitted work"
     fi
 }
 
@@ -1547,7 +1736,7 @@ validate_legacy_adoption_marker() {
     supervisor_line="$(sed -n '6p' "$LEGACY_ADOPTION_MARKER")"
     LEGACY_MARKER_SUPERVISOR_KIND="${supervisor_line#supervisor_kind=}"
     case "$LEGACY_MARKER_SUPERVISOR_KIND" in
-        none|linux-system|macos-launchd|detached) ;;
+        none|linux-system|macos-launchd|detached|detached-untracked) ;;
         *) die "Legacy-adoption marker has an invalid supervisor kind" ;;
     esac
     LEGACY_SUPERVISOR_KIND="$LEGACY_MARKER_SUPERVISOR_KIND"
@@ -1649,9 +1838,12 @@ preserve_legacy_v07_configuration() {
                         "$LEGACY_PRESERVED_DIR/legacy-macos-com.arc.updater.plist" \
                         "preserved macOS updater LaunchAgent" file "$expected_uid"
                 fi ;;
-            detached)
-                validate_owned_nonwritable_path "$LEGACY_PRESERVED_DIR/legacy-node.pid" \
-                    "preserved detached PID file" file "$expected_uid" ;;
+            detached|detached-untracked)
+                load_legacy_detached_topology_archive
+                if [ "$LEGACY_SUPERVISOR_KIND" = detached ]; then
+                    validate_owned_nonwritable_path "$LEGACY_PRESERVED_DIR/legacy-node.pid" \
+                        "preserved detached PID file" file "$expected_uid"
+                fi ;;
         esac
         return
     fi
@@ -1714,8 +1906,17 @@ preserve_legacy_v07_configuration() {
                     die "Could not preserve legacy macOS supervisor file: $source_path"
                 fi
             done ;;
-        detached)
-            if [ -f "$LEGACY_NODE_PID_FILE" ] && [ ! -L "$LEGACY_NODE_PID_FILE" ]; then
+        detached|detached-untracked)
+            if ! legacy_detached_topology_expected \
+                | install_root_as_owner dd \
+                    of="$staged_dir/legacy-detached-topology" conv=fsync 2>/dev/null \
+                || ! install_root_as_owner chmod 600 \
+                    "$staged_dir/legacy-detached-topology"; then
+                install_root_as_owner rm -rf -- "$staged_dir" || true
+                die "Could not preserve the legacy detached process topology"
+            fi
+            if [ "$LEGACY_SUPERVISOR_KIND" = detached ] \
+                && [ -f "$LEGACY_NODE_PID_FILE" ] && [ ! -L "$LEGACY_NODE_PID_FILE" ]; then
                 if ! install_root_as_owner cp -p -- "$LEGACY_NODE_PID_FILE" \
                     "$staged_dir/legacy-node.pid" \
                     || ! install_root_as_owner chmod 600 "$staged_dir/legacy-node.pid"; then
@@ -1782,8 +1983,11 @@ validate_legacy_supervisor_archive_binding() {
                     "$LEGACY_PRESERVED_DIR/legacy-macos-com.arc.updater.plist" \
                     || die "Legacy macOS updater agent changed after adoption was reserved"
             fi ;;
-        detached)
+        detached|detached-untracked)
+            load_legacy_detached_topology_archive
             if legacy_path_present "$LEGACY_NODE_PID_FILE"; then
+                [ "$LEGACY_SUPERVISOR_KIND" = detached ] \
+                    || die "Untracked legacy topology unexpectedly acquired node.pid"
                 cmp -s "$LEGACY_NODE_PID_FILE" \
                     "$LEGACY_PRESERVED_DIR/legacy-node.pid" \
                     || die "Legacy detached PID changed after adoption was reserved"
@@ -1959,13 +2163,12 @@ if [ "$UNINSTALL" = false ]; then
                         validate_legacy_v07_layout
                         [ "$LEGACY_SOURCE_VERSION" = "$pending_source_version" ] \
                             || die "Pending adoption source version changed after marker creation"
-                        # A crash can occur after the pending marker is durable
-                        # but before the archive rename. Revalidate the still-
-                        # live v0.7 supervisor, publish the archive, and only
-                        # then accept this as resumable evidence.
+                        # Preserve compatibility with the old marker-before-
+                        # archive crash shape, but defer every publication until
+                        # the install lock is held and the unsigned updater is
+                        # stopped. The locked phase revalidates the live source.
                         prepare_legacy_supervisor true
-                        preserve_legacy_v07_configuration
-                        validate_resumable_legacy_evidence ;;
+                        LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=true ;;
                     0.8.*|0.9.*|[1-9][0-9]*.*)
                         LEGACY_SOURCE_VERSION="$pending_source_version"
                         LEGACY_PARTIAL_RESUME=true
@@ -1974,7 +2177,7 @@ if [ "$UNINSTALL" = false ]; then
                         # present before any partial supervisor is inspected.
                         validate_resumable_legacy_evidence
                         prepare_legacy_supervisor true
-                        preserve_legacy_v07_configuration ;;
+                        LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=true ;;
                     *) die "Pending adoption contains an unknown partial node binary" ;;
                 esac
                 LEGACY_ADOPTION_ACTIVE=true
@@ -1986,8 +2189,8 @@ if [ "$UNINSTALL" = false ]; then
                     die "Legacy adoption requires a new, unused v0.8 data directory: $NODE_DATA_DIR"
                 fi
                 prepare_legacy_supervisor false
-                create_legacy_adoption_marker
-                preserve_legacy_v07_configuration
+                LEGACY_ADOPTION_MARKER_NEEDS_CREATE=true
+                LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=true
                 LEGACY_ADOPTION_ACTIVE=true
             fi
         else
@@ -2002,10 +2205,6 @@ else
     # uninstall or purge capability. Purge checks the marker again immediately
     # before recursion.
     validate_install_root_marker
-fi
-
-if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
-    validate_legacy_supervisor_archive_binding
 fi
 
 if [ "$SERVICE_SCOPE" = system-user ]; then
@@ -2141,23 +2340,38 @@ if [ "$SERVICE_SCOPE" = system ]; then
         || [ $((PARENT_MODE_DECIMAL % 10 & 2)) -ne 0 ]; then
         die "System install parent must not be group/world writable: $INSTALL_PARENT"
     fi
-    as_root mkdir -p -- "$ARC_DIR" "$ARC_DIR/bin" "$ARC_DIR/identity" "$NODE_DATA_DIR"
+    as_root mkdir -p -- "$ARC_DIR" "$ARC_DIR/bin" "$ARC_DIR/identity"
+    # A v0.7 adoption must prove that the v0.8 state path is still absent.
+    # Create it only after the compiled retirement verifier has published the
+    # matching offline receipt. Fresh installs and ordinary v0.8 updates keep
+    # the normal eager directory preparation.
+    if [ "$LEGACY_ADOPTION_ACTIVE" = false ]; then
+        as_root mkdir -p -- "$NODE_DATA_DIR"
+    fi
     as_root chown root:root "$ARC_DIR" "$ARC_DIR/bin"
     as_root chmod 755 "$ARC_DIR" "$ARC_DIR/bin"
-    as_root chown "$TARGET_USER:$TARGET_GROUP" "$ARC_DIR/identity" "$NODE_DATA_DIR"
-    as_root chmod 700 "$ARC_DIR/identity" "$NODE_DATA_DIR"
+    as_root chown "$TARGET_USER:$TARGET_GROUP" "$ARC_DIR/identity"
+    as_root chmod 700 "$ARC_DIR/identity"
+    if [ "$LEGACY_ADOPTION_ACTIVE" = false ]; then
+        as_root chown "$TARGET_USER:$TARGET_GROUP" "$NODE_DATA_DIR"
+        as_root chmod 700 "$NODE_DATA_DIR"
+    fi
 else
     ensure_private_dir "$ARC_DIR"
     ensure_private_dir "$ARC_DIR/bin"
     ensure_private_dir "$ARC_DIR/identity"
-    ensure_private_dir "$NODE_DATA_DIR"
+    if [ "$LEGACY_ADOPTION_ACTIVE" = false ]; then
+        ensure_private_dir "$NODE_DATA_DIR"
+    fi
 fi
 if [ "$SERVICE_SCOPE" != system ]; then
     as_target test -w "$ARC_DIR" \
         || die "Install user $TARGET_USER cannot write $ARC_DIR"
 fi
-as_target test -w "$NODE_DATA_DIR" \
-    || die "Install user $TARGET_USER cannot write data directory $NODE_DATA_DIR"
+if [ "$LEGACY_ADOPTION_ACTIVE" = false ]; then
+    as_target test -w "$NODE_DATA_DIR" \
+        || die "Install user $TARGET_USER cannot write data directory $NODE_DATA_DIR"
+fi
 if [ -n "$MODEL_PATH" ]; then
     as_target test -r "$MODEL_PATH" \
         || die "Install user $TARGET_USER cannot read model $MODEL_PATH"
@@ -2166,6 +2380,85 @@ fi
 TRANSACTION_ACTIVE=false
 TRANSACTION_COMMITTED=false
 TRANSACTION_ROLLING_BACK=false
+LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN=""
+
+ensure_no_legacy_updater_processes() {
+    local process_rows pid process_uid command_line updater_path
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    updater_path="$ARC_DIR/bin/arc-auto-update.sh"
+    process_rows="$(ps -ww -axo pid=,uid=,command= 2>/dev/null)" \
+        || die "Could not enumerate processes while fencing the legacy updater"
+    while read -r pid process_uid command_line; do
+        [ -n "$pid" ] || continue
+        case "$command_line" in
+            "$updater_path"|"$updater_path "*|*" $updater_path"|*" $updater_path "*)
+                die "A legacy unsigned updater process is still running after its schedule was fenced" ;;
+        esac
+    done <<< "$process_rows"
+}
+
+revalidate_legacy_sources_after_updater_fence() {
+    local source_version_before="$LEGACY_SOURCE_VERSION"
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    ensure_no_legacy_updater_processes
+    if [ "$LEGACY_PARTIAL_RESUME" = false ]; then
+        validate_legacy_v07_layout
+        [ "$LEGACY_SOURCE_VERSION" = "$source_version_before" ] \
+            || die "Legacy node version changed while the updater was being fenced"
+        preserve_legacy_v07_configuration
+    fi
+    validate_legacy_supervisor_archive_binding
+}
+
+fence_legacy_updater_before_network() {
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    case "$LEGACY_SUPERVISOR_KIND" in
+        linux-system)
+            if legacy_path_present "$LEGACY_LINUX_UPDATER_SERVICE"; then
+                as_root systemctl disable --now arc-updater.timer >/dev/null 2>&1 \
+                    || die "Could not fence the legacy updater timer"
+                as_root systemctl disable --now arc-updater.service >/dev/null 2>&1 \
+                    || die "Could not fence the running legacy updater"
+                if as_root systemctl is-active --quiet arc-updater.timer \
+                    || as_root systemctl is-enabled --quiet arc-updater.timer \
+                    || as_root systemctl is-active --quiet arc-updater.service \
+                    || as_root systemctl is-enabled --quiet arc-updater.service; then
+                    die "Legacy updater schedule remained active after fencing"
+                fi
+            fi ;;
+        macos-launchd)
+            LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN="user/$TARGET_UID"
+            if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
+                LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN="gui/$TARGET_UID"
+            fi
+            if legacy_path_present "$LEGACY_MAC_UPDATER_PLIST"; then
+                launchctl disable \
+                    "$LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN/com.arc.updater" \
+                    >/dev/null 2>&1 \
+                    || die "Could not persistently fence the legacy macOS updater"
+            fi
+            if launchctl print \
+                "$LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN/com.arc.updater" \
+                >/dev/null 2>&1; then
+                LEGACY_MAC_UPDATER_LOADED=true
+                launchctl bootout \
+                    "$LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN/com.arc.updater" \
+                    >/dev/null 2>&1 \
+                    || die "Could not fence the legacy macOS updater"
+                if launchctl print \
+                    "$LEGACY_UPDATER_FENCE_LAUNCHD_DOMAIN/com.arc.updater" \
+                    >/dev/null 2>&1; then
+                    die "Legacy macOS updater remained loaded after fencing"
+                fi
+            fi ;;
+    esac
+    # The v0.7 updater ignores this install lock. Re-read every source after
+    # it is definitely absent so a mid-reservation replacement cannot cross
+    # the transaction boundary unnoticed. Once fenced, it intentionally stays
+    # fenced on every failure: durable migration evidence must never coexist
+    # with an unsigned updater that can invalidate that evidence.
+    revalidate_legacy_sources_after_updater_fence
+}
 
 LOCK_DIR="$ARC_DIR/.install.lock"
 if [ "$SERVICE_SCOPE" = system ]; then
@@ -2203,11 +2496,42 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+fence_legacy_updater_before_network
+if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
+    # No marker or archive is published until the install lock is held and the
+    # unsigned v0.7 updater is absent. Archive-first publication means a crash
+    # cannot pin stale source bytes behind a live updater schedule.
+    if [ "$LEGACY_ADOPTION_MARKER_NEEDS_CREATE" = true ]; then
+        create_legacy_adoption_marker
+        LEGACY_ADOPTION_MARKER_NEEDS_CREATE=false
+    fi
+    if [ "$LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION" = true ]; then
+        validate_resumable_legacy_evidence
+        LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=false
+    fi
+    validate_legacy_adoption_marker
+    validate_legacy_supervisor_archive_binding
+fi
+
 NODE_ASSET="arc-node-$PLATFORM"
 CLI_ASSET="arc-cli-$PLATFORM"
+HEADLESS_CHANNEL_MINIMUM_VERSION=0.8.0
 
 strict_version() {
     printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+# Bash arithmetic is signed and accepts implementation-specific integer
+# spellings.  Network evidence is compared arithmetically below, so accept
+# only canonical decimal integers small enough to remain portable.
+canonical_uint() {
+    local value="$1"
+    [ -n "$value" ] && [ "${#value}" -le 18 ] || return 1
+    case "$value" in
+        *[!0-9]*) return 1 ;;
+        0|[1-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 extract_version() {
@@ -2237,17 +2561,407 @@ github_curl() {
     curl "${args[@]}" "$url"
 }
 
+# GitHub's global `latest` pointer must remain on the v0.7-compatible release
+# until every unsigned v0.7 updater has been retired.  New headless installs
+# and the signed v0.8 updater therefore discover their own channel from the
+# release collection, then resolve and authenticate one exact immutable tag.
+#
+# This small JSON scanner deliberately recognizes only a top-level release
+# object's literal `tag_name` string.  A release body containing escaped JSON,
+# or a nested asset object, cannot inject a candidate.  The selected tag is
+# still treated only as discovery: the exact-tag response, protected source
+# commit, owner-signed manifest, and every payload are verified below.
+extract_top_level_release_tags() {
+    awk '
+        BEGIN {
+            object_depth = 0
+            array_depth = 0
+            root_started = 0
+            root_closed = 0
+            in_string = 0
+            escaped = 0
+            token = ""
+            token_had_escape = 0
+            tag_key_pending = 0
+            tag_value_pending = 0
+            capture_tag_value = 0
+        }
+        {
+            line = $0 "\n"
+            for (i = 1; i <= length(line); i++) {
+                ch = substr(line, i, 1)
+                if (in_string) {
+                    if (escaped) {
+                        token_had_escape = 1
+                        escaped = 0
+                        continue
+                    }
+                    if (ch == "\\") {
+                        escaped = 1
+                        continue
+                    }
+                    if (ch == "\"") {
+                        in_string = 0
+                        if (capture_tag_value) {
+                            if (!token_had_escape) print token
+                            capture_tag_value = 0
+                        } else if (object_depth == 1 && !token_had_escape && token == "tag_name") {
+                            tag_key_pending = 1
+                        }
+                        token = ""
+                        token_had_escape = 0
+                        continue
+                    }
+                    token = token ch
+                    continue
+                }
+
+                if (root_closed && ch !~ /[[:space:]]/) exit 2
+
+                if (tag_key_pending) {
+                    if (ch ~ /[[:space:]]/) continue
+                    tag_key_pending = 0
+                    if (ch == ":") {
+                        tag_value_pending = 1
+                        continue
+                    }
+                }
+                if (tag_value_pending) {
+                    if (ch ~ /[[:space:]]/) continue
+                    tag_value_pending = 0
+                    if (ch == "\"" && object_depth == 1) {
+                        in_string = 1
+                        token = ""
+                        token_had_escape = 0
+                        capture_tag_value = 1
+                        continue
+                    }
+                }
+
+                if (ch == "\"") {
+                    if (!root_started || root_closed) exit 2
+                    in_string = 1
+                    token = ""
+                    token_had_escape = 0
+                } else if (ch == "{") {
+                    if (!root_started) root_started = 1
+                    object_depth += 1
+                } else if (ch == "}") {
+                    if (object_depth <= 0) exit 2
+                    object_depth -= 1
+                    tag_key_pending = 0
+                    tag_value_pending = 0
+                    if (object_depth == 0 && array_depth == 0) root_closed = 1
+                } else if (ch == "[") {
+                    if (!root_started) root_started = 1
+                    array_depth += 1
+                } else if (ch == "]") {
+                    if (array_depth <= 0) exit 2
+                    array_depth -= 1
+                    if (object_depth == 0 && array_depth == 0) root_closed = 1
+                } else if (!root_started && ch !~ /[[:space:]]/) {
+                    exit 2
+                }
+            }
+        }
+        END {
+            if (in_string || escaped || object_depth != 0 || array_depth != 0 \
+                || !root_started || !root_closed) exit 2
+        }
+    ' "$1"
+}
+
+# Emit exactly one top-level JSON scalar as either `string<TAB>value` or
+# `bare<TAB>value`. This keeps the installer dependency-free on minimal Linux
+# and macOS hosts while avoiding regex matches inside nested objects, arrays,
+# or quoted prose. Escaped top-level keys and escaped selected values fail
+# closed because every field consumed below has a canonical ASCII spelling.
+extract_unique_top_level_json_scalar() {
+    local json_file="$1" wanted_key="$2"
+    awk -v wanted="$wanted_key" '
+        function fail() { failed = 1; exit 2 }
+        function emit(kind, value) {
+            if (found) fail()
+            print kind "\t" value
+            found = 1
+        }
+        BEGIN {
+            mode = "before"
+            object_depth = 0
+            array_depth = 0
+            in_string = 0
+            escaped = 0
+            string_kind = ""
+            token = ""
+            token_had_escape = 0
+            key = ""
+            root_closed = 0
+            found = 0
+            failed = 0
+        }
+        {
+            line = $0 "\n"
+            for (i = 1; i <= length(line); i++) {
+                ch = substr(line, i, 1)
+                if (root_closed) {
+                    if (ch !~ /[[:space:]]/) fail()
+                    continue
+                }
+                if (in_string) {
+                    if (escaped) {
+                        token_had_escape = 1
+                        escaped = 0
+                        token = token ch
+                        continue
+                    }
+                    if (ch == "\\") {
+                        escaped = 1
+                        token_had_escape = 1
+                        continue
+                    }
+                    if (ch == "\"") {
+                        in_string = 0
+                        if (string_kind == "key") {
+                            if (token_had_escape) fail()
+                            key = token
+                            mode = "colon"
+                        } else if (string_kind == "value") {
+                            if (key == wanted) {
+                                if (token_had_escape) fail()
+                                emit("string", token)
+                            }
+                            mode = "comma"
+                        }
+                        string_kind = ""
+                        token = ""
+                        token_had_escape = 0
+                        continue
+                    }
+                    token = token ch
+                    continue
+                }
+
+                if (mode == "before") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch != "{") fail()
+                    object_depth = 1
+                    mode = "key"
+                    continue
+                }
+
+                if (mode == "nested") {
+                    if (ch == "\"") {
+                        in_string = 1
+                        string_kind = "nested"
+                        token = ""
+                        token_had_escape = 0
+                    } else if (ch == "{") {
+                        object_depth += 1
+                    } else if (ch == "}") {
+                        if (object_depth <= 1) fail()
+                        object_depth -= 1
+                        if (object_depth == 1 && array_depth == 0) mode = "comma"
+                    } else if (ch == "[") {
+                        array_depth += 1
+                    } else if (ch == "]") {
+                        if (array_depth <= 0) fail()
+                        array_depth -= 1
+                        if (object_depth == 1 && array_depth == 0) mode = "comma"
+                    }
+                    continue
+                }
+
+                if (mode == "key") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == "}") {
+                        object_depth = 0
+                        root_closed = 1
+                        continue
+                    }
+                    if (ch != "\"") fail()
+                    in_string = 1
+                    string_kind = "key"
+                    token = ""
+                    token_had_escape = 0
+                    continue
+                }
+                if (mode == "colon") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch != ":") fail()
+                    mode = "value"
+                    continue
+                }
+                if (mode == "value") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == "\"") {
+                        in_string = 1
+                        string_kind = "value"
+                        token = ""
+                        token_had_escape = 0
+                    } else if (ch == "{") {
+                        object_depth += 1
+                        mode = "nested"
+                    } else if (ch == "[") {
+                        array_depth += 1
+                        mode = "nested"
+                    } else {
+                        token = ch
+                        mode = "bare"
+                    }
+                    continue
+                }
+                if (mode == "bare") {
+                    if (ch == "," || ch == "}") {
+                        sub(/^[[:space:]]+/, "", token)
+                        sub(/[[:space:]]+$/, "", token)
+                        if (token == "" || token ~ /[[:space:]\"{}\[\],:]/) fail()
+                        if (key == wanted) emit("bare", token)
+                        token = ""
+                        if (ch == ",") {
+                            mode = "key"
+                        } else {
+                            object_depth = 0
+                            root_closed = 1
+                        }
+                    } else {
+                        token = token ch
+                    }
+                    continue
+                }
+                if (mode == "comma") {
+                    if (ch ~ /[[:space:]]/) continue
+                    if (ch == ",") {
+                        mode = "key"
+                    } else if (ch == "}") {
+                        object_depth = 0
+                        root_closed = 1
+                    } else {
+                        fail()
+                    }
+                }
+            }
+        }
+        END {
+            if (failed || in_string || escaped || !root_closed \
+                || object_depth != 0 || array_depth != 0 || !found) exit 2
+        }
+    ' "$json_file"
+}
+
+top_level_json_string() {
+    local row kind value
+    row="$(extract_unique_top_level_json_scalar "$1" "$2")" || return 1
+    kind="${row%%$'\t'*}"
+    value="${row#*$'\t'}"
+    [ "$kind" = string ] && [ "$value" != "$row" ] || return 1
+    printf '%s\n' "$value"
+}
+
+top_level_json_bare() {
+    local row kind value
+    row="$(extract_unique_top_level_json_scalar "$1" "$2")" || return 1
+    kind="${row%%$'\t'*}"
+    value="${row#*$'\t'}"
+    [ "$kind" = bare ] && [ "$value" != "$row" ] || return 1
+    printf '%s\n' "$value"
+}
+
+select_headless_channel_version() {
+    local releases_url="$API_ROOT/releases?per_page=100"
+    local tag candidate_version comparison candidate_metadata
+    if ! github_curl "$releases_url" > "$TMP_DIR/releases.json"; then
+        die "Could not read the ARC v0.8 release channel: $releases_url"
+    fi
+    if ! extract_top_level_release_tags "$TMP_DIR/releases.json" \
+        > "$TMP_DIR/release-tags"; then
+        die "GitHub returned malformed release-channel metadata"
+    fi
+    : > "$TMP_DIR/release-candidates"
+    while IFS= read -r tag; do
+        case "$tag" in v*) tag="${tag#v}" ;; *) continue ;; esac
+        strict_version "$tag" || continue
+        comparison="$(version_compare "$tag" "$HEADLESS_CHANNEL_MINIMUM_VERSION")"
+        [ "$comparison" -ge 0 ] || continue
+        if ! grep -Fxq -- "$tag" "$TMP_DIR/release-candidates"; then
+            printf '%s\n' "$tag" >> "$TMP_DIR/release-candidates"
+        fi
+    done < "$TMP_DIR/release-tags"
+    [ -s "$TMP_DIR/release-candidates" ] \
+        || die "No ARC v0.8+ release tag is discoverable; use --version only with a reviewed exact tag"
+
+    # A tag name in the collection is discovery input, not a channel member.
+    # Walk candidates from highest to lowest and exact-resolve each one until
+    # an immutable stable protected-publisher release is found. Otherwise a
+    # manually published v999.0.0 draft/prerelease could poison every unpinned
+    # install even though a valid lower stable release still exists.
+    : > "$TMP_DIR/release-candidates-rejected"
+    while :; do
+        candidate_version=""
+        while IFS= read -r tag; do
+            grep -Fxq -- "$tag" "$TMP_DIR/release-candidates-rejected" && continue
+            if [ -z "$candidate_version" ] \
+                || [ "$(version_compare "$tag" "$candidate_version")" -gt 0 ]; then
+                candidate_version="$tag"
+            fi
+        done < "$TMP_DIR/release-candidates"
+        [ -n "$candidate_version" ] || break
+
+        candidate_metadata="$TMP_DIR/release-candidate-$candidate_version.json"
+        if github_curl "$API_ROOT/releases/tags/v$candidate_version" \
+            > "$candidate_metadata" \
+            && release_metadata_is_channel_eligible \
+                "$candidate_metadata" "$candidate_version"; then
+            mv -- "$candidate_metadata" "$TMP_DIR/release.json"
+            REQUESTED_VERSION="$candidate_version"
+            RELEASE_METADATA_PREFETCHED=true
+            return 0
+        fi
+        printf '%s\n' "$candidate_version" >> "$TMP_DIR/release-candidates-rejected"
+        rm -f -- "$candidate_metadata"
+    done
+    die "No immutable stable ARC v0.8+ release from the protected publisher is discoverable"
+}
+
+release_metadata_is_channel_eligible() {
+    local metadata_file="$1" expected_version="$2"
+    local key expected rejected flattened tags resolved
+    for key in immutable draft prerelease; do
+        case "$key" in
+            immutable) expected=true; rejected=false ;;
+            *) expected=false; rejected=true ;;
+        esac
+        grep -Eq "\"$key\"[[:space:]]*:[[:space:]]*$expected([[:space:]]*[,}])" \
+            "$metadata_file" || return 1
+        if grep -Eq "\"$key\"[[:space:]]*:[[:space:]]*$rejected([[:space:]]*[,}])" \
+            "$metadata_file"; then
+            return 1
+        fi
+    done
+    flattened="$TMP_DIR/release-channel-one-line-$expected_version.json"
+    tr -d '\r\n' < "$metadata_file" > "$flattened"
+    grep -Eq '"author"[[:space:]]*:[[:space:]]*\{[[:space:]]*"login"[[:space:]]*:[[:space:]]*"github-actions\[bot\]"([[:space:]]*[,}])' \
+        "$flattened" || return 1
+    tags="$TMP_DIR/release-channel-tags-$expected_version"
+    extract_top_level_release_tags "$metadata_file" > "$tags" || return 1
+    [ "$(awk 'END { print NR + 0 }' "$tags")" -eq 1 ] || return 1
+    resolved="$(sed -n '1p' "$tags")"
+    [ "$resolved" = "v$expected_version" ]
+}
+
+RELEASE_METADATA_PREFETCHED=false
+
 if [ -n "$REQUESTED_VERSION" ]; then
     REQUESTED_VERSION="${REQUESTED_VERSION#v}"
     strict_version "$REQUESTED_VERSION" \
         || die "Version must be strict X.Y.Z (got: $REQUESTED_VERSION)"
-    RELEASE_METADATA_URL="$API_ROOT/releases/tags/v$REQUESTED_VERSION"
 else
-    RELEASE_METADATA_URL="$API_ROOT/releases/latest"
+    select_headless_channel_version
 fi
+RELEASE_METADATA_URL="$API_ROOT/releases/tags/v$REQUESTED_VERSION"
 
 info "Resolving a complete release for $PLATFORM"
-if ! github_curl "$RELEASE_METADATA_URL" > "$TMP_DIR/release.json"; then
+if [ "$RELEASE_METADATA_PREFETCHED" = false ] \
+    && ! github_curl "$RELEASE_METADATA_URL" > "$TMP_DIR/release.json"; then
     die "Could not read GitHub release metadata: $RELEASE_METADATA_URL"
 fi
 
@@ -2282,7 +2996,13 @@ grep -Eq '"author"[[:space:]]*:[[:space:]]*\{[[:space:]]*"login"[[:space:]]*:[[:
     "$TMP_DIR/release-one-line.json" \
     || die "Release metadata author must be github-actions[bot] from the protected publisher"
 
-RESOLVED_TAG="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP_DIR/release.json" | head -n 1)"
+if ! extract_top_level_release_tags "$TMP_DIR/release.json" \
+    > "$TMP_DIR/exact-release-tags"; then
+    die "Exact release metadata is malformed"
+fi
+[ "$(awk 'END { print NR + 0 }' "$TMP_DIR/exact-release-tags")" -eq 1 ] \
+    || die "Exact release metadata must contain exactly one top-level tag"
+RESOLVED_TAG="$(sed -n '1p' "$TMP_DIR/exact-release-tags")"
 case "$RESOLVED_TAG" in v*) VERSION="${RESOLVED_TAG#v}" ;; *) die "Release metadata has no valid vX.Y.Z tag" ;; esac
 strict_version "$VERSION" || die "Release tag is not strict vX.Y.Z: $RESOLVED_TAG"
 if [ -n "$REQUESTED_VERSION" ] && [ "$VERSION" != "$REQUESTED_VERSION" ]; then
@@ -2409,6 +3129,620 @@ DOWNLOADED_CLI_VERSION="$("$TMP_DIR/$CLI_ASSET" --version 2>/dev/null | extract_
     || die "$NODE_ASSET reports v${DOWNLOADED_NODE_VERSION:-unknown}, expected v$VERSION"
 [ "$DOWNLOADED_CLI_VERSION" = "$VERSION" ] \
     || die "$CLI_ASSET reports v${DOWNLOADED_CLI_VERSION:-unknown}, expected v$VERSION"
+
+LEGACY_BOUNDARY_ASSET=arc-legacy-maintenance-boundary.json
+RECOVERY_DESCRIPTOR_ASSET=arc-recovery-checkpoint-descriptor.json
+CUTOVER_POLICY_ASSET=arc-cutover-policy.json
+RELEASE_INSTALLER_BINDING="$TMP_DIR/arc-release-installer-binding.json"
+RETIREMENT_MANIFEST_HASH=""
+RETIREMENT_NETWORK_GENESIS_HASH=""
+RETIREMENT_RECOVERY_DOMAIN=""
+RETIREMENT_RECOVERY_EPOCH=""
+RETIREMENT_VALIDATOR_SET_ID=""
+RETIREMENT_SOURCE_HEIGHT=""
+RETIREMENT_TRANSITION_HEIGHT=""
+
+write_release_installer_binding() {
+    local records="$TMP_DIR/release-binding-files" sorted="$TMP_DIR/release-binding-files-sorted"
+    local asset digest first=true
+    : > "$records"
+    for asset in \
+        "$NODE_ASSET" "$CLI_ASSET" genesis.toml \
+        "$LEGACY_BOUNDARY_ASSET" "$RECOVERY_DESCRIPTOR_ASSET" "$CUTOVER_POLICY_ASSET"; do
+        printf '%s\n' "$asset" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' \
+            || die "Internal release-binding asset name is unsafe: $asset"
+        digest="$(sha256_file "$TMP_DIR/$asset")"
+        printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$' \
+            || die "Could not hash release-binding asset: $asset"
+        printf '%s\t%s\n' "$asset" "$digest" >> "$records"
+    done
+    LC_ALL=C sort -t $'\t' -k1,1 "$records" > "$sorted" \
+        || die "Could not canonicalize the release binding"
+    [ "$(cut -f1 "$sorted" | uniq -d | awk 'END { print NR + 0 }')" -eq 0 ] \
+        || die "Release binding contains a duplicate asset"
+    {
+        printf '{"commit":"%s","files":{' "$RESOLVED_COMMIT"
+        while IFS=$'\t' read -r asset digest; do
+            if [ "$first" = true ]; then first=false; else printf ','; fi
+            printf '"%s":"%s"' "$asset" "$digest"
+        done < "$sorted"
+        printf '},"manifest_signature_sha256":"%s"' \
+            "$(sha256_file "$TMP_DIR/SHA256SUMS.sig")"
+        printf ',"repository":"FerrumVir/arc-chain"'
+        printf ',"schema":"arc.release-installer-binding.v1"'
+        printf ',"signed_manifest_sha256":"%s"' \
+            "$(sha256_file "$TMP_DIR/SHA256SUMS")"
+        printf ',"tag":"%s"}\n' "$RESOLVED_TAG"
+    } > "$RELEASE_INSTALLER_BINDING" \
+        || die "Could not write the local release binding"
+    chmod 600 "$RELEASE_INSTALLER_BINDING" \
+        || die "Could not protect the local release binding"
+}
+
+verify_recovery_descriptor_for_retirement() {
+    local output="$TMP_DIR/recovery-descriptor-verification.json"
+    local status hash_value
+    if ! "$TMP_DIR/$NODE_ASSET" recovery verify-descriptor \
+        --descriptor "$TMP_DIR/$RECOVERY_DESCRIPTOR_ASSET" \
+        --genesis "$TMP_DIR/genesis.toml" > "$output"; then
+        die "The signed compact recovery descriptor failed cryptographic verification"
+    fi
+    [ -f "$output" ] && [ ! -L "$output" ] \
+        && [ "$(wc -c < "$output" | tr -d ' ')" -le 1048576 ] \
+        || die "Recovery descriptor verifier returned unsafe output"
+    status="$(top_level_json_string "$output" status)" \
+        || die "Recovery descriptor verifier returned no unique status"
+    [ "$status" = VERIFIED_DESCRIPTOR_QUORUM ] \
+        || die "Recovery descriptor verifier did not prove validator quorum"
+    RETIREMENT_MANIFEST_HASH="$(top_level_json_string "$output" manifest_hash)" \
+        || die "Recovery descriptor verifier omitted manifest_hash"
+    RETIREMENT_NETWORK_GENESIS_HASH="$(top_level_json_string "$output" network_genesis_hash)" \
+        || die "Recovery descriptor verifier omitted network_genesis_hash"
+    RETIREMENT_RECOVERY_DOMAIN="$(top_level_json_string "$output" recovery_domain)" \
+        || die "Recovery descriptor verifier omitted recovery_domain"
+    for hash_value in \
+        "$RETIREMENT_MANIFEST_HASH" "$RETIREMENT_NETWORK_GENESIS_HASH" \
+        "$RETIREMENT_RECOVERY_DOMAIN"; do
+        printf '%s\n' "$hash_value" | grep -Eq '^[0-9a-f]{64}$' \
+            || die "Recovery descriptor verifier returned a malformed hash"
+    done
+    RETIREMENT_RECOVERY_EPOCH="$(top_level_json_bare "$output" recovery_epoch)" \
+        || die "Recovery descriptor verifier omitted recovery_epoch"
+    RETIREMENT_VALIDATOR_SET_ID="$(top_level_json_bare "$output" validator_set_id)" \
+        || die "Recovery descriptor verifier omitted validator_set_id"
+    RETIREMENT_SOURCE_HEIGHT="$(top_level_json_bare "$output" source_height)" \
+        || die "Recovery descriptor verifier omitted source_height"
+    RETIREMENT_TRANSITION_HEIGHT="$(top_level_json_bare "$output" transition_height)" \
+        || die "Recovery descriptor verifier omitted transition_height"
+    canonical_uint "$RETIREMENT_RECOVERY_EPOCH" \
+        && canonical_uint "$RETIREMENT_VALIDATOR_SET_ID" \
+        && canonical_uint "$RETIREMENT_SOURCE_HEIGHT" \
+        && canonical_uint "$RETIREMENT_TRANSITION_HEIGHT" \
+        || die "Recovery descriptor verifier returned malformed numeric identity"
+    [ "$RETIREMENT_SOURCE_HEIGHT" -eq 137145 ] \
+        && [ "$RETIREMENT_TRANSITION_HEIGHT" -eq 137146 ] \
+        && [ "$RETIREMENT_RECOVERY_EPOCH" -eq 1 ] \
+        && [ "$RETIREMENT_VALIDATOR_SET_ID" -eq 1 ] \
+        || die "Recovery descriptor differs from the fixed ARC cutover boundary"
+}
+
+ensure_legacy_retirement_evidence_dirs() {
+    local expected_uid directory
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    expected_uid="$(legacy_expected_owner_uid)"
+    for directory in "$LEGACY_RETIREMENT_DIR" "$LEGACY_RETIREMENT_RELEASE_DIR"; do
+        if legacy_path_present "$directory"; then
+            validate_owned_nonwritable_path "$directory" \
+                "legacy retirement evidence directory" directory "$expected_uid"
+            continue
+        fi
+        install_root_as_owner mkdir -- "$directory" \
+            || die "Could not create legacy retirement evidence directory: $directory"
+        install_root_as_owner chmod 700 "$directory" \
+            || die "Could not protect legacy retirement evidence directory: $directory"
+        sync
+        validate_owned_nonwritable_path "$directory" \
+            "legacy retirement evidence directory" directory "$expected_uid"
+    done
+}
+
+publish_legacy_retirement_file() {
+    local source="$1" destination="$2" label="$3"
+    local expected_uid source_sha destination_sha staged parent
+    expected_uid="$(legacy_expected_owner_uid)"
+    source_sha="$(sha256_file "$source")"
+    printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{64}$' \
+        || die "Could not hash $label"
+    if legacy_path_present "$destination"; then
+        validate_owned_nonwritable_path "$destination" "$label" file "$expected_uid"
+        destination_sha="$(sha256_file "$destination")"
+        [ "$destination_sha" = "$source_sha" ] \
+            || die "Existing $label differs from the exact retirement evidence"
+        printf '%s\n' "$destination_sha"
+        return 0
+    fi
+    parent="$(dirname -- "$destination")"
+    staged="$(install_root_as_owner mktemp "$parent/.arc-retirement.new.XXXXXX")" \
+        || die "Could not reserve $label"
+    if ! install_root_as_owner cp -- "$source" "$staged" \
+        || ! install_root_as_owner chmod 600 "$staged"; then
+        install_root_as_owner rm -f -- "$staged" || true
+        die "Could not stage $label"
+    fi
+    if ! install_root_as_owner mv -n -- "$staged" "$destination" \
+        || legacy_path_present "$staged"; then
+        install_root_as_owner rm -f -- "$staged" || true
+        die "$label appeared concurrently"
+    fi
+    sync
+    validate_owned_nonwritable_path "$destination" "$label" file "$expected_uid"
+    destination_sha="$(sha256_file "$destination")"
+    [ "$destination_sha" = "$source_sha" ] \
+        || die "Published $label differs from its staged bytes"
+    printf '%s\n' "$destination_sha"
+}
+
+json_quote() {
+    local value="$1"
+    if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        die "Retirement evidence contains an unsupported control character"
+    fi
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "$value"
+}
+
+write_legacy_retirement_supervisor_binding() {
+    local supervisor_kind source_path source_sha executable_sha legacy_seed
+    local temporary="$TMP_DIR/legacy-supervisor-binding.json" token first=true
+    local -a argv=()
+    case "$LEGACY_SUPERVISOR_KIND" in
+        linux-system)
+            supervisor_kind=systemd
+            source_path="$LEGACY_PRESERVED_DIR/legacy-linux-arc-node.service"
+            while IFS= read -r token; do argv+=("$token"); done \
+                < <(legacy_systemd_exec_tokens "$source_path") ;;
+        macos-launchd)
+            supervisor_kind=launchd
+            source_path="$LEGACY_PRESERVED_DIR/legacy-macos-com.arc.inference.plist"
+            while IFS= read -r token; do argv+=("$token"); done \
+                < <(plist_program_arguments "$source_path") ;;
+        detached|detached-untracked)
+            supervisor_kind=manual
+            source_path="$LEGACY_PRESERVED_DIR/legacy-detached-topology"
+            argv=("${LEGACY_DETACHED_RESTART_ARGS[@]}") ;;
+        none)
+            # A stopped no-service v0.7 default has no live supervisor source.
+            # Bind the exact archived release version plus the only recognized
+            # stake-zero command that the legacy default layout can resume.
+            supervisor_kind=manual
+            source_path="$LEGACY_PRESERVED_DIR/version.txt"
+            legacy_seed="$(sed -n '1p' "$LEGACY_PRESERVED_DIR/identity.seed")"
+            argv=(
+                "$ARC_DIR/bin/arc-node"
+                --rpc "0.0.0.0:$RPC_PORT"
+                --p2p-port "$P2P_PORT"
+                --seeds-file "$ARC_DIR/seeds.txt"
+                --genesis "$ARC_DIR/genesis.toml"
+                --validator-seed "$legacy_seed"
+                --stake 0 --min-stake 0 --eth-rpc-port 0
+                --data-dir "$ARC_DIR/data"
+            )
+            [ -z "$MODEL_PATH" ] || argv+=(--model "$MODEL_PATH")
+            argv+=(--community-mode) ;;
+        *) die "Internal unsupported retirement supervisor: $LEGACY_SUPERVISOR_KIND" ;;
+    esac
+    [ "${#argv[@]}" -gt 0 ] && [ "${argv[0]}" = "$ARC_DIR/bin/arc-node" ] \
+        || die "Legacy retirement supervisor does not bind the exact v0.7 executable"
+    validate_owned_nonwritable_path "$source_path" \
+        "legacy retirement supervisor source" file "$(legacy_expected_owner_uid)"
+    source_sha="$(sha256_file "$source_path")"
+    executable_sha="$(sha256_file "$ARC_DIR/bin/arc-node")"
+    {
+        printf '{"argv":['
+        for token in "${argv[@]}"; do
+            if [ "$first" = true ]; then first=false; else printf ','; fi
+            json_quote "$token"
+        done
+        printf '],"executable_path":'
+        json_quote "$ARC_DIR/bin/arc-node"
+        printf ',"executable_sha256":"%s","kind":' "$executable_sha"
+        json_quote "$supervisor_kind"
+        printf ',"schema":"arc.migration.legacy-v07-supervisor-binding.v1","source_path":'
+        json_quote "$source_path"
+        printf ',"source_sha256":"%s"}\n' "$source_sha"
+    } > "$temporary" || die "Could not write the canonical legacy supervisor binding"
+    LEGACY_RETIREMENT_SUPERVISOR_BINDING_SHA256="$(publish_legacy_retirement_file \
+        "$temporary" "$LEGACY_RETIREMENT_SUPERVISOR_BINDING" \
+        "legacy retirement supervisor binding")"
+}
+
+stage_legacy_retirement_release_evidence() {
+    local asset
+    ensure_legacy_retirement_evidence_dirs
+    for asset in \
+        "$LEGACY_BOUNDARY_ASSET" "$RECOVERY_DESCRIPTOR_ASSET" "$CUTOVER_POLICY_ASSET"; do
+        publish_legacy_retirement_file "$TMP_DIR/$asset" \
+            "$LEGACY_RETIREMENT_RELEASE_DIR/$asset" \
+            "legacy retirement release asset $asset" >/dev/null
+    done
+    publish_legacy_retirement_file "$RELEASE_INSTALLER_BINDING" \
+        "$LEGACY_RETIREMENT_RELEASE_DIR/arc-release-installer-binding.json" \
+        "legacy retirement release binding" >/dev/null
+    RELEASE_INSTALLER_BINDING="$LEGACY_RETIREMENT_RELEASE_DIR/arc-release-installer-binding.json"
+    write_legacy_retirement_supervisor_binding
+}
+
+if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
+    download_checked "$LEGACY_BOUNDARY_ASSET"
+    download_checked "$RECOVERY_DESCRIPTOR_ASSET"
+    download_checked "$CUTOVER_POLICY_ASSET"
+    write_release_installer_binding
+    verify_recovery_descriptor_for_retirement
+    stage_legacy_retirement_release_evidence
+fi
+
+network_https_curl() {
+    local url="$1"
+    curl --fail --silent --show-error --location --retry 2 \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 20 \
+        --header 'Accept: application/json' \
+        --header 'User-Agent: arc-chain-legacy-retirement-gate' \
+        "$url"
+}
+
+legacy_http_listener_responds() {
+    local url="$1"
+    # No --fail: any HTTP status proves a legacy listener or proxy still
+    # answers on the exact port the released worker uses. Connection refusal,
+    # routing failure, or timeout proves that this host cannot open a new
+    # legacy claim/submit channel at the cutover boundary.
+    curl --silent --show-error --output /dev/null \
+        --proto '=http' --connect-timeout 3 --max-time 5 "$url"
+}
+
+verify_legacy_v07_network_retirement() {
+    local index origin host info_file error_file failed=0 hash_value
+    local node_version protocol_version recovery_active recovery_epoch validator_set_id
+    local validator_address checkpoint_hash transaction_domain network_genesis_hash height
+    local expected_address shared_checkpoint="" shared_domain="" shared_genesis=""
+    local info_pids=() probe_pids=() probe_labels=()
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    [ "${#COMMUNITY_RPC_ORIGINS[@]}" -eq 6 ] \
+        && [ "${#COMMUNITY_VALIDATOR_ADDRESSES[@]}" -eq 6 ] \
+        || die "Legacy retirement gate has an incomplete fixed validator topology"
+
+    info "Proving all six recovered v3 validators are live before retiring v0.7"
+    for ((index=0; index<${#COMMUNITY_RPC_ORIGINS[@]}; index++)); do
+        origin="${COMMUNITY_RPC_ORIGINS[$index]}"
+        info_file="$TMP_DIR/legacy-retirement-info-$index.json"
+        error_file="$TMP_DIR/legacy-retirement-info-$index.stderr"
+        ( network_https_curl "$origin/network/info" > "$info_file" 2> "$error_file" ) &
+        info_pids+=("$!")
+    done
+    for ((index=0; index<${#info_pids[@]}; index++)); do
+        if ! wait "${info_pids[$index]}"; then
+            warn "Recovered validator did not answer authenticated HTTPS: ${COMMUNITY_RPC_ORIGINS[$index]}"
+            failed=1
+        fi
+    done
+    [ "$failed" -eq 0 ] \
+        || die "The recovered v3 fleet is not fully reachable; the running v0.7 node was not stopped"
+
+    for ((index=0; index<${#COMMUNITY_RPC_ORIGINS[@]}; index++)); do
+        origin="${COMMUNITY_RPC_ORIGINS[$index]}"
+        info_file="$TMP_DIR/legacy-retirement-info-$index.json"
+        [ -f "$info_file" ] && [ ! -L "$info_file" ] \
+            && [ "$(wc -c < "$info_file" | tr -d ' ')" -le 1048576 ] \
+            || die "Recovered validator returned unsafe /info evidence: $origin"
+        node_version="$(top_level_json_string "$info_file" node_version)" \
+            || die "Recovered validator /network/info has no unique node_version: $origin"
+        protocol_version="$(top_level_json_string "$info_file" protocol_version)" \
+            || die "Recovered validator /network/info has no unique protocol_version: $origin"
+        strict_version "$node_version" \
+            && [ "$(version_compare "$node_version" 0.8.0)" -ge 0 ] \
+            || die "Validator is not running v0.8-or-newer node code: $origin"
+        strict_version "$protocol_version" \
+            && [ "$(version_compare "$protocol_version" 0.8.0)" -ge 0 ] \
+            || die "Validator has not sealed a v0.8-or-newer protocol block: $origin"
+
+        recovery_active="$(top_level_json_bare "$info_file" recovery_active)" \
+            || die "Recovered validator /network/info has no unique recovery_active field: $origin"
+        [ "$recovery_active" = true ] \
+            || die "Validator has no active checkpoint recovery context: $origin"
+        recovery_epoch="$(top_level_json_bare "$info_file" recovery_epoch)" \
+            || die "Recovered validator /network/info has no unique recovery_epoch: $origin"
+        validator_set_id="$(top_level_json_bare "$info_file" validator_set_id)" \
+            || die "Recovered validator /network/info has no unique validator_set_id: $origin"
+        height="$(top_level_json_bare "$info_file" height)" \
+            || die "Recovered validator /network/info has no unique height: $origin"
+        canonical_uint "$recovery_epoch" \
+            && canonical_uint "$validator_set_id" \
+            && canonical_uint "$height" \
+            || die "Recovered validator returned malformed numeric identity: $origin"
+        [ "$recovery_epoch" -eq "$RETIREMENT_RECOVERY_EPOCH" ] \
+            && [ "$validator_set_id" -eq "$RETIREMENT_VALIDATOR_SET_ID" ] \
+            && [ "$height" -ge "$RETIREMENT_TRANSITION_HEIGHT" ] \
+            || die "Validator has not crossed the approved v0.7 retirement boundary: $origin"
+
+        validator_address="$(top_level_json_string "$info_file" validator_address)" \
+            || die "Recovered validator /network/info has no unique validator_address: $origin"
+        expected_address="0x${COMMUNITY_VALIDATOR_ADDRESSES[$index]}"
+        [ "$validator_address" = "$expected_address" ] \
+            || die "Recovered validator identity differs for $origin"
+        checkpoint_hash="$(top_level_json_string "$info_file" checkpoint_manifest_hash)" \
+            || die "Recovered validator /network/info has no unique checkpoint_manifest_hash: $origin"
+        transaction_domain="$(top_level_json_string "$info_file" transaction_domain)" \
+            || die "Recovered validator /network/info has no unique transaction_domain: $origin"
+        network_genesis_hash="$(top_level_json_string "$info_file" network_genesis_hash)" \
+            || die "Recovered validator /network/info has no unique network_genesis_hash: $origin"
+        for hash_value in "$checkpoint_hash" "$transaction_domain" "$network_genesis_hash"; do
+            printf '%s\n' "$hash_value" | grep -Eq '^0x[0-9a-f]{64}$' \
+                || die "Recovered validator returned a malformed checkpoint/domain/genesis hash: $origin"
+        done
+        [ "$checkpoint_hash" != "0x$(printf '%064d' 0)" ] \
+            && [ "$transaction_domain" != "0x$(printf '%064d' 0)" ] \
+            && [ "$network_genesis_hash" != "0x$(printf '%064d' 0)" ] \
+            || die "Recovered validator returned a zero checkpoint/domain/genesis hash: $origin"
+        [ "$checkpoint_hash" = "0x$RETIREMENT_MANIFEST_HASH" ] \
+            && [ "$transaction_domain" = "0x$RETIREMENT_RECOVERY_DOMAIN" ] \
+            && [ "$network_genesis_hash" = "0x$RETIREMENT_NETWORK_GENESIS_HASH" ] \
+            || die "Recovered validator does not match the signed recovery descriptor: $origin"
+        if [ -z "$shared_checkpoint" ]; then
+            shared_checkpoint="$checkpoint_hash"
+            shared_domain="$transaction_domain"
+            shared_genesis="$network_genesis_hash"
+        elif [ "$checkpoint_hash" != "$shared_checkpoint" ] \
+            || [ "$transaction_domain" != "$shared_domain" ] \
+            || [ "$network_genesis_hash" != "$shared_genesis" ]; then
+            die "Recovered validators disagree on checkpoint, transaction domain, or genesis"
+        fi
+    done
+
+    # Released v0.7 workers use raw HTTP on every seed's :9090 and :3001.
+    # Prove those exact channels are unreachable from this worker before TERM;
+    # a long timeout cannot turn v0.7's immediate-exit handler into a drain.
+    for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
+        host="${origin#https://}"
+        for legacy_port in 9090 3001; do
+            probe_label="$host:$legacy_port"
+            probe_labels+=("$probe_label")
+            ( if legacy_http_listener_responds \
+                    "http://$probe_label/health"; then
+                  exit 0
+              fi
+              exit 1 ) &
+            probe_pids+=("$!")
+        done
+    done
+    for ((index=0; index<${#probe_pids[@]}; index++)); do
+        if wait "${probe_pids[$index]}"; then
+            die "Legacy v0.7 RPC is still reachable at ${probe_labels[$index]}; the old node was not stopped"
+        fi
+    done
+    ok "All six exact validators match the signed checkpoint at or above block $RETIREMENT_TRANSITION_HEIGHT and legacy claim/submit ports are unreachable"
+}
+
+prepare_absent_v08_data_dir_for_retirement() {
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    if ! legacy_path_present "$NODE_DATA_DIR"; then return 0; fi
+    [ "$LEGACY_PARTIAL_RESUME" = true ] \
+        || die "Legacy retirement requires an absent, unused v0.8 data directory: $NODE_DATA_DIR"
+    [ -d "$NODE_DATA_DIR" ] && [ ! -L "$NODE_DATA_DIR" ] \
+        || die "Pending legacy adoption has an unsafe v0.8 data path: $NODE_DATA_DIR"
+    if find "$NODE_DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        die "Pending legacy adoption already wrote v0.8 state; preserve it and inspect before retrying"
+    fi
+    install_root_as_owner rmdir -- "$NODE_DATA_DIR" \
+        || die "Could not remove the empty pre-receipt v0.8 directory"
+    sync
+    [ ! -e "$NODE_DATA_DIR" ] && [ ! -L "$NODE_DATA_DIR" ] \
+        || die "The v0.8 data directory still exists before retirement receipt"
+}
+
+capture_legacy_retirement_process() {
+    local pid=""
+    LEGACY_RETIREMENT_ALREADY_OFFLINE=false
+    case "$LEGACY_SUPERVISOR_KIND" in
+        linux-system)
+            if as_root systemctl is-active --quiet arc-node.service; then
+                pid="$(as_root systemctl show --property=MainPID --value arc-node.service 2>/dev/null)" \
+                    || die "Could not inspect the active legacy systemd PID"
+            fi ;;
+        macos-launchd)
+            [ -n "$LAUNCHD_DOMAIN" ] || LAUNCHD_DOMAIN="user/$TARGET_UID"
+            if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
+                LAUNCHD_DOMAIN="gui/$TARGET_UID"
+            fi
+            pid="$(launchd_service_pid com.arc.inference 2>/dev/null || true)" ;;
+        detached|detached-untracked)
+            if [ -n "$LEGACY_DETACHED_PID" ] \
+                && kill -0 "$LEGACY_DETACHED_PID" 2>/dev/null; then
+                pid="$LEGACY_DETACHED_PID"
+            fi ;;
+        none) ;;
+        *) die "Internal unsupported retirement supervisor: $LEGACY_SUPERVISOR_KIND" ;;
+    esac
+    if [ -n "$pid" ]; then
+        case "$pid" in ''|*[!0-9]*) die "Legacy supervisor returned a malformed PID" ;; esac
+        [ "$pid" -gt 1 ] || die "Legacy supervisor returned an unsafe PID"
+        LEGACY_RETIREMENT_PROCESS_PID="$pid"
+    else
+        LEGACY_RETIREMENT_PROCESS_PID=""
+        LEGACY_RETIREMENT_ALREADY_OFFLINE=true
+    fi
+}
+
+create_legacy_retirement_intent() {
+    local output="$TMP_DIR/legacy-retirement-create.json" status mode reported_sha
+    local legacy_executable_sha release_binding_sha boundary_sha descriptor_sha policy_sha
+    local -a mode_args=()
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    prepare_absent_v08_data_dir_for_retirement
+    if legacy_path_present "$LEGACY_RETIREMENT_INTENT"; then
+        validate_owned_nonwritable_path "$LEGACY_RETIREMENT_INTENT" \
+            "legacy retirement intent" file "$(legacy_expected_owner_uid)"
+        # Conservatively cross the no-restart boundary before parsing an
+        # existing create-only record. A malformed protected record must fail
+        # stopped; it must never cause the installer to revive v0.7.
+        LEGACY_RETIREMENT_INTENT_DURABLE=true
+    fi
+    capture_legacy_retirement_process
+    if [ "$LEGACY_RETIREMENT_ALREADY_OFFLINE" = true ]; then
+        mode_args=(--already-offline)
+    else
+        mode_args=(--legacy-pid "$LEGACY_RETIREMENT_PROCESS_PID")
+    fi
+    legacy_executable_sha="$(sha256_file "$ARC_DIR/bin/arc-node")"
+    release_binding_sha="$(sha256_file "$RELEASE_INSTALLER_BINDING")"
+    boundary_sha="$(sha256_file "$LEGACY_RETIREMENT_RELEASE_DIR/$LEGACY_BOUNDARY_ASSET")"
+    descriptor_sha="$(sha256_file "$LEGACY_RETIREMENT_RELEASE_DIR/$RECOVERY_DESCRIPTOR_ASSET")"
+    policy_sha="$(sha256_file "$LEGACY_RETIREMENT_RELEASE_DIR/$CUTOVER_POLICY_ASSET")"
+    if ! "$TMP_DIR/$NODE_ASSET" legacy-retirement create-intent \
+        --intent-output "$LEGACY_RETIREMENT_INTENT" \
+        --target-release "$RELEASE_INSTALLER_BINDING" \
+        --target-release-sha256 "$release_binding_sha" \
+        --maintenance-boundary "$LEGACY_RETIREMENT_RELEASE_DIR/$LEGACY_BOUNDARY_ASSET" \
+        --maintenance-boundary-sha256 "$boundary_sha" \
+        --cutover-policy "$LEGACY_RETIREMENT_RELEASE_DIR/$CUTOVER_POLICY_ASSET" \
+        --cutover-policy-sha256 "$policy_sha" \
+        --checkpoint-descriptor "$LEGACY_RETIREMENT_RELEASE_DIR/$RECOVERY_DESCRIPTOR_ASSET" \
+        --checkpoint-descriptor-sha256 "$descriptor_sha" \
+        "${mode_args[@]}" \
+        --legacy-version "$LEGACY_SOURCE_VERSION" \
+        --legacy-executable "$ARC_DIR/bin/arc-node" \
+        --legacy-executable-sha256 "$legacy_executable_sha" \
+        --supervisor-definition "$LEGACY_RETIREMENT_SUPERVISOR_BINDING" \
+        --supervisor-definition-sha256 "$LEGACY_RETIREMENT_SUPERVISOR_BINDING_SHA256" \
+        --data-dir "$ARC_DIR/data" \
+        --v08-data-dir "$NODE_DATA_DIR" \
+        --forensic-only > "$output"; then
+        die "The compiled verifier refused to create or resume the v0.7 retirement intent"
+    fi
+    status="$(top_level_json_string "$output" status)" \
+        || die "Retirement intent verifier returned no unique status"
+    [ "$status" = RETIREMENT_INTENT_CREATED ] \
+        || die "Retirement intent verifier returned an unexpected status"
+    reported_sha="$(top_level_json_string "$output" sha256)" \
+        || die "Retirement intent verifier omitted its SHA-256"
+    printf '%s\n' "$reported_sha" | grep -Eq '^[0-9a-f]{64}$' \
+        || die "Retirement intent verifier returned a malformed SHA-256"
+    [ "$(sha256_file "$LEGACY_RETIREMENT_INTENT")" = "$reported_sha" ] \
+        || die "Published retirement intent differs from the verifier result"
+    mode="$(top_level_json_string "$output" retirement_mode)" \
+        || die "Retirement intent verifier omitted its mode"
+    case "$mode" in
+        term_only)
+            LEGACY_RETIREMENT_PROCESS_PID="$(top_level_json_bare "$output" legacy_pid)" \
+                || die "Retirement intent verifier omitted its bound PID"
+            LEGACY_RETIREMENT_PROCESS_BOOT_ID="$(top_level_json_string "$output" legacy_boot_id)" \
+                || die "Retirement intent verifier omitted its boot identity"
+            LEGACY_RETIREMENT_PROCESS_START_TICKS="$(top_level_json_bare "$output" legacy_start_ticks)" \
+                || die "Retirement intent verifier omitted its start ticks"
+            case "$LEGACY_RETIREMENT_PROCESS_PID:$LEGACY_RETIREMENT_PROCESS_START_TICKS" in
+                *[!0-9:]*|:*) die "Retirement intent verifier returned malformed process identity" ;;
+            esac
+            LEGACY_RETIREMENT_ALREADY_OFFLINE=false ;;
+        preexisting_offline)
+            LEGACY_RETIREMENT_PROCESS_PID=""
+            LEGACY_RETIREMENT_PROCESS_BOOT_ID=""
+            LEGACY_RETIREMENT_PROCESS_START_TICKS=""
+            LEGACY_RETIREMENT_ALREADY_OFFLINE=true ;;
+        *) die "Retirement intent verifier returned an unsupported mode" ;;
+    esac
+    LEGACY_RETIREMENT_INTENT_SHA256="$reported_sha"
+    LEGACY_RETIREMENT_INTENT_DURABLE=true
+    ok "Published the create-only v0.7 retirement intent $reported_sha"
+}
+
+write_legacy_retirement_stop_evidence() {
+    local temporary="$TMP_DIR/legacy-retirement-stop-evidence.json"
+    local schema signals process_identity offline_observed_at
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    [ "$LEGACY_RETIREMENT_INTENT_DURABLE" = true ] \
+        || die "Internal refusal to write stop evidence without a durable intent"
+    if legacy_path_present "$LEGACY_RETIREMENT_STOP_EVIDENCE"; then
+        validate_owned_nonwritable_path "$LEGACY_RETIREMENT_STOP_EVIDENCE" \
+            "legacy retirement stop evidence" file "$(legacy_expected_owner_uid)"
+        LEGACY_RETIREMENT_STOP_EVIDENCE_SHA256="$(sha256_file \
+            "$LEGACY_RETIREMENT_STOP_EVIDENCE")"
+        return 0
+    fi
+    offline_observed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [ "$LEGACY_RETIREMENT_ALREADY_OFFLINE" = true ]; then
+        schema=arc.migration.legacy-v07-preexisting-offline-evidence.v1
+        signals='[]'
+        process_identity=null
+        LEGACY_RETIREMENT_SUPERVISOR_MECHANISM=preexisting-offline-verified-supervisor
+    else
+        schema=arc.migration.legacy-v07-term-only-stop-evidence.v1
+        signals='["SIGTERM"]'
+        process_identity="{\"boot_id\":$(json_quote "$LEGACY_RETIREMENT_PROCESS_BOOT_ID"),\"pid\":$LEGACY_RETIREMENT_PROCESS_PID,\"start_ticks\":$LEGACY_RETIREMENT_PROCESS_START_TICKS}"
+        case "$LEGACY_SUPERVISOR_KIND" in
+            linux-system) LEGACY_RETIREMENT_SUPERVISOR_MECHANISM=systemd-send-sigkill-no ;;
+            macos-launchd) LEGACY_RETIREMENT_SUPERVISOR_MECHANISM=launchd-term-only ;;
+            detached|detached-untracked) LEGACY_RETIREMENT_SUPERVISOR_MECHANISM=direct-term-only ;;
+            *) die "TERM-only retirement has no supported supervisor mechanism" ;;
+        esac
+    fi
+    {
+        printf '{"legacy_exit_clean_claimed":false,"observation_started_at":'
+        json_quote "$LEGACY_RETIREMENT_OBSERVATION_STARTED_AT"
+        printf ',"offline_observed_at":'
+        json_quote "$offline_observed_at"
+        printf ',"process_identity":%s,"schema":' "$process_identity"
+        json_quote "$schema"
+        printf ',"supervisor":{"escalation_used":false,"exit_status_observed":false,"mechanism":'
+        json_quote "$LEGACY_RETIREMENT_SUPERVISOR_MECHANISM"
+        printf ',"send_sigkill_configured":false,"sigkill_sent":false,"signals_sent":%s}}\n' \
+            "$signals"
+    } > "$temporary" || die "Could not write canonical legacy stop evidence"
+    LEGACY_RETIREMENT_STOP_EVIDENCE_SHA256="$(publish_legacy_retirement_file \
+        "$temporary" "$LEGACY_RETIREMENT_STOP_EVIDENCE" \
+        "legacy retirement stop evidence")"
+}
+
+finalize_legacy_retirement_receipt() {
+    local output="$TMP_DIR/legacy-retirement-finalize.json" status reported_sha
+    [ "$LEGACY_ADOPTION_ACTIVE" = true ] || return 0
+    [ -n "$LEGACY_RETIREMENT_INTENT_SHA256" ] \
+        && [ -n "$LEGACY_RETIREMENT_STOP_EVIDENCE_SHA256" ] \
+        || die "Retirement finalization is missing sealed intent or stop evidence"
+    if ! "$TMP_DIR/$NODE_ASSET" legacy-retirement finalize \
+        --intent "$LEGACY_RETIREMENT_INTENT" \
+        --intent-sha256 "$LEGACY_RETIREMENT_INTENT_SHA256" \
+        --stop-evidence "$LEGACY_RETIREMENT_STOP_EVIDENCE" \
+        --stop-evidence-sha256 "$LEGACY_RETIREMENT_STOP_EVIDENCE_SHA256" \
+        --receipt-output "$LEGACY_RETIREMENT_RECEIPT" \
+        --stability-seconds 10 --samples 3 > "$output"; then
+        die "The compiled offline verifier refused the v0.7 retirement receipt"
+    fi
+    status="$(top_level_json_string "$output" status)" \
+        || die "Retirement finalizer returned no unique status"
+    [ "$status" = RETIREMENT_RECEIPT_CREATED ] \
+        || die "Retirement finalizer returned an unexpected status"
+    reported_sha="$(top_level_json_string "$output" sha256)" \
+        || die "Retirement finalizer omitted its SHA-256"
+    printf '%s\n' "$reported_sha" | grep -Eq '^[0-9a-f]{64}$' \
+        || die "Retirement finalizer returned a malformed SHA-256"
+    [ "$(sha256_file "$LEGACY_RETIREMENT_RECEIPT")" = "$reported_sha" ] \
+        || die "Published retirement receipt differs from the verifier result"
+    LEGACY_RETIREMENT_RECEIPT_SHA256="$reported_sha"
+
+    # Only the receipt may authorize creation of fresh v0.8 state.
+    if [ "$SERVICE_SCOPE" = system ]; then
+        as_root mkdir -- "$NODE_DATA_DIR" \
+            || die "Could not create the receipt-authorized v0.8 data directory"
+        as_root chown "$TARGET_USER:$TARGET_GROUP" "$NODE_DATA_DIR"
+        as_root chmod 700 "$NODE_DATA_DIR"
+    else
+        ensure_private_dir "$NODE_DATA_DIR"
+    fi
+    as_target test -w "$NODE_DATA_DIR" \
+        || die "Install user $TARGET_USER cannot write receipt-authorized data directory $NODE_DATA_DIR"
+    ok "Published the offline v0.7 retirement receipt $LEGACY_RETIREMENT_RECEIPT_SHA256"
+}
 
 atomic_copy() {
     local source="$1"
@@ -2572,18 +3906,7 @@ capture_legacy_runtime_state() {
             if as_root systemctl is-enabled --quiet arc-node.service; then
                 LEGACY_LINUX_NODE_ENABLED=true
             fi
-            if as_root systemctl is-active --quiet arc-updater.timer; then
-                LEGACY_LINUX_UPDATER_ACTIVE=true
-            fi
-            if as_root systemctl is-enabled --quiet arc-updater.timer; then
-                LEGACY_LINUX_UPDATER_ENABLED=true
-            fi
-            if as_root systemctl is-active --quiet arc-updater.service; then
-                LEGACY_LINUX_UPDATER_SERVICE_ACTIVE=true
-            fi
-            if as_root systemctl is-enabled --quiet arc-updater.service; then
-                LEGACY_LINUX_UPDATER_SERVICE_ENABLED=true
-            fi ;;
+            ;;
         macos-launchd)
             [ -n "$LAUNCHD_DOMAIN" ] || LAUNCHD_DOMAIN="user/$TARGET_UID"
             if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
@@ -2607,7 +3930,7 @@ begin_install_transaction() {
         0) die "ARC_INSTALL_TEST_FAIL_AFTER_COPY must be a positive integer" ;;
     esac
 
-    validate_legacy_supervisor_archive_binding
+    revalidate_legacy_sources_after_updater_fence
 
     snapshot_transaction_path "$ARC_DIR/bin/arc-node"
     snapshot_transaction_path "$ARC_DIR/bin/arc-cli"
@@ -2657,6 +3980,7 @@ begin_install_transaction() {
                 snapshot_transaction_path "$LEGACY_MAC_UPDATER_PLIST" ;;
             detached)
                 snapshot_transaction_path "$LEGACY_NODE_PID_FILE" ;;
+            detached-untracked) : ;;
         esac
     fi
     capture_service_state
@@ -2706,9 +4030,10 @@ stop_launchd_node_gracefully() {
     esac
     kill -TERM "$pid" 2>/dev/null || return 1
 
-    # Wait for the exact process that owned admitted work to finish. The
-    # caller disables the label first, so KeepAlive cannot turn this into an
-    # unbounded restart loop before the job is unloaded.
+    # Wait for the exact process to finish. The caller disables the label
+    # first, so KeepAlive cannot turn this into an unbounded restart loop.
+    # For v0.8 this bounds its real quiescence barrier; for v0.7 it proves
+    # only TERM-without-KILL process death and must never be called a drain.
     for ((elapsed=0; elapsed<GRACEFUL_STOP_TIMEOUT_SECS; elapsed++)); do
         kill -0 "$pid" 2>/dev/null || return 0
         sleep 1
@@ -2717,17 +4042,22 @@ stop_launchd_node_gracefully() {
 }
 
 stop_legacy_detached_process() {
+    local elapsed
     [ -n "$LEGACY_DETACHED_PID" ] || return 0
+    if ! kill -0 "$LEGACY_DETACHED_PID" 2>/dev/null; then
+        ensure_no_legacy_arc_processes
+        return 0
+    fi
+    validate_legacy_detached_pid "$LEGACY_DETACHED_PID" "pre-stop process"
     kill -TERM "$LEGACY_DETACHED_PID" 2>/dev/null || return 1
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-        kill -0 "$LEGACY_DETACHED_PID" 2>/dev/null || return 0
+    for ((elapsed=0; elapsed<GRACEFUL_STOP_TIMEOUT_SECS; elapsed++)); do
+        if ! kill -0 "$LEGACY_DETACHED_PID" 2>/dev/null; then
+            ensure_no_legacy_arc_processes
+            return 0
+        fi
         sleep 1
     done
-    kill -KILL "$LEGACY_DETACHED_PID" 2>/dev/null || return 1
-    for _ in 1 2 3 4 5; do
-        kill -0 "$LEGACY_DETACHED_PID" 2>/dev/null || return 0
-        sleep 1
-    done
+    warn "Legacy detached node did not exit after TERM within ${GRACEFUL_STOP_TIMEOUT_SECS}s; it was not force-killed"
     return 1
 }
 
@@ -2737,12 +4067,18 @@ retire_legacy_runtime() {
     case "$LEGACY_SUPERVISOR_KIND" in
         linux-system)
             if legacy_path_present "$LEGACY_LINUX_UPDATER_SERVICE"; then
-                as_root systemctl disable --now arc-updater.service >/dev/null 2>&1 \
-                    || return 1
                 as_root systemctl disable --now arc-updater.timer >/dev/null 2>&1 \
+                    || return 1
+                as_root systemctl disable --now arc-updater.service >/dev/null 2>&1 \
                     || return 1
             fi
             if legacy_path_present "$LEGACY_LINUX_NODE_UNIT"; then
+                # The released v0.7 unit inherited systemd's short default
+                # stop timeout. Override only the runtime instance so a
+                # migration can never turn in-flight work into SIGKILL.
+                as_root systemctl set-property --runtime arc-node.service \
+                    "TimeoutStopSec=${GRACEFUL_STOP_TIMEOUT_SECS}s" \
+                    SendSIGKILL=no >/dev/null 2>&1 || return 1
                 as_root systemctl disable --now arc-node.service >/dev/null 2>&1 \
                     || return 1
                 if as_root systemctl is-active --quiet arc-node.service; then
@@ -2762,15 +4098,17 @@ retire_legacy_runtime() {
             as_root systemctl daemon-reload || return 1 ;;
         macos-launchd)
             [ -n "$LAUNCHD_DOMAIN" ] || LAUNCHD_DOMAIN="user/$TARGET_UID"
+            if [ "$LEGACY_MAC_UPDATER_LOADED" = true ] \
+                && launchctl print "$LAUNCHD_DOMAIN/com.arc.updater" \
+                    >/dev/null 2>&1; then
+                launchctl bootout "$LAUNCHD_DOMAIN/com.arc.updater" 2>/dev/null \
+                    || return 1
+            fi
             if [ "$LEGACY_MAC_NODE_LOADED" = true ]; then
                 launchctl disable "$LAUNCHD_DOMAIN/com.arc.inference" || return 1
                 stop_launchd_node_gracefully com.arc.inference \
                     "$ARC_DIR/bin/arc-node" || return 1
                 launchctl bootout "$LAUNCHD_DOMAIN/com.arc.inference" 2>/dev/null \
-                    || return 1
-            fi
-            if [ "$LEGACY_MAC_UPDATER_LOADED" = true ]; then
-                launchctl bootout "$LAUNCHD_DOMAIN/com.arc.updater" 2>/dev/null \
                     || return 1
             fi
             launchctl print "$LAUNCHD_DOMAIN/com.arc.inference" >/dev/null 2>&1 \
@@ -2779,12 +4117,15 @@ retire_legacy_runtime() {
                 && return 1
             remove_transaction_path "$LEGACY_MAC_NODE_PLIST" || return 1
             remove_transaction_path "$LEGACY_MAC_UPDATER_PLIST" || return 1 ;;
-        detached)
+        detached|detached-untracked)
             if [ "$LEGACY_DETACHED_WAS_RUNNING" = true ]; then
                 stop_legacy_detached_process || return 1
             fi
-            remove_transaction_path "$LEGACY_NODE_PID_FILE" || return 1 ;;
+            if [ "$LEGACY_SUPERVISOR_KIND" = detached ]; then
+                remove_transaction_path "$LEGACY_NODE_PID_FILE" || return 1
+            fi ;;
     esac
+    ensure_no_legacy_arc_processes
     if legacy_path_present "$ARC_DIR/bin/arc-auto-update.sh"; then
         remove_transaction_path "$ARC_DIR/bin/arc-auto-update.sh" || return 1
     fi
@@ -2794,10 +4135,15 @@ restart_legacy_detached_process() {
     local restarted_pid staged_pid_file
     [ "$LEGACY_DETACHED_WAS_RUNNING" = true ] || return 0
     [ "${#LEGACY_DETACHED_RESTART_ARGS[@]}" -gt 0 ] || return 1
+    if [ "$LEGACY_DETACHED_HAD_PID_FILE" = false ] \
+        && legacy_path_present "$LEGACY_NODE_PID_FILE"; then
+        return 1
+    fi
     nohup "${LEGACY_DETACHED_RESTART_ARGS[@]}" \
         >> "$ARC_DIR/node.log" 2>&1 &
     restarted_pid=$!
     kill -0 "$restarted_pid" 2>/dev/null || return 1
+    [ "$LEGACY_DETACHED_HAD_PID_FILE" = true ] || return 0
     staged_pid_file="$LEGACY_NODE_PID_FILE.rollback-pid.$$"
     printf '%s\n' "$restarted_pid" > "$staged_pid_file" || return 1
     chmod 600 "$staged_pid_file" || return 1
@@ -2815,26 +4161,12 @@ restore_legacy_runtime_state() {
             else
                 as_root systemctl disable arc-node.service >/dev/null 2>&1 || true
             fi
-            if [ "$LEGACY_LINUX_UPDATER_ENABLED" = true ]; then
-                as_root systemctl enable arc-updater.timer >/dev/null || status=1
-            else
-                as_root systemctl disable arc-updater.timer >/dev/null 2>&1 || true
-            fi
-            if [ "$LEGACY_LINUX_UPDATER_SERVICE_ENABLED" = true ]; then
-                as_root systemctl enable arc-updater.service >/dev/null || status=1
-            else
-                as_root systemctl disable arc-updater.service >/dev/null 2>&1 || true
-            fi
-            if [ "$LEGACY_LINUX_UPDATER_ACTIVE" = true ]; then
-                as_root systemctl restart arc-updater.timer || status=1
-            else
-                as_root systemctl stop arc-updater.timer >/dev/null 2>&1 || true
-            fi
-            if [ "$LEGACY_LINUX_UPDATER_SERVICE_ACTIVE" = true ]; then
-                as_root systemctl start arc-updater.service || status=1
-            else
-                as_root systemctl stop arc-updater.service >/dev/null 2>&1 || true
-            fi
+            # Restore the exact legacy files and node state, but never re-arm
+            # the unsigned updater while the durable migration marker remains.
+            as_root systemctl disable --now arc-updater.timer \
+                >/dev/null 2>&1 || status=1
+            as_root systemctl disable --now arc-updater.service \
+                >/dev/null 2>&1 || status=1
             if [ "$LEGACY_LINUX_NODE_ACTIVE" = true ]; then
                 as_root systemctl restart arc-node.service || status=1
             else
@@ -2851,6 +4183,7 @@ restore_legacy_runtime_state() {
                     status=1
                 fi
             fi
+            launchctl disable "$LAUNCHD_DOMAIN/com.arc.updater" || status=1
             launchctl bootout "$LAUNCHD_DOMAIN/com.arc.updater" 2>/dev/null || true
             if [ "$LEGACY_MAC_NODE_LOADED" = true ]; then
                 launchctl enable "$LAUNCHD_DOMAIN/com.arc.inference" || status=1
@@ -2858,10 +4191,8 @@ restore_legacy_runtime_state() {
             else
                 launchctl disable "$LAUNCHD_DOMAIN/com.arc.inference" || status=1
             fi
-            if [ "$LEGACY_MAC_UPDATER_LOADED" = true ]; then
-                launchctl bootstrap "$LAUNCHD_DOMAIN" "$LEGACY_MAC_UPDATER_PLIST" || status=1
-            fi ;;
-        detached)
+            ;;
+        detached|detached-untracked)
             restart_legacy_detached_process || status=1 ;;
     esac
     return "$status"
@@ -3028,6 +4359,57 @@ restore_launchd_state() {
     return "$status"
 }
 
+enforce_post_intent_fail_stop() {
+    local status=0 pid="" unit label
+    [ "$LEGACY_RETIREMENT_INTENT_DURABLE" = true ] || return 1
+    case "$LEGACY_SUPERVISOR_KIND" in
+        linux-system)
+            # The restored on-disk unit may be v0.7 while systemd still has a
+            # v0.8 process loaded. Apply the no-KILL runtime boundary before
+            # stopping either generation, then leave every old/new updater
+            # and node unit disabled.
+            as_root systemctl set-property --runtime arc-node.service \
+                "TimeoutStopSec=${GRACEFUL_STOP_TIMEOUT_SECS}s" \
+                SendSIGKILL=no >/dev/null 2>&1 || true
+            as_root systemctl disable --now arc-node.service >/dev/null 2>&1 \
+                || status=1
+            for unit in \
+                arc-updater.timer arc-updater.service \
+                arc-node-update.timer arc-node-update.service; do
+                as_root systemctl disable --now "$unit" >/dev/null 2>&1 || true
+            done
+            as_root systemctl daemon-reload || status=1
+            if as_root systemctl is-active --quiet arc-node.service; then status=1; fi ;;
+        macos-launchd)
+            [ -n "$LAUNCHD_DOMAIN" ] || LAUNCHD_DOMAIN="user/$TARGET_UID"
+            if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
+                LAUNCHD_DOMAIN="gui/$TARGET_UID"
+            fi
+            for label in com.arc.updater network.arc.update; do
+                launchctl disable "$LAUNCHD_DOMAIN/$label" >/dev/null 2>&1 || true
+                launchctl bootout "$LAUNCHD_DOMAIN/$label" >/dev/null 2>&1 || true
+            done
+            for label in com.arc.inference network.arc.node; do
+                launchctl disable "$LAUNCHD_DOMAIN/$label" >/dev/null 2>&1 || status=1
+                pid="$(launchd_service_pid "$label" 2>/dev/null || true)"
+                if [ -n "$pid" ]; then
+                    if [ "$label" = network.arc.node ]; then
+                        stop_launchd_node_gracefully "$label" \
+                            "$ARC_DIR/bin/arc-node" "$ARC_DIR/bin/run-arc-node" || status=1
+                    else
+                        stop_launchd_node_gracefully "$label" \
+                            "$ARC_DIR/bin/arc-node" || status=1
+                    fi
+                fi
+                launchctl bootout "$LAUNCHD_DOMAIN/$label" >/dev/null 2>&1 || true
+            done ;;
+        detached|detached-untracked|none)
+            ensure_no_legacy_arc_processes || status=1 ;;
+        *) status=1 ;;
+    esac
+    return "$status"
+}
+
 rollback_install_transaction() {
     local status=0
     local index
@@ -3036,15 +4418,25 @@ rollback_install_transaction() {
     for ((index=${#TRANSACTION_PATHS[@]} - 1; index >= 0; index--)); do
         restore_transaction_path "$index" || status=1
     done
-    case "$SERVICE_SCOPE" in
-        system|system-user|user) restore_systemd_state || status=1 ;;
-        launchd) restore_launchd_state || status=1 ;;
-    esac
-    restore_legacy_runtime_state || status=1
+    if [ "$LEGACY_RETIREMENT_INTENT_DURABLE" = true ]; then
+        enforce_post_intent_fail_stop || status=1
+    else
+        case "$SERVICE_SCOPE" in
+            system|system-user|user) restore_systemd_state || status=1 ;;
+            launchd) restore_launchd_state || status=1 ;;
+        esac
+        restore_legacy_runtime_state || status=1
+    fi
     TRANSACTION_ACTIVE=false
     TRANSACTION_ROLLING_BACK=false
     if [ "$status" -eq 0 ]; then
-        ok "Previous ARC installation and service state restored"
+        if [ "$LEGACY_RETIREMENT_INTENT_DURABLE" = true ]; then
+            ok "Previous ARC files restored; v0.7 remains stopped and every legacy updater stays fenced behind the durable retirement intent"
+        elif [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
+            ok "Previous ARC files and node state restored; the unsigned legacy updater remains fenced"
+        else
+            ok "Previous ARC installation and service state restored"
+        fi
     else
         warn "Rollback encountered an error; inspect all managed files and service state before restarting ARC"
     fi
@@ -3059,10 +4451,19 @@ commit_install_transaction() {
 if [ "$SERVICE_SCOPE" = system ]; then PROGRAM_MODE=755; CONFIG_MODE=644
 else PROGRAM_MODE=700; CONFIG_MODE=600
 fi
+verify_legacy_v07_network_retirement
 begin_install_transaction
+create_legacy_retirement_intent
+if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
+    LEGACY_RETIREMENT_OBSERVATION_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+fi
 if ! retire_legacy_runtime; then
     rollback_install_transaction || true
     die "Could not retire the verified v0.7 runtime safely"
+fi
+if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
+    write_legacy_retirement_stop_evidence
+    finalize_legacy_retirement_receipt
 fi
 transactional_copy "$TMP_DIR/$NODE_ASSET" "$ARC_DIR/bin/arc-node" "$PROGRAM_MODE" root
 transactional_copy "$TMP_DIR/$CLI_ASSET" "$ARC_DIR/bin/arc-cli" "$PROGRAM_MODE" root
@@ -3228,6 +4629,7 @@ install_systemd_system() {
             "Restart=$restart_policy" \
             'RestartSec=5' \
             "TimeoutStopSec=$GRACEFUL_STOP_TIMEOUT_SECS" \
+            'SendSIGKILL=no' \
             'UMask=0077' \
             'NoNewPrivileges=true' \
             'PrivateTmp=true' \
@@ -3274,6 +4676,7 @@ install_systemd_user() {
             'Restart=on-failure' \
             'RestartSec=5' \
             "TimeoutStopSec=$GRACEFUL_STOP_TIMEOUT_SECS" \
+            'SendSIGKILL=no' \
             'UMask=0077' \
             'NoNewPrivileges=true' \
             'PrivateTmp=true' \
@@ -3464,6 +4867,13 @@ rollback_and_die() {
     rollback_install_transaction || true
     die "$reason"
 }
+
+if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
+    # Re-check immediately before the first v0.8 launch.  A v0.7 binary does
+    # not honor the new lock namespace, and an operator could otherwise start
+    # the old path again during the file transaction.
+    ensure_no_legacy_arc_processes
+fi
 
 if [ "$SERVICE_SCOPE" != none ]; then
     info "Installing $SERVICE_SCOPE service for $TARGET_USER"

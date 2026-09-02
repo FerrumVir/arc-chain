@@ -6549,27 +6549,27 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                 return {
                     "eligible_inference_workers": 3 if include_new_worker[0] else 2,
                     "coordinator_model_id": "0x" + "1" * 64,
-                }
-            if path == "/community/list":
-                return {
-                    "count": 3,
+                    "count_visible": 3,
                     "workers": [
                         {
                             "worker_id": workers[0],
                             "capabilities": ["inference"],
                             "model_id": "0x" + "1" * 64,
                             "execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                            "work_completed": 1,
                         },
                         {
                             "worker_id": workers[1],
                             "capabilities": ["inference"],
                             "model_id": "0x" + "1" * 64,
                             "execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                            "work_completed": 2,
                         },
                         {
                             "worker_id": "0x" + "8" * 64,
                             "capabilities": ["inference"],
                             "model_id": "0x" + "1" * 64,
+                            "work_completed": 0,
                             "execution_profile": (
                                 rollout.CANONICAL_EXECUTION_PROFILE
                                 if include_new_worker[0]

@@ -453,6 +453,15 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     path.resolve(REPO_DESKTOP, "src", "lib", "updater.ts"),
     "utf8",
   );
+  const updaterChannel = fs.readFileSync(
+    path.resolve(
+      REPO_DESKTOP,
+      "src-tauri",
+      "src",
+      "updater_channel.rs",
+    ),
+    "utf8",
+  );
   const updateController = fs.readFileSync(
     path.resolve(REPO_DESKTOP, "src", "lib", "update-controller.ts"),
     "utf8",
@@ -470,15 +479,21 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     ),
   );
 
-  test("auto-update: updater plugin registered + real pubkey wired", () => {
+  test("auto-update: signed exact-release channel + real pubkey wired", () => {
     expect(lib).toMatch(/tauri_plugin_updater::Builder::new\(\)\.build\(\)/);
+    expect(lib).toContain("updater_channel::check_arc_update");
     expect(conf.plugins?.updater?.active).toBe(true);
     // Reject any TODO / placeholder values.
     const pubkey = conf.plugins?.updater?.pubkey ?? "";
     expect(pubkey.length).toBeGreaterThan(50);
     expect(pubkey).not.toMatch(/TODO/i);
     expect(conf.bundle?.createUpdaterArtifacts).toBe(true);
-    expect(conf.plugins?.updater?.endpoints?.[0]).toMatch(/releases\/latest/);
+    expect(conf.plugins?.updater?.endpoints).toEqual([]);
+    expect(updater).toContain('invoke<NativeUpdateMetadata | null>(\n    "check_arc_update"');
+    expect(updaterChannel).toContain('const RELEASE_PUBLISHER: &str = "github-actions[bot]"');
+    expect(updaterChannel).toContain("release.immutable");
+    expect(updaterChannel).toContain("validate_tauri_update(&update, &selected)");
+    expect(updaterChannel).toContain(".endpoints(vec![endpoint])");
   });
 
   test("updater fences download/install separately and startup adopts only an exact version", () => {

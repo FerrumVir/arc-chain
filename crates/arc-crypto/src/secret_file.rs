@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 pub const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
 pub const DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME: &str = "shutdown-unproven";
 pub const DESKTOP_SHUTDOWN_ACK_FILE_NAME: &str = "shutdown-clean-ack";
+pub const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str = "lifecycle.lock";
+pub const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_PREFIX: &str = "lifecycle.namespace-proof.v3-";
+const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_SCHEMA: &str = "arc.desktop.lifecycle-namespace.v3";
+const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_MAX_BYTES: u64 = 512;
 const DESKTOP_SHUTDOWN_RECEIPT_SCHEMA: &str = "arc.desktop.shutdown-unproven.v1";
 const DESKTOP_SHUTDOWN_ACK_SCHEMA: &str = "arc.desktop.shutdown-clean-ack.v1";
 const DESKTOP_SHUTDOWN_RECEIPT_MAX_BYTES: u64 = 768;
@@ -293,12 +297,18 @@ fn private_directory_namespace_rebarrier_path(path: &Path) -> io::Result<PathBuf
     )))
 }
 
-/// Stable namespace identity for a target whose parent already exists.
-/// Windows resolves ordinary file names case-insensitively, so case-fold the
-/// leaf before hashing; otherwise `data-v3` and `Data-V3` could acquire
-/// different outer locks while referring to the same live/staged namespace.
-/// Conservative Unicode uppercasing may serialize a few distinct exotic
-/// names together, which is safe; it must never split names Windows aliases.
+/// Stable sidecar identity for a target within its already-existing parent.
+/// The parent directory itself scopes every lock/staging path, so hashing it
+/// again would be harmful: two drive/mount spellings of the same Windows
+/// parent could derive different sibling locks. Windows leaf names are folded
+/// by the platform's non-linguistic filesystem casing rules. On macOS the
+/// containing volume is queried with `_PC_CASE_SENSITIVE`; ASCII leaves are
+/// folded on case-insensitive volumes and retained exactly on case-sensitive
+/// volumes. Non-ASCII absent leaves are rejected on case-insensitive macOS
+/// volumes because guessing APFS Unicode equivalence would permit two locks
+/// for one future directory name. Case-sensitive Windows parents are rejected
+/// because two distinct names could otherwise collide in this deterministic
+/// sidecar namespace.
 pub fn namespace_path_digest(path: &Path) -> io::Result<String> {
     let leaf = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -311,14 +321,315 @@ pub fn namespace_path_digest(path: &Path) -> io::Result<String> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .canonicalize()?;
-    let mut hasher = Sha256::new();
-    update_path_hash(&mut hasher, &parent);
-    hasher.update([0xff]);
+    // The deterministic sibling names below deliberately case-fold their
+    // target leaf. A Windows directory with the per-directory POSIX
+    // case-sensitive flag could contain two distinct names that fold to the
+    // same lock/staging path, so reject that unsupported namespace before
+    // deriving or mutating either sidecar.
     #[cfg(windows)]
-    hasher.update(leaf.to_string_lossy().to_uppercase().as_bytes());
+    platform::validate_case_insensitive_namespace_parent(&parent)?;
     #[cfg(not(windows))]
+    let _ = &parent;
+    #[cfg(windows)]
+    let canonical_leaf = windows_canonical_namespace_leaf(&parent.join(leaf))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"arc.private-directory.namespace-leaf.v2\0");
+    #[cfg(windows)]
+    for code_unit in windows_casefold_namespace_leaf(&canonical_leaf)? {
+        hasher.update(code_unit.to_le_bytes());
+    }
+    #[cfg(target_os = "macos")]
+    hasher.update(macos_namespace_leaf_bytes(&parent, leaf)?);
+    #[cfg(not(any(windows, target_os = "macos")))]
     update_path_hash(&mut hasher, Path::new(leaf));
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Compare two target paths by their actual parent directory plus the exact
+/// per-platform leaf namespace rules. This is intentionally separate from the
+/// parent-scoped sidecar digest above.
+pub fn same_private_directory_namespace(left: &Path, right: &Path) -> io::Result<bool> {
+    let split = |path: &Path| -> io::Result<(PathBuf, std::ffi::OsString)> {
+        let leaf = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("namespace target has no leaf: {}", path.display()),
+            )
+        })?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        Ok((parent, leaf.to_os_string()))
+    };
+    let (left_parent, left_leaf) = split(left)?;
+    let (right_parent, right_leaf) = split(right)?;
+
+    #[cfg(windows)]
+    {
+        platform::validate_case_insensitive_namespace_parent(&left_parent)?;
+        platform::validate_case_insensitive_namespace_parent(&right_parent)?;
+        if platform::namespace_parent_identity(&left_parent)?
+            != platform::namespace_parent_identity(&right_parent)?
+        {
+            return Ok(false);
+        }
+        let left_leaf = windows_canonical_namespace_leaf(&left_parent.join(left_leaf))?;
+        let right_leaf = windows_canonical_namespace_leaf(&right_parent.join(right_leaf))?;
+        return windows_namespace_leaves_equal(&left_leaf, &right_leaf);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if left_parent != right_parent {
+            return Ok(false);
+        }
+        Ok(macos_namespace_leaf_bytes(&left_parent, &left_leaf)?
+            == macos_namespace_leaf_bytes(&right_parent, &right_leaf)?)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    Ok(left_parent == right_parent && left_leaf == right_leaf)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_namespace_parent_is_case_sensitive(parent: &Path) -> io::Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "macOS namespace parent contains an interior NUL: {}",
+                parent.display()
+            ),
+        )
+    })?;
+    // SAFETY: `path` is NUL terminated and live for the synchronous call.
+    // Clearing errno distinguishes an unsupported/indeterminate -1 from an
+    // actual pathconf error. `_PC_CASE_SENSITIVE` is a boolean on Darwin.
+    let result = unsafe {
+        *libc::__error() = 0;
+        libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE)
+    };
+    match result {
+        0 => Ok(false),
+        1 => Ok(true),
+        -1 => {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(0) {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "macOS filesystem does not report case-sensitivity for {}",
+                        parent.display()
+                    ),
+                ))
+            } else {
+                Err(error)
+            }
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "macOS filesystem returned invalid _PC_CASE_SENSITIVE value {other} for {}",
+                parent.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_namespace_leaf_bytes(parent: &Path, leaf: &std::ffi::OsStr) -> io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = leaf.as_bytes();
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "macOS namespace leaf must not be empty",
+        ));
+    }
+    if macos_namespace_parent_is_case_sensitive(parent)? {
+        return Ok(bytes.to_vec());
+    }
+    if !bytes.is_ascii() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "non-ASCII directory leaves are unsupported for ARC namespace locks on case-insensitive macOS volumes: {}",
+                leaf.to_string_lossy()
+            ),
+        ));
+    }
+    Ok(bytes.to_ascii_lowercase())
+}
+
+#[cfg(windows)]
+fn windows_casefold_namespace_leaf(leaf: &std::ffi::OsStr) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Globalization::{
+        LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT,
+    };
+
+    let source = leaf.encode_wide().collect::<Vec<_>>();
+    let source_len = i32::try_from(source.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows namespace leaf exceeds the Win32 mapping limit",
+        )
+    })?;
+    if source_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows namespace leaf must not be empty",
+        ));
+    }
+    // SAFETY: `source` remains live for its explicit length. A null output
+    // buffer asks the API for the exact number of UTF-16 code units required.
+    let required = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            null_mut(),
+            0,
+            null(),
+            null(),
+            0,
+        )
+    };
+    if required == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut mapped = vec![0u16; required as usize];
+    // SAFETY: input and output buffers are disjoint, live for their explicit
+    // lengths, and neither pointer is retained by the synchronous API.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            mapped.as_mut_ptr(),
+            required,
+            null(),
+            null(),
+            0,
+        )
+    };
+    if written == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    mapped.truncate(written as usize);
+    Ok(mapped)
+}
+
+#[cfg(windows)]
+fn windows_namespace_leaves_equal(
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    let left_len = i32::try_from(left.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows namespace leaf exceeds the Win32 comparison limit",
+        )
+    })?;
+    let right_len = i32::try_from(right.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows namespace leaf exceeds the Win32 comparison limit",
+        )
+    })?;
+    // SAFETY: both slices remain live for their explicit lengths and the API
+    // does not retain either pointer.
+    let comparison =
+        unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+    if comparison == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(comparison == CSTR_EQUAL)
+}
+
+/// Return the existing final component's canonical long name, rejecting an
+/// NTFS 8.3 or other alternate spelling. Case-only variants are accepted and
+/// hash to the same namespace, but a second non-case spelling must never
+/// derive a different lock or staging name for the same live directory.
+#[cfg(windows)]
+fn windows_canonical_namespace_leaf(target: &Path) -> io::Result<std::ffi::OsString> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, GetLongPathNameW};
+
+    let requested_leaf = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Windows namespace target has no leaf: {}", target.display()),
+        )
+    })?;
+
+    let metadata = match std::fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(requested_leaf.to_os_string());
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(permission_error(format!(
+            "Windows namespace target is a reparse point: {}",
+            target.display()
+        )));
+    }
+    let target_wide = windows_extended_path(target)?;
+    let mut long_wide = vec![0u16; 32_768];
+    let long_len = loop {
+        // SAFETY: input is NUL terminated and the output buffer is valid for
+        // its advertised length. A too-small result reports the required
+        // capacity, so an unusually long path is retried without truncation.
+        let written = unsafe {
+            GetLongPathNameW(
+                target_wide.as_ptr(),
+                long_wide.as_mut_ptr(),
+                long_wide.len() as u32,
+            )
+        };
+        if written == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize >= long_wide.len() {
+            long_wide.resize(written as usize + 1, 0);
+            continue;
+        }
+        break written as usize;
+    };
+    let long_path = PathBuf::from(OsString::from_wide(&long_wide[..long_len]));
+    let long_leaf = long_path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "canonical Windows namespace target has no leaf: {}",
+                long_path.display()
+            ),
+        )
+    })?;
+    if !windows_namespace_leaves_equal(requested_leaf, long_leaf)? {
+        return Err(permission_error(format!(
+            "Windows namespace aliases are not accepted; use the canonical long path {} instead of {}",
+            long_path.display(),
+            target.display()
+        )));
+    }
+    Ok(long_leaf.to_os_string())
 }
 
 /// Cross-process guard for publishing or rebarriering one private directory
@@ -330,6 +641,19 @@ pub struct PrivateDirectoryNamespaceLock {
     _file: File,
 }
 
+/// Capability proving that one private directory name was restored and then
+/// either rebarriered directly or authenticated by the desktop's exact durable
+/// namespace marker while its stable sibling lock remained held.
+pub struct PreparedPrivateDirectoryNamespaceLock {
+    inner: PrivateDirectoryNamespaceLock,
+}
+
+impl PreparedPrivateDirectoryNamespaceLock {
+    pub fn target(&self) -> &Path {
+        self.inner.target()
+    }
+}
+
 impl PrivateDirectoryNamespaceLock {
     /// Restore a staged-only directory before an absent-name creation check.
     /// Callers must retain this guard through the following create/open step.
@@ -337,11 +661,44 @@ impl PrivateDirectoryNamespaceLock {
         restore_private_directory_namespace_rebarrier(&self.target)
     }
 
-    /// Re-prove an existing directory name after the caller has acquired the
-    /// semantic lock inside it. Holding both locks prevents a second process
-    /// from creating a split directory while the live name is briefly away.
+    /// Re-prove an existing directory name while retaining this stable sibling
+    /// lock. On Windows the caller must not retain any open descendant handle:
+    /// MS-FSA 2.1.5.15.12 requires a directory rename to fail with access
+    /// denied while a file beneath that directory is open. Callers that also
+    /// use an inner semantic lock must close it for the rename and reacquire it
+    /// before mutating the restored live namespace.
     pub fn rebarrier_existing(&self) -> io::Result<()> {
         rebarrier_private_directory_namespace(&self.target)
+    }
+
+    /// Consume the live sibling guard only after its target has crossed the
+    /// platform durability barrier successfully.
+    pub fn rebarrier_into_prepared(self) -> io::Result<PreparedPrivateDirectoryNamespaceLock> {
+        rebarrier_private_directory_namespace(&self.target)?;
+        Ok(PreparedPrivateDirectoryNamespaceLock { inner: self })
+    }
+
+    /// Consume the live sibling guard after authenticating the desktop's exact
+    /// proof and its actively held in-directory lifecycle handle. This avoids
+    /// an impossible parent rename on Windows while keeping the skip bound to
+    /// one continuous desktop-to-node namespace handoff.
+    pub fn into_desktop_lifecycle_proven(
+        self,
+        session_nonce: &[u8; 32],
+    ) -> io::Result<PreparedPrivateDirectoryNamespaceLock> {
+        self.restore_interrupted()?;
+        validate_private_directory(&self.target)?;
+        let proof_path = desktop_lifecycle_namespace_proof_path(&self.target)?;
+        if !has_active_exact_desktop_lifecycle_namespace_proof(&self.target, session_nonce)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "desktop lifecycle namespace proof is absent or not owned by a live desktop: {}",
+                    proof_path.display()
+                ),
+            ));
+        }
+        Ok(PreparedPrivateDirectoryNamespaceLock { inner: self })
     }
 
     pub fn target(&self) -> &Path {
@@ -353,6 +710,22 @@ impl PrivateDirectoryNamespaceLock {
 /// The target may be absent, but its parent must already be a real directory.
 pub fn acquire_private_directory_namespace_lock(
     target: &Path,
+) -> io::Result<PrivateDirectoryNamespaceLock> {
+    acquire_private_directory_namespace_lock_with_mode(target, false)
+}
+
+/// Try to acquire the deterministic parent-sibling namespace lock without
+/// waiting. This is reserved for process-lifetime ownership protocols whose
+/// public contract must report an already-running owner instead of blocking.
+pub fn try_acquire_private_directory_namespace_lock(
+    target: &Path,
+) -> io::Result<PrivateDirectoryNamespaceLock> {
+    acquire_private_directory_namespace_lock_with_mode(target, true)
+}
+
+fn acquire_private_directory_namespace_lock_with_mode(
+    target: &Path,
+    nonblocking: bool,
 ) -> io::Result<PrivateDirectoryNamespaceLock> {
     let leaf = target.file_name().ok_or_else(|| {
         io::Error::new(
@@ -380,21 +753,352 @@ pub fn acquire_private_directory_namespace_lock(
             // CREATE_NEW handle is intentionally born exclusive on Windows;
             // retaining it would make contenders fail at open instead of wait
             // on the common kernel lock.
-            open_private_read_write(&lock_path)?
+            open_private_namespace_lock_after_create(&lock_path, nonblocking)?
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            open_private_read_write(&lock_path)?
+            open_private_namespace_lock_after_create(&lock_path, nonblocking)?
         }
         Err(error) => return Err(error),
     };
     // Namespace preparation is bounded to two same-parent moves. Waiting for
     // an in-flight cooperating creator avoids surfacing spurious request
     // failures when several settlement publishers initialize one directory.
-    file.lock()?;
+    if nonblocking {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "private directory namespace is already locked: {}",
+                        target.display()
+                    ),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    } else {
+        file.lock()?;
+    }
+    // Close the absent-name race: an uncooperating creator may have made an
+    // alternate Windows spelling resolve after the digest was first derived.
+    #[cfg(windows)]
+    windows_canonical_namespace_leaf(&target)?;
     Ok(PrivateDirectoryNamespaceLock {
         target,
         _file: file,
     })
+}
+
+fn open_private_namespace_lock_after_create(path: &Path, nonblocking: bool) -> io::Result<File> {
+    #[cfg(not(windows))]
+    {
+        let _ = nonblocking;
+        open_private_read_write(path)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        // `create_new_private` intentionally uses a share-mode-zero handle.
+        // A simultaneous first acquirer can observe the name before that
+        // creator finishes its fixed write/fsync/drop. Retry only this exact
+        // transient; every other validation/open failure remains fail-closed.
+        const ATTEMPTS: usize = 400;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+        let mut last_sharing_violation = None;
+        for attempt in 0..ATTEMPTS {
+            match open_private_read_write(path) {
+                Ok(file) => return Ok(file),
+                Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                    last_sharing_violation = Some(error);
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(RETRY_DELAY);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if nonblocking {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "private directory namespace lock is still being created: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(last_sharing_violation.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("cannot open private namespace lock: {}", path.display()),
+            )
+        }))
+    }
+}
+
+fn desktop_lifecycle_namespace_identity(data_dir: &Path) -> io::Result<(String, String, String)> {
+    let canonical = data_dir.canonicalize()?;
+    validate_private_directory(&canonical)?;
+    let control_dir = canonical.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    validate_private_directory(&control_dir)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"arc.desktop.lifecycle-canonical-path.v3\0");
+    update_path_hash(&mut hasher, &canonical);
+    let canonical_path_sha256 = hex::encode(hasher.finalize());
+    let data_directory_identity = platform::private_directory_identity(&canonical)?;
+    let control_directory_identity = platform::private_directory_identity(&control_dir)?;
+    Ok((
+        canonical_path_sha256,
+        data_directory_identity,
+        control_directory_identity,
+    ))
+}
+
+/// Return the only v3 proof pathname valid for this exact canonical data path
+/// and filesystem directory identity. A moved or restored tree carries a
+/// differently named, inert proof and can therefore be rebarriered and
+/// migrated without trusting or overwriting prior evidence.
+pub fn desktop_lifecycle_namespace_proof_path(data_dir: &Path) -> io::Result<PathBuf> {
+    let (canonical_path_sha256, data_directory_identity, control_directory_identity) =
+        desktop_lifecycle_namespace_identity(data_dir)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"arc.desktop.lifecycle-proof-name.v3\0");
+    hasher.update(canonical_path_sha256.as_bytes());
+    hasher.update([0]);
+    hasher.update(data_directory_identity.as_bytes());
+    hasher.update([0]);
+    hasher.update(control_directory_identity.as_bytes());
+    let proof_name_sha256 = hex::encode(hasher.finalize());
+    Ok(data_dir
+        .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+        .join(format!(
+            "{DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_PREFIX}{proof_name_sha256}"
+        )))
+}
+
+/// Build the desktop's exact path-and-directory-identity proof after its
+/// managed data directory and shutdown-control child have both crossed their
+/// write-through barriers. A copied/restored directory receives a different
+/// filesystem identity even at the same lexical path, while a moved tree also
+/// changes the canonical-path digest and expected proof filename.
+pub fn desktop_lifecycle_namespace_proof(
+    data_dir: &Path,
+    session_nonce: &[u8; 32],
+) -> io::Result<Vec<u8>> {
+    let (canonical_path_sha256, data_directory_identity, control_directory_identity) =
+        desktop_lifecycle_namespace_identity(data_dir)?;
+    Ok(format!(
+        "{DESKTOP_LIFECYCLE_NAMESPACE_PROOF_SCHEMA}\ntarget_canonical_path_sha256={canonical_path_sha256}\ntarget_data_directory_identity={data_directory_identity}\ntarget_control_directory_identity={control_directory_identity}\nsession_nonce={}\n",
+        hex::encode(session_nonce)
+    )
+    .into_bytes())
+}
+
+pub fn desktop_lifecycle_lock_payload(session_nonce: &[u8; 32]) -> Vec<u8> {
+    format!(
+        "arc.desktop.lifecycle-lock.v2\nsession_nonce={}\n",
+        hex::encode(session_nonce)
+    )
+    .into_bytes()
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn valid_desktop_lifecycle_directory_identity(value: &str) -> bool {
+    if let Some(value) = value.strip_prefix("unix:") {
+        let Some((device, inode)) = value.split_once(':') else {
+            return false;
+        };
+        return valid_lower_hex(device, 16) && valid_lower_hex(inode, 16);
+    }
+    if let Some(value) = value.strip_prefix("windows:") {
+        let Some((volume, file_index)) = value.split_once(':') else {
+            return false;
+        };
+        return valid_lower_hex(volume, 8) && valid_lower_hex(file_index, 16);
+    }
+    false
+}
+
+/// Validate the desktop's exact path-bound proof that both its managed data
+/// directory and shutdown-control child were durably published
+/// before any lifecycle handle was retained beneath them. A well-formed proof
+/// copied with a replacement directory is stale (Ok(false)) and must be
+/// refreshed only after a real rebarrier. Malformed/truncated contents remain
+/// hard failures. The retired v1 static marker is never accepted as proof.
+pub fn has_exact_desktop_lifecycle_namespace_proof(
+    data_dir: &Path,
+    session_nonce: &[u8; 32],
+) -> io::Result<bool> {
+    match std::fs::symlink_metadata(data_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(permission_error(format!(
+                    "desktop managed data path is linked or not a directory: {}",
+                    data_dir.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    validate_private_directory(data_dir)?;
+    let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    match std::fs::symlink_metadata(&control_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(permission_error(format!(
+                    "desktop shutdown-control path is linked or not a directory: {}",
+                    control_dir.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    validate_private_directory(&control_dir)?;
+    let (
+        expected_path_sha256,
+        expected_data_directory_identity,
+        expected_control_directory_identity,
+    ) = desktop_lifecycle_namespace_identity(data_dir)?;
+    let proof_path = desktop_lifecycle_namespace_proof_path(data_dir)?;
+    let mut proof = match open_private(&proof_path) {
+        Ok(proof) => proof,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let length = proof.metadata()?.len();
+    if length == 0 || length > DESKTOP_LIFECYCLE_NAMESPACE_PROOF_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "desktop lifecycle namespace proof has an invalid length: {}",
+                proof_path.display()
+            ),
+        ));
+    }
+    let mut actual = String::with_capacity(length as usize);
+    proof.read_to_string(&mut actual).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "desktop lifecycle namespace proof is not UTF-8 ({}): {error}",
+                proof_path.display()
+            ),
+        )
+    })?;
+    let Some(body) = actual.strip_suffix('\n') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "desktop lifecycle namespace proof has invalid contents: {}",
+                proof_path.display()
+            ),
+        ));
+    };
+    let mut lines = body.split('\n');
+    let schema = lines.next();
+    let path_sha256 = lines
+        .next()
+        .and_then(|line| line.strip_prefix("target_canonical_path_sha256="));
+    let data_directory_identity = lines
+        .next()
+        .and_then(|line| line.strip_prefix("target_data_directory_identity="));
+    let control_directory_identity = lines
+        .next()
+        .and_then(|line| line.strip_prefix("target_control_directory_identity="));
+    let actual_session_nonce = lines
+        .next()
+        .and_then(|line| line.strip_prefix("session_nonce="));
+    if schema != Some(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_SCHEMA)
+        || lines.next().is_some()
+        || !path_sha256.is_some_and(|value| valid_lower_hex(value, 64))
+        || !data_directory_identity.is_some_and(valid_desktop_lifecycle_directory_identity)
+        || !control_directory_identity.is_some_and(valid_desktop_lifecycle_directory_identity)
+        || !actual_session_nonce.is_some_and(|value| valid_lower_hex(value, 64))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "desktop lifecycle namespace proof has invalid contents: {}",
+                proof_path.display()
+            ),
+        ));
+    }
+    let path_sha256 = path_sha256.expect("validated above");
+    if path_sha256 != expected_path_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "desktop lifecycle namespace proof names the wrong canonical path: {}",
+                proof_path.display()
+            ),
+        ));
+    }
+    let expected_session_nonce = hex::encode(session_nonce);
+    Ok(
+        data_directory_identity == Some(expected_data_directory_identity.as_str())
+            && control_directory_identity == Some(expected_control_directory_identity.as_str())
+            && actual_session_nonce == Some(expected_session_nonce.as_str()),
+    )
+}
+
+/// The node may consume the desktop proof only while the desktop still owns
+/// the in-directory lifecycle lock. The stable sibling namespace lock held by
+/// the caller closes the small interval between this probe and node startup:
+/// proof publication happens under that same sibling lock, and the desktop
+/// does not release it until after acquiring the lifecycle lock.
+pub fn has_active_exact_desktop_lifecycle_namespace_proof(
+    data_dir: &Path,
+    session_nonce: &[u8; 32],
+) -> io::Result<bool> {
+    let lifecycle_path = data_dir
+        .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+        .join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+    let mut lifecycle = match open_private_read_write(&lifecycle_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match lifecycle.try_lock() {
+        Ok(()) => {
+            lifecycle.unlock()?;
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let expected = desktop_lifecycle_lock_payload(session_nonce);
+            if lifecycle.metadata()?.len() != expected.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "active desktop lifecycle lock has an invalid length: {}",
+                        lifecycle_path.display()
+                    ),
+                ));
+            }
+            let mut actual = vec![0u8; expected.len()];
+            lifecycle.read_exact(&mut actual)?;
+            if actual != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "active desktop lifecycle lock does not match this node handoff: {}",
+                        lifecycle_path.display()
+                    ),
+                ));
+            }
+            has_exact_desktop_lifecycle_namespace_proof(data_dir, session_nonce)
+        }
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 fn validate_private_directory_parent(path: &Path) -> io::Result<()> {
@@ -1712,6 +2416,17 @@ mod platform {
         validate_private_directory_handle(&directory, path)
     }
 
+    pub(super) fn private_directory_identity(path: &Path) -> io::Result<String> {
+        let directory = open_private_directory(path)?;
+        validate_private_directory_handle(&directory, path)?;
+        let metadata = directory.metadata()?;
+        Ok(format!(
+            "unix:{:016x}:{:016x}",
+            metadata.dev(),
+            metadata.ino()
+        ))
+    }
+
     pub(super) fn secure_private_directory(path: &Path) -> io::Result<()> {
         let directory = match open_private_directory(path) {
             Ok(directory) => directory,
@@ -1876,6 +2591,332 @@ mod tests {
         drop(file);
         guard.rebarrier_existing().unwrap();
         assert_eq!(std::fs::read(&payload).unwrap(), b"canonical history");
+    }
+
+    #[test]
+    fn namespace_sidecar_digest_is_parent_scoped_not_a_global_path_identity() {
+        let root = TestDir::new("directory-namespace-parent-scope");
+        let first_parent = root.0.join("first");
+        let second_parent = root.0.join("second");
+        create_private_directory_tree(&first_parent).unwrap();
+        create_private_directory_tree(&second_parent).unwrap();
+        let first = first_parent.join("same-leaf");
+        let second = second_parent.join("same-leaf");
+
+        assert_eq!(
+            namespace_path_digest(&first).unwrap(),
+            namespace_path_digest(&second).unwrap(),
+            "the containing directory already scopes each deterministic sidecar"
+        );
+        assert!(
+            !same_private_directory_namespace(&first, &second).unwrap(),
+            "parent-scoped digests must never be reused as global namespace identities"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_case_aliases_share_one_absent_namespace_lock() {
+        let root = TestDir::new("directory-namespace-macos-case-alias");
+        secure_private_directory(&root.0).unwrap();
+        let canonical = root.0.join("data-v0.8");
+        let variant = root.0.join("DATA-V0.8");
+        if macos_namespace_parent_is_case_sensitive(&root.0).unwrap() {
+            assert_ne!(
+                namespace_path_digest(&canonical).unwrap(),
+                namespace_path_digest(&variant).unwrap()
+            );
+            assert!(!same_private_directory_namespace(&canonical, &variant).unwrap());
+            return;
+        }
+
+        assert_eq!(
+            namespace_path_digest(&canonical).unwrap(),
+            namespace_path_digest(&variant).unwrap()
+        );
+        assert!(same_private_directory_namespace(&canonical, &variant).unwrap());
+        let owner = try_acquire_private_directory_namespace_lock(&canonical).unwrap();
+        let error = match try_acquire_private_directory_namespace_lock(&variant) {
+            Ok(_) => panic!("a differently-cased spelling acquired a second APFS lock"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(owner);
+        try_acquire_private_directory_namespace_lock(&variant)
+            .expect("the alias lock must become acquirable after the owner exits");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_case_insensitive_lock_rejects_unmodeled_unicode_leaf() {
+        let root = TestDir::new("directory-namespace-macos-unicode");
+        secure_private_directory(&root.0).unwrap();
+        if macos_namespace_parent_is_case_sensitive(&root.0).unwrap() {
+            return;
+        }
+        let error = namespace_path_digest(&root.0.join("dátá-v0.8"))
+            .expect_err("Unicode APFS case equivalence must not be guessed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("non-ASCII"));
+    }
+
+    #[test]
+    fn desktop_lifecycle_namespace_proof_is_path_bound_and_v1_is_inert() {
+        let root = TestDir::new("desktop-proof-path-binding");
+        secure_private_directory(&root.0).unwrap();
+        let first_parent = root.0.join("first");
+        let second_parent = root.0.join("second");
+        create_private_directory_tree(&first_parent).unwrap();
+        create_private_directory_tree(&second_parent).unwrap();
+        let first_data = first_parent.join("data-v3");
+        let control = first_data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        create_private_directory_tree(&control).unwrap();
+
+        // A v1 marker may exist on a candidate installation, but it is never
+        // silently promoted to the path-bound capability.
+        durably_publish_new_private(
+            &control.join("lifecycle.namespace-proof"),
+            b"arc.desktop.lifecycle-namespace.v1\n",
+        )
+        .unwrap();
+        assert!(!has_exact_desktop_lifecycle_namespace_proof(&first_data, &[0u8; 32]).unwrap());
+
+        let session_nonce = [0x11u8; 32];
+        let proof = desktop_lifecycle_namespace_proof(&first_data, &session_nonce).unwrap();
+        let proof_path = desktop_lifecycle_namespace_proof_path(&first_data).unwrap();
+        durably_publish_new_private(&proof_path, &proof).unwrap();
+        assert!(has_exact_desktop_lifecycle_namespace_proof(&first_data, &session_nonce).unwrap());
+
+        let moved_data = second_parent.join("data-v3");
+        std::fs::rename(&first_data, &moved_data).unwrap();
+        assert!(
+            !has_exact_desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap(),
+            "a carried proof filename must be inert at a different path"
+        );
+
+        let moved_control = moved_data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        let moved_proof_path = desktop_lifecycle_namespace_proof_path(&moved_data).unwrap();
+        let moved_proof = desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap();
+        durably_replace_private(&moved_proof_path, &moved_proof).unwrap();
+        assert!(has_exact_desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap());
+
+        // Replacing the data directory at the identical lexical path changes
+        // its filesystem identity. Even copying valid old bytes into the new
+        // identity-keyed proof name cannot authenticate the replacement.
+        let archived_data = second_parent.join("archived-data-v3");
+        std::fs::rename(&moved_data, &archived_data).unwrap();
+        create_private_directory_tree(&moved_control).unwrap();
+        let restored_proof_path = desktop_lifecycle_namespace_proof_path(&moved_data).unwrap();
+        durably_replace_private(&restored_proof_path, &moved_proof).unwrap();
+        assert!(
+            !has_exact_desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap(),
+            "same-path restore must not inherit the old data-directory identity"
+        );
+
+        // Replacing only the shutdown-control child is equally visible.
+        let refreshed_proof =
+            desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap();
+        durably_replace_private(&restored_proof_path, &refreshed_proof).unwrap();
+        let archived_control = moved_data.join("archived-control");
+        std::fs::rename(&moved_control, &archived_control).unwrap();
+        create_private_directory_tree(&moved_control).unwrap();
+        let replacement_control_proof_path =
+            desktop_lifecycle_namespace_proof_path(&moved_data).unwrap();
+        durably_replace_private(&replacement_control_proof_path, &refreshed_proof).unwrap();
+        assert!(
+            !has_exact_desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap(),
+            "control-subtree replacement must invalidate the old proof"
+        );
+    }
+
+    #[test]
+    fn desktop_lifecycle_handoff_requires_active_matching_session() {
+        let root = TestDir::new("desktop-proof-live-session");
+        secure_private_directory(&root.0).unwrap();
+        let data_dir = root.0.join("data-v3");
+        let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        create_private_directory_tree(&control_dir).unwrap();
+        let session_nonce = [0x22u8; 32];
+        let proof_path = desktop_lifecycle_namespace_proof_path(&data_dir).unwrap();
+        durably_replace_private(
+            &proof_path,
+            &desktop_lifecycle_namespace_proof(&data_dir, &session_nonce).unwrap(),
+        )
+        .unwrap();
+        let lifecycle_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+        durably_replace_private(
+            &lifecycle_path,
+            &desktop_lifecycle_lock_payload(&session_nonce),
+        )
+        .unwrap();
+        let lifecycle = open_private_read_write(&lifecycle_path).unwrap();
+        lifecycle.try_lock().unwrap();
+
+        assert!(
+            has_active_exact_desktop_lifecycle_namespace_proof(&data_dir, &session_nonce).unwrap()
+        );
+        let wrong_nonce = [0x33u8; 32];
+        let error = has_active_exact_desktop_lifecycle_namespace_proof(&data_dir, &wrong_nonce)
+            .expect_err("a delayed child from another desktop session must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("does not match this node handoff")
+        );
+
+        lifecycle.unlock().unwrap();
+        drop(lifecycle);
+        assert!(
+            !has_active_exact_desktop_lifecycle_namespace_proof(&data_dir, &session_nonce).unwrap(),
+            "exact static bytes without a live desktop owner are not a handoff"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_rebarrier_requires_closed_descendant_handles() {
+        let root = TestDir::new("directory-rebarrier-open-child");
+        let requested = root.0.join("semantic-child");
+        let guard = acquire_private_directory_namespace_lock(&requested).unwrap();
+        guard.restore_interrupted().unwrap();
+        create_private_directory_tree(guard.target()).unwrap();
+        let payload = guard.target().join("history");
+        let mut created = create_new_private(&payload).unwrap();
+        created.write_all(b"canonical history").unwrap();
+        created.sync_all().unwrap();
+        drop(created);
+
+        // Even a descendant reopened with FILE_SHARE_DELETE pins its ancestor
+        // against rename on NTFS. This is the exact constraint the recovery
+        // store's two-phase inner-lock handshake must respect.
+        let opened = open_private_read_write(&payload).unwrap();
+        opened.try_lock().unwrap();
+        let error = guard
+            .rebarrier_existing()
+            .expect_err("an open descendant must pin the Windows directory name");
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert!(guard.target().is_dir());
+        assert!(
+            !private_directory_namespace_rebarrier_path(guard.target())
+                .unwrap()
+                .exists()
+        );
+
+        opened.unlock().unwrap();
+        drop(opened);
+        guard.rebarrier_existing().unwrap();
+        assert_eq!(std::fs::read(payload).unwrap(), b"canonical history");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_8dot3_alias_is_rejected_before_namespace_derivation() {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING, SetFileShortNameW,
+        };
+
+        let root = TestDir::new("directory-namespace-8dot3-alias");
+        secure_private_directory(&root.0).unwrap();
+        let long_path = root.0.join("CanonicalNamespaceHistoryDirectory");
+        create_private_directory_tree(&long_path).unwrap();
+        let wide = windows_extended_path(&long_path).unwrap();
+        // SAFETY: the path is NUL terminated and every flag is valid for an
+        // existing directory handle. The successful handle is transferred to
+        // `File` immediately below.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DELETE | FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "cannot open alias fixture");
+        // SAFETY: the successful handle is uniquely owned here.
+        let directory = unsafe { File::from_raw_handle(handle.cast::<c_void>()) };
+        let mut alias_wide = std::ffi::OsStr::new("ARCALT01")
+            .encode_wide()
+            .collect::<Vec<_>>();
+        alias_wide.push(0);
+        // SAFETY: the directory handle has DELETE access and the requested
+        // DOS 8.3 name is NUL terminated. Hosted Windows CI must exercise the
+        // real alternate-name path rather than silently skipping it.
+        assert_ne!(
+            unsafe { SetFileShortNameW(directory.as_raw_handle().cast(), alias_wide.as_ptr()) },
+            0,
+            "cannot assign deterministic 8.3 alias: {}",
+            io::Error::last_os_error()
+        );
+        drop(directory);
+        let alias = long_path.parent().unwrap().join("ARCALT01");
+        assert!(alias.exists(), "the reported short path must resolve");
+        let error = namespace_path_digest(&alias)
+            .expect_err("an existing 8.3 alias must not derive a second namespace");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("aliases are not accepted"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_case_variants_share_one_namespace_and_sidecar() {
+        let root = TestDir::new("directory-namespace-case-variant");
+        secure_private_directory(&root.0).unwrap();
+        let canonical = root.0.join("CanonicalHistoryDirectory");
+        create_private_directory_tree(&canonical).unwrap();
+        let variant = root.0.join("cANONICALhISTORYdIRECTORY");
+
+        assert_eq!(
+            namespace_path_digest(&canonical).unwrap(),
+            namespace_path_digest(&variant).unwrap()
+        );
+        assert!(same_private_directory_namespace(&canonical, &variant).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_simultaneous_first_namespace_lock_waits_out_exclusive_create_handle() {
+        use std::sync::{Arc, Barrier};
+
+        let root = TestDir::new("directory-namespace-first-create-race");
+        secure_private_directory(&root.0).unwrap();
+        let target = root.0.join("semantic-child");
+        let digest = namespace_path_digest(&target).unwrap();
+        let lock_path = root
+            .0
+            .join(format!(".arc-private-directory-namespace-{digest}.lock"));
+        let mut exclusive_creator = create_new_private(&lock_path).unwrap();
+        exclusive_creator
+            .write_all(b"arc.private-directory.namespace-lock.v1\n")
+            .unwrap();
+        exclusive_creator.sync_all().unwrap();
+
+        let start = Arc::new(Barrier::new(2));
+        let contender_start = Arc::clone(&start);
+        let contender_target = target.clone();
+        let contender = std::thread::spawn(move || {
+            contender_start.wait();
+            try_acquire_private_directory_namespace_lock(&contender_target)
+        });
+        start.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(exclusive_creator);
+
+        let guard = contender
+            .join()
+            .unwrap()
+            .expect("a first-create sharing window must converge on the advisory lock");
+        assert_eq!(guard.target(), target);
     }
 
     #[cfg(windows)]
@@ -2449,12 +3490,13 @@ mod platform {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_DATA, FileCaseSensitiveInfo, GetFileInformationByHandleEx,
         OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::SystemServices::{
-        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, FILE_CS_FLAG_CASE_SENSITIVE_DIR,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -2902,6 +3944,89 @@ mod platform {
     pub(super) fn validate_private_directory(path: &Path) -> io::Result<()> {
         let directory = open_private_directory_raw(path)?;
         validate_private_directory_handle(&directory, path)
+    }
+
+    pub(super) fn private_directory_identity(path: &Path) -> io::Result<String> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let directory = open_private_directory_raw(path)?;
+        validate_private_directory_handle(&directory, path)?;
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `directory` owns a live validated handle and `information`
+        // is a writable output buffer for this synchronous call.
+        if unsafe { GetFileInformationByHandle(directory.as_raw_handle().cast(), &mut information) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let file_index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        Ok(format!(
+            "windows:{:08x}:{file_index:016x}",
+            information.dwVolumeSerialNumber
+        ))
+    }
+
+    pub(super) fn validate_case_insensitive_namespace_parent(path: &Path) -> io::Result<()> {
+        let directory = open_private_directory_raw_with_access(path, GENERIC_READ)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "Windows namespace parent is not a non-reparse directory: {}",
+                path.display()
+            )));
+        }
+        let mut information = FILE_CASE_SENSITIVE_INFO::default();
+        // SAFETY: `directory` owns a live directory handle and `information`
+        // is a correctly sized writable output buffer for this synchronous
+        // query. Failing the query is itself fail-closed: ARC cannot safely
+        // assume that case-folded deterministic sidecars are unique.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle().cast(),
+                FileCaseSensitiveInfo,
+                (&mut information as *mut FILE_CASE_SENSITIVE_INFO).cast(),
+                size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if information.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
+            return Err(permission_error(format!(
+                "Windows case-sensitive namespace parents are unsupported for ARC durable directory sidecars: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn namespace_parent_identity(path: &Path) -> io::Result<(u32, u64)> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let directory = open_private_directory_raw_with_access(path, GENERIC_READ)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "Windows namespace parent is not a non-reparse directory: {}",
+                path.display()
+            )));
+        }
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `directory` owns a live handle and `information` is a valid
+        // output buffer for this synchronous identity query.
+        if unsafe { GetFileInformationByHandle(directory.as_raw_handle().cast(), &mut information) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let file_index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        Ok((information.dwVolumeSerialNumber, file_index))
     }
 
     fn open_private_directory_raw(path: &Path) -> io::Result<File> {

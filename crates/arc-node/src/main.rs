@@ -1,4 +1,6 @@
 mod config;
+mod legacy_retirement;
+mod recovery_descriptor;
 mod validator_identity;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -33,6 +35,22 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
+
+fn parse_desktop_lifecycle_nonce(encoded: &str) -> std::result::Result<[u8; 32], String> {
+    if encoded.len() != 64
+        || !encoded
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err("must contain exactly 64 lowercase hexadecimal characters".to_string());
+    }
+    let decoded = hex::decode(encoded)
+        .map_err(|_| "must contain exactly 64 lowercase hexadecimal characters".to_string())?;
+    decoded
+        .try_into()
+        .map_err(|_| "must decode to exactly 32 bytes".to_string())
+}
 
 #[derive(Parser)]
 #[command(name = "arc-node", version, about = "ARC Chain Node")]
@@ -76,6 +94,15 @@ struct Cli {
     /// sibling request file instead; no network shutdown endpoint is exposed.
     #[arg(long)]
     desktop_shutdown_token_file: Option<PathBuf>,
+
+    /// Session-bound desktop-to-node namespace handoff capability.
+    #[arg(
+        long,
+        value_name = "64_HEX_CHARS",
+        requires = "desktop_shutdown_token_file",
+        value_parser = parse_desktop_lifecycle_nonce
+    )]
+    desktop_lifecycle_nonce: Option<[u8; 32]>,
 
     /// Bootstrap peer addresses (comma-separated host:port)
     #[arg(long, value_delimiter = ',')]
@@ -383,6 +410,11 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Create or finalize offline, create-only v0.7 community retirement evidence.
+    LegacyRetirement {
+        #[command(subcommand)]
+        command: legacy_retirement::LegacyRetirementCommand,
+    },
     /// Operate the quorum-certified ARCCHKPT recovery protocol.
     Recovery {
         #[command(subcommand)]
@@ -559,6 +591,14 @@ enum RecoveryCommand {
         #[arg(long, default_value_t = 1)]
         validator_set_id: u64,
     },
+    /// Verify the compact, release-signed projection of a quorum-certified
+    /// checkpoint without downloading the full protected ARCCHKPT payload.
+    VerifyDescriptor {
+        #[arg(long)]
+        descriptor: String,
+        #[arg(long)]
+        genesis: String,
+    },
     /// Verify and atomically activate a checkpoint in a fresh data directory.
     Import {
         #[arg(long)]
@@ -713,9 +753,37 @@ fn print_recovery_summary(
     source_wal: Option<&arc_state::recovery::LegacyWalBoundaryReport>,
 ) -> Result<()> {
     let transition = checkpoint.manifest.transition_block()?;
+    let validators = checkpoint
+        .manifest
+        .validators
+        .iter()
+        .map(|validator| {
+            serde_json::json!({
+                "address": format!("0x{}", validator.address.to_hex()),
+                "public_key": hex::encode(validator.public_key),
+                "stake": validator.stake,
+            })
+        })
+        .collect::<Vec<_>>();
+    let signatures = checkpoint
+        .signatures
+        .iter()
+        .map(|signature| {
+            let mut bytes = [0u8; 64];
+            bytes[..32].copy_from_slice(&signature.signature_halves[0]);
+            bytes[32..].copy_from_slice(&signature.signature_halves[1]);
+            serde_json::json!({
+                "validator": format!("0x{}", signature.validator.to_hex()),
+                "public_key": hex::encode(signature.public_key),
+                "signature": hex::encode(bytes),
+            })
+        })
+        .collect::<Vec<_>>();
     let mut summary = serde_json::json!({
         "status": status,
+        "format_version": checkpoint.manifest.format_version,
         "manifest_hash": format!("0x{}", checkpoint.manifest_hash().to_hex()),
+        "signing_hash": format!("0x{}", checkpoint.manifest.signing_hash().to_hex()),
         "payload_hash": format!("0x{}", checkpoint.manifest.payload_hash.to_hex()),
         "full_state_root": format!("0x{}", checkpoint.manifest.full_state_root.to_hex()),
         "chain_id": checkpoint.manifest.chain_id,
@@ -736,8 +804,11 @@ fn print_recovery_summary(
             checkpoint.manifest.protocol_version.minor,
             checkpoint.manifest.protocol_version.patch,
         ),
+        "community_rewards_v1_activation_height": checkpoint.manifest.community_rewards_v1_activation_height,
         "validator_count": checkpoint.manifest.validators.len(),
         "signature_count": checkpoint.signatures.len(),
+        "validators": validators,
+        "signatures": signatures,
         "source_validator_count": checkpoint.payload.validators.len(),
         "source_validator_stake": checkpoint.payload.staking_pool,
         "source_validator_set_hash": format!("0x{}", checkpoint.payload.source_validator_set_hash().to_hex()),
@@ -1614,9 +1685,29 @@ fn restore_legacy_dag_wal_and_read_round(dag_wal_path: &Path) -> Result<u64> {
 /// and consensus WALs concurrently without creating a stale-PID blocker.
 struct NodeDataDirLock {
     _file: File,
+    startup_namespace: Option<arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock>,
 }
 
-fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
+impl NodeDataDirLock {
+    fn prepared_directory(
+        &self,
+    ) -> &arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock {
+        self.startup_namespace
+            .as_ref()
+            .expect("node data namespace is retained until persistent state opens")
+    }
+
+    fn finish_persistent_state_startup(&mut self) {
+        self.startup_namespace.take();
+    }
+}
+
+fn acquire_node_data_dir_lock(
+    data_dir: &Path,
+    desktop_lifecycle_nonce: Option<&[u8; 32]>,
+) -> Result<NodeDataDirLock> {
+    #[cfg(not(windows))]
+    let _ = desktop_lifecycle_nonce;
     let parent = data_dir
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1636,23 +1727,32 @@ fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
     // directory itself moves away and back. An in-directory lock alone is not
     // sufficient: a racing startup could otherwise create a second directory
     // during that brief absent-name window.
-    let namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(
-        data_dir,
-    )
-    .with_context(|| {
-        format!(
-            "failed to lock node data-directory namespace {}",
-            data_dir.display()
-        )
-    })?;
+    let namespace_lock =
+        match arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(data_dir) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                bail!(
+                    "node data directory {} is already locked by another ARC process",
+                    data_dir.display()
+                )
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to lock node data-directory namespace {}",
+                        data_dir.display()
+                    )
+                });
+            }
+        };
     namespace_lock.restore_interrupted().with_context(|| {
         format!(
             "failed to restore interrupted node data-directory namespace {}",
             data_dir.display()
         )
     })?;
-    let locked_data_dir = namespace_lock.target();
-    match std::fs::symlink_metadata(locked_data_dir) {
+    let locked_data_dir = namespace_lock.target().to_path_buf();
+    match std::fs::symlink_metadata(&locked_data_dir) {
         Ok(metadata) => ensure!(
             metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
             "node data directory {} must be a real directory",
@@ -1668,37 +1768,82 @@ fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
     // Run this on both first creation and every retry. A prior attempt may
     // have made the leaf visible before its parent-directory fsync reported a
     // late error; merely syncing a child lock file cannot prove the leaf name.
-    arc_crypto::secret_file::create_private_directory_tree(locked_data_dir).with_context(|| {
+    arc_crypto::secret_file::create_private_directory_tree(&locked_data_dir).with_context(
+        || {
+            format!(
+                "failed to durably create or rebarrier private node data directory {}",
+                locked_data_dir.display()
+            )
+        },
+    )?;
+
+    #[cfg(windows)]
+    let desktop_namespace_is_proven = match desktop_lifecycle_nonce {
+        Some(session_nonce) => {
+            arc_crypto::secret_file::has_active_exact_desktop_lifecycle_namespace_proof(
+                &locked_data_dir,
+                session_nonce,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to validate active desktop lifecycle namespace proof/handoff beneath {}",
+                    locked_data_dir.display()
+                )
+            })?
+        }
+        None => false,
+    };
+
+    let path = locked_data_dir.join(".arc-node.lock");
+    let file = open_and_try_lock_node_data_file(&path, &locked_data_dir)?;
+
+    // NTFS denies renaming a directory while any descendant handle remains
+    // open (MS-FSA 2.1.5.15.12). Probe the inner in-directory lock first. An
+    // exact desktop proof safely avoids the move while its lifecycle handle is
+    // live; otherwise close our handle, rebarrier, and reacquire before any
+    // mutation. The stable sibling lock remains held throughout, and that
+    // second probe catches a same-version racer in the real-move branch.
+    // Released v0.7 binaries honor neither lock; first upgrade must fully
+    // quiesce the old process and use the documented fresh v0.8 data path.
+    #[cfg(windows)]
+    let (file, prepared_namespace) = if desktop_namespace_is_proven {
+        let prepared = namespace_lock
+            .into_desktop_lifecycle_proven(
+                desktop_lifecycle_nonce.expect("proof branch requires a handoff nonce"),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to authenticate prepared desktop data-directory namespace {}",
+                    locked_data_dir.display()
+                )
+            })?;
+        (file, prepared)
+    } else {
+        file.unlock().with_context(|| {
+            format!(
+                "failed to release node data lock {} before Windows namespace rebarrier",
+                path.display()
+            )
+        })?;
+        drop(file);
+        let prepared = namespace_lock.rebarrier_into_prepared().with_context(|| {
+            format!(
+                "failed to durably rebarrier node data-directory name {}",
+                locked_data_dir.display()
+            )
+        })?;
+        let file = open_and_try_lock_node_data_file(&path, &locked_data_dir)?;
+        (file, prepared)
+    };
+    #[cfg(not(windows))]
+    let prepared_namespace = namespace_lock.rebarrier_into_prepared().with_context(|| {
         format!(
-            "failed to durably create or rebarrier private node data directory {}",
+            "failed to durably rebarrier node data-directory name {}",
             locked_data_dir.display()
         )
     })?;
 
-    let path = locked_data_dir.join(".arc-node.lock");
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        ensure!(
-            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-            "node data lock {} must be a regular file",
-            path.display()
-        );
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("failed to open node data lock {}", path.display()))?;
-    file.try_lock().with_context(|| {
-        format!(
-            "node data directory {} is already locked by another ARC process",
-            locked_data_dir.display()
-        )
-    })?;
+    let mut file = file;
     file.set_len(0)
         .with_context(|| format!("failed to reset node data lock {}", path.display()))?;
     file.write_all(
@@ -1707,14 +1852,43 @@ fn acquire_node_data_dir_lock(data_dir: &Path) -> Result<NodeDataDirLock> {
     .with_context(|| format!("failed to write node data lock {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to fsync node data lock {}", path.display()))?;
-    namespace_lock.rebarrier_existing().with_context(|| {
+    sync_directory(&locked_data_dir)?;
+    Ok(NodeDataDirLock {
+        _file: file,
+        startup_namespace: Some(prepared_namespace),
+    })
+}
+
+fn open_and_try_lock_node_data_file(path: &Path, locked_data_dir: &Path) -> Result<File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "node data lock {} must be a regular file",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect node data lock {}", path.display()));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open node data lock {}", path.display()))?;
+    file.try_lock().with_context(|| {
         format!(
-            "failed to durably rebarrier node data-directory name {}",
+            "node data directory {} is already locked by another ARC process",
             locked_data_dir.display()
         )
     })?;
-    sync_directory(locked_data_dir)?;
-    Ok(NodeDataDirLock { _file: file })
+    Ok(file)
 }
 
 fn write_recovery_dag_binding_atomically(path: &Path, binding: &RecoveryDagBinding) -> Result<()> {
@@ -3440,6 +3614,10 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
             checkpoint.verify(&trust)?;
             print_recovery_summary(&checkpoint, "VERIFIED_QUORUM", None)
         }
+        RecoveryCommand::VerifyDescriptor {
+            descriptor,
+            genesis,
+        } => recovery_descriptor::verify_and_print(Path::new(&descriptor), Path::new(&genesis)),
         RecoveryCommand::Import {
             checkpoint,
             data_dir,
@@ -3480,6 +3658,7 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::LegacyRetirement { command } => legacy_retirement::run(command),
         OperatorCommand::Recovery { command } => run_recovery_operator_command(command),
         OperatorCommand::Archive {
             command:
@@ -5411,7 +5590,11 @@ async fn main() -> Result<()> {
         } else {
             node_cfg.storage.data_dir.clone()
         };
-    let _data_dir_lock = acquire_node_data_dir_lock(Path::new(&data_dir))?;
+    // Clap validates the handoff nonce during the first parse, before model
+    // discovery/download, config loading, filesystem locking, or networking.
+    let desktop_lifecycle_nonce = cli.desktop_lifecycle_nonce;
+    let mut data_dir_lock =
+        acquire_node_data_dir_lock(Path::new(&data_dir), desktop_lifecycle_nonce.as_ref())?;
     let desktop_shutdown_control = prepare_desktop_shutdown_control(
         Path::new(&data_dir),
         cli.desktop_shutdown_token_file.as_deref(),
@@ -5975,13 +6158,17 @@ async fn main() -> Result<()> {
             validators: genesis_validators.clone(),
             community_rewards_v1_activation_height: reward_activation_height,
         };
-        let mut db = StateDB::with_genesis_persistent_recovery(
+        let mut db = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
             &genesis_accounts,
-            &data_dir,
+            data_dir_lock.prepared_directory(),
             recovery_network,
             recovery_import,
         )
         .context("failed to initialize genesis/recovery-bound persistent state")?;
+        // The process-lifetime inner lock now protects the open WAL. Release
+        // the stable sibling startup guard only after replay/import and every
+        // namespace-dependent state decision has completed successfully.
+        data_dir_lock.finish_persistent_state_startup();
         db.set_community_rewards_v1_activation_height(reward_activation_height);
         match reward_activation_height {
             Some(height) => tracing::info!(
@@ -9022,6 +9209,50 @@ mod tests {
     }
 
     #[test]
+    fn desktop_lifecycle_nonce_cli_is_strict_early_and_capability_visible() {
+        let encoded = "5a".repeat(32);
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "--desktop-shutdown-token-file",
+            "desktop-token",
+            "--desktop-lifecycle-nonce",
+            &encoded,
+        ])
+        .expect("the desktop's exact lowercase 32-byte nonce must parse");
+        assert_eq!(cli.desktop_lifecycle_nonce, Some([0x5a; 32]));
+
+        for invalid in [
+            "5a".repeat(31),
+            "5A".repeat(32),
+            format!("{}g0", "5a".repeat(31)),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "arc-node",
+                    "--desktop-shutdown-token-file",
+                    "desktop-token",
+                    "--desktop-lifecycle-nonce",
+                    &invalid,
+                ])
+                .is_err(),
+                "malformed desktop lifecycle nonce unexpectedly parsed: {invalid}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["arc-node", "--desktop-lifecycle-nonce", encoded.as_str(),])
+                .is_err(),
+            "the namespace handoff must require the private shutdown capability"
+        );
+        assert!(
+            Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("--desktop-lifecycle-nonce"),
+            "the desktop must be able to capability-probe the handoff flag before spawn"
+        );
+    }
+
+    #[test]
     fn full_integer_worker_is_explicit_stake_zero_and_never_a_shard_holder() {
         let valid = Cli::try_parse_from([
             "arc-node",
@@ -9110,6 +9341,29 @@ mod tests {
         };
         assert_eq!(recovery_epoch, 1);
         assert_eq!(validator_set_id, 1);
+
+        let descriptor = Cli::try_parse_from([
+            "arc-node",
+            "recovery",
+            "verify-descriptor",
+            "--descriptor",
+            "arc-recovery-checkpoint-descriptor.json",
+            "--genesis",
+            "genesis.toml",
+        ])
+        .unwrap();
+        let Some(OperatorCommand::Recovery {
+            command:
+                RecoveryCommand::VerifyDescriptor {
+                    descriptor,
+                    genesis,
+                },
+        }) = descriptor.operator_command
+        else {
+            panic!("recovery verify-descriptor command was not parsed")
+        };
+        assert_eq!(descriptor, "arc-recovery-checkpoint-descriptor.json");
+        assert_eq!(genesis, "genesis.toml");
 
         assert!(
             Cli::try_parse_from([
@@ -9308,14 +9562,20 @@ mod tests {
     fn node_data_directory_lock_rejects_concurrent_owner_and_survives_stale_file() {
         let data_dir =
             std::env::temp_dir().join(format!("arc-node-data-lock-test-{}", uuid::Uuid::new_v4()));
-        let first = acquire_node_data_dir_lock(&data_dir).unwrap();
-        let error = acquire_node_data_dir_lock(&data_dir)
+        let mut first = acquire_node_data_dir_lock(&data_dir, None).unwrap();
+        let error = acquire_node_data_dir_lock(&data_dir, None)
             .err()
-            .expect("a second process handle must not share one data directory");
+            .expect("the retained startup namespace lock must reject a second owner");
+        assert!(error.to_string().contains("already locked"), "{error}");
+
+        first.finish_persistent_state_startup();
+        let error = acquire_node_data_dir_lock(&data_dir, None)
+            .err()
+            .expect("the process-lifetime inner lock must reject a second owner");
         assert!(error.to_string().contains("already locked"), "{error}");
 
         drop(first);
-        let second = acquire_node_data_dir_lock(&data_dir)
+        let second = acquire_node_data_dir_lock(&data_dir, None)
             .expect("the persistent lock file must be reusable after owner exit");
         drop(second);
         std::fs::remove_dir_all(&data_dir).unwrap();
@@ -9328,11 +9588,180 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let data_dir = root.join("missing-parent").join("arc-data");
-        let error = acquire_node_data_dir_lock(&data_dir)
+        let error = acquire_node_data_dir_lock(&data_dir, None)
             .err()
             .expect("ARC must not acknowledge state under an unproved missing ancestor");
         assert!(error.to_string().contains("parent"));
         assert!(!root.exists());
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum WindowsDesktopProofFixture {
+        Exact,
+        Missing,
+        Invalid(&'static [u8]),
+    }
+
+    #[cfg(windows)]
+    fn windows_desktop_lifecycle_fixture(
+        label: &str,
+        proof: WindowsDesktopProofFixture,
+    ) -> (PathBuf, std::fs::File, [u8; 32]) {
+        let parent = std::env::temp_dir().join(format!(
+            "arc-node-desktop-lifecycle-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        arc_crypto::secret_file::create_private_directory_tree(&parent).unwrap();
+        let data_dir = parent.join("arc-data");
+        let data_guard =
+            arc_crypto::secret_file::acquire_private_directory_namespace_lock(&data_dir).unwrap();
+        data_guard.restore_interrupted().unwrap();
+        arc_crypto::secret_file::create_private_directory_tree(data_guard.target()).unwrap();
+
+        let control_dir = data_dir.join(arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+        let control_guard =
+            arc_crypto::secret_file::acquire_private_directory_namespace_lock(&control_dir)
+                .unwrap();
+        control_guard.restore_interrupted().unwrap();
+        arc_crypto::secret_file::create_private_directory_tree(control_guard.target()).unwrap();
+        control_guard.rebarrier_existing().unwrap();
+        drop(control_guard);
+        // Match the desktop's real proof contract exactly: publish the child
+        // namespace first, then rebarrier the parent while no descendant
+        // handles remain, and only then publish the proof and lifecycle lock.
+        data_guard.rebarrier_existing().unwrap();
+        drop(data_guard);
+        let session_nonce = [0x5au8; 32];
+        let proof = match proof {
+            WindowsDesktopProofFixture::Exact => Some(
+                arc_crypto::secret_file::desktop_lifecycle_namespace_proof(
+                    &data_dir,
+                    &session_nonce,
+                )
+                .unwrap(),
+            ),
+            WindowsDesktopProofFixture::Missing => None,
+            WindowsDesktopProofFixture::Invalid(proof) => Some(proof.to_vec()),
+        };
+        if let Some(proof) = proof.as_deref() {
+            assert!(
+                arc_crypto::secret_file::durably_publish_new_private(
+                    &arc_crypto::secret_file::desktop_lifecycle_namespace_proof_path(&data_dir)
+                        .unwrap(),
+                    proof,
+                )
+                .unwrap()
+            );
+        }
+        let lifecycle_path =
+            control_dir.join(arc_crypto::secret_file::DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+        assert!(
+            arc_crypto::secret_file::durably_publish_new_private(
+                &lifecycle_path,
+                &arc_crypto::secret_file::desktop_lifecycle_lock_payload(&session_nonce),
+            )
+            .unwrap()
+        );
+        let lifecycle = arc_crypto::secret_file::open_private_read_write(&lifecycle_path).unwrap();
+        lifecycle.try_lock().unwrap();
+        (data_dir, lifecycle, session_nonce)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn desktop_namespace_proof_allows_node_and_prepared_state_with_live_lifecycle_handle() {
+        let (data_dir, lifecycle, session_nonce) =
+            windows_desktop_lifecycle_fixture("exact-proof", WindowsDesktopProofFixture::Exact);
+        let mut node_lock = acquire_node_data_dir_lock(&data_dir, Some(&session_nonce)).unwrap();
+        let genesis_hash = hash_bytes(b"desktop-prepared-state-genesis");
+        let state = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+            &[(hash_bytes(b"desktop-funded"), 123)],
+            node_lock.prepared_directory(),
+            arc_state::recovery::RecoveryNetworkPolicy {
+                chain_id: "0x415243".into(),
+                genesis_hash,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: Vec::new(),
+                community_rewards_v1_activation_height: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(state.height(), 0);
+        node_lock.finish_persistent_state_startup();
+        drop(state);
+        drop(node_lock);
+        lifecycle.unlock().unwrap();
+        drop(lifecycle);
+        std::fs::remove_dir_all(data_dir.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_desktop_handle_without_exact_namespace_proof_fails_closed() {
+        for (label, proof, expected) in [
+            (
+                "missing-proof",
+                WindowsDesktopProofFixture::Missing,
+                "rebarrier",
+            ),
+            (
+                "invalid-proof",
+                WindowsDesktopProofFixture::Invalid(b"arc.desktop.lifecycle-namespace.v2\n"),
+                "proof",
+            ),
+        ] {
+            let (data_dir, lifecycle, session_nonce) =
+                windows_desktop_lifecycle_fixture(label, proof);
+            let sentinel = data_dir.join("preserved-history");
+            std::fs::write(&sentinel, b"canonical history").unwrap();
+            let error = acquire_node_data_dir_lock(&data_dir, Some(&session_nonce))
+                .err()
+                .expect("an unproved live descendant must prevent startup");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"canonical history");
+            lifecycle.unlock().unwrap();
+            drop(lifecycle);
+            std::fs::remove_dir_all(data_dir.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unlocked_lifecycle_ignores_stale_proof_and_runs_real_rebarrier() {
+        let (data_dir, lifecycle, session_nonce) = windows_desktop_lifecycle_fixture(
+            "unlocked-stale-proof",
+            WindowsDesktopProofFixture::Invalid(b"truncated stale proof\n"),
+        );
+        let sentinel = data_dir.join("preserved-history");
+        std::fs::write(&sentinel, b"canonical history").unwrap();
+        lifecycle.unlock().unwrap();
+        drop(lifecycle);
+
+        let lock = acquire_node_data_dir_lock(&data_dir, Some(&session_nonce))
+            .expect("an unlocked stale desktop session must use the real rebarrier path");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"canonical history");
+        drop(lock);
+        std::fs::remove_dir_all(data_dir.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_desktop_handoff_rejects_wrong_session_nonce() {
+        let (data_dir, lifecycle, _session_nonce) = windows_desktop_lifecycle_fixture(
+            "wrong-session-nonce",
+            WindowsDesktopProofFixture::Exact,
+        );
+        let wrong_nonce = [0x44u8; 32];
+        let error = acquire_node_data_dir_lock(&data_dir, Some(&wrong_nonce))
+            .err()
+            .expect("a delayed child from another desktop session must fail closed");
+        assert!(error.to_string().contains("handoff"), "{error}");
+        lifecycle.unlock().unwrap();
+        drop(lifecycle);
+        std::fs::remove_dir_all(data_dir.parent().unwrap()).unwrap();
     }
 
     #[cfg(windows)]
@@ -9353,7 +9782,7 @@ mod tests {
         arc_crypto::secret_file::windows_move_path_write_through(&data_dir, &staged, false)
             .unwrap();
 
-        let lock = acquire_node_data_dir_lock(&data_dir).unwrap();
+        let lock = acquire_node_data_dir_lock(&data_dir, None).unwrap();
         assert_eq!(
             std::fs::read(data_dir.join("history")).unwrap(),
             b"preserved"

@@ -9,13 +9,17 @@ verification, and call any HTTP response “healthy.” Those assumptions are
 unsafe, particularly while the public v2 fleet is known to have mixed versions
 and divergent chain state.
 
-The recovery candidate is not published or deployed. Until operators approve a
-v3 fleet manifest, there is no supported cloud deployment procedure. That
-future manifest must pin every artifact by version and digest, bind a unique
-off-repository validator identity to each host, pin the canonical genesis and
-checkpoint hashes, use verified SSH host identities, define a coordinated
-activation/rollback plan, and prove shared-chain progress rather than mere HTTP
-reachability.
+The recovery candidate is not published or deployed. There is no supported v2
+cloud deployment procedure. The v3 recovery execution boundary is
+[`scripts/recovery/recovery_rollout.py`](../scripts/recovery/recovery_rollout.py),
+used only with the sealed manifest and evidence gates in
+[`scripts/recovery/README.md`](../scripts/recovery/README.md). That manifest
+pins every artifact by version and digest, binds a unique off-repository
+validator identity to each host, pins the canonical genesis and checkpoint
+hashes, uses verified SSH host identities, defines a coordinated
+activation/rollback plan, and proves shared-chain progress rather than mere
+HTTP reachability. The tool's presence does not make these retired cloud assets
+operational or authorize an unsealed recovery run.
 
 Current safeguards:
 

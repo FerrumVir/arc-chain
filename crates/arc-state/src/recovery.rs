@@ -2914,6 +2914,24 @@ impl StateDB {
         import: Option<RecoveryImport>,
     ) -> Result<Self, StateError> {
         let namespace_lock = crate::prepare_persistent_state_directory(wal_dir.as_ref())?;
+        Self::with_genesis_persistent_recovery_in_prepared_directory(
+            prefunded,
+            &namespace_lock,
+            network,
+            import,
+        )
+    }
+
+    /// Open normal state or activate/reopen an approved ARCCHKPT base beneath
+    /// an already-proven directory namespace. The opaque capability can only
+    /// be minted by a successful direct rebarrier or by the desktop's exact
+    /// private lifecycle proof while the stable sibling lock remains held.
+    pub fn with_genesis_persistent_recovery_in_prepared_directory(
+        prefunded: &[(Address, u64)],
+        namespace_lock: &arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock,
+        network: RecoveryNetworkPolicy,
+        import: Option<RecoveryImport>,
+    ) -> Result<Self, StateError> {
         let wal_dir = namespace_lock.target();
         crate::cleanup_state_staging_files(wal_dir)?;
         cleanup_recovery_staging_files(wal_dir)?;

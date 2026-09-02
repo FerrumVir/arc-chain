@@ -352,6 +352,19 @@ case "$command_name" in
         ;;
     ps)
         case " $* " in
+            *' -axo pid=,uid=,command='*)
+                if [ -n "${MOCK_PS_ALL_ROWS:-}" ]; then
+                    while read -r mock_pid mock_uid mock_command; do
+                        [ -n "$mock_pid" ] || continue
+                        kill -0 "$mock_pid" 2>/dev/null \
+                            && printf '%s %s %s\n' "$mock_pid" "$mock_uid" "$mock_command"
+                    done <<< "$MOCK_PS_ALL_ROWS"
+                fi
+                exit 0
+                ;;
+            *' -o uid='*)
+                printf '%s\n' "${MOCK_PS_UID:-${MOCK_TARGET_UID:-1000}}"
+                ;;
             *' -o command='*)
                 if [ -n "${MOCK_PS_COMMAND:-}" ]; then
                     printf '%s\n' "$MOCK_PS_COMMAND"

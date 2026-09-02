@@ -190,3 +190,8 @@ local to screens; use the tokens for new general UI styling.
   cutover and independent runtime gate are proven live.
 - `.deb` and `.rpm` installs remain package-manager updates; only macOS,
   Windows NSIS, and AppImage consume the in-app signed updater payload.
+- The v0.8+ desktop channel discovers only protected-publisher, immutable ARC
+  releases and hands Tauri an exact-tag manifest. It does not consume GitHub's
+  global `latest` pointer, which remains reserved while unsigned v0.7 headless
+  updaters are retired; downloaded application bytes still must pass Tauri's
+  embedded-key signature verification before installation.

@@ -2233,7 +2233,7 @@ before mutation and again after cutover.
 The public GET allowlist carried verbatim in the manifest is `/health`,
 `/info`, `/network/info`, `/stats`, `/validators`, `/block/latest`, `/blocks`,
 `/inference/attestations`, `/economics/rewards`, `/faucet/status`,
-`/community/list`, `/community/reward_policy`, `/workers/scoreboard`, `/shards`,
+`/community/reward_policy`, `/workers/scoreboard`, `/shards`,
 `/models`, and `/models/shards`. Strict parameterized public reads cover only
 blocks, transactions, accounts, worker earnings, reward receipts, and reward
 jobs in the shapes documented in the repository README.
@@ -2399,9 +2399,10 @@ Bind those values into the draft before sealing:
 ```
 
 The stake-zero worker must already be running and registered with all six
-sealed HTTPS origins. `/workers/scoreboard` and `/community/list` are public
-read-only dashboard/probe endpoints; shard forwarding and reward approval stay
-validator-IP-only.
+sealed HTTPS origins. `/workers/scoreboard` is the public read-only
+dashboard/probe inventory; the side-effecting compatibility handler
+`/community/list` is not exposed by the v3 gateway. Shard forwarding and reward
+approval stay validator-IP-only.
 
 The probe receives only these non-secret environment values:
 `ARC_RECOVERY_RPC_URLS`, `ARC_RECOVERY_ROLLOUT_MANIFEST_SHA256`, and

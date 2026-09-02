@@ -253,7 +253,7 @@ fn cleanup_state_staging_files(wal_dir: &Path) -> Result<(), StateError> {
 /// decisions so a second cooperating constructor cannot create a split root.
 pub(crate) fn prepare_persistent_state_directory(
     requested: &Path,
-) -> Result<arc_crypto::secret_file::PrivateDirectoryNamespaceLock, StateError> {
+) -> Result<arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock, StateError> {
     let parent = requested
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -298,12 +298,11 @@ pub(crate) fn prepare_persistent_state_directory(
             ))
         },
     )?;
-    namespace_lock.rebarrier_existing().map_err(|error| {
+    namespace_lock.rebarrier_into_prepared().map_err(|error| {
         StateError::PersistenceError(format!(
             "failed to rebarrier persistent state directory namespace {requested:?}: {error}"
         ))
-    })?;
-    Ok(namespace_lock)
+    })
 }
 
 // ---------------------------------------------------------------------------

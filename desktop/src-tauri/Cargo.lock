@@ -107,6 +107,7 @@ dependencies = [
  "libc",
  "rand 0.8.7",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

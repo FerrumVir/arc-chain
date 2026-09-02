@@ -24,13 +24,13 @@ const LOG_RING_SIZE: usize = 2000;
 const GRACEFUL_STOP_TIMEOUT_SECS: u64 = 4_420;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(GRACEFUL_STOP_TIMEOUT_SECS);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str = ".arc-desktop-control";
+const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str =
+    arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME;
 const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
 const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
 const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
-const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str = "lifecycle.lock";
-const DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME: &str = "lifecycle.namespace-proof";
-const DESKTOP_LIFECYCLE_NAMESPACE_PROOF: &[u8] = b"arc.desktop.lifecycle-namespace.v1\n";
+const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str =
+    arc_crypto::secret_file::DESKTOP_LIFECYCLE_LOCK_FILE_NAME;
 const DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME: &str = "managed-executable.path";
 const DESKTOP_EXECUTABLE_IDENTITY_SCHEMA: &str = "arc.desktop.executable-path.v1";
 const DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES: u64 = 32 * 1024;
@@ -73,6 +73,9 @@ struct DesktopShutdownControl {
 pub struct ManagedLifecycleLock {
     data_dir: PathBuf,
     _file: std::fs::File,
+    namespace_guard: Option<arc_crypto::secret_file::PrivateDirectoryNamespaceLock>,
+    namespace_prepared: bool,
+    session_nonce: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -195,37 +198,31 @@ impl ManagedLifecycleLock {
             "managed lifecycle lock does not belong to data directory {}",
             data_dir.display()
         );
+        anyhow::ensure!(
+            self.namespace_prepared && self.session_nonce.is_some(),
+            "managed data-directory namespace has not completed its durability barrier"
+        );
         Ok(())
+    }
+
+    fn session_nonce(&self) -> anyhow::Result<&[u8; 32]> {
+        self.session_nonce.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("managed lifecycle lease has no prepared desktop handoff nonce")
+        })
     }
 }
 
-fn has_exact_lifecycle_namespace_proof(control_dir: &Path) -> anyhow::Result<bool> {
-    let proof_path = control_dir.join(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME);
-    let mut proof = match arc_crypto::secret_file::open_private(&proof_path) {
-        Ok(proof) => proof,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "cannot validate managed lifecycle namespace proof {}",
-                    proof_path.display()
-                )
-            });
-        }
-    };
-    anyhow::ensure!(
-        proof.metadata()?.len() == DESKTOP_LIFECYCLE_NAMESPACE_PROOF.len() as u64,
-        "managed lifecycle namespace proof has an invalid length: {}",
-        proof_path.display()
-    );
-    let mut actual = [0u8; DESKTOP_LIFECYCLE_NAMESPACE_PROOF.len()];
-    proof.read_exact(&mut actual)?;
-    anyhow::ensure!(
-        actual == DESKTOP_LIFECYCLE_NAMESPACE_PROOF,
-        "managed lifecycle namespace proof has invalid contents: {}",
-        proof_path.display()
-    );
-    Ok(true)
+fn has_exact_lifecycle_namespace_proof(
+    data_dir: &Path,
+    session_nonce: &[u8; 32],
+) -> anyhow::Result<bool> {
+    arc_crypto::secret_file::has_exact_desktop_lifecycle_namespace_proof(data_dir, session_nonce)
+        .with_context(|| {
+            format!(
+                "cannot validate managed lifecycle namespace proof beneath {}",
+                data_dir.display()
+            )
+        })
 }
 
 fn validate_configured_directory_ancestry_no_link(path: &Path) -> anyhow::Result<()> {
@@ -294,13 +291,8 @@ fn is_managed_default_data_namespace(data_dir: &Path, managed_root: &Path) -> bo
     // for their namespace locks. This catches Windows case variants without
     // following a different custom leaf target. A missing custom ancestor is
     // intentionally left to the existing custom-parent validation below.
-    matches!(
-        (
-            arc_crypto::secret_file::namespace_path_digest(data_parent),
-            arc_crypto::secret_file::namespace_path_digest(managed_root),
-        ),
-        (Ok(left), Ok(right)) if left == right
-    )
+    arc_crypto::secret_file::same_private_directory_namespace(data_parent, managed_root)
+        .unwrap_or(false)
 }
 
 fn prepare_first_launch_managed_root_at(
@@ -393,6 +385,20 @@ fn prepare_first_launch_managed_root_at(
 pub fn acquire_managed_lifecycle_lock(
     configured_data_dir: &str,
 ) -> anyhow::Result<ManagedLifecycleLock> {
+    refresh_managed_lifecycle_namespace(acquire_managed_lifecycle_lock_for_reconciliation(
+        configured_data_dir,
+    )?)
+}
+
+/// Acquire a provisional desktop-only lease while retaining the stable outer
+/// namespace guard. Startup reconciliation uses this form to drain an exact
+/// orphaned child before Windows can rename the data directory. The lease is
+/// deliberately not accepted by launch/mutation entrypoints and must be
+/// converted by `refresh_managed_lifecycle_namespace` after every writer is
+/// gone.
+fn acquire_managed_lifecycle_lock_for_reconciliation(
+    configured_data_dir: &str,
+) -> anyhow::Result<ManagedLifecycleLock> {
     let data_dir = resolve_data_dir(configured_data_dir);
     // Validate the pathname exactly as configured before canonicalization or
     // namespace-lock acquisition. Otherwise a custom symlinked parent is
@@ -440,8 +446,7 @@ pub fn acquire_managed_lifecycle_lock(
     let data_dir = data_dir.canonicalize()?;
     let locked_target = data_namespace_lock.target();
     let same_namespace = data_dir == locked_target
-        || arc_crypto::secret_file::namespace_path_digest(&data_dir)?
-            == arc_crypto::secret_file::namespace_path_digest(locked_target)?;
+        || arc_crypto::secret_file::same_private_directory_namespace(&data_dir, locked_target)?;
     anyhow::ensure!(
         same_namespace,
         "managed data directory resolved outside its locked namespace: {}",
@@ -465,55 +470,11 @@ pub fn acquire_managed_lifecycle_lock(
             )
         })?;
     arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
-
-    // Windows cannot rename a directory while an open, byte-range-locked
-    // descendant exists. Rebarriering after locking `lifecycle.lock` therefore
-    // made every first acquisition fail with ERROR_ACCESS_DENIED, and doing it
-    // before every acquisition would make contenders fail before they reached
-    // the intended lifecycle-lock check. An exact private marker records that
-    // both directory names have already crossed their write-through barriers.
-    // Its publication comes last, so its presence is a durable proof that no
-    // future acquisition needs to move a potentially live managed directory.
-    let namespace_is_proven = has_exact_lifecycle_namespace_proof(&control_dir)?;
-    if !namespace_is_proven {
-        control_namespace_lock
-            .rebarrier_existing()
-            .with_context(|| {
-                format!(
-                    "cannot rebarrier managed shutdown-control namespace {}",
-                    control_dir.display()
-                )
-            })?;
-    }
-    // The control namespace guard lives inside the data directory. Release
-    // its Windows handle before rebarriering the parent data-directory name.
-    // The outer data namespace guard still serializes every cooperating
-    // desktop through proof publication and internal lifecycle-lock acquire.
+    // A malformed current proof is never migration input. Missing, moved, or
+    // retired proofs are safe here because this provisional lease authorizes
+    // only exact detached-process reconciliation, not a new launch.
+    let _ = has_exact_lifecycle_namespace_proof(&data_dir, &[0u8; 32])?;
     drop(control_namespace_lock);
-    if !namespace_is_proven {
-        data_namespace_lock.rebarrier_existing().with_context(|| {
-            format!(
-                "cannot rebarrier managed data-directory namespace {}",
-                data_dir.display()
-            )
-        })?;
-        let proof_path = control_dir.join(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME);
-        arc_crypto::secret_file::durably_publish_new_private(
-            &proof_path,
-            DESKTOP_LIFECYCLE_NAMESPACE_PROOF,
-        )
-        .with_context(|| {
-            format!(
-                "cannot publish managed lifecycle namespace proof {}",
-                proof_path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            has_exact_lifecycle_namespace_proof(&control_dir)?,
-            "managed lifecycle namespace proof disappeared during publication: {}",
-            proof_path.display()
-        );
-    }
 
     let lock_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
     arc_crypto::secret_file::durably_publish_new_private(
@@ -530,6 +491,155 @@ pub fn acquire_managed_lifecycle_lock(
     Ok(ManagedLifecycleLock {
         data_dir,
         _file: file,
+        namespace_guard: Some(data_namespace_lock),
+        namespace_prepared: false,
+        session_nonce: None,
+    })
+}
+
+fn retire_legacy_lifecycle_namespace_proofs(control_dir: &Path) -> anyhow::Result<()> {
+    // v1 was path-independent. The fixed-name v2 entry was used only by a
+    // pre-release candidate, but removing both after current-v3 publication
+    // prevents an older build from reopening either downgrade path.
+    for file_name in ["lifecycle.namespace-proof", "lifecycle.namespace-proof.v2"] {
+        let path = control_dir.join(file_name);
+        arc_crypto::secret_file::durably_replace_private(
+            &path,
+            b"arc.desktop.lifecycle-namespace.retired-by-v3\n",
+        )
+        .with_context(|| {
+            format!(
+                "cannot install lifecycle namespace downgrade tombstone {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Convert a provisional/reused lifecycle lease into a fresh launch-capable
+/// namespace. The outer sibling guard stays held while the descendant lock is
+/// released, both directory names cross their durability barriers, the exact
+/// proof is replaced, and the lifecycle lock is reacquired. This is the only
+/// transition that sets `namespace_prepared`.
+fn refresh_managed_lifecycle_namespace(
+    mut lifecycle_lock: ManagedLifecycleLock,
+) -> anyhow::Result<ManagedLifecycleLock> {
+    let data_dir = lifecycle_lock.data_dir.clone();
+    let data_namespace_lock = match lifecycle_lock.namespace_guard.take() {
+        Some(guard) => guard,
+        None => arc_crypto::secret_file::acquire_private_directory_namespace_lock(&data_dir)
+            .with_context(|| {
+                format!(
+                    "cannot lock managed data-directory namespace {} for refresh",
+                    data_dir.display()
+                )
+            })?,
+    };
+    data_namespace_lock.restore_interrupted().with_context(|| {
+        format!(
+            "cannot restore interrupted managed data-directory namespace {}",
+            data_dir.display()
+        )
+    })?;
+    let locked_target = data_namespace_lock.target();
+    anyhow::ensure!(
+        data_dir == locked_target
+            || arc_crypto::secret_file::same_private_directory_namespace(&data_dir, locked_target,)?,
+        "managed lifecycle lease resolved outside its locked namespace: {}",
+        data_dir.display()
+    );
+
+    let control_dir = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
+    let control_namespace_lock =
+        arc_crypto::secret_file::acquire_private_directory_namespace_lock(&control_dir)
+            .with_context(|| {
+                format!(
+                    "cannot lock managed shutdown-control namespace {} for refresh",
+                    control_dir.display()
+                )
+            })?;
+    control_namespace_lock.restore_interrupted()?;
+    arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
+    // Validate any proof at the one currently expected identity-bound name.
+    // Well-formed stale identities are refreshable; malformed bytes fail
+    // before the lifecycle lease or any live namespace name is released.
+    let _ = has_exact_lifecycle_namespace_proof(&data_dir, &[0u8; 32])?;
+
+    let node_lock_path = data_dir.join(".arc-node.lock");
+    match arc_crypto::secret_file::open_private_read_write(&node_lock_path) {
+        Ok(node_lock) => {
+            node_lock.try_lock_exclusive().map_err(|error| {
+                anyhow::anyhow!(
+                    "managed node still owns {} after detached-process reconciliation: {error}",
+                    node_lock_path.display()
+                )
+            })?;
+            fs2::FileExt::unlock(&node_lock)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    fs2::FileExt::unlock(&lifecycle_lock._file)
+        .context("cannot release provisional desktop lifecycle lock before namespace refresh")?;
+    drop(lifecycle_lock._file);
+    control_namespace_lock
+        .rebarrier_existing()
+        .with_context(|| {
+            format!(
+                "cannot rebarrier managed shutdown-control namespace {}",
+                control_dir.display()
+            )
+        })?;
+    drop(control_namespace_lock);
+    data_namespace_lock.rebarrier_existing().with_context(|| {
+        format!(
+            "cannot rebarrier managed data-directory namespace {}",
+            data_dir.display()
+        )
+    })?;
+
+    let mut session_nonce = [0u8; 32];
+    {
+        use rand::RngCore as _;
+        rand::rngs::OsRng.fill_bytes(&mut session_nonce);
+    }
+    let proof_path = arc_crypto::secret_file::desktop_lifecycle_namespace_proof_path(&data_dir)?;
+    let proof =
+        arc_crypto::secret_file::desktop_lifecycle_namespace_proof(&data_dir, &session_nonce)?;
+    arc_crypto::secret_file::durably_replace_private(&proof_path, &proof).with_context(|| {
+        format!(
+            "cannot durably refresh managed lifecycle namespace proof {}",
+            proof_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        has_exact_lifecycle_namespace_proof(&data_dir, &session_nonce)?,
+        "managed lifecycle namespace proof disappeared during refresh: {}",
+        proof_path.display()
+    );
+    retire_legacy_lifecycle_namespace_proofs(&control_dir)?;
+
+    let lock_path = control_dir.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME);
+    arc_crypto::secret_file::durably_replace_private(
+        &lock_path,
+        &arc_crypto::secret_file::desktop_lifecycle_lock_payload(&session_nonce),
+    )?;
+    let file = arc_crypto::secret_file::open_private_read_write(&lock_path)?;
+    file.try_lock_exclusive().map_err(|error| {
+        anyhow::anyhow!(
+            "managed lifecycle ownership changed during namespace refresh for {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    drop(data_namespace_lock);
+    Ok(ManagedLifecycleLock {
+        data_dir,
+        _file: file,
+        namespace_guard: None,
+        namespace_prepared: true,
+        session_nonce: Some(session_nonce),
     })
 }
 
@@ -1596,6 +1706,12 @@ impl NodeManager {
                 binary.display()
             );
         }
+        if !binary_supports_flag(&binary, "--desktop-lifecycle-nonce") {
+            anyhow::bail!(
+                "arc-node at {} lacks the session-bound desktop namespace handoff; update the managed node before starting so Windows cannot bypass the data-directory durability barrier",
+                binary.display()
+            );
+        }
         let mut shutdown_control = if supports_desktop_shutdown {
             let mut control = prepare_desktop_shutdown_control(&data_dir)?;
             // A stale receipt is a recovery fence, not a file to overwrite.
@@ -1677,7 +1793,9 @@ impl NodeManager {
             .stderr(Stdio::piped());
         if let Some(control) = shutdown_control.as_ref() {
             cmd.arg("--desktop-shutdown-token-file")
-                .arg(&control.token_file);
+                .arg(&control.token_file)
+                .arg("--desktop-lifecycle-nonce")
+                .arg(hex::encode(lifecycle_lock.session_nonce()?));
         }
 
         // ── Compute contribution ────────────────────────────────────────
@@ -2013,7 +2131,9 @@ impl NodeManager {
             None => self
                 .managed_data_dir
                 .as_deref()
-                .map(|data_dir| acquire_managed_lifecycle_lock(&data_dir.to_string_lossy()))
+                .map(|data_dir| {
+                    acquire_managed_lifecycle_lock_for_reconciliation(&data_dir.to_string_lossy())
+                })
                 .transpose()?,
         };
         let mut stopped = match self.stop_owned_child().await {
@@ -2081,7 +2201,10 @@ impl NodeManager {
             }
             .into());
         }
-        // Return the still-live guard so callers performing a local mutation
+        lifecycle_lock = lifecycle_lock
+            .map(refresh_managed_lifecycle_namespace)
+            .transpose()?;
+        // Return the freshly prepared, still-live guard so callers performing a local mutation
         // or update can extend the same transaction without a release/reopen
         // gap. Plain Stop drops it immediately after this function returns.
         Ok(StopLifecycleOutcome {
@@ -4207,6 +4330,7 @@ mod tests {
         arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
         let configured = root.join("data-v3").to_string_lossy().into_owned();
         let first = acquire_managed_lifecycle_lock(&configured).unwrap();
+        let first_nonce = *first.session_nonce().unwrap();
         let error = match acquire_managed_lifecycle_lock(&configured) {
             Ok(_) => panic!("a second desktop must not acquire the managed lifecycle"),
             Err(error) => error,
@@ -4218,16 +4342,65 @@ mod tests {
             "an established namespace must reach the lifecycle-lock check: {error}"
         );
         drop(first);
-        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        let second = acquire_managed_lifecycle_lock(&configured).unwrap();
+        assert_ne!(first_nonce, *second.session_nonce().unwrap());
+        let data = PathBuf::from(&configured);
+        assert!(
+            !has_exact_lifecycle_namespace_proof(&data, &first_nonce).unwrap(),
+            "a completed prior desktop session must not authorize a delayed child"
+        );
+        assert!(
+            has_exact_lifecycle_namespace_proof(&data, second.session_nonce().unwrap()).unwrap()
+        );
+        drop(second);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn managed_lifecycle_lock_migrates_pre_proof_lock_residue() {
-        let root = resource_test_dir("lifecycle-lock-pre-proof-residue");
+    fn provisional_orphan_lease_cannot_launch_and_prepares_after_node_lock_reaps() {
+        let root = resource_test_dir("lifecycle-orphan-transition");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let data = root.join("data-v3");
+        drop(acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap());
+
+        let node_lock_path = data.join(".arc-node.lock");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &node_lock_path,
+            b"schema=arc.node.data-lock.v1\npid=1\n",
+        )
+        .unwrap();
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+
+        let provisional =
+            acquire_managed_lifecycle_lock_for_reconciliation(&data.to_string_lossy()).unwrap();
+        let error = provisional
+            .ensure_data_dir(&data.canonicalize().unwrap())
+            .expect_err("a provisional orphan lease must not authorize launch or mutation");
+        assert!(error.to_string().contains("durability barrier"));
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+
+        let prepared = refresh_managed_lifecycle_namespace(provisional).unwrap();
+        prepared
+            .ensure_data_dir(&data.canonicalize().unwrap())
+            .unwrap();
+        drop(prepared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_lifecycle_lock_migrates_v1_proof_and_lock_residue() {
+        let root = resource_test_dir("lifecycle-lock-v1-proof-residue");
         let data = root.join("data-v3");
         let control = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
         arc_crypto::secret_file::secure_private_directory_tree(&control).unwrap();
+        let retired_v1_proof = control.join("lifecycle.namespace-proof");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &retired_v1_proof,
+            b"arc.desktop.lifecycle-namespace.v1\n",
+        )
+        .unwrap();
         arc_crypto::secret_file::durably_publish_new_private(
             &control.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME),
             b"arc.desktop.lifecycle-lock.v1\n",
@@ -4235,7 +4408,11 @@ mod tests {
         .unwrap();
 
         let lock = acquire_managed_lifecycle_lock(&data.to_string_lossy()).unwrap();
-        assert!(has_exact_lifecycle_namespace_proof(&control).unwrap());
+        assert!(has_exact_lifecycle_namespace_proof(&data, lock.session_nonce().unwrap()).unwrap());
+        assert_eq!(
+            std::fs::read(&retired_v1_proof).unwrap(),
+            b"arc.desktop.lifecycle-namespace.retired-by-v3\n"
+        );
 
         drop(lock);
         std::fs::remove_dir_all(root).unwrap();
@@ -4247,9 +4424,11 @@ mod tests {
         let data = root.join("data-v3");
         let control = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
         arc_crypto::secret_file::secure_private_directory_tree(&control).unwrap();
+        let proof_path =
+            arc_crypto::secret_file::desktop_lifecycle_namespace_proof_path(&data).unwrap();
         arc_crypto::secret_file::durably_publish_new_private(
-            &control.join(DESKTOP_LIFECYCLE_NAMESPACE_PROOF_FILE_NAME),
-            b"arc.desktop.lifecycle-namespace.v2\n",
+            &proof_path,
+            b"arc.desktop.lifecycle-namespace.v3\n",
         )
         .unwrap();
 
@@ -4257,11 +4436,10 @@ mod tests {
             Ok(_) => panic!("an invalid namespace proof must fail closed"),
             Err(error) => error,
         };
+        let error_chain = format!("{error:#}");
         assert!(
-            error
-                .to_string()
-                .contains("namespace proof has invalid contents"),
-            "unexpected error: {error}"
+            error_chain.contains("namespace proof has invalid contents"),
+            "unexpected error: {error_chain}"
         );
         assert!(!control.join(DESKTOP_LIFECYCLE_LOCK_FILE_NAME).exists());
 
@@ -4306,10 +4484,11 @@ mod tests {
         let root_guard = prepare_first_launch_managed_root_at(&data, &managed_root)
             .unwrap()
             .expect("visible root without data must re-enter the namespace protocol");
-        assert_eq!(
-            arc_crypto::secret_file::namespace_path_digest(root_guard.target()).unwrap(),
-            arc_crypto::secret_file::namespace_path_digest(&managed_root).unwrap()
-        );
+        assert!(arc_crypto::secret_file::same_private_directory_namespace(
+            root_guard.target(),
+            &managed_root,
+        )
+        .unwrap());
         assert!(managed_root.is_dir());
         assert!(!private_directory_rebarrier_staging(&managed_root).exists());
 
@@ -4656,7 +4835,7 @@ mod tests {
         let genesis = root.join("genesis.toml");
         std::fs::write(
             &binary,
-            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file'\n  exit 0\nfi\nwhile :; do sleep 1; done\n",
+            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce'\n  exit 0\nfi\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -83,8 +83,13 @@ commands below are release-shape examples, not a claim that GitHub's current
 
 ```bash
 # Example only after the v0.8.0 release is explicitly approved and published:
-curl --fail --silent --show-error --location --output install.sh \
-  https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
+ARC_INSTALL_SHA256=903c97d309ecd2ae22cfe87fa88e9a4dcb8ec8331aa0b7c8503148071de35ee4
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
+else
+  printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
+fi
 bash install.sh --version 0.8.0
 ```
 
@@ -103,6 +108,7 @@ clear recovery message instead of silently operating the forked fleet.
 | Retired entry point | Unsafe legacy behavior now blocked |
 |---------------------|------------------------------------|
 | [`arc-watchdog.sh`](arc-watchdog.sh) | SSH polling, hard process kills, and relaunch with label-derived validator identity and fixed stake. |
+| [`arc-export-volatile-state.sh`](arc-export-volatile-state.sh) | Exported a partial set of process-local HTTP views and incorrectly implied that capture made a rolling restart safe; it cannot produce or restore the manifest-bound canonical checkpoint required by v3. |
 | [`arc-tunnel-watchdog.sh`](arc-tunnel-watchdog.sh) + [`arc-health-check.sh`](arc-health-check.sh) | A reverse SSH tunnel with host verification disabled, and a host-local probe that mislabeled reachable processes as a healthy network. |
 | [`rolling-upgrade.sh`](rolling-upgrade.sh) | Remote build/copy, state deletion, service control, and rolling relaunch across hard-coded seeds. |
 | [`arc-rolling-restart.sh`](arc-rolling-restart.sh) + [`arc-remote-relaunch.sh`](arc-remote-relaunch.sh) | Capture-and-replay of live validator argv followed by hard process termination. |
@@ -115,11 +121,14 @@ clear recovery message instead of silently operating the forked fleet.
 | [`monitor-testnet.sh`](monitor-testnet.sh) | Treated any HTTP response as a healthy node and aggregated incompatible seed state. |
 | [`run-node.sh`](run-node.sh) | Bound RPC to every interface and launched a legacy fixed-stake identity without the approved v3 genesis/keyfile contract. |
 
-Replacement operator tooling must consume one approved v3 manifest that pins
-artifact digests, unique validator public identities, canonical genesis and
-checkpoint hashes, verified host keys, and an explicit activation/rollback
-plan. It must verify shared-chain progress and finality before calling a fleet
-healthy. See [`../deploy/README.md`](../deploy/README.md).
+The supported recovery execution boundary is
+[`scripts/recovery/recovery_rollout.py`](recovery/recovery_rollout.py), used
+only with the sealed manifest and staged evidence described in
+[`scripts/recovery/README.md`](recovery/README.md). It pins artifact digests,
+unique validator public identities, canonical genesis and checkpoint hashes,
+verified host keys, and an explicit activation/rollback plan. It verifies
+shared-chain progress and finality before calling a fleet healthy. See also
+[`../deploy/README.md`](../deploy/README.md).
 
 The old local launchers [`testnet.sh`](testnet.sh),
 [`create-testnet.sh`](create-testnet.sh), and [`run_cluster.sh`](run_cluster.sh)
@@ -172,8 +181,13 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 **I want to join the network as a community node:**
 ```bash
 # Only after v0.8.0 is explicitly approved and published:
-curl --fail --silent --show-error --location --output install.sh \
-  https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
+ARC_INSTALL_SHA256=903c97d309ecd2ae22cfe87fa88e9a4dcb8ec8331aa0b7c8503148071de35ee4
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
+else
+  printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
+fi
 bash install.sh --version 0.8.0
 ```
 
@@ -184,5 +198,6 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-bench.sh
 
 **I'm the operator and a node went down:** do not run a legacy restart,
 self-heal, upgrade, deploy, or teardown command. Capture read-only evidence and
-use the approved recovery runbook; the repository does not yet contain the v3
-manifest-based operator tool.
+use the approved recovery runbook. The manifest-bound execution tool is
+[`scripts/recovery/recovery_rollout.py`](recovery/recovery_rollout.py); its
+presence does not authorize a run without every runbook gate and sealed input.

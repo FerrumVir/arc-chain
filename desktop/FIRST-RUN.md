@@ -84,6 +84,12 @@ and paste the log output from the `Logs` screen.
 - Windows: `%APPDATA%\network.arc.desktop\` and
   `%USERPROFILE%\.arc\data-v3\`
 
+Before the first v0.8 launch, fully quit the v0.7 desktop/node and its updater;
+also stop any separately launched v0.7 `arc-node`. The v0.8
+`.arc-node.lock` is a same-generation guard, and released v0.7 binaries do not
+acquire it. A fresh path prevents WAL reuse but does not make overlapping old
+and new processes safe.
+
 When v0.8 first opens a v0.7 store that points at an unbound WAL in `~/.arc`,
 it leaves those old block/WAL bytes untouched, preserves identity and model
 selection, switches only the persisted data-directory pointer to a fresh

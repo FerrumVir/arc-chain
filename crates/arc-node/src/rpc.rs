@@ -7135,7 +7135,9 @@ async fn workers_scoreboard(
         capabilities: Vec<String>,
         model: Option<String>,
         model_id: Option<String>,
+        execution_profile: Option<String>,
         registered_at: u64,
+        work_completed: u64,
         success_count: u64,
         failure_count: u64,
         success_rate: f64,
@@ -7178,7 +7180,9 @@ async fn workers_scoreboard(
             capabilities: w.capabilities.clone(),
             model: w.model.clone(),
             model_id: w.model_id.clone(),
+            execution_profile: w.execution_profile.clone(),
             registered_at: w.registered_at,
+            work_completed: w.work_completed,
             success_count: w.success_count,
             failure_count: w.failure_count,
             success_rate,
@@ -16416,6 +16420,14 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "recovery_active": recovery_context.is_some(),
         "recovery_epoch": recovery_context.as_ref().map(|context| context.recovery_epoch),
         "validator_set_id": recovery_context.as_ref().map(|context| context.validator_set_id),
+        // `genesis_hash` above is the retained height-zero block hash.  The
+        // recovery trust root instead binds the canonical genesis config's
+        // network hash; publish both under distinct names so a cutover gate
+        // can compare like with like rather than accepting six replicas that
+        // merely agree on the wrong identity domain.
+        "network_genesis_hash": recovery_context
+            .as_ref()
+            .map(|context| format!("0x{}", context.genesis_hash.to_hex())),
         // Canonical audience field consumed by every signed validator HTTP
         // client. `recovery_domain` remains as a descriptive alias for older
         // dashboards, but callers must not have to guess that relationship.
@@ -22845,6 +22857,16 @@ mod tests {
         assert_eq!(
             workers[0].get("model_id").and_then(|x| x.as_str()),
             Some(test_model_id().as_str())
+        );
+        assert_eq!(
+            workers[0].get("execution_profile").and_then(|x| x.as_str()),
+            Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
+            "the read-only scoreboard must expose the exact profile used for rollout eligibility"
+        );
+        assert_eq!(
+            workers[0].get("work_completed").and_then(|x| x.as_u64()),
+            Some(10),
+            "the walkthrough must use the server-authoritative completion counter"
         );
     }
 

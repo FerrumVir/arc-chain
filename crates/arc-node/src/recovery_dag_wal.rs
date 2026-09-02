@@ -2334,37 +2334,34 @@ impl StoreLock {
             .map_err(|error| io_error("secure generation-store root", root, error))?;
         let root = namespace_lock.target();
         let path = root.join(WRITE_LOCK_FILE);
-        if path.exists() {
-            regular_file_metadata(&path)?;
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        set_private_file_mode(&mut options);
-        let mut file = options
-            .open(&path)
-            .map_err(|error| io_error("open/create", &path, error))?;
-        if !file
-            .metadata()
-            .map_err(|error| io_error("inspect open", &path, error))?
-            .is_file()
-        {
-            return Err(GenerationError::Invalid(format!(
-                "{} is not a regular lock file",
-                path.display()
-            )));
-        }
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(GenerationError::Locked(path));
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(io_error("acquire advisory lock on", &path, error));
-            }
-        }
+        let file = open_and_try_lock_store_file(&path)?;
+
+        // NTFS rejects a directory rename while any descendant file handle is
+        // open, even when that handle allows FILE_SHARE_DELETE (MS-FSA
+        // 2.1.5.15.12). Probe the legacy inner lock first, then close our own
+        // descendant handle while the stable sibling namespace lock remains
+        // held. The second try-lock prevents any legacy writer that appeared
+        // during the rename window from being followed by patched mutation.
+        #[cfg(windows)]
+        let file = {
+            file.unlock().map_err(|error| {
+                io_error(
+                    "release advisory lock before Windows namespace rebarrier on",
+                    &path,
+                    error,
+                )
+            })?;
+            drop(file);
+            namespace_lock
+                .rebarrier_existing()
+                .map_err(|error| io_error("rebarrier generation-store namespace", root, error))?;
+            open_and_try_lock_store_file(&path)?
+        };
+        #[cfg(not(windows))]
         namespace_lock
             .rebarrier_existing()
             .map_err(|error| io_error("rebarrier generation-store namespace", root, error))?;
+        let mut file = file;
         restore_interrupted_generation_rebarriers(root)?;
         cleanup_incomplete_store_staging(root)?;
         file.set_len(0)
@@ -2394,6 +2391,39 @@ impl StoreLock {
             .map_err(|error| io_error("release advisory lock on", &self.path, error))?;
         self.released = true;
         Ok(())
+    }
+}
+
+fn open_and_try_lock_store_file(path: &Path) -> Result<File> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            regular_file_metadata(path)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect", path, error)),
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    set_private_file_mode(&mut options);
+    let file = options
+        .open(path)
+        .map_err(|error| io_error("open/create", path, error))?;
+    if !file
+        .metadata()
+        .map_err(|error| io_error("inspect open", path, error))?
+        .is_file()
+    {
+        return Err(GenerationError::Invalid(format!(
+            "{} is not a regular lock file",
+            path.display()
+        )));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(GenerationError::Locked(path.to_path_buf())),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(io_error("acquire advisory lock on", path, error))
+        }
     }
 }
 

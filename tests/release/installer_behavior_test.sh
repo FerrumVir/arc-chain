@@ -20,6 +20,11 @@ arc-cli-macos-x86_64
 arc-node-windows-x86_64.exe
 arc-cli-windows-x86_64.exe
 '
+CUTOVER_ASSETS='
+arc-cutover-policy.json
+arc-legacy-maintenance-boundary.json
+arc-recovery-checkpoint-descriptor.json
+'
 
 ACTIVE_SANDBOXES=""
 ACTIVE_TEST_PIDS=""
@@ -41,8 +46,12 @@ canonical_pairs_for_version() {
     for asset in $CANONICAL_ASSETS; do
         printf '%s/%s ' "$version" "$asset"
     done
-    printf '%s/SHA256SUMS %s/SHA256SUMS.sig %s/install.sh %s/testnet-seeds.txt %s/genesis.toml\n' \
+    printf '%s/SHA256SUMS %s/SHA256SUMS.sig %s/install.sh %s/testnet-seeds.txt %s/genesis.toml ' \
         "$version" "$version" "$version" "$version" "$version"
+    for asset in $CUTOVER_ASSETS; do
+        printf '%s/%s ' "$version" "$asset"
+    done
+    printf '\n'
 }
 
 new_sandbox() {
@@ -611,6 +620,8 @@ reset_legacy_supervisor_test_environment() {
     MOCK_LAUNCHD_NODE_PID_UNDER_TEST=''
     MOCK_LEGACY_LAUNCHD_NODE_PID_UNDER_TEST=''
     MOCK_PS_COMMAND_UNDER_TEST=''
+    MOCK_PS_ALL_ROWS_UNDER_TEST=''
+    MOCK_PS_UID_UNDER_TEST=''
     MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=''
     MOCK_SYSTEMD_MAIN_PID_AFTER_UNDER_TEST=''
     MOCK_SYSTEMD_RESTART_DELAY_POLLS_UNDER_TEST=''
@@ -621,6 +632,11 @@ reset_legacy_supervisor_test_environment() {
     MOCK_HEALTH_PORT_UNDER_TEST=''
     ARC_HEALTH_TIMEOUT_UNDER_TEST=''
     MOCK_TARGET_UID_UNDER_TEST=''
+    MOCK_RELEASE_FIXTURE_DIR_UNDER_TEST=''
+    MOCK_V3_RETIREMENT_MODE_UNDER_TEST=''
+    MOCK_LEGACY_LISTENER_OPEN_UNDER_TEST=''
+    MOCK_RETIREMENT_CREATE_FAIL_UNDER_TEST=''
+    MOCK_RETIREMENT_FINALIZE_FAIL_UNDER_TEST=''
 }
 
 legacy_default_adoption_preserves_state_config_model_and_identity() {
@@ -811,6 +827,7 @@ legacy_linux_system_supervisor_is_transactionally_adopted() {
     host_uid="$(id -u)"
     MOCK_TARGET_UID_UNDER_TEST="$host_uid"
     MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
     MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
     MOCK_LEGACY_UPDATER_ACTIVE_UNDER_TEST=true
     MOCK_LEGACY_UPDATER_ENABLED_UNDER_TEST=true
@@ -873,7 +890,7 @@ legacy_linux_system_supervisor_is_transactionally_adopted() {
         'legacy Linux updater service remained enabled after commit' || return 1
 }
 
-legacy_linux_failure_restores_exact_runtime_state() {
+legacy_linux_post_intent_failure_restores_files_but_stays_stopped() {
     local sandbox legacy_root unit_dir output status host_uid
     local binary_hash node_unit_hash updater_service_hash updater_timer_hash updater_script_hash
     reset_legacy_supervisor_test_environment
@@ -892,6 +909,7 @@ legacy_linux_failure_restores_exact_runtime_state() {
     host_uid="$(id -u)"
     MOCK_TARGET_UID_UNDER_TEST="$host_uid"
     MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
     MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=false
     MOCK_LEGACY_UPDATER_ACTIVE_UNDER_TEST=false
     MOCK_LEGACY_UPDATER_ENABLED_UNDER_TEST=true
@@ -918,21 +936,237 @@ legacy_linux_failure_restores_exact_runtime_state() {
     assert_equals "$updater_script_hash" \
         "$(file_sha256 "$legacy_root/bin/arc-auto-update.sh")" \
         'legacy rollback did not restore the exact updater executable' || return 1
-    assert_file_contains "$sandbox/systemd-state/arc-node.service.active" '^true$' \
-        'legacy rollback did not restore active node state' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-node.service.active" '^false$' \
+        'post-intent rollback restarted the retired v0.7 node' || return 1
     assert_file_contains "$sandbox/systemd-state/arc-node.service.enabled" '^false$' \
         'legacy rollback did not restore disabled node state' || return 1
     assert_file_contains "$sandbox/systemd-state/arc-updater.timer.active" '^false$' \
         'legacy rollback did not restore inactive updater timer state' || return 1
-    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.enabled" '^true$' \
-        'legacy rollback did not restore enabled updater timer state' || return 1
-    assert_file_contains "$sandbox/systemd-state/arc-updater.service.active" '^true$' \
-        'legacy rollback did not restore active updater service state' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.enabled" '^false$' \
+        'legacy rollback re-armed the unsigned updater timer' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.service.active" '^false$' \
+        'legacy rollback restarted the unsigned updater service' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.service.enabled" '^false$' \
+        'legacy rollback enabled the unsigned updater service' || return 1
     [ -f "$legacy_root/.arc-chain-legacy-adoption-pending" ] \
         && [ ! -e "$legacy_root/.arc-chain-install-root" ] \
         || { printf 'failed migration enabled purge before commit\n'; return 1; }
-    assert_file_contains "$output" 'Previous ARC installation and service state restored' \
-        'legacy Linux failure did not report a successful rollback' || return 1
+    [ -f "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/retirement-intent.json" ] \
+        && [ -f "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/retirement-receipt.json" ] \
+        || { printf 'post-intent rollback lost its create-only retirement evidence\n'; return 1; }
+    assert_file_contains "$output" \
+        'v0\.7 remains stopped and every legacy updater stays fenced behind the durable retirement intent' \
+        'post-intent Linux failure did not report its fail-stopped rollback' || return 1
+}
+
+legacy_retirement_failures_obey_the_intent_boundary() {
+    local sandbox legacy_root unit_dir output status host_uid binary_hash
+
+    # A create-intent refusal is still before the irreversible boundary: the
+    # exact v0.7 node may be restored, but its unsigned updater stays fenced.
+    reset_legacy_supervisor_test_environment
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    legacy_root="$sandbox/home/.arc"
+    unit_dir="$sandbox/systemd-system"
+    write_legacy_v07_fixture "$legacy_root"
+    prepare_installer_systemd_sandbox "$sandbox"
+    write_legacy_linux_supervisor_fixture "$legacy_root" "$unit_dir" 18444 18445
+    binary_hash="$(file_sha256 "$legacy_root/bin/arc-node")"
+    host_uid="$(id -u)"
+    MOCK_TARGET_UID_UNDER_TEST="$host_uid"
+    MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
+    MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
+    MOCK_RETIREMENT_CREATE_FAIL_UNDER_TEST=1
+    output="$sandbox/intent-create-failure.out"
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
+        --install-dir "$legacy_root" >"$output" 2>&1
+    status=$?
+    [ "$status" -ne 0 ] || { printf 'retirement intent failure unexpectedly committed\n'; return 1; }
+    assert_equals "$binary_hash" "$(file_sha256 "$legacy_root/bin/arc-node")" \
+        'create-intent failure changed the v0.7 executable' || return 1
+    [ ! -e "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/retirement-intent.json" ] \
+        || { printf 'failed create-intent published a retirement intent\n'; return 1; }
+    assert_file_contains "$sandbox/systemd-state/arc-node.service.active" '^true$' \
+        'pre-intent failure did not restore the previously active v0.7 node' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.active" '^false$' \
+        'pre-intent failure rearmed the unsigned updater' || return 1
+
+    # Once intent publication succeeds, a finalizer refusal must restore files
+    # but leave v0.7 stopped. No receipt and no v0.8 state may appear.
+    reset_legacy_supervisor_test_environment
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    legacy_root="$sandbox/home/.arc"
+    unit_dir="$sandbox/systemd-system"
+    write_legacy_v07_fixture "$legacy_root"
+    prepare_installer_systemd_sandbox "$sandbox"
+    write_legacy_linux_supervisor_fixture "$legacy_root" "$unit_dir" 18444 18445
+    binary_hash="$(file_sha256 "$legacy_root/bin/arc-node")"
+    MOCK_TARGET_UID_UNDER_TEST="$host_uid"
+    MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
+    MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
+    MOCK_RETIREMENT_FINALIZE_FAIL_UNDER_TEST=1
+    output="$sandbox/retirement-finalize-failure.out"
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
+        --install-dir "$legacy_root" >"$output" 2>&1
+    status=$?
+    reset_legacy_supervisor_test_environment
+    [ "$status" -ne 0 ] || { printf 'retirement finalizer failure unexpectedly committed\n'; return 1; }
+    assert_equals "$binary_hash" "$(file_sha256 "$legacy_root/bin/arc-node")" \
+        'post-intent finalizer failure did not restore the exact v0.7 executable' || return 1
+    [ -f "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/retirement-intent.json" ] \
+        && [ -f "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/stop-evidence.json" ] \
+        && [ ! -e "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/retirement-receipt.json" ] \
+        && [ ! -e "$legacy_root/data-v0.8" ] \
+        || { printf 'finalizer failure crossed the receipt-authorized state boundary\n'; return 1; }
+    assert_file_contains "$sandbox/systemd-state/arc-node.service.active" '^false$' \
+        'post-intent finalizer failure restarted v0.7' || return 1
+    assert_file_contains "$output" \
+        'v0\.7 remains stopped and every legacy updater stays fenced behind the durable retirement intent' \
+        'post-intent finalizer failure did not report fail-stopped recovery' || return 1
+}
+
+legacy_updater_is_fenced_before_release_failure_and_stays_fenced() {
+    local sandbox legacy_root unit_dir fixture output status host_uid
+    reset_legacy_supervisor_test_environment
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    legacy_root="$sandbox/home/.arc"
+    unit_dir="$sandbox/systemd-system"
+    write_legacy_v07_fixture "$legacy_root"
+    prepare_installer_systemd_sandbox "$sandbox"
+    write_legacy_linux_supervisor_fixture "$legacy_root" "$unit_dir" 18444 18445
+    fixture="$sandbox/untrusted-release.json"
+    sed 's/"immutable": true/"immutable": false/' \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" > "$fixture"
+    host_uid="$(id -u)"
+    MOCK_TARGET_UID_UNDER_TEST="$host_uid"
+    MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
+    MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
+    MOCK_LEGACY_UPDATER_ACTIVE_UNDER_TEST=true
+    MOCK_LEGACY_UPDATER_ENABLED_UNDER_TEST=true
+    MOCK_LEGACY_UPDATER_SERVICE_ACTIVE_UNDER_TEST=true
+    MOCK_LEGACY_UPDATER_SERVICE_ENABLED_UNDER_TEST=false
+    output="$sandbox/pre-network-fence.out"
+    invoke_installer "$sandbox" Linux x86_64 "$fixture" 0.8.0 \
+        --install-dir "$legacy_root" >"$output" 2>&1
+    status=$?
+    reset_legacy_supervisor_test_environment
+    [ "$status" -ne 0 ] \
+        || { printf 'untrusted release unexpectedly crossed the migration fence\n'; return 1; }
+    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.active" '^false$' \
+        'pre-download failure restarted the legacy updater timer' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.enabled" '^false$' \
+        'pre-download failure re-enabled the legacy updater timer' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.service.active" '^false$' \
+        'pre-download failure restarted the legacy updater service' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.service.enabled" '^false$' \
+        'pre-download failure changed legacy updater-service enablement' || return 1
+    if grep -Fq 'set-property --runtime arc-node.service' "$sandbox/service.log" \
+        || grep -Fq 'disable --now arc-node.service' "$sandbox/service.log"; then
+        printf 'release rejection stopped the legacy node instead of only fencing its updater\n'
+        return 1
+    fi
+    assert_file_contains "$legacy_root/bin/arc-node" 'arc-node 0\.7\.11' \
+        'release rejection replaced the v0.7 node binary' || return 1
+    assert_file_contains "$legacy_root/data/state.wal" '^legacy chain state must survive$' \
+        'release rejection changed legacy chain state' || return 1
+    [ -f "$legacy_root/.arc-chain-legacy-adoption-pending" ] \
+        && [ -d "$legacy_root/legacy-v0.7-preserved" ] \
+        || { printf 'release rejection did not retain archive-first migration evidence\n'; return 1; }
+}
+
+legacy_retirement_gate_fails_before_v07_stop() {
+    local gate_case sandbox legacy_root unit_dir output status host_uid
+    local binary_hash data_hash
+    for gate_case in offline recovery-inactive low-height split-manifest \
+        split-network-genesis \
+        wrong-validator old-node duplicate-field leading-zero-height \
+        huge-height exponent-height legacy-listener
+    do
+        reset_legacy_supervisor_test_environment
+        new_sandbox
+        sandbox="$NEW_SANDBOX"
+        legacy_root="$sandbox/home/.arc"
+        unit_dir="$sandbox/systemd-system"
+        write_legacy_v07_fixture "$legacy_root"
+        prepare_installer_systemd_sandbox "$sandbox"
+        write_legacy_linux_supervisor_fixture "$legacy_root" "$unit_dir" 18444 18445
+        binary_hash="$(file_sha256 "$legacy_root/bin/arc-node")"
+        data_hash="$(file_sha256 "$legacy_root/data/state.wal")"
+        host_uid="$(id -u)"
+        MOCK_TARGET_UID_UNDER_TEST="$host_uid"
+        MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+        MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
+        MOCK_LEGACY_UPDATER_ACTIVE_UNDER_TEST=true
+        MOCK_LEGACY_UPDATER_ENABLED_UNDER_TEST=true
+        MOCK_LEGACY_UPDATER_SERVICE_ACTIVE_UNDER_TEST=true
+        MOCK_LEGACY_UPDATER_SERVICE_ENABLED_UNDER_TEST=false
+        if [ "$gate_case" = legacy-listener ]; then
+            MOCK_V3_RETIREMENT_MODE_UNDER_TEST=ok
+            MOCK_LEGACY_LISTENER_OPEN_UNDER_TEST=all
+        else
+            MOCK_V3_RETIREMENT_MODE_UNDER_TEST="$gate_case"
+        fi
+        output="$sandbox/retirement-gate-$gate_case.out"
+        invoke_installer "$sandbox" Linux x86_64 \
+            "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
+            --install-dir "$legacy_root" >"$output" 2>&1
+        status=$?
+        reset_legacy_supervisor_test_environment
+        [ "$status" -ne 0 ] || {
+            printf 'legacy retirement gate accepted unsafe evidence: %s\n' "$gate_case"
+            return 1
+        }
+        assert_equals "$binary_hash" "$(file_sha256 "$legacy_root/bin/arc-node")" \
+            "retirement gate $gate_case replaced the v0.7 node" || return 1
+        assert_equals "$data_hash" "$(file_sha256 "$legacy_root/data/state.wal")" \
+            "retirement gate $gate_case changed legacy chain history" || return 1
+        if [ -e "$sandbox/systemd-state/arc-node.service.active" ]; then
+            assert_file_contains "$sandbox/systemd-state/arc-node.service.active" '^true$' \
+                "retirement gate $gate_case stopped the legacy node" || return 1
+        fi
+        if grep -Fq 'disable --now arc-node.service' "$sandbox/service.log" \
+            || grep -Fq 'set-property --runtime arc-node.service' "$sandbox/service.log"; then
+            printf 'retirement gate %s crossed the v0.7 stop boundary\n' "$gate_case"
+            return 1
+        fi
+    done
+}
+
+installer_distinguishes_v07_retirement_from_v08_quiescence() {
+    local gate_line transaction_line
+    assert_file_not_contains "$REPO_ROOT/install.sh" \
+        'kill -KILL "\$LEGACY_DETACHED_PID"' \
+        'legacy detached retirement still force-kills the old process' || return 1
+    assert_file_contains "$REPO_ROOT/install.sh" \
+        "a long timeout cannot turn v0\.7's immediate-exit handler into a drain" \
+        'installer source falsely treats a timed v0.7 TERM as quiescence' || return 1
+    assert_file_not_contains "$REPO_ROOT/install.sh" \
+        'Legacy detached node did not drain' \
+        'legacy detached retirement still claims a drain it cannot prove' || return 1
+    [ "$(grep -Fc "'SendSIGKILL=no'" "$REPO_ROOT/install.sh")" -ge 2 ] || {
+        printf 'managed systemd node units can still force-kill after TimeoutStopSec\n'
+        return 1
+    }
+    assert_file_contains "$REPO_ROOT/install.sh" \
+        'systemctl set-property --runtime arc-node\.service' \
+        'legacy systemd migration does not install a no-SIGKILL runtime fence' || return 1
+    gate_line="$(grep -n '^verify_legacy_v07_network_retirement$' "$REPO_ROOT/install.sh" \
+        | tail -n1 | cut -d: -f1)"
+    transaction_line="$(grep -n '^begin_install_transaction$' "$REPO_ROOT/install.sh" \
+        | tail -n1 | cut -d: -f1)"
+    [ -n "$gate_line" ] && [ -n "$transaction_line" ] \
+        && [ "$gate_line" -lt "$transaction_line" ] || {
+        printf 'legacy retirement evidence is not checked before the stop transaction\n'
+        return 1
+    }
 }
 
 legacy_marker_fsync_crash_keeps_v07_runnable_and_resumes() {
@@ -954,6 +1188,7 @@ legacy_marker_fsync_crash_keeps_v07_runnable_and_resumes() {
     host_uid="$(id -u)"
     MOCK_TARGET_UID_UNDER_TEST="$host_uid"
     MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
     MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
     MOCK_LEGACY_UPDATER_ACTIVE_UNDER_TEST=true
     MOCK_LEGACY_UPDATER_ENABLED_UNDER_TEST=true
@@ -967,14 +1202,21 @@ legacy_marker_fsync_crash_keeps_v07_runnable_and_resumes() {
     [ "$status" -ne 0 ] \
         || { printf 'legacy marker fsync crash injection unexpectedly committed\n'; return 1; }
     [ -f "$legacy_root/.arc-chain-legacy-adoption-pending" ] \
-        && [ ! -e "$legacy_root/legacy-v0.7-preserved" ] \
+        && [ -d "$legacy_root/legacy-v0.7-preserved" ] \
         && [ ! -e "$legacy_root/.arc-chain-install-root" ] \
-        || { printf 'marker fsync crash claimed success or published an uncommitted archive\n'; return 1; }
+        || { printf 'marker fsync crash did not retain archive-first pending evidence\n'; return 1; }
     assert_file_contains "$output" \
         'Injected failure after durable legacy-adoption marker publication' \
         'marker fsync crash did not stop at the exact injected boundary' || return 1
-    assert_file_not_contains "$sandbox/service.log" 'systemctl (stop|disable|restart|enable)' \
-        'marker fsync crash changed the running legacy supervisor' || return 1
+    if grep -Fq 'disable --now arc-node.service' "$sandbox/service.log" \
+        || grep -Fq 'stop arc-node.service' "$sandbox/service.log"; then
+        printf 'marker fsync crash changed the running legacy node supervisor\n'
+        return 1
+    fi
+    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.active" '^false$' \
+        'marker fsync crash restarted the unsigned updater timer' || return 1
+    assert_file_contains "$sandbox/systemd-state/arc-updater.timer.enabled" '^false$' \
+        'marker fsync crash re-enabled the unsigned updater timer' || return 1
     assert_equals "$binary_hash" "$(file_sha256 "$legacy_root/bin/arc-node")" \
         'marker fsync crash changed the runnable v0.7 binary' || return 1
     assert_equals "$node_unit_hash" "$(file_sha256 "$unit_dir/arc-node.service")" \
@@ -1240,6 +1482,55 @@ legacy_detached_pid_is_exactly_verified_and_retired() {
         "^$detached_pid$" 'detached adoption did not archive the exact prior PID' || return 1
 }
 
+legacy_untracked_no_sudo_process_is_discovered_and_retired() {
+    local sandbox legacy_root output host_uid detached_pid waiter_pid status command_line
+    reset_legacy_supervisor_test_environment
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    legacy_root="$sandbox/home/.arc"
+    write_legacy_v07_fixture "$legacy_root"
+    (
+        /bin/sleep 300 &
+        printf '%s\n' "$!" >"$sandbox/untracked-real-pid"
+        wait "$!"
+    ) &
+    waiter_pid=$!
+    while [ ! -s "$sandbox/untracked-real-pid" ]; do /bin/sleep 0.01; done
+    detached_pid="$(sed -n '1p' "$sandbox/untracked-real-pid")"
+    host_uid="$(id -u)"
+    command_line="$legacy_root/bin/arc-node --rpc 0.0.0.0:19444 --p2p-port 19445 --seeds-file $legacy_root/seeds.txt --genesis $legacy_root/genesis.toml --validator-seed community-legacy-host-01020304 --stake 0 --min-stake 0 --eth-rpc-port 0 --data-dir $legacy_root/data --model $legacy_root/community-model.gguf"
+    MOCK_TARGET_UID_UNDER_TEST="$host_uid"
+    MOCK_PS_UID_UNDER_TEST="$host_uid"
+    MOCK_PS_COMMAND_UNDER_TEST="$command_line"
+    MOCK_PS_ALL_ROWS_UNDER_TEST="$detached_pid $host_uid $command_line"
+    MOCK_REAL_SLEEP_UNDER_TEST=true
+    output="$sandbox/untracked-legacy-adoption.out"
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
+        --install-dir "$legacy_root" --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    wait "$waiter_pid" 2>/dev/null || true
+    reset_legacy_supervisor_test_environment
+    if [ "$status" -ne 0 ]; then
+        sed -n '1,260p' "$output"
+        return 1
+    fi
+    kill -0 "$detached_pid" 2>/dev/null \
+        && { printf 'historical no-sudo v0.7 process survived committed adoption\n'; return 1; }
+    [ ! -e "$legacy_root/node.pid" ] \
+        || { printf 'untracked legacy topology was changed into a PID-file topology\n'; return 1; }
+    assert_file_contains \
+        "$legacy_root/legacy-v0.7-preserved/legacy-detached-topology" \
+        '^pid_file=false$' \
+        'untracked legacy process topology was not archived' || return 1
+    assert_file_contains \
+        "$legacy_root/legacy-v0.7-preserved/legacy-detached-topology" \
+        '^community_mode=false$' \
+        'historical no-sudo community-mode shape was not preserved' || return 1
+    assert_file_contains "$legacy_root/install.conf" '^rpc_port=19444$' \
+        'untracked legacy process RPC configuration was not adopted' || return 1
+}
+
 legacy_linux_supervisor_lookalikes_fail_before_reservation() {
     local sandbox legacy_root unit_dir output status host_uid case_name
     host_uid="$(id -u)"
@@ -1297,8 +1588,14 @@ invoke_installer() {
         TEST_UNAME_S="$os" \
         TEST_UNAME_M="$arch" \
         MOCK_RELEASE_FILE="$fixture" \
+        MOCK_RELEASE_FIXTURE_DIR="${MOCK_RELEASE_FIXTURE_DIR_UNDER_TEST:-}" \
+        MOCK_RELEASE_LIST_FILE="${MOCK_RELEASE_LIST_FILE_UNDER_TEST:-}" \
+        MOCK_V3_RETIREMENT_MODE="${MOCK_V3_RETIREMENT_MODE_UNDER_TEST:-ok}" \
+        MOCK_LEGACY_LISTENER_OPEN="${MOCK_LEGACY_LISTENER_OPEN_UNDER_TEST:-}" \
+        MOCK_RETIREMENT_CREATE_FAIL="${MOCK_RETIREMENT_CREATE_FAIL_UNDER_TEST:-0}" \
+        MOCK_RETIREMENT_FINALIZE_FAIL="${MOCK_RETIREMENT_FINALIZE_FAIL_UNDER_TEST:-0}" \
         MOCK_AVAILABLE_ASSETS="$(canonical_pairs_for_version "$version")" \
-        MOCK_CHECKSUM_ASSETS="$CANONICAL_ASSETS testnet-seeds.txt genesis.toml install.sh" \
+        MOCK_CHECKSUM_ASSETS="$CANONICAL_ASSETS $CUTOVER_ASSETS testnet-seeds.txt genesis.toml install.sh" \
         MOCK_CURL_LOG="$sandbox/curl.log" \
         MOCK_SERVICE_LOG="$sandbox/service.log" \
         MOCK_OWNER_LOG="$sandbox/owner.log" \
@@ -1339,6 +1636,8 @@ invoke_installer() {
         MOCK_LEGACY_LAUNCHD_NODE_PID="${MOCK_LEGACY_LAUNCHD_NODE_PID_UNDER_TEST:-}" \
         MOCK_LAUNCHD_STATE_DIR="$sandbox/launchd-state" \
         MOCK_PS_COMMAND="${MOCK_PS_COMMAND_UNDER_TEST:-}" \
+        MOCK_PS_ALL_ROWS="${MOCK_PS_ALL_ROWS_UNDER_TEST:-}" \
+        MOCK_PS_UID="${MOCK_PS_UID_UNDER_TEST:-${MOCK_TARGET_UID_UNDER_TEST:-1000}}" \
         MOCK_REAL_SLEEP="${MOCK_REAL_SLEEP_UNDER_TEST:-false}" \
         MOCK_SERVICE_FAIL_MATCH="${MOCK_SERVICE_FAIL_MATCH_UNDER_TEST:-}" \
         MOCK_SERVICE_FAIL_ONCE_FILE="$sandbox/service-fail-once" \
@@ -1427,8 +1726,13 @@ Darwin|x86_64|arc-node-macos-x86_64|arc-cli-macos-x86_64
             printf '%s/%s --no-service unexpectedly performed a localhost health probe\n' "$os" "$arch"
             return 1
         fi
-        if grep -Eq 'releases/latest/download|releases\?per_page=|(^|[[:space:]])-r([[:space:]]|$)' "$sandbox/curl.log"; then
-            printf '%s/%s used an ambiguous latest download, release walking, or Range probe:\n' "$os" "$arch"
+        if grep -Eq 'releases/latest|releases/latest/download|(^|[[:space:]])-r([[:space:]]|$)' "$sandbox/curl.log"; then
+            printf '%s/%s used global latest or a Range probe:\n' "$os" "$arch"
+            cat "$sandbox/curl.log"
+            return 1
+        fi
+        if [ "$(grep -Fc '/releases?per_page=100' "$sandbox/curl.log")" -ne 1 ]; then
+            printf '%s/%s did not discover exactly one v0.8 channel page:\n' "$os" "$arch"
             cat "$sandbox/curl.log"
             return 1
         fi
@@ -1462,6 +1766,128 @@ minified_github_api_json_without_newline_installs_exact_assets() {
     for asset in arc-node-linux-x86_64 arc-cli-linux-x86_64 SHA256SUMS testnet-seeds.txt genesis.toml; do
         assert_log_contains_literal "$sandbox/curl.log" "/v0.8.0/$asset" \
             "minified API install did not fetch exact-tag $asset" || return 1
+    done
+}
+
+v08_channel_selection_ignores_global_latest_and_nested_tags() {
+    local sandbox list_fixture output status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    list_fixture="$sandbox/releases-list.json"
+    printf '%s\n' \
+        '[' \
+        '  {"tag_name":"v0.8.0","body":"escaped \\"tag_name\\":\\"v99.0.0\\" text"},' \
+        '  {"tag_name":"v0.7.11"},' \
+        '  {"tag_name":"v0.8.1","assets":[{"tag_name":"v98.0.0"}]}' \
+        ']' > "$list_fixture"
+    output="$sandbox/channel-install.out"
+    ARC_NODE_VERSION_UNDER_TEST=''
+    MOCK_RELEASE_LIST_FILE_UNDER_TEST="$list_fixture"
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" '0.8.1' \
+        --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    MOCK_RELEASE_LIST_FILE_UNDER_TEST=''
+    if [ "$status" -ne 0 ]; then
+        printf 'v0.8 channel discovery failed (exit %s):\n' "$status"
+        sed -n '1,140p' "$output"
+        return 1
+    fi
+    assert_log_contains_literal "$sandbox/curl.log" '/releases?per_page=100' \
+        'installer did not query the dedicated v0.8 release collection' || return 1
+    assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.1' \
+        'installer did not resolve the highest discovered v0.8 tag exactly' || return 1
+    if grep -Fq '/releases/latest' "$sandbox/curl.log" \
+        || grep -Eq '/releases/tags/v(98|99)\.' "$sandbox/curl.log"; then
+        printf 'channel selection trusted global latest or a nested/body tag:\n'
+        cat "$sandbox/curl.log"
+        return 1
+    fi
+}
+
+v08_channel_skips_higher_untrusted_tags_for_stable_release() {
+    local sandbox fixture_dir list_fixture output status rejected_tag
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    fixture_dir="$sandbox/exact-releases"
+    list_fixture="$sandbox/releases-list.json"
+    mkdir -p "$fixture_dir"
+    cp "$TEST_DIR/fixtures/release-v0.8.1.json" "$fixture_dir/v0.8.1.json"
+    sed -e 's/"tag_name": "v0.8.1"/"tag_name": "v0.9.0"/' \
+        -e 's/"prerelease": false/"prerelease": true/' \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" > "$fixture_dir/v0.9.0.json"
+    sed -e 's/"tag_name": "v0.8.1"/"tag_name": "v0.10.0"/' \
+        -e 's/github-actions\[bot\]/manual-publisher/' \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" > "$fixture_dir/v0.10.0.json"
+    sed -e 's/"tag_name": "v0.8.1"/"tag_name": "v0.11.0"/' \
+        -e 's/"immutable": true/"immutable": false/' \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" > "$fixture_dir/v0.11.0.json"
+    printf '%s\n' \
+        '[' \
+        '  {"tag_name":"v0.9.0"},' \
+        '  {"tag_name":"v0.8.1"},' \
+        '  {"tag_name":"v0.11.0"},' \
+        '  {"tag_name":"v0.10.0"}' \
+        ']' > "$list_fixture"
+
+    output="$sandbox/channel-untrusted-fallback.out"
+    ARC_NODE_VERSION_UNDER_TEST=''
+    MOCK_RELEASE_LIST_FILE_UNDER_TEST="$list_fixture"
+    MOCK_RELEASE_FIXTURE_DIR_UNDER_TEST="$fixture_dir"
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" '0.8.1' \
+        --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    MOCK_RELEASE_LIST_FILE_UNDER_TEST=''
+    MOCK_RELEASE_FIXTURE_DIR_UNDER_TEST=''
+    if [ "$status" -ne 0 ]; then
+        printf 'v0.8 channel did not fall through poisoned higher tags (exit %s):\n' "$status"
+        sed -n '1,180p' "$output"
+        return 1
+    fi
+    for rejected_tag in v0.11.0 v0.10.0 v0.9.0; do
+        assert_log_contains_literal "$sandbox/curl.log" "/releases/tags/$rejected_tag" \
+            "installer did not exact-check rejected channel tag $rejected_tag" || return 1
+        if grep -Fq "/releases/download/$rejected_tag/" "$sandbox/curl.log"; then
+            printf 'installer downloaded an asset from rejected channel tag %s\n' "$rejected_tag"
+            return 1
+        fi
+    done
+    assert_log_contains_literal "$sandbox/curl.log" '/releases/tags/v0.8.1' \
+        'installer did not fall through to the trusted stable tag' || return 1
+    assert_file_contains "$sandbox/arc/bin/arc-node" 'arc-node 0\.8\.1' \
+        'installer did not commit the highest trusted stable release' || return 1
+}
+
+v08_channel_fails_closed_without_a_compatible_or_complete_list() {
+    local sandbox list_fixture output status case_name
+    for case_name in v07-only truncated; do
+        new_sandbox
+        sandbox="$NEW_SANDBOX"
+        list_fixture="$sandbox/releases-list.json"
+        if [ "$case_name" = v07-only ]; then
+            printf '%s\n' '[{"tag_name":"v0.7.11"}]' > "$list_fixture"
+        else
+            printf '%s' '[{"tag_name":"v0.8.1"}' > "$list_fixture"
+        fi
+        output="$sandbox/channel-rejected.out"
+        ARC_NODE_VERSION_UNDER_TEST=''
+        MOCK_RELEASE_LIST_FILE_UNDER_TEST="$list_fixture"
+        invoke_installer "$sandbox" Linux x86_64 \
+            "$TEST_DIR/fixtures/release-v0.8.1.json" '0.8.1' \
+            --no-service --no-auto-update >"$output" 2>&1
+        status=$?
+        MOCK_RELEASE_LIST_FILE_UNDER_TEST=''
+        [ "$status" -ne 0 ] || {
+            printf 'installer accepted a %s v0.8 channel response\n' "$case_name"
+            return 1
+        }
+        if grep -Fq '/releases/tags/' "$sandbox/curl.log" \
+            || grep -Fq '/releases/download/' "$sandbox/curl.log"; then
+            printf '%s channel rejection reached exact metadata or payloads:\n' "$case_name"
+            cat "$sandbox/curl.log"
+            return 1
+        fi
     done
 }
 
@@ -1809,12 +2235,13 @@ update_only_refuses_downgrade() {
     before_hash="$(file_sha256 "$sandbox/arc/bin/arc-node")"
 
     : >"$sandbox/curl.log"
-    ARC_NODE_VERSION_UNDER_TEST=''
+    ARC_NODE_VERSION_UNDER_TEST='v0.7.9'
     output="$sandbox/downgrade.out"
     invoke_installer "$sandbox" Linux x86_64 \
         "$TEST_DIR/fixtures/release-v0.7.9.json" '0.7.9' \
         --update-only --no-service --no-auto-update >"$output" 2>&1
     status=$?
+    ARC_NODE_VERSION_UNDER_TEST=''
     after_hash="$(file_sha256 "$sandbox/arc/bin/arc-node")"
 
     if [ "$status" -eq 0 ]; then
@@ -1920,6 +2347,7 @@ managed_system_user_update_waits_past_thirty_seconds_for_graceful_restart() {
     host_uid="$(id -u)"
     MOCK_TARGET_UID_UNDER_TEST="$host_uid"
     MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_MAIN_PID_UNDER_TEST=999999
     MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
     MOCK_HEALTH_PORT_UNDER_TEST=18444
     ARC_HEALTH_TIMEOUT_UNDER_TEST=4
@@ -2240,6 +2668,9 @@ transaction_contract_covers_every_service_scope() {
 
 run_test 'offline platform aliases install exact-tag node + CLI assets without starting' install_only_platform_matrix
 run_test 'minified GitHub API JSON with no trailing newline installs exact-tag assets' minified_github_api_json_without_newline_installs_exact_assets
+run_test 'v0.8 channel ignores global latest plus body/nested tag injection and resolves the highest exact tag' v08_channel_selection_ignores_global_latest_and_nested_tags
+run_test 'v0.8 channel skips higher mutable, manual, and prerelease poison tags' v08_channel_skips_higher_untrusted_tags_for_stable_release
+run_test 'v0.8 channel fails closed without a compatible complete release list' v08_channel_fails_closed_without_a_compatible_or_complete_list
 run_test 'mutable, draft, prerelease, and manual-publisher metadata fail before any asset download' untrusted_release_metadata_fails_before_asset_download
 run_test 'tampered release-manifest signature fails before executable download' tampered_manifest_signature_fails_before_payload_download
 run_test 'missing checksum or signature fails before executable download' missing_checksum_or_signature_fails_before_payload_download
@@ -2258,12 +2689,17 @@ run_test 'copied and symlinked markers cannot authorize purge of another tree' c
 run_test 'verified v0.7 default adoption preserves state, config, model, and identity' legacy_default_adoption_preserves_state_config_model_and_identity
 run_test 'legacy adoption rejects custom roots and hostile default lookalikes' legacy_adoption_refuses_custom_and_hostile_lookalikes
 run_test 'real v0.7 Linux global supervisor is retired into a target-user managed bridge' legacy_linux_system_supervisor_is_transactionally_adopted
-run_test 'failed v0.7 Linux migration restores exact binary, units, and runtime state' legacy_linux_failure_restores_exact_runtime_state
+run_test 'post-intent v0.7 Linux failure restores files but never revives the retired node' legacy_linux_post_intent_failure_restores_files_but_stays_stopped
+run_test 'retirement create/finalize failures obey the durable no-restart boundary' legacy_retirement_failures_obey_the_intent_boundary
+run_test 'legacy unsigned updater is fenced before release resolution and stays fenced on rejection' legacy_updater_is_fenced_before_release_failure_and_stays_fenced
+run_test 'unsafe or split recovery evidence fails before the v0.7 stop boundary' legacy_retirement_gate_fails_before_v07_stop
+run_test 'installer distinguishes v0.7 TERM-only retirement from v0.8 quiescence' installer_distinguishes_v07_retirement_from_v08_quiescence
 run_test 'marker-fsync crash leaves v0.7 runnable and resumes into an exact archive plus fresh state' legacy_marker_fsync_crash_keeps_v07_runnable_and_resumes
 run_test 'pending Linux migration resumes only its bound system-user scope' pending_linux_adoption_resumes_only_its_bound_scope
 run_test 'real v0.7 macOS agents are retired and replaced transactionally' legacy_macos_agents_are_retired_and_replaced
 run_test 'managed macOS updates drain old nodes and never unload their running updater' managed_macos_update_drains_old_node_without_unloading_its_updater
 run_test 'verified detached v0.7 PID is retired without losing its configuration' legacy_detached_pid_is_exactly_verified_and_retired
+run_test 'historical no-root/no-sudo v0.7 process without node.pid is discovered and retired' legacy_untracked_no_sudo_process_is_discovered_and_retired
 run_test 'hostile Linux supervisor lookalikes fail before reservation or download' legacy_linux_supervisor_lookalikes_fail_before_reservation
 run_test '--no-service --no-auto-update has no start, health, service, or updater side effects' no_service_no_updater_really_is_install_only
 run_test 'sudo/root execution normalizes ownership to the invoking community user' sudo_root_install_targets_the_invoking_user
