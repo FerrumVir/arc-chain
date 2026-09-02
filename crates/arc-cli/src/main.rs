@@ -9,9 +9,9 @@
 //!   arc tx <hash>
 //!   arc faucet <address>
 
+mod commands;
 mod keygen;
 mod rpc;
-mod commands;
 
 use clap::{Parser, Subcommand};
 
@@ -36,6 +36,12 @@ enum Commands {
         /// Output keyfile path
         #[arg(long, default_value = "arc-key.json")]
         output: String,
+        /// Migration only: read one protected legacy seed file and preserve its Ed25519 address
+        #[arg(long, value_name = "PATH")]
+        legacy_seed_file: Option<String>,
+        /// Validate one private keyfile and print only its public ARC address
+        #[arg(long, value_name = "PATH", conflicts_with = "legacy_seed_file")]
+        verify_keyfile: Option<String>,
     },
     /// Query account balance
     Balance {
@@ -56,6 +62,8 @@ enum Commands {
     },
     /// Query chain info
     Info,
+    /// Validate node health JSON and print `ok` or `degraded`
+    Health,
     /// Get block details
     Block {
         /// Block height
@@ -80,31 +88,41 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    let rpc_url = cli.rpc
+    let rpc_url = cli
+        .rpc
         .or_else(|| std::env::var("ARC_RPC_URL").ok())
         .unwrap_or_else(|| "http://localhost:9944".to_string());
     let rpc_client = rpc::RpcClient::new(&rpc_url);
 
     let result = match cli.command {
-        Commands::Keygen { scheme, output } => {
-            keygen::run(&scheme, &output)
-        }
-        Commands::Balance { address } => {
-            commands::balance::run(&rpc_client, &address).await
-        }
+        Commands::Keygen {
+            scheme,
+            output,
+            legacy_seed_file,
+            verify_keyfile,
+        } => match (legacy_seed_file, verify_keyfile) {
+            (Some(input), None) if scheme == "ed25519" => {
+                keygen::run_legacy_seed_file(&input, &output)
+            }
+            (Some(_), None) => Err(anyhow::anyhow!(
+                "--legacy-seed-file is migration-only and requires --scheme ed25519"
+            )),
+            (None, Some(path)) => keygen::run_verify_keyfile(&path),
+            (None, None) => keygen::run(&scheme, &output),
+            (Some(_), Some(_)) => unreachable!("clap rejects conflicting keygen modes"),
+        },
+        Commands::Balance { address } => commands::balance::run(&rpc_client, &address).await,
         Commands::Transfer { from, to, amount } => {
             commands::transfer::run(&rpc_client, &from, &to, amount).await
         }
-        Commands::Info => {
-            commands::info::run(&rpc_client).await
-        }
-        Commands::Block { height } => {
-            commands::block::run(&rpc_client, height).await
-        }
-        Commands::Tx { hash } => {
-            commands::tx::run(&rpc_client, &hash).await
-        }
-        Commands::Faucet { address, faucet_url } => {
+        Commands::Info => commands::info::run(&rpc_client).await,
+        Commands::Health => commands::health::run(&rpc_client).await,
+        Commands::Block { height } => commands::block::run(&rpc_client, height).await,
+        Commands::Tx { hash } => commands::tx::run(&rpc_client, &hash).await,
+        Commands::Faucet {
+            address,
+            faucet_url,
+        } => {
             let url = faucet_url
                 .or_else(|| std::env::var("ARC_FAUCET_URL").ok())
                 .unwrap_or_else(|| format!("{}/faucet", rpc_url));

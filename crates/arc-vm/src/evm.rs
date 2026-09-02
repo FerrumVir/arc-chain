@@ -10,8 +10,8 @@ use arc_types::{Address, EventLog};
 use revm::{
     Database, Evm,
     primitives::{
-        AccountInfo, Address as RevmAddress, B256, Bytes, Bytecode, ExecutionResult,
-        KECCAK_EMPTY, Log, Output, SpecId, TxKind, U256,
+        AccountInfo, Address as RevmAddress, B256, Bytecode, Bytes, ExecutionResult, KECCAK_EMPTY,
+        Log, Output, SpecId, TxKind, U256,
     },
 };
 use std::collections::HashMap;
@@ -146,11 +146,7 @@ fn convert_logs(logs: Vec<Log>, block_height: u64, tx_hash: Hash256) -> Vec<Even
     logs.into_iter()
         .enumerate()
         .map(|(i, log)| {
-            let topics = log
-                .topics()
-                .iter()
-                .map(|t| Hash256(t.0))
-                .collect();
+            let topics = log.topics().iter().map(|t| Hash256(t.0)).collect();
             EventLog {
                 address: evm_to_arc_address(&log.address),
                 topics,
@@ -211,7 +207,12 @@ fn apply_state_changes(
 
 fn process_result(result_and_state: revm::primitives::ResultAndState) -> EvmResult {
     match result_and_state.result {
-        ExecutionResult::Success { output, gas_used, logs, .. } => {
+        ExecutionResult::Success {
+            output,
+            gas_used,
+            logs,
+            ..
+        } => {
             let (return_data, deployed_address) = match output {
                 Output::Call(data) => (data.to_vec(), None),
                 Output::Create(data, addr) => {
@@ -401,38 +402,26 @@ mod tests {
     #[test]
     fn test_evm_call_empty_contract() {
         let state = Arc::new(StateDB::new());
-        let result = evm_call(
-            &state,
-            test_addr(1),
-            test_addr(2),
-            vec![],
-            0,
-            1_000_000,
-        );
+        let result = evm_call(&state, test_addr(1), test_addr(2), vec![], 0, 1_000_000);
         // Calling an empty address succeeds with no return data
         assert!(result.success);
     }
 
     #[test]
     fn test_evm_deploy_persists_contract() {
-        let state = Arc::new(StateDB::with_genesis(&[
-            (test_addr(1), 1_000_000_000),
-        ]));
+        let state = Arc::new(StateDB::with_genesis(&[(test_addr(1), 1_000_000_000)]));
         // Minimal bytecode: PUSH1 0x42 PUSH1 0x00 MSTORE PUSH1 0x01 PUSH1 0x1F RETURN
         // This deploys a contract that returns 0x42
         let bytecode = vec![0x60, 0x42, 0x60, 0x00, 0x52, 0x60, 0x01, 0x60, 0x1f, 0xf3];
-        let result = evm_deploy(
-            &state,
-            test_addr(1),
-            bytecode,
-            0,
-            1_000_000,
-        );
+        let result = evm_deploy(&state, test_addr(1), bytecode, 0, 1_000_000);
         assert!(result.success);
         // Verify the deployed contract has bytecode stored
         if let Some(addr) = result.deployed_address {
             let stored = state.get_contract(&addr);
-            assert!(stored.is_some(), "deployed contract bytecode should be persisted");
+            assert!(
+                stored.is_some(),
+                "deployed contract bytecode should be persisted"
+            );
         }
     }
 
@@ -442,13 +431,7 @@ mod tests {
         // Minimal valid bytecode: PUSH1 0x00 PUSH1 0x00 RETURN
         // This deploys an empty contract (returns 0 bytes)
         let bytecode = vec![0x60, 0x00, 0x60, 0x00, 0xF3];
-        let result = evm_deploy(
-            &state,
-            test_addr(1),
-            bytecode,
-            0,
-            1_000_000,
-        );
+        let result = evm_deploy(&state, test_addr(1), bytecode, 0, 1_000_000);
         assert!(result.success);
     }
 }

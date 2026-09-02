@@ -288,7 +288,7 @@ impl MultiSigWallet {
         match tx.status {
             MultiSigTxStatus::Executed => return Err(MultiSigError::TxAlreadyExecuted),
             MultiSigTxStatus::Expired | MultiSigTxStatus::Cancelled => {
-                return Err(MultiSigError::TxExpired)
+                return Err(MultiSigError::TxExpired);
             }
             _ => {}
         }
@@ -326,18 +326,15 @@ impl MultiSigWallet {
         let total_weight = self.total_weight();
         let threshold = self.threshold;
         // Build a lookup of owner weights to avoid borrowing self inside closure.
-        let owner_weights: Vec<([u8; 32], u32)> = self
-            .owners
-            .iter()
-            .map(|o| (o.address, o.weight))
-            .collect();
+        let owner_weights: Vec<([u8; 32], u32)> =
+            self.owners.iter().map(|o| (o.address, o.weight)).collect();
 
         let tx = self.find_tx_mut(&tx_id)?;
 
         match tx.status {
             MultiSigTxStatus::Executed => return Err(MultiSigError::TxAlreadyExecuted),
             MultiSigTxStatus::Expired | MultiSigTxStatus::Cancelled => {
-                return Err(MultiSigError::TxExpired)
+                return Err(MultiSigError::TxExpired);
             }
             _ => {}
         }
@@ -540,7 +537,9 @@ mod tests {
     #[test]
     fn test_propose_tx() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 1000, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 1000, vec![], 9999)
+            .unwrap();
         assert_eq!(wallet.pending_txs.len(), 1);
         assert_eq!(wallet.pending_txs[0].id, tx_id);
         assert_eq!(wallet.nonce, 1);
@@ -556,7 +555,9 @@ mod tests {
     #[test]
     fn test_approve_and_threshold() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 500, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 500, vec![], 9999)
+            .unwrap();
 
         // First approval: threshold not yet met (1 of 2).
         let met = wallet.approve(tx_id, addr(1)).unwrap();
@@ -571,7 +572,9 @@ mod tests {
     #[test]
     fn test_approve_already_approved() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 500, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 500, vec![], 9999)
+            .unwrap();
         wallet.approve(tx_id, addr(1)).unwrap();
         let result = wallet.approve(tx_id, addr(1));
         assert_eq!(result.unwrap_err(), MultiSigError::AlreadyApproved);
@@ -580,7 +583,9 @@ mod tests {
     #[test]
     fn test_reject_tx() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 500, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 500, vec![], 9999)
+            .unwrap();
         wallet.reject(tx_id, addr(1)).unwrap();
         wallet.reject(tx_id, addr(2)).unwrap();
         // With 2 of 3 rejected (remaining weight 1 < threshold 2), status → Rejected.
@@ -591,7 +596,9 @@ mod tests {
     #[test]
     fn test_execute_approved_tx() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 500, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 500, vec![], 9999)
+            .unwrap();
         wallet.approve(tx_id, addr(1)).unwrap();
         wallet.approve(tx_id, addr(2)).unwrap();
 
@@ -606,7 +613,9 @@ mod tests {
     #[test]
     fn test_execute_without_threshold() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 500, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 500, vec![], 9999)
+            .unwrap();
         wallet.approve(tx_id, addr(1)).unwrap();
         let result = wallet.execute(tx_id);
         assert_eq!(result.unwrap_err(), MultiSigError::ThresholdNotMet);
@@ -615,7 +624,9 @@ mod tests {
     #[test]
     fn test_execute_already_executed() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 500, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 500, vec![], 9999)
+            .unwrap();
         wallet.approve(tx_id, addr(1)).unwrap();
         wallet.approve(tx_id, addr(2)).unwrap();
         wallet.execute(tx_id).unwrap();
@@ -671,9 +682,15 @@ mod tests {
     #[test]
     fn test_cancel_expired() {
         let mut wallet = default_wallet();
-        let tx1 = wallet.propose_tx(addr(1), addr(99), 100, vec![], 500).unwrap();
-        let _tx2 = wallet.propose_tx(addr(1), addr(99), 200, vec![], 1500).unwrap();
-        let tx3 = wallet.propose_tx(addr(1), addr(99), 300, vec![], 700).unwrap();
+        let tx1 = wallet
+            .propose_tx(addr(1), addr(99), 100, vec![], 500)
+            .unwrap();
+        let _tx2 = wallet
+            .propose_tx(addr(1), addr(99), 200, vec![], 1500)
+            .unwrap();
+        let tx3 = wallet
+            .propose_tx(addr(1), addr(99), 300, vec![], 700)
+            .unwrap();
 
         let cancelled = wallet.cancel_expired(1000);
         assert_eq!(cancelled, 2);
@@ -689,7 +706,9 @@ mod tests {
         // Owner 1 has weight 3, owner 2 has weight 1. Threshold = 3.
         let owners = vec![owner(1, 3), owner(2, 1)];
         let mut wallet = MultiSigWallet::new(owners, 3).unwrap();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 100, vec![], 9999).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 100, vec![], 9999)
+            .unwrap();
 
         // Single heavy signer meets the threshold alone.
         let met = wallet.approve(tx_id, addr(1)).unwrap();
@@ -700,7 +719,9 @@ mod tests {
     #[test]
     fn test_approve_expired_tx() {
         let mut wallet = default_wallet();
-        let tx_id = wallet.propose_tx(addr(1), addr(99), 100, vec![], 500).unwrap();
+        let tx_id = wallet
+            .propose_tx(addr(1), addr(99), 100, vec![], 500)
+            .unwrap();
         wallet.cancel_expired(1000);
         let result = wallet.approve(tx_id, addr(1));
         assert_eq!(result.unwrap_err(), MultiSigError::TxExpired);

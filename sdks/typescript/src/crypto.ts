@@ -5,7 +5,7 @@
  * derivation using @noble/ed25519 and @noble/hashes.
  */
 
-import * as ed from "@noble/ed25519";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { blake3 } from "@noble/hashes/blake3";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 
@@ -30,8 +30,8 @@ export class KeyPair {
    * Generate a random Ed25519 key pair.
    */
   static async generate(): Promise<KeyPair> {
-    const privateKey = ed.utils.randomPrivateKey();
-    const publicKey = await ed.getPublicKeyAsync(privateKey);
+    const privateKey = ed25519.utils.randomSecretKey();
+    const publicKey = ed25519.getPublicKey(privateKey);
     return new KeyPair(privateKey, publicKey);
   }
 
@@ -42,7 +42,7 @@ export class KeyPair {
     if (seed.length !== 32) {
       throw new Error(`Seed must be exactly 32 bytes, got ${seed.length}`);
     }
-    const publicKey = await ed.getPublicKeyAsync(seed);
+    const publicKey = ed25519.getPublicKey(seed);
     return new KeyPair(seed, publicKey);
   }
 
@@ -60,7 +60,7 @@ export class KeyPair {
    * Sign a message and return the 64-byte Ed25519 signature.
    */
   async sign(message: Uint8Array): Promise<Uint8Array> {
-    return ed.signAsync(message, this._privateKey);
+    return ed25519.sign(message, this._privateKey);
   }
 
   /**
@@ -68,7 +68,7 @@ export class KeyPair {
    */
   async verify(message: Uint8Array, signature: Uint8Array): Promise<boolean> {
     try {
-      return await ed.verifyAsync(signature, message, this._publicKey);
+      return ed25519.verify(signature, message, this._publicKey);
     } catch {
       return false;
     }
@@ -83,7 +83,7 @@ export class KeyPair {
     signature: Uint8Array
   ): Promise<boolean> {
     try {
-      return await ed.verifyAsync(signature, message, publicKey);
+      return ed25519.verify(signature, message, publicKey);
     } catch {
       return false;
     }

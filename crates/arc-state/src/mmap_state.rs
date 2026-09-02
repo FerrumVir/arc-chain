@@ -204,7 +204,7 @@ pub struct MmapConfig {
 impl Default for MmapConfig {
     fn default() -> Self {
         Self {
-            initial_size: PAGE_SLOT_SIZE * 256, // ~1 MiB
+            initial_size: PAGE_SLOT_SIZE * 256,   // ~1 MiB
             max_size: PAGE_SLOT_SIZE * 1_048_576, // ~4 GiB
             growth_factor: 2.0,
         }

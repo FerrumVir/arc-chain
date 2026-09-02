@@ -77,6 +77,25 @@ required-features = ["candle"]
 [[example]]
 name = "eval_perplexity"
 required-features = ["candle"]
+# These five were missing from this list, so `--all-targets` (and plain
+# `cargo test -p arc-inference`) tried to build them without the candle
+# dependency and failed on unresolved `candle_core`/`candle_transformers`
+# imports. They are candle-only probes like the rest of the list.
+[[example]]
+name = "probe_block_i8"
+required-features = ["candle"]
+[[example]]
+name = "probe_candle_multi"
+required-features = ["candle"]
+[[example]]
+name = "probe_candle_ppl"
+required-features = ["candle"]
+[[example]]
+name = "probe_candle_vs_integer"
+required-features = ["candle"]
+[[example]]
+name = "probe_i16_real_weights"
+required-features = ["candle"]
 [[example]]
 name = "profile_int8"
 required-features = ["candle"]

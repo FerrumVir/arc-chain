@@ -1,69 +1,733 @@
 name: CI
+
+# Parallel sibling jobs. Nothing uses `needs:` except where a job genuinely
+# consumes another's output, so every gate occupies its own runner and total
+# wall clock stays roughly the Rust build time even as coverage widens.
+#
+# OPTIONAL-GATE CONTRACT (read before editing):
+#   Every remaining `continue-on-error` has a named TODO and a concrete exit
+#   condition. Optional jobs measure known platform/tooling debt; required
+#   fmt, clippy, check, unit, integration, web-contract, and desktop gates fail
+#   the workflow immediately when they regress.
+#
+# No `paths:` filter is set deliberately: once these checks are required by
+# branch protection, a docs-only PR that skips them sits forever in "Expected
+# — Waiting for status to be reported". Cheap jobs on every PR beats that.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly canary so advisory data (audit job) is re-evaluated even in a quiet
+  # week, and so bit-rot in the non-blocking jobs surfaces without a PR.
+  schedule:
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT setting `RUSTFLAGS: -D warnings` here. It would apply to
+  # every job including the blocking `test` job, promoting ordinary rustc
+  # warnings (unused variables, dead code) to hard errors on a workspace that
+  # has never been gated on them. Warning-denial belongs to the blocking
+  # clippy job instead.
 
 jobs:
-  rust-check:
+  # ----------------------------------------------- release/install contract --
+  # Cheap, deterministic, and completely offline. This recreates release
+  # artifacts from fixtures and runs the installer through PATH shims, catching
+  # a desktop-only release, renamed asset, checksum bypass, architecture drift,
+  # or accidental service start before a tag can be cut.
+  release-contract:
+    name: release + installer contract
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # `--lib` skips examples/bins. Several examples under
-      # crates/arc-inference/examples/*.rs reference fields on
-      # CachedIntegerModel that no longer exist (the struct was refactored
-      # but the examples weren't), and a couple under crates/arc-crypto/examples
-      # depend on the nightly-only `stwo-prover` feature. Neither blocks
-      # library correctness. Library tests still run below.
-      - run: cargo check --workspace --lib --tests
-      # Clippy runs as a warning surface, not a gate. Each Rust release adds
-      # new stylistic lints that fire on existing code; letting them break CI
-      # either forces mechanical rewrites of crypto hot-paths (which risks
-      # on-chain attestation divergence) or a running war of allowlists.
-      # Real regressions still fail via `cargo check` and `cargo test`.
-      - run: cargo clippy --workspace --lib --tests
-      - run: cargo test --workspace --lib
-
-  # explorer/ has no package.json - it ships as static HTML served by the
-  # dashboard node. The old `explorer-build` job below tried to `npm ci`
-  # inside it and failed every run since the TypeScript port was reverted.
-  # Guard the job with a file-existence check so it only runs when a real
-  # node project lands. The previous hardcoded `cache-dependency-path:
-  # explorer/package-lock.json` failed the cache bootstrap before any
-  # condition could be evaluated, so we drop the cache entry and rely on
-  # setup-node's default.
-  explorer-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - id: has_npm_project
-        run: |
-          if [ -f explorer/package.json ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::explorer/ has no package.json - skipping npm build"
-          fi
-      - uses: actions/setup-node@v4
-        if: steps.has_npm_project.outputs.found == 'true'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 20
-      - if: steps.has_npm_project.outputs.found == 'true'
-        working-directory: explorer
-        run: npm ci && npx tsc --noEmit && npm run build
+          persist-credentials: false
+      - name: Shell syntax and offline contract tests
+        run: bash tests/release/run.sh
+      - name: ShellCheck release/install scripts
+        run: |
+          shellcheck -S warning \
+            install.sh \
+            scripts/install-community-node.sh \
+            scripts/install-node.sh \
+            scripts/auto-update.sh \
+            scripts/sero-quickstart.sh \
+            scripts/release/assemble-release.sh
+          # Contract tests intentionally single-quote literal shell/GitHub
+          # expressions and source fixture-selected helpers. Keep production
+          # scripts on the blocking warning/error policy while suppressing only
+          # those two inapplicable diagnostics in the test harness.
+          shellcheck -S warning --exclude=SC1090,SC2016 \
+            tests/release/*.sh \
+            tests/release/helpers/*.sh \
+            tests/integration/*.sh
 
-  sdk-check:
+  # ------------------------------------------------ current-tree secrets ----
+  # Full history intentionally contains the retired deterministic validator
+  # material, so scanning history would create a permanent false gate. This
+  # job archives and scans only the exact checked-out commit with a checksummed,
+  # pinned Gitleaks binary; any secret present in the releasable tree blocks CI.
+  secret-scan:
+    name: secret scan (current tree)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - run: bash tests/release/current_tree_secret_scan.sh
+
+  # ------------------------------------------------ workflow syntax -------
+  # Release and deployment behavior is encoded in Actions YAML, so malformed
+  # expressions or runner syntax must fail before merge rather than at tag
+  # time. The binary and checksum are pinned to the upstream release.
+  workflow-syntax:
+    name: workflow syntax (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+      - name: Check every workflow
+        run: |
+          "$RUNNER_TEMP/actionlint" -color
+
+  # ----------------------------------------------- static web contracts ----
+  # Dashboard CSS is compiled and committed so production never executes the
+  # Tailwind development CDN. Its verifier regenerates CSS and rejects drift;
+  # the contract validates JavaScript syntax, sources, safe rendering, and
+  # honest liveness semantics. Explorer remains dependency-free static HTML.
+  dashboard-contract:
+    name: dashboard build + contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  explorer-contract:
+    name: explorer contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: node explorer/test-contract.mjs
+
+  # ---------------------------------------------------------------- fmt ----
+  # Cheapest gate in the repo, so it runs alone and fails in seconds instead
+  # of waiting behind a multi-minute cargo build.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep this dated toolchain aligned with rust-toolchain.toml. Custom
+      # toolchain inputs use the action's master revision by design.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: rustfmt
+      - run: ./scripts/rustfmt-workspace.sh --check
+
+  # ------------------------------------------------------------- clippy ----
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # The production node is built with Candle even though arc-inference keeps
+  # that backend nondefault. Give this shipped feature its own protected status
+  # instead of hiding it inside the generic test/clippy jobs.
+  release-candle:
+    name: release Candle feature
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: release-candle
+      - name: Deny warnings across every Candle target
+        run: cargo clippy -p arc-inference -p arc-node --all-targets --features candle --locked -- -D warnings
+      - name: Exercise inference, admission, cancellation, and shutdown paths
+        run: cargo test -p arc-inference -p arc-node --lib --features candle --locked
+
+  # Deterministic benchmark signers and transaction reconstruction are
+  # intentionally excluded from default builds. This distinct protected check
+  # prevents that dormant security boundary from silently rotting.
+  benchmark-tools:
+    name: benchmark-tools feature
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: benchmark-tools
+      - name: Deny warnings across every benchmark-tools target
+        run: cargo clippy -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked -- -D warnings
+      - name: Compile nondefault examples and benches
+        run: cargo check -p arc-crypto -p arc-state -p arc-node -p arc-bench --all-targets --features benchmark-tools --locked
+      - name: Exercise feature-gated libraries and binaries
+        run: cargo test -p arc-crypto -p arc-state -p arc-node -p arc-bench --lib --bins --tests --features benchmark-tools --locked
+
+  # --------------------------------------------------------------- test ----
+  # The merge gate. macos-15 is Apple Silicon, so this matrix is the only
+  # place in the repo where the ARM half of the "bit-identical across
+  # ARM/x86" claim is exercised at all. Note that an OS matrix alone does
+  # NOT prove cross-platform determinism — every determinism test in the
+  # workspace compares a run to another run in the same process on the same
+  # machine. See .github/workflows/golden-vectors.yml for the missing half.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # The Windows all-targets + library leg reached the former 45-minute
+    # ceiling and GitHub cancelled an otherwise progressing required check.
+    # Keep one bounded ceiling for the matrix, but leave enough headroom for a
+    # cold Windows runner and the expanded protocol-v3 regression suite.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.8 treats every shipped server OS as a blocking workspace target.
+        # Platform-specific compile or unit failures must be repaired before
+        # merge; a green Linux leg cannot mask a broken Mac or Windows binary.
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: test-${{ matrix.os }}
+      # Keep the native Windows namespace/durability cases ahead of every
+      # broad gate. If one regresses, CI must still attempt and name each
+      # exact primitive, recovery, startup, and history-preservation contract.
+      - name: Native Windows namespace and recovery regressions
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -uo pipefail
+          failed=0
+          run_test() { "$@" || failed=1; }
+
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_directory_rebarrier_requires_closed_descendant_handles \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_existing_8dot3_alias_is_rejected_before_namespace_derivation \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_existing_case_variants_share_one_namespace_and_sidecar \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::windows_simultaneous_first_namespace_lock_waits_out_exclusive_create_handle \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-crypto --lib --locked \
+            secret_file::tests::desktop_lifecycle_handoff_requires_active_matching_session \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --lib --locked \
+            recovery_dag_wal::tests::advisory_lock_contends_and_stale_regular_file_is_harmless \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::node_data_directory_lock_rejects_concurrent_owner_and_survives_stale_file \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::desktop_namespace_proof_allows_node_and_prepared_state_with_live_lifecycle_handle \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::live_desktop_handle_without_exact_namespace_proof_fails_closed \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::unlocked_lifecycle_ignores_stale_proof_and_runs_real_rebarrier \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::active_desktop_handoff_rejects_wrong_session_nonce \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::desktop_lifecycle_nonce_cli_is_strict_early_and_capability_visible \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::node_data_directory_lock_restores_staged_only_history_before_open \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --bin arc-node --locked \
+            tests::recovery_archive_rebarriers_a_visible_archive_on_absent_source_retry \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test -p arc-node --test desktop_shutdown_lifecycle --locked \
+            private_desktop_request_stops_node_during_initialization \
+            -- --exact --test-threads=1 --nocapture
+          exit "$failed"
+      # Compile-check everything the test step does not build: the 15
+      # [[bin]] targets in arc-bench (which produce the numbers in
+      # docs/BENCHMARK-RESULTS.md and were never compiled by CI), the
+      # arc-crypto criterion bench, and every example. A manifest or
+      # compile break in those targets is exactly the class of failure that
+      # shipped v0.5.5 and v0.5.6 with no arc-node binaries attached.
+      - name: cargo check (all targets)
+        run: cargo check --workspace --all-targets --locked
+      - name: cargo test (lib)
+        if: runner.os != 'Windows'
+        run: cargo test --workspace --lib --locked
+      # GitHub's Windows runners expose DX12 through the WARP software
+      # adapter. arc-gpu, arc-state, and arc-node all open GPU devices in unit
+      # tests; running those tests concurrently can terminate the entire test
+      # process with Windows exit code 2173 before libtest can name a failure.
+      # Keep every functional test blocking, but serialize the full Windows
+      # library gate so future GPU consumers inherit the same protection.
+      - name: cargo test (lib, serial on Windows WARP)
+        if: runner.os == 'Windows'
+        env:
+          RUST_BACKTRACE: '1'
+        run: cargo test --workspace --lib --locked -- --test-threads=1 --nocapture
+      # The 4096x4096 performance workload is ignored by the ordinary libtest
+      # gate so it cannot contend with functional device tests. Exercise it
+      # explicitly and serially on the Apple Silicon runner's real GPU.
+      - name: LLM-sized GPU benchmark (macOS hardware)
+        if: matrix.os == 'macos-15'
+        run: cargo test -p arc-gpu --lib --locked gpu_matmul::tests::bench_matmul_4096 -- --exact --ignored --test-threads=1 --nocapture
+      - name: ARC node binary shutdown and startup tests
+        run: cargo test -p arc-node --bin arc-node --locked -- --test-threads=1
+      - name: Desktop-managed node graceful shutdown integration
+        run: cargo test -p arc-node --test desktop_shutdown_lifecycle --locked -- --test-threads=1
+
+  # -------------------------------------------------------- integration ----
+  # Separate job so a slow multi-node run neither serializes behind nor
+  # blocks fast unit feedback.
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The timing-sensitive three-node transition scenario remains explicitly
+    # ignored; every integration test that actually runs is a required gate.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: integration
+      # --test-threads=1 because these tests bind sockets and race each
+      # other for ports when run in parallel.
+      - run: cargo test --workspace --test '*' --locked -- --test-threads=1
+      - name: Doc tests
+        run: cargo test --workspace --doc --locked
+
+  # ---------------------------------------------------- desktop typecheck --
+  # Blocking from day one: desktop/package.json's `build` script already runs
+  # `tsc --noEmit`, and tauri.conf.json calls that script as
+  # beforeBuildCommand, so it necessarily passed when v0.7.11 was tagged.
+  # The only thing changing here is WHEN it runs — PR time instead of mid
+  # release, across four parallel platform bundles.
+  desktop-typecheck:
+    name: desktop typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  # ---------------------------------------------------- desktop Tauri Rust --
+  # desktop/src-tauri is intentionally outside the root Cargo workspace. Build
+  # every release OS on stable, matching release.yml and exercising each
+  # platform-specific supervisor/updater branch before a tag is created.
+  desktop-tauri-test:
+    name: desktop Tauri Rust tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # The repository root pins nightly for Stwo. `--manifest-path` does not
+      # override that directory toolchain, so merely installing stable below
+      # still ran these tests on nightly. Keep PR and release builds identical.
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 is Apple Silicon; macos-15-intel covers the Intel package
+        # that regressed for community users and is still released.
+        os: [ubuntu-latest, macos-15, macos-15-intel, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Build desktop frontend required by Tauri context
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: desktop/src-tauri
+          shared-key: desktop-tauri-${{ matrix.os }}
+      - name: Native Windows desktop lifecycle state-machine regressions
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUST_BACKTRACE: '1'
+        run: |
+          set -uo pipefail
+          failed=0
+          run_test() { "$@" || failed=1; }
+
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_serializes_desktop_processes \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::provisional_orphan_lease_cannot_launch_and_prepares_after_node_lock_reaps \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_migrates_v1_proof_and_lock_residue \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_rejects_invalid_namespace_proof \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_restores_staged_data_directory \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_restores_staged_control_directory \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::managed_lifecycle_lock_accepts_existing_case_variant_namespace \
+            -- --exact --test-threads=1 --nocapture
+          exit "$failed"
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
+
+  # -------------------------------------------------------- desktop e2e ----
+  # playwright.config.ts drives the mock Tauri backend, so no arc-node binary
+  # is required and a plain Ubuntu runner suffices. The green suite is a
+  # required gate alongside the desktop typecheck.
+  desktop-e2e:
+    name: desktop e2e (playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # webServer in playwright.gate.config.ts runs `npm run build && npm run
+      # preview` on :4173 and CI=true turns on forbidOnly/retries/1 worker.
+      - run: npx playwright test --config playwright.gate.config.ts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: playwright-report
+          path: desktop/playwright-report/
+          retention-days: 7
+
+  # -------------------------------------------------------------- audit ----
+  audit:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enforce advisory, license, source, and dependency policy
+        run: |
+          set -euo pipefail
+          for manifest in \
+            Cargo.toml \
+            desktop/src-tauri/Cargo.toml \
+            tests/release/tauri-updater-verifier/Cargo.toml; do
+            bash scripts/ci/run-cargo-deny.sh "$manifest"
+          done
+
+  # ------------------------------------------------------- shell syntax ----
+  # Zero-debt gate, blocking from day one: `bash -n` parses without executing,
+  # so it can only fail on a genuine syntax error.
+  shell-syntax:
+    name: shell syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: bash -n every shell script
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            if ! bash -n "$f"; then
+              echo "::error file=$f::bash syntax error"
+              fail=1
+            fi
+          done < <(find scripts deploy tests/release tests/integration -type f -name '*.sh' | sort)
+          exit "$fail"
+
+  # --------------------------------------------------------- shellcheck ----
+  # Shell scripts include curl|bash installers, deployment tooling, and the
+  # per-seed self-heal daemon. Warning-level findings are kept at zero so
+  # quoting, masked exit codes, broken traps, and positional parsing regressions
+  # cannot merge.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # shellcheck is preinstalled on ubuntu-latest runners; no third-party
+      # action needed for a one-line invocation.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          files=(install.sh)
+          while IFS= read -r -d '' file; do
+            files+=("$file")
+          done < <(find scripts deploy tests/release tests/integration -type f -name '*.sh' -print0)
+          shellcheck -S warning "${files[@]}"
+
+  # ------------------------------------------------------------- forge ----
+  # 8 production Solidity files including a bridge, staking contract,
+  # state-root anchor and UUPS proxy, plus standards/proxy regression tests.
+  # Formatting, tests, and compilation are blocking gates; OpenZeppelin is
+  # resolved at an exact version.
+  forge:
+    name: contracts (forge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          # Keep formatter/compiler behavior reproducible instead of following
+          # the action's moving `stable` default.
+          version: v1.7.1
+      - name: forge fmt --check
+        run: forge fmt --check
+      - name: Resolve OpenZeppelin
+        run: npm install --no-save @openzeppelin/contracts@5.0.2
+      - name: forge tests
+        env:
+          FOUNDRY_REMAPPINGS: '@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/'
+        run: forge test
+      - name: forge build --sizes
+        env:
+          FOUNDRY_REMAPPINGS: '@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/'
+        run: forge build --sizes
+
+  # --------------------------------------------------------- sdk-check ----
+  # Was `npm install` (resolves a fresh tree, so CI could pass on a dependency
+  # set no developer has); now `npm ci`, which honours the tracked lockfile.
+  #
+  # `npm ci` fails hard if package.json and package-lock.json drift apart,
+  # where `npm install` would silently reconcile them. Fix lock drift with
+  # `cd sdk/typescript && npm install` and commit the lockfile; do not weaken
+  # this gate by reverting to `npm install`.
+  sdk-check:
+    name: SDK clean build + packed consumer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
         working-directory: sdk/typescript
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 20
-      - run: npm install
-      - run: npx tsc --noEmit
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - run: npm ci
+      # Builds from an isolated copy, installs the tarball into an empty
+      # consumer, imports its ESM API, and compiles its declarations. The gate
+      # never rewrites the checkout's tracked dist directory.
+      - run: npm test
+
+  compatibility-typescript-sdk:
+    name: compatibility TypeScript SDK (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=low
+      - run: npm test -- --runInBand
+      - run: npm run build
+      - name: Load the published CommonJS entrypoint
+        shell: bash
+        run: >-
+          node -e "const sdk=require('./dist');
+          if (!sdk || typeof sdk !== 'object') throw new Error('CommonJS SDK failed to load')"
+
+  python-sdk:
+    name: Python SDK (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/arc-python-sdk-pycache-${{ matrix.python-version }}
+      RUFF_CACHE_DIR: /tmp/arc-python-sdk-ruff-cache-${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.13']
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: sdks/python/pyproject.toml
+      - run: python -m pip install -e '.[dev]'
+      - name: Audit the resolved SDK dependency graph
+        if: matrix.python-version != '3.9'
+        run: |
+          python -m pip freeze --exclude-editable > "$RUNNER_TEMP/arc-python-sdk-requirements.txt"
+          python -m pip_audit -r "$RUNNER_TEMP/arc-python-sdk-requirements.txt"
+      - run: python -m ruff check arc_sdk tests
+      - run: python -m ruff format --check arc_sdk tests
+      - run: python -m unittest discover -s tests -v
+      - run: python -m compileall -q arc_sdk tests
+
+# REMOVED: the old `explorer-build` job. It probed for explorer/package.json,
+# emitted a ::notice:: and exited. Explorer is intentionally dependency-free
+# static HTML/CSS/JavaScript now, and its executable contract is enforced by
+# the blocking `explorer-contract` job above. Add a build job only if a real
+# package/build pipeline lands in explorer/.
+#
+# Both compatibility SDK trees are deliberately blocking even though only
+# sdk/typescript is publishable. Keeping them executable prevents stale client
+# code from becoming a security or integration blind spot while consumers
+# migrate to the canonical package.

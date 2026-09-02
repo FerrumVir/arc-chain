@@ -5,16 +5,10 @@
 
 use arc_crypto::Hash256;
 use arc_state::StateDB;
-use arc_state::gpu_state::{GpuStateCacheConfig, GpuStateCache};
-use arc_types::{Account, Address, Transaction, TxBody, TxType};
+use arc_state::gpu_state::GpuStateCacheConfig;
+use arc_types::Address;
 use std::sync::Arc;
 use std::time::Instant;
-
-fn benchmark_address(seed: u8) -> Address {
-    let mut addr = [0u8; 32];
-    addr[0] = seed;
-    Hash256(addr)
-}
 
 fn benchmark_address_u16(seed: u16) -> Address {
     let mut addr = [0u8; 32];
@@ -73,17 +67,17 @@ pub fn run_gpu_state_benchmark() {
         let sender = benchmark_address_u16(sender_idx);
         let receiver = benchmark_address_u16(receiver_idx);
 
-        if let Some(mut acct) = state_baseline.get_account(&sender) {
-            if acct.balance >= 1 {
-                acct.balance -= 1;
-                acct.nonce += 1;
-                state_baseline.update_account(&sender, acct);
+        if let Some(mut acct) = state_baseline.get_account(&sender)
+            && acct.balance >= 1
+        {
+            acct.balance -= 1;
+            acct.nonce += 1;
+            state_baseline.update_account(&sender, acct);
 
-                let mut recv_acct = state_baseline.get_or_create_account(&receiver);
-                recv_acct.balance += 1;
-                state_baseline.update_account(&receiver, recv_acct);
-                success_count += 1;
-            }
+            let mut recv_acct = state_baseline.get_or_create_account(&receiver);
+            recv_acct.balance += 1;
+            state_baseline.update_account(&receiver, recv_acct);
+            success_count += 1;
         }
     }
     let baseline_transfer_elapsed = t1.elapsed();
@@ -107,10 +101,7 @@ pub fn run_gpu_state_benchmark() {
 
     // Report memory model
     if let Some(cache) = state_gpu.gpu_cache() {
-        println!(
-            "  Memory model: {:?}",
-            cache.memory_model()
-        );
+        println!("  Memory model: {:?}", cache.memory_model());
         let stats = cache.stats();
         println!(
             "  GPU accounts: {}, Warm accounts: {}",
@@ -145,17 +136,17 @@ pub fn run_gpu_state_benchmark() {
         let sender = benchmark_address_u16(sender_idx);
         let receiver = benchmark_address_u16(receiver_idx);
 
-        if let Some(mut acct) = state_gpu.get_account(&sender) {
-            if acct.balance >= 1 {
-                acct.balance -= 1;
-                acct.nonce += 1;
-                state_gpu.update_account(&sender, acct);
+        if let Some(mut acct) = state_gpu.get_account(&sender)
+            && acct.balance >= 1
+        {
+            acct.balance -= 1;
+            acct.nonce += 1;
+            state_gpu.update_account(&sender, acct);
 
-                let mut recv_acct = state_gpu.get_or_create_account(&receiver);
-                recv_acct.balance += 1;
-                state_gpu.update_account(&receiver, recv_acct);
-                gpu_success += 1;
-            }
+            let mut recv_acct = state_gpu.get_or_create_account(&receiver);
+            recv_acct.balance += 1;
+            state_gpu.update_account(&receiver, recv_acct);
+            gpu_success += 1;
         }
     }
     let gpu_transfer_elapsed = t3.elapsed();
@@ -172,7 +163,9 @@ pub fn run_gpu_state_benchmark() {
         let stats = cache.stats();
         println!(
             "  Cache stats: GPU hits={}, CPU hits={}, misses={}, hit_rate={:.1}%",
-            stats.gpu_hits, stats.cpu_hits, stats.misses,
+            stats.gpu_hits,
+            stats.cpu_hits,
+            stats.misses,
             stats.gpu_hit_rate * 100.0
         );
     }
@@ -192,10 +185,7 @@ pub fn run_gpu_state_benchmark() {
         "║  Transfer TPS:      Baseline {:.0} → GPU {:.0}  ({:.1}x)",
         baseline_tps, gpu_tps, transfer_speedup
     );
-    println!(
-        "║  Accounts:          {}",
-        num_accounts
-    );
+    println!("║  Accounts:          {}", num_accounts);
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 

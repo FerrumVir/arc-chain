@@ -5,7 +5,7 @@
 //! computes a global state root, manages shard assignments for validators,
 //! and handles cross-shard settlement.
 
-use arc_crypto::{hash_pair, Hash256};
+use arc_crypto::{Hash256, hash_pair};
 use dashmap::DashMap;
 use thiserror::Error;
 
@@ -305,7 +305,11 @@ mod tests {
         let root1 = state.compute_global_root();
         let root2 = state.compute_global_root();
         assert_eq!(root1, root2, "global root must be deterministic");
-        assert_ne!(root1, Hash256::ZERO, "root should not be zero with attestations");
+        assert_ne!(
+            root1,
+            Hash256::ZERO,
+            "root should not be zero with attestations"
+        );
     }
 
     #[test]
@@ -375,7 +379,12 @@ mod tests {
         for i in 0..=255u8 {
             let addr = make_address(i);
             let shard = state.get_shard_for_account(&addr);
-            assert!(shard < 16, "shard {} out of range for address seed {}", shard, i);
+            assert!(
+                shard < 16,
+                "shard {} out of range for address seed {}",
+                shard,
+                i
+            );
         }
     }
 

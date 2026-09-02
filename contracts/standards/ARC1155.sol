@@ -20,20 +20,10 @@ contract ARC1155 {
 
     // ── Events ─────────────────────────────────────────────────────────────
 
-    event TransferSingle(
-        address indexed operator,
-        address indexed from,
-        address indexed to,
-        uint256 id,
-        uint256 value
-    );
+    event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
 
     event TransferBatch(
-        address indexed operator,
-        address indexed from,
-        address indexed to,
-        uint256[] ids,
-        uint256[] values
+        address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values
     );
 
     event ApprovalForAll(address indexed account, address indexed operator, bool approved);
@@ -75,10 +65,9 @@ contract ARC1155 {
      * @notice Query interface support (ERC-165).
      */
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return
-            interfaceId == 0xd9b67a26 || // ERC-1155
-            interfaceId == 0x0e89341c || // ERC-1155 Metadata URI
-            interfaceId == 0x01ffc9a7;   // ERC-165
+        return interfaceId == 0xd9b67a26 // ERC-1155
+            || interfaceId == 0x0e89341c // ERC-1155 Metadata URI
+            || interfaceId == 0x01ffc9a7; // ERC-165
     }
 
     // ── ERC-1155 Interface ─────────────────────────────────────────────────
@@ -94,10 +83,11 @@ contract ARC1155 {
     /**
      * @notice Get balances for multiple account/token pairs.
      */
-    function balanceOfBatch(
-        address[] calldata accounts,
-        uint256[] calldata ids
-    ) external view returns (uint256[] memory) {
+    function balanceOfBatch(address[] calldata accounts, uint256[] calldata ids)
+        external
+        view
+        returns (uint256[] memory)
+    {
         if (accounts.length != ids.length) revert ArrayLengthMismatch();
 
         uint256[] memory batchBalances = new uint256[](accounts.length);
@@ -126,13 +116,7 @@ contract ARC1155 {
     /**
      * @notice Transfer a single token type.
      */
-    function safeTransferFrom(
-        address from,
-        address to,
-        uint256 id,
-        uint256 amount,
-        bytes calldata data
-    ) external {
+    function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert NotAuthorized(msg.sender);
         }
@@ -161,7 +145,13 @@ contract ARC1155 {
      * @notice Get the URI for a token type.
      * @dev Returns the base URI. Clients replace `{id}` with the hex token ID per ERC-1155 spec.
      */
-    function uri(uint256 /* id */) external view returns (string memory) {
+    function uri(
+        uint256 /* id */
+    )
+        external
+        view
+        returns (string memory)
+    {
         return _uri;
     }
 
@@ -188,24 +178,17 @@ contract ARC1155 {
      * @param amount  Number of tokens to mint
      * @param data    Data payload for receiver hook
      */
-    function mint(
-        address to,
-        uint256 id,
-        uint256 amount,
-        bytes calldata data
-    ) external onlyOwner {
+    function mint(address to, uint256 id, uint256 amount, bytes calldata data) external onlyOwner {
         _mint(to, id, amount, data);
     }
 
     /**
      * @notice Mint multiple token types in a single call. Owner only.
      */
-    function mintBatch(
-        address to,
-        uint256[] calldata ids,
-        uint256[] calldata amounts,
-        bytes calldata data
-    ) external onlyOwner {
+    function mintBatch(address to, uint256[] calldata ids, uint256[] calldata amounts, bytes calldata data)
+        external
+        onlyOwner
+    {
         _mintBatch(to, ids, amounts, data);
     }
 
@@ -222,11 +205,7 @@ contract ARC1155 {
     /**
      * @notice Burn multiple token types from the caller's balance.
      */
-    function burnBatch(
-        address from,
-        uint256[] calldata ids,
-        uint256[] calldata amounts
-    ) external {
+    function burnBatch(address from, uint256[] calldata ids, uint256[] calldata amounts) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert NotAuthorized(msg.sender);
         }
@@ -244,13 +223,7 @@ contract ARC1155 {
 
     // ── Internal ───────────────────────────────────────────────────────────
 
-    function _safeTransferFrom(
-        address from,
-        address to,
-        uint256 id,
-        uint256 amount,
-        bytes calldata data
-    ) internal {
+    function _safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) internal {
         if (to == address(0)) revert ZeroAddress();
 
         uint256 fromBalance = _balances[id][from];
@@ -308,12 +281,7 @@ contract ARC1155 {
         _checkOnERC1155Received(msg.sender, address(0), to, id, amount, data);
     }
 
-    function _mintBatch(
-        address to,
-        uint256[] calldata ids,
-        uint256[] calldata amounts,
-        bytes calldata data
-    ) internal {
+    function _mintBatch(address to, uint256[] calldata ids, uint256[] calldata amounts, bytes calldata data) internal {
         if (to == address(0)) revert ZeroAddress();
         if (ids.length != amounts.length) revert ArrayLengthMismatch();
 
@@ -340,11 +308,7 @@ contract ARC1155 {
         emit TransferSingle(msg.sender, from, address(0), id, amount);
     }
 
-    function _burnBatch(
-        address from,
-        uint256[] calldata ids,
-        uint256[] calldata amounts
-    ) internal {
+    function _burnBatch(address from, uint256[] calldata ids, uint256[] calldata amounts) internal {
         if (ids.length != amounts.length) revert ArrayLengthMismatch();
 
         for (uint256 i = 0; i < ids.length; i++) {
@@ -391,7 +355,9 @@ contract ARC1155 {
         bytes calldata data
     ) private {
         if (to.code.length > 0) {
-            try IERC1155Receiver(to).onERC1155BatchReceived(operator, from, ids, amounts, data) returns (bytes4 retval) {
+            try IERC1155Receiver(to).onERC1155BatchReceived(operator, from, ids, amounts, data) returns (
+                bytes4 retval
+            ) {
                 if (retval != IERC1155Receiver.onERC1155BatchReceived.selector) {
                     revert UnsafeRecipient(to);
                 }
@@ -406,13 +372,9 @@ contract ARC1155 {
  * @dev Interface for contracts that want to support transfers from ERC-1155 contracts.
  */
 interface IERC1155Receiver {
-    function onERC1155Received(
-        address operator,
-        address from,
-        uint256 id,
-        uint256 value,
-        bytes calldata data
-    ) external returns (bytes4);
+    function onERC1155Received(address operator, address from, uint256 id, uint256 value, bytes calldata data)
+        external
+        returns (bytes4);
 
     function onERC1155BatchReceived(
         address operator,

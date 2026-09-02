@@ -1,14 +1,8 @@
-# ARC Chain Genesis Configuration
-# Defines the initial chain state: prefunded accounts and validators.
-# All nodes MUST use the same genesis config for consensus to work.
-# Usage: arc-node --genesis genesis.toml
-
 [chain]
 name = "arc-testnet"
-chain_id = "0x415243"  # "ARC" in ASCII hex
-
-# ── Prefunded Genesis Accounts ──────────────────────────────────────────
-# blake3::hash(&[i]) for i in 0..10, each with 1 trillion ARC
+chain_id = "0x415243"
+validator_set_complete = true
+community_rewards_v1_activation_height = 137146
 
 [[accounts]]
 address = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
@@ -30,37 +24,50 @@ balance = 1_000_000_000_000
 address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
 balance = 1_000_000_000_000
 
-# ── Genesis Validators (Testnet) ──────────────────────────────────────
-# These seeds MUST match the --validator-seed flag each node uses.
-# All nodes load this file → all nodes have the same validator set from
-# round 0 → deterministic leader selection → consensus.
+[[accounts]]
+address = "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f"
+balance = 0
+
+[[accounts]]
+address = "44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780"
+balance = 0
+
+[[accounts]]
+address = "5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21"
+balance = 0
+
+[[accounts]]
+address = "228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd"
+balance = 0
+
+[[accounts]]
+address = "f03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f"
+balance = 0
+
+[[accounts]]
+address = "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b"
+balance = 0
 
 [[validators]]
-seed = "NYC"
-stake = 5_000_000
+address = "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f"
+stake = 6_666_667
 
 [[validators]]
-seed = "LAX"
-stake = 5_000_000
+address = "44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780"
+stake = 6_666_667
 
 [[validators]]
-seed = "AMS"
-stake = 5_000_000
+address = "5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21"
+stake = 6_666_667
 
 [[validators]]
-seed = "LHR"
-stake = 5_000_000
+address = "228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd"
+stake = 6_666_667
 
 [[validators]]
-seed = "NRT"
-stake = 5_000_000
+address = "f03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f"
+stake = 6_666_666
 
 [[validators]]
-seed = "SGP"
-stake = 5_000_000
-
-# SAO + JNB retired 2026-04-22 (closes GH #32). They were RPC-dead for weeks
-# and their datacenters had unreliable peer connectivity. Removing from
-# genesis shrinks the validator set to 6; takes effect only on nodes that
-# rebuild from fresh state (live chain has the 8-validator set in its DAG
-# history and ignores this change until a coordinated restart).
+address = "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b"
+stake = 6_666_666

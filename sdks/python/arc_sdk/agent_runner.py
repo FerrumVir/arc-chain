@@ -89,6 +89,7 @@ def _model_id(name: str) -> str:
 @dataclass
 class AgentStats:
     """Running statistics for the agent."""
+
     requests_processed: int = 0
     requests_failed: int = 0
     attestations_submitted: int = 0
@@ -111,6 +112,7 @@ class AgentStats:
 @dataclass
 class InferenceRequest:
     """A pending inference request from the chain."""
+
     request_id: str
     sender: str
     input_text: str
@@ -122,6 +124,7 @@ class InferenceRequest:
 @dataclass
 class InferenceResult:
     """Result of an inference execution."""
+
     request_id: str
     output_text: str
     input_hash: str
@@ -198,7 +201,9 @@ class AgentRunner:
             "gas_limit": 50_000,
         }
         tx_hash = self.client.submit_transaction(tx)
-        logger.info(f"Agent registered: {self.name} addr={self.address[:16]}... tx={tx_hash[:16]}...")
+        logger.info(
+            f"Agent registered: {self.name} addr={self.address[:16]}... tx={tx_hash[:16]}..."
+        )
         return tx_hash
 
     async def start(self, max_iterations: Optional[int] = None):
@@ -411,6 +416,7 @@ class AgentRunner:
 
 # ── Convenience constructors for common providers ────────────────────────
 
+
 def openai_runner(
     client: ArcClient,
     keypair: KeyPair,
@@ -422,10 +428,12 @@ def openai_runner(
 ) -> AgentRunner:
     """Create an AgentRunner that calls OpenAI's API."""
     import os
+
     _api_key = api_key or os.getenv("OPENAI_API_KEY", "")
 
     async def _infer(input_text: str, model_id: str) -> str:
         import httpx
+
         async with httpx.AsyncClient() as http:
             resp = await http.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -436,8 +444,9 @@ def openai_runner(
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
 
-    return AgentRunner(client=client, keypair=keypair, name=name,
-                       inference_fn=_infer, model_name=model, **kwargs)
+    return AgentRunner(
+        client=client, keypair=keypair, name=name, inference_fn=_infer, model_name=model, **kwargs
+    )
 
 
 def ollama_runner(
@@ -453,6 +462,7 @@ def ollama_runner(
 
     async def _infer(input_text: str, model_id: str) -> str:
         import httpx
+
         async with httpx.AsyncClient() as http:
             resp = await http.post(
                 f"{ollama_url}/api/generate",
@@ -462,8 +472,9 @@ def ollama_runner(
             resp.raise_for_status()
             return resp.json()["response"]
 
-    return AgentRunner(client=client, keypair=keypair, name=name,
-                       inference_fn=_infer, model_name=model, **kwargs)
+    return AgentRunner(
+        client=client, keypair=keypair, name=name, inference_fn=_infer, model_name=model, **kwargs
+    )
 
 
 def openclaw_runner(
@@ -480,6 +491,7 @@ def openclaw_runner(
 
     async def _infer(input_text: str, model_id: str) -> str:
         import httpx
+
         headers = {}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -494,5 +506,11 @@ def openclaw_runner(
             data = resp.json()
             return data.get("output", data.get("result", str(data)))
 
-    return AgentRunner(client=client, keypair=keypair, name=name,
-                       inference_fn=_infer, model_name=f"openclaw-{agent_id}", **kwargs)
+    return AgentRunner(
+        client=client,
+        keypair=keypair,
+        name=name,
+        inference_fn=_infer,
+        model_name=f"openclaw-{agent_id}",
+        **kwargs,
+    )

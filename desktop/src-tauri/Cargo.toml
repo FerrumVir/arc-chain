@@ -1,9 +1,10 @@
 [package]
 name = "arc-desktop"
-version = "0.7.11"
+version = "0.8.0"
 description = "ARC Node - desktop app"
 authors = ["FerrumVir"]
 edition = "2021"
+license = "BUSL-1.1"
 
 [lib]
 name = "arc_desktop_lib"
@@ -22,6 +23,7 @@ tauri-plugin-process = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 thiserror = "1"
@@ -30,15 +32,23 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 directories = "5"
 rand = "0.8"
 hex = "0.4"
+fs2 = "0.4"
 # Identity / signing - must match the arc-node derivation scheme
 # (crates/arc-node/src/main.rs:310–311). Any change here desyncs the address
 # from what the chain actually sees.
 bip39 = "2.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 blake3 = "1.5"
+sha2 = "0.10"
+# Pure-Rust OpenSSH `sshsig` verification. The desktop must authenticate the
+# owner-signed SHA256SUMS before it trusts and executes a downloaded arc-node;
+# invoking an optional system ssh-keygen would break clean Windows installs.
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519", "getrandom"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1"
+libc = "0.2"
 
 # Milestone B (#36): build InferenceEscrowOpen transactions locally so the
 # desktop app can submit them to a coordinator before calling
@@ -46,6 +56,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # desktop/src-tauri is intentionally excluded from the top-level workspace.
 arc-types = { path = "../../crates/arc-types" }
 arc-crypto = { path = "../../crates/arc-crypto" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [features]
 default = ["custom-protocol"]

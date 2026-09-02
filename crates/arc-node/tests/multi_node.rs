@@ -19,19 +19,24 @@
 
 #![allow(dead_code)]
 
-use arc_crypto::{hash_bytes, Hash256, KeyPair};
+use arc_crypto::{Hash256, KeyPair, hash_bytes};
 use arc_mempool::Mempool;
-use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
+use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
 use arc_node::consensus::ConsensusManager;
 use arc_state::StateDB;
 use arc_types::{Block, Transaction};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn init_tracing() {
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string());
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+}
 
 /// Derive a deterministic validator keypair from a seed string.
 /// Same logic as main.rs: BLAKE3 KDF -> Ed25519 signing key.
@@ -41,12 +46,20 @@ fn make_validator_keypair(seed: &str) -> KeyPair {
     KeyPair::Ed25519(signing_key)
 }
 
+fn validator_allowlist(addresses: &[Hash256]) -> Arc<std::collections::HashSet<[u8; 32]>> {
+    Arc::new(addresses.iter().map(|address| address.0).collect())
+}
+
 /// Standard genesis accounts shared across all test nodes.
 /// All nodes MUST use the same genesis to produce the same genesis hash,
 /// which is required for the QUIC handshake to succeed.
+fn genesis_keypair(index: u8) -> KeyPair {
+    make_validator_keypair(&format!("test-genesis-account-{index}"))
+}
+
 fn genesis_accounts() -> Vec<(Hash256, u64)> {
     (0..100u8)
-        .map(|i| (hash_bytes(&[i]), 1_000_000_000_000))
+        .map(|i| (genesis_keypair(i).address(), 1_000_000_000_000))
         .collect()
 }
 
@@ -88,20 +101,23 @@ struct TestNode {
 impl TestNode {
     /// Create and start a full test node.
     ///
-    /// The node starts as a single-validator (fast path). When peers connect
-    /// via QUIC transport, `PeerConnected` messages flow into consensus, which
-    /// dynamically adds them to the validator set and transitions to multi-
-    /// validator DAG consensus mode. This mirrors the production wiring.
+    /// The consensus engine receives the complete genesis validator set up
+    /// front, just like `main.rs`, so every node freezes the same epoch-1
+    /// leader set before networking starts. `PeerConnected` still drives live
+    /// connectivity but must not be used to guess consensus membership in a
+    /// different arrival order on every node.
     ///
     /// * `seed` - deterministic validator seed (e.g. "test-validator-0").
     /// * `stake` - ARC stake amount (must be >= 5M for block production).
     /// * `port` - port to listen on (use `find_free_port()` to get one).
     /// * `bootstrap_peers` - addresses of peers to connect to on startup.
+    /// * `peer_validators` - the other genesis validators and their stake.
     async fn start(
         seed: &str,
         stake: u64,
         port: u16,
         bootstrap_peers: Vec<SocketAddr>,
+        peer_validators: Vec<(Hash256, u64)>,
     ) -> Self {
         let keypair = make_validator_keypair(seed);
         let address = keypair.address();
@@ -118,6 +134,9 @@ impl TestNode {
 
         let genesis_hash = Block::genesis().hash;
         let listen_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut transport_validators = vec![address];
+        transport_validators.extend(peer_validators.iter().map(|(peer, _)| *peer));
+        let transport_allowlist = validator_allowlist(&transport_validators);
 
         // Start transport
         let transport_keypair = keypair.clone();
@@ -129,6 +148,7 @@ impl TestNode {
             address,
             stake,
             genesis_hash,
+            transport_allowlist,
             outbound_rx,
             transport_inbound_tx,
             transport_peer_count,
@@ -136,14 +156,15 @@ impl TestNode {
             String::new(), // data_dir: empty for tests (no peer persistence)
         ));
 
-        // Start consensus - no pre-populated peers (matches main.rs behavior).
-        // Peers are discovered dynamically via PeerConnected from transport.
+        // Start consensus with the complete, deterministic genesis validator
+        // membership. `ConsensusManager::new_with_keypair` freezes epoch 1
+        // immediately when this list is non-empty.
         let consensus = ConsensusManager::new_with_keypair(
             address,
             stake,
             4,     // num_shards
             false, // not benchmark mode
-            &[],   // no pre-populated peers - dynamic discovery
+            &peer_validators,
             keypair,
         );
         let state_clone = state.clone();
@@ -220,9 +241,7 @@ impl Drop for TestNode {
 /// - PeerConnected messages are emitted on both sides with correct addresses.
 #[tokio::test]
 async fn test_two_nodes_connect() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("error")
-        .try_init();
+    init_tracing();
 
     let port_a = find_free_port().await;
     let port_b = find_free_port().await;
@@ -253,6 +272,7 @@ async fn test_two_nodes_connect() {
         address_a,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_a,
         inbound_tx_a,
         pc_a,
@@ -277,6 +297,7 @@ async fn test_two_nodes_connect() {
         address_b,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_b,
         inbound_tx_b,
         pc_b,
@@ -309,7 +330,9 @@ async fn test_two_nodes_connect() {
     let msg_b = timeout(Duration::from_secs(5), inbound_rx_b.recv()).await;
     assert!(msg_b.is_ok(), "Node B did not receive PeerConnected");
     match msg_b.unwrap() {
-        Some(InboundMessage::PeerConnected { address, stake: s }) => {
+        Some(InboundMessage::PeerConnected {
+            address, stake: s, ..
+        }) => {
             assert_eq!(address, address_a, "Node B should see Node A's address");
             assert_eq!(s, stake, "Stake should match");
         }
@@ -320,7 +343,9 @@ async fn test_two_nodes_connect() {
     let msg_a = timeout(Duration::from_secs(5), inbound_rx_a.recv()).await;
     assert!(msg_a.is_ok(), "Node A did not receive PeerConnected");
     match msg_a.unwrap() {
-        Some(InboundMessage::PeerConnected { address, stake: s }) => {
+        Some(InboundMessage::PeerConnected {
+            address, stake: s, ..
+        }) => {
             assert_eq!(address, address_b, "Node A should see Node B's address");
             assert_eq!(s, stake, "Stake should match");
         }
@@ -329,6 +354,81 @@ async fn test_two_nodes_connect() {
 
     handle_a.abort();
     handle_b.abort();
+}
+
+/// An authenticated Ed25519 identity is still not a validator unless it is in
+/// the frozen validator set. Prove that a correctly signed but unknown node
+/// cannot consume a peer slot or emit `PeerConnected` on the validator.
+#[tokio::test]
+async fn test_unknown_validator_is_rejected_after_authentication() {
+    init_tracing();
+
+    let port_a = find_free_port().await;
+    let port_c = find_free_port().await;
+    let stake = 5_000_000u64;
+    let keypair_a = make_validator_keypair("allowlisted-validator-a");
+    let keypair_b = make_validator_keypair("allowlisted-validator-b");
+    let keypair_c = make_validator_keypair("unknown-validator-c");
+    let address_a = keypair_a.address();
+    let address_b = keypair_b.address();
+    let address_c = keypair_c.address();
+    let genesis_hash = Block::genesis().hash;
+
+    let (inbound_tx_a, mut inbound_rx_a) = mpsc::channel::<InboundMessage>(16);
+    let (_outbound_tx_a, outbound_rx_a) = mpsc::channel::<OutboundMessage>(16);
+    let peer_count_a = Arc::new(AtomicU32::new(0));
+    let handle_a = tokio::spawn(run_transport(
+        format!("127.0.0.1:{port_a}").parse().unwrap(),
+        vec![],
+        address_a,
+        stake,
+        genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
+        outbound_rx_a,
+        inbound_tx_a,
+        peer_count_a.clone(),
+        keypair_a,
+        String::new(),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // C has a valid key and is willing to trust A. A must nevertheless reject
+    // C because membership is determined by A's frozen validator set.
+    let (inbound_tx_c, mut inbound_rx_c) = mpsc::channel::<InboundMessage>(16);
+    let (_outbound_tx_c, outbound_rx_c) = mpsc::channel::<OutboundMessage>(16);
+    let peer_count_c = Arc::new(AtomicU32::new(0));
+    let handle_c = tokio::spawn(run_transport(
+        format!("127.0.0.1:{port_c}").parse().unwrap(),
+        vec![format!("127.0.0.1:{port_a}").parse().unwrap()],
+        address_c,
+        stake,
+        genesis_hash,
+        validator_allowlist(&[address_a, address_c]),
+        outbound_rx_c,
+        inbound_tx_c,
+        peer_count_c.clone(),
+        keypair_c,
+        String::new(),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(peer_count_a.load(Ordering::Relaxed), 0);
+    assert_eq!(peer_count_c.load(Ordering::Relaxed), 0);
+    assert!(
+        timeout(Duration::from_millis(250), inbound_rx_a.recv())
+            .await
+            .is_err(),
+        "allowlisted validator must not emit PeerConnected for an unknown identity"
+    );
+    assert!(
+        timeout(Duration::from_millis(250), inbound_rx_c.recv())
+            .await
+            .is_err(),
+        "unknown node must not observe a successful validator connection"
+    );
+
+    handle_a.abort();
+    handle_c.abort();
 }
 
 // ─── Test 2: Block Propagation ──────────────────────────────────────────────
@@ -348,9 +448,7 @@ async fn test_two_nodes_connect() {
 /// 8. Both StateDBs advance to height >= 1.
 #[tokio::test]
 async fn test_block_propagation() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("error")
-        .try_init();
+    init_tracing();
 
     let port_a = find_free_port().await;
     let port_b = find_free_port().await;
@@ -363,13 +461,22 @@ async fn test_block_propagation() {
 
     // Start Node A (seed node, no bootstrap peers).
     // Starts as single-validator; will transition when Node B connects.
-    let node_a = TestNode::start(seed_a, stake, port_a, vec![]).await;
+    let address_a = make_validator_keypair(seed_a).address();
+    let address_b = make_validator_keypair(seed_b).address();
+    let node_a = TestNode::start(seed_a, stake, port_a, vec![], vec![(address_b, stake)]).await;
 
     // Let Node A bind and start listening.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Start Node B (bootstraps to Node A).
-    let node_b = TestNode::start(seed_b, stake, port_b, vec![addr_a]).await;
+    let node_b = TestNode::start(
+        seed_b,
+        stake,
+        port_b,
+        vec![addr_a],
+        vec![(address_a, stake)],
+    )
+    .await;
 
     // Wait for both nodes to see each other via transport.
     let peers_ok = timeout(Duration::from_secs(15), async {
@@ -399,7 +506,9 @@ async fn test_block_propagation() {
     // Submit a transfer transaction to Node A's mempool.
     // Genesis account 0 -> genesis account 1, amount 1000.
     let genesis = genesis_accounts();
-    let tx = Transaction::new_transfer(genesis[0].0, genesis[1].0, 1000, 0);
+    let sender = genesis_keypair(0);
+    let mut tx = Transaction::new_transfer(sender.address(), genesis[1].0, 1000, 0);
+    tx.sign(&sender).expect("sign block-propagation transfer");
     node_a
         .mempool
         .insert(tx)
@@ -434,6 +543,16 @@ async fn test_block_propagation() {
     let (h_a, h_b) = height_ok.unwrap();
     assert!(h_a >= 1, "Node A should have produced at least 1 block");
     assert!(h_b >= 1, "Node B should have committed at least 1 block");
+    let block_a = node_a.state.get_block(1).expect("node A block 1");
+    let block_b = node_b.state.get_block(1).expect("node B block 1");
+    assert_eq!(
+        block_a.header.state_root, block_b.header.state_root,
+        "validators must derive one state root for the first committed DAG block"
+    );
+    assert_eq!(
+        block_a.hash, block_b.hash,
+        "consensus-provided timestamps must make the linear block hash deterministic"
+    );
 }
 
 // ─── Test 3: Three-Node DAG Consensus ───────────────────────────────────────
@@ -448,11 +567,8 @@ async fn test_block_propagation() {
 /// - Blocks are committed (finalized) on all nodes.
 /// - All nodes converge to consistent heights (within tolerance).
 #[tokio::test]
-#[ignore = "Flaky: 3-node DAG consensus timing-sensitive with validator set transitions. Run with --ignored for manual verification."]
 async fn test_three_node_consensus() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("error")
-        .try_init();
+    init_tracing();
 
     let port_0 = find_free_port().await;
     let port_1 = find_free_port().await;
@@ -464,22 +580,31 @@ async fn test_three_node_consensus() {
     let addr_0: SocketAddr = format!("127.0.0.1:{}", port_0).parse().unwrap();
     let addr_1: SocketAddr = format!("127.0.0.1:{}", port_1).parse().unwrap();
 
-    // Start all three nodes in quick succession to minimize the window
-    // where nodes 0 and 1 form a 2-validator consensus before node 2 joins.
-    // This is important because if nodes 0+1 advance several DAG rounds before
-    // node 2 connects, node 2's fresh DAG will be out of sync and struggle
-    // to catch up.
-    let node_0 = TestNode::start(seeds[0], stake, port_0, vec![]).await;
+    // Every node gets the same complete epoch-1 validator set before it starts,
+    // eliminating the old connection-arrival-order race.
+    let validator_addresses: Vec<Hash256> = seeds
+        .iter()
+        .map(|seed| make_validator_keypair(seed).address())
+        .collect();
+    let peers_for = |local: usize| {
+        validator_addresses
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != local)
+            .map(|(_, address)| (*address, stake))
+            .collect::<Vec<_>>()
+    };
+    let node_0 = TestNode::start(seeds[0], stake, port_0, vec![], peers_for(0)).await;
     // Brief delay for Node 0 to bind its QUIC listener.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start Nodes 1 and 2 nearly simultaneously - both bootstrap to Node 0.
     // Node 1 also serves as a bootstrap target for Node 2.
-    let node_1 = TestNode::start(seeds[1], stake, port_1, vec![addr_0]).await;
+    let node_1 = TestNode::start(seeds[1], stake, port_1, vec![addr_0], peers_for(1)).await;
     // Tiny delay for Node 1 to bind.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let node_2 = TestNode::start(seeds[2], stake, port_2, vec![addr_0, addr_1]).await;
+    let node_2 = TestNode::start(seeds[2], stake, port_2, vec![addr_0, addr_1], peers_for(2)).await;
 
     // Wait for mesh connectivity: each node should see at least 2 peers.
     // The bootstrap pattern gives:
@@ -522,15 +647,21 @@ async fn test_three_node_consensus() {
     let genesis = genesis_accounts();
 
     // Tx on Node 0: account[10] -> account[11], 500 ARC
-    let tx_0 = Transaction::new_transfer(genesis[10].0, genesis[11].0, 500, 0);
+    let sender_0 = genesis_keypair(10);
+    let mut tx_0 = Transaction::new_transfer(sender_0.address(), genesis[11].0, 500, 0);
+    tx_0.sign(&sender_0).expect("sign node-0 transfer");
     node_0.mempool.insert(tx_0).expect("insert tx into Node 0");
 
     // Tx on Node 1: account[20] -> account[21], 750 ARC
-    let tx_1 = Transaction::new_transfer(genesis[20].0, genesis[21].0, 750, 0);
+    let sender_1 = genesis_keypair(20);
+    let mut tx_1 = Transaction::new_transfer(sender_1.address(), genesis[21].0, 750, 0);
+    tx_1.sign(&sender_1).expect("sign node-1 transfer");
     node_1.mempool.insert(tx_1).expect("insert tx into Node 1");
 
     // Tx on Node 2: account[30] -> account[31], 250 ARC
-    let tx_2 = Transaction::new_transfer(genesis[30].0, genesis[31].0, 250, 0);
+    let sender_2 = genesis_keypair(30);
+    let mut tx_2 = Transaction::new_transfer(sender_2.address(), genesis[31].0, 250, 0);
+    tx_2.sign(&sender_2).expect("sign node-2 transfer");
     node_2.mempool.insert(tx_2).expect("insert tx into Node 2");
 
     // Wait for all nodes to finalize blocks (height >= 1).
@@ -572,6 +703,14 @@ async fn test_three_node_consensus() {
     assert!(h1 >= 1, "Node 1 should have finalized blocks");
     assert!(h2 >= 1, "Node 2 should have finalized blocks");
 
+    let block_0 = node_0.state.get_block(1).expect("node 0 block 1");
+    let block_1 = node_1.state.get_block(1).expect("node 1 block 1");
+    let block_2 = node_2.state.get_block(1).expect("node 2 block 1");
+    assert_eq!(block_0.header.state_root, block_1.header.state_root);
+    assert_eq!(block_0.header.state_root, block_2.header.state_root);
+    assert_eq!(block_0.hash, block_1.hash);
+    assert_eq!(block_0.hash, block_2.hash);
+
     // Heights should be roughly consistent across nodes.
     // Propagation delay can cause slight divergence (1-2 blocks).
     let max_h = h0.max(h1).max(h2);
@@ -594,9 +733,7 @@ async fn test_three_node_consensus() {
 /// and no PeerConnected message is emitted.
 #[tokio::test]
 async fn test_genesis_mismatch_rejected() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("error")
-        .try_init();
+    init_tracing();
 
     let port_a = find_free_port().await;
     let port_b = find_free_port().await;
@@ -629,6 +766,7 @@ async fn test_genesis_mismatch_rejected() {
         address_a,
         stake,
         genesis_hash_a,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_a,
         inbound_tx_a,
         pc_a,
@@ -651,6 +789,7 @@ async fn test_genesis_mismatch_rejected() {
         address_b,
         stake,
         genesis_hash_b, // MISMATCH - handshake should fail
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_b,
         inbound_tx_b,
         pc_b,
@@ -695,9 +834,7 @@ async fn test_genesis_mismatch_rejected() {
 /// transaction gossip directly.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_transaction_gossip() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("error")
-        .try_init();
+    init_tracing();
 
     let port_a = find_free_port().await;
     let port_b = find_free_port().await;
@@ -728,6 +865,7 @@ async fn test_transaction_gossip() {
         address_a,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_a,
         inbound_tx_a,
         pc_a,
@@ -751,6 +889,7 @@ async fn test_transaction_gossip() {
         address_b,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_b,
         inbound_tx_b,
         pc_b,
@@ -816,10 +955,7 @@ async fn test_transaction_gossip() {
             assert_eq!(received_txs[1], b"raw-tx-beta-002".to_vec());
             assert_eq!(received_txs[2], b"raw-tx-gamma-003".to_vec());
         }
-        other => panic!(
-            "Expected InboundMessage::Transactions, got: {:?}",
-            other
-        ),
+        other => panic!("Expected InboundMessage::Transactions, got: {:?}", other),
     }
 
     // Suppress unused variable warnings.

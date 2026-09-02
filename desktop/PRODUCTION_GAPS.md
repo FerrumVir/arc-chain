@@ -1,4 +1,17 @@
-# Production readiness - honest gaps
+# Production readiness - honest gaps (archived alpha snapshot)
+
+> **Historical gap list, not current release status.** Several items below were
+> subsequently implemented or replaced, including real BIP-39 derivation,
+> native tests, CI, the updater key, and the updater lifecycle. Other claims
+> describe superseded inference/reward designs. The v0.8.0 candidate remains
+> unpublished and undeployed; use [`README.md`](README.md),
+> [`../README.md`](../README.md), and
+> [`../docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](../docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
+> for current status.
+>
+> **Do not use any command, path, secret-storage statement, or release claim
+> below as current operational guidance. The remainder is preserved verbatim
+> only as an alpha-era historical record.**
 
 Status: **closed-alpha ready** (v0.2 pass addressed #4, #6, #7, #8, #13).
 Public beta still gated on code-signing + key derivation.
@@ -89,8 +102,14 @@ and "TJ's mom installs it from arcnetwork.ai and starts earning".
 
 ### ~~13. No auto-updater wired~~ → PARTIALLY RESOLVED
 
-- Plugin wired, endpoint pointed at `github.com/FerrumVir/arc-chain/releases/latest/download/latest.json`.
-- **TODO before first release**: `npx @tauri-apps/cli signer generate -w ~/.tauri/arc-desktop-key`, paste the public key into `tauri.conf.json > plugins.updater.pubkey`, and commit signed update artifacts with each release (`tauri build` respects `createUpdaterArtifacts: true`).
+- Historical implementation pointed the plugin at GitHub's global `latest`
+  manifest. The v0.8+ implementation instead selects a protected-publisher,
+  immutable release in native code and gives Tauri only its exact-tag
+  manifest, so legacy v0.7 headless timers can remain fenced off `latest`.
+- That alpha-era signing-key TODO is resolved in the v0.8 release contract:
+  the public key is embedded in `tauri.conf.json`, the private key remains in
+  the protected signing workflow, and release assembly verifies every updater
+  payload signature before publication.
 
 ### 14. Accessibility gaps
 

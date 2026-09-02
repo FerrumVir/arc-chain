@@ -1,15 +1,14 @@
-/// Extract the correct BLAKE3 derived key for "ARC-chain-tx-v1" and verify
-/// against the blake3 crate's output.
-///
-/// BLAKE3 `new_derive_key(context)` works in two phases:
-/// 1. Hash the context string with DERIVE_KEY_CONTEXT flag → 32-byte key
-/// 2. Hash data using that key as initial CV with DERIVE_KEY_MATERIAL flag
-///
-/// We need the key from phase 1 to bake into the GPU shader.
+//! Extract the correct BLAKE3 derived key for "ARC-chain-tx-v1" and verify
+//! against the blake3 crate's output.
+//!
+//! BLAKE3 `new_derive_key(context)` works in two phases:
+//! 1. Hash the context string with DERIVE_KEY_CONTEXT flag → 32-byte key
+//! 2. Hash data using that key as initial CV with DERIVE_KEY_MATERIAL flag
+//!
+//! We need the key from phase 1 to bake into the GPU shader.
 
 const IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
-    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
 const MSG_SCHEDULE: [[usize; 16]; 7] = [
@@ -44,26 +43,43 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
     state[b] = rotr(state[b] ^ state[c], 7);
 }
 
-fn compress(cv: &[u32; 8], block: &[u32; 16], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
+fn compress(
+    cv: &[u32; 8],
+    block: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
     let mut state: [u32; 16] = [
-        cv[0], cv[1], cv[2], cv[3],
-        cv[4], cv[5], cv[6], cv[7],
-        IV[0], IV[1], IV[2], IV[3],
-        counter as u32, (counter >> 32) as u32, block_len, flags,
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        IV[0],
+        IV[1],
+        IV[2],
+        IV[3],
+        counter as u32,
+        (counter >> 32) as u32,
+        block_len,
+        flags,
     ];
 
-    for round in 0..7 {
-        let s = &MSG_SCHEDULE[round];
+    for s in &MSG_SCHEDULE {
         // Column step
-        g(&mut state, 0, 4, 8,  12, block[s[0]],  block[s[1]]);
-        g(&mut state, 1, 5, 9,  13, block[s[2]],  block[s[3]]);
-        g(&mut state, 2, 6, 10, 14, block[s[4]],  block[s[5]]);
-        g(&mut state, 3, 7, 11, 15, block[s[6]],  block[s[7]]);
+        g(&mut state, 0, 4, 8, 12, block[s[0]], block[s[1]]);
+        g(&mut state, 1, 5, 9, 13, block[s[2]], block[s[3]]);
+        g(&mut state, 2, 6, 10, 14, block[s[4]], block[s[5]]);
+        g(&mut state, 3, 7, 11, 15, block[s[6]], block[s[7]]);
         // Diagonal step
-        g(&mut state, 0, 5, 10, 15, block[s[8]],  block[s[9]]);
+        g(&mut state, 0, 5, 10, 15, block[s[8]], block[s[9]]);
         g(&mut state, 1, 6, 11, 12, block[s[10]], block[s[11]]);
-        g(&mut state, 2, 7, 8,  13, block[s[12]], block[s[13]]);
-        g(&mut state, 3, 4, 9,  14, block[s[14]], block[s[15]]);
+        g(&mut state, 2, 7, 8, 13, block[s[12]], block[s[13]]);
+        g(&mut state, 3, 4, 9, 14, block[s[14]], block[s[15]]);
     }
 
     // Finalization XOR
@@ -78,7 +94,9 @@ fn compress(cv: &[u32; 8], block: &[u32; 16], counter: u64, block_len: u32, flag
 fn bytes_to_block(data: &[u8]) -> [u32; 16] {
     let mut block = [0u32; 16];
     for (i, chunk) in data.chunks(4).enumerate() {
-        if i >= 16 { break; }
+        if i >= 16 {
+            break;
+        }
         let mut word = [0u8; 4];
         word[..chunk.len()].copy_from_slice(chunk);
         block[i] = u32::from_le_bytes(word);
@@ -97,12 +115,20 @@ fn main() {
 
     // The key is the first 8 words of the compression output
     let key: [u32; 8] = [
-        context_result[0], context_result[1], context_result[2], context_result[3],
-        context_result[4], context_result[5], context_result[6], context_result[7],
+        context_result[0],
+        context_result[1],
+        context_result[2],
+        context_result[3],
+        context_result[4],
+        context_result[5],
+        context_result[6],
+        context_result[7],
     ];
 
     println!("// Correct BLAKE3 derived key for \"ARC-chain-tx-v1\"");
-    println!("// Phase 1: compress(IV, context_block, 0, 15, CHUNK_START|CHUNK_END|ROOT|DERIVE_KEY_CONTEXT)");
+    println!(
+        "// Phase 1: compress(IV, context_block, 0, 15, CHUNK_START|CHUNK_END|ROOT|DERIVE_KEY_CONTEXT)"
+    );
     for (i, word) in key.iter().enumerate() {
         println!("const KEY{i}: u32 = 0x{word:08X}u;");
     }
@@ -128,7 +154,10 @@ fn main() {
     println!("\n// Verification: hash of [0,0,0,0] (4 bytes)");
     println!("// Manual:  {}", hex::encode(manual_hash));
     println!("// Crate:   {crate_hash}");
-    println!("// Match:   {}", hex::encode(manual_hash) == crate_hash.to_string());
+    println!(
+        "// Match:   {}",
+        hex::encode(manual_hash) == crate_hash.to_string()
+    );
 
     // Also verify with 128-byte payload
     let test_128 = [0u8; 128];
@@ -154,7 +183,10 @@ fn main() {
     println!("\n// Verification: hash of 128 zero bytes");
     println!("// Manual:  {}", hex::encode(manual_128));
     println!("// Crate:   {crate_128}");
-    println!("// Match:   {}", hex::encode(manual_128) == crate_128.to_string());
+    println!(
+        "// Match:   {}",
+        hex::encode(manual_128) == crate_128.to_string()
+    );
 
     // 256-byte payload (4 blocks)
     let test_256 = [0u8; 256];
@@ -163,8 +195,12 @@ fn main() {
         let offset = (block_idx as usize) * 64;
         let blk = bytes_to_block(&test_256[offset..offset + 64]);
         let mut flags = DERIVE_KEY_MATERIAL;
-        if block_idx == 0 { flags |= CHUNK_START; }
-        if block_idx == 3 { flags |= CHUNK_END | ROOT; }
+        if block_idx == 0 {
+            flags |= CHUNK_START;
+        }
+        if block_idx == 3 {
+            flags |= CHUNK_END | ROOT;
+        }
         let r = compress(&cv, &blk, 0, 64, flags);
         cv = [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]];
     }
@@ -180,5 +216,8 @@ fn main() {
     println!("\n// Verification: hash of 256 zero bytes");
     println!("// Manual:  {}", hex::encode(manual_256));
     println!("// Crate:   {crate_256}");
-    println!("// Match:   {}", hex::encode(manual_256) == crate_256.to_string());
+    println!(
+        "// Match:   {}",
+        hex::encode(manual_256) == crate_256.to_string()
+    );
 }

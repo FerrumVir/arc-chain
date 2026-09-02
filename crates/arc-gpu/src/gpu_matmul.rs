@@ -26,8 +26,18 @@ struct BufferPool {
     output_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
+    // Allocated up front but not yet bound by any dispatch path in this file:
+    // the scales binding is currently supplied per-weight from `GpuWeights`.
+    // Keeping the field alive keeps the pooled allocation alive, so removing
+    // it would change how much GPU memory this engine reserves at startup.
+    // Not deleted for that reason - it is reserved capacity, not stale code.
+    #[allow(dead_code)]
     scales_buf: wgpu::Buffer,
+    // Recorded pool capacity. Not read today; kept so the pool carries the
+    // sizes it was built with rather than re-deriving them at a call site.
+    #[allow(dead_code)]
     max_in_size: usize,
+    #[allow(dead_code)]
     max_out_size: usize,
 }
 
@@ -76,7 +86,8 @@ impl GpuMatmul {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
-        })).map_err(|_| "No GPU adapter found".to_string())?;
+        }))
+        .map_err(|_| "No GPU adapter found".to_string())?;
 
         let adapter_info = adapter.get_info();
 
@@ -86,8 +97,13 @@ impl GpuMatmul {
         }
 
         let is_metal = adapter_info.backend == wgpu::Backend::Metal;
-        let has_msl = adapter.features().contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
-        info!("GPU matmul: {} ({:?}, metal={}, msl={})", adapter_info.name, adapter_info.backend, is_metal, has_msl);
+        let has_msl = adapter
+            .features()
+            .contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
+        info!(
+            "GPU matmul: {} ({:?}, metal={}, msl={})",
+            adapter_info.name, adapter_info.backend, is_metal, has_msl
+        );
 
         let required_features = if has_msl {
             wgpu::Features::MSL_SHADER_PASSTHROUGH
@@ -95,14 +111,13 @@ impl GpuMatmul {
             wgpu::Features::empty()
         };
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("ARC Matmul GPU"),
-                required_features,
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            },
-        )).map_err(|e| format!("GPU device: {e}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("ARC Matmul GPU"),
+            required_features,
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .map_err(|e| format!("GPU device: {e}"))?;
 
         let device: Arc<wgpu::Device> = Arc::new(device);
         let queue: Arc<wgpu::Queue> = Arc::new(queue);
@@ -117,9 +132,9 @@ impl GpuMatmul {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("matmul_layout"),
             entries: &[
-                bgl_entry(0, true),   // weights (read-only storage)
-                bgl_entry(1, true),   // input (read-only storage)
-                bgl_entry(2, false),  // output (read-write storage)
+                bgl_entry(0, true),  // weights (read-only storage)
+                bgl_entry(1, true),  // input (read-only storage)
+                bgl_entry(2, false), // output (read-write storage)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -130,7 +145,7 @@ impl GpuMatmul {
                     },
                     count: None,
                 },
-                bgl_entry(4, true),   // scales (read-only storage)
+                bgl_entry(4, true), // scales (read-only storage)
             ],
         });
 
@@ -156,14 +171,12 @@ impl GpuMatmul {
             eprintln!("[GPU] MSL passthrough DETECTED, compiling matmul_i8...");
             let msl_shader = unsafe {
                 device.create_shader_module_passthrough(
-                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                        wgpu::ShaderModuleDescriptorMsl {
-                            entry_point: "matmul_i8".to_string(),
-                            label: Some("matmul_metal"),
-                            num_workgroups: (128, 1, 1), // 4 simdgroups × 32 threads
-                            source: std::borrow::Cow::Borrowed(msl_source),
-                        },
-                    ),
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
+                        entry_point: "matmul_i8".to_string(),
+                        label: Some("matmul_metal"),
+                        num_workgroups: (128, 1, 1), // 4 simdgroups × 32 threads
+                        source: std::borrow::Cow::Borrowed(msl_source),
+                    }),
                 )
             };
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -181,7 +194,10 @@ impl GpuMatmul {
                     Some(p)
                 }
                 Err(e) => {
-                    eprintln!("[GPU] MSL pipeline creation failed, using WGSL fallback: {:?}", e);
+                    eprintln!(
+                        "[GPU] MSL pipeline creation failed, using WGSL fallback: {:?}",
+                        e
+                    );
                     None
                 }
             }
@@ -195,26 +211,36 @@ impl GpuMatmul {
             let fused_src = include_str!("fused_kernels.metal");
             let q4_shader = unsafe {
                 device.create_shader_module_passthrough(
-                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                        wgpu::ShaderModuleDescriptorMsl {
-                            entry_point: "matmul_i4".to_string(),
-                            label: Some("matmul_q4_metal"),
-                            num_workgroups: (128, 1, 1),
-                            source: std::borrow::Cow::Borrowed(fused_src),
-                        },
-                    ),
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
+                        entry_point: "matmul_i4".to_string(),
+                        label: Some("matmul_q4_metal"),
+                        num_workgroups: (128, 1, 1),
+                        source: std::borrow::Cow::Borrowed(fused_src),
+                    }),
                 )
             };
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("matmul_q4_msl"), layout: Some(&pl), module: &q4_shader,
-                    entry_point: Some("matmul_i4"), compilation_options: Default::default(), cache: None,
+                    label: Some("matmul_q4_msl"),
+                    layout: Some(&pl),
+                    module: &q4_shader,
+                    entry_point: Some("matmul_i4"),
+                    compilation_options: Default::default(),
+                    cache: None,
                 })
             })) {
-                Ok(p) => { info!("Native Metal Q4 matmul pipeline READY"); Some(p) }
-                Err(_) => { info!("MSL Q4 matmul failed"); None }
+                Ok(p) => {
+                    info!("Native Metal Q4 matmul pipeline READY");
+                    Some(p)
+                }
+                Err(_) => {
+                    info!("MSL Q4 matmul failed");
+                    None
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
 
         // Pre-allocate buffer pool
         let pool = BufferPool {
@@ -252,18 +278,39 @@ impl GpuMatmul {
             max_out_size: max_out,
         };
 
-        info!("GPU matmul ready: pool for {}×{}, MSL={}, Q4={}", max_out, max_in, msl_pipeline.is_some(), msl_q4_pipeline.is_some());
-        Ok(Self { device, queue, pipeline, msl_pipeline, msl_q4_pipeline, bind_group_layout, pool, is_metal, has_msl })
+        info!(
+            "GPU matmul ready: pool for {}×{}, MSL={}, Q4={}",
+            max_out,
+            max_in,
+            msl_pipeline.is_some(),
+            msl_q4_pipeline.is_some()
+        );
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            msl_pipeline,
+            msl_q4_pipeline,
+            bind_group_layout,
+            pool,
+            is_metal,
+            has_msl,
+        })
     }
 
     /// Upload weight matrix to GPU. Call once per weight at model load.
     /// `scales`: per-row i32 scales. Pass `None` for identity (scale=256 → >>8 = 1).
-    pub fn upload_weights(&self, data: &[i8], n_rows: usize, n_cols: usize, scales: Option<&[i32]>) -> GpuWeights {
+    pub fn upload_weights(
+        &self,
+        data: &[i8],
+        n_rows: usize,
+        n_cols: usize,
+        scales: Option<&[i32]>,
+    ) -> GpuWeights {
         let (buf_data, buf_size) = if self.msl_pipeline.is_some() {
             // Metal: raw i8 bytes (native char type)
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len())
-            };
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len()) };
             (bytes.to_vec(), data.len())
         } else {
             // WGSL: pack i8 into u32 (no native i8 in WGSL)
@@ -289,15 +336,28 @@ impl GpuMatmul {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&scales_buffer, 0, bytemuck::cast_slice(scale_data));
+        self.queue
+            .write_buffer(&scales_buffer, 0, bytemuck::cast_slice(scale_data));
 
-        GpuWeights { buffer, scales_buffer, n_rows, n_cols, is_q4: false }
+        GpuWeights {
+            buffer,
+            scales_buffer,
+            n_rows,
+            n_cols,
+            is_q4: false,
+        }
     }
 
     /// Upload Q4 weights (4-bit, 2 values per byte). Requires Metal MSL.
     /// `data`: raw i8 weights (will be quantized to Q4 on CPU).
     /// Returns Q4 GpuWeights with half the buffer size.
-    pub fn upload_weights_q4(&self, data: &[i8], n_rows: usize, n_cols: usize, scales: Option<&[i32]>) -> GpuWeights {
+    pub fn upload_weights_q4(
+        &self,
+        data: &[i8],
+        n_rows: usize,
+        n_cols: usize,
+        scales: Option<&[i32]>,
+    ) -> GpuWeights {
         // Quantize i8 → Q4: clamp to [-8, 7] and pack 2 per byte
         let q4_data = pack_i8_to_q4(data);
 
@@ -317,9 +377,16 @@ impl GpuMatmul {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&scales_buffer, 0, bytemuck::cast_slice(scale_data));
+        self.queue
+            .write_buffer(&scales_buffer, 0, bytemuck::cast_slice(scale_data));
 
-        GpuWeights { buffer, scales_buffer, n_rows, n_cols, is_q4: true }
+        GpuWeights {
+            buffer,
+            scales_buffer,
+            n_rows,
+            n_cols,
+            is_q4: true,
+        }
     }
 
     /// Zero-alloc matmul dispatch using pre-allocated pool.
@@ -337,23 +404,45 @@ impl GpuMatmul {
         } else {
             // WGSL: packed u32
             let input_packed = pack_i8_to_u32(input_i8);
-            self.queue.write_buffer(&self.pool.input_buf, 0, bytemuck::cast_slice(&input_packed));
+            self.queue
+                .write_buffer(&self.pool.input_buf, 0, bytemuck::cast_slice(&input_packed));
         }
 
         // Write params (16 bytes: in_size, out_size, scale_offset, _pad)
-        let params = MatmulParams { in_size: n_cols as u32, out_size: n_rows as u32, scale_offset: 0, _pad: 0 };
-        self.queue.write_buffer(&self.pool.params_buf, 0, bytemuck::bytes_of(&params));
+        let params = MatmulParams {
+            in_size: n_cols as u32,
+            out_size: n_rows as u32,
+            scale_offset: 0,
+            _pad: 0,
+        };
+        self.queue
+            .write_buffer(&self.pool.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Create bind group with all 5 bindings
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: weights.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.pool.input_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.pool.output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.pool.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: weights.scales_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: weights.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.pool.input_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.pool.output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.pool.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: weights.scales_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -368,10 +457,10 @@ impl GpuMatmul {
             || !weights.is_q4 && self.msl_pipeline.is_some();
         let wg_count = if use_metal_dispatch {
             // Metal: 4 rows per threadgroup (4 simdgroups × 32 threads)
-            (n_rows as u32 + 3) / 4
+            (n_rows as u32).div_ceil(4)
         } else {
             // WGSL: 1 row per thread, 256 threads per workgroup
-            (n_rows as u32 + 255) / 256
+            (n_rows as u32).div_ceil(256)
         };
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -382,18 +471,32 @@ impl GpuMatmul {
             pass.dispatch_workgroups(wg_count, 1, 1);
         }
         let out_bytes = (n_rows * 4) as u64;
-        encoder.copy_buffer_to_buffer(&self.pool.output_buf, 0, &self.pool.staging_buf, 0, out_bytes);
+        encoder.copy_buffer_to_buffer(
+            &self.pool.output_buf,
+            0,
+            &self.pool.staging_buf,
+            0,
+            out_bytes,
+        );
         self.queue.submit([encoder.finish()]);
 
         // Readback (zero-copy on unified memory)
         let slice = self.pool.staging_buf.slice(..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         let _ = self.device.poll(wgpu::PollType::wait());
         match rx.recv() {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return vec![]; },
-            Err(_) => { eprintln!("GPU map channel closed"); return vec![]; },
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("GPU map error: {:?}", e);
+                return vec![];
+            }
+            Err(_) => {
+                eprintln!("GPU map channel closed");
+                return vec![];
+            }
         }
 
         let mapped = slice.get_mapped_range();
@@ -420,29 +523,54 @@ impl GpuMatmul {
                 self.queue.write_buffer(&self.pool.input_buf, 0, bytes);
             } else {
                 let input_packed = pack_i8_to_u32(input_i8);
-                self.queue.write_buffer(&self.pool.input_buf, 0, bytemuck::cast_slice(&input_packed));
+                self.queue.write_buffer(
+                    &self.pool.input_buf,
+                    0,
+                    bytemuck::cast_slice(&input_packed),
+                );
             }
 
-            let params = MatmulParams { in_size: n_cols as u32, out_size: n_rows as u32, scale_offset: 0, _pad: 0 };
-            self.queue.write_buffer(&self.pool.params_buf, 0, bytemuck::bytes_of(&params));
+            let params = MatmulParams {
+                in_size: n_cols as u32,
+                out_size: n_rows as u32,
+                scale_offset: 0,
+                _pad: 0,
+            };
+            self.queue
+                .write_buffer(&self.pool.params_buf, 0, bytemuck::bytes_of(&params));
 
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self.bind_group_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: weights.buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.pool.input_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.pool.output_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: self.pool.params_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: weights.scales_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: weights.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.pool.input_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.pool.output_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.pool.params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: weights.scales_buffer.as_entire_binding(),
+                    },
                 ],
             });
 
             let active = self.msl_pipeline.as_ref().unwrap_or(&self.pipeline);
             let wg_count = if self.msl_pipeline.is_some() {
-                (n_rows as u32 + 3) / 4
+                (n_rows as u32).div_ceil(4)
             } else {
-                (n_rows as u32 + 255) / 256
+                (n_rows as u32).div_ceil(256)
             };
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -480,17 +608,21 @@ pub fn pack_i8_to_u32_pub(data: &[i8]) -> Vec<u32> {
 /// Values clamped to [-8, 7], stored with bias +8 encoding [0, 15].
 /// Decode: value = nibble - 8.
 pub fn pack_i8_to_q4(data: &[i8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((data.len() + 1) / 2);
+    let mut packed = Vec::with_capacity(data.len().div_ceil(2));
     for pair in data.chunks(2) {
-        let lo = ((pair[0].max(-8).min(7) + 8) as u8) & 0x0F;
-        let hi = if pair.len() > 1 { ((pair[1].max(-8).min(7) + 8) as u8) & 0x0F } else { 8 };
+        let lo = ((pair[0].clamp(-8, 7) + 8) as u8) & 0x0F;
+        let hi = if pair.len() > 1 {
+            ((pair[1].clamp(-8, 7) + 8) as u8) & 0x0F
+        } else {
+            8
+        };
         packed.push(lo | (hi << 4));
     }
     packed
 }
 
 fn pack_i8_to_u32(data: &[i8]) -> Vec<u32> {
-    let padded_len = (data.len() + 3) / 4 * 4;
+    let padded_len = data.len().div_ceil(4) * 4;
     let mut packed = Vec::with_capacity(padded_len / 4);
     for chunk in data.chunks(4) {
         let mut val = 0u32;
@@ -525,7 +657,10 @@ mod tests {
                 let result = gpu.matmul(&gw, &input);
                 assert_eq!(result[0], 10); // (1+2+3+4) * 1
                 assert_eq!(result[1], 26); // (5+6+7+8) * 1
-                println!("GPU matmul PASSED (metal={}, msl={})", gpu.is_metal, gpu.has_msl);
+                println!(
+                    "GPU matmul PASSED (metal={}, msl={})",
+                    gpu.is_metal, gpu.has_msl
+                );
             }
             Err(e) => println!("No GPU: {}", e),
         }
@@ -545,22 +680,24 @@ mod tests {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
-        })).unwrap();
+        }))
+        .unwrap();
 
-        let has_msl = adapter.features().contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
+        let has_msl = adapter
+            .features()
+            .contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
         if !has_msl {
             println!("SKIP: no MSL passthrough");
             return;
         }
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("diag"),
-                required_features: wgpu::Features::MSL_SHADER_PASSTHROUGH,
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            },
-        )).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("diag"),
+            required_features: wgpu::Features::MSL_SHADER_PASSTHROUGH,
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .unwrap();
 
         let diag_src = include_str!("matmul_diag.metal");
 
@@ -568,14 +705,12 @@ mod tests {
         {
             let shader = unsafe {
                 device.create_shader_module_passthrough(
-                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                        wgpu::ShaderModuleDescriptorMsl {
-                            entry_point: "diag_write".to_string(),
-                            label: Some("diag_write"),
-                            num_workgroups: (1, 1, 1),
-                            source: std::borrow::Cow::Borrowed(diag_src),
-                        },
-                    ),
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
+                        entry_point: "diag_write".to_string(),
+                        label: Some("diag_write"),
+                        num_workgroups: (1, 1, 1),
+                        source: std::borrow::Cow::Borrowed(diag_src),
+                    }),
                 )
             };
             let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -583,44 +718,72 @@ mod tests {
                 entries: &[bgl_entry(0, false)],
             });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+                label: None,
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[],
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: None, layout: Some(&pl), module: &shader,
-                entry_point: Some("diag_write"), compilation_options: Default::default(), cache: None,
+                label: None,
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("diag_write"),
+                compilation_options: Default::default(),
+                cache: None,
             });
 
             let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 8,
+                label: None,
+                size: 8,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 8,
+                label: None,
+                size: 8,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None, layout: &bgl,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: out_buf.as_entire_binding() }],
+                label: None,
+                layout: &bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: out_buf.as_entire_binding(),
+                }],
             });
 
             let mut enc = device.create_command_encoder(&Default::default());
-            { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&pipeline); p.set_bind_group(0, &bg, &[]); p.dispatch_workgroups(1, 1, 1); }
+            {
+                let mut p = enc.begin_compute_pass(&Default::default());
+                p.set_pipeline(&pipeline);
+                p.set_bind_group(0, &bg, &[]);
+                p.dispatch_workgroups(1, 1, 1);
+            }
             enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, 8);
             queue.submit([enc.finish()]);
 
             let slice = staging.slice(..8);
             let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
             let _ = device.poll(wgpu::PollType::wait());
             match rx.recv() {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return; },
-                Err(_) => { eprintln!("GPU map channel closed"); return; },
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("GPU map error: {:?}", e);
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("GPU map channel closed");
+                    return;
+                }
             }
             let data: Vec<i32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
-            println!("DIAG1 diag_write: output[0]={}, output[1]={} (expect 12345, 67890)", data[0], data[1]);
+            println!(
+                "DIAG1 diag_write: output[0]={}, output[1]={} (expect 12345, 67890)",
+                data[0], data[1]
+            );
             assert_eq!(data[0], 12345, "diag_write: buffer(0) mapping failed");
             assert_eq!(data[1], 67890, "diag_write: buffer(0) mapping failed");
         }
@@ -629,23 +792,21 @@ mod tests {
         {
             let shader = unsafe {
                 device.create_shader_module_passthrough(
-                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                        wgpu::ShaderModuleDescriptorMsl {
-                            entry_point: "diag_5buf".to_string(),
-                            label: Some("diag_5buf"),
-                            num_workgroups: (1, 1, 1),
-                            source: std::borrow::Cow::Borrowed(diag_src),
-                        },
-                    ),
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
+                        entry_point: "diag_5buf".to_string(),
+                        label: Some("diag_5buf"),
+                        num_workgroups: (1, 1, 1),
+                        source: std::borrow::Cow::Borrowed(diag_src),
+                    }),
                 )
             };
 
             let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None,
                 entries: &[
-                    bgl_entry(0, true),   // buf0 (weights)
-                    bgl_entry(1, true),   // buf1 (input)
-                    bgl_entry(2, false),  // buf2 (output)
+                    bgl_entry(0, true),  // buf0 (weights)
+                    bgl_entry(1, true),  // buf1 (input)
+                    bgl_entry(2, false), // buf2 (output)
                     wgpu::BindGroupLayoutEntry {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
@@ -656,20 +817,27 @@ mod tests {
                         },
                         count: None,
                     },
-                    bgl_entry(4, true),   // buf4 (scales)
+                    bgl_entry(4, true), // buf4 (scales)
                 ],
             });
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+                label: None,
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[],
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: None, layout: Some(&pl), module: &shader,
-                entry_point: Some("diag_5buf"), compilation_options: Default::default(), cache: None,
+                label: None,
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("diag_5buf"),
+                compilation_options: Default::default(),
+                cache: None,
             });
 
             let mk_buf = |data: &[i32], usage: wgpu::BufferUsages| -> wgpu::Buffer {
                 let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None, size: (data.len() * 4).max(16) as u64,
+                    label: None,
+                    size: (data.len() * 4).max(16) as u64,
                     usage: usage | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 });
@@ -677,57 +845,102 @@ mod tests {
                 buf
             };
 
-            let buf0 = mk_buf(&[111], wgpu::BufferUsages::STORAGE);     // weights marker
-            let buf1 = mk_buf(&[222], wgpu::BufferUsages::STORAGE);     // input marker
-            let buf2 = mk_buf(&[0; 5], wgpu::BufferUsages::STORAGE);    // output
+            let buf0 = mk_buf(&[111], wgpu::BufferUsages::STORAGE); // weights marker
+            let buf1 = mk_buf(&[222], wgpu::BufferUsages::STORAGE); // input marker
+            let buf2 = mk_buf(&[0; 5], wgpu::BufferUsages::STORAGE); // output
             let buf3 = mk_buf(&[333, 0, 0, 0], wgpu::BufferUsages::UNIFORM); // params (16 bytes)
-            let buf4 = mk_buf(&[444], wgpu::BufferUsages::STORAGE);     // scales marker
+            let buf4 = mk_buf(&[444], wgpu::BufferUsages::STORAGE); // scales marker
 
             let staging = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None, size: 20,
+                label: None,
+                size: 20,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None, layout: &bgl,
+                label: None,
+                layout: &bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buf0.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: buf1.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: buf2.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: buf3.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: buf4.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf0.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf1.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buf2.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: buf3.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: buf4.as_entire_binding(),
+                    },
                 ],
             });
 
             let mut enc = device.create_command_encoder(&Default::default());
-            { let mut p = enc.begin_compute_pass(&Default::default()); p.set_pipeline(&pipeline); p.set_bind_group(0, &bg, &[]); p.dispatch_workgroups(1, 1, 1); }
+            {
+                let mut p = enc.begin_compute_pass(&Default::default());
+                p.set_pipeline(&pipeline);
+                p.set_bind_group(0, &bg, &[]);
+                p.dispatch_workgroups(1, 1, 1);
+            }
             enc.copy_buffer_to_buffer(&buf2, 0, &staging, 0, 20);
             queue.submit([enc.finish()]);
 
             let slice = staging.slice(..20);
             let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
             let _ = device.poll(wgpu::PollType::wait());
             match rx.recv() {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return; },
-                Err(_) => { eprintln!("GPU map channel closed"); return; },
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("GPU map error: {:?}", e);
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("GPU map channel closed");
+                    return;
+                }
             }
             let data: Vec<i32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
-            println!("DIAG2 diag_5buf: [{}, {}, {}, {}, {}]", data[0], data[1], data[2], data[3], data[4]);
-            println!("  Expected: [111 (buf0), 222 (buf1), 333 (buf3/params), 444 (buf4/scales), 77777 (sentinel)]");
+            println!(
+                "DIAG2 diag_5buf: [{}, {}, {}, {}, {}]",
+                data[0], data[1], data[2], data[3], data[4]
+            );
+            println!(
+                "  Expected: [111 (buf0), 222 (buf1), 333 (buf3/params), 444 (buf4/scales), 77777 (sentinel)]"
+            );
 
             // Don't assert yet - just print to discover the actual mapping
             if data[4] != 77777 {
                 println!("  SENTINEL MISMATCH: output buffer(2) may not map to binding(2)!");
                 // Try to find the actual data
-                for i in 0..5 {
-                    if data[i] == 77777 { println!("  Found sentinel at output[{}]", i); }
-                    if data[i] == 111 { println!("  Found buf0 marker at output[{}]", i); }
-                    if data[i] == 222 { println!("  Found buf1 marker at output[{}]", i); }
-                    if data[i] == 333 { println!("  Found buf3 marker at output[{}]", i); }
-                    if data[i] == 444 { println!("  Found buf4 marker at output[{}]", i); }
+                for (i, &v) in data[..5].iter().enumerate() {
+                    if v == 77777 {
+                        println!("  Found sentinel at output[{}]", i);
+                    }
+                    if v == 111 {
+                        println!("  Found buf0 marker at output[{}]", i);
+                    }
+                    if v == 222 {
+                        println!("  Found buf1 marker at output[{}]", i);
+                    }
+                    if v == 333 {
+                        println!("  Found buf3 marker at output[{}]", i);
+                    }
+                    if v == 444 {
+                        println!("  Found buf4 marker at output[{}]", i);
+                    }
                 }
             }
         }
@@ -762,7 +975,7 @@ mod tests {
         // Byte 1: lo=3+8=11(0x0B), hi=-4+8=4(0x04) → 0x4B
         assert_eq!(packed[1], 0x0B | (0x04 << 4));
         // Byte 2: lo=7+8=15(0x0F), hi=-8+8=0(0x00) → 0x0F
-        assert_eq!(packed[2], 0x0F | (0x00 << 4));
+        assert_eq!(packed[2], 0x0F);
         // Verify decode: nibble - 8 recovers original value
         for (i, &orig) in data.iter().enumerate() {
             let byte = packed[i / 2];
@@ -788,7 +1001,10 @@ mod tests {
                 let result = gpu.matmul(&gw, &input);
                 // Row 0: 1+2+3+4 = 10
                 // Row 1: 5+6+7+(-8) = 10
-                println!("Q4 matmul result: [{}, {}] (expect [10, 10])", result[0], result[1]);
+                println!(
+                    "Q4 matmul result: [{}, {}] (expect [10, 10])",
+                    result[0], result[1]
+                );
                 assert_eq!(result[0], 10);
                 assert_eq!(result[1], 10);
                 println!("GPU Q4 matmul PASSED");
@@ -798,7 +1014,12 @@ mod tests {
     }
 
     /// Benchmark: LLM-sized matmul (4096×4096) to measure Metal vs WGSL speedup.
+    ///
+    /// This opens multiple devices, dispatches large workloads, and temporarily
+    /// changes a process-global backend selector. Keep it out of parallel
+    /// libtest execution and run it explicitly on a provisioned GPU host.
     #[test]
+    #[ignore = "hardware benchmark; run explicitly with --ignored --test-threads=1"]
     fn bench_matmul_4096() {
         let n = 4096usize;
         // Need to create two separate GPU instances to compare WGSL vs Metal
@@ -806,14 +1027,18 @@ mod tests {
         // Test correctness at LLM dimensions first
         match GpuMatmul::new(n, n) {
             Ok(gpu) => {
+                assert!(
+                    gpu.msl_pipeline.is_some(),
+                    "provisioned macOS GPU benchmark requires a compiled MSL pipeline"
+                );
                 let mut weights = vec![0i8; n * n];
                 let mut input = vec![0i8; n];
                 // Fill with small values to avoid overflow
-                for i in 0..weights.len() {
-                    weights[i] = ((i % 5) as i8) - 2; // -2, -1, 0, 1, 2
+                for (i, w) in weights.iter_mut().enumerate() {
+                    *w = ((i % 5) as i8) - 2; // -2, -1, 0, 1, 2
                 }
-                for i in 0..input.len() {
-                    input[i] = ((i % 3) as i8) - 1; // -1, 0, 1
+                for (i, x) in input.iter_mut().enumerate() {
+                    *x = ((i % 3) as i8) - 1; // -1, 0, 1
                 }
 
                 let gw = gpu.upload_weights(&weights, n, n, None);
@@ -831,8 +1056,14 @@ mod tests {
                 let elapsed = start.elapsed();
                 let ms_per = elapsed.as_secs_f64() * 1000.0 / iters as f64;
 
-                println!("GPU matmul {}×{}: {:.2} ms/call ({} iters, MSL={})",
-                    n, n, ms_per, iters, gpu.msl_pipeline.is_some());
+                println!(
+                    "GPU matmul {}×{}: {:.2} ms/call ({} iters, MSL={})",
+                    n,
+                    n,
+                    ms_per,
+                    iters,
+                    gpu.msl_pipeline.is_some()
+                );
 
                 // Verify outputs are non-zero
                 let result = gpu.matmul(&gw, &input);
@@ -843,9 +1074,11 @@ mod tests {
                 // Also measure WGSL for comparison
                 println!("\n  Forcing WGSL for comparison...");
                 // Create a copy that forces WGSL by disabling MSL
-                unsafe { std::env::set_var("ARC_FORCE_WGSL_BENCH", "1"); }
+                unsafe {
+                    std::env::set_var("ARC_FORCE_WGSL_BENCH", "1");
+                }
             }
-            Err(e) => println!("No GPU: {}", e),
+            Err(e) => panic!("provisioned GPU benchmark could not create its device: {e}"),
         }
 
         // WGSL-only benchmark + correctness comparison
@@ -853,17 +1086,26 @@ mod tests {
             let gpu_wgsl = GpuMatmul::new_wgsl_only(n, n).unwrap();
             let mut weights = vec![0i8; n * n];
             let mut input = vec![0i8; n];
-            for i in 0..weights.len() { weights[i] = ((i % 5) as i8) - 2; }
-            for i in 0..input.len() { input[i] = ((i % 3) as i8) - 1; }
+            for (i, w) in weights.iter_mut().enumerate() {
+                *w = ((i % 5) as i8) - 2;
+            }
+            for (i, x) in input.iter_mut().enumerate() {
+                *x = ((i % 3) as i8) - 1;
+            }
             let gw_wgsl = gpu_wgsl.upload_weights(&weights, n, n, None);
             let _ = gpu_wgsl.matmul(&gw_wgsl, &input);
             let _ = gpu_wgsl.matmul(&gw_wgsl, &input);
             let iters = 20;
             let start = std::time::Instant::now();
-            for _ in 0..iters { let _ = gpu_wgsl.matmul(&gw_wgsl, &input); }
+            for _ in 0..iters {
+                let _ = gpu_wgsl.matmul(&gw_wgsl, &input);
+            }
             let elapsed = start.elapsed();
             let ms_per = elapsed.as_secs_f64() * 1000.0 / iters as f64;
-            println!("  WGSL matmul {}×{}: {:.2} ms/call ({} iters)", n, n, ms_per, iters);
+            println!(
+                "  WGSL matmul {}×{}: {:.2} ms/call ({} iters)",
+                n, n, ms_per, iters
+            );
 
             // Correctness: compare Metal vs WGSL outputs
             let gpu_metal = GpuMatmul::new(n, n).unwrap();
@@ -873,13 +1115,21 @@ mod tests {
                 let wgsl_out = gpu_wgsl.matmul(&gw_wgsl, &input);
                 let mut mismatches = 0;
                 for i in 0..n {
-                    if metal_out[i] != wgsl_out[i] { mismatches += 1; }
+                    if metal_out[i] != wgsl_out[i] {
+                        mismatches += 1;
+                    }
                 }
-                println!("  Metal vs WGSL correctness: {}/{} match ({} mismatches)",
-                    n - mismatches, n, mismatches);
+                println!(
+                    "  Metal vs WGSL correctness: {}/{} match ({} mismatches)",
+                    n - mismatches,
+                    n,
+                    mismatches
+                );
                 assert_eq!(mismatches, 0, "Metal and WGSL produce different outputs!");
             }
-            unsafe { std::env::remove_var("ARC_FORCE_WGSL_BENCH"); }
+            unsafe {
+                std::env::remove_var("ARC_FORCE_WGSL_BENCH");
+            }
         }
     }
 }

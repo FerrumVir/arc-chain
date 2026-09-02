@@ -316,7 +316,10 @@ impl NeuralNet {
     }
 
     fn forward_relu(input: &[f32]) -> Vec<f32> {
-        input.iter().map(|&x| if x > 0.0 { x } else { 0.0 }).collect()
+        input
+            .iter()
+            .map(|&x| if x > 0.0 { x } else { 0.0 })
+            .collect()
     }
 
     fn forward_softmax(input: &[f32]) -> Vec<f32> {
@@ -324,10 +327,7 @@ impl NeuralNet {
             return Vec::new();
         }
         // Numerically stable softmax: subtract max before exp.
-        let max_val = input
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = input.iter().map(|&x| (x - max_val).exp()).collect();
         let sum: f32 = exps.iter().sum();
         if sum == 0.0 {
@@ -338,12 +338,7 @@ impl NeuralNet {
         exps.iter().map(|&e| e / sum).collect()
     }
 
-    fn forward_layer_norm(
-        gamma: &[f32],
-        beta: &[f32],
-        eps: f32,
-        input: &[f32],
-    ) -> Vec<f32> {
+    fn forward_layer_norm(gamma: &[f32], beta: &[f32], eps: f32, input: &[f32]) -> Vec<f32> {
         let n = input.len() as f32;
         // Mean
         let mean: f32 = input.iter().sum::<f32>() / n;
@@ -374,7 +369,7 @@ impl NeuralNet {
             } else {
                 // Out-of-vocabulary - emit zeros matching embed_dim.
                 let dim = if table.is_empty() { 0 } else { table[0].len() };
-                output.extend(std::iter::repeat(0.0f32).take(dim));
+                output.extend(std::iter::repeat_n(0.0f32, dim));
             }
         }
         output
@@ -566,10 +561,8 @@ impl InferenceEngine {
         let net = if model_data.is_empty() {
             None
         } else {
-            match NeuralNet::from_bytes(model_data) {
-                Ok(n) => Some(n),
-                Err(_) => None, // fall back to mock
-            }
+            // A parse failure falls back to mock mode (see doc comment above).
+            NeuralNet::from_bytes(model_data).ok()
         };
         self.load_model_inner(id, info, net)
     }
@@ -691,10 +684,8 @@ impl InferenceEngine {
                 // Simple char-level tokenization → embedding indices → forward → decode.
                 // Use full Unicode codepoint (clamped to embedding table size) to
                 // preserve character identity for non-ASCII input (Cyrillic, CJK, etc.).
-                let char_indices: Vec<f32> = text
-                    .chars()
-                    .map(|c| (c as u32).min(65535) as f32)
-                    .collect();
+                let char_indices: Vec<f32> =
+                    text.chars().map(|c| (c as u32).min(65535) as f32).collect();
                 let raw_output = net.forward(&char_indices);
                 // Interpret output as per-character logits and decode via argmax
                 // If output is small, just return it as-is as a text representation.
@@ -761,10 +752,7 @@ impl InferenceEngine {
     // Mock fallback path (original behaviour)
     // ------------------------------------------------------------------
 
-    fn run_mock_inference(
-        input: &InferenceInput,
-        model_name: &str,
-    ) -> (InferenceOutput, u64) {
+    fn run_mock_inference(input: &InferenceInput, model_name: &str) -> (InferenceOutput, u64) {
         match input {
             InferenceInput::Text(text) => {
                 let reversed: String = text.chars().rev().collect();
@@ -861,7 +849,11 @@ mod tests {
     fn test_load_model() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(1);
-        assert!(engine.load_model(id, sample_model_info("test-model")).is_ok());
+        assert!(
+            engine
+                .load_model(id, sample_model_info("test-model"))
+                .is_ok()
+        );
         assert_eq!(engine.loaded_models().len(), 1);
         assert_eq!(engine.get_model_status(&id), Some(ModelStatus::Ready));
     }
@@ -882,8 +874,12 @@ mod tests {
         config.max_loaded_models = 2;
         let mut engine = InferenceEngine::new(config);
 
-        engine.load_model(model_id(1), sample_model_info("m1")).unwrap();
-        engine.load_model(model_id(2), sample_model_info("m2")).unwrap();
+        engine
+            .load_model(model_id(1), sample_model_info("m1"))
+            .unwrap();
+        engine
+            .load_model(model_id(2), sample_model_info("m2"))
+            .unwrap();
         let result = engine.load_model(model_id(3), sample_model_info("m3"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Maximum loaded models"));
@@ -904,7 +900,9 @@ mod tests {
     fn test_inference_text_input() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(4);
-        engine.load_model(id, sample_model_info("gpt-mock")).unwrap();
+        engine
+            .load_model(id, sample_model_info("gpt-mock"))
+            .unwrap();
 
         let request = InferenceRequest {
             model_id: id,
@@ -928,7 +926,9 @@ mod tests {
     fn test_inference_tokens_input() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(5);
-        engine.load_model(id, sample_model_info("tok-model")).unwrap();
+        engine
+            .load_model(id, sample_model_info("tok-model"))
+            .unwrap();
 
         let tokens = vec![100, 200, 300];
         let request = InferenceRequest {
@@ -946,7 +946,9 @@ mod tests {
     fn test_inference_embedding_input() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(6);
-        engine.load_model(id, sample_model_info("emb-model")).unwrap();
+        engine
+            .load_model(id, sample_model_info("emb-model"))
+            .unwrap();
 
         let emb = vec![3.0f32, 4.0];
         let request = InferenceRequest {
@@ -1005,7 +1007,9 @@ mod tests {
     fn test_stats_accumulate() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(8);
-        engine.load_model(id, sample_model_info("stats-test")).unwrap();
+        engine
+            .load_model(id, sample_model_info("stats-test"))
+            .unwrap();
 
         assert_eq!(engine.stats().total_inferences, 0);
         assert_eq!(engine.stats().total_tokens, 0);
@@ -1058,10 +1062,7 @@ mod tests {
         // output[1] = 0*1 + 1*2 + 2*3 + (-0.5) = 2 + 6 - 0.5 = 7.5
         let net = NeuralNet {
             layers: vec![Layer::Dense {
-                weights: vec![
-                    vec![1.0, 0.0, -1.0],
-                    vec![0.0, 1.0, 2.0],
-                ],
+                weights: vec![vec![1.0, 0.0, -1.0], vec![0.0, 1.0, 2.0]],
                 bias: vec![0.5, -0.5],
             }],
             input_size: 3,
@@ -1143,8 +1144,8 @@ mod tests {
         );
 
         // Variance of output should be ~1
-        let var: f32 = output.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
-            / output.len() as f32;
+        let var: f32 =
+            output.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / output.len() as f32;
         assert!(
             (var - 1.0).abs() < 1e-4,
             "layernorm output variance should be ~1, got {}",
@@ -1250,12 +1251,7 @@ mod tests {
         let out_restored = restored.forward(&test_input);
         assert_eq!(out_orig.len(), out_restored.len());
         for (a, b) in out_orig.iter().zip(out_restored.iter()) {
-            assert!(
-                (a - b).abs() < 1e-7,
-                "output mismatch: {} vs {}",
-                a,
-                b
-            );
+            assert!((a - b).abs() < 1e-7, "output mismatch: {} vs {}", a, b);
         }
     }
 
@@ -1378,11 +1374,7 @@ mod tests {
         // Embedding table with 3 tokens of dim 2.
         let net = NeuralNet {
             layers: vec![Layer::Embedding {
-                table: vec![
-                    vec![10.0, 20.0],
-                    vec![30.0, 40.0],
-                    vec![50.0, 60.0],
-                ],
+                table: vec![vec![10.0, 20.0], vec![30.0, 40.0], vec![50.0, 60.0]],
             }],
             input_size: 3,
             output_size: 2,
@@ -1403,10 +1395,7 @@ mod tests {
         let net = NeuralNet {
             layers: vec![
                 Layer::Dense {
-                    weights: vec![
-                        vec![0.123, -0.456, 0.789],
-                        vec![0.321, 0.654, -0.987],
-                    ],
+                    weights: vec![vec![0.123, -0.456, 0.789], vec![0.321, 0.654, -0.987]],
                     bias: vec![0.01, -0.02],
                 },
                 Layer::ReLU,

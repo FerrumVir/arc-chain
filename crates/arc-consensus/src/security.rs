@@ -6,15 +6,19 @@
 //!    fail to publish blocks they were expected to produce, indicating a withholding
 //!    attack that can degrade network liveness.
 //!
-//! 2. **Long-Range Attack Prevention** (#28): Maintains a checkpoint registry of
-//!    finalized chain state, rejecting any forks that diverge before the latest
-//!    checkpoint. This prevents attackers from rewriting distant history.
+//! 2. **Long-Range Checkpoint Verification** (#28): Stores only checkpoints
+//!    carrying real strict-supermajority certificates from an externally
+//!    trusted validator set. Production currently leaves this registry empty
+//!    until canonical state-root signature collection is implemented; an empty
+//!    registry is not represented as long-range protection.
 //!
 //! 3. **Nothing-at-Stake Mitigation** (#29): Detects double-voting across forks
 //!    and enforces graduated slashing penalties to make equivocation economically
 //!    irrational.
 
-use arc_crypto::Hash256;
+use crate::{StakeTier, ValidatorSet};
+use arc_crypto::{Hash256, Signature};
+use arc_types::strict_supermajority_threshold;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -58,18 +62,12 @@ impl WithholdingDetector {
 
     /// Mark that a validator was expected to produce a block in the given round.
     pub fn report_expected(&mut self, validator: Hash256, round: u64) {
-        self.expected
-            .entry(validator)
-            .or_default()
-            .insert(round);
+        self.expected.entry(validator).or_default().insert(round);
     }
 
     /// Mark that a validator actually published a block in the given round.
     pub fn report_received(&mut self, validator: Hash256, round: u64) {
-        self.received
-            .entry(validator)
-            .or_default()
-            .insert(round);
+        self.received.entry(validator).or_default().insert(round);
     }
 
     /// Scan the last `window` rounds for validators with high withholding scores.
@@ -107,11 +105,7 @@ impl WithholdingDetector {
             let missing: Vec<u64> = expected_in_window
                 .iter()
                 .copied()
-                .filter(|r| {
-                    received_rounds
-                        .map(|set| !set.contains(r))
-                        .unwrap_or(true)
-                })
+                .filter(|r| received_rounds.map(|set| !set.contains(r)).unwrap_or(true))
                 .collect();
 
             let withholding_score = missing.len() as f64 / total_expected as f64;
@@ -153,7 +147,8 @@ impl WithholdingDetector {
 // §2  Long-Range Attack Prevention (#28)
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Interval (in rounds) between checkpoints.
+/// Candidate interval for collecting a checkpoint certificate. Reaching this
+/// round alone never registers a trust anchor.
 pub const CHECKPOINT_INTERVAL: u64 = 1000;
 
 /// A validator's signature on a checkpoint.
@@ -161,15 +156,51 @@ pub const CHECKPOINT_INTERVAL: u64 = 1000;
 pub struct ValidatorSignature {
     /// The signing validator's address.
     pub validator: Hash256,
-    /// The raw signature bytes (Ed25519).
-    pub signature: Vec<u8>,
+    /// Ed25519 verifying key whose hash must equal `validator`.
+    pub public_key: [u8; 32],
+    /// Fixed-size Ed25519 signature split for portable serde array support.
+    pub signature_halves: [[u8; 32]; 2],
+}
+
+impl ValidatorSignature {
+    /// Convert only canonical 64-byte Ed25519 signatures. Checkpoint trust does
+    /// not accept recoverable or post-quantum transaction signature variants.
+    pub fn from_ed25519_signature(validator: Hash256, signature: Signature) -> Option<Self> {
+        let Signature::Ed25519 {
+            public_key,
+            signature,
+        } = signature
+        else {
+            return None;
+        };
+        let bytes: [u8; 64] = signature.try_into().ok()?;
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        first.copy_from_slice(&bytes[..32]);
+        second.copy_from_slice(&bytes[32..]);
+        Some(Self {
+            validator,
+            public_key,
+            signature_halves: [first, second],
+        })
+    }
+
+    fn as_signature(&self) -> Signature {
+        let mut signature = Vec::with_capacity(64);
+        signature.extend_from_slice(&self.signature_halves[0]);
+        signature.extend_from_slice(&self.signature_halves[1]);
+        Signature::Ed25519 {
+            public_key: self.public_key,
+            signature,
+        }
+    }
 }
 
 /// A finalized checkpoint anchoring the chain at a specific round/height.
 ///
-/// Checkpoints are produced every `CHECKPOINT_INTERVAL` rounds and signed by a
-/// quorum of validators. Any chain that diverges before the latest checkpoint
-/// is rejected, preventing long-range history rewrite attacks.
+/// A checkpoint becomes trusted only after [`CheckpointRegistry::add_checkpoint`]
+/// verifies its real validator certificate against an externally trusted set.
+/// Merely reaching `CHECKPOINT_INTERVAL` does not create a trust anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// Hash of the block at this checkpoint.
@@ -186,6 +217,86 @@ pub struct Checkpoint {
     pub signatures: Vec<ValidatorSignature>,
 }
 
+impl Checkpoint {
+    /// Canonical, domain-separated checkpoint transcript. Signatures are
+    /// excluded so every validator signs the same bounded message.
+    pub fn signing_hash(&self) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-consensus-finalized-checkpoint-v1");
+        hasher.update(&self.block_hash);
+        hasher.update(&self.round.to_le_bytes());
+        hasher.update(&self.height.to_le_bytes());
+        hasher.update(&self.state_root);
+        hasher.update(&self.timestamp.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Verify this checkpoint only against an externally trusted active
+    /// validator set. Checkpoint-provided identities never declare stake.
+    pub fn verify_against_trusted_validator_set(
+        &self,
+        trusted: &ValidatorSet,
+    ) -> Result<(), CheckpointError> {
+        let (active_stakes, total_stake) = trusted_validator_stakes(trusted)?;
+        if self.signatures.is_empty() {
+            return Err(CheckpointError::EmptySignatures);
+        }
+        if self.signatures.len() > active_stakes.len() {
+            return Err(CheckpointError::TooManySignatures {
+                have: self.signatures.len(),
+                maximum: active_stakes.len(),
+            });
+        }
+
+        let active_identity_count = u64::try_from(active_stakes.len()).map_err(|_| {
+            CheckpointError::InvalidTrustedValidatorSet(
+                "active validator count exceeds u64::MAX".to_string(),
+            )
+        })?;
+        let required_identities = strict_supermajority_threshold(active_identity_count);
+        let required_identities = usize::try_from(required_identities).map_err(|_| {
+            CheckpointError::InvalidTrustedValidatorSet(
+                "identity threshold exceeds usize::MAX".to_string(),
+            )
+        })?;
+        let signing_hash = self.signing_hash();
+        let mut seen = HashSet::with_capacity(self.signatures.len());
+        let mut approved_stake = 0u64;
+
+        for approval in &self.signatures {
+            if !seen.insert(approval.validator) {
+                return Err(CheckpointError::DuplicateSigner(approval.validator));
+            }
+            let Some(stake) = active_stakes.get(&approval.validator) else {
+                return Err(CheckpointError::UnknownSigner(approval.validator));
+            };
+            approval
+                .as_signature()
+                .verify(&signing_hash, &approval.validator)
+                .map_err(|_| CheckpointError::InvalidSignature(approval.validator))?;
+            approved_stake = approved_stake.checked_add(*stake).ok_or_else(|| {
+                CheckpointError::InvalidTrustedValidatorSet(
+                    "approved validator stake exceeds u64::MAX".to_string(),
+                )
+            })?;
+        }
+
+        if seen.len() < required_identities {
+            return Err(CheckpointError::InsufficientIdentities {
+                have: seen.len(),
+                need: required_identities,
+            });
+        }
+        let required_stake = strict_supermajority_threshold(total_stake);
+        if approved_stake < required_stake {
+            return Err(CheckpointError::InsufficientStake {
+                have: approved_stake,
+                need: required_stake,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Lightweight reference to a block, used for chain verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockRef {
@@ -197,11 +308,82 @@ pub struct BlockRef {
     pub height: u64,
 }
 
-/// Registry of finalized checkpoints for long-range attack prevention.
+/// Why an untrusted checkpoint failed the trust boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("trusted validator set is empty")]
+    EmptyTrustedValidatorSet,
+    #[error("invalid trusted validator set: {0}")]
+    InvalidTrustedValidatorSet(String),
+    #[error("checkpoint round {round} is not newer than trusted round {latest}")]
+    StaleRound { round: u64, latest: u64 },
+    #[error("checkpoint round zero is reserved for the uninitialized registry")]
+    ZeroRound,
+    #[error("checkpoint has no validator signatures")]
+    EmptySignatures,
+    #[error("checkpoint has {have} signatures but trusted set has only {maximum} validators")]
+    TooManySignatures { have: usize, maximum: usize },
+    #[error("duplicate checkpoint signer {0}")]
+    DuplicateSigner(Hash256),
+    #[error("checkpoint signer {0} is not in the trusted active validator set")]
+    UnknownSigner(Hash256),
+    #[error("invalid Ed25519 checkpoint signature from {0}")]
+    InvalidSignature(Hash256),
+    #[error("checkpoint has {have} distinct validator identities; requires {need}")]
+    InsufficientIdentities { have: usize, need: usize },
+    #[error("checkpoint has {have} signed stake; requires {need}")]
+    InsufficientStake { have: u64, need: u64 },
+}
+
+fn trusted_validator_stakes(
+    trusted: &ValidatorSet,
+) -> Result<(HashMap<Hash256, u64>, u64), CheckpointError> {
+    if trusted.validators.is_empty() {
+        return Err(CheckpointError::EmptyTrustedValidatorSet);
+    }
+    let mut stakes = HashMap::with_capacity(trusted.validators.len());
+    let mut total = 0u64;
+    for validator in &trusted.validators {
+        if StakeTier::from_stake(validator.stake) != Some(validator.tier) {
+            return Err(CheckpointError::InvalidTrustedValidatorSet(format!(
+                "validator {} has inactive stake or inconsistent tier",
+                validator.address
+            )));
+        }
+        if stakes.insert(validator.address, validator.stake).is_some() {
+            return Err(CheckpointError::InvalidTrustedValidatorSet(format!(
+                "duplicate validator {}",
+                validator.address
+            )));
+        }
+        total = total.checked_add(validator.stake).ok_or_else(|| {
+            CheckpointError::InvalidTrustedValidatorSet(
+                "total validator stake exceeds u64::MAX".to_string(),
+            )
+        })?;
+    }
+    if trusted.total_stake != total {
+        return Err(CheckpointError::InvalidTrustedValidatorSet(format!(
+            "cached total stake {} does not match recomputed {}",
+            trusted.total_stake, total
+        )));
+    }
+    let expected_quorum = strict_supermajority_threshold(total);
+    if trusted.quorum != expected_quorum {
+        return Err(CheckpointError::InvalidTrustedValidatorSet(format!(
+            "cached quorum {} does not match strict threshold {}",
+            trusted.quorum, expected_quorum
+        )));
+    }
+    Ok((stakes, total))
+}
+
+/// Registry of authenticated finalized checkpoints.
 ///
 /// Nodes joining the network (or syncing after a long absence) use this registry
 /// to verify that the chain they are downloading is consistent with the checkpoints
-/// known to the honest majority.
+/// known to the honest majority. An empty registry provides no long-range trust
+/// and its verification helpers deliberately fail closed.
 #[derive(Debug, Default)]
 pub struct CheckpointRegistry {
     /// Checkpoints indexed by round number.
@@ -216,24 +398,35 @@ impl CheckpointRegistry {
         Self::default()
     }
 
-    /// Register a new checkpoint.
+    /// Verify and register a new trusted checkpoint.
     ///
-    /// The checkpoint's round must be greater than the current latest round.
-    /// In production the signatures would be verified against the validator set;
-    /// here we store the checkpoint and advance the latest-round pointer.
-    pub fn add_checkpoint(&mut self, checkpoint: Checkpoint) -> bool {
+    /// The checkpoint must be newer than the current anchor and carry real,
+    /// unique Ed25519 signatures from strict supermajorities of both identities
+    /// and active stake in the supplied trusted validator set.
+    pub fn add_checkpoint(
+        &mut self,
+        checkpoint: Checkpoint,
+        trusted: &ValidatorSet,
+    ) -> Result<(), CheckpointError> {
+        if checkpoint.round == 0 {
+            return Err(CheckpointError::ZeroRound);
+        }
         if checkpoint.round <= self.latest_round && self.latest_round > 0 {
             warn!(
                 round = checkpoint.round,
                 latest = self.latest_round,
                 "Rejecting checkpoint at or before latest round"
             );
-            return false;
+            return Err(CheckpointError::StaleRound {
+                round: checkpoint.round,
+                latest: self.latest_round,
+            });
         }
+        checkpoint.verify_against_trusted_validator_set(trusted)?;
         let round = checkpoint.round;
         self.checkpoints.insert(round, checkpoint);
         self.latest_round = round;
-        true
+        Ok(())
     }
 
     /// Return the most recent checkpoint, if any.
@@ -243,46 +436,48 @@ impl CheckpointRegistry {
 
     /// Verify that a chain of blocks is consistent with all known checkpoints.
     ///
-    /// For each checkpoint whose round falls within the chain range, the chain
-    /// must contain a block at that round with a matching hash. Returns `false`
-    /// if any checkpoint is violated.
+    /// When a trusted checkpoint exists, the supplied chain must explicitly
+    /// contain the latest anchor with matching round, height, and hash. A chain
+    /// that begins after the checkpoint without carrying the anchor proves
+    /// nothing about its history and therefore fails closed.
     pub fn verify_chain_against_checkpoints(&self, chain: &[BlockRef]) -> bool {
+        let Some(latest) = self.latest_checkpoint() else {
+            warn!("Cannot verify a chain without a trusted checkpoint anchor");
+            return false;
+        };
         if chain.is_empty() {
-            return true;
+            warn!(
+                round = latest.round,
+                "Cannot verify an empty chain against a trusted checkpoint"
+            );
+            return false;
         }
 
-        // Build a quick lookup: round -> block hash.
-        let round_to_hash: HashMap<u64, [u8; 32]> = chain
-            .iter()
-            .map(|b| (b.round, b.hash))
-            .collect();
-
-        let chain_min = chain.iter().map(|b| b.round).min().unwrap_or(0);
-        let chain_max = chain.iter().map(|b| b.round).max().unwrap_or(0);
+        let mut by_round: HashMap<u64, &BlockRef> = HashMap::with_capacity(chain.len());
+        for block in chain {
+            if let Some(previous) = by_round.insert(block.round, block)
+                && (previous.hash != block.hash || previous.height != block.height)
+            {
+                warn!(
+                    round = block.round,
+                    "Chain has conflicting block references"
+                );
+                return false;
+            }
+        }
 
         for (round, checkpoint) in &self.checkpoints {
-            if *round >= chain_min && *round <= chain_max {
-                match round_to_hash.get(round) {
-                    Some(hash) if *hash == checkpoint.block_hash => {
-                        // Consistent - continue checking.
-                    }
-                    Some(_) => {
-                        warn!(
-                            round = round,
-                            "Chain diverges from checkpoint"
-                        );
-                        return false;
-                    }
-                    None => {
-                        // Chain doesn't include this round at all - suspicious but
-                        // may happen with sparse block refs. We treat missing as
-                        // invalid since the chain should cover checkpoint rounds.
-                        warn!(
-                            round = round,
-                            "Chain missing block at checkpoint round"
-                        );
-                        return false;
-                    }
+            match by_round.get(round) {
+                Some(block)
+                    if block.hash == checkpoint.block_hash && block.height == checkpoint.height => {
+                }
+                Some(_) => {
+                    warn!(round = round, "Chain diverges from checkpoint");
+                    return false;
+                }
+                None => {
+                    warn!(round = round, "Chain omits trusted checkpoint anchor");
+                    return false;
                 }
             }
         }
@@ -292,17 +487,18 @@ impl CheckpointRegistry {
 
     /// Determine whether a proposed fork point is valid.
     ///
-    /// A fork is rejected if it branches off before the latest checkpoint, since
-    /// that would require rewriting finalized history.
+    /// A fork is rejected unless it branches strictly after the latest
+    /// checkpoint. This helper has no block-hash argument, so equality cannot
+    /// prove descent from the exact trusted anchor.
     pub fn is_valid_fork_point(&self, round: u64) -> bool {
         if self.latest_round == 0 {
-            // No checkpoints yet - any fork point is acceptable.
-            return true;
+            // No authenticated anchor means this API cannot vouch for a fork.
+            return false;
         }
-        // Fork at or after the checkpoint round is valid. In DAG consensus,
-        // multiple blocks can exist at the same round (different validators).
-        // The checkpoint finalizes the committed ordering, not a single block.
-        round >= self.latest_round
+        // Without a block hash, a fork advertised at the checkpoint's own
+        // round cannot prove it descends from the exact anchor. Only a fork
+        // strictly after the trusted checkpoint is safe here.
+        round > self.latest_round
     }
 
     /// Return the checkpoint at a specific round, if it exists.
@@ -387,10 +583,10 @@ pub struct PenaltyRecord {
 /// - `WithholdingBlock`: 10% of stake (liveness degradation)
 pub fn calculate_slash_amount(offense: &SlashableOffense, stake: u64) -> u64 {
     match offense {
-        SlashableOffense::DoubleVote => stake,                  // 100%
-        SlashableOffense::Equivocation => stake,                // 100%
-        SlashableOffense::InvalidBlock => stake / 2,            // 50%
-        SlashableOffense::WithholdingBlock => stake / 10,       // 10%
+        SlashableOffense::DoubleVote => stake,            // 100%
+        SlashableOffense::Equivocation => stake,          // 100%
+        SlashableOffense::InvalidBlock => stake / 2,      // 50%
+        SlashableOffense::WithholdingBlock => stake / 10, // 10%
     }
 }
 
@@ -500,7 +696,8 @@ impl StakeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_crypto::hash_bytes;
+    use crate::{STAKE_ARC, Validator};
+    use arc_crypto::{KeyPair, hash_bytes};
 
     /// Deterministic test address from a single byte.
     fn test_addr(n: u8) -> Hash256 {
@@ -512,7 +709,7 @@ mod tests {
         *hash_bytes(&[n]).as_bytes()
     }
 
-    /// Create a test checkpoint at the given round.
+    /// Create an unsigned test checkpoint at the given round.
     fn make_checkpoint(round: u64, block_hash: [u8; 32]) -> Checkpoint {
         Checkpoint {
             block_hash,
@@ -520,11 +717,41 @@ mod tests {
             height: round, // For simplicity, height == round in tests.
             state_root: [0u8; 32],
             timestamp: 1_700_000_000 + round,
-            signatures: vec![ValidatorSignature {
-                validator: test_addr(0),
-                signature: vec![0u8; 64],
-            }],
+            signatures: Vec::new(),
         }
+    }
+
+    fn validator_fixture(stakes: &[u64]) -> (Vec<KeyPair>, ValidatorSet) {
+        let keys: Vec<_> = stakes.iter().map(|_| KeyPair::generate_ed25519()).collect();
+        let validators = keys
+            .iter()
+            .zip(stakes)
+            .enumerate()
+            .map(|(index, (key, stake))| {
+                Validator::new(key.address(), *stake, index as u16).expect("active validator")
+            })
+            .collect();
+        (keys, ValidatorSet::new(validators, 1))
+    }
+
+    fn sign_checkpoint(checkpoint: &mut Checkpoint, signers: &[&KeyPair]) {
+        let signing_hash = checkpoint.signing_hash();
+        checkpoint.signatures = signers
+            .iter()
+            .map(|signer| {
+                ValidatorSignature::from_ed25519_signature(
+                    signer.address(),
+                    signer.sign(&signing_hash).expect("checkpoint signature"),
+                )
+                .expect("Ed25519 fixture")
+            })
+            .collect();
+    }
+
+    fn signed_checkpoint(round: u64, block_hash: [u8; 32], keys: &[KeyPair]) -> Checkpoint {
+        let mut checkpoint = make_checkpoint(round, block_hash);
+        sign_checkpoint(&mut checkpoint, &[&keys[0], &keys[1], &keys[2]]);
+        checkpoint
     }
 
     // ── Withholding Detection Tests ─────────────────────────────────────────
@@ -579,7 +806,10 @@ mod tests {
 
         // Window of 50 covers rounds 51-100 - all present, no withholding.
         let reports = detector.detect_withholding(50);
-        assert!(reports.is_empty(), "Recent window should show no withholding");
+        assert!(
+            reports.is_empty(),
+            "Recent window should show no withholding"
+        );
 
         // Window of 100 covers everything - 50 missing out of 100 = 0.5, not > 0.5.
         let reports_full = detector.detect_withholding(100);
@@ -643,35 +873,197 @@ mod tests {
     // ── Checkpoint Registry Tests ───────────────────────────────────────────
 
     #[test]
-    fn checkpoint_add_and_retrieve() {
+    fn checkpoint_add_and_retrieve_requires_real_supermajority_signatures() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
-        let cp = make_checkpoint(1000, test_block_hash(1));
-        assert!(registry.add_checkpoint(cp.clone()));
+        let cp = signed_checkpoint(1000, test_block_hash(1), &keys);
+        registry
+            .add_checkpoint(cp.clone(), &trusted)
+            .expect("3 of 4 valid equal-stake validators");
         assert_eq!(registry.latest_checkpoint(), Some(&cp));
         assert_eq!(registry.len(), 1);
     }
 
     #[test]
     fn checkpoint_rejects_old_round() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
-        let cp1 = make_checkpoint(2000, test_block_hash(1));
-        let cp_old = make_checkpoint(1000, test_block_hash(2));
+        let cp1 = signed_checkpoint(2000, test_block_hash(1), &keys);
+        let cp_old = signed_checkpoint(1000, test_block_hash(2), &keys);
 
-        assert!(registry.add_checkpoint(cp1));
-        assert!(!registry.add_checkpoint(cp_old), "Should reject older checkpoint");
+        assert!(
+            registry.add_checkpoint(cp1, &trusted).is_ok(),
+            "new checkpoint should register"
+        );
+        assert!(matches!(
+            registry.add_checkpoint(cp_old, &trusted),
+            Err(CheckpointError::StaleRound { .. })
+        ));
         assert_eq!(registry.len(), 1);
     }
 
     #[test]
+    fn checkpoint_rejects_empty_signatures() {
+        let (_, trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        let mut registry = CheckpointRegistry::new();
+        let error = registry
+            .add_checkpoint(make_checkpoint(1000, test_block_hash(1)), &trusted)
+            .expect_err("unsigned checkpoint must never become trusted");
+        assert_eq!(error, CheckpointError::EmptySignatures);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_registry_without_trusted_anchor_fails_closed() {
+        let mut registry = CheckpointRegistry::new();
+        assert!(!registry.verify_chain_against_checkpoints(&[BlockRef {
+            hash: test_block_hash(1),
+            round: 1,
+            height: 1,
+        }]));
+        assert!(!registry.is_valid_fork_point(1));
+
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        let checkpoint = signed_checkpoint(0, test_block_hash(1), &keys);
+        assert_eq!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::ZeroRound)
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_fake_ed25519_signature() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        let mut checkpoint = signed_checkpoint(1000, test_block_hash(1), &keys);
+        checkpoint.signatures[1].signature_halves[0][0] ^= 0x80;
+        let mut registry = CheckpointRegistry::new();
+        assert!(matches!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::InvalidSignature(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_duplicate_signer_identity() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        let mut checkpoint = signed_checkpoint(1000, test_block_hash(1), &keys);
+        checkpoint.signatures[2] = checkpoint.signatures[1].clone();
+        let mut registry = CheckpointRegistry::new();
+        assert!(matches!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::DuplicateSigner(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_unknown_signer_even_with_valid_signature() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        let outsider = KeyPair::generate_ed25519();
+        let mut checkpoint = make_checkpoint(1000, test_block_hash(1));
+        sign_checkpoint(&mut checkpoint, &[&keys[0], &keys[1], &outsider]);
+        let mut registry = CheckpointRegistry::new();
+        assert_eq!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::UnknownSigner(outsider.address()))
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_exactly_two_thirds_identities() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 6]);
+        let mut checkpoint = make_checkpoint(1000, test_block_hash(1));
+        sign_checkpoint(&mut checkpoint, &[&keys[0], &keys[1], &keys[2], &keys[3]]);
+        let mut registry = CheckpointRegistry::new();
+        assert_eq!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::InsufficientIdentities { have: 4, need: 5 })
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_exactly_two_thirds_active_stake() {
+        let unit = STAKE_ARC;
+        let (keys, trusted) = validator_fixture(&[unit, unit, 4 * unit, 3 * unit]);
+        let mut checkpoint = make_checkpoint(1000, test_block_hash(1));
+        sign_checkpoint(&mut checkpoint, &[&keys[0], &keys[1], &keys[2]]);
+        let mut registry = CheckpointRegistry::new();
+        assert_eq!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::InsufficientStake {
+                have: 6 * unit,
+                need: 6 * unit + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_forged_trusted_set_stake_cache() {
+        let (keys, mut trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        trusted.total_stake = 1;
+        trusted.quorum = 1;
+        let checkpoint = signed_checkpoint(1000, test_block_hash(1), &keys);
+        let mut registry = CheckpointRegistry::new();
+        assert!(matches!(
+            registry.add_checkpoint(checkpoint, &trusted),
+            Err(CheckpointError::InvalidTrustedValidatorSet(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_signatures_bind_every_checkpoint_field() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
+        let checkpoint = signed_checkpoint(1000, test_block_hash(1), &keys);
+
+        let mut mutations = Vec::new();
+        let mut changed = checkpoint.clone();
+        changed.block_hash = test_block_hash(2);
+        mutations.push(changed);
+        let mut changed = checkpoint.clone();
+        changed.round += 1;
+        mutations.push(changed);
+        let mut changed = checkpoint.clone();
+        changed.height += 1;
+        mutations.push(changed);
+        let mut changed = checkpoint.clone();
+        changed.state_root[0] ^= 1;
+        mutations.push(changed);
+        let mut changed = checkpoint;
+        changed.timestamp += 1;
+        mutations.push(changed);
+
+        for changed in mutations {
+            assert!(matches!(
+                changed.verify_against_trusted_validator_set(&trusted),
+                Err(CheckpointError::InvalidSignature(_))
+            ));
+        }
+    }
+
+    #[test]
     fn checkpoint_verify_chain_consistent() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
         let bh = test_block_hash(42);
-        registry.add_checkpoint(make_checkpoint(1000, bh));
+        registry
+            .add_checkpoint(signed_checkpoint(1000, bh, &keys), &trusted)
+            .unwrap();
 
         let chain = vec![
-            BlockRef { hash: test_block_hash(0), round: 500, height: 500 },
-            BlockRef { hash: bh, round: 1000, height: 1000 },
-            BlockRef { hash: test_block_hash(1), round: 1500, height: 1500 },
+            BlockRef {
+                hash: test_block_hash(0),
+                round: 500,
+                height: 500,
+            },
+            BlockRef {
+                hash: bh,
+                round: 1000,
+                height: 1000,
+            },
+            BlockRef {
+                hash: test_block_hash(1),
+                round: 1500,
+                height: 1500,
+            },
         ];
 
         assert!(registry.verify_chain_against_checkpoints(&chain));
@@ -679,26 +1071,48 @@ mod tests {
 
     #[test]
     fn checkpoint_verify_chain_divergent() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
-        registry.add_checkpoint(make_checkpoint(1000, test_block_hash(42)));
+        registry
+            .add_checkpoint(
+                signed_checkpoint(1000, test_block_hash(42), &keys),
+                &trusted,
+            )
+            .unwrap();
 
         // Chain has a different hash at round 1000.
-        let chain = vec![
-            BlockRef { hash: test_block_hash(99), round: 1000, height: 1000 },
-        ];
+        let chain = vec![BlockRef {
+            hash: test_block_hash(99),
+            round: 1000,
+            height: 1000,
+        }];
 
         assert!(!registry.verify_chain_against_checkpoints(&chain));
     }
 
     #[test]
     fn checkpoint_verify_chain_missing_round() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
-        registry.add_checkpoint(make_checkpoint(1000, test_block_hash(42)));
+        registry
+            .add_checkpoint(
+                signed_checkpoint(1000, test_block_hash(42), &keys),
+                &trusted,
+            )
+            .unwrap();
 
         // Chain spans the checkpoint round but has no block at round 1000.
         let chain = vec![
-            BlockRef { hash: test_block_hash(0), round: 999, height: 999 },
-            BlockRef { hash: test_block_hash(1), round: 1001, height: 1001 },
+            BlockRef {
+                hash: test_block_hash(0),
+                round: 999,
+                height: 999,
+            },
+            BlockRef {
+                hash: test_block_hash(1),
+                round: 1001,
+                height: 1001,
+            },
         ];
 
         assert!(!registry.verify_chain_against_checkpoints(&chain));
@@ -706,28 +1120,40 @@ mod tests {
 
     #[test]
     fn checkpoint_fork_point_validity() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
 
-        // No checkpoints - any fork point is fine.
-        assert!(registry.is_valid_fork_point(0));
-        assert!(registry.is_valid_fork_point(500));
+        // No authenticated checkpoint means this API cannot vouch for a fork.
+        assert!(!registry.is_valid_fork_point(0));
+        assert!(!registry.is_valid_fork_point(500));
 
-        registry.add_checkpoint(make_checkpoint(1000, test_block_hash(1)));
+        registry
+            .add_checkpoint(signed_checkpoint(1000, test_block_hash(1), &keys), &trusted)
+            .unwrap();
 
         // Fork before checkpoint is rejected.
         assert!(!registry.is_valid_fork_point(999));
         assert!(!registry.is_valid_fork_point(0));
 
-        // Fork at or after checkpoint is accepted.
-        assert!(registry.is_valid_fork_point(1000));
+        // The checkpoint round itself lacks a hash argument, so only a fork
+        // strictly after it can be accepted by this helper.
+        assert!(!registry.is_valid_fork_point(1000));
         assert!(registry.is_valid_fork_point(1500));
     }
 
     #[test]
-    fn checkpoint_empty_chain_is_valid() {
+    fn checkpoint_empty_or_post_anchor_chain_fails_closed() {
+        let (keys, trusted) = validator_fixture(&[STAKE_ARC; 4]);
         let mut registry = CheckpointRegistry::new();
-        registry.add_checkpoint(make_checkpoint(1000, test_block_hash(1)));
-        assert!(registry.verify_chain_against_checkpoints(&[]));
+        registry
+            .add_checkpoint(signed_checkpoint(1000, test_block_hash(1), &keys), &trusted)
+            .unwrap();
+        assert!(!registry.verify_chain_against_checkpoints(&[]));
+        assert!(!registry.verify_chain_against_checkpoints(&[BlockRef {
+            hash: test_block_hash(2),
+            round: 1001,
+            height: 1001,
+        }]));
     }
 
     // ── Nothing-at-Stake / Slashing Tests ───────────────────────────────────
@@ -774,10 +1200,22 @@ mod tests {
     fn stake_slash_amounts_graduated() {
         let stake = 1_000_000u64;
 
-        assert_eq!(calculate_slash_amount(&SlashableOffense::DoubleVote, stake), 1_000_000);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::Equivocation, stake), 1_000_000);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::InvalidBlock, stake), 500_000);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::WithholdingBlock, stake), 100_000);
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::DoubleVote, stake),
+            1_000_000
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::Equivocation, stake),
+            1_000_000
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::InvalidBlock, stake),
+            500_000
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::WithholdingBlock, stake),
+            100_000
+        );
     }
 
     #[test]
@@ -828,7 +1266,10 @@ mod tests {
     #[test]
     fn stake_offense_labels() {
         assert_eq!(SlashableOffense::DoubleVote.label(), "double_vote");
-        assert_eq!(SlashableOffense::WithholdingBlock.label(), "withholding_block");
+        assert_eq!(
+            SlashableOffense::WithholdingBlock.label(),
+            "withholding_block"
+        );
         assert_eq!(SlashableOffense::InvalidBlock.label(), "invalid_block");
         assert_eq!(SlashableOffense::Equivocation.label(), "equivocation");
     }
@@ -837,7 +1278,13 @@ mod tests {
     fn stake_slash_zero_stake() {
         // Edge case: slashing zero stake should produce zero penalty.
         assert_eq!(calculate_slash_amount(&SlashableOffense::DoubleVote, 0), 0);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::InvalidBlock, 0), 0);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::WithholdingBlock, 0), 0);
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::InvalidBlock, 0),
+            0
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::WithholdingBlock, 0),
+            0
+        );
     }
 }

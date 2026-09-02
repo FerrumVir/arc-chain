@@ -39,8 +39,11 @@ impl BlockI8Weights {
     /// dimensions (4096, 11008, 32000) all satisfy this.
     pub fn quantize_f32(values: &[f32], n_rows: usize, n_cols: usize) -> Self {
         assert_eq!(values.len(), n_rows * n_cols, "shape mismatch");
-        assert_eq!(n_cols % BLOCK_SIZE, 0,
-            "n_cols ({n_cols}) must be a multiple of BLOCK_SIZE ({BLOCK_SIZE})");
+        assert_eq!(
+            n_cols % BLOCK_SIZE,
+            0,
+            "n_cols ({n_cols}) must be a multiple of BLOCK_SIZE ({BLOCK_SIZE})"
+        );
 
         let blocks_per_row = n_cols / BLOCK_SIZE;
         let mut data = Vec::with_capacity(n_rows * n_cols);
@@ -55,7 +58,11 @@ impl BlockI8Weights {
                 // sub-integer values (the trap that broke the old per-row
                 // scheme). Floor at 1e-10 so a pure-zero block still
                 // produces a valid i16 scale.
-                let abs_max = block.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-10);
+                let abs_max = block
+                    .iter()
+                    .map(|x| x.abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-10);
 
                 // Quantize the block.
                 let inv_abs_max = 127.0 / abs_max;
@@ -73,12 +80,22 @@ impl BlockI8Weights {
             }
         }
 
-        Self { data, scales, n_rows, n_cols }
+        Self {
+            data,
+            scales,
+            n_rows,
+            n_cols,
+        }
     }
 
     /// Empty placeholder for shard slots this node doesn't hold.
     pub fn empty() -> Self {
-        Self { data: Vec::new(), scales: Vec::new(), n_rows: 0, n_cols: 0 }
+        Self {
+            data: Vec::new(),
+            scales: Vec::new(),
+            n_rows: 0,
+            n_cols: 0,
+        }
     }
 
     /// Memory footprint in bytes.
@@ -109,26 +126,26 @@ impl BlockI8Weights {
 /// Integer-only - no f32 anywhere. Produces bit-identical output on any
 /// platform where i128 arithmetic is supported (all modern CPUs, GPUs via
 /// emulation, and phones).
-pub fn matmul_block_i8_into(
-    weights: &BlockI8Weights,
-    input: &[i64],
-    output: &mut [i64],
-) {
+pub fn matmul_block_i8_into(weights: &BlockI8Weights, input: &[i64], output: &mut [i64]) {
     let n_rows = weights.n_rows;
     let n_cols = weights.n_cols;
     assert_eq!(input.len(), n_cols, "input width mismatch");
     assert_eq!(output.len(), n_rows, "output row count mismatch");
-    if n_rows == 0 || n_cols == 0 { return; }
+    if n_rows == 0 || n_cols == 0 {
+        return;
+    }
 
     let blocks_per_row = n_cols / BLOCK_SIZE;
 
-    for row_idx in 0..n_rows {
+    // `output.len() == n_rows` is asserted above, and `row_scales` is built with
+    // exactly `blocks_per_row` elements, so iterating them covers exactly the
+    // same indices in the same order as the original ranges.
+    for (row_idx, out_row) in output.iter_mut().enumerate() {
         let row_data = &weights.data[row_idx * n_cols..(row_idx + 1) * n_cols];
-        let row_scales = &weights.scales[row_idx * blocks_per_row
-            ..(row_idx + 1) * blocks_per_row];
+        let row_scales = &weights.scales[row_idx * blocks_per_row..(row_idx + 1) * blocks_per_row];
 
         let mut acc: i128 = 0;
-        for block_idx in 0..blocks_per_row {
+        for (block_idx, &row_scale) in row_scales.iter().enumerate() {
             let block_start = block_idx * BLOCK_SIZE;
             let block_end = block_start + BLOCK_SIZE;
             let wblock = &row_data[block_start..block_end];
@@ -141,13 +158,13 @@ pub fn matmul_block_i8_into(
                 block_dot += (wblock[j] as i64) * iblock[j];
             }
 
-            let scale = row_scales[block_idx] as i128;
+            let scale = row_scale as i128;
             acc += (block_dot as i128) * scale;
         }
 
         // Finalize Q16: (row_acc >> FRAC_BITS) gives the Q16 output
         // equivalent of sum(weight_real × input_real) × ONE.
-        output[row_idx] = (acc >> FRAC_BITS as i128) as i64;
+        *out_row = (acc >> FRAC_BITS as i128) as i64;
     }
 }
 
@@ -167,22 +184,33 @@ mod tests {
     /// f64; we expect relative error < 1% for well-conditioned inputs.
     #[test]
     fn test_single_block_matches_f64() {
-        let weights_f32: Vec<f32> = (0..BLOCK_SIZE).map(|i| ((i as f32) - 16.0) / 10.0).collect();
+        let weights_f32: Vec<f32> = (0..BLOCK_SIZE)
+            .map(|i| ((i as f32) - 16.0) / 10.0)
+            .collect();
         let input_f32: Vec<f32> = (0..BLOCK_SIZE).map(|i| ((i as f32) - 8.0) / 5.0).collect();
 
-        let truth: f64 = weights_f32.iter().zip(input_f32.iter())
+        let truth: f64 = weights_f32
+            .iter()
+            .zip(input_f32.iter())
             .map(|(w, x)| (*w as f64) * (*x as f64))
             .sum();
 
         let w = BlockI8Weights::quantize_f32(&weights_f32, 1, BLOCK_SIZE);
-        let input_q16: Vec<i64> = input_f32.iter()
+        let input_q16: Vec<i64> = input_f32
+            .iter()
             .map(|&x| (x as f64 * ONE as f64).round() as i64)
             .collect();
         let out = matmul_block_i8(&w, &input_q16);
         let reconstructed = out[0] as f64 / ONE as f64;
 
         let rel_err = (reconstructed - truth).abs() / truth.abs().max(1e-10);
-        assert!(rel_err < 0.02, "rel_err = {:.4} truth={:.4} got={:.4}", rel_err, truth, reconstructed);
+        assert!(
+            rel_err < 0.02,
+            "rel_err = {:.4} truth={:.4} got={:.4}",
+            rel_err,
+            truth,
+            reconstructed
+        );
     }
 
     /// Large matrix with realistic Llama-shaped distribution (abs_max per row
@@ -199,7 +227,8 @@ mod tests {
         for r in 0..n_rows {
             let row_abs_max = 0.05 + 0.45 * ((r as f32) / (n_rows as f32));
             for c in 0..n_cols {
-                let x = (((r * n_cols + c) as u64).wrapping_mul(2862933555777941757)
+                let x = (((r * n_cols + c) as u64)
+                    .wrapping_mul(2862933555777941757)
                     .wrapping_add(3037000493)) as i64;
                 let unit = ((x >> 33) as f64 / u32::MAX as f64) - 0.5;
                 weights_f32.push((unit as f32) * 2.0 * row_abs_max);
@@ -210,33 +239,45 @@ mod tests {
         let mut input_f32 = Vec::with_capacity(n_cols);
         let mut s: u64 = 42;
         for _ in 0..n_cols {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u1 = ((s >> 33) as f64 / u32::MAX as f64) - 0.5;
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u2 = ((s >> 33) as f64 / u32::MAX as f64) - 0.5;
             input_f32.push(((u1 + u2) as f32) * 1.4);
         }
 
         // Ground truth in f64
-        let truth: Vec<f64> = (0..n_rows).map(|r| {
-            weights_f32[r * n_cols..(r + 1) * n_cols].iter()
-                .zip(input_f32.iter())
-                .map(|(w, x)| (*w as f64) * (*x as f64))
-                .sum()
-        }).collect();
+        let truth: Vec<f64> = (0..n_rows)
+            .map(|r| {
+                weights_f32[r * n_cols..(r + 1) * n_cols]
+                    .iter()
+                    .zip(input_f32.iter())
+                    .map(|(w, x)| (*w as f64) * (*x as f64))
+                    .sum()
+            })
+            .collect();
 
         // Quantized path
         let w = BlockI8Weights::quantize_f32(&weights_f32, n_rows, n_cols);
-        let input_q16: Vec<i64> = input_f32.iter()
+        let input_q16: Vec<i64> = input_f32
+            .iter()
             .map(|&x| (x as f64 * ONE as f64).round() as i64)
             .collect();
         let out = matmul_block_i8(&w, &input_q16);
 
         // Compare
-        let rel_errs: Vec<f64> = out.iter().zip(truth.iter()).map(|(&got, &t)| {
-            let got_real = got as f64 / ONE as f64;
-            (got_real - t).abs() / t.abs().max(1e-6)
-        }).collect();
+        let rel_errs: Vec<f64> = out
+            .iter()
+            .zip(truth.iter())
+            .map(|(&got, &t)| {
+                let got_real = got as f64 / ONE as f64;
+                (got_real - t).abs() / t.abs().max(1e-6)
+            })
+            .collect();
         let mean_rel = rel_errs.iter().sum::<f64>() / rel_errs.len() as f64;
         let max_rel = rel_errs.iter().cloned().fold(0.0f64, f64::max);
 
@@ -247,11 +288,16 @@ mod tests {
     /// Bitwise determinism across 1000 re-runs of the same matmul.
     #[test]
     fn test_deterministic_1000() {
-        let weights_f32: Vec<f32> = (0..4 * BLOCK_SIZE).map(|i| ((i as f32) - 64.0) / 32.0).collect();
-        let input_f32: Vec<f32> = (0..BLOCK_SIZE).map(|i| ((i as f32) - 16.0) / 10.0).collect();
+        let weights_f32: Vec<f32> = (0..4 * BLOCK_SIZE)
+            .map(|i| ((i as f32) - 64.0) / 32.0)
+            .collect();
+        let input_f32: Vec<f32> = (0..BLOCK_SIZE)
+            .map(|i| ((i as f32) - 16.0) / 10.0)
+            .collect();
 
         let w = BlockI8Weights::quantize_f32(&weights_f32, 4, BLOCK_SIZE);
-        let input_q16: Vec<i64> = input_f32.iter()
+        let input_q16: Vec<i64> = input_f32
+            .iter()
             .map(|&x| (x as f64 * ONE as f64).round() as i64)
             .collect();
 

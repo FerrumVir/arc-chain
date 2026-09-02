@@ -2,13 +2,16 @@
 
 TypeScript SDK for the **ARC Chain** RPC API -- the agent-native L1 blockchain.
 
-Zero dependencies. Uses the built-in Fetch API (Node 18+, all modern browsers).
+Zero dependencies. Uses the built-in Fetch API (Node.js 24 LTS+, all modern browsers).
 
 ## Installation
 
 ```bash
 npm install @arc-chain/sdk
 ```
+
+The package is native ESM. Use `import` (or dynamic `import()` from a CommonJS
+application); it does not advertise a `require()` entrypoint.
 
 ## Quick Start
 
@@ -83,19 +86,39 @@ console.log(full.body);     // Typed body matching tx_type
 const proof = await client.getTxProof("a1b2c3d4...");
 console.log(proof.verified);
 
-// Submit a transaction
+// Submit a transfer signed for the exact domain from /network/info.
+// A v3 signer must include that domain in its ARC-chain-tx-v3 hash.
+const transactionDomain = await client.getTransactionDomain();
 const result = await client.submitTx({
   from: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
   to:   "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
   amount: 1000,
   nonce: 0,
+  fee: 1,
+  signature: "<128 hex characters from the domain-bound signer>",
+  public_key: "<64 hex characters>",
+  transaction_domain: transactionDomain,
 });
 console.log(result.tx_hash, result.status);
 
-// Submit a batch
+// Rust u64 values above Number.MAX_SAFE_INTEGER must use bigint. The SDK
+// emits exact unquoted JSON integers and rejects unsafe/fractional numbers.
+// Large u64 fields read from RPC responses are returned as bigint.
+const exactResult = await client.submitTx({
+  from: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  to:   "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+  amount: 9_007_199_254_740_993n,
+  nonce: 9_007_199_254_740_995n,
+  fee: 1n,
+  signature: "<128 hex characters from the domain-bound signer>",
+  public_key: "<64 hex characters>",
+  transaction_domain: transactionDomain,
+});
+
+// Submit a batch (maximum 64 transactions, matching the node admission cap)
 const batch = await client.submitTxBatch([
-  { from: "af1349...", to: "2d3ade...", amount: 100, nonce: 0 },
-  { from: "af1349...", to: "2d3ade...", amount: 200, nonce: 1 },
+  { from: "af1349...", to: "2d3ade...", amount: 100, nonce: 0, fee: 1, signature: "...", public_key: "...", transaction_domain: transactionDomain },
+  { from: "af1349...", to: "2d3ade...", amount: 200, nonce: 1, fee: 1, signature: "...", public_key: "...", transaction_domain: transactionDomain },
 ]);
 console.log(batch.accepted, batch.rejected);
 
@@ -282,12 +305,28 @@ ARC Chain supports 21 transaction types. The `TransactionBody` type is a discrim
 | `ChannelClose` | Close state channel (L1 scaling) |
 | `ChannelDispute` | Dispute state channel (L1 scaling) |
 | `ShardProof` | Shard STARK proof (L1 scaling) |
+| `InferenceAttestation` | Optimistic inference result attestation |
+| `InferenceChallenge` | Challenge an inference attestation |
+| `InferenceRegister` | Register an inference provider |
+| `InferenceEscrowOpen` | Open an inference payment escrow |
+| `InferenceEscrowRelease` | Release an inference payment escrow |
+| `InferenceEscrowRefund` | Refund an expired inference escrow |
+| `ModelRegistration` | Register inference model metadata |
+| `ModelRequest` | Request replicated model coverage |
+| `ShardCoverageClaim` | Claim a model layer range |
+| `CapacityAdvertisement` | Advertise worker hardware capacity |
+| `ShardAssignmentProposal` | Publish deterministic shard assignments |
+| `FaucetClaim` | Validator-authorized faucet claim |
+| `InferenceRequest` | Request Tier 1 on-chain inference |
+| `InferenceVote` | Submit a Tier 1 committee result |
+| `InferenceFinalize` | Finalize a Tier 1 inference request |
+| `CommunityInferenceReward` | Reward a verified community inference job |
 
 ## Requirements
 
-- Node.js >= 18 (for native `fetch`)
+- Node.js >= 24 (the package's declared LTS runtime floor)
 - TypeScript >= 5.0 (for development)
 
 ## License
 
-MIT
+[Business Source License 1.1](./LICENSE). The change license is Apache-2.0 on March 25, 2030.

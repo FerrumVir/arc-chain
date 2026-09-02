@@ -98,11 +98,11 @@ impl ZkVerifierRegistry {
         }
 
         // Compute expected prefix: BLAKE3(circuit_id || public_inputs as le bytes)
-        let expected_prefix = Self::compute_expected_prefix(&input.circuit_id, &input.public_inputs);
+        let expected_prefix =
+            Self::compute_expected_prefix(&input.circuit_id, &input.public_inputs);
 
         // Proof is valid if its data starts with the expected 8-byte prefix
-        let valid = input.proof_data.len() >= 8
-            && input.proof_data[..8] == expected_prefix[..8];
+        let valid = input.proof_data.len() >= 8 && input.proof_data[..8] == expected_prefix[..8];
 
         ZkVerifyResult {
             valid,

@@ -85,7 +85,7 @@ pub fn batch_commit(values: &[u64]) -> Vec<PedersenCommitment> {
 
 /// Batch-verify Pedersen proofs in parallel.
 pub fn batch_verify(proofs: &[PedersenProof]) -> Vec<bool> {
-    proofs.par_iter().map(|p| verify_commitment(p)).collect()
+    proofs.par_iter().map(verify_commitment).collect()
 }
 
 /// Homomorphic addition of two commitments.

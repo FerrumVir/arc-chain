@@ -24,7 +24,7 @@
 //! returned as a remainder for the normal execution path.
 
 use arc_state::{StateDB, StateError};
-use arc_types::{Account, Address, Transaction, TxBody, TxType};
+use arc_types::{Address, Transaction, TxBody, TxType};
 use std::collections::HashMap;
 
 /// Result of coalescing a batch of transactions.
@@ -127,8 +127,7 @@ impl CoalescedBatch {
     ///
     /// Returns statistics including the number of state reads/writes saved.
     pub fn execute(&self, state: &StateDB) -> Result<CoalesceStats, StateError> {
-        let total_txs = self.groups.values().map(|g| g.len()).sum::<usize>()
-            + self.remainder.len();
+        let total_txs = self.groups.values().map(|g| g.len()).sum::<usize>() + self.remainder.len();
         let unique_senders = self.groups.len();
 
         // Track per-receiver accumulated credits from successful transactions.
@@ -204,8 +203,7 @@ impl CoalescedBatch {
         //
         // Reads saved  = (coalesced_txs - unique_senders) + (coalesced_txs - unique_receivers)
         // Writes saved = same
-        let reads_saved = coalesced_tx_count
-            .saturating_sub(unique_senders)
+        let reads_saved = coalesced_tx_count.saturating_sub(unique_senders)
             + coalesced_tx_count.saturating_sub(unique_receivers);
         let writes_saved = reads_saved; // symmetric - same number of reads and writes saved
 
@@ -329,14 +327,7 @@ mod tests {
 
     #[test]
     fn test_settle_is_coalesceable() {
-        let tx = Transaction::new_settle(
-            addr(1),
-            addr(5),
-            hash_bytes(b"svc"),
-            500,
-            10,
-            0,
-        );
+        let tx = Transaction::new_settle(addr(1), addr(5), hash_bytes(b"svc"), 500, 10, 0);
         let batch = CoalescedBatch::from_transactions(vec![tx]);
 
         assert_eq!(batch.groups.len(), 1);
@@ -396,7 +387,7 @@ mod tests {
 
         // 3 txs, 1 sender → saved 2 sender reads + writes.
         // 3 txs, 2 receivers → saved 1 receiver read + write.
-        assert_eq!(stats.reads_saved, 3);  // (3-1) + (3-2) = 2 + 1
+        assert_eq!(stats.reads_saved, 3); // (3-1) + (3-2) = 2 + 1
         assert_eq!(stats.writes_saved, 3);
     }
 
@@ -442,11 +433,7 @@ mod tests {
 
     #[test]
     fn test_execute_multiple_senders() {
-        let state = test_state(&[
-            (addr(1), 5000),
-            (addr(2), 3000),
-            (addr(3), 0),
-        ]);
+        let state = test_state(&[(addr(1), 5000), (addr(2), 3000), (addr(3), 0)]);
 
         let txs = vec![
             Transaction::new_transfer(addr(1), addr(3), 1000, 0),
@@ -558,16 +545,15 @@ mod tests {
     #[test]
     fn test_stats_include_remainder() {
         let transfer = Transaction::new_transfer(addr(1), addr(2), 100, 0);
-        let wasm = Transaction::new_wasm_call(
-            addr(3), addr(10), "foo".to_string(), vec![], 0, 100_000, 0,
-        );
+        let wasm =
+            Transaction::new_wasm_call(addr(3), addr(10), "foo".to_string(), vec![], 0, 100_000, 0);
 
         let batch = CoalescedBatch::from_transactions(vec![transfer, wasm]);
         assert_eq!(batch.remainder.len(), 1);
 
         // total_txs should count both coalesceable and remainder.
-        let total: usize = batch.groups.values().map(|g| g.len()).sum::<usize>()
-            + batch.remainder.len();
+        let total: usize =
+            batch.groups.values().map(|g| g.len()).sum::<usize>() + batch.remainder.len();
         assert_eq!(total, 2);
     }
 

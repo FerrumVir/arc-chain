@@ -66,8 +66,16 @@ impl RelayerConfig {
     }
 
     /// Parse the bridge contract address into a 20-byte array.
+    // Nothing calls this yet. `validate()` only checks that `bridge_contract`
+    // is non-empty; it never checks the string is a real 20-byte address, and
+    // this function is the missing check. Calling it from `validate()` would
+    // change startup behaviour (a malformed address would start being rejected),
+    // so that is left as a deliberate follow-up rather than slipped in here.
+    #[allow(dead_code)]
     pub fn bridge_contract_bytes(&self) -> anyhow::Result<[u8; 20]> {
-        let stripped = self.bridge_contract.strip_prefix("0x")
+        let stripped = self
+            .bridge_contract
+            .strip_prefix("0x")
             .unwrap_or(&self.bridge_contract);
         let bytes = hex::decode(stripped)?;
         if bytes.len() != 20 {

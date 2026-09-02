@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_crypto::{hash_bytes, Hash256};
+use arc_crypto::{Hash256, hash_bytes};
 use arc_types::{Account, Address};
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -82,7 +82,7 @@ impl NibblePath {
     /// Build from an explicit nibble slice (each element 0..15).
     fn from_nibbles(nibbles: &[u8]) -> Self {
         let num_nibbles = nibbles.len();
-        let byte_len = (num_nibbles + 1) / 2;
+        let byte_len = num_nibbles.div_ceil(2);
         let mut bytes = vec![0u8; byte_len];
         for (i, &nib) in nibbles.iter().enumerate() {
             if i % 2 == 0 {
@@ -107,17 +107,13 @@ impl NibblePath {
         self.num_nibbles
     }
 
-    fn is_empty(&self) -> bool {
-        self.num_nibbles == 0
-    }
-
     /// Get the nibble at position `i`, or `None` if out of bounds.
     fn get(&self, i: usize) -> Option<u8> {
         if i >= self.num_nibbles {
             return None;
         }
         let byte = self.bytes[i / 2];
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             Some(byte >> 4)
         } else {
             Some(byte & 0x0F)
@@ -130,7 +126,9 @@ impl NibblePath {
             return Self::empty();
         }
         // Safety: iterating within num_nibbles bounds
-        let nibbles: Vec<u8> = (start..self.num_nibbles).map(|i| self.get(i).unwrap()).collect();
+        let nibbles: Vec<u8> = (start..self.num_nibbles)
+            .map(|i| self.get(i).unwrap())
+            .collect();
         Self::from_nibbles(&nibbles)
     }
 
@@ -139,26 +137,6 @@ impl NibblePath {
         let end = end.min(self.num_nibbles);
         // Safety: iterating within num_nibbles bounds
         let nibbles: Vec<u8> = (0..end).map(|i| self.get(i).unwrap()).collect();
-        Self::from_nibbles(&nibbles)
-    }
-
-    /// Concatenate this path with another.
-    fn concat(&self, other: &NibblePath) -> Self {
-        // Safety: both loops iterate within respective num_nibbles bounds
-        let mut nibbles: Vec<u8> = (0..self.num_nibbles).map(|i| self.get(i).unwrap()).collect();
-        for i in 0..other.num_nibbles {
-            nibbles.push(other.get(i).unwrap());
-        }
-        Self::from_nibbles(&nibbles)
-    }
-
-    /// Prepend a single nibble to produce a new path.
-    fn prepend_nibble(&self, nibble: u8) -> Self {
-        let mut nibbles = vec![nibble];
-        // Safety: iterating within num_nibbles bounds
-        for i in 0..self.num_nibbles {
-            nibbles.push(self.get(i).unwrap());
-        }
         Self::from_nibbles(&nibbles)
     }
 
@@ -174,19 +152,13 @@ impl NibblePath {
         limit
     }
 
-    /// Unpack all nibbles into a Vec.
-    fn to_nibbles(&self) -> Vec<u8> {
-        // Safety: iterating within num_nibbles bounds
-        (0..self.num_nibbles).map(|i| self.get(i).unwrap()).collect()
-    }
-
     /// Convert a full 64-nibble path back to an Address.
     fn to_address(path: &NibblePath) -> Address {
         let mut addr = [0u8; 32];
-        for i in 0..32 {
+        for (i, byte) in addr.iter_mut().enumerate() {
             let hi = path.get(i * 2).unwrap_or(0);
             let lo = path.get(i * 2 + 1).unwrap_or(0);
-            addr[i] = (hi << 4) | lo;
+            *byte = (hi << 4) | lo;
         }
         Hash256(addr)
     }
@@ -214,7 +186,10 @@ pub struct NodeKey {
 pub enum Node {
     /// 16-ary branch node. `children[nibble]` is `Some((child_hash, child_version))`
     /// when that child exists.
-    Internal(InternalNode),
+    ///
+    /// Boxed: an `InternalNode` is 16 slots wide, an order of magnitude larger
+    /// than `LeafNode`, and leaves dominate the node map.
+    Internal(Box<InternalNode>),
     /// Stores the full address, remaining suffix, and value hash.
     Leaf(LeafNode),
     /// Sentinel / empty subtree.
@@ -241,29 +216,15 @@ impl InternalNode {
         hasher.update(INTERNAL_NODE_DOMAIN);
         for slot in &self.children {
             match slot {
-                Some((h, _)) => { hasher.update(&h.0); }
-                None => { hasher.update(&Hash256::ZERO.0); }
+                Some((h, _)) => {
+                    hasher.update(&h.0);
+                }
+                None => {
+                    hasher.update(&Hash256::ZERO.0);
+                }
             }
         }
         Hash256(*hasher.finalize().as_bytes())
-    }
-
-    /// Count of non-None children.
-    fn child_count(&self) -> usize {
-        self.children.iter().filter(|c| c.is_some()).count()
-    }
-
-    /// If exactly one child, return its (nibble, hash, version).
-    fn single_child(&self) -> Option<(u8, Hash256, u64)> {
-        if self.child_count() != 1 {
-            return None;
-        }
-        for (i, slot) in self.children.iter().enumerate() {
-            if let Some((h, v)) = slot {
-                return Some((i as u8, *h, *v));
-            }
-        }
-        None
     }
 }
 
@@ -287,6 +248,21 @@ impl LeafNode {
         hasher.update(&self.value_hash.0);
         Hash256(*hasher.finalize().as_bytes())
     }
+}
+
+/// The two diverging leaves handed to `build_split`, each with the full nibble
+/// path of its address. Grouped into one struct purely to keep `build_split`'s
+/// parameter list readable - the fields are used exactly as before.
+#[derive(Clone, Copy)]
+struct SplitPair<'a> {
+    /// Full nibble path of the leaf already in the trie.
+    existing_path: &'a NibblePath,
+    /// The leaf already in the trie.
+    existing_leaf: &'a LeafNode,
+    /// Full nibble path of the leaf being inserted.
+    new_path: &'a NibblePath,
+    /// The leaf being inserted.
+    new_leaf: &'a LeafNode,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +300,12 @@ pub struct JmtStore {
     root_keys: DashMap<u64, NodeKey>,
 }
 
+impl Default for JmtStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JmtStore {
     /// Create a new, empty JMT store at version 0.
     pub fn new() -> Self {
@@ -356,8 +338,8 @@ impl JmtStore {
     /// Stage an account update. The account is hashed and added to the dirty
     /// set; the trie is only recomputed on the next `commit()`.
     pub fn put_account(&self, addr: Address, account: &Account) -> Result<(), JmtError> {
-        let bytes = bincode::serialize(account)
-            .map_err(|e| JmtError::SerializationError(e.to_string()))?;
+        let bytes =
+            bincode::serialize(account).map_err(|e| JmtError::SerializationError(e.to_string()))?;
         let value_hash = hash_bytes(&bytes);
         self.dirty.write().insert(addr, value_hash);
         Ok(())
@@ -390,12 +372,21 @@ impl JmtStore {
             self.version.store(new_version, Ordering::SeqCst);
             let root = *self.root_hash.read();
             self.version_roots.insert(new_version, root);
-            // Copy root node key forward if it exists.
-            if let Some(prev) = self.root_keys.get(&(new_version - 1)) {
-                self.root_keys.insert(new_version, NodeKey {
-                    version: prev.version,
-                    nibble_path: prev.nibble_path.clone(),
-                });
+            // Copy the value out before inserting into the same DashMap. Keeping a
+            // `get()` guard alive across `insert()` can self-deadlock whenever the
+            // old and new versions land in the same shard.
+            let previous_root_key = self
+                .root_keys
+                .get(&(new_version - 1))
+                .map(|prev| prev.clone());
+            if let Some(prev) = previous_root_key {
+                self.root_keys.insert(
+                    new_version,
+                    NodeKey {
+                        version: prev.version,
+                        nibble_path: prev.nibble_path.clone(),
+                    },
+                );
             }
             return root;
         }
@@ -441,7 +432,9 @@ impl JmtStore {
 
         self.collect_proof(version, &root_key, &path, 0, &mut siblings);
 
-        let leaf = self.get_leaf(version, &path).map(|l| (l.address, l.value_hash));
+        let leaf = self
+            .get_leaf(version, &path)
+            .map(|l| (l.address, l.value_hash));
 
         MerkleProof { siblings, leaf }
     }
@@ -587,14 +580,7 @@ impl JmtStore {
                 suffix: NibblePath::empty(), // Will be set during insertion
                 value_hash: *value_hash,
             };
-            root_node = Some(self.insert_recursive(
-                root_node,
-                prev_version,
-                new_version,
-                &path,
-                0,
-                leaf,
-            ));
+            root_node = Some(self.insert_recursive(root_node, new_version, &path, 0, leaf));
         }
 
         let root_hash = match &root_node {
@@ -619,7 +605,6 @@ impl JmtStore {
     fn insert_recursive(
         &self,
         node: Option<Node>,
-        prev_version: u64,
         new_version: u64,
         path: &NibblePath,
         depth: usize,
@@ -660,10 +645,12 @@ impl JmtStore {
                     depth,
                     depth + common_len,
                     new_version,
-                    &existing_full_path,
-                    &existing,
-                    new_full_path,
-                    &new_leaf,
+                    SplitPair {
+                        existing_path: &existing_full_path,
+                        existing_leaf: &existing,
+                        new_path: new_full_path,
+                        new_leaf: &new_leaf,
+                    },
                 )
             }
             Some(Node::Internal(internal)) => {
@@ -690,14 +677,8 @@ impl JmtStore {
                     None
                 };
 
-                let new_child = self.insert_recursive(
-                    child_node,
-                    prev_version,
-                    new_version,
-                    path,
-                    depth + 1,
-                    new_leaf,
-                );
+                let new_child =
+                    self.insert_recursive(child_node, new_version, path, depth + 1, new_leaf);
 
                 let child_hash = self.node_hash(&new_child);
 
@@ -721,14 +702,20 @@ impl JmtStore {
         base_depth: usize,
         split_depth: usize,
         new_version: u64,
-        existing_path: &NibblePath,
-        existing_leaf: &LeafNode,
-        new_path: &NibblePath,
-        new_leaf: &LeafNode,
+        pair: SplitPair<'_>,
     ) -> Node {
-        let existing_nibble = existing_path.get(split_depth)
-            .expect("split_depth within existing path bounds") as usize;
-        let new_nibble = new_path.get(split_depth)
+        let SplitPair {
+            existing_path,
+            existing_leaf,
+            new_path,
+            new_leaf,
+        } = pair;
+        let existing_nibble = existing_path
+            .get(split_depth)
+            .expect("split_depth within existing path bounds")
+            as usize;
+        let new_nibble = new_path
+            .get(split_depth)
             .expect("split_depth within new path bounds") as usize;
 
         // Create the two leaves with their remaining suffixes.
@@ -763,7 +750,7 @@ impl JmtStore {
         internal.children[existing_nibble] = Some((existing_hash, new_version));
         internal.children[new_nibble] = Some((new_hash, new_version));
 
-        let mut current = Node::Internal(internal);
+        let mut current = Node::Internal(Box::new(internal));
 
         // Wrap in additional internal nodes for each shared-prefix nibble
         // between base_depth and split_depth (if any).
@@ -781,7 +768,7 @@ impl JmtStore {
 
             let mut wrapper = InternalNode::new();
             wrapper.children[nibble] = Some((current_hash, new_version));
-            current = Node::Internal(wrapper);
+            current = Node::Internal(Box::new(wrapper));
         }
 
         current
@@ -800,7 +787,7 @@ impl JmtStore {
     fn get_leaf(&self, version: u64, path: &NibblePath) -> Option<LeafNode> {
         let root_key = self.root_keys.get(&version)?;
         let root_node = self.nodes.get(&*root_key)?;
-        self.traverse_to_leaf(&*root_node, version, path, 0)
+        self.traverse_to_leaf(&root_node, version, path, 0)
     }
 
     /// Recursively traverse the trie to find a leaf.
@@ -834,7 +821,7 @@ impl JmtStore {
                     nibble_path: path.prefix(depth + 1),
                 };
                 let child = self.nodes.get(&child_key)?;
-                self.traverse_to_leaf(&*child, child_ver, path, depth + 1)
+                self.traverse_to_leaf(&child, child_ver, path, depth + 1)
             }
         }
     }
@@ -868,8 +855,12 @@ impl JmtStore {
                         continue;
                     }
                     match slot {
-                        Some((h, _)) => { hasher.update(&h.0); }
-                        None => { hasher.update(&Hash256::ZERO.0); }
+                        Some((h, _)) => {
+                            hasher.update(&h.0);
+                        }
+                        None => {
+                            hasher.update(&Hash256::ZERO.0);
+                        }
                     }
                 }
                 siblings.push(Hash256(*hasher.finalize().as_bytes()));
@@ -917,6 +908,12 @@ pub struct JmtStateTree {
     dirty: bool,
     /// Version counter (increments per batch update).
     version: u64,
+}
+
+impl Default for JmtStateTree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JmtStateTree {
@@ -970,11 +967,9 @@ impl JmtStateTree {
         }
 
         // Sort leaves by address for deterministic ordering.
-        let mut sorted_leaves: Vec<([u8; 32], Hash256)> = self.leaves
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        sorted_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sorted_leaves: Vec<([u8; 32], Hash256)> =
+            self.leaves.iter().map(|(k, v)| (*k, *v)).collect();
+        sorted_leaves.sort_by_key(|a| a.0);
 
         // Build Merkle tree bottom-up from sorted leaf hashes.
         let leaf_hashes: Vec<Hash256> = sorted_leaves
@@ -1005,7 +1000,7 @@ impl JmtStateTree {
 
         let mut current_level = hashes.to_vec();
         while current_level.len() > 1 {
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 if chunk.len() == 2 {
                     let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
@@ -1034,7 +1029,6 @@ impl JmtStateTree {
         // use it.
         if version > self.version {
             // Cannot prune past the current version - clamp silently.
-            return;
         }
         // In the full VersionedJmtStore this would drop old nodes.
         // Here it is intentionally a no-op on the node set.
@@ -1068,11 +1062,9 @@ impl JmtStateTree {
         }
 
         // Build proof by collecting sibling hashes along the path.
-        let mut sorted_leaves: Vec<([u8; 32], Hash256)> = self.leaves
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        sorted_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sorted_leaves: Vec<([u8; 32], Hash256)> =
+            self.leaves.iter().map(|(k, v)| (*k, *v)).collect();
+        sorted_leaves.sort_by_key(|a| a.0);
 
         let leaf_hashes: Vec<Hash256> = sorted_leaves
             .iter()
@@ -1100,7 +1092,11 @@ impl JmtStateTree {
         let mut current_level = hashes.to_vec();
 
         while current_level.len() > 1 {
-            let sibling_idx = if index % 2 == 0 { index + 1 } else { index - 1 };
+            let sibling_idx = if index.is_multiple_of(2) {
+                index + 1
+            } else {
+                index - 1
+            };
             if sibling_idx < current_level.len() {
                 siblings.push(current_level[sibling_idx]);
             } else {
@@ -1109,7 +1105,7 @@ impl JmtStateTree {
             }
 
             // Move to next level.
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 if chunk.len() == 2 {
                     let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
@@ -1147,7 +1143,7 @@ impl JmtProof {
 
         for sibling in &self.siblings {
             let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 hasher.update(current.as_ref());
                 hasher.update(sibling.as_ref());
             } else {
@@ -1176,8 +1172,8 @@ mod tests {
         let mut addr = [0u8; 32];
         // Fill with a deterministic pattern based on seed so different seeds
         // produce very different nibble paths.
-        for i in 0..32 {
-            addr[i] = seed.wrapping_mul(17).wrapping_add(i as u8);
+        for (i, byte) in addr.iter_mut().enumerate() {
+            *byte = seed.wrapping_mul(17).wrapping_add(i as u8);
         }
         Hash256(addr)
     }
@@ -1274,7 +1270,10 @@ mod tests {
             .collect();
         let root_batch = store_batch.batch_update(&pairs);
 
-        assert_eq!(root_seq, root_batch, "batch must equal sequential (same commit)");
+        assert_eq!(
+            root_seq, root_batch,
+            "batch must equal sequential (same commit)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1289,7 +1288,10 @@ mod tests {
         let _root = store.commit();
 
         let proof = store.get_proof(&addr);
-        assert!(proof.leaf.is_some(), "proof must contain leaf for existing account");
+        assert!(
+            proof.leaf.is_some(),
+            "proof must contain leaf for existing account"
+        );
 
         let (leaf_addr, leaf_hash) = proof.leaf.as_ref().unwrap();
         assert_eq!(*leaf_addr, addr);
@@ -1523,15 +1525,41 @@ mod tests {
     fn test_empty_commit_preserves_root() {
         let mut store = JmtStore::new();
         let addr = test_address(1);
-        store
-            .put_account(addr, &test_account(addr, 100))
-            .unwrap();
+        store.put_account(addr, &test_account(addr, 100)).unwrap();
         let root = store.commit();
 
         // Commit again with no changes.
         let root2 = store.commit();
         assert_eq!(root, root2, "empty commit must not change root");
         assert_eq!(store.version(), 2);
+    }
+
+    #[test]
+    fn test_repeated_empty_commits_do_not_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut store = JmtStore::new();
+            let addr = test_address(1);
+            store.put_account(addr, &test_account(addr, 100)).unwrap();
+            let expected_root = store.commit();
+
+            // Exercise enough distinct version keys to force repeated access to
+            // the same DashMap shards regardless of the map's randomized seed.
+            for _ in 0..1_024 {
+                assert_eq!(store.commit(), expected_root);
+            }
+
+            finished_tx.send(store.version()).unwrap();
+        });
+
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(1_025),
+            "repeated empty commits deadlocked"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1542,14 +1570,10 @@ mod tests {
         let mut store = JmtStore::new();
         let addr = test_address(1);
 
-        store
-            .put_account(addr, &test_account(addr, 100))
-            .unwrap();
+        store.put_account(addr, &test_account(addr, 100)).unwrap();
         let root1 = store.commit();
 
-        store
-            .put_account(addr, &test_account(addr, 200))
-            .unwrap();
+        store.put_account(addr, &test_account(addr, 200)).unwrap();
         let root2 = store.commit();
 
         assert_ne!(root1, root2, "updating balance must change root");

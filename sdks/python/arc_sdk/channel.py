@@ -13,7 +13,7 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
 
@@ -115,9 +115,7 @@ class Channel:
             raise ChannelError(f"Cannot pay: channel is {self.state.value}")
 
         if amount > self.my_balance:
-            raise ChannelError(
-                f"Insufficient balance: have {self.my_balance}, need {amount}"
-            )
+            raise ChannelError(f"Insufficient balance: have {self.my_balance}, need {amount}")
 
         if self.role == Role.OPENER:
             new_opener = self.opener_balance - amount
@@ -128,9 +126,7 @@ class Channel:
 
         return self.propose_state(new_opener, new_counter)
 
-    def propose_state(
-        self, opener_balance: int, counterparty_balance: int
-    ) -> StateCommitment:
+    def propose_state(self, opener_balance: int, counterparty_balance: int) -> StateCommitment:
         """Propose a new state with arbitrary balances."""
         if self.state != ChannelState.OPEN:
             raise ChannelError(f"Cannot propose: channel is {self.state.value}")
@@ -162,9 +158,7 @@ class Channel:
             raise ChannelError("Channel ID mismatch")
 
         if commitment.nonce <= self.nonce:
-            raise ChannelError(
-                f"Nonce must increase: got {commitment.nonce}, current {self.nonce}"
-            )
+            raise ChannelError(f"Nonce must increase: got {commitment.nonce}, current {self.nonce}")
 
         total = commitment.opener_balance + commitment.counterparty_balance
         if total != self.total_deposit:

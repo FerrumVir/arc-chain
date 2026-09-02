@@ -183,10 +183,7 @@ impl BridgeTransfer {
     ///
     /// Fee = amount * fee_bps / 10_000
     pub fn estimated_fee(&self, config: &BridgeConfig) -> u128 {
-        self.amount
-            .checked_mul(config.fee_bps as u128)
-            .unwrap_or(u128::MAX)
-            / 10_000
+        self.amount.saturating_mul(config.fee_bps as u128) / 10_000
     }
 }
 
@@ -223,7 +220,7 @@ impl BridgeProof {
 
         for sibling in &self.merkle_siblings {
             let mut hasher = blake3::Hasher::new();
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 // Current is the left child
                 hasher.update(&current);
                 hasher.update(sibling);
@@ -294,7 +291,7 @@ impl BridgeConfig {
             max_transfer_amount: 1_000_000_000_000_000_000_000, // 1000 ETH in wei
             min_transfer_amount: 10_000_000_000_000_000,        // 0.01 ETH in wei
             fee_bps: 30,                                        // 0.30%
-            timeout_blocks: 7200,                                // ~24h at 12s blocks
+            timeout_blocks: 7200,                               // ~24h at 12s blocks
             is_active: true,
         }
     }
@@ -556,9 +553,7 @@ mod tests {
     #[test]
     fn test_bridge_proof_verification() {
         // Build a small Merkle tree manually: 4 leaves
-        let leaves: Vec<[u8; 32]> = (0u8..4)
-            .map(|i| *blake3::hash(&[i]).as_bytes())
-            .collect();
+        let leaves: Vec<[u8; 32]> = (0u8..4).map(|i| *blake3::hash(&[i]).as_bytes()).collect();
 
         // Level 0: [L0, L1, L2, L3]
         // Level 1: [H(L0,L1), H(L2,L3)]
@@ -599,9 +594,7 @@ mod tests {
     // 7. Tampered proof fails
     #[test]
     fn test_bridge_proof_invalid() {
-        let leaves: Vec<[u8; 32]> = (0u8..4)
-            .map(|i| *blake3::hash(&[i]).as_bytes())
-            .collect();
+        let leaves: Vec<[u8; 32]> = (0u8..4).map(|i| *blake3::hash(&[i]).as_bytes()).collect();
 
         let h01 = {
             let mut h = blake3::Hasher::new();
@@ -820,7 +813,7 @@ mod tests {
     #[test]
     fn test_success_rate() {
         let mut stats = BridgeStats::default();
-        assert_eq!(stats.success_rate(), 0.0);
+        assert!(stats.success_rate().abs() < f64::EPSILON);
 
         stats.completed_transfers = 9;
         stats.failed_transfers = 1;
@@ -828,6 +821,6 @@ mod tests {
 
         stats.completed_transfers = 0;
         stats.failed_transfers = 5;
-        assert_eq!(stats.success_rate(), 0.0);
+        assert!(stats.success_rate().abs() < f64::EPSILON);
     }
 }

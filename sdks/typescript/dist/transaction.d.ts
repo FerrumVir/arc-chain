@@ -5,7 +5,7 @@
  * then signs them with Ed25519 and computes the BLAKE3 transaction hash.
  */
 import { KeyPair } from "./crypto";
-import type { Transaction } from "./types";
+import type { Transaction, TransferTransaction, SignedTransferTransaction, Ed25519Signature, U64 } from "./types";
 /**
  * Build unsigned ARC Chain transactions.
  *
@@ -22,7 +22,7 @@ export declare class TransactionBuilder {
      * @param fee - Transaction fee (default 1)
      * @param nonce - Sender nonce for replay protection
      */
-    static transfer(fromAddr: string, toAddr: string, amount: number, fee?: number, nonce?: number): Transaction;
+    static transfer(fromAddr: string, toAddr: string, amount: U64, fee?: U64, nonce?: U64, transactionDomain?: string | null): TransferTransaction;
     /**
      * Build an unsigned contract deployment transaction.
      *
@@ -34,7 +34,7 @@ export declare class TransactionBuilder {
      * @param constructorArgs - ABI-encoded constructor arguments
      * @param stateRentDeposit - Pre-paid state rent
      */
-    static deployContract(fromAddr: string, code: Uint8Array, gasLimit?: number, fee?: number, nonce?: number, constructorArgs?: Uint8Array, stateRentDeposit?: number): Transaction;
+    static deployContract(fromAddr: string, code: Uint8Array, gasLimit?: U64, fee?: U64, nonce?: U64, constructorArgs?: Uint8Array, stateRentDeposit?: U64): Transaction;
     /**
      * Build an unsigned WASM contract call transaction.
      *
@@ -47,7 +47,7 @@ export declare class TransactionBuilder {
      * @param fee - Transaction fee
      * @param nonce - Sender nonce
      */
-    static callContract(fromAddr: string, contractAddr: string, calldata: Uint8Array, value?: number, gasLimit?: number, func?: string, fee?: number, nonce?: number): Transaction;
+    static callContract(fromAddr: string, contractAddr: string, calldata: Uint8Array, value?: U64, gasLimit?: U64, func?: string, fee?: U64, nonce?: U64): Transaction;
     /**
      * Build an unsigned stake/unstake transaction.
      *
@@ -58,7 +58,7 @@ export declare class TransactionBuilder {
      * @param fee - Transaction fee
      * @param nonce - Sender nonce
      */
-    static stake(fromAddr: string, amount: number, isStake?: boolean, validator?: string, fee?: number, nonce?: number): Transaction;
+    static stake(fromAddr: string, amount: U64, isStake?: boolean, validator?: string, fee?: U64, nonce?: U64): Transaction;
     /**
      * Build an unsigned settlement transaction (zero fee).
      *
@@ -69,7 +69,7 @@ export declare class TransactionBuilder {
      * @param usageUnits - Usage units consumed
      * @param nonce - Sender nonce
      */
-    static settle(fromAddr: string, agentId: string, serviceHash: string, amount: number, usageUnits: number, nonce?: number): Transaction;
+    static settle(fromAddr: string, agentId: string, serviceHash: string, amount: U64, usageUnits: U64, nonce?: U64): Transaction;
     /**
      * Sign a transaction with the given key pair.
      *
@@ -77,6 +77,9 @@ export declare class TransactionBuilder {
      * @param keypair - Ed25519 key pair whose address matches tx.from
      * @returns A new signed transaction (original is not modified)
      */
-    static sign(tx: Transaction, keypair: KeyPair): Promise<Transaction>;
+    static sign(tx: TransferTransaction, keypair: KeyPair): Promise<SignedTransferTransaction>;
+    static sign<T extends Transaction>(tx: T, keypair: KeyPair): Promise<T & {
+        signature: Ed25519Signature;
+    }>;
 }
 //# sourceMappingURL=transaction.d.ts.map

@@ -1,10 +1,11 @@
-<stdin>:15: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
 # ARC Chain - Factual Benchmark Report
 
-> **Topology note (2026-04-22):** this run was captured against the 7-shard
-> 1×-replica topology in April. The live cluster now runs 6 layer ranges
-> with 3× replication each (18 replica entries across NYC, LAX, AMS, LHR,
-> NRT, SGP). Per-hop numbers below are a point-in-time snapshot, not a spec.
+> **Historical benchmark:** this run was captured against the April 7-shard,
+> 1×-replica topology. At the later 2026-04-22 snapshot, the cluster reported 6
+> layer ranges with 3× replication each. Neither topology is current production
+> evidence: the 2026-08-26 fleet is forked/version-skewed, and v0.8.0 is not
+> deployed. Per-hop numbers and receipt links below are point-in-time evidence,
+> not a spec; re-run them before quoting them.
 
 3 factual prompts run sequentially through the then-live 7-shard pipeline,
 with 60s pause between requests to let the coordinator drain.

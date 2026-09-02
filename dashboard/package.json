@@ -1,0 +1,12 @@
+{
+  "name": "arc-chain-dashboard",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -c ./tailwind.config.cjs -i ./tailwind.input.css -o ./tailwind.css --minify",
+    "test": "node ./verify-css.mjs && node ../shared/frontend/test-arc-network.mjs && node ./test-contract.mjs",
+    "test:live": "node ./test-live.mjs"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

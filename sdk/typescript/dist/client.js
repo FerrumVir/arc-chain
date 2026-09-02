@@ -1,6 +1,8 @@
-// ─── @arc-chain/sdk — RPC Client ──────────────────────────────
+// ─── @arc-chain/sdk - RPC Client ──────────────────────────────
 // Full-featured client for the ARC Chain native REST API.
-// Zero dependencies — uses the built-in Fetch API (Node 18+, all browsers).
+// Zero dependencies - uses the built-in Fetch API (Node 24+, modern browsers).
+import { assertU64, parseJsonWithBigInts, stringifyJsonWithBigInts, u64ToBigInt, } from "./u64.js";
+const MAX_TX_SUBMIT_BATCH_SIZE = 64;
 // ─── Error ──────────────────────────────────────────────────
 /**
  * Error thrown when an RPC request fails.
@@ -23,13 +25,13 @@ export class ArcRpcError extends Error {
  * ARC Chain RPC client.
  *
  * Wraps the full ARC native REST API with typed methods.
- * Uses the built-in `fetch` — no external dependencies required.
+ * Uses the built-in `fetch` - no external dependencies required.
  *
  * @example
  * ```ts
  * import { ArcClient } from "@arc-chain/sdk";
  *
- * const client = new ArcClient("http://localhost:9090");
+ * const client = new ArcClient("http://localhost:9944");
  *
  * const health = await client.getHealth();
  * console.log(health.status); // "ok"
@@ -45,7 +47,7 @@ export class ArcClient {
     /**
      * Create a new ARC Chain RPC client.
      *
-     * @param rpcUrl - Base URL of the ARC Chain node (e.g. `"http://localhost:9090"`).
+     * @param rpcUrl - Base URL of the ARC Chain node (e.g. `"http://localhost:9944"`).
      * @param options - Optional configuration.
      * @param options.timeout - Request timeout in milliseconds (default: 30000).
      * @param options.headers - Additional headers to include on every request.
@@ -59,25 +61,25 @@ export class ArcClient {
         };
     }
     // ─── Health & Info ──────────────────────────────────────
-    /** `GET /health` — Node health check. */
+    /** `GET /health` - Node health check. */
     async getHealth() {
         return this._get("/health");
     }
-    /** `GET /info` — Chain information including GPU status. */
+    /** `GET /info` - Chain information including GPU status. */
     async getInfo() {
         return this._get("/info");
     }
-    /** `GET /node/info` — Validator-specific node information. */
+    /** `GET /node/info` - Validator-specific node information. */
     async getNodeInfo() {
         return this._get("/node/info");
     }
-    /** `GET /stats` — Aggregate chain statistics. */
+    /** `GET /stats` - Aggregate chain statistics. */
     async getStats() {
         return this._get("/stats");
     }
     // ─── Blocks ─────────────────────────────────────────────
     /**
-     * `GET /block/{height}` — Fetch a block by height.
+     * `GET /block/{height}` - Fetch a block by height.
      *
      * Returns the full block detail including header, transaction hashes,
      * and the block hash.
@@ -88,7 +90,7 @@ export class ArcClient {
         return this._get(`/block/${height}`);
     }
     /**
-     * `GET /blocks` — Paginated block listing.
+     * `GET /blocks` - Paginated block listing.
      *
      * @param options.from - Start height (inclusive, default 0).
      * @param options.to - End height (inclusive, default chain tip).
@@ -106,7 +108,7 @@ export class ArcClient {
         return this._get(`/blocks${qs ? `?${qs}` : ""}`);
     }
     /**
-     * `GET /block/{height}/txs` — Paginated transactions for a block.
+     * `GET /block/{height}/txs` - Paginated transactions for a block.
      *
      * For benchmark blocks, transactions are reconstructed on-demand.
      *
@@ -125,14 +127,14 @@ export class ArcClient {
         return this._get(`/block/${height}/txs${qs ? `?${qs}` : ""}`);
     }
     /**
-     * `GET /block/{height}/proofs` — All Merkle inclusion proofs for a block.
+     * `GET /block/{height}/proofs` - All Merkle inclusion proofs for a block.
      */
     async getBlockProofs(height) {
         return this._get(`/block/${height}/proofs`);
     }
     // ─── Transactions ───────────────────────────────────────
     /**
-     * `GET /tx/{hash}` — Look up a transaction receipt by hash.
+     * `GET /tx/{hash}` - Look up a transaction receipt by hash.
      *
      * Falls back to on-demand reconstruction for benchmark transactions.
      *
@@ -143,7 +145,7 @@ export class ArcClient {
         return this._get(`/tx/${hash}`);
     }
     /**
-     * `GET /tx/{hash}/full` — Full transaction with type-specific body fields,
+     * `GET /tx/{hash}/full` - Full transaction with type-specific body fields,
      * signature information, and receipt data.
      *
      * Supports all 21 transaction types.
@@ -155,7 +157,7 @@ export class ArcClient {
         return this._get(`/tx/${hash}/full`);
     }
     /**
-     * `GET /tx/{hash}/proof` — Merkle inclusion proof for a transaction.
+     * `GET /tx/{hash}/proof` - Merkle inclusion proof for a transaction.
      *
      * The proof can be verified client-side using BLAKE3 with the
      * `ARC-chain-tx-v1` domain separator.
@@ -167,37 +169,112 @@ export class ArcClient {
         return this._get(`/tx/${hash}/proof`);
     }
     /**
-     * `POST /tx/submit` — Submit a transaction to the mempool.
+     * `POST /tx/submit` - Submit a transaction to the mempool.
      *
      * @param tx - Transaction payload (from, to, amount, nonce, optional tx_type).
      * @throws {ArcRpcError} 400 if addresses are invalid hex.
      * @throws {ArcRpcError} 409 if transaction already exists (duplicate hash).
      */
     async submitTx(tx) {
-        return this._post("/tx/submit", tx);
+        assertSignedTransferU64Fields(tx);
+        await this._assertTransactionDomain(tx.transaction_domain);
+        const { transaction_domain: _domain, ...wire } = tx;
+        return this._post("/tx/submit", wire);
     }
     /**
-     * `POST /tx/submit` — Submit a fully-formed signed transaction.
+     * `POST /tx/submit` - Submit a fully-formed signed transaction.
      *
      * Use this when you have constructed and signed the transaction yourself.
      */
     async submitSignedTx(tx) {
-        return this._post("/tx/submit", tx);
+        assertU64(tx.gas_limit, "gas_limit");
+        if (u64ToBigInt(tx.gas_limit, "gas_limit") !== 0n) {
+            throw new RangeError("gas_limit must be zero for the flat transfer RPC");
+        }
+        const signature = tx.signature.Ed25519;
+        return this.submitTx({
+            from: tx.from,
+            to: tx.body.to,
+            amount: tx.body.amount,
+            nonce: tx.nonce,
+            fee: tx.fee,
+            tx_type: "Transfer",
+            signature: signature.signature,
+            public_key: signature.public_key,
+            transaction_domain: tx.transaction_domain,
+        });
     }
     /**
-     * `POST /tx/submit_batch` — Submit multiple transactions in one request.
+     * `POST /tx/submit_batch` - Submit multiple transactions in one request.
      *
      * Each transaction is processed independently; some may be accepted
      * while others are rejected.
      */
     async submitTxBatch(transactions) {
+        if (transactions.length > MAX_TX_SUBMIT_BATCH_SIZE) {
+            throw new RangeError(`transaction batch exceeds the maximum of ${MAX_TX_SUBMIT_BATCH_SIZE} items`);
+        }
+        for (const tx of transactions)
+            assertSignedTransferU64Fields(tx);
+        const domain = await this.getTransactionDomain();
+        for (const tx of transactions) {
+            this._requireMatchingTransactionDomain(tx.transaction_domain, domain);
+        }
         return this._post("/tx/submit_batch", {
-            transactions,
+            transactions: transactions.map(({ transaction_domain: _domain, ...wire }) => wire),
         });
+    }
+    /**
+     * Fetch the exact transaction-signing domain advertised by the node.
+     * Legacy nodes without `/network/info` use the v1 null domain.
+     */
+    async getTransactionDomain() {
+        let value;
+        try {
+            value = await this._get("/network/info");
+        }
+        catch (error) {
+            if (error instanceof ArcRpcError && error.statusCode === 404)
+                return null;
+            throw error;
+        }
+        const raw = value.transaction_domain;
+        const recoveryActive = value.recovery_active === true;
+        const protocolMajor = Number.parseInt(String(value.protocol_version ?? "0").split(".")[0] ?? "0", 10);
+        if (raw == null) {
+            if (recoveryActive || protocolMajor >= 3) {
+                throw new Error("node requires recovery-domain signatures but omitted transaction_domain");
+            }
+            return null;
+        }
+        if (typeof raw !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+            throw new Error("node returned a malformed 32-byte transaction_domain");
+        }
+        if (/^0x0{64}$/i.test(raw)) {
+            throw new Error("node returned an all-zero transaction_domain");
+        }
+        return raw.toLowerCase();
+    }
+    async _assertTransactionDomain(signedDomain) {
+        const advertised = await this.getTransactionDomain();
+        this._requireMatchingTransactionDomain(signedDomain, advertised);
+    }
+    _requireMatchingTransactionDomain(signedDomain, advertised) {
+        let normalized = null;
+        if (signedDomain !== null) {
+            if (!/^0x[0-9a-fA-F]{64}$/.test(signedDomain) || /^0x0{64}$/i.test(signedDomain)) {
+                throw new Error("transaction signature domain must be a non-zero 32-byte 0x-prefixed hex value");
+            }
+            normalized = signedDomain.toLowerCase();
+        }
+        if (normalized !== advertised) {
+            throw new Error(`transaction signature domain mismatch: signed for ${normalized ?? "legacy-v1"}, ` +
+                `node requires ${advertised ?? "legacy-v1"}`);
+        }
     }
     // ─── Accounts ───────────────────────────────────────────
     /**
-     * `GET /account/{address}` — Fetch account state.
+     * `GET /account/{address}` - Fetch account state.
      *
      * @param address - 64-character hex address.
      * @throws {ArcRpcError} 400 if address is not valid hex.
@@ -207,16 +284,14 @@ export class ArcClient {
         return this._get(`/account/${address}`);
     }
     /**
-     * `GET /account/{address}/txs` — Transaction hashes involving an account.
+     * `GET /account/{address}/txs` - Transaction hashes involving an account.
      *
      * @param address - 64-character hex address.
      */
     async getAccountTxs(address) {
         return this._get(`/account/${address}/txs`);
     }
-    /**
-     * Convenience: get account balance as a number.
-     */
+    /** Convenience: get an exact account balance (`bigint` above 2^53 - 1). */
     async getBalance(address) {
         const account = await this.getAccount(address);
         return account.balance;
@@ -229,13 +304,13 @@ export class ArcClient {
         return account.nonce;
     }
     // ─── Validators ─────────────────────────────────────────
-    /** `GET /validators` — List all validators with stake and tier. */
+    /** `GET /validators` - List all validators with stake and tier. */
     async getValidators() {
         return this._get("/validators");
     }
     // ─── Contracts ──────────────────────────────────────────
     /**
-     * `GET /contract/{address}` — Get deployed contract information.
+     * `GET /contract/{address}` - Get deployed contract information.
      *
      * @param address - 64-character hex contract address.
      * @throws {ArcRpcError} 404 if no contract at address.
@@ -244,7 +319,7 @@ export class ArcClient {
         return this._get(`/contract/${address}`);
     }
     /**
-     * `POST /contract/{address}/call` — Read-only contract call.
+     * `POST /contract/{address}/call` - Read-only contract call.
      *
      * Executes the function in a sandbox without modifying state.
      *
@@ -255,6 +330,9 @@ export class ArcClient {
      * @param options.gasLimit - Gas limit for execution.
      */
     async callContract(address, fn, options) {
+        if (options?.gasLimit !== undefined) {
+            assertU64(options.gasLimit, "gas_limit");
+        }
         return this._post(`/contract/${address}/call`, {
             function: fn,
             calldata: options?.calldata,
@@ -263,16 +341,16 @@ export class ArcClient {
         });
     }
     // ─── Light Client & Sync ────────────────────────────────
-    /** `GET /light/snapshot` — Lightweight snapshot for light client bootstrapping. */
+    /** `GET /light/snapshot` - Lightweight snapshot for light client bootstrapping. */
     async getLightSnapshot() {
         return this._get("/light/snapshot");
     }
-    /** `GET /sync/snapshot/info` — Metadata about the available state snapshot. */
+    /** `GET /sync/snapshot/info` - Metadata about the available state snapshot. */
     async getSyncSnapshotInfo() {
         return this._get("/sync/snapshot/info");
     }
     /**
-     * `GET /sync/snapshot` — Download the full state snapshot as LZ4-compressed bincode.
+     * `GET /sync/snapshot` - Download the full state snapshot as LZ4-compressed bincode.
      *
      * Returns the raw response so you can stream or save the binary data.
      * Use `response.arrayBuffer()` or pipe `response.body` for large snapshots.
@@ -296,7 +374,7 @@ export class ArcClient {
     }
     // ─── Faucet ─────────────────────────────────────────────
     /**
-     * `POST /claim` — Request test tokens from the faucet.
+     * `POST /claim` - Request test tokens from the faucet.
      *
      * The faucet is a separate service (default port 3001).
      * If your faucet runs on a different URL, create a second `ArcClient`
@@ -307,11 +385,11 @@ export class ArcClient {
     async faucetClaim(address) {
         return this._post("/claim", { address });
     }
-    /** `GET /status` — Faucet operational status. */
+    /** `GET /status` - Faucet operational status. */
     async faucetStatus() {
         return this._get("/status");
     }
-    /** `GET /health` — Faucet health check (same path as node health, different service). */
+    /** `GET /health` - Faucet health check (same path as node health, different service). */
     async faucetHealth() {
         return this._get("/health");
     }
@@ -344,25 +422,25 @@ export class ArcClient {
         return response.result;
     }
     /**
-     * `eth_chainId` — Returns the ARC Chain ID (`0x415243` = 4,281,923).
+     * `eth_chainId` - Returns the ARC Chain ID (`0x415243` = 4,281,923).
      */
     async ethChainId() {
         return this.ethRpc("eth_chainId");
     }
     /**
-     * `eth_blockNumber` — Current block height as hex.
+     * `eth_blockNumber` - Current block height as hex.
      */
     async ethBlockNumber() {
         return this.ethRpc("eth_blockNumber");
     }
     /**
-     * `eth_getBalance` — Account balance in hex wei.
+     * `eth_getBalance` - Account balance in hex wei.
      */
     async ethGetBalance(address, block = "latest") {
         return this.ethRpc("eth_getBalance", [address, block]);
     }
     /**
-     * `eth_getTransactionCount` — Account nonce as hex.
+     * `eth_getTransactionCount` - Account nonce as hex.
      */
     async ethGetTransactionCount(address, block = "latest") {
         return this.ethRpc("eth_getTransactionCount", [address, block]);
@@ -449,7 +527,7 @@ export class ArcClient {
             if (!res.ok) {
                 throw new ArcRpcError(res.status, await res.text());
             }
-            return (await res.json());
+            return parseJsonWithBigInts(await res.text());
         }
         finally {
             clearTimeout(timer);
@@ -459,17 +537,18 @@ export class ArcClient {
     async _post(path, body) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeout);
+        const serializedBody = stringifyJsonWithBigInts(body);
         try {
             const res = await fetch(`${this.baseUrl}${path}`, {
                 method: "POST",
                 headers: this.headers,
-                body: JSON.stringify(body),
+                body: serializedBody,
                 signal: controller.signal,
             });
             if (!res.ok) {
                 throw new ArcRpcError(res.status, await res.text());
             }
-            return (await res.json());
+            return parseJsonWithBigInts(await res.text());
         }
         finally {
             clearTimeout(timer);
@@ -479,5 +558,10 @@ export class ArcClient {
 // ─── Helpers ────────────────────────────────────────────────
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function assertSignedTransferU64Fields(tx) {
+    assertU64(tx.amount, "amount");
+    assertU64(tx.nonce, "nonce");
+    assertU64(tx.fee, "fee");
 }
 //# sourceMappingURL=client.js.map

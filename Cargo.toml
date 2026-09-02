@@ -2,6 +2,8 @@
 resolver = "2"
 exclude = ["desktop/src-tauri", "vendor/stwo"]
 members = [
+    "vendor/wasmer-derive",
+    "crates/arc-bincode",
     "crates/arc-crypto",
     "crates/arc-types",
     "crates/arc-state",
@@ -21,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.11"
+version = "0.8.0"
 edition = "2024"
 license = "BUSL-1.1"
 authors = ["FerrumVir"]
@@ -40,13 +42,16 @@ sha2 = "0.10"
 sha3 = "0.10"
 blst = { version = "0.3", features = ["portable"] }
 # STARK prover (Stwo - StarkWare's Circle STARK)
+# Vendored from the audited upstream revision so tagged builds remain
+# reproducible even if upstream moves or becomes unavailable. Bump the vendor
+# tree and Cargo.lock together in a dedicated dependency update.
 stwo = { path = "vendor/stwo/stwo", default-features = false, features = ["prover"] }
 stwo-constraint-framework = { path = "vendor/stwo/constraint-framework", default-features = false, features = ["prover"] }
 # GPU acceleration (ICICLE - Ingonyama's GPU library for M31 field ops)
-icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
-icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
-icicle-m31 = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
-icicle-hash = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
+icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
+icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
+icicle-m31 = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
+icicle-hash = { git = "https://github.com/ingonyama-zk/icicle.git", rev = "cb1cdcb37c7a10f1b19e29d28be4f6d39ac68f06" }
 num-traits = "0.2"
 rand = "0.8"
 rand_core = "0.6"
@@ -54,7 +59,10 @@ rand_core = "0.6"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = "1.3"
+# Maintained, bincode-v1-wire-compatible serde adapter. The dependency key
+# intentionally remains `bincode` so protocol call sites cannot accidentally
+# mix codecs while the package itself is the ARC compatibility facade.
+bincode = { package = "arc-bincode", path = "crates/arc-bincode" }
 
 # Async / networking
 tokio = { version = "1.0", features = ["full"] }
@@ -64,6 +72,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 quinn = "0.11"
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
+webpki = { package = "rustls-webpki", version = "0.103" }
 
 # WASM runtime
 wasmer = "6.0"
@@ -93,6 +102,15 @@ anyhow = "1.0"
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Property-based testing
+# Seeded here so the follow-up work has a dependency to reach for. Nothing
+# consumes it yet: every one of the workspace's ~1,356 test attributes is
+# example-based, and there is no proptest, quickcheck or fuzz target anywhere
+# in the repo. Add `proptest.workspace = true` to the [dev-dependencies] of a
+# crate to start. Chosen over cargo-fuzz because it runs under plain
+# `cargo test` on stable with no extra CI infrastructure.
+proptest = "1"
+
 # Config
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
@@ -103,7 +121,14 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 bytes = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Wasmer 6.1.0 still depends on the abandoned `proc-macro-error2` crate even
+# though wasmer-derive only uses it for diagnostics. Keep the runtime and its
+# generated valid-code behavior pinned to 6.1.0, while replacing that helper
+# in a narrowly vendored derive crate. See vendor/wasmer-derive/README.md.
+[patch.crates-io]
+wasmer-derive = { path = "vendor/wasmer-derive" }
 
 [profile.release]
 opt-level = 3
@@ -116,10 +141,74 @@ strip = true
 inherits = "release"
 debug = true
 
-# CI runs `cargo clippy --workspace` without -D warnings, so we don't need
-# workspace-level allowlists for stylistic lints. Real bugs (rustc errors,
-# test failures) still gate merges. If you want to enforce a specific lint
-# workspace-wide, add it here as `<lint> = "deny"`.
+# ---------------------------------------------------------------- lints ----
+# All 16 workspace members opt in with `[lints] workspace = true`. Until this
+# change both tables below were EMPTY, so that plumbing was connected to
+# nothing and CI ran clippy without `-D warnings` - the lint apparatus existed
+# and gated zero things.
+#
+# The curated set below is deliberately BUG-CATCHING, not stylistic. The
+# previous comment here argued that enforcing lints would force mechanical
+# rewrites of crypto hot-paths and risk on-chain attestation divergence. That
+# concern is legitimate and is why no formatting-adjacent or "idiomatic style"
+# lint appears here: nothing in this list asks anyone to rewrite a working
+# kernel. Where a hot path must genuinely opt out, use a file-level
+# `#![allow(clippy::x)]` with a comment naming the divergence risk, rather
+# than leaving the whole workspace ungated.
 [workspace.lints.clippy]
+# Groups need `priority = -1` so the individual lints below can override them.
+# `correctness` is deny-by-default in clippy; stated explicitly so that
+# remains true if a future clippy reshuffles a lint between groups.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "warn", priority = -1 }
 
+# Individually selected: each of these is a class of real defect.
+await_holding_lock = "deny"          # deadlock in async paths
+await_holding_refcell_ref = "deny"   # same, RefCell flavour
+mem_forget = "deny"                  # leaks Drop guards (zeroize!)
+float_cmp = "warn"                   # exact float equality in an integer-determinism codebase is a red flag
+lossy_float_literal = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
+# DELIBERATELY ALLOWED - each was considered and rejected, with the condition
+# that would make it enforceable. Do not "tidy" these away.
+#
+# unwrap_used/expect_used: the right lints for this codebase, but unusable
+#   today. This workspace keeps its ~1,356 tests INSIDE src/ (#[cfg(test)]
+#   modules), and suppressing the lint in test code requires
+#   `allow-unwrap-in-tests = true` in a clippy.toml, which does not exist.
+#   Without it these fire tens of thousands of times from test bodies and
+#   bury every real finding. Land clippy.toml with allow-unwrap-in-tests and
+#   allow-expect-in-tests, then promote these to "warn" in lib code.
+unwrap_used = "allow"
+expect_used = "allow"
+# arithmetic_side_effects / indexing_slicing: genuinely relevant to a
+#   pure-integer inference engine and to overflow hardening, but they fire on
+#   essentially every line of a numeric kernel. Workspace-wide they are noise
+#   that would make `-D warnings` unreachable. Correct move is a targeted
+#   crate-level or module-level opt-in on the arithmetic that handles
+#   untrusted input (wire decode, balance math), not a workspace default.
+arithmetic_side_effects = "allow"
+indexing_slicing = "allow"
+# print_stdout/print_stderr: arc-cli and the 15 arc-bench binaries print as
+#   their entire purpose.
+print_stdout = "allow"
+print_stderr = "allow"
+
+# NOTE ON SCOPE: rustc lints (unlike clippy lints) apply to `cargo build`,
+# `cargo check` and `cargo test`, not just to the clippy job. Promoting
+# anything here from "warn" to "deny" therefore changes the BLOCKING test
+# gate, not the non-blocking lint gate, and must be staged accordingly:
+# measure the warning count first, fix, then promote. That is why the two
+# entries below are "warn" and not "deny" despite both being worth denying.
 [workspace.lints.rust]
+# warn-by-default in edition 2024 (NOT a hard error — earlier comment here
+# overstated it). Denying it surfaced 139 real sites in arc-inference, all
+# now wrapped in explicit `unsafe {}` blocks with SAFETY comments.
+unsafe_op_in_unsafe_fn = "deny"
+# TODO: promote to "deny" once the count is zero. An ignored Result in a
+# consensus or state-transition path is a silent correctness bug.
+unused_must_use = "warn"

@@ -1,39 +1,41 @@
-/// ARC Chain - Multi-Node Live Benchmark
-///
-/// Modes:
-///   live     - Live dashboard + WebSocket coordinator
-///   worker   - Benchmark worker (standalone HTTP or reporting to coordinator)
-///   coord    - One-shot aggregation of worker nodes
-///   local    - Run benchmark locally, output JSON
-///
-/// Usage:
-///   arc-bench-node live [--port 8080]
-///   arc-bench-node worker [--port 9944] [--coord http://coordinator:8080]
-///   arc-bench-node coord --nodes http://node1:9944,http://node2:9944 [--n 1000000]
-///   arc-bench-node local [--n 1000000]
+//! ARC Chain - Multi-Node Live Benchmark
+//!
+//! Modes:
+//!   live     - Live dashboard + WebSocket coordinator
+//!   worker   - Benchmark worker (standalone HTTP or reporting to coordinator)
+//!   coord    - One-shot aggregation of worker nodes
+//!   local    - Run benchmark locally, output JSON
+//!
+//! Usage:
+//!   arc-bench-node live [--port 8080] [--listen 127.0.0.1]
+//!   arc-bench-node worker [--port 9944] [--listen 127.0.0.1] [--coord http://coordinator:8080]
+//!   arc-bench-node coord --nodes http://node1:9944,http://node2:9944 [--n 1000000]
+//!   arc-bench-node local [--n 1000000]
 
 use arc_crypto::*;
 use arc_gpu::{cpu_batch_commit, gpu_batch_commit, probe_gpu};
 use arc_state::StateDB;
 use arc_types::*;
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::HeaderMap,
     response::{Html, IntoResponse},
     routing::{get, post},
-    Json, Router,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+
+const PUBLIC_BIND_OPT_IN: &str = "--allow-public-benchmark-bind";
 
 // ─────────────────────────────────────────────────────────────────
 //  Types
@@ -202,7 +204,8 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
         .flat_map(|agent_id| {
             let from = hash_bytes(&agent_id.to_le_bytes());
             let to = hash_bytes(&((agent_id + 1) % num_agents).to_le_bytes());
-            (0..txs_per_agent as u64).map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
+            (0..txs_per_agent as u64)
+                .map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
         })
         .collect();
 
@@ -304,10 +307,7 @@ async fn live_report(
     "ok"
 }
 
-async fn live_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<LiveState>>,
-) -> impl IntoResponse {
+async fn live_ws(ws: WebSocketUpgrade, State(state): State<Arc<LiveState>>) -> impl IntoResponse {
     ws.on_upgrade(|socket| dashboard_loop(socket, state))
 }
 
@@ -326,57 +326,11 @@ async fn live_api_nodes(State(state): State<Arc<LiveState>>) -> Json<LiveSnapsho
     Json(state.snapshot().await)
 }
 
-async fn live_join_sh(headers: HeaderMap) -> impl IntoResponse {
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:8080");
-
-    let script = format!(
-        r#"#!/bin/sh
-set -e
-echo ""
-echo "  ARC Chain Benchmark - Joining the Swarm"
-echo "  ========================================="
-echo ""
-
-COORD="http://{host}"
-
-# Check dependencies
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "  Installing Rust..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    . "$HOME/.cargo/env"
-fi
-
-if ! command -v git >/dev/null 2>&1; then
-    echo "  ERROR: git is required"
-    exit 1
-fi
-
-TMPDIR=$(mktemp -d)
-echo "  Cloning arc-chain..."
-git clone --depth 1 https://github.com/FerrumVir/arc-chain.git "$TMPDIR/arc-chain" 2>&1 | tail -1
-
-echo "  Building (release mode)..."
-cd "$TMPDIR/arc-chain"
-cargo build --release -p arc-bench 2>&1 | tail -3
-
-echo ""
-echo "  Starting worker → $COORD"
-echo ""
-./target/release/arc-bench-node worker --coord "$COORD" --n 500000
-"#
-    );
-
-    ([("content-type", "text/plain; charset=utf-8")], script)
-}
-
 // ─────────────────────────────────────────────────────────────────
 //  Live mode - coordinator + dashboard + self-benchmark
 // ─────────────────────────────────────────────────────────────────
 
-async fn run_live(port: u16) {
+async fn run_live(addr: SocketAddr) -> std::io::Result<()> {
     let state = Arc::new(LiveState::new());
 
     // Background: self-benchmark
@@ -415,47 +369,39 @@ async fn run_live(port: u16) {
         .route("/api/report", post(live_report))
         .route("/api/nodes", get(live_api_nodes))
         .route("/ws/dashboard", get(live_ws))
-        .route("/join.sh", get(live_join_sh))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{port}");
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  ARC Chain - Live Benchmark Coordinator                    ║");
-    println!(
-        "║  Dashboard:   http://{:<40}║",
-        format!("localhost:{port}")
-    );
+    println!("║  Dashboard:   http://{:<40}║", addr);
     println!(
         "║  API:         http://{:<40}║",
-        format!("localhost:{port}/api/nodes")
+        format!("{addr}/api/nodes")
     );
     println!(
         "║  WebSocket:   ws://{:<42}║",
-        format!("localhost:{port}/ws/dashboard")
+        format!("{addr}/ws/dashboard")
     );
-    println!(
-        "║  Join:        curl -sSL http://{:<30}║",
-        format!("localhost:{port}/join.sh | sh")
-    );
+    println!("║  Workers:      use a reviewed local arc-bench-node binary       ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Self-benchmarking in background...");
     println!("  Workers can POST results to /api/report");
     println!();
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await
 }
 
 // ─────────────────────────────────────────────────────────────────
 //  Worker mode - standalone HTTP or reporting to coordinator
 // ─────────────────────────────────────────────────────────────────
 
-async fn run_worker(port: u16, coord_url: Option<String>) {
+async fn run_worker(addr: SocketAddr, coord_url: Option<String>) -> std::io::Result<()> {
     if let Some(coord) = coord_url {
         run_worker_reporting(&coord).await;
-        return;
+        return Ok(());
     }
 
     // Standalone HTTP server
@@ -464,18 +410,14 @@ async fn run_worker(port: u16, coord_url: Option<String>) {
         .route("/info", get(handle_info))
         .route("/benchmark", get(handle_benchmark));
 
-    let addr = format!("0.0.0.0:{port}");
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  ARC Chain - Benchmark Worker Node                         ║");
-    println!(
-        "║  Listening on {:<46}║",
-        &addr
-    );
+    println!("║  Listening on {:<46}║", &addr);
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await
 }
 
 async fn run_worker_reporting(coord_url: &str) {
@@ -485,10 +427,7 @@ async fn run_worker_reporting(coord_url: &str) {
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  ARC Chain - Benchmark Worker (Reporting Mode)             ║");
-    println!(
-        "║  Coordinator: {:<46}║",
-        coord_url
-    );
+    println!("║  Coordinator: {:<46}║", coord_url);
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -627,28 +566,13 @@ async fn run_coordinator(node_urls: Vec<String>, n: usize) {
                 "no GPU"
             }
         );
-        println!(
-            "║    CPU hash:     {:>12.0} TPS",
-            node.cpu_hash_tps
-        );
+        println!("║    CPU hash:     {:>12.0} TPS", node.cpu_hash_tps);
         if node.gpu_hash_tps > 0.0 {
-            println!(
-                "║    GPU hash:     {:>12.0} TPS",
-                node.gpu_hash_tps
-            );
+            println!("║    GPU hash:     {:>12.0} TPS", node.gpu_hash_tps);
         }
-        println!(
-            "║    State exec:   {:>12.0} TPS",
-            node.state_exec_tps
-        );
-        println!(
-            "║    Pipeline:     {:>12.0} TPS",
-            node.compact_pipeline_tps
-        );
-        println!(
-            "║    Best:         {:>12.0} TPS",
-            node.best_single_node_tps
-        );
+        println!("║    State exec:   {:>12.0} TPS", node.state_exec_tps);
+        println!("║    Pipeline:     {:>12.0} TPS", node.compact_pipeline_tps);
+        println!("║    Best:         {:>12.0} TPS", node.best_single_node_tps);
     }
 
     println!("║                                                            ║");
@@ -659,10 +583,7 @@ async fn run_coordinator(node_urls: Vec<String>, n: usize) {
         results.len(),
         combined_tps
     );
-    println!(
-        "║  Avg per node:                {:>12.0} TPS",
-        avg_node_tps
-    );
+    println!("║  Avg per node:                {:>12.0} TPS", avg_node_tps);
     println!(
         "║  Elapsed:                     {:>12.2}s",
         total_elapsed.as_secs_f64()
@@ -693,27 +614,112 @@ fn get_arg(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+fn unique_arg<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let mut positions = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == flag).then_some(index));
+    let Some(index) = positions.next() else {
+        return Ok(None);
+    };
+    if positions.next().is_some() {
+        return Err(format!("{flag} may be specified only once"));
+    }
+
+    let value = args
+        .get(index + 1)
+        .filter(|value| !value.starts_with("--"))
+        .ok_or_else(|| format!("{flag} requires a value"))?;
+    Ok(Some(value))
+}
+
+/// Parse a benchmark server bind address without DNS or shell interpretation.
+///
+/// Listening is loopback-only by default. Exposing a benchmark endpoint on any
+/// other interface is allowed only after an explicit command-line opt-in.
+fn parse_bind_addr(args: &[String], default_port: u16) -> Result<SocketAddr, String> {
+    let ip = unique_arg(args, "--listen")?
+        .unwrap_or("127.0.0.1")
+        .parse::<IpAddr>()
+        .map_err(|_| "--listen must be a numeric IPv4 or IPv6 address".to_string())?;
+    let port = match unique_arg(args, "--port")? {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| "--port must be an integer from 0 through 65535".to_string())?,
+        None => default_port,
+    };
+
+    let opt_in_count = args
+        .iter()
+        .filter(|value| value.as_str() == PUBLIC_BIND_OPT_IN)
+        .count();
+    if opt_in_count > 1 {
+        return Err(format!("{PUBLIC_BIND_OPT_IN} may be specified only once"));
+    }
+    if !ip.is_loopback() && opt_in_count == 0 {
+        return Err(format!(
+            "refusing non-loopback benchmark bind {ip}; pass {PUBLIC_BIND_OPT_IN} to expose it"
+        ));
+    }
+
+    Ok(SocketAddr::new(ip, port))
+}
+
+fn print_usage() {
+    eprintln!("ARC Chain - Multi-Node Benchmark");
+    eprintln!();
+    eprintln!("Usage:");
+    eprintln!(
+        "  arc-bench-node live     [--port 8080] [--listen 127.0.0.1]        Live dashboard coordinator"
+    );
+    eprintln!(
+        "  arc-bench-node worker   [--port 9944] [--listen 127.0.0.1]        Benchmark worker"
+    );
+    eprintln!(
+        "  arc-bench-node coord    --nodes url1,url2 [--n 1000000]           One-shot aggregation"
+    );
+    eprintln!(
+        "  arc-bench-node local    [--n 1000000]                             Local benchmark"
+    );
+    eprintln!();
+    eprintln!("Non-loopback live/worker binds also require {PUBLIC_BIND_OPT_IN}.");
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
         Some("live") => {
-            let port = get_arg(&args, "--port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(8080);
-            run_live(port).await;
+            let addr = match parse_bind_addr(&args, 8080) {
+                Ok(addr) => addr,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    print_usage();
+                    std::process::exit(2);
+                }
+            };
+            if let Err(error) = run_live(addr).await {
+                eprintln!("failed to serve benchmark coordinator on {addr}: {error}");
+                std::process::exit(1);
+            }
         }
         Some("worker") => {
-            let port = get_arg(&args, "--port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(9944);
+            let addr = match parse_bind_addr(&args, 9944) {
+                Ok(addr) => addr,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    print_usage();
+                    std::process::exit(2);
+                }
+            };
             let coord = get_arg(&args, "--coord");
-            run_worker(port, coord).await;
+            if let Err(error) = run_worker(addr, coord).await {
+                eprintln!("failed to serve benchmark worker on {addr}: {error}");
+                std::process::exit(1);
+            }
         }
         Some("coord") => {
             let nodes_str = get_arg(&args, "--nodes").expect("--nodes required");
@@ -731,13 +737,93 @@ async fn main() {
             println!("\n{}", serde_json::to_string_pretty(&result).unwrap());
         }
         _ => {
-            eprintln!("ARC Chain - Multi-Node Benchmark");
-            eprintln!();
-            eprintln!("Usage:");
-            eprintln!("  arc-bench-node live     [--port 8080]                             Live dashboard coordinator");
-            eprintln!("  arc-bench-node worker   [--port 9944] [--coord http://host:8080]  Benchmark worker");
-            eprintln!("  arc-bench-node coord    --nodes url1,url2 [--n 1000000]           One-shot aggregation");
-            eprintln!("  arc-bench-node local    [--n 1000000]                             Local benchmark");
+            print_usage();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PUBLIC_BIND_OPT_IN, parse_bind_addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn bind_defaults_to_loopback() {
+        assert_eq!(
+            parse_bind_addr(&args(&["arc-bench-node", "live"]), 8080).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
+        );
+    }
+
+    #[test]
+    fn accepts_numeric_loopback_addresses_and_strict_ports() {
+        assert_eq!(
+            parse_bind_addr(
+                &args(&[
+                    "arc-bench-node",
+                    "worker",
+                    "--listen",
+                    "127.42.0.9",
+                    "--port",
+                    "9443",
+                ]),
+                9944,
+            )
+            .unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 42, 0, 9)), 9443)
+        );
+        assert_eq!(
+            parse_bind_addr(
+                &args(&["arc-bench-node", "worker", "--listen", "::1"]),
+                9944,
+            )
+            .unwrap(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9944)
+        );
+    }
+
+    #[test]
+    fn rejects_hostnames_missing_duplicates_and_shell_like_values() {
+        for values in [
+            vec!["arc-bench-node", "live", "--listen", "localhost"],
+            vec!["arc-bench-node", "live", "--listen"],
+            vec![
+                "arc-bench-node",
+                "live",
+                "--listen",
+                "127.0.0.1",
+                "--listen",
+                "127.0.0.2",
+            ],
+            vec!["arc-bench-node", "live", "--listen", "127.0.0.1;touch"],
+            vec!["arc-bench-node", "live", "--port", "8080;touch"],
+        ] {
+            assert!(
+                parse_bind_addr(&args(&values), 8080).is_err(),
+                "unsafe bind arguments were accepted: {values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_bind_requires_the_loud_opt_in() {
+        let public = args(&["arc-bench-node", "live", "--listen", "0.0.0.0"]);
+        assert!(parse_bind_addr(&public, 8080).is_err());
+
+        let opted_in = args(&[
+            "arc-bench-node",
+            "live",
+            "--listen",
+            "0.0.0.0",
+            PUBLIC_BIND_OPT_IN,
+        ]);
+        assert_eq!(
+            parse_bind_addr(&opted_in, 8080).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080)
+        );
     }
 }

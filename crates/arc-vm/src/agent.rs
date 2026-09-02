@@ -22,7 +22,7 @@ impl fmt::Debug for AgentId {
 
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0))
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 
@@ -306,20 +306,20 @@ impl AgentRegistry {
         }
 
         // Validate transition.
-        let valid = match (&agent.state, &state) {
-            (AgentState::Created, AgentState::Active) => true,
-            (AgentState::Active, AgentState::Paused)
-            | (AgentState::Active, AgentState::Suspended)
-            | (AgentState::Active, AgentState::OutOfFunds)
-            | (AgentState::Active, AgentState::Terminated) => true,
-            (AgentState::Paused, AgentState::Active)
-            | (AgentState::Paused, AgentState::Terminated) => true,
-            (AgentState::Suspended, AgentState::Active)
-            | (AgentState::Suspended, AgentState::Terminated) => true,
-            (AgentState::OutOfFunds, AgentState::Active)
-            | (AgentState::OutOfFunds, AgentState::Terminated) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (&agent.state, &state),
+            (AgentState::Created, AgentState::Active)
+                | (AgentState::Active, AgentState::Paused)
+                | (AgentState::Active, AgentState::Suspended)
+                | (AgentState::Active, AgentState::OutOfFunds)
+                | (AgentState::Active, AgentState::Terminated)
+                | (AgentState::Paused, AgentState::Active)
+                | (AgentState::Paused, AgentState::Terminated)
+                | (AgentState::Suspended, AgentState::Active)
+                | (AgentState::Suspended, AgentState::Terminated)
+                | (AgentState::OutOfFunds, AgentState::Active)
+                | (AgentState::OutOfFunds, AgentState::Terminated)
+        );
 
         if !valid {
             return Err(AgentError::InvalidState);
@@ -624,7 +624,8 @@ mod tests {
         reg.register(make_agent(1, "a")).unwrap();
         let id = make_id(1);
 
-        reg.write_memory(&id, "key1".to_string(), vec![10, 20]).unwrap();
+        reg.write_memory(&id, "key1".to_string(), vec![10, 20])
+            .unwrap();
         let val = reg.read_memory(&id, "key1").unwrap();
         assert_eq!(val, vec![10, 20]);
     }
@@ -638,10 +639,13 @@ mod tests {
         let id = make_id(1);
 
         // "key1" (4 bytes) + value (4 bytes) = 8 bytes - fits
-        reg.write_memory(&id, "key1".to_string(), vec![0; 4]).unwrap();
+        reg.write_memory(&id, "key1".to_string(), vec![0; 4])
+            .unwrap();
 
         // "key2" (4 bytes) + value (4 bytes) = 8 more bytes - exceeds limit of 10
-        let err = reg.write_memory(&id, "key2".to_string(), vec![0; 4]).unwrap_err();
+        let err = reg
+            .write_memory(&id, "key2".to_string(), vec![0; 4])
+            .unwrap_err();
         assert_eq!(err, AgentError::MemoryFull);
     }
 
@@ -699,7 +703,10 @@ mod tests {
         reg.update_state(&id, AgentState::Active).unwrap();
 
         reg.execute_action(&id, make_action(1, 10)).unwrap();
-        assert_eq!(reg.execute_action(&id, make_action(1, 10)).unwrap_err(), AgentError::RateLimited);
+        assert_eq!(
+            reg.execute_action(&id, make_action(1, 10)).unwrap_err(),
+            AgentError::RateLimited
+        );
 
         reg.reset_block_counters();
         // Should succeed again.
@@ -725,13 +732,16 @@ mod tests {
         let id = make_id(1);
 
         // "abc" (3) + value (5) = 8
-        reg.write_memory(&id, "abc".to_string(), vec![0; 5]).unwrap();
+        reg.write_memory(&id, "abc".to_string(), vec![0; 5])
+            .unwrap();
         // Overwrite with smaller value - should free space.
-        reg.write_memory(&id, "abc".to_string(), vec![0; 2]).unwrap();
+        reg.write_memory(&id, "abc".to_string(), vec![0; 2])
+            .unwrap();
         let val = reg.read_memory(&id, "abc").unwrap();
         assert_eq!(val.len(), 2);
 
         // Memory total should now be 3 + 2 = 5, so we can write more.
-        reg.write_memory(&id, "xyz".to_string(), vec![0; 10]).unwrap();
+        reg.write_memory(&id, "xyz".to_string(), vec![0; 10])
+            .unwrap();
     }
 }

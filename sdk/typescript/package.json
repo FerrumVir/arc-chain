@@ -2,26 +2,30 @@
   "name": "@arc-chain/sdk",
   "version": "0.1.0",
   "description": "TypeScript SDK for the ARC Chain RPC API - the agent-native L1 blockchain",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "dist/index.d.ts",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build"
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "clean": "node ./scripts/clean.mjs",
+    "prepack": "npm run clean && npm run build",
+    "test:package": "node ./test-package.mjs",
+    "test": "npm run typecheck && npm run test:package"
   },
   "keywords": [
     "arc-chain",
@@ -32,14 +36,18 @@
     "sdk",
     "typescript"
   ],
-  "license": "MIT",
+  "license": "BUSL-1.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/FerrumVir/arc-chain.git",
     "directory": "sdk/typescript"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "devDependencies": {
     "typescript": "^5.9.3"

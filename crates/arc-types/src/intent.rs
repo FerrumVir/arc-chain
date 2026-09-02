@@ -77,10 +77,7 @@ pub enum IntentType {
         require_all: bool,
     },
     /// Custom intent with arbitrary action descriptor and payload.
-    Custom {
-        action: String,
-        data: Vec<u8>,
-    },
+    Custom { action: String, data: Vec<u8> },
 }
 
 /// Constraint on how an intent may be executed.
@@ -570,14 +567,7 @@ mod tests {
 
     #[test]
     fn test_create_transfer_intent() {
-        let intent = Intent::new_transfer(
-            test_addr(1),
-            test_token(10),
-            test_addr(2),
-            500,
-            200,
-            1,
-        );
+        let intent = Intent::new_transfer(test_addr(1), test_token(10), test_addr(2), 500, 200, 1);
 
         assert_eq!(intent.creator, test_addr(1));
         assert_eq!(intent.deadline, 200);
@@ -613,8 +603,14 @@ mod tests {
             0,
         );
 
-        assert!(!intent.is_expired(50), "should not be expired before deadline");
-        assert!(!intent.is_expired(99), "should not be expired one block before");
+        assert!(
+            !intent.is_expired(50),
+            "should not be expired before deadline"
+        );
+        assert!(
+            !intent.is_expired(99),
+            "should not be expired one block before"
+        );
         assert!(intent.is_expired(100), "should be expired at deadline");
         assert!(intent.is_expired(200), "should be expired after deadline");
     }
@@ -664,13 +660,7 @@ mod tests {
             },
         ];
 
-        let solution = Solution::new(
-            [1u8; 32],
-            test_addr(5),
-            steps,
-            995,
-            1000,
-        );
+        let solution = Solution::new([1u8; 32], test_addr(5), steps, 995, 1000);
 
         assert_eq!(solution.intent_id, [1u8; 32]);
         assert_eq!(solution.solver, test_addr(5));
@@ -688,7 +678,7 @@ mod tests {
     fn test_solver_reputation() {
         let mut solver = Solver::new(test_addr(1), 10_000);
 
-        assert_eq!(solver.success_rate(), 0.0);
+        assert!(solver.success_rate().abs() < f64::EPSILON);
         assert_eq!(solver.total_solved, 0);
         assert_eq!(solver.total_failed, 0);
         assert!(solver.is_active);
@@ -885,6 +875,9 @@ mod tests {
             100,
             43,
         );
-        assert_ne!(a.intent_id, c.intent_id, "different nonce must produce different ID");
+        assert_ne!(
+            a.intent_id, c.intent_id,
+            "different nonce must produce different ID"
+        );
     }
 }

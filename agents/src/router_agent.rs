@@ -22,13 +22,11 @@
 //!                                                   └──────────────┘
 //! ```
 
-use arc_crypto::{hash_bytes, Hash256};
 use arc_crypto::signature::Signature;
-use arc_types::transaction::{
-    RegisterBody, SettleBody, Transaction, TxBody, TxType,
-};
+use arc_crypto::{Hash256, hash_bytes};
+use arc_types::transaction::{RegisterBody, SettleBody, Transaction, TxBody, TxType};
 use arc_vm::agent::{
-    Agent, AgentAction, AgentConfig, AgentId, AgentRegistry, AgentState, ActionResult, ActionType,
+    ActionResult, ActionType, Agent, AgentAction, AgentConfig, AgentId, AgentRegistry, AgentState,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,6 +41,11 @@ const ROUTING_FEE: u64 = 10;
 // ---------------------------------------------------------------------------
 // Routing table
 // ---------------------------------------------------------------------------
+
+/// Seed data for one demo provider, in the order the demo table lists them:
+/// (routing key, display name, cost per request, average latency in ms,
+/// capabilities, reputation).
+type ProviderSeed = (&'static str, &'static str, u64, u64, Vec<&'static str>, f64);
 
 /// An entry in the routing table representing an available inference provider.
 #[derive(Debug, Clone)]
@@ -72,7 +75,9 @@ struct RoutingTable {
 
 impl RoutingTable {
     fn new() -> Self {
-        Self { providers: Vec::new() }
+        Self {
+            providers: Vec::new(),
+        }
     }
 
     fn register_provider(&mut self, entry: ProviderEntry) {
@@ -84,7 +89,9 @@ impl RoutingTable {
         capability: &str,
         strategy: RoutingStrategy,
     ) -> Option<&ProviderEntry> {
-        let candidates: Vec<&ProviderEntry> = self.providers.iter()
+        let candidates: Vec<&ProviderEntry> = self
+            .providers
+            .iter()
             .filter(|p| p.available && p.capabilities.iter().any(|c| c == capability))
             .collect();
 
@@ -93,19 +100,15 @@ impl RoutingTable {
         }
 
         match strategy {
-            RoutingStrategy::Cheapest => {
-                candidates.into_iter().min_by_key(|p| p.cost_per_request)
-            }
-            RoutingStrategy::Fastest => {
-                candidates.into_iter().min_by_key(|p| p.avg_latency_ms)
-            }
-            RoutingStrategy::Balanced => {
-                candidates.into_iter().min_by(|a, b| {
-                    let score_a = a.cost_per_request as f64 + a.avg_latency_ms as f64 * 0.1;
-                    let score_b = b.cost_per_request as f64 + b.avg_latency_ms as f64 * 0.1;
-                    score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
-                })
-            }
+            RoutingStrategy::Cheapest => candidates.into_iter().min_by_key(|p| p.cost_per_request),
+            RoutingStrategy::Fastest => candidates.into_iter().min_by_key(|p| p.avg_latency_ms),
+            RoutingStrategy::Balanced => candidates.into_iter().min_by(|a, b| {
+                let score_a = a.cost_per_request as f64 + a.avg_latency_ms as f64 * 0.1;
+                let score_b = b.cost_per_request as f64 + b.avg_latency_ms as f64 * 0.1;
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
         }
     }
 
@@ -142,7 +145,8 @@ fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
             "routing_fee": ROUTING_FEE,
             "strategies": ["cheapest", "fastest", "balanced"],
             "description": "Routes inference requests to optimal providers"
-        })).unwrap_or_default(),
+        }))
+        .unwrap_or_default(),
     });
 
     let hash = hash_bytes(&serde_json::to_vec(&body).unwrap_or_default());
@@ -256,20 +260,59 @@ fn main() {
         balance: 5_000_000,
     };
 
-    registry.register(router_agent).expect("router registration failed");
-    registry.update_state(&router_id, AgentState::Active).expect("activation failed");
+    registry
+        .register(router_agent)
+        .expect("router registration failed");
+    registry
+        .update_state(&router_id, AgentState::Active)
+        .expect("activation failed");
     println!("      Router agent registered: {:?}", router_id);
 
     // 2. Populate the routing table with inference providers.
     println!("[2/5] Populating routing table with inference providers\n");
     let mut routing_table = RoutingTable::new();
 
-    let providers_data: Vec<(&str, &str, u64, u64, Vec<&str>, f64)> = vec![
-        ("sentiment-fast",  "SentimentFast",  50,  10, vec!["sentiment"],                   0.95),
-        ("sentiment-cheap", "SentimentCheap", 20,  50, vec!["sentiment"],                   0.88),
-        ("oracle-primary",  "OraclePrimary",  30,   5, vec!["price-oracle"],                0.99),
-        ("oracle-backup",   "OracleBackup",   25,  15, vec!["price-oracle"],                0.92),
-        ("embedding-gpu",   "EmbeddingGPU",   100,  3, vec!["embedding", "sentiment"],      0.97),
+    let providers_data: Vec<ProviderSeed> = vec![
+        (
+            "sentiment-fast",
+            "SentimentFast",
+            50,
+            10,
+            vec!["sentiment"],
+            0.95,
+        ),
+        (
+            "sentiment-cheap",
+            "SentimentCheap",
+            20,
+            50,
+            vec!["sentiment"],
+            0.88,
+        ),
+        (
+            "oracle-primary",
+            "OraclePrimary",
+            30,
+            5,
+            vec!["price-oracle"],
+            0.99,
+        ),
+        (
+            "oracle-backup",
+            "OracleBackup",
+            25,
+            15,
+            vec!["price-oracle"],
+            0.92,
+        ),
+        (
+            "embedding-gpu",
+            "EmbeddingGPU",
+            100,
+            3,
+            vec!["embedding", "sentiment"],
+            0.97,
+        ),
     ];
 
     for (key, name, cost, latency, caps, rep) in &providers_data {
@@ -282,12 +325,17 @@ fn main() {
             available: true,
             reputation: *rep,
         };
-        println!("  Registered: {} (cost: {}, latency: {}ms, caps: {:?})",
-            name, cost, latency, caps);
+        println!(
+            "  Registered: {} (cost: {}, latency: {}ms, caps: {:?})",
+            name, cost, latency, caps
+        );
         routing_table.register_provider(entry);
     }
-    println!("\n      Total providers: {}, available: {}",
-        routing_table.provider_count(), routing_table.available_count());
+    println!(
+        "\n      Total providers: {}, available: {}",
+        routing_table.provider_count(),
+        routing_table.available_count()
+    );
 
     // 3. Register provider agents on-chain.
     println!("\n[3/5] Registering provider agents on-chain");
@@ -306,15 +354,19 @@ fn main() {
             reputation: 1.0,
             balance: 1_000_000,
         };
-        registry.register(agent).expect("provider registration failed");
-        registry.update_state(&id, AgentState::Active).expect("provider activation failed");
+        registry
+            .register(agent)
+            .expect("provider registration failed");
+        registry
+            .update_state(&id, AgentState::Active)
+            .expect("provider activation failed");
         println!("      Provider {} registered: {:?}", i + 1, id);
     }
 
     // 4. Process sample routing requests.
     println!("\n[4/5] Processing inference routing requests\n");
 
-    let requests = vec![
+    let requests = [
         InferenceRoutingRequest {
             capability: "sentiment".to_string(),
             input_data: b"I love ARC Chain!".to_vec(),
@@ -359,20 +411,29 @@ fn main() {
     let mut nonce = 1u64;
 
     for (i, request) in requests.iter().enumerate() {
-        println!("  Request {}: capability=\"{}\", strategy={:?}, max_cost={}",
-            i + 1, request.capability, request.strategy, request.max_cost);
+        println!(
+            "  Request {}: capability=\"{}\", strategy={:?}, max_cost={}",
+            i + 1,
+            request.capability,
+            request.strategy,
+            request.max_cost
+        );
 
         match routing_table.select_provider(&request.capability, request.strategy) {
             Some(provider) => {
                 let total_cost = provider.cost_per_request + ROUTING_FEE;
                 if total_cost > request.max_cost {
-                    println!("    REJECTED: total cost {} exceeds max_cost {}\n",
-                        total_cost, request.max_cost);
+                    println!(
+                        "    REJECTED: total cost {} exceeds max_cost {}\n",
+                        total_cost, request.max_cost
+                    );
                     continue;
                 }
 
-                println!("    Routed to: {} (cost: {} + {} routing = {})",
-                    provider.name, provider.cost_per_request, ROUTING_FEE, total_cost);
+                println!(
+                    "    Routed to: {} (cost: {} + {} routing = {})",
+                    provider.name, provider.cost_per_request, ROUTING_FEE, total_cost
+                );
 
                 let result_data = hash_bytes(&request.input_data).0.to_vec();
 
@@ -385,15 +446,22 @@ fn main() {
                     timestamp: i as u64,
                     result: ActionResult::Success(result_data),
                 };
-                registry.execute_action(&router_id, action).expect("routing action failed");
+                registry
+                    .execute_action(&router_id, action)
+                    .expect("routing action failed");
 
                 let request_hash = hash_bytes(&request.input_data);
                 let routing_settle = build_routing_fee_settle_tx(
-                    owner, Hash256(router_id_bytes), request_hash, nonce,
+                    owner,
+                    Hash256(router_id_bytes),
+                    request_hash,
+                    nonce,
                 );
                 nonce += 1;
-                println!("    Routing fee Settle TX: hash={}",
-                    &hex::encode(routing_settle.hash.0)[..16]);
+                println!(
+                    "    Routing fee Settle TX: hash={}",
+                    &hex::encode(routing_settle.hash.0)[..16]
+                );
 
                 let provider_settle = build_provider_settle_tx(
                     Hash256(router_id_bytes),
@@ -403,17 +471,21 @@ fn main() {
                     nonce,
                 );
                 nonce += 1;
-                println!("    Provider fee Settle TX: hash={} (amount: {})",
+                println!(
+                    "    Provider fee Settle TX: hash={} (amount: {})",
                     &hex::encode(provider_settle.hash.0)[..16],
-                    provider.cost_per_request);
+                    provider.cost_per_request
+                );
 
                 total_routing_fees += ROUTING_FEE;
                 total_provider_fees += provider.cost_per_request;
                 successful_routes += 1;
             }
             None => {
-                println!("    NO PROVIDER FOUND for capability \"{}\"",
-                    request.capability);
+                println!(
+                    "    NO PROVIDER FOUND for capability \"{}\"",
+                    request.capability
+                );
             }
         }
         println!();
@@ -429,8 +501,11 @@ fn main() {
     println!("  Successful routes:  {}", successful_routes);
     println!("  Total routing fees: {} ARC", total_routing_fees);
     println!("  Total provider fees:{} ARC", total_provider_fees);
-    println!("  Providers:          {} ({} available)",
-        routing_table.provider_count(), routing_table.available_count());
+    println!(
+        "  Providers:          {} ({} available)",
+        routing_table.provider_count(),
+        routing_table.available_count()
+    );
 
     println!("\nRouter Agent completed successfully.");
 }

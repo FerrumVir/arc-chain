@@ -19,7 +19,7 @@
 //!    erasure-coded chunks) alongside each block, enabling anyone to verify
 //!    individual chunks without the full dataset.
 
-use arc_crypto::{hash_bytes, Hash256, MerkleTree};
+use arc_crypto::{Hash256, MerkleTree, hash_bytes};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -95,7 +95,7 @@ pub fn encode_block_data(data: &[u8], data_chunks: u16, parity_chunks: u16) -> E
     let chunk_size = if original_size == 0 {
         1
     } else {
-        (original_size + k - 1) / k
+        original_size.div_ceil(k)
     };
 
     // Split data into k chunks, padding with zeros as needed
@@ -201,7 +201,11 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
         for (i, slot) in data_slots.iter().enumerate() {
             match slot.as_ref() {
                 Some(data) => result.extend_from_slice(data),
-                None => return Err(format!("data slot {i} unexpectedly None despite count={available_data}")),
+                None => {
+                    return Err(format!(
+                        "data slot {i} unexpectedly None despite count={available_data}"
+                    ));
+                }
             }
         }
         result.truncate(encoding.original_size);
@@ -217,10 +221,10 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
     let mut recovered = true;
     while recovered {
         recovered = false;
-        for j in 0..p {
-            if parity_slots[j].is_none() {
+        for (j, parity) in parity_slots.iter().enumerate() {
+            let Some(parity_data) = parity.as_ref() else {
                 continue;
-            }
+            };
 
             // Find which data chunks belong to parity group j
             let group_indices: Vec<usize> = (0..k).filter(|&i| i % p == j).collect();
@@ -233,16 +237,16 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
             if missing.len() == 1 {
                 // Can recover the single missing chunk
                 let missing_idx = missing[0];
-                let mut reconstructed = parity_slots[j].as_ref().unwrap().clone();
+                let mut reconstructed = parity_data.clone();
 
                 // XOR with all present data chunks in the group
                 for &i in &group_indices {
-                    if i != missing_idx {
-                        if let Some(ref chunk_data) = data_slots[i] {
-                            for (byte_idx, &byte) in chunk_data.iter().enumerate() {
-                                if byte_idx < reconstructed.len() {
-                                    reconstructed[byte_idx] ^= byte;
-                                }
+                    if i != missing_idx
+                        && let Some(ref chunk_data) = data_slots[i]
+                    {
+                        for (byte_idx, &byte) in chunk_data.iter().enumerate() {
+                            if byte_idx < reconstructed.len() {
+                                reconstructed[byte_idx] ^= byte;
                             }
                         }
                     }
@@ -439,7 +443,8 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
-        let data = b"Hello, ARC Chain data availability layer! This is test data for erasure coding.";
+        let data =
+            b"Hello, ARC Chain data availability layer! This is test data for erasure coding.";
         let encoding = encode_block_data(data, 4, 4);
 
         assert_eq!(encoding.original_size, data.len());
@@ -451,7 +456,11 @@ mod tests {
 
         // All chunks should have valid integrity
         for chunk in &encoding.chunks {
-            assert!(chunk.verify_integrity(), "chunk {} integrity failed", chunk.index);
+            assert!(
+                chunk.verify_integrity(),
+                "chunk {} integrity failed",
+                chunk.index
+            );
         }
 
         // Decode should recover original data
@@ -483,7 +492,8 @@ mod tests {
     #[test]
     fn test_partial_reconstruction() {
         // Encode with 4 data chunks and 4 parity chunks (k=4, n=8)
-        let data = b"Data availability is essential for blockchain scaling and light client security!";
+        let data =
+            b"Data availability is essential for blockchain scaling and light client security!";
         let full_encoding = encode_block_data(data, 4, 4);
 
         // Simulate losing some data chunks but keeping enough to reconstruct.
@@ -501,14 +511,16 @@ mod tests {
         let mut partial2 = full_encoding.clone();
         partial2.chunks.retain(|c| c.index != 1);
 
-        let decoded2 = decode_block_data(&partial2).expect("should reconstruct with chunk 1 missing");
+        let decoded2 =
+            decode_block_data(&partial2).expect("should reconstruct with chunk 1 missing");
         assert_eq!(decoded2, data);
 
         // Remove data chunks 0 and 1 (from different parity groups with k=4, p=4)
         let mut partial3 = full_encoding.clone();
         partial3.chunks.retain(|c| c.index != 0 && c.index != 1);
 
-        let decoded3 = decode_block_data(&partial3).expect("should reconstruct with two missing data chunks");
+        let decoded3 =
+            decode_block_data(&partial3).expect("should reconstruct with two missing data chunks");
         assert_eq!(decoded3, data);
     }
 
@@ -519,17 +531,29 @@ mod tests {
 
         // Valid chunk should verify
         let valid_chunk = &encoding.chunks[0];
-        assert!(verify_chunk(valid_chunk, &encoding.root, encoding.chunk_count));
+        assert!(verify_chunk(
+            valid_chunk,
+            &encoding.root,
+            encoding.chunk_count
+        ));
 
         // Corrupted chunk should not verify
         let mut corrupted = encoding.chunks[0].clone();
         corrupted.data[0] ^= 0xFF; // Flip bits
-        assert!(!verify_chunk(&corrupted, &encoding.root, encoding.chunk_count));
+        assert!(!verify_chunk(
+            &corrupted,
+            &encoding.root,
+            encoding.chunk_count
+        ));
 
         // Chunk with tampered proof should not verify
         let mut tampered_proof = encoding.chunks[1].clone();
         tampered_proof.proof = Hash256::ZERO;
-        assert!(!verify_chunk(&tampered_proof, &encoding.root, encoding.chunk_count));
+        assert!(!verify_chunk(
+            &tampered_proof,
+            &encoding.root,
+            encoding.chunk_count
+        ));
     }
 
     #[test]
@@ -636,6 +660,10 @@ mod tests {
         assert!(result.is_err(), "should fail with too few chunks");
     }
 
+    // `confidence` is assigned the literal 0.0 on the empty-encoding early-return
+    // path in `sample_availability`, never computed, so exact equality is the
+    // correct assertion here. An epsilon comparison would weaken the test.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_das_sampler_empty_encoding() {
         let sampler = DASampler::new(5);

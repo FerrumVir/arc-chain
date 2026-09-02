@@ -13,8 +13,45 @@ path = "src/main.rs"
 # Dev builds on stable use mock BLAKE3 verifier - proofs are structurally identical.
 [features]
 default = []
+benchmark-tools = ["arc-crypto/benchmark-tools", "arc-state/benchmark-tools"]
 candle = ["arc-inference/candle"]
 stwo-prover = ["arc-crypto/stwo-prover", "arc-state/stwo-prover"]
+# Historical public-testnet mutation drivers are inert, but keeping them behind
+# an explicit feature prevents default/release builds from treating them as
+# supported operational tools.
+retired-live-examples = []
+
+[[example]]
+name = "diag_model_reg"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "diag_open"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "keepalive"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "live_milestones_cde"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "live_paid_inference"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "manual_release"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "quick_transfer_test"
+required-features = ["retired-live-examples"]
+
+[[example]]
+name = "v079_signed_inference"
+required-features = ["retired-live-examples"]
 
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
@@ -47,14 +84,20 @@ blake3.workspace = true
 ed25519-dalek.workspace = true
 k256.workspace = true
 sha3.workspace = true
+sha2.workspace = true
 rayon.workspace = true
 lz4_flex.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rand = "0.8"
+tempfile = "3"
 
 [lints]
 workspace = true

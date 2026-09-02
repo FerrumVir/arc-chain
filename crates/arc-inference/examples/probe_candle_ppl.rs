@@ -17,8 +17,11 @@ fn main() {
     let mut model = ModelWeights::from_gguf(content, &mut file, &device).unwrap();
 
     let tokens_raw = std::fs::read_to_string(TOKENS_PATH).unwrap();
-    let tokens: Vec<u32> = serde_json::from_str::<Vec<u64>>(&tokens_raw).unwrap()
-        .into_iter().map(|x| x as u32).collect();
+    let tokens: Vec<u32> = serde_json::from_str::<Vec<u64>>(&tokens_raw)
+        .unwrap()
+        .into_iter()
+        .map(|x| x as u32)
+        .collect();
     let n = tokens.len().min(256);
     eprintln!("Evaluating {} tokens on candle reference", n);
 
@@ -38,12 +41,19 @@ fn main() {
         let logits = logits.squeeze(0).unwrap();
         let logits = if logits.dims().len() == 2 {
             logits.get(logits.dim(0).unwrap() - 1).unwrap()
-        } else { logits };
+        } else {
+            logits
+        };
         let v: Vec<f32> = logits.to_vec1().unwrap();
 
         // log-softmax
         let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let log_sum_exp: f64 = v.iter().map(|&x| ((x - max) as f64).exp()).sum::<f64>().ln() + max as f64;
+        let log_sum_exp: f64 = v
+            .iter()
+            .map(|&x| ((x - max) as f64).exp())
+            .sum::<f64>()
+            .ln()
+            + max as f64;
         let log_p = if next_tok < v.len() {
             v[next_tok] as f64 - log_sum_exp
         } else {

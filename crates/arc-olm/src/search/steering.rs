@@ -15,8 +15,13 @@ use std::path::Path;
 
 /// Extract 32-dimensional features from a single grid.
 fn grid_features(g: &Grid) -> Vec<f32> {
-    let h = g.len() as f32;
-    let w = if g.is_empty() { 0.0 } else { g[0].len() as f32 };
+    // Keep the integer dimensions around: the square/diagonal-symmetry checks below
+    // are asking "is this grid square?", which is an exact integer question, not a
+    // floating-point one.
+    let h_cells = g.len();
+    let w_cells = if g.is_empty() { 0 } else { g[0].len() };
+    let h = h_cells as f32;
+    let w = w_cells as f32;
     let total = h * w;
 
     // Color histogram (10 values, normalized to 0-1)
@@ -54,14 +59,14 @@ fn grid_features(g: &Grid) -> Vec<f32> {
     // Symmetry checks (fast)
     let sym_h = if *g == grid::hmirror(g) { 1.0 } else { 0.0 };
     let sym_v = if *g == grid::vmirror(g) { 1.0 } else { 0.0 };
-    let sym_d = if h == w && *g == grid::dmirror(g) {
+    let sym_d = if h_cells == w_cells && *g == grid::dmirror(g) {
         1.0
     } else {
         0.0
     };
     let sym_r = if *g == grid::rot180(g) { 1.0 } else { 0.0 };
 
-    let is_square = if h == w { 1.0 } else { 0.0 };
+    let is_square = if h_cells == w_cells { 1.0 } else { 0.0 };
     let bg_frac = hist[bg];
 
     // Assemble 32-dim vector
@@ -193,13 +198,14 @@ fn read_weight_matrix(
 
 fn matmul(matrix: &WeightMatrix, input: &[f32]) -> Vec<f32> {
     let mut output = vec![0.0f32; matrix.n_rows];
-    for i in 0..matrix.n_rows {
+    for (i, out) in output.iter_mut().enumerate() {
         let mut sum = matrix.bias[i];
         let row_start = i * matrix.n_cols;
-        for j in 0..matrix.n_cols.min(input.len()) {
-            sum += matrix.weights[row_start + j] * input[j];
+        // `take(n_cols)` on `input` gives exactly the old `0..n_cols.min(input.len())`.
+        for (j, &x) in input.iter().enumerate().take(matrix.n_cols) {
+            sum += matrix.weights[row_start + j] * x;
         }
-        output[i] = sum;
+        *out = sum;
     }
     output
 }
@@ -254,17 +260,25 @@ impl SteeringModel {
         let mut heads = Vec::new();
         for (_, head_dim) in &head_configs {
             let w = read_weight_matrix(&data, &mut cursor, *head_dim, h2)?;
-            heads.push(TypeHead { weights: w, prim_names: Vec::new() });
+            heads.push(TypeHead {
+                weights: w,
+                prim_names: Vec::new(),
+            });
         }
 
         // Read vocab section (newline-separated strings per head)
         for head in &mut heads {
-            if cursor + 4 > data.len() { break; }
+            if cursor + 4 > data.len() {
+                break;
+            }
             let vocab_len = read_u32(&data, &mut cursor) as usize;
-            if cursor + vocab_len > data.len() { break; }
+            if cursor + vocab_len > data.len() {
+                break;
+            }
             let vocab_str = String::from_utf8(data[cursor..cursor + vocab_len].to_vec()).ok()?;
             cursor += vocab_len;
-            head.prim_names = vocab_str.split('\n')
+            head.prim_names = vocab_str
+                .split('\n')
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .collect();
@@ -285,11 +299,7 @@ impl SteeringModel {
 impl SteeringModel {
     /// Score operations for the given state and type.
     /// Returns `(primitive_name, score)` pairs sorted by descending score.
-    pub fn score_operations(
-        &self,
-        features: &[f32],
-        current_type: &DagType,
-    ) -> Vec<(String, f32)> {
+    pub fn score_operations(&self, features: &[f32], current_type: &DagType) -> Vec<(String, f32)> {
         // Layer 1: matmul + ReLU
         let h1 = matmul(&self.layer1, features);
         let h1: Vec<f32> = h1.into_iter().map(|x| x.max(0.0)).collect();

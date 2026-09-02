@@ -164,10 +164,10 @@ impl PoseidonState {
 
             // --- MDS Mix ---
             let old = self.elements.clone();
-            for i in 0..t {
+            for (i, row) in mds.iter().enumerate().take(t) {
                 let mut acc: u64 = 0;
-                for j in 0..t {
-                    acc = mod_add(acc, mod_mul(mds[i][j], old[j]));
+                for (j, &o) in old.iter().enumerate().take(t) {
+                    acc = mod_add(acc, mod_mul(row[j], o));
                 }
                 self.elements[i] = acc;
             }
@@ -217,7 +217,7 @@ pub fn poseidon_hash_with_config(inputs: &[u64], config: &PoseidonConfig) -> u64
 /// finalised for full 256-bit output).
 pub fn poseidon_hash_bytes(data: &[u8]) -> [u8; 32] {
     // Pack bytes into u64 chunks (little-endian, 8 bytes each).
-    let mut limbs: Vec<u64> = Vec::with_capacity((data.len() + 7) / 8);
+    let mut limbs: Vec<u64> = Vec::with_capacity(data.len().div_ceil(8));
     for chunk in data.chunks(8) {
         let mut buf = [0u8; 8];
         buf[..chunk.len()].copy_from_slice(chunk);
@@ -285,8 +285,7 @@ impl PoseidonSponge {
             let remaining = self.absorb_buf.split_off(rate);
             let block = std::mem::replace(&mut self.absorb_buf, remaining);
             for (i, &v) in block.iter().enumerate() {
-                self.state.elements[1 + i] =
-                    mod_add(self.state.elements[1 + i], v % MODULUS);
+                self.state.elements[1 + i] = mod_add(self.state.elements[1 + i], v % MODULUS);
             }
             self.state.permute(&self.config);
         }

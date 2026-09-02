@@ -34,10 +34,13 @@
 
 use arc_crypto::Hash256;
 use arc_types::transaction::{
-    AssignmentEntry, CapacityAdvertisementBody, ModelRequestBody,
-    ShardAssignmentProposalBody,
+    AssignmentEntry, CapacityAdvertisementBody, ModelRequestBody, ShardAssignmentProposalBody,
 };
 use std::collections::BTreeMap;
+
+/// `(node_pubkey, model_id)` → the layer ranges that node is assigned for that
+/// model. Raw `[u8; 32]` keys because `Hash256` isn't `Ord`; rewrapped on output.
+type PerNodeModelRanges = BTreeMap<([u8; 32], [u8; 32]), Vec<(u32, u32)>>;
 
 /// Per-model layer count snapshot. The planner doesn't itself know how
 /// many layers a model has - callers fetch it from the registry and
@@ -92,8 +95,7 @@ pub fn compute_assignment(
     // assignments keyed by (node, model) so we can emit one
     // AssignmentEntry per pair at the end. Uses raw [u8; 32] for
     // model_id because Hash256 isn't Ord; we rewrap at output time.
-    let mut per_node_model: BTreeMap<([u8; 32], [u8; 32]), Vec<(u32, u32)>> =
-        BTreeMap::new();
+    let mut per_node_model: PerNodeModelRanges = BTreeMap::new();
 
     // Rough per-range memory bid: assume a layer costs ~100 MB at INT16
     // for a 7B model; bucket cost = layers_in_bucket × 100 MB. This is
@@ -109,8 +111,7 @@ pub fn compute_assignment(
         let ranges = layer_ranges(n_layers, DEFAULT_BUCKET_LAYERS);
 
         for (start, end) in ranges {
-            let bucket_bytes =
-                BYTES_PER_LAYER_HEURISTIC * (end - start) as u64;
+            let bucket_bytes = BYTES_PER_LAYER_HEURISTIC * (end - start) as u64;
 
             // Candidate list: every node that has enough remaining RAM.
             // Sort by (remaining_ram DESC, node_pubkey ASC) - deterministic
@@ -123,8 +124,11 @@ pub fn compute_assignment(
                 .collect();
             candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-            let picked: Vec<[u8; 32]> =
-                candidates.iter().take(k as usize).map(|(pk, _)| *pk).collect();
+            let picked: Vec<[u8; 32]> = candidates
+                .iter()
+                .take(k as usize)
+                .map(|(pk, _)| *pk)
+                .collect();
             for pk in &picked {
                 *remaining.get_mut(pk).unwrap() -= bucket_bytes;
                 per_node_model
@@ -206,7 +210,7 @@ pub fn compute_input_snapshot_hash(
             .then(a.request_id.cmp(&b.request_id))
     });
     let mut ads: Vec<&CapacityAdvertisementBody> = capacity_ads.iter().collect();
-    ads.sort_by(|a, b| a.node_pubkey.cmp(&b.node_pubkey));
+    ads.sort_by_key(|a| a.node_pubkey);
 
     let mut buf = Vec::new();
     for r in &reqs {
@@ -262,18 +266,12 @@ mod tests {
 
     #[test]
     fn test_layer_ranges_exact_split() {
-        assert_eq!(
-            layer_ranges(10, 5),
-            vec![(0, 5), (5, 10)]
-        );
+        assert_eq!(layer_ranges(10, 5), vec![(0, 5), (5, 10)]);
     }
 
     #[test]
     fn test_layer_ranges_trailing_remainder() {
-        assert_eq!(
-            layer_ranges(12, 5),
-            vec![(0, 5), (5, 10), (10, 12)]
-        );
+        assert_eq!(layer_ranges(12, 5), vec![(0, 5), (5, 10), (10, 12)]);
     }
 
     #[test]
@@ -297,7 +295,13 @@ mod tests {
         let a3 = ad(3, 8, "AS");
         let counts: LayerCounts = [(hash_bytes(m).0, 10u32)].into_iter().collect();
 
-        let p1 = compute_assignment(&[r1.clone(), r2.clone()], &[a1.clone(), a2.clone(), a3.clone()], &counts, 1000).unwrap();
+        let p1 = compute_assignment(
+            &[r1.clone(), r2.clone()],
+            &[a1.clone(), a2.clone(), a3.clone()],
+            &counts,
+            1000,
+        )
+        .unwrap();
         let p2 = compute_assignment(&[r2, r1], &[a3, a1, a2], &counts, 1000).unwrap();
 
         assert_eq!(p1.assignments.len(), p2.assignments.len());
@@ -355,7 +359,11 @@ mod tests {
         let p = compute_assignment(&reqs, &ads, &counts, 1000).unwrap();
         // 15 layers / 5 per bucket = 3 ranges, but node can hold
         // only 2 × 500 MB = 1000 MB.
-        let entry = p.assignments.iter().find(|a| a.node_pubkey == [1u8; 32]).unwrap();
+        let entry = p
+            .assignments
+            .iter()
+            .find(|a| a.node_pubkey == [1u8; 32])
+            .unwrap();
         assert!(entry.ranges.len() <= 2);
     }
 }

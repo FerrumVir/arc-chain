@@ -18,8 +18,7 @@ contract ARCStaking is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice The ARC ERC-20 token contract.
-    IERC20 public constant ARC_TOKEN =
-        IERC20(0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499);
+    IERC20 public constant ARC_TOKEN = IERC20(0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499);
 
     /// @notice Seconds in one year (365.25 days).
     uint256 public constant YEAR = 365.25 days;
@@ -32,13 +31,13 @@ contract ARCStaking is Ownable, ReentrancyGuard {
 
     // Tier minimum stake thresholds (18 decimals)
     uint256 public constant SPARK_MIN = 500_000e18;
-    uint256 public constant ARC_MIN   = 5_000_000e18;
-    uint256 public constant CORE_MIN  = 50_000_000e18;
+    uint256 public constant ARC_MIN = 5_000_000e18;
+    uint256 public constant CORE_MIN = 50_000_000e18;
 
     // APY in basis points
-    uint256 public constant SPARK_APY = 800;   // 8%
-    uint256 public constant ARC_APY   = 1_500; // 15%
-    uint256 public constant CORE_APY  = 2_500; // 25%
+    uint256 public constant SPARK_APY = 800; // 8%
+    uint256 public constant ARC_APY = 1500; // 15%
+    uint256 public constant CORE_APY = 2500; // 25%
 
     // -------------------------------------------------------------------------
     // Types
@@ -57,8 +56,8 @@ contract ARCStaking is Ownable, ReentrancyGuard {
         uint256 amount;
         uint256 stakedAt;
         uint256 lastClaimed;
-        Tier    tier;
-        bool    pendingUnstake;
+        Tier tier;
+        bool pendingUnstake;
         uint256 unstakeRequestedAt;
     }
 
@@ -140,10 +139,7 @@ contract ARCStaking is Ownable, ReentrancyGuard {
     function withdraw() external nonReentrant {
         StakeInfo storage info = _stakes[msg.sender];
         require(info.pendingUnstake, "ARCStaking: no pending unstake");
-        require(
-            block.timestamp >= info.unstakeRequestedAt + COOLDOWN,
-            "ARCStaking: cooldown not elapsed"
-        );
+        require(block.timestamp >= info.unstakeRequestedAt + COOLDOWN, "ARCStaking: cooldown not elapsed");
 
         uint256 amount = info.amount;
 
@@ -177,10 +173,7 @@ contract ARCStaking is Ownable, ReentrancyGuard {
     /// @dev Called by the owner (off-chain oracle / admin). Bonus = tps * 1e18 per node.
     /// @param nodes Array of node operator addresses.
     /// @param tps   Array of TPS values corresponding to each node.
-    function reportTPS(
-        address[] calldata nodes,
-        uint256[] calldata tps
-    ) external onlyOwner {
+    function reportTPS(address[] calldata nodes, uint256[] calldata tps) external onlyOwner {
         require(nodes.length == tps.length, "ARCStaking: length mismatch");
 
         for (uint256 i = 0; i < nodes.length; i++) {
@@ -249,15 +242,15 @@ contract ARCStaking is Ownable, ReentrancyGuard {
     /// @dev Determine the tier for a given stake `amount`.
     function _tierFor(uint256 amount) internal pure returns (Tier) {
         if (amount >= CORE_MIN) return Tier.Core;
-        if (amount >= ARC_MIN)  return Tier.Arc;
+        if (amount >= ARC_MIN) return Tier.Arc;
         if (amount >= SPARK_MIN) return Tier.Spark;
         return Tier.None;
     }
 
     /// @dev Return APY in basis points for a given `tier`.
     function _apyForTier(Tier tier) internal pure returns (uint256) {
-        if (tier == Tier.Core)  return CORE_APY;
-        if (tier == Tier.Arc)   return ARC_APY;
+        if (tier == Tier.Core) return CORE_APY;
+        if (tier == Tier.Arc) return ARC_APY;
         if (tier == Tier.Spark) return SPARK_APY;
         return 0;
     }

@@ -1,0 +1,1649 @@
+name: Release signing preflight
+
+run-name: Release preflight at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-signing-preflight
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: bind the candidate to exact protected main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.candidate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve one immutable candidate for the entire matrix
+        id: candidate
+        shell: bash
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          [ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]
+          [ "$DISPATCH_REF" = "refs/heads/main" ] || {
+            echo "::error::Dispatch this workflow from protected main, not $DISPATCH_REF."
+            exit 1
+          }
+          [[ "$DISPATCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          checked_out_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          remote_main_sha="$(git rev-parse refs/remotes/origin/main)"
+          [ "$checked_out_sha" = "$DISPATCH_SHA" ]
+          [ "$checked_out_sha" = "$remote_main_sha" ] || {
+            echo "::error::Protected main moved before the preflight candidate could be sealed. Dispatch again."
+            exit 1
+          }
+          echo "sha=$checked_out_sha" >> "$GITHUB_OUTPUT"
+          echo "Exact protected-main candidate: \`$checked_out_sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+  backup-readiness:
+    name: protected signing-key backup is ready
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    needs: validate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Select and download the exact-main ciphertext before secret access
+        id: backup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set +x
+          set -Eeuo pipefail
+          umask 077
+          main_sha="$EXPECTED_SHA"
+          [ "$(git rev-parse HEAD)" = "$main_sha" ]
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$main_sha" = "$(git rev-parse refs/remotes/origin/main)" ]
+          backup_run_id="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow release-signing-backup.yml \
+            --commit "$main_sha" \
+            --event workflow_dispatch \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')"
+          if [ -z "$backup_run_id" ]; then
+            echo "::error::No successful restore-tested signing-key backup exists for exact protected-main commit $main_sha."
+            exit 1
+          fi
+          artifact_json="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$backup_run_id/artifacts" \
+            --jq '[.artifacts[] | select(.expired == false) | {id, name}]')"
+          artifact_name="$(printf '%s' "$artifact_json" | jq -r \
+            --arg prefix "arc-signing-backup-$main_sha-$backup_run_id-" \
+            '[.[] | select(.name | startswith($prefix))] | if length == 1 then .[0].name else empty end')"
+          if [ -z "$artifact_name" ]; then
+            echo "::error::Exact-main backup run $backup_run_id has no unique unexpired ciphertext artifact."
+            exit 1
+          fi
+          if [[ ! "$artifact_name" =~ ^arc-signing-backup-${main_sha}-${backup_run_id}-[1-9][0-9]*-([0-9a-f]{64})$ ]]; then
+            echo "::error::Backup artifact name is not bound to run, attempt, and ciphertext hash."
+            exit 1
+          fi
+          cipher_sha256="${BASH_REMATCH[1]}"
+          work_dir="$RUNNER_TEMP/arc-backup-preflight-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [ ! -e "$work_dir" ]
+          install -d -m 700 -- "$work_dir"
+          gh run download "$backup_run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" \
+            --dir "$work_dir"
+          ciphertext="$work_dir/arc-signing-keys.tar.gpg"
+          [ -f "$ciphertext" ] && [ ! -L "$ciphertext" ] && [ -s "$ciphertext" ]
+          [ "$(wc -c < "$ciphertext" | tr -d ' ')" -le 2097152 ]
+          [ "$(sha256sum "$ciphertext" | awk '{print $1}')" = "$cipher_sha256" ]
+
+          # Pin the only non-system executable allowed to touch a restored key.
+          jq -e \
+            '.packages["node_modules/@tauri-apps/cli"].version == "2.11.4"
+             and .packages["node_modules/@tauri-apps/cli"].integrity == "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ=="
+             and .packages["node_modules/@tauri-apps/cli-linux-x64-gnu"].version == "2.11.4"
+             and .packages["node_modules/@tauri-apps/cli-linux-x64-gnu"].integrity == "sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ=="' \
+            desktop/package-lock.json >/dev/null
+          npm ci --prefix desktop --ignore-scripts
+          node_bin="$(command -v node)"
+          tauri_cli="$GITHUB_WORKSPACE/desktop/node_modules/@tauri-apps/cli/tauri.js"
+          [ -x "$node_bin" ] && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
+          [ "$("$node_bin" --version)" = "v24.20.0" ]
+          node_sha256="$(sha256sum "$node_bin" | awk '{print $1}')"
+          tauri_cli_sha256="$(sha256sum "$tauri_cli" | awk '{print $1}')"
+          [ "$tauri_cli_sha256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          [ "$(jq -r '.version' desktop/node_modules/@tauri-apps/cli/package.json)" = "2.11.4" ]
+          {
+            echo "backup_run_id=$backup_run_id"
+            echo "ciphertext=$ciphertext"
+            echo "cipher_sha256=$cipher_sha256"
+            echo "work_dir=$work_dir"
+            echo "node_bin=$node_bin"
+            echo "node_sha256=$node_sha256"
+            echo "tauri_cli=$tauri_cli"
+            echo "tauri_cli_sha256=$tauri_cli_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      # No repository script, package lifecycle, compiler, or source-generated
+      # executable runs before or while this step holds the recovery secret.
+      - name: Restore only the four bounded members and exercise both keys
+        id: restore
+        shell: bash
+        env:
+          ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}
+          EXPECTED_CIPHERTEXT_SHA256: ${{ steps.backup.outputs.cipher_sha256 }}
+          CIPHERTEXT: ${{ steps.backup.outputs.ciphertext }}
+          WORK_DIR: ${{ steps.backup.outputs.work_dir }}
+          ARC_NODE_BIN: ${{ steps.backup.outputs.node_bin }}
+          ARC_NODE_SHA256: ${{ steps.backup.outputs.node_sha256 }}
+          ARC_TAURI_CLI: ${{ steps.backup.outputs.tauri_cli }}
+          ARC_TAURI_CLI_SHA256: ${{ steps.backup.outputs.tauri_cli_sha256 }}
+          ARC_EXPECTED_MANIFEST_PUBLIC_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set +x
+          set -Eeuo pipefail
+          ulimit -c 0
+          umask 077
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS \
+            TAURI_CONFIG TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+            TAURI_SIGNING_PRIVATE_KEY_PATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB GIT_CONFIG_GLOBAL \
+            GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+          passphrase="${ARC_SIGNING_BACKUP_PASSPHRASE:-}"
+          unset ARC_SIGNING_BACKUP_PASSPHRASE
+          [ "${#passphrase}" -ge 32 ] || {
+            echo "::error::The protected signing-backup passphrase is unavailable or too short."
+            exit 1
+          }
+          [ -f "$CIPHERTEXT" ] && [ ! -L "$CIPHERTEXT" ] \
+            && [ "$(/usr/bin/sha256sum "$CIPHERTEXT" | /usr/bin/awk '{print $1}')" = "$EXPECTED_CIPHERTEXT_SHA256" ]
+          [ -x "$ARC_NODE_BIN" ] && [ -f "$ARC_NODE_BIN" ] && [ ! -L "$ARC_NODE_BIN" ]
+          [ -f "$ARC_TAURI_CLI" ] && [ ! -L "$ARC_TAURI_CLI" ]
+          [ "$(/usr/bin/sha256sum "$ARC_NODE_BIN" | /usr/bin/awk '{print $1}')" = "$ARC_NODE_SHA256" ]
+          [ "$(/usr/bin/sha256sum "$ARC_TAURI_CLI" | /usr/bin/awk '{print $1}')" = "$ARC_TAURI_CLI_SHA256" ]
+          [ "$ARC_TAURI_CLI_SHA256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          restored="$WORK_DIR/restored"
+          archive="$WORK_DIR/signing-keys.tar"
+          derived_manifest="$WORK_DIR/derived-manifest.pub"
+          cleanup_plaintext() {
+            unset ARC_SIGNING_BACKUP_PASSPHRASE passphrase \
+              ARC_EXPECTED_MANIFEST_PUBLIC_KEY
+            for secret_path in \
+              "$restored/KEY-SHA256SUMS" \
+              "$restored/release-manifest-ed25519" \
+              "$restored/release-manifest-ed25519.pub" \
+              "$restored/tauri-updater.key" \
+              "$archive" "$derived_manifest"; do
+              if [ -f "$secret_path" ] && [ ! -L "$secret_path" ]; then
+                /usr/bin/shred -u -- "$secret_path" || true
+              fi
+            done
+          }
+          trap cleanup_plaintext EXIT HUP INT TERM
+          /usr/bin/install -d -m 700 -- "$restored"
+          /usr/bin/printf '%s' "$passphrase" | /usr/bin/gpg \
+            --batch --yes --no-symkey-cache --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt --output "$archive" "$CIPHERTEXT"
+          unset passphrase
+
+          expected_members="$WORK_DIR/expected-members"
+          actual_members="$WORK_DIR/actual-members"
+          /usr/bin/printf '%s\n' \
+            KEY-SHA256SUMS \
+            release-manifest-ed25519 \
+            release-manifest-ed25519.pub \
+            tauri-updater.key | /usr/bin/sort > "$expected_members"
+          /usr/bin/tar -tf "$archive" | /usr/bin/sort > "$actual_members"
+          /usr/bin/cmp -s "$expected_members" "$actual_members" || {
+            echo "::error::Decrypted backup membership differs from the four-file contract."
+            exit 1
+          }
+          [ "$(/usr/bin/tar -tvf "$archive" | /usr/bin/awk '$1 !~ /^-/ {bad++} END {print bad+0}')" -eq 0 ] || {
+            echo "::error::Decrypted backup contains a non-regular archive member."
+            exit 1
+          }
+          /usr/bin/tar --extract --file "$archive" --directory "$restored" \
+            --no-same-owner --no-same-permissions -- \
+            KEY-SHA256SUMS release-manifest-ed25519 \
+            release-manifest-ed25519.pub tauri-updater.key
+          for name in KEY-SHA256SUMS release-manifest-ed25519 release-manifest-ed25519.pub tauri-updater.key; do
+            path="$restored/$name"
+            [ -f "$path" ] && [ ! -L "$path" ] && [ -s "$path" ] \
+              && [ "$(/usr/bin/wc -c < "$path" | /usr/bin/tr -d ' ')" -le 1048576 ]
+            /usr/bin/chmod 600 "$path"
+          done
+
+          /usr/bin/ssh-keygen -y -f "$restored/release-manifest-ed25519" \
+            > "$derived_manifest"
+          [ "$(/usr/bin/tr -d '\r\n' < "$derived_manifest")" = "$ARC_EXPECTED_MANIFEST_PUBLIC_KEY" ]
+          [ "$(/usr/bin/tr -d '\r\n' < "$restored/release-manifest-ed25519.pub")" = "$ARC_EXPECTED_MANIFEST_PUBLIC_KEY" ]
+
+          manifest_canary="$WORK_DIR/manifest-canary"
+          updater_canary="$WORK_DIR/updater-canary"
+          /usr/bin/printf '%s\n' 'ARC downloaded-backup manifest canary v1' > "$manifest_canary"
+          /usr/bin/printf '%s\n' 'ARC downloaded-backup updater canary v1' > "$updater_canary"
+          /usr/bin/ssh-keygen -Y sign \
+            -f "$restored/release-manifest-ed25519" \
+            -n arc-release-manifest-v1 "$manifest_canary"
+          "$ARC_NODE_BIN" "$ARC_TAURI_CLI" signer sign \
+            --private-key-path "$restored/tauri-updater.key" \
+            --password "" "$updater_canary"
+          [ -s "$manifest_canary.sig" ] && [ ! -L "$manifest_canary.sig" ]
+          [ -s "$updater_canary.sig" ] && [ ! -L "$updater_canary.sig" ]
+
+          # Remove passphrase-equivalent plaintext before any repository
+          # verifier, compiler, or package lifecycle can run.
+          cleanup_plaintext
+          trap - EXIT HUP INT TERM
+          unset ARC_EXPECTED_MANIFEST_PUBLIC_KEY CIPHERTEXT EXPECTED_CIPHERTEXT_SHA256
+          /usr/bin/ssh-keygen -Y verify \
+            -f <(/usr/bin/printf '%s\n' \
+              'arc-release namespaces="arc-release-manifest-v1" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY arc-release-manifest-v1') \
+            -I arc-release -n arc-release-manifest-v1 \
+            -s "$manifest_canary.sig" < "$manifest_canary"
+          {
+            echo "updater_canary=$updater_canary"
+            echo "updater_signature=$updater_canary.sig"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Verify the updater canary only after all recovered secrets are gone
+        shell: bash
+        env:
+          UPDATER_CANARY: ${{ steps.restore.outputs.updater_canary }}
+          UPDATER_SIGNATURE: ${{ steps.restore.outputs.updater_signature }}
+          ARC_EXPECTED_UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlBOTcwQ0FBQ0U1NjQ3M0IKUldRN1IxYk9xZ3lYbWcrbkhkWnZlc0tmWW1uTTlhcDljLzF4cUZtUUVibTRNa2V4TjBoNHJqY2EK
+        run: |
+          set -Eeuo pipefail
+          verifier_target="$RUNNER_TEMP/tauri-updater-backup-verifier"
+          CARGO_TARGET_DIR="$verifier_target" cargo build --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
+          "$verifier_target/debug/tauri-updater-verifier" \
+            "$ARC_EXPECTED_UPDATER_PUBLIC_KEY" \
+            "$UPDATER_CANARY" "$UPDATER_SIGNATURE"
+          {
+            echo "Exact-main signing-key backup run: \`${{ steps.backup.outputs.backup_run_id }}\`"
+            echo "Protected passphrase successfully restored both authorized keys."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove all downloaded and restored backup material
+        if: ${{ always() }}
+        shell: bash
+        env:
+          WORK_DIR: ${{ steps.backup.outputs.work_dir }}
+        run: |
+          set +x
+          set -Eeuo pipefail
+          expected="$RUNNER_TEMP/arc-backup-preflight-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [ -z "${WORK_DIR:-}" ] || [ "$WORK_DIR" = "$expected" ] || {
+            echo "::error::Refusing unexpected backup cleanup path."
+            exit 1
+          }
+          if [ -d "$expected" ] && [ ! -L "$expected" ]; then
+            find "$expected" -type f -exec shred -u -- {} + 2>/dev/null || true
+            chmod -R u+rwX -- "$expected" 2>/dev/null || true
+            rm -rf -- "$expected"
+          fi
+
+  manifest-key:
+    name: protected manifest-key canary (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    needs: validate
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind preflight to the exact protected-main head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$CHECKED_OUT_SHA" != "$REMOTE_MAIN_SHA" ]; then
+            echo "::error::Preflight checkout $CHECKED_OUT_SHA is not current protected main $REMOTE_MAIN_SHA."
+            exit 1
+          fi
+          [ "$CHECKED_OUT_SHA" = "$EXPECTED_SHA" ]
+          {
+            echo '## ARC release signing preflight'
+            echo
+            echo "Exact protected-main commit: \`$CHECKED_OUT_SHA\`"
+            echo
+            echo 'The release tag and final publisher must remain bound to this SHA.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sign only the manifest-key canary
+        id: manifest-canary
+        shell: bash
+        env:
+          ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set +x
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH SSH_AUTH_SOCK SSH_SK_PROVIDER
+          if [ -z "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]; then
+            echo "::error::ARC_RELEASE_MANIFEST_PRIVATE_KEY is unavailable."
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/arc-release-manifest-key"
+          canary="$RUNNER_TEMP/arc-release-signing-canary"
+          cleanup_key() {
+            unset ARC_RELEASE_MANIFEST_PRIVATE_KEY
+            if [ -f "$key_file" ] && [ ! -L "$key_file" ]; then
+              /usr/bin/shred -u -- "$key_file" || true
+            fi
+          }
+          trap cleanup_key EXIT HUP INT TERM
+          umask 077
+          /usr/bin/printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$key_file"
+          /usr/bin/printf '%s\n' 'ARC protected release signing canary v1' > "$canary"
+          /usr/bin/chmod 600 "$key_file"
+          /usr/bin/ssh-keygen -Y sign \
+            -f "$key_file" \
+            -n arc-release-manifest-v1 \
+            "$canary"
+          cleanup_key
+          trap - EXIT HUP INT TERM
+          {
+            echo "canary=$canary"
+            echo "signature=$canary.sig"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the manifest-key canary after private-key removal
+        shell: bash
+        env:
+          CANARY: ${{ steps.manifest-canary.outputs.canary }}
+          SIGNATURE: ${{ steps.manifest-canary.outputs.signature }}
+        run: |
+          set -Eeuo pipefail
+          cleanup() {
+            rm -f -- "$CANARY" "$SIGNATURE"
+          }
+          trap cleanup EXIT HUP INT TERM
+          ssh-keygen -Y verify \
+            -f release/arc-release-allowed-signers \
+            -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s "$SIGNATURE" \
+            < "$CANARY"
+          cleanup
+          trap - EXIT HUP INT TERM
+
+
+  updater-key:
+    name: protected updater-key canary (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    environment: release
+    needs: validate
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            exe-suffix: ''
+          - platform: macos-arm64
+            runner: macos-15
+            exe-suffix: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            exe-suffix: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            exe-suffix: .exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind preflight to the exact protected-main head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          REMOTE_MAIN_SHA="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$CHECKED_OUT_SHA" != "$REMOTE_MAIN_SHA" ]; then
+            echo "::error::Preflight checkout $CHECKED_OUT_SHA is not current protected main $REMOTE_MAIN_SHA."
+            exit 1
+          fi
+          [ "$CHECKED_OUT_SHA" = "$EXPECTED_SHA" ]
+          echo "Exact protected-main commit: \`$CHECKED_OUT_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install the locked Tauri signer
+        id: updater-signer
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          case "$PLATFORM" in
+            linux-x86_64)
+              native='@tauri-apps/cli-linux-x64-gnu'
+              native_integrity='sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ=='
+              ;;
+            macos-arm64)
+              native='@tauri-apps/cli-darwin-arm64'
+              native_integrity='sha512-1ryOF3ZhpZ/nemHV5zVwBQBz9jDGKmKPvWPADOhc83ig0P4bMc2iER4NbC6r9sjeIZ6RVQ4g3RZIYvezhcl4TQ=='
+              ;;
+            macos-x86_64)
+              native='@tauri-apps/cli-darwin-x64'
+              native_integrity='sha512-uFsGQAAfuyz1k/yGLmkWfkBlgKAqZfxqlHmLWx81QU27RJWfmbNHCIq8T8w1e+VClleIuZUjpHWfoE4E3DLo3A=='
+              ;;
+            windows-x86_64)
+              native='@tauri-apps/cli-win32-x64-msvc'
+              native_integrity='sha512-+vDiqBIU5dMISg/wNvX3sF+ZHfgJGJ5T0AcO+EHNXV9GGAG+P5fzodlDXD3QdKCRgZxMoCm5PPvj3BqLNjBthw=='
+              ;;
+          esac
+          jq -e --arg native "node_modules/$native" \
+            --arg native_integrity "$native_integrity" \
+            '.packages["node_modules/@tauri-apps/cli"].version == "2.11.4"
+             and .packages["node_modules/@tauri-apps/cli"].integrity == "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ=="
+             and .packages[$native].version == "2.11.4"
+             and .packages[$native].integrity == $native_integrity' \
+            desktop/package-lock.json >/dev/null
+          npm ci --prefix desktop --ignore-scripts
+          node_bin="$(command -v node)"
+          tauri_cli="$GITHUB_WORKSPACE/desktop/node_modules/@tauri-apps/cli/tauri.js"
+          [ -x "$node_bin" ] && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
+          [ "$("$node_bin" --version)" = "v24.20.0" ]
+          case "$RUNNER_OS" in
+            macOS)
+              node_sha256="$(/usr/bin/shasum -a 256 "$node_bin" | /usr/bin/awk '{print $1}')"
+              tauri_cli_sha256="$(/usr/bin/shasum -a 256 "$tauri_cli" | /usr/bin/awk '{print $1}')"
+              ;;
+            Linux|Windows)
+              node_sha256="$(/usr/bin/sha256sum "$node_bin" | /usr/bin/awk '{print $1}')"
+              tauri_cli_sha256="$(/usr/bin/sha256sum "$tauri_cli" | /usr/bin/awk '{print $1}')"
+              ;;
+          esac
+          [ "$tauri_cli_sha256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          {
+            echo "node_bin=$node_bin"
+            echo "node_sha256=$node_sha256"
+            echo "tauri_cli=$tauri_cli"
+            echo "tauri_cli_sha256=$tauri_cli_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign the updater-key canary
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # The retained v0.7-compatible key is intentionally unencrypted.
+          # Tauri still requires the password variable to be present in a
+          # headless runner; an absent variable attempts an interactive prompt.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          ARC_NODE_BIN: ${{ steps.updater-signer.outputs.node_bin }}
+          ARC_NODE_SHA256: ${{ steps.updater-signer.outputs.node_sha256 }}
+          ARC_TAURI_CLI: ${{ steps.updater-signer.outputs.tauri_cli }}
+          ARC_TAURI_CLI_SHA256: ${{ steps.updater-signer.outputs.tauri_cli_sha256 }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set +x
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS \
+            TAURI_CONFIG TAURI_SIGNING_PRIVATE_KEY_PATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB
+          cleanup_signing_env() {
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          }
+          trap cleanup_signing_env EXIT HUP INT TERM
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is unavailable."
+            exit 1
+          fi
+          tauri_canary="$RUNNER_TEMP/arc-tauri-signing-canary"
+          /usr/bin/printf '%s\n' 'ARC protected Tauri signing canary v1' > "$tauri_canary"
+          [ -x "$ARC_NODE_BIN" ] && [ -f "$ARC_NODE_BIN" ] && [ ! -L "$ARC_NODE_BIN" ]
+          [ -f "$ARC_TAURI_CLI" ] && [ ! -L "$ARC_TAURI_CLI" ]
+          case "$RUNNER_OS" in
+            macOS)
+              [ "$(/usr/bin/shasum -a 256 "$ARC_NODE_BIN" | /usr/bin/awk '{print $1}')" = "$ARC_NODE_SHA256" ]
+              [ "$(/usr/bin/shasum -a 256 "$ARC_TAURI_CLI" | /usr/bin/awk '{print $1}')" = "$ARC_TAURI_CLI_SHA256" ]
+              ;;
+            Linux|Windows)
+              [ "$(/usr/bin/sha256sum "$ARC_NODE_BIN" | /usr/bin/awk '{print $1}')" = "$ARC_NODE_SHA256" ]
+              [ "$(/usr/bin/sha256sum "$ARC_TAURI_CLI" | /usr/bin/awk '{print $1}')" = "$ARC_TAURI_CLI_SHA256" ]
+              ;;
+          esac
+          [ "$ARC_TAURI_CLI_SHA256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          "$ARC_NODE_BIN" "$ARC_TAURI_CLI" signer sign "$tauri_canary"
+          [ -s "$tauri_canary.sig" ]
+          cleanup_signing_env
+          trap - EXIT HUP INT TERM
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Verify the updater-key canary without private keys
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tauri_canary="$RUNNER_TEMP/arc-tauri-signing-canary"
+          verifier_target="$RUNNER_TEMP/arc-tauri-verifier"
+          cleanup() {
+            rm -f -- "$tauri_canary" "$tauri_canary.sig"
+          }
+          trap cleanup EXIT HUP INT TERM
+          tauri_public_key="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text())
+          print(config["plugins"]["updater"]["pubkey"])
+          PY
+          )"
+          CARGO_TARGET_DIR="$verifier_target" cargo build --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
+          "$verifier_target/debug/tauri-updater-verifier${{ matrix.exe-suffix }}" \
+            "$tauri_public_key" "$tauri_canary" "$tauri_canary.sig"
+          cleanup
+          trap - EXIT HUP INT TERM
+
+  headless-runtime:
+    name: pre-tag headless runtime (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Build and actually boot every GUI-free target promised by the
+          # immutable release. No platform may compile for the first time
+          # after the protected tag exists.
+          - platform: linux-x86_64
+            # Build against the oldest supported glibc baseline. A GNU binary
+            # linked on Ubuntu 24 can require symbols absent from Ubuntu 22,
+            # even if later container smokes are present.
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary-suffix: ''
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary-suffix: ''
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary-suffix: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary-suffix: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary-suffix: .exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind candidate build to exact protected-main head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$checked_out_sha" = "$(git rev-parse refs/remotes/origin/main)" ]
+          [ "$checked_out_sha" = "$EXPECTED_SHA" ]
+          echo "Exact protected-main commit: \`$checked_out_sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: pretag-headless-${{ matrix.target }}
+          workspaces: . -> target
+
+      - name: Build the real release node and CLI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo build --release --locked -p arc-node --features candle --target "${{ matrix.target }}"
+          cargo build --release --locked -p arc-cli --target "${{ matrix.target }}"
+
+      - name: Boot the headless node and require a truthful health response
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node="target/${{ matrix.target }}/release/arc-node${{ matrix.binary-suffix }}"
+          cli="target/${{ matrix.target }}/release/arc${{ matrix.binary-suffix }}"
+          "$node" --version | grep -F " $(awk -F' *= *' '/^version/ { gsub(/\"/, "", $2); print $2; exit }' Cargo.toml)"
+          "$cli" --version >/dev/null
+          smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/arc-pretag-${{ matrix.platform }}.XXXXXX")"
+          log="$smoke_dir/node.log"
+          # Invoked indirectly by trap.
+          # shellcheck disable=SC2317,SC2329
+          cleanup() {
+            if [ -n "${node_pid:-}" ]; then
+              if [ "$RUNNER_OS" = Windows ]; then
+                taskkill.exe /PID "$node_pid" /T /F >/dev/null 2>&1 || true
+              else
+                kill "$node_pid" 2>/dev/null || true
+              fi
+              wait "$node_pid" 2>/dev/null || true
+            fi
+            rm -rf -- "$smoke_dir"
+          }
+          trap cleanup EXIT HUP INT TERM
+          "$node" \
+            --rpc 127.0.0.1:19944 \
+            --p2p-port 19945 \
+            --eth-rpc-port 0 \
+            --data-dir "$smoke_dir/data" \
+            --genesis genesis.toml \
+            --no-community >"$log" 2>&1 &
+          node_pid=$!
+          for _ in $(seq 1 80); do
+            if ! kill -0 "$node_pid" 2>/dev/null; then
+              cat "$log"
+              exit 1
+            fi
+            response="$(curl -fsS --max-time 2 http://127.0.0.1:19944/health 2>/dev/null || true)"
+            if printf '%s' "$response" | grep -Eq '"status":"(ok|degraded)"'; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat "$log"
+          exit 1
+
+      - name: Package a hash-bound validator-staging artifact
+        id: package
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+          BINARY_SUFFIX: ${{ matrix.binary-suffix }}
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          stage="pretag-artifacts/headless-$PLATFORM"
+          payload="$stage/payload"
+          mkdir -p "$payload"
+          cp "target/$TARGET/release/arc-node$BINARY_SUFFIX" \
+            "$payload/arc-node-$PLATFORM$BINARY_SUFFIX"
+          cp "target/$TARGET/release/arc$BINARY_SUFFIX" \
+            "$payload/arc-cli-$PLATFORM$BINARY_SUFFIX"
+          cp genesis.toml "$payload/genesis.toml"
+          chmod +x \
+            "$payload/arc-node-$PLATFORM$BINARY_SUFFIX" \
+            "$payload/arc-cli-$PLATFORM$BINARY_SUFFIX"
+          python3 scripts/release/package-pretag-artifact.py \
+            --kind headless \
+            --platform "$PLATFORM" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXPECTED_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --version "$version" \
+            --rust-target "$TARGET" \
+            --payload-dir "$payload" \
+            --stage-dir "$stage" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload create-only exact-SHA staging artifact
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            pretag-artifacts/headless-${{ matrix.platform }}/*.tar.gz
+            pretag-artifacts/headless-${{ matrix.platform }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Record staging artifact receipt
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.package.outputs.artifact_name }}
+          ARCHIVE_SHA: ${{ steps.package.outputs.archive_sha }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          {
+            echo "Headless staging artifact: \`$ARTIFACT_NAME\`"
+            echo "Archive SHA-256: \`$ARCHIVE_SHA\`"
+            echo "Actions artifact ID: \`$ARTIFACT_ID\`"
+            echo "Actions artifact digest: \`$ARTIFACT_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  desktop-unsigned:
+    name: pre-tag no-key desktop build and bundle (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    needs: validate
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            rust-target: x86_64-unknown-linux-gnu
+            tauri-args: --target x86_64-unknown-linux-gnu
+            binary-suffix: ''
+          - platform: macos-arm64
+            runner: macos-15
+            rust-target: aarch64-apple-darwin
+            tauri-args: --target aarch64-apple-darwin
+            binary-suffix: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            tauri-args: --target x86_64-apple-darwin
+            binary-suffix: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            tauri-args: --target x86_64-pc-windows-msvc
+            binary-suffix: .exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind package build to exact protected-main head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$checked_out_sha" = "$(git rev-parse refs/remotes/origin/main)" ]
+          [ "$checked_out_sha" = "$EXPECTED_SHA" ]
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: pretag-desktop-${{ matrix.rust-target }}
+          workspaces: desktop/src-tauri -> target
+
+      - name: Install exact locked desktop dependencies for the unsigned build
+        working-directory: desktop
+        shell: bash
+        run: npm ci
+
+      - name: Build the desktop binary without signing keys
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm exec --offline -- tauri build --ci --no-bundle \
+            ${{ matrix.tauri-args }} -- --locked
+
+      - name: Bundle native packages without updater signing keys
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+            TAURI_SIGNING_PRIVATE_KEY_PATH
+          npm exec --offline -- tauri bundle --ci --no-sign \
+            ${{ matrix.tauri-args }}
+
+      - name: Normalize and package the exact no-key bundle handoff
+        id: handoff
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.rust-target }}
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git diff --exit-code -- \
+            Cargo.toml Cargo.lock \
+            desktop/package.json desktop/package-lock.json \
+            desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock \
+            desktop/src-tauri/tauri.conf.json
+          root="desktop/src-tauri/target/$TARGET/release/bundle"
+          payload="unsigned-desktop-payload/$PLATFORM"
+          mkdir -p "$payload"
+          if find "$root" -type f -name '*.sig' -print -quit | grep -q .; then
+            echo '::error::The no-key bundler unexpectedly created a signature.'
+            exit 1
+          fi
+
+          find_one() {
+            local pattern="$1"
+            local matches=()
+            while IFS= read -r match; do
+              matches+=("$match")
+            done < <(find "$root" -path "$root/$pattern" -type f -size +0c -print)
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one nonempty $root/$pattern; found ${#matches[@]}."
+              exit 1
+            fi
+            printf '%s\n' "${matches[0]}"
+          }
+
+          case "$PLATFORM" in
+            linux-x86_64)
+              cp "$(find_one 'appimage/*.AppImage')" \
+                "$payload/arc-desktop-linux-x86_64.AppImage"
+              cp "$(find_one 'deb/*.deb')" \
+                "$payload/arc-desktop-linux-x86_64.deb"
+              cp "$(find_one 'rpm/*.rpm')" \
+                "$payload/arc-desktop-linux-x86_64.rpm"
+              ;;
+            macos-arm64|macos-x86_64)
+              cp "$(find_one 'macos/*.app.tar.gz')" \
+                "$payload/arc-desktop-$PLATFORM.app.tar.gz"
+              cp "$(find_one 'dmg/*.dmg')" \
+                "$payload/arc-desktop-$PLATFORM.dmg"
+              ;;
+            windows-x86_64)
+              cp "$(find_one 'nsis/*-setup.exe')" \
+                "$payload/arc-desktop-windows-x86_64-setup.exe"
+              cp "$(find_one 'msi/*.msi')" \
+                "$payload/arc-desktop-windows-x86_64.msi"
+              ;;
+            *)
+              echo "::error::Unsupported desktop platform: $PLATFORM"
+              exit 1
+              ;;
+          esac
+
+          version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          python3 scripts/release/unsigned-desktop-handoff.py package \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXPECTED_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --platform "$PLATFORM" \
+            --rust-target "$TARGET" \
+            --version "$version" \
+            --payload-dir "$payload" \
+            --stage-dir "unsigned-desktop/$PLATFORM" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload create-only unsigned desktop handoff
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.handoff.outputs.artifact_name }}
+          path: |
+            unsigned-desktop/${{ matrix.platform }}/*.tar.gz
+            unsigned-desktop/${{ matrix.platform }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Record immutable unsigned handoff receipt
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.handoff.outputs.artifact_name }}
+          ARCHIVE_SHA: ${{ steps.handoff.outputs.archive_sha }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          {
+            echo "Unsigned desktop handoff: \`$ARTIFACT_NAME\`"
+            echo "Archive SHA-256: \`$ARCHIVE_SHA\`"
+            echo "Actions artifact ID: \`$ARTIFACT_ID\`"
+            echo "Actions artifact digest: \`$ARTIFACT_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  desktop-signer-handoff:
+    name: seal verified desktop payloads for isolated signers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [validate, desktop-unsigned]
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.seal.outputs.artifact_name }}
+      manifest_sha: ${{ steps.seal.outputs.manifest_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select all four exact no-key handoff artifacts
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          api="$RUNNER_TEMP/unsigned-desktop-artifacts.json"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[]' | jq -s '{artifacts: .}' > "$api"
+          version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          selection='{}'
+          artifact_ids=''
+          for pair in \
+            linux-x86_64:x86_64-unknown-linux-gnu \
+            macos-arm64:aarch64-apple-darwin \
+            macos-x86_64:x86_64-apple-darwin \
+            windows-x86_64:x86_64-pc-windows-msvc; do
+            platform="${pair%%:*}"
+            target="${pair#*:}"
+            output="$RUNNER_TEMP/$platform.out"
+            python3 scripts/release/unsigned-desktop-handoff.py select \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$EXPECTED_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --platform "$platform" \
+              --rust-target "$target" \
+              --version "$version" \
+              --api-json "$api" \
+              --github-output "$output" >/dev/null
+            artifact_id="$(sed -n 's/^artifact_id=//p' "$output")"
+            artifact_json="$(sed -n 's/^artifact_json=//p' "$output")"
+            selection="$(jq -cn \
+              --argjson current "$selection" \
+              --arg platform "$platform" \
+              --argjson artifact "$artifact_json" \
+              '$current + {($platform): $artifact}')"
+            artifact_ids="${artifact_ids:+$artifact_ids,}$artifact_id"
+          done
+          {
+            echo "selection=$selection"
+            echo "artifact_ids=$artifact_ids"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download every exact no-key handoff by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.select.outputs.artifact_ids }}
+          path: unsigned-downloads
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Materialize and verify every handoff without release secrets
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          SELECTION: ${{ steps.select.outputs.selection }}
+        run: |
+          set -Eeuo pipefail
+          version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          mkdir desktop-signer-handoff
+          for pair in \
+            linux-x86_64:x86_64-unknown-linux-gnu \
+            macos-arm64:aarch64-apple-darwin \
+            macos-x86_64:x86_64-apple-darwin \
+            windows-x86_64:x86_64-pc-windows-msvc; do
+            platform="${pair%%:*}"
+            target="${pair#*:}"
+            artifact="$(jq -c --arg platform "$platform" '.[$platform]' <<< "$SELECTION")"
+            python3 scripts/release/unsigned-desktop-handoff.py materialize \
+              --repository "$GITHUB_REPOSITORY" \
+              --commit "$EXPECTED_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --platform "$platform" \
+              --rust-target "$target" \
+              --version "$version" \
+              --artifact-json "$artifact" \
+              --expected-artifact-id "$(jq -r '.id' <<< "$artifact")" \
+              --expected-artifact-digest "$(jq -r '.digest' <<< "$artifact")" \
+              --expected-archive-sha256 "$(jq -r '.archive_sha256' <<< "$artifact")" \
+              --downloads-root unsigned-downloads \
+              --output-dir "desktop-signer-handoff/$platform"
+          done
+
+      - name: Bind the direct signer handoff to exact inputs
+        id: seal
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            desktop-signer-handoff "$GITHUB_OUTPUT" <<'PY'
+          import hashlib, json, pathlib, sys
+          repository, commit, run_id, attempt, root_raw, output_raw = sys.argv[1:]
+          root = pathlib.Path(root_raw)
+          platforms = {}
+          for child in sorted(root.iterdir()):
+              receipt_path = child / "HANDOFF-RECEIPT.json"
+              receipt_bytes = receipt_path.read_bytes()
+              receipt = json.loads(receipt_bytes)
+              canonical = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+              if canonical != receipt_bytes or receipt.get("platform") != child.name:
+                  raise SystemExit("non-canonical or cross-platform signer receipt")
+              platforms[child.name] = receipt
+          expected = {"linux-x86_64", "macos-arm64", "macos-x86_64", "windows-x86_64"}
+          if set(platforms) != expected:
+              raise SystemExit("desktop signer platform set differs")
+          manifest = {
+              "schema": "arc.desktop-signer-handoff.v1",
+              "repository": repository,
+              "commit": commit,
+              "workflow_run_id": int(run_id),
+              "workflow_run_attempt": int(attempt),
+              "platforms": platforms,
+          }
+          payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          path = root / "DESKTOP-SIGNER-HANDOFF.json"
+          path.write_bytes(payload)
+          digest = hashlib.sha256(payload).hexdigest()
+          name = f"arc-desktop-signer-handoff-{commit}-{run_id}-{attempt}-{digest}"
+          with pathlib.Path(output_raw).open("a", encoding="utf-8") as output:
+              output.write(f"manifest_sha={digest}\nartifact_name={name}\n")
+          PY
+
+      - name: Upload one create-only direct-signer handoff
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.seal.outputs.artifact_name }}
+          path: desktop-signer-handoff/*
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  desktop-bundle:
+    name: pre-tag desktop package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    environment: release
+    needs: [validate, desktop-signer-handoff]
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            rust-target: x86_64-unknown-linux-gnu
+            tauri-args: --target x86_64-unknown-linux-gnu
+            binary-suffix: ''
+          - platform: macos-arm64
+            runner: macos-15
+            rust-target: aarch64-apple-darwin
+            tauri-args: --target aarch64-apple-darwin
+            binary-suffix: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            tauri-args: --target x86_64-apple-darwin
+            binary-suffix: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            tauri-args: --target x86_64-pc-windows-msvc
+            binary-suffix: .exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind clean signer to exact protected-main head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$checked_out_sha" = "$(git rev-parse refs/remotes/origin/main)" ]
+          [ "$checked_out_sha" = "$EXPECTED_SHA" ]
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Download the sealed direct-signer handoff by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.desktop-signer-handoff.outputs.artifact_id }}
+          path: signer-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      # This exact inline validator is the only handoff parser in the protected
+      # job. No repository program runs before the updater-key step.
+      - name: Validate the sealed handoff and make payloads non-executable
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.rust-target }}
+          EXPECTED_ARTIFACT_NAME: ${{ needs.desktop-signer-handoff.outputs.artifact_name }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.desktop-signer-handoff.outputs.artifact_digest }}
+          EXPECTED_MANIFEST_SHA: ${{ needs.desktop-signer-handoff.outputs.manifest_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_name="arc-desktop-signer-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_MANIFEST_SHA"
+          [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
+          /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TARGET" \
+            "$EXPECTED_MANIFEST_SHA" signer-handoff <<'PY'
+          import hashlib, json, os, pathlib, stat, sys
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          repository, commit, run_id, attempt, platform, target, expected_sha, root_raw = sys.argv[1:]
+          root = pathlib.Path(root_raw)
+          manifest_path = root / "DESKTOP-SIGNER-HANDOFF.json"
+          if not root.is_dir() or root.is_symlink() or not manifest_path.is_file() or manifest_path.is_symlink():
+              raise SystemExit("direct-signer handoff root is unsafe")
+          manifest_bytes = manifest_path.read_bytes()
+          if hashlib.sha256(manifest_bytes).hexdigest() != expected_sha:
+              raise SystemExit("direct-signer manifest hash differs")
+          manifest = json.loads(manifest_bytes)
+          canonical = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          if canonical != manifest_bytes:
+              raise SystemExit("direct-signer manifest is not canonical")
+          if manifest.get("schema") != "arc.desktop-signer-handoff.v1" or \
+             manifest.get("repository") != repository or manifest.get("commit") != commit or \
+             manifest.get("workflow_run_id") != int(run_id) or \
+             manifest.get("workflow_run_attempt") != int(attempt):
+              raise SystemExit("direct-signer manifest identity differs")
+          targets = {
+              "linux-x86_64": "x86_64-unknown-linux-gnu",
+              "macos-arm64": "aarch64-apple-darwin",
+              "macos-x86_64": "x86_64-apple-darwin",
+              "windows-x86_64": "x86_64-pc-windows-msvc",
+          }
+          expected_files = {
+              "linux-x86_64": {"arc-desktop-linux-x86_64.AppImage", "arc-desktop-linux-x86_64.deb", "arc-desktop-linux-x86_64.rpm"},
+              "macos-arm64": {"arc-desktop-macos-arm64.app.tar.gz", "arc-desktop-macos-arm64.dmg"},
+              "macos-x86_64": {"arc-desktop-macos-x86_64.app.tar.gz", "arc-desktop-macos-x86_64.dmg"},
+              "windows-x86_64": {"arc-desktop-windows-x86_64-setup.exe", "arc-desktop-windows-x86_64.msi"},
+          }
+          if set(manifest.get("platforms", {})) != set(targets) or targets.get(platform) != target:
+              raise SystemExit("direct-signer platform set or target differs")
+          if {path.name for path in root.iterdir()} != set(targets) | {manifest_path.name}:
+              raise SystemExit("direct-signer root membership differs")
+          for name, expected_target in targets.items():
+              directory = root / name
+              receipt_path = directory / "HANDOFF-RECEIPT.json"
+              if not directory.is_dir() or directory.is_symlink() or \
+                 not receipt_path.is_file() or receipt_path.is_symlink():
+                  raise SystemExit("direct-signer platform directory is unsafe")
+              receipt_bytes = receipt_path.read_bytes()
+              receipt = json.loads(receipt_bytes)
+              receipt_canonical = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+              if receipt_canonical != receipt_bytes or manifest["platforms"].get(name) != receipt:
+                  raise SystemExit("direct-signer receipt differs")
+              if receipt.get("repository") != repository or receipt.get("commit") != commit or \
+                 receipt.get("workflow_run_id") != int(run_id) or \
+                 receipt.get("workflow_run_attempt") != int(attempt) or \
+                 receipt.get("platform") != name or receipt.get("rust_target") != expected_target:
+                  raise SystemExit("direct-signer receipt identity differs")
+              files = receipt.get("files")
+              if not isinstance(files, dict) or set(files) != expected_files[name]:
+                  raise SystemExit("direct-signer payload allowlist differs")
+              if {path.name for path in directory.iterdir()} != expected_files[name] | {receipt_path.name}:
+                  raise SystemExit("direct-signer directory membership differs")
+              for filename, expected_hash in files.items():
+                  path = directory / filename
+                  mode = path.lstat().st_mode
+                  if not stat.S_ISREG(mode) or path.is_symlink() or path.stat().st_size <= 0:
+                      raise SystemExit("direct-signer payload is not a regular file")
+                  digest = sha256(path)
+                  if digest != expected_hash:
+                      raise SystemExit("direct-signer payload hash differs")
+                  os.chmod(path, 0o400)
+              os.chmod(receipt_path, 0o400)
+          os.chmod(manifest_path, 0o400)
+          PY
+          mv "signer-handoff/$PLATFORM" unsigned-materialized
+
+      # npm lifecycle hooks stay disabled, and the registry tarballs are bound
+      # to the reviewed lockfile integrity values before the signer is installed.
+      - name: Rehydrate the exact locked signer after materialization
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          case "$PLATFORM" in
+            linux-x86_64)
+              native='@tauri-apps/cli-linux-x64-gnu'
+              native_integrity='sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ=='
+              ;;
+            macos-arm64)
+              native='@tauri-apps/cli-darwin-arm64'
+              native_integrity='sha512-1ryOF3ZhpZ/nemHV5zVwBQBz9jDGKmKPvWPADOhc83ig0P4bMc2iER4NbC6r9sjeIZ6RVQ4g3RZIYvezhcl4TQ=='
+              ;;
+            macos-x86_64)
+              native='@tauri-apps/cli-darwin-x64'
+              native_integrity='sha512-uFsGQAAfuyz1k/yGLmkWfkBlgKAqZfxqlHmLWx81QU27RJWfmbNHCIq8T8w1e+VClleIuZUjpHWfoE4E3DLo3A=='
+              ;;
+            windows-x86_64)
+              native='@tauri-apps/cli-win32-x64-msvc'
+              native_integrity='sha512-+vDiqBIU5dMISg/wNvX3sF+ZHfgJGJ5T0AcO+EHNXV9GGAG+P5fzodlDXD3QdKCRgZxMoCm5PPvj3BqLNjBthw=='
+              ;;
+          esac
+          jq -e \
+            --arg native "node_modules/$native" \
+            --arg native_integrity "$native_integrity" \
+            '.packages["node_modules/@tauri-apps/cli"].version == "2.11.4"
+             and .packages["node_modules/@tauri-apps/cli"].integrity == "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ=="
+             and .packages[$native].version == "2.11.4"
+             and .packages[$native].integrity == $native_integrity' \
+            desktop/package-lock.json >/dev/null
+          npm ci --prefix desktop --ignore-scripts
+
+      - name: Freeze the exact locked file-signing surface without executing it
+        id: clean-signer
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ "$(jq -r '.version' desktop/node_modules/@tauri-apps/cli/package.json)" = '2.11.4' ]
+          node_bin="$(command -v node)"
+          tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"
+          [ -x "$node_bin" ] && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
+          [ "$("$node_bin" --version)" = "v24.20.0" ]
+          case "$RUNNER_OS" in
+            macOS)
+              node_sha256="$(/usr/bin/shasum -a 256 "$node_bin" | /usr/bin/awk '{print $1}')"
+              tauri_cli_sha256="$(/usr/bin/shasum -a 256 "$tauri_cli" | /usr/bin/awk '{print $1}')"
+              ;;
+            Linux|Windows)
+              node_sha256="$(/usr/bin/sha256sum "$node_bin" | /usr/bin/awk '{print $1}')"
+              tauri_cli_sha256="$(/usr/bin/sha256sum "$tauri_cli" | /usr/bin/awk '{print $1}')"
+              ;;
+          esac
+          [ "$tauri_cli_sha256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          native_count="$(find desktop/node_modules/@tauri-apps -maxdepth 2 \
+            -type f -name 'cli.*.node' | wc -l | tr -d ' ')"
+          [ "$native_count" -eq 1 ]
+          {
+            echo "node_bin=$node_bin"
+            echo "node_sha256=$node_sha256"
+            echo "tauri_cli=$tauri_cli"
+            echo "tauri_cli_sha256=$tauri_cli_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign only the verified updater payload
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          ARC_NODE_BIN: ${{ steps.clean-signer.outputs.node_bin }}
+          ARC_NODE_SHA256: ${{ steps.clean-signer.outputs.node_sha256 }}
+          ARC_TAURI_CLI: ${{ steps.clean-signer.outputs.tauri_cli }}
+          ARC_TAURI_CLI_SHA256: ${{ steps.clean-signer.outputs.tauri_cli_sha256 }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set +x
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS \
+            TAURI_CONFIG TAURI_SIGNING_PRIVATE_KEY_PATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB
+          cleanup_signing_env() {
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          }
+          trap cleanup_signing_env EXIT HUP INT TERM
+          [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || {
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is unavailable."
+            exit 1
+          }
+          [ -x "$ARC_NODE_BIN" ] && [ -f "$ARC_NODE_BIN" ] && [ ! -L "$ARC_NODE_BIN" ]
+          [ -f "$ARC_TAURI_CLI" ] && [ ! -L "$ARC_TAURI_CLI" ]
+          case "$RUNNER_OS" in
+            macOS)
+              [ "$(/usr/bin/shasum -a 256 "$ARC_NODE_BIN" | /usr/bin/awk '{print $1}')" = "$ARC_NODE_SHA256" ]
+              [ "$(/usr/bin/shasum -a 256 "$ARC_TAURI_CLI" | /usr/bin/awk '{print $1}')" = "$ARC_TAURI_CLI_SHA256" ]
+              ;;
+            Linux|Windows)
+              [ "$(/usr/bin/sha256sum "$ARC_NODE_BIN" | /usr/bin/awk '{print $1}')" = "$ARC_NODE_SHA256" ]
+              [ "$(/usr/bin/sha256sum "$ARC_TAURI_CLI" | /usr/bin/awk '{print $1}')" = "$ARC_TAURI_CLI_SHA256" ]
+              ;;
+          esac
+          [ "$ARC_TAURI_CLI_SHA256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          case "${{ matrix.platform }}" in
+            linux-x86_64)
+              updater="$PWD/unsigned-materialized/arc-desktop-linux-x86_64.AppImage"
+              ;;
+            macos-arm64|macos-x86_64)
+              updater="$PWD/unsigned-materialized/arc-desktop-${{ matrix.platform }}.app.tar.gz"
+              ;;
+            windows-x86_64)
+              updater="$PWD/unsigned-materialized/arc-desktop-windows-x86_64-setup.exe"
+              ;;
+          esac
+          [ -f "$updater" ] && [ ! -L "$updater" ] && [ ! -e "$updater.sig" ]
+          "$ARC_NODE_BIN" "$ARC_TAURI_CLI" signer sign "$updater"
+          cleanup_signing_env
+          trap - EXIT HUP INT TERM
+
+      - name: Prove signer output, restore release modes, and verify the signature
+        id: signed
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.rust-target }}
+        run: |
+          set -Eeuo pipefail
+          version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          python3 scripts/release/unsigned-desktop-handoff.py verify-signed \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXPECTED_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --platform "$PLATFORM" \
+            --rust-target "$TARGET" \
+            --version "$version" \
+            --workspace unsigned-materialized \
+            --github-output "$GITHUB_OUTPUT"
+          case "$PLATFORM" in
+            linux-x86_64)
+              updater_file='arc-desktop-linux-x86_64.AppImage'
+              ;;
+            macos-arm64|macos-x86_64)
+              updater_file="arc-desktop-$PLATFORM.app.tar.gz"
+              ;;
+            windows-x86_64)
+              updater_file='arc-desktop-windows-x86_64-setup.exe'
+              ;;
+          esac
+          public_key="$(jq -er '.plugins.updater.pubkey' \
+            desktop/src-tauri/tauri.conf.json)"
+          verifier_target="$RUNNER_TEMP/tauri-updater-verifier"
+          CARGO_TARGET_DIR="$verifier_target" cargo build --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
+          "$verifier_target/debug/tauri-updater-verifier" \
+            "$public_key" \
+            "unsigned-materialized/$updater_file" \
+            "unsigned-materialized/$updater_file.sig"
+
+      - name: Package the exact signed desktop candidate
+        id: package
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.rust-target }}
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          stage="pretag-artifacts/desktop-$PLATFORM"
+          payload="$stage/payload"
+          mkdir -p "$payload"
+
+          case "$PLATFORM" in
+            linux-x86_64)
+              files='arc-desktop-linux-x86_64.AppImage arc-desktop-linux-x86_64.AppImage.sig arc-desktop-linux-x86_64.deb arc-desktop-linux-x86_64.rpm'
+              ;;
+            macos-arm64|macos-x86_64)
+              files="arc-desktop-$PLATFORM.app.tar.gz arc-desktop-$PLATFORM.app.tar.gz.sig arc-desktop-$PLATFORM.dmg"
+              ;;
+            windows-x86_64)
+              files='arc-desktop-windows-x86_64-setup.exe arc-desktop-windows-x86_64-setup.exe.sig arc-desktop-windows-x86_64.msi'
+              ;;
+            *)
+              echo "::error::Unsupported desktop platform: $PLATFORM"
+              exit 1
+              ;;
+          esac
+          for name in $files; do
+            source="unsigned-materialized/$name"
+            [ -f "$source" ] && [ ! -L "$source" ] && [ -s "$source" ]
+            cp "$source" "$payload/$name"
+          done
+
+          version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          python3 scripts/release/package-pretag-artifact.py \
+            --kind desktop \
+            --platform "$PLATFORM" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXPECTED_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --version "$version" \
+            --rust-target "$TARGET" \
+            --payload-dir "$payload" \
+            --stage-dir "$stage" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload create-only signed desktop candidate
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            pretag-artifacts/desktop-${{ matrix.platform }}/*.tar.gz
+            pretag-artifacts/desktop-${{ matrix.platform }}/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Record signed desktop candidate receipt
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.package.outputs.artifact_name }}
+          ARCHIVE_SHA: ${{ steps.package.outputs.archive_sha }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          {
+            echo "Desktop candidate artifact: \`$ARTIFACT_NAME\`"
+            echo "Archive SHA-256: \`$ARCHIVE_SHA\`"
+            echo "Actions artifact ID: \`$ARTIFACT_ID\`"
+            echo "Actions artifact digest: \`$ARTIFACT_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  seal:
+    name: seal exact-main pre-tag evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - validate
+      - backup-readiness
+      - manifest-key
+      - updater-key
+      - headless-runtime
+      - desktop-bundle
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Refuse mixed-commit or stale preflight evidence
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" ] || {
+            echo "::error::Protected main moved while the matrix ran; no tag may consume this preflight. Dispatch again."
+            exit 1
+          }
+
+      - name: Seal all nine immutable artifact IDs and digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          artifacts_json="$RUNNER_TEMP/pretag-artifacts.json"
+          selection_json="$RUNNER_TEMP/pretag-selection.json"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[]' | jq -s '{artifacts: .}' > "$artifacts_json"
+          python3 scripts/release/select-pretag-artifacts.py \
+            --api-json "$artifacts_json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$EXPECTED_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$selection_json" >/dev/null
+          {
+            echo '## Exact pre-tag artifacts'
+            echo
+            echo '| Group | Artifact ID | Actions digest | Inner archive SHA-256 |'
+            echo '|---|---:|---|---|'
+            jq -r '.artifacts | to_entries[] as $platform | $platform.value | to_entries[] | "| \(.key)/\($platform.key) | \(.value.id) | `\(.value.digest)` | `\(.value.archive_sha256)` |"' \
+              "$selection_json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reconfirm protected main after sealing artifact IDs
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          [ "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" ] || {
+            echo "::error::Protected main moved while artifact IDs were sealed; this run is not releasable."
+            exit 1
+          }
+          {
+            echo '## Pre-tag evidence sealed'
+            echo
+            echo "All backup, signing, five-platform headless runtime, four-platform desktop bundle, and artifact-identity checks passed for exact main \`$EXPECTED_SHA\`."
+            echo 'Create an immutable tag only at this SHA and only while it remains protected main.'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,21 +6,34 @@ import type {
   AccountBalance,
   Attestation,
   BinaryStatus,
+  BlockTxs,
+  DataMigrationNotice,
   Earnings,
+  EarningsProjection,
   FaucetResult,
   HardwareInfo,
   Identity,
   InferenceResult,
+  InferenceSettlement,
   LogEntry,
   ModelTierInfo,
+  NetworkOverview,
   NetworkStats,
   NodeConfig,
+  NodeContribution,
   NodeStatus,
   PaidInferenceResult,
+  RecentBlocks,
   ResetPeerStateResult,
+  RewardEconomics,
+  SavedLogs,
+  ThreadsApplied,
   Tier1Result,
   Tier1Submitted,
   Tier1Vote,
+  TxLookup,
+  UpdateInstallPolicy,
+  WalletTxResult,
 } from "./types";
 
 const IS_TAURI =
@@ -40,12 +53,647 @@ const IS_PROD_TAURI_BUNDLE =
 // directly, adapting the shapes the same way src-tauri/src/rpc_client.rs does.
 function liveBase(): string | null {
   if (typeof window === "undefined") return null;
+  // `__ARC_LIVE__` is an E2E-only browser seam. A packaged production bundle
+  // opened outside Tauri must stay blocked even if page script tries to set it.
+  if (IS_PROD_TAURI_BUNDLE) return null;
   const port = (window as Window & { __ARC_LIVE__?: number | string }).__ARC_LIVE__;
   if (!port) return null;
   return `http://127.0.0.1:${port}`;
 }
 
-const REWARD_PER_ATTESTATION = 2.5;
+/** Browser-preview fixture amount for a successful mined 0x25 receipt. */
+const MOCK_REWARD_PER_RECEIPT = 2.5;
+
+const SETTLEMENT_WRITE_UNAVAILABLE =
+  "is unavailable before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not ready on the selected path. VRF selection and server-derived replica labels are not validator approval. Unpaid inference remains available, but running it does not earn ARC.";
+
+function settlementWriteUnavailable(flow: string): Error {
+  return new Error(`${flow} ${SETTLEMENT_WRITE_UNAVAILABLE}`);
+}
+
+const RETAINED_EARNINGS_SOURCE =
+  "scan of this node's in-memory full_transactions map";
+const ARCHIVE_EARNINGS_SCOPE =
+  "complete canonical reward history since the v3 recovery boundary";
+const RETAINED_EARNINGS_SCOPE =
+  "this node's bounded retained reward-receipt window";
+const EARNINGS_HISTORY_DOMAIN =
+  "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
+
+function unavailableEarnings(unavailableReason: string): Earnings {
+  return {
+    totalArc: 0,
+    todayArc: null,
+    pendingArc: null,
+    rank: null,
+    attestations: 0,
+    lastPayoutAt: null,
+    lastPayoutBlock: null,
+    confirmedReceipts: [],
+    projectedDailyArc: null,
+    projectedDailyUnavailableReason:
+      "confirmed mined reward receipts are unavailable",
+    recoveryEpoch: null,
+    validatorSetId: null,
+    unavailableReason,
+    receiptSource: null,
+    archiveMode: null,
+    historyCompleteSinceRecovery: null,
+    historyScope: null,
+    fromChain: false,
+  };
+}
+
+function normalizeHash32(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const bare = value.replace(/^0x/i, "");
+  return /^[0-9a-fA-F]{64}$/.test(bare) ? `0x${bare.toLowerCase()}` : null;
+}
+
+/**
+ * Parse only the candidate's mined-0x25 receipt/readiness contract.
+ * Public v2 returns HTTP 200 for this path too, but its body is raw-0x16
+ * count × constant display arithmetic. HTTP status is not a semantics gate.
+ */
+function confirmedEarningsFromBody(body: unknown): Earnings | null {
+  if (!body || typeof body !== "object") return null;
+  const o = body as Record<string, unknown>;
+  const totalRewards = o.total_rewards;
+  const totalArc = o.confirmed_gross_earnings_arc;
+  const confirmedCount = o.confirmed_receipt_count;
+  const confirmedBase = o.confirmed_gross_earnings_base;
+  const rows = o.confirmed_receipts;
+  const note = o.estimated_total_arc_note;
+  const effective = o.community_rewards_v1_enabled;
+  const protocolActive = o.community_rewards_v1_protocol_active;
+  const approvalReady = o.community_rewards_v1_approval_collection_ready;
+  const receiptSource = o.source;
+  const archiveMode = o.archive_mode;
+  const historyCompleteSinceRecovery = o.history_complete_since_recovery;
+  const historyScope = o.history_scope;
+  const historyDomain = o.history_domain;
+  const responseAddress = normalizeHash32(o.address);
+  if (
+    typeof totalRewards !== "number" ||
+    !Number.isSafeInteger(totalRewards) ||
+    totalRewards < 0 ||
+    typeof totalArc !== "number" ||
+    !Number.isFinite(totalArc) ||
+    totalArc < 0 ||
+    o.today_arc !== null ||
+    confirmedCount !== totalRewards ||
+    !Number.isSafeInteger(confirmedBase) ||
+    (confirmedBase as number) < 0 ||
+    !Array.isArray(rows) ||
+    rows.length !== totalRewards ||
+    typeof note !== "string" ||
+    !note.includes("CommunityInferenceReward") ||
+    typeof effective !== "boolean" ||
+    typeof protocolActive !== "boolean" ||
+    typeof approvalReady !== "boolean" ||
+    receiptSource !== RETAINED_EARNINGS_SOURCE ||
+    typeof archiveMode !== "boolean" ||
+    typeof historyCompleteSinceRecovery !== "boolean" ||
+    typeof historyScope !== "string" ||
+    historyDomain !== EARNINGS_HISTORY_DOMAIN ||
+    responseAddress === null ||
+    (archiveMode
+      ? historyCompleteSinceRecovery !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
+      : historyCompleteSinceRecovery !== false || historyScope !== RETAINED_EARNINGS_SCOPE)
+  ) {
+    return null;
+  }
+  if (effective && (!protocolActive || !approvalReady)) return null;
+  let receiptBaseSum = 0;
+  let receiptArcSum = 0;
+  const receiptTxHashes = new Set<string>();
+  const receiptJobIds = new Set<string>();
+  const confirmedReceipts = [] as Earnings["confirmedReceipts"];
+  for (const value of rows as unknown[]) {
+    if (!value || typeof value !== "object") return null;
+    const receipt = value as Record<string, unknown>;
+    if (
+      receipt.tx_type !== "0x25" ||
+      receipt.submitted !== true ||
+      receipt.included !== true ||
+      receipt.confirmed !== true ||
+      receipt.success !== true ||
+      normalizeHash32(receipt.tx_hash) === null ||
+      normalizeHash32(receipt.job_id) === null ||
+      normalizeHash32(receipt.worker) !== responseAddress ||
+      !Number.isSafeInteger(receipt.block_height) ||
+      (receipt.block_height as number) < 0 ||
+      normalizeHash32(receipt.block_hash) === null ||
+      receipt.reward_base !== 2_500_000_000 ||
+      receipt.reward_arc !== 2.5
+    ) {
+      return null;
+    }
+    const normalizedTxHash = normalizeHash32(receipt.tx_hash)!;
+    const normalizedJobId = normalizeHash32(receipt.job_id)!;
+    const expectedReceiptUrl = `/community/reward_receipt/${normalizedTxHash}`;
+    if (receipt.receipt_url !== expectedReceiptUrl) return null;
+    if (receiptTxHashes.has(normalizedTxHash) || receiptJobIds.has(normalizedJobId)) {
+      return null;
+    }
+    receiptTxHashes.add(normalizedTxHash);
+    receiptJobIds.add(normalizedJobId);
+    receiptBaseSum += receipt.reward_base as number;
+    receiptArcSum += receipt.reward_arc;
+    if (!Number.isSafeInteger(receiptBaseSum)) return null;
+    confirmedReceipts.push({
+      txHash: normalizedTxHash,
+      jobId: normalizedJobId,
+      blockHeight: receipt.block_height as number,
+      blockHash: normalizeHash32(receipt.block_hash)!,
+      rewardBase: receipt.reward_base as number,
+      rewardArc: receipt.reward_arc,
+      receiptUrl: expectedReceiptUrl,
+      recoveryEpoch:
+        typeof receipt.recovery_epoch === "number"
+          ? receipt.recovery_epoch
+          : null,
+      validatorSetId:
+        typeof receipt.validator_set_id === "number"
+          ? receipt.validator_set_id
+          : null,
+    });
+  }
+  if (receiptBaseSum !== confirmedBase) return null;
+  if (!Number.isFinite(receiptArcSum) || Math.abs(receiptArcSum - totalArc) > 1e-9) {
+    return null;
+  }
+  const projection = o.projected_daily_arc;
+  if (
+    projection !== null &&
+    (typeof projection !== "number" ||
+      !Number.isFinite(projection) ||
+      projection < 0)
+  ) return null;
+  const projectionReason = o.projected_daily_unavailable_reason;
+  if (
+    projectionReason !== null &&
+    (typeof projectionReason !== "string" || projectionReason.trim().length === 0)
+  ) return null;
+  const hostProjectedDailyArc = projection as number | null;
+  const hostProjectionReason = projectionReason as string | null;
+  if ((hostProjectedDailyArc === null) === (hostProjectionReason === null)) return null;
+  // Treat the host's numeric field as a candidate only. The exact receipt rows
+  // above, not `total_rewards` alone, establish the observation count used by
+  // the minimum-history gate.
+  const observationGate = projectionObservationGate(o, confirmedReceipts.length);
+  const projectedDailyArc = observationGate === null ? hostProjectedDailyArc : null;
+  const projectedDailyUnavailableReason =
+    observationGate ?? hostProjectionReason;
+  if (
+    !Object.prototype.hasOwnProperty.call(o, "last_reward_block") ||
+    !Object.prototype.hasOwnProperty.call(o, "last_reward_tx_hash")
+  ) {
+    return null;
+  }
+  const lastBlock =
+    typeof o.last_reward_block === "number" &&
+    Number.isSafeInteger(o.last_reward_block) &&
+    o.last_reward_block >= 0
+      ? o.last_reward_block
+      : null;
+  const lastHash = normalizeHash32(o.last_reward_tx_hash);
+  if (totalRewards > 0 && (lastBlock === null || lastHash === null)) return null;
+  if (
+    totalRewards > 0
+    && !confirmedReceipts.some(
+      (receipt) => receipt.txHash === lastHash && receipt.blockHeight === lastBlock,
+    )
+  ) return null;
+
+  return {
+    totalArc,
+    todayArc: null,
+    pendingArc: null,
+    rank: null,
+    attestations: totalRewards,
+    lastPayoutAt:
+      typeof o.last_reward_at === "number" &&
+      Number.isFinite(o.last_reward_at)
+        ? o.last_reward_at
+        : null,
+    lastPayoutBlock: lastBlock,
+    confirmedReceipts,
+    projectedDailyArc,
+    projectedDailyUnavailableReason,
+    recoveryEpoch:
+      typeof o.recovery_epoch === "number" ? o.recovery_epoch : null,
+    validatorSetId:
+      typeof o.validator_set_id === "number" ? o.validator_set_id : null,
+    unavailableReason: null,
+    receiptSource,
+    archiveMode,
+    historyCompleteSinceRecovery,
+    historyScope,
+    fromChain: true,
+  };
+}
+
+/** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
+const COORDINATOR_HOSTS = [
+  "https://149.28.32.76", // NYC
+  "https://140.82.16.112", // LAX
+  "https://136.244.109.1", // AMS
+  "https://104.238.171.11", // LHR
+  "https://202.182.107.41", // NRT
+  "https://149.28.153.31", // SGP
+];
+
+type CommunityRewardReceiptExpectation = {
+  sourceHost: string;
+  txHash: string;
+  jobId: string;
+  worker: string;
+  receiptUrl: string;
+};
+
+const liveCommunityReceiptRoutes = new Map<
+  string,
+  CommunityRewardReceiptExpectation
+>();
+
+function pinLiveCommunityReceiptRoute(result: InferenceResult): void {
+  const settlement = result.settlement;
+  if (!settlement || !result.coordinator) return;
+  const route = {
+    sourceHost: result.coordinator,
+    txHash: settlement.txHash,
+    jobId: settlement.jobId,
+    worker: settlement.worker,
+    receiptUrl: settlement.receiptUrl,
+  };
+  try {
+    validateCommunityRewardReceiptExpectation(route);
+  } catch {
+    return;
+  }
+  if (
+    liveCommunityReceiptRoutes.size >= 512 &&
+    !liveCommunityReceiptRoutes.has(route.txHash)
+  ) {
+    const first = liveCommunityReceiptRoutes.keys().next().value;
+    if (typeof first === "string") liveCommunityReceiptRoutes.delete(first);
+  }
+  liveCommunityReceiptRoutes.set(route.txHash, route);
+}
+
+function canonicalHash32(value: unknown): string | null {
+  const normalized = normalizeHash32(value);
+  return typeof value === "string" && value === normalized ? normalized : null;
+}
+
+function validateCommunityRewardReceiptExpectation(
+  expected: CommunityRewardReceiptExpectation,
+): void {
+  if (
+    canonicalHash32(expected.txHash) === null ||
+    canonicalHash32(expected.jobId) === null ||
+    canonicalHash32(expected.worker) === null
+  ) {
+    throw new Error(
+      "reward receipt unavailable: submitted transaction, job, and worker identities must be canonical lowercase hashes",
+    );
+  }
+  if (
+    expected.receiptUrl !==
+    `/community/reward_receipt/${expected.txHash}`
+  ) {
+    throw new Error(
+      "reward receipt unavailable: submitted receipt URL is not bound to its transaction hash",
+    );
+  }
+}
+
+/**
+ * Fail-closed adapter for the independently fetched canonical receipt. Every
+ * identity and boolean/null combination is exact; an impossible or partial
+ * state is not downgraded into a payment claim.
+ */
+function parseCommunityRewardReceiptBody(
+  body: unknown,
+  expected: CommunityRewardReceiptExpectation,
+): InferenceSettlement {
+  validateCommunityRewardReceiptExpectation(expected);
+  const value = asObject(body);
+  if (!value) {
+    throw new Error("reward receipt unavailable: pinned host returned invalid JSON");
+  }
+  for (const [field, exact] of [
+    ["tx_type", "0x25"],
+    ["tx_hash", expected.txHash],
+    ["job_id", expected.jobId],
+    ["worker", expected.worker],
+    ["receipt_url", expected.receiptUrl],
+  ] as const) {
+    if (value[field] !== exact) {
+      throw new Error(
+        `reward receipt unavailable: canonical response ${field} did not exactly match the submitted identity`,
+      );
+    }
+  }
+
+  const status = value.status;
+  const safeNonnegativeInteger = (candidate: unknown): candidate is number =>
+    typeof candidate === "number" &&
+    Number.isSafeInteger(candidate) &&
+    candidate >= 0;
+  const includedEvidence =
+    safeNonnegativeInteger(value.block_height) &&
+    canonicalHash32(value.block_hash) !== null &&
+    safeNonnegativeInteger(value.index);
+  const pendingHasNoInclusion =
+    (value.block_height === undefined || value.block_height === null) &&
+    (value.block_hash === undefined || value.block_hash === null) &&
+    (value.index === undefined || value.index === null);
+  const pending =
+    status === "pending_mined_receipt" &&
+    value.submitted === true &&
+    value.included === false &&
+    value.confirmed === false &&
+    value.success === null &&
+    value.reward_base === null &&
+    value.reward_arc === null &&
+    pendingHasNoInclusion;
+  const minedSuccess =
+    status === "mined_success" &&
+    value.submitted === true &&
+    value.included === true &&
+    value.confirmed === true &&
+    value.success === true &&
+    value.reward_base === 2_500_000_000 &&
+    value.reward_arc === MOCK_REWARD_PER_RECEIPT &&
+    includedEvidence;
+  const minedFailed =
+    status === "mined_failed" &&
+    value.submitted === true &&
+    value.included === true &&
+    value.confirmed === false &&
+    value.success === false &&
+    value.reward_base === null &&
+    value.reward_arc === null &&
+    includedEvidence;
+  const unavailable =
+    status === "receipt_unavailable" &&
+    value.submitted === true &&
+    value.included === true &&
+    value.confirmed === false &&
+    value.success === null &&
+    value.reward_base === null &&
+    value.reward_arc === null &&
+    includedEvidence;
+  if (!pending && !minedSuccess && !minedFailed && !unavailable) {
+    throw new Error(
+      `reward receipt unavailable: canonical response has an invalid ${String(status)} state matrix`,
+    );
+  }
+
+  return {
+    status: status as string,
+    txType: "0x25",
+    txHash: expected.txHash,
+    jobId: expected.jobId,
+    worker: expected.worker,
+    submitted: true,
+    included: value.included as boolean,
+    confirmed: value.confirmed as boolean,
+    success: value.success as boolean | null,
+    blockHeight: safeNonnegativeInteger(value.block_height)
+      ? value.block_height
+      : null,
+    blockHash: canonicalHash32(value.block_hash),
+    index: safeNonnegativeInteger(value.index) ? value.index : null,
+    rewardBase: safeNonnegativeInteger(value.reward_base)
+      ? value.reward_base
+      : null,
+    rewardArc: value.reward_arc as number | null,
+    receiptUrl: expected.receiptUrl,
+  };
+}
+
+/**
+ * Per-command mock overrides, for tests only.
+ *
+ * The endpoints behind the projection and Network screens are newer than the
+ * deployed seeds, so their real-world behaviour today is a 404 that degrades
+ * to a stated reason. Both the populated path and each degraded path have to
+ * be exercisable, and a test cannot reach into a Rust process to make a seed
+ * 404 on demand.
+ *
+ * This seam lives inside `mockInvoke` only. It is unreachable in the Tauri app
+ * (which never calls the mock) and unreachable from a production bundle opened
+ * outside Tauri (which refuses to mock at all — see the guard in
+ * `mockInvoke`). Setting it cannot make the real app show a fabricated number.
+ */
+type MockOverrides = Record<string, unknown>;
+function mockOverride<T>(cmd: string): T | undefined {
+  if (typeof window === "undefined") return undefined;
+  const o = (window as Window & { __ARC_MOCK__?: MockOverrides }).__ARC_MOCK__;
+  if (!o || !(cmd in o)) return undefined;
+  return o[cmd] as T;
+}
+
+/** Strip an optional `0x` and lowercase. Mirrors rpc_client.rs::strip_0x. */
+function strip0x(s: string): string {
+  return s.trim().replace(/^0[xX]/, "").toLowerCase();
+}
+
+/** ARC base units per whole ARC. Mirrors rpc_client.rs::ARC_BASE_UNITS. */
+const ARC_BASE_UNITS = 1_000_000_000;
+const MIN_PROJECTION_RECEIPTS = 3;
+const MIN_PROJECTION_WINDOW_MS = 86_400_000;
+const PROJECTION_COLLECTING_REASON =
+  "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries";
+
+function projectionObservationGate(
+  body: Record<string, unknown>,
+  receiptCount: number,
+): string | null {
+  if (receiptCount < MIN_PROJECTION_RECEIPTS) {
+    return PROJECTION_COLLECTING_REASON;
+  }
+  const first = body.observed_window_first_timestamp_ms;
+  const last = body.observed_window_last_timestamp_ms;
+  if (
+    typeof first !== "number" ||
+    !Number.isSafeInteger(first) ||
+    typeof last !== "number" ||
+    !Number.isSafeInteger(last) ||
+    last <= first ||
+    last - first < MIN_PROJECTION_WINDOW_MS
+  ) {
+    return "collecting data: this host has not supplied a valid confirmed-receipt window spanning at least 24 hours";
+  }
+  return null;
+}
+
+function exactBaseUnits(value: unknown, field: string): string {
+  if (typeof value === "string" && /^\d+$/.test(value)) return value;
+  if (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  ) {
+    return String(value);
+  }
+  throw new Error(`${field} is not an exact base-unit integer`);
+}
+
+function arcFromBaseUnits(value: string): string {
+  const padded = value.padStart(10, "0");
+  const whole = padded.slice(0, -9).replace(/^0+(?=\d)/, "");
+  const fraction = padded.slice(-9).replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringField(value: Record<string, unknown> | null, key: string): string {
+  const field = value?.[key];
+  return typeof field === "string" ? field : "";
+}
+
+function numberField(value: Record<string, unknown> | null, key: string): number {
+  const field = value?.[key];
+  return typeof field === "number" && Number.isFinite(field) ? field : 0;
+}
+
+/** Adapt the node's common `/inference/run` envelope for browser-live tests. */
+function parseInferenceRunBody(
+  body: unknown,
+  servedLocally: boolean,
+  coordinator?: string,
+): InferenceResult {
+  const value = asObject(body);
+  if (!value) throw new Error("inference endpoint returned invalid JSON");
+  if (value.success === false) {
+    throw new Error(
+      typeof value.error === "string"
+        ? value.error
+        : "inference endpoint reported success=false",
+    );
+  }
+  const inference =
+    asObject(value.inference) ??
+    (typeof value.output === "string" ? value : null);
+  if (!inference) {
+    throw new Error("inference response omitted inference output");
+  }
+  const attestation = asObject(value.attestation);
+  const verification = asObject(value.verification);
+  const settlementValue = asObject(value.settlement);
+  const settlementStatus = stringField(settlementValue, "status").trim();
+  const rewardArc = settlementValue?.reward_arc;
+  const trace = Array.isArray(value.shard_trace)
+    ? value.shard_trace
+        .map((raw) => asObject(raw))
+        .filter((hop): hop is Record<string, unknown> => hop !== null)
+        .map((hop) => ({
+          hop: numberField(hop, "hop"),
+          node: stringField(hop, "node") || stringField(hop, "node_name") || "unknown",
+          layers: stringField(hop, "layers"),
+          computeMs: numberField(hop, "compute_ms"),
+          wallMs: numberField(hop, "wall_ms"),
+          isTerminal: hop.is_terminal === true,
+        }))
+    : undefined;
+
+  return {
+    input: stringField(inference, "input"),
+    output: stringField(inference, "output"),
+    outputHash: stringField(inference, "output_hash"),
+    modelHash: stringField(inference, "model_hash"),
+    tokensGenerated: numberField(inference, "tokens_generated"),
+    inferenceMs:
+      typeof inference.inference_ms === "number"
+        ? numberField(inference, "inference_ms")
+        : numberField(inference, "total_ms"),
+    // Keep the unpaid 0x16 claim separate from community 0x25 settlement.
+    txHash: stringField(attestation, "tx_hash"),
+    deterministic: inference.deterministic === true,
+    profileBound:
+      typeof verification?.profile_bound === "boolean"
+        ? verification.profile_bound
+        : inference.profile_bound === true,
+    quorumVerified:
+      typeof verification?.quorum_verified === "boolean"
+        ? verification.quorum_verified
+        : inference.quorum_verified === true,
+    executionProfile:
+      stringField(verification, "execution_profile") ||
+      stringField(inference, "execution_profile"),
+    engine: stringField(inference, "engine"),
+    explorerUrl: stringField(value, "explorer_url"),
+    routedVia:
+      stringField(value, "routed_via") ||
+      (Array.isArray(value.shard_trace) ? "sharded_seed_pipeline" : ""),
+    settlement: settlementStatus
+      ? {
+          status: settlementStatus,
+          txType: stringField(settlementValue, "tx_type"),
+          txHash: stringField(settlementValue, "tx_hash"),
+          jobId: stringField(settlementValue, "job_id"),
+          worker: stringField(settlementValue, "worker"),
+          submitted: settlementValue?.submitted === true,
+          included: settlementValue?.included === true,
+          confirmed: settlementValue?.confirmed === true,
+          success:
+            typeof settlementValue?.success === "boolean"
+              ? settlementValue.success
+              : null,
+          blockHeight:
+            typeof settlementValue?.block_height === "number" &&
+            Number.isSafeInteger(settlementValue.block_height) &&
+            settlementValue.block_height >= 0
+              ? settlementValue.block_height
+              : null,
+          blockHash: stringField(settlementValue, "block_hash") || null,
+          index:
+            typeof settlementValue?.index === "number" &&
+            Number.isSafeInteger(settlementValue.index) &&
+            settlementValue.index >= 0
+              ? settlementValue.index
+              : null,
+          rewardBase:
+            typeof settlementValue?.reward_base === "number" &&
+            Number.isSafeInteger(settlementValue.reward_base) &&
+            settlementValue.reward_base >= 0
+              ? settlementValue.reward_base
+              : null,
+          rewardArc:
+            typeof rewardArc === "number" &&
+            Number.isFinite(rewardArc) &&
+            rewardArc >= 0
+              ? rewardArc
+              : null,
+          receiptUrl: stringField(settlementValue, "receipt_url"),
+        }
+      : undefined,
+    consensus: undefined,
+    coordinator,
+    servedLocally,
+    trace: trace && trace.length > 0 ? trace : undefined,
+  };
+}
+
+/** Errors after a claimed community assignment must never trigger duplicate work. */
+function directInferenceMustNotRetry(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("may still settle") ||
+    normalized.includes("refusing a second late") ||
+    normalized.includes("query its job status") ||
+    /http (400|401|403|409|413|422|504)\b/.test(normalized)
+  );
+}
 
 async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const base = liveBase()!;
@@ -53,6 +701,90 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     const r = await fetch(`${base}${path}`);
     if (!r.ok) throw new Error(`${path} → ${r.status}`);
     return r.json();
+  };
+
+  // Mirrors rpc_client.rs::get_detailed — keeps "this host has no such
+  // endpoint" (404) apart from "this host is unreachable", because the two
+  // degrade to different sentences in the UI.
+  type Detailed =
+    | { kind: "ok"; body: Record<string, unknown> }
+    | { kind: "notFound" }
+    | { kind: "badRequest" }
+    | { kind: "status"; code: number }
+    | { kind: "unreachable"; error: string }
+    | { kind: "unparseable" };
+  const getDetailed = async (path: string): Promise<Detailed> => {
+    try {
+      const r = await fetch(`${base}${path}`);
+      if (r.ok) {
+        try {
+          return { kind: "ok", body: await r.json() };
+        } catch {
+          return { kind: "unparseable" };
+        }
+      }
+      if (r.status === 404) return { kind: "notFound" };
+      if (r.status === 400) return { kind: "badRequest" };
+      return { kind: "status", code: r.status };
+    } catch (e) {
+      return { kind: "unreachable", error: String(e) };
+    }
+  };
+  const reason = (path: string, d: Detailed): string => {
+    switch (d.kind) {
+      case "notFound":
+        return `${base} does not serve ${path} (HTTP 404).`;
+      case "badRequest":
+        return `${base} rejected ${path} as malformed (HTTP 400).`;
+      case "status":
+        return `${base} answered ${path} with HTTP ${d.code}.`;
+      case "unreachable":
+        return `Could not reach ${base} — ${d.error}`;
+      default:
+        return `${base} answered ${path} with a response this build could not parse.`;
+    }
+  };
+  const numOf = (
+    o: Record<string, unknown>,
+    keys: string[],
+  ): number | null => {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+    }
+    return null;
+  };
+  // `/node/contribution` and `/network/info` nest their figures, so a flat
+  // lookup for "threads" returns the OBJECT and reads as absent.
+  const at = (o: unknown, path: string): unknown => {
+    let cur: unknown = o;
+    for (const seg of path.split(".")) {
+      if (cur === null || typeof cur !== "object") return undefined;
+      cur = (cur as Record<string, unknown>)[seg];
+    }
+    return cur;
+  };
+  const nNum = (o: unknown, path: string): number | null => {
+    const v = at(o, path);
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  };
+  const nStr = (o: unknown, path: string): string | null => {
+    const v = at(o, path);
+    return typeof v === "string" && v.length > 0 ? v : null;
+  };
+  const nBool = (o: unknown, path: string): boolean | null => {
+    const v = at(o, path);
+    return typeof v === "boolean" ? v : null;
+  };
+  const strOf = (
+    o: Record<string, unknown>,
+    keys: string[],
+  ): string | null => {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "string" && v.length > 0) return v;
+    }
+    return null;
   };
 
   switch (cmd) {
@@ -69,13 +801,11 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         gpuVramGb: 16,
         recommendedModel: "Llama-2-7B Q4_K_M (3.8 GB)",
         recommendedRole: "worker",
-        estimatedDailyArc: 180,
       } as T;
     case "generate_identity":
       return {
         address:
-          "arc1q" +
-          [...crypto.getRandomValues(new Uint8Array(20))]
+          [...crypto.getRandomValues(new Uint8Array(32))]
             .map((b) => b.toString(16).padStart(2, "0"))
             .join(""),
         publicKey:
@@ -83,16 +813,20 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           [...crypto.getRandomValues(new Uint8Array(32))]
             .map((b) => b.toString(16).padStart(2, "0"))
             .join(""),
-        seedPhrase:
-          "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment",
         createdAt: Date.now(),
       } as T;
+    case "reveal_seed_phrase":
+      return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
     case "save_config":
       return undefined as T;
     case "load_config":
       return null as T;
+    case "load_data_migration_notice":
+      return null as T;
+    case "dismiss_data_migration_notice":
+      return undefined as T;
     case "node_status": {
       // Mirror desktop/src-tauri/src/rpc_client.rs::fetch_status:
       // if local /health is missing peers, probe the public seed
@@ -100,29 +834,26 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       // health to "lite". This is what unlocks the v0.7.0 Client-mode
       // banner in the dashboard. Pre-v0.7 the JS mock hardcoded
       // coordinatorUrl: null so the banner was untestable in live mode.
-      const COORDINATOR_HOSTS = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
+      // Probed concurrently, matching rpc_client.rs::probe_coordinator.
       const probeCoordinator = async (): Promise<string | null> => {
-        for (const origin of COORDINATOR_HOSTS) {
-          try {
-            const r = await fetch(`${origin}/health`, {
-              method: "GET",
-              signal: AbortSignal.timeout(2000),
-            });
-            if (r.ok) return origin;
-          } catch {
-            // try next
-          }
+        const attempts = COORDINATOR_HOSTS.map(async (origin) => {
+          const r = await fetch(`${origin}/health`, {
+            method: "GET",
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!r.ok) throw new Error(`${origin} → ${r.status}`);
+          return origin;
+        });
+        try {
+          return await Promise.any(attempts);
+        } catch {
+          return null;
         }
-        return null;
       };
 
+      const rpcPort = Number(
+        (window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__,
+      );
       try {
         const h = await fetchJson("/health");
         const peers = h.peers ?? 0;
@@ -146,9 +877,15 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           height: h.height ?? 0,
           uptimeSeconds: uptime,
           address: null,
-          rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
+          rpcPort,
           lastError: null,
           coordinatorUrl,
+          chainHost: coordinatorUrl,
+          chainHeight: null,
+          chainRound: null,
+          chainBlockAgeSeconds: null,
+          workerThreads: null,
+          cpuCores: navigator.hardwareConcurrency ?? null,
         } as T;
       } catch {
         const coordinatorUrl = await probeCoordinator();
@@ -163,67 +900,133 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           height: 0,
           uptimeSeconds: 0,
           address: null,
-          rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
+          rpcPort,
           lastError: coordinatorUrl ? null : "No response",
           coordinatorUrl,
+          chainHost: coordinatorUrl,
+          chainHeight: null,
+          chainRound: null,
+          chainBlockAgeSeconds: null,
+          workerThreads: null,
+          cpuCores: navigator.hardwareConcurrency ?? null,
         } as T;
       }
     }
     case "fetch_earnings": {
-      try {
-        const r = await fetchJson("/inference/results?limit=1");
-        const count = r.count ?? 0;
-        return {
-          totalArc: count * REWARD_PER_ATTESTATION,
-          todayArc: Math.round(count * 0.12) * REWARD_PER_ATTESTATION,
-          pendingArc: 2.5,
-          rank: null,
-          attestations: count,
-          lastPayoutAt: Date.now() - 60_000,
-        } as T;
-      } catch {
-        return {
-          totalArc: 0,
-          todayArc: 0,
-          pendingArc: 0,
-          rank: null,
-          attestations: 0,
-          lastPayoutAt: null,
-        } as T;
+      const stored = localStorage.getItem("arc-desktop-state-v1");
+      const addr = stored
+        ? (JSON.parse(stored).identity?.address as string | undefined)
+        : undefined;
+      if (!addr) {
+        return unavailableEarnings(
+          "No identity exists on this device yet, so retained reward receipts cannot be queried.",
+        ) as T;
       }
+      const path = `/worker/earnings/${strip0x(addr)}`;
+      const response = await getDetailed(path);
+      if (response.kind !== "ok") {
+        return unavailableEarnings(reason(path, response)) as T;
+      }
+      if (normalizeHash32(asObject(response.body)?.address) !== normalizeHash32(addr)) {
+        return unavailableEarnings(
+          `${base} answered ${path}, but the earnings response was not bound to the requested worker address.`,
+        ) as T;
+      }
+      return (confirmedEarningsFromBody(response.body) ?? unavailableEarnings(
+        `${base} answered ${path}, but did not provide the candidate mined-0x25 retained-receipt contract. Legacy or malformed inference-count arithmetic is not earnings.`,
+      )) as T;
     }
     case "fetch_attestations": {
+      // Shape-tolerant, matching rpc_client.rs::fetch_attestations. The live
+      // seeds return flat tx records with no nested `inference` object, so
+      // reading only the nested shape produced blank rows with "0 tokens",
+      // "0ms" and a hardcoded "+2.50".
       try {
         const limit = (args as { limit?: number } | undefined)?.limit ?? 20;
         const r = await fetchJson(`/inference/attestations?limit=${limit}`);
-        const arr = (r.attestations ?? []) as Array<{
-          tx_hash: string;
-          success: boolean;
-          inference: {
-            input: string;
-            output_hash: string;
-            model_hash: string;
-            tokens_generated: number;
-            ms_per_token: number;
-          };
-        }>;
-        const now = Date.now();
-        return arr.map((v, i) => ({
-          txHash: v.tx_hash,
-          inputPreview: (v.inference?.input ?? "")
-            .replace("[INST] ", "")
-            .replace(" [/INST]", "")
-            .slice(0, 140),
-          outputHash: v.inference?.output_hash ?? "",
-          modelHash: v.inference?.model_hash ?? "",
-          tokens: v.inference?.tokens_generated ?? 0,
-          latencyMs:
-            (v.inference?.tokens_generated ?? 0) *
-            (v.inference?.ms_per_token ?? 0),
-          rewardArc: REWARD_PER_ATTESTATION,
-          timestamp: now - i * 30_000,
-          verified: !!v.success,
-        })) as T;
+        type Raw = Record<string, unknown>;
+        const hasActivityRows = Array.isArray(r.activities);
+        const arr = (hasActivityRows ? r.activities : (r.attestations ?? [])) as Raw[];
+        const stored = localStorage.getItem("arc-desktop-state-v1");
+        const mineAddr = stored
+          ? (JSON.parse(stored).identity?.address as string | undefined)
+              ?.replace(/^0x/, "")
+              .toLowerCase()
+          : undefined;
+
+        const num = (o: Raw, k: string): number | null => {
+          const v = o[k];
+          return typeof v === "number" && v > 0 ? v : null;
+        };
+
+        return arr
+          .filter((v) => {
+            if (!hasActivityRows) return true;
+            const common = v.schema === "arc.inference.activity.v1"
+              && v.source === "chain_receipt"
+              && v.mined === true
+              && v.success === true
+              && v.computed === true;
+            if (!common) return false;
+            if (v.record_kind === "mined_community_inference_reward") {
+              const txHash = typeof v.tx_hash === "string"
+                ? v.tx_hash.replace(/^0x/i, "").toLowerCase()
+                : "";
+              return v.tx_type === "CommunityInferenceReward"
+                && v.tx_type_code === "0x25"
+                && v.paid === true
+                && v.earned === true
+                && v.submitted === true
+                && v.included === true
+                && v.confirmed === true
+                && /^[0-9a-f]{64}$/.test(txHash)
+                && v.receipt_url === `/community/reward_receipt/0x${txHash}`;
+            }
+            if (v.record_kind === "mined_inference_attestation") {
+              return v.tx_type === "InferenceAttestation"
+                && v.tx_type_code === "0x16"
+                && v.paid === false
+                && v.earned === false;
+            }
+            return false;
+          })
+          .map((v) => {
+            const inf = (v.inference as Raw | undefined) ?? v;
+            const txHash = (v.tx_hash as string) ?? "";
+            if (!txHash) return null;
+            const tokens = num(inf, "tokens_generated");
+            const msPerTok = num(inf, "ms_per_token");
+            const from = (((v.worker as string) ?? (v.from as string)) ?? "")
+              .replace(/^0x/, "")
+              .toLowerCase();
+            const mine = !!mineAddr && !!from && from === mineAddr;
+            return {
+              txHash,
+              inputPreview: ((inf.input as string) ?? "")
+                .replace("[INST] ", "")
+                .replace(" [/INST]", "")
+                .slice(0, 140),
+              outputHash: (inf.output_hash as string) ?? "",
+              modelHash: (inf.model_hash as string) ?? "",
+              tokens,
+              latencyMs:
+                tokens !== null && msPerTok !== null
+                  ? tokens * msPerTok
+                  : num(inf, "inference_ms"),
+              timestamp: num(v, "timestamp"),
+              blockHeight: num(v, "block_height"),
+              txType: (v.tx_type as string) ?? null,
+              recordKind: (v.record_kind as string) ?? null,
+              computed: hasActivityRows ? v.computed === true : !!v.success,
+              paid: hasActivityRows ? v.paid === true : false,
+              earned: hasActivityRows ? v.earned === true : false,
+              from: from || null,
+              mine,
+              verified: hasActivityRows ? v.success === true && v.mined === true : !!v.success,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .sort((a, b) => (b.blockHeight ?? 0) - (a.blockHeight ?? 0)) as T;
       } catch {
         return [] as T;
       }
@@ -254,6 +1057,9 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "start_node":
     case "stop_node":
+    case "prepare_update_relaunch":
+    case "begin_update_handoff":
+    case "abort_update_relaunch":
     case "restart_node":
       return undefined as T;
     case "reset_peer_state":
@@ -271,27 +1077,51 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (!addr) {
         return {
           address: "",
-          balance: 0,
+          balanceBase: "0",
+          balanceArc: "0",
           nonce: 0,
-          stakedBalance: 0,
+          stakedBalanceBase: "0",
+          stakedBalanceArc: "0",
         } as T;
       }
       try {
         const r = await fetch(`${base}/account/${addr}`);
         if (r.status === 404) {
-          return { address: addr, balance: 0, nonce: 0, stakedBalance: 0 } as T;
+          return {
+            address: addr,
+            balanceBase: "0",
+            balanceArc: "0",
+            nonce: 0,
+            stakedBalanceBase: "0",
+            stakedBalanceArc: "0",
+          } as T;
         }
         const v = await r.json();
+        const balanceBase = exactBaseUnits(v.balance, "balance");
+        const stakedBalanceBase = exactBaseUnits(
+          v.staked_balance,
+          "staked_balance",
+        );
         return {
           address: v.address ?? addr,
-          balance: v.balance ?? 0,
+          balanceBase,
+          balanceArc: arcFromBaseUnits(balanceBase),
           nonce: v.nonce ?? 0,
-          stakedBalance: v.staked_balance ?? 0,
+          stakedBalanceBase,
+          stakedBalanceArc: arcFromBaseUnits(stakedBalanceBase),
         } as T;
-      } catch {
-        return { address: addr, balance: 0, nonce: 0, stakedBalance: 0 } as T;
+      } catch (error) {
+        throw new Error(
+          `could not read an exact wallet balance: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
+    case "send_arc":
+      // Browser-live mode intentionally has no signing material. Never add a
+      // seed argument here: native Rust signing is the security boundary.
+      throw new Error(
+        "Sending ARC requires the native desktop app so signing stays in Rust.",
+      );
     case "faucet_claim": {
       const stored = localStorage.getItem("arc-desktop-state-v1");
       const addr = stored
@@ -306,70 +1136,148 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const v = await r.json();
       if (!r.ok)
         throw new Error(v.error ?? `faucet error ${r.status}`);
+      if (v.status !== "pending") {
+        throw new Error("faucet did not acknowledge the claim as pending");
+      }
+      const txHash = strip0x(String(v.tx_hash ?? ""));
+      if (!/^[0-9a-f]{64}$/.test(txHash)) {
+        throw new Error("faucet returned no valid transaction hash");
+      }
+      const amountBase = exactBaseUnits(v.amount, "faucet amount");
+      const receipt = await getDetailed(`/tx/${txHash}`);
+      const receiptBody = receipt.kind === "ok" ? receipt.body : null;
+      const mined = receiptBody !== null;
+      const success =
+        receiptBody && typeof receiptBody.success === "boolean"
+          ? receiptBody.success
+          : null;
+      const receiptStatus = mined
+        ? success === true
+          ? "mined_success"
+          : success === false
+            ? "mined_failed"
+            : "receipt_unavailable"
+        : receipt.kind === "notFound"
+          ? "pending"
+          : "receipt_unavailable";
       return {
-        txHash: v.tx_hash,
-        amount: v.amount,
-        message: v.message,
+        txHash,
+        amountBase,
+        amountArc: arcFromBaseUnits(amountBase),
+        receiptStatus,
+        mined,
+        success,
+        blockHeight:
+          receiptBody && typeof receiptBody.block_height === "number"
+            ? receiptBody.block_height
+            : null,
+        blockHash:
+          receiptBody && typeof receiptBody.block_hash === "string"
+            ? strip0x(receiptBody.block_hash)
+            : null,
+        sourceHost: base,
+        unavailable:
+          receiptStatus === "receipt_unavailable"
+            ? "the receipt lookup could not establish transaction success"
+            : null,
+        message:
+          receiptStatus === "mined_success"
+            ? "Faucet claim has a successful mined receipt."
+            : receiptStatus === "mined_failed"
+              ? "Faucet claim was mined but failed."
+              : "Faucet claim was accepted and is waiting for a mined receipt.",
       } as T;
     }
     case "run_inference": {
-      const { prompt, maxTokens } = args as {
+      const { prompt, maxTokens, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
       const r = await fetch(`${base}/inference/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: wrapped, max_tokens: maxTokens ?? 32 }),
+        body: JSON.stringify({
+          input: prompt,
+          max_tokens: maxTokens ?? 32,
+          chat_template: chatTemplate ?? true,
+        }),
       });
-      if (!r.ok) throw new Error(`inference error ${r.status}`);
+      if (!r.ok) {
+        const detail = await r.text().catch(() => "");
+        throw new Error(`inference error HTTP ${r.status}: ${detail}`);
+      }
       const v = await r.json();
-      return {
-        input: v.inference?.input ?? "",
-        output: v.inference?.output ?? "",
-        outputHash: v.inference?.output_hash ?? "",
-        modelHash: v.inference?.model_hash ?? "",
-        tokensGenerated: v.inference?.tokens_generated ?? 0,
-        inferenceMs: v.inference?.inference_ms ?? 0,
-        txHash: v.attestation?.tx_hash ?? "",
-        deterministic: v.inference?.deterministic ?? false,
-        engine: v.inference?.engine ?? "",
-        explorerUrl: v.explorer_url ?? "",
-      } as T;
+      // liveBase() is 127.0.0.1 - this IS the local node, even when that
+      // coordinator dispatches the actual compute to a community worker.
+      const result = parseInferenceRunBody(v, true, base);
+      pinLiveCommunityReceiptRoute(result);
+      return result as T;
+    }
+    case "fetch_community_reward_receipt": {
+      const expected = args as CommunityRewardReceiptExpectation;
+      validateCommunityRewardReceiptExpectation(expected);
+      if (
+        expected.sourceHost !== base &&
+        !COORDINATOR_HOSTS.includes(expected.sourceHost)
+      ) {
+        throw new Error(
+          "reward receipt unavailable: source host is not the exact local node or a compiled-in ARC coordinator",
+        );
+      }
+      const pinned = liveCommunityReceiptRoutes.get(expected.txHash);
+      if (
+        !pinned ||
+        pinned.sourceHost !== expected.sourceHost ||
+        pinned.jobId !== expected.jobId ||
+        pinned.worker !== expected.worker ||
+        pinned.receiptUrl !== expected.receiptUrl
+      ) {
+        throw new Error(
+          "reward receipt unavailable: requested identity differs from the browser-live inference route pin",
+        );
+      }
+      const response = await fetch(
+        `${expected.sourceHost}${expected.receiptUrl}`,
+        { redirect: "error" },
+      ).catch((error) => {
+        throw new Error(
+          `reward receipt unavailable from pinned coordinator ${expected.sourceHost}: ${String(error)}`,
+        );
+      });
+      if (!response.ok) {
+        throw new Error(
+          `reward receipt unavailable from pinned coordinator ${expected.sourceHost}: HTTP ${response.status}`,
+        );
+      }
+      const body = await response.json().catch(() => {
+        throw new Error(
+          `reward receipt unavailable from pinned coordinator ${expected.sourceHost}: invalid JSON`,
+        );
+      });
+      return parseCommunityRewardReceiptBody(body, expected) as T;
     }
     case "run_inference_via_coordinator": {
-      const { prompt, maxTokens, k } = args as {
+      const { prompt, maxTokens, k, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
         k?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
       // Live mode iterates the same seed list the Rust side uses so the
       // browser E2E path exercises the coordinator fallback against a
       // real chain host.
-      const hosts = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
       let lastErr = "";
-      for (const host of hosts) {
+      for (const host of COORDINATOR_HOSTS) {
         try {
           const r = await fetch(`${host}/inference/run_consensus`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              input: wrapped,
+              input: prompt,
               max_tokens: maxTokens ?? 32,
               k: k ?? 3,
+              chat_template: chatTemplate ?? true,
             }),
           });
           if (!r.ok) {
@@ -386,9 +1294,14 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             tokensGenerated: v.tokens_generated ?? 0,
             inferenceMs: v.total_ms ?? 0,
             txHash: "",
-            deterministic: true,
-            engine: "consensus",
+            deterministic: v.deterministic ?? false,
+            profileBound: v.profile_bound ?? false,
+            quorumVerified: v.quorum_verified ?? false,
+            executionProfile: v.execution_profile ?? "",
+            engine: v.engine ?? "consensus",
             explorerUrl: "",
+            routedVia: "sharded_consensus",
+            settlement: undefined,
             consensus: {
               k: c.k ?? 0,
               votesTotal: c.votes_total ?? 0,
@@ -400,6 +1313,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
                 : 0,
             },
             coordinator: host,
+            servedLocally: false,
           } as T;
         } catch (e) {
           lastErr = `${host} → ${String(e)}`;
@@ -408,98 +1322,49 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(`all coordinators failed; last: ${lastErr}`);
     }
     case "run_inference_via_coordinator_direct": {
-      const { prompt, maxTokens } = args as {
+      const { prompt, maxTokens, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
-      const hosts = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
       let lastErr = "";
-      for (const host of hosts) {
+      for (const host of COORDINATOR_HOSTS) {
         try {
           const r = await fetch(`${host}/inference/run`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              input: wrapped,
+              input: prompt,
               max_tokens: maxTokens ?? 32,
+              chat_template: chatTemplate ?? true,
             }),
           });
           if (!r.ok) {
-            lastErr = `${host} → HTTP ${r.status}`;
+            const detail = await r.text().catch(() => "");
+            const message = `${host} → HTTP ${r.status}: ${detail}`;
+            if (directInferenceMustNotRetry(message)) {
+              throw new Error(message);
+            }
+            lastErr = message;
             continue;
           }
           const v = await r.json();
-          const inf = v.inference ?? {};
-          const att = v.attestation ?? {};
-          return {
-            input: inf.input ?? "",
-            output: inf.output ?? "",
-            outputHash: inf.output_hash ?? "",
-            modelHash: inf.model_hash ?? "",
-            tokensGenerated: inf.tokens_generated ?? 0,
-            inferenceMs: inf.inference_ms ?? 0,
-            txHash: att.tx_hash ?? "",
-            deterministic: inf.deterministic ?? false,
-            engine: inf.engine ?? "",
-            explorerUrl: v.explorer_url ?? "",
-            consensus: undefined,
-            coordinator: host,
-          } as T;
+          const result = parseInferenceRunBody(v, false, host);
+          pinLiveCommunityReceiptRoute(result);
+          return result as T;
         } catch (e) {
-          lastErr = `${host} → ${String(e)}`;
+          const message = `${host} → ${String(e)}`;
+          if (directInferenceMustNotRetry(message)) throw e;
+          lastErr = message;
         }
       }
       throw new Error(`all coordinators failed (direct path); last: ${lastErr}`);
     }
     case "run_paid_inference": {
-      // Paid-inference signs and submits an on-chain tx; the live browser
-      // mode doesn't carry the payer's private key and can't represent
-      // that flow honestly. Surface a clear error rather than synthesize
-      // fake tx hashes the user might take as real.
-      throw new Error(
-        "run_paid_inference requires the Tauri native app (signing + tx submission)",
-      );
+      throw settlementWriteUnavailable("Paid inference escrow");
     }
     case "tier1_submit": {
-      const { prompt, maxTokens, maxReward, deadlineBlocks, committeeSize } =
-        args as {
-          prompt: string;
-          maxTokens?: number;
-          maxReward?: number;
-          deadlineBlocks?: number;
-          committeeSize?: number;
-        };
-      const r = await fetch(`${base}/inference/onchain/submit`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: prompt,
-          max_tokens: maxTokens ?? 32,
-          max_reward: maxReward ?? 10,
-          deadline_blocks: deadlineBlocks ?? 20,
-          committee_size: committeeSize ?? 5,
-        }),
-      });
-      if (!r.ok) throw new Error(`tier1_submit → HTTP ${r.status}`);
-      const v = await r.json();
-      return {
-        requestId: v.request_id,
-        txHash: v.tx_hash,
-        anchorHeight: v.anchor_height,
-        committeeSize: v.committee_size,
-        deadlineBlocks: v.deadline_blocks,
-        maxReward: v.max_reward,
-      } as T;
+      throw settlementWriteUnavailable("Tier 1 on-chain inference");
     }
     case "tier1_result": {
       const { requestId } = args as { requestId: string };
@@ -525,13 +1390,528 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         maxReward: v.max_reward,
       } as T;
     }
+    // ── Chain visibility + projection ────────────────────────────────────
+    // These mirror rpc_client.rs exactly. In live browser mode `base` is the
+    // local node, which is also the chain host being read, so every number
+    // below is attributable to one host — the same invariant the Rust side
+    // holds (CLAUDE.md rule 4).
+    case "fetch_reward_economics": {
+      const path = "/economics/rewards";
+      const d = await getDetailed(path);
+      const shell = {
+        sourceHost: base,
+        rewardPerAttestation: null,
+        treasuryBalanceArc: null,
+        treasuryBalanceUnavailableReason: null,
+        attestationsRemaining: null,
+        attestationsRemainingUnavailableReason: null,
+        treasuryIsFinite: null,
+        bondPerAttestation: null,
+        challengePeriodBlocks: null,
+        bondRefundedAfterChallengePeriod: null,
+        fundingDetail: null,
+      };
+      if (d.kind !== "ok") {
+        return { ...shell, unavailable: reason(path, d) } as T;
+      }
+      // Prefer the exact `_base` integer and divide; the `_arc` floats are
+      // produced by dividing by 1e9 and carry rounding.
+      const baseOrArc = (baseKey: string, arcKey: string) => {
+        const b = numOf(d.body, [baseKey]);
+        if (b !== null) return b / ARC_BASE_UNITS;
+        return numOf(d.body, [arcKey]);
+      };
+      return {
+        ...shell,
+        unavailable: null,
+        rewardPerAttestation: baseOrArc(
+          "reward_per_attestation_base",
+          "reward_per_attestation_arc",
+        ),
+        treasuryBalanceArc: baseOrArc(
+          "treasury_balance_base",
+          "treasury_balance_arc",
+        ),
+        treasuryBalanceUnavailableReason: strOf(d.body, [
+          "treasury_balance_unavailable_reason",
+        ]),
+        // `rewards_remaining` is a COUNT of fundable reward receipts, NOT an
+        // ARC amount. Renamed on ingest so no call site can mistake it for
+        // currency.
+        attestationsRemaining: numOf(d.body, ["rewards_remaining"]),
+        attestationsRemainingUnavailableReason: strOf(d.body, [
+          "rewards_remaining_unavailable_reason",
+        ]),
+        treasuryIsFinite: nBool(d.body, "treasury_is_finite"),
+        bondPerAttestation: baseOrArc(
+          "community_worker_certificate_bond_base",
+          "community_worker_certificate_bond_arc",
+        ),
+        challengePeriodBlocks: null,
+        bondRefundedAfterChallengePeriod: null,
+        fundingDetail: strOf(d.body, ["funding_detail", "funding"]),
+      } as T;
+    }
+    case "fetch_earnings_projection": {
+      const stored = localStorage.getItem("arc-desktop-state-v1");
+      const addr = stored
+        ? (JSON.parse(stored).identity?.address as string | undefined)
+        : undefined;
+      const empty = {
+        sourceHost: base,
+        rewardPerAttestation: null,
+        rewardRateSource: "unknown" as const,
+        communityRewardsEnabled: null,
+        projectedDailyArc: null,
+        projectedDailyUnavailableReason: null,
+        rewardPolicyHash: null,
+        rewardBudgetEpoch: null,
+        rewardsRemainingThisEpoch: null,
+        workerRewardsRemainingThisEpoch: null,
+        coordinatorRewardsRemainingThisEpoch: null,
+        issuanceReadyForWorker: null,
+        rewardProgram: null,
+        rewardIsCustomerDemand: null,
+        attestationsTotal: 0,
+        firstAttestationBlock: null,
+        attestationsPerDay: null,
+        rateUnavailableReason: null,
+        observedOverBlocks: null,
+        rateCaveat: null,
+      };
+      if (!addr) {
+        return {
+          ...empty,
+          unavailable:
+            "No identity on this device yet, so there is nothing to project.",
+        } as T;
+      }
+      const path = `/worker/earnings/${strip0x(addr)}`;
+      const d = await getDetailed(path);
+      if (d.kind !== "ok") {
+        return { ...empty, unavailable: reason(path, d) } as T;
+      }
+      if (normalizeHash32(asObject(d.body)?.address) !== normalizeHash32(addr)) {
+        return {
+          ...empty,
+          unavailable: `${base} answered ${path}, but the earnings response was not bound to the requested worker address.`,
+        } as T;
+      }
+      const confirmed = confirmedEarningsFromBody(d.body);
+      if (!confirmed) {
+        return {
+          ...empty,
+          unavailable: `${base} answered ${path}, but did not provide the candidate mined-0x25 receipt and reward-readiness contract. Legacy inference-count arithmetic is not projected as earnings.`,
+        } as T;
+      }
+      const rateBase = numOf(d.body, ["reward_per_attestation_base"]);
+      const chainRate =
+        rateBase !== null
+          ? rateBase / ARC_BASE_UNITS
+          : numOf(d.body, ["reward_per_attestation_arc"]);
+      // `confirmedEarningsFromBody` has already reconciled this value against
+      // every exact successful mined 0x25 receipt row. Never trust a parallel
+      // host count when receipt identities are available.
+      const attestationsTotal = confirmed.attestations;
+      const observationGate = projectionObservationGate(
+        d.body,
+        attestationsTotal,
+      );
+      const payableRate =
+        chainRate !== null && chainRate >= 0 ? chainRate : null;
+      const observedPerDay = numOf(d.body, ["attestations_per_day_observed"]);
+      const perDay =
+        observationGate === null &&
+        observedPerDay !== null &&
+        observedPerDay >= 0
+          ? observedPerDay
+          : null;
+      const rewardBudget =
+        d.body.reward_budget !== null &&
+        typeof d.body.reward_budget === "object" &&
+        !Array.isArray(d.body.reward_budget)
+          ? (d.body.reward_budget as Record<string, unknown>)
+          : {};
+      return {
+        sourceHost: base,
+        unavailable: null,
+        // The selected coordinator must report the payable amount. A local
+        // constant cannot prove remote rollout alignment.
+        rewardPerAttestation: payableRate,
+        rewardRateSource: payableRate !== null ? "chain" : "unknown",
+        communityRewardsEnabled: nBool(
+          d.body,
+          "community_rewards_v1_enabled",
+        ),
+        projectedDailyArc:
+          observationGate === null ? confirmed.projectedDailyArc : null,
+        projectedDailyUnavailableReason:
+          observationGate ?? confirmed.projectedDailyUnavailableReason,
+        rewardPolicyHash: strOf(d.body, ["reward_issuance_policy_hash"]),
+        rewardBudgetEpoch: numOf(rewardBudget, ["epoch"]),
+        rewardsRemainingThisEpoch: numOf(rewardBudget, [
+          "remaining_this_epoch",
+        ]),
+        workerRewardsRemainingThisEpoch: numOf(rewardBudget, [
+          "worker_remaining_this_epoch",
+        ]),
+        coordinatorRewardsRemainingThisEpoch: numOf(rewardBudget, [
+          "coordinator_remaining_this_epoch",
+        ]),
+        issuanceReadyForWorker: nBool(d.body, "issuance_ready_for_worker"),
+        rewardProgram: strOf(d.body, ["reward_program"]),
+        rewardIsCustomerDemand: nBool(d.body, "reward_is_customer_demand"),
+        attestationsTotal,
+        firstAttestationBlock: numOf(d.body, ["first_attestation_block"]),
+        attestationsPerDay: perDay,
+        rateUnavailableReason:
+          perDay !== null
+            ? null
+            : (observationGate ??
+              strOf(d.body, ["attestations_per_day_unavailable_reason"]) ??
+              (attestationsTotal === 0
+                ? "No successful mined reward receipts are retained for this address, so there is no history to measure a rate from."
+                : `${base} reports ${attestationsTotal} successful mined reward receipt(s) for this address but no observed rate, so a per-day figure cannot be measured here.`)),
+        // `blocks_observed` on the wire.
+        observedOverBlocks: numOf(d.body, ["blocks_observed"]),
+        // Shown verbatim: the host knows its own method, this build does not.
+        rateCaveat: strOf(d.body, ["attestations_per_day_caveat"]),
+        // The bond is NOT on this endpoint — it comes from /economics/rewards.
+      } as T;
+    }
+    case "fetch_node_contribution": {
+      const cores = navigator.hardwareConcurrency ?? null;
+      const shell = {
+        sourceHost: base,
+        layersHeld: null as string | null,
+        layerCount: null as number | null,
+        totalLayers: null as number | null,
+        hopMsMean: null as number | null,
+        hopSamples: null as number | null,
+        hopUnavailableReason: null as string | null,
+      };
+      const direct = await getDetailed("/node/contribution");
+      if (direct.kind === "ok") {
+        // Nested: `threads`, `shards` and `own_compute_ms` are objects.
+        const ranges =
+          (at(direct.body, "shards.ranges") as
+            | Array<Record<string, unknown>>
+            | undefined) ?? [];
+        const rendered = ranges
+          .map((r) =>
+            typeof r.start_layer === "number" && typeof r.end_layer === "number"
+              ? `${r.start_layer}..${r.end_layer}`
+              : null,
+          )
+          .filter((x): x is string => x !== null);
+        const avail = nNum(direct.body, "threads.available_parallelism");
+        return {
+          ...shell,
+          unavailable: null,
+          source: "contribution",
+          threadsInUse: nNum(direct.body, "threads.in_use"),
+          // The host reports 0 when it could not read the core count. Zero
+          // cores is not a measurement, so fall back to ours.
+          threadsAvailable: avail !== null && avail > 0 ? avail : cores,
+          layersHeld: rendered.length > 0 ? rendered.join(", ") : null,
+          // A UNION of layers held, which the host computes. Summing the
+          // ranges would double-count replicated layers.
+          layerCount: nNum(direct.body, "shards.layers_held"),
+          totalLayers: nNum(direct.body, "shards.total_layers"),
+          runsServed: numOf(direct.body, ["sharded_runs_total"]),
+          // `sharded_cache_hits` — no `_total` suffix here, unlike
+          // `sharded_runs_total` and `sharded_bytes_total`.
+          cacheHits: numOf(direct.body, ["sharded_cache_hits"]),
+          hopMsMean: nNum(direct.body, "own_compute_ms.mean_ms"),
+          hopSamples: nNum(direct.body, "own_compute_ms.samples"),
+          hopUnavailableReason: nStr(
+            direct.body,
+            "own_compute_ms.unavailable_reason",
+          ),
+        } as T;
+      }
+      const [threads, stats] = await Promise.all([
+        getDetailed("/node/threads"),
+        getDetailed("/stats"),
+      ]);
+      const threadsInUse =
+        threads.kind === "ok"
+          ? numOf(threads.body, ["threads", "threads_in_use", "worker_threads"])
+          : null;
+      const runsServed =
+        stats.kind === "ok" ? numOf(stats.body, ["sharded_runs_total"]) : null;
+      if (threadsInUse === null && runsServed === null) {
+        return {
+          ...shell,
+          unavailable:
+            "Your node did not answer /node/contribution, /node/threads or /stats, so what it is contributing cannot be read right now.",
+          source: "none",
+          threadsInUse: null,
+          threadsAvailable: cores,
+          runsServed: null,
+          cacheHits: null,
+        } as T;
+      }
+      return {
+        ...shell,
+        unavailable: null,
+        source: "composed",
+        threadsInUse,
+        threadsAvailable:
+          (threads.kind === "ok"
+            ? numOf(threads.body, ["available", "cpu_cores", "max_threads"])
+            : null) ?? cores,
+        runsServed,
+        // /stats spells it with `_total`; /node/contribution does not.
+        cacheHits:
+          stats.kind === "ok"
+            ? numOf(stats.body, [
+                "sharded_cache_hits_total",
+                "sharded_cache_hits",
+              ])
+            : null,
+      } as T;
+    }
+    case "fetch_network_overview": {
+      const [info, health, latest, validators] = await Promise.all([
+        getDetailed("/network/info"),
+        getDetailed("/health"),
+        getDetailed("/block/latest"),
+        getDetailed("/validators"),
+      ]);
+      const iv = info.kind === "ok" ? info.body : null;
+      const h = health.kind === "ok" ? health.body : null;
+
+      // Only /network/info may name the network. `/info` is deliberately not
+      // consulted: its `chain` field is the constant "ARC Chain" everywhere,
+      // so it cannot tell a testnet from a mainnet.
+      const networkName = iv ? strOf(iv, ["network"]) : null;
+
+      const rawValidators =
+        validators.kind === "ok"
+          ? ((validators.body.validators as Array<Record<string, unknown>>) ??
+            [])
+          : [];
+      const list = rawValidators
+        .map((v) => {
+          const address = typeof v.address === "string" ? v.address : null;
+          if (!address) return null;
+          const stake = typeof v.stake === "number" ? v.stake : 0;
+          return { address: strip0x(address), stake, active: stake > 0 };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+
+      // /network/info applies the real min_active_stake threshold; counting
+      // stake > 0 only approximates it. Prefer the reported figures and record
+      // which was used, so an approximation is never shown as the host's own.
+      const reportedActive = iv ? numOf(iv, ["validators_active"]) : null;
+      const reportedRegistered = iv
+        ? numOf(iv, ["validators_registered"])
+        : null;
+
+      const header =
+        latest.kind === "ok"
+          ? (latest.body.header as Record<string, unknown> | undefined)
+          : undefined;
+      const tsMs =
+        header && typeof header.timestamp === "number" && header.timestamp > 0
+          ? header.timestamp
+          : null;
+      const height = h ? numOf(h, ["height", "block_height"]) : null;
+      // Prefer the host's own age; fall back to computing it from the header.
+      const lastBlockAgeSecs =
+        (iv ? numOf(iv, ["last_block_age_secs"]) : null) ??
+        (tsMs !== null ? Math.max(0, Math.floor((Date.now() - tsMs) / 1000)) : null);
+
+      return {
+        sourceHost: base,
+        unavailable:
+          height === null && lastBlockAgeSecs === null && list.length === 0
+            ? reason("/health", health)
+            : null,
+        networkName,
+        networkNameUnavailableReason:
+          (iv ? strOf(iv, ["network_unavailable_reason"]) : null) ??
+          (info.kind === "ok" ? null : reason("/network/info", info)),
+        chainId: iv ? strOf(iv, ["chain_id"]) : null,
+        // The ONLY input allowed to make this app describe a network as mainnet.
+        declaresMainnet: nBool(iv ?? {}, "declares_mainnet"),
+        isBlockProducing: nBool(iv ?? {}, "is_block_producing"),
+        isBlockProducingBasis: iv
+          ? strOf(iv, ["is_block_producing_basis"])
+          : null,
+        hostVersion: h ? strOf(h, ["version"]) : null,
+        height,
+        lastBlockAgeSecs,
+        dagRound: h ? numOf(h, ["dag_round"]) : null,
+        dagCommitted: h ? numOf(h, ["dag_committed"]) : null,
+        peers: h ? numOf(h, ["peers", "connected_peers"]) : null,
+        validatorsActive:
+          reportedActive ??
+          (validators.kind === "ok"
+            ? list.filter((v) => v.active).length
+            : null),
+        validatorsRegistered:
+          reportedRegistered ??
+          (validators.kind === "ok"
+            ? (numOf(validators.body, ["count"]) ?? list.length)
+            : null),
+        minActiveStake: iv ? numOf(iv, ["min_active_stake"]) : null,
+        validatorSplitDerived: reportedActive === null,
+        validators: list,
+      } as T;
+    }
+    case "fetch_recent_blocks": {
+      const limit = Math.min(
+        100,
+        Math.max(1, (args as { limit?: number } | undefined)?.limit ?? 10),
+      );
+      // The range must be computed. `/blocks` defaults `from` to 0, so
+      // `?limit=10` returns the ten OLDEST blocks starting at genesis — not
+      // the newest ten. Verified against the live NYC seed, which answered
+      // `?limit=2` with height 0. Anchor the window to the tip instead.
+      const health = await getDetailed("/health");
+      const tip =
+        health.kind === "ok" ? numOf(health.body, ["height", "block_height"]) : null;
+      if (tip === null) {
+        return {
+          sourceHost: base,
+          unavailable: `Could not read the current height from ${base}, so the newest blocks cannot be located.`,
+          blocks: [],
+        } as T;
+      }
+      const from = Math.max(0, tip - limit + 1);
+      const path = `/blocks?from=${from}&to=${tip}&limit=${limit}`;
+      const d = await getDetailed(path);
+      if (d.kind !== "ok") {
+        return {
+          sourceHost: base,
+          unavailable: reason(path, d),
+          blocks: [],
+        } as T;
+      }
+      const arr = (d.body.blocks as Array<Record<string, unknown>>) ?? [];
+      return {
+        sourceHost: base,
+        unavailable: null,
+        blocks: arr
+          .map((b) => {
+            const height = typeof b.height === "number" ? b.height : null;
+            if (height === null) return null;
+            // A zero timestamp is not a time: genesis carries `timestamp: 0`,
+            // and the UI's relative-time formatter renders that as "20770d
+            // ago". Same reasoning for an all-zero producer, which is a
+            // placeholder rather than an address.
+            const ts = numOf(b, ["timestamp"]);
+            const producer =
+              typeof b.producer === "string" ? strip0x(b.producer) : null;
+            return {
+              height,
+              hash: typeof b.hash === "string" ? strip0x(b.hash) : "",
+              timestampMs: ts !== null && ts > 0 ? ts : null,
+              txCount: numOf(b, ["tx_count"]),
+              proposer:
+                producer && /[^0]/.test(producer) ? producer : null,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .sort((a, b) => b.height - a.height),
+      } as T;
+    }
+    case "fetch_block_txs": {
+      const { height, limit } = args as { height: number; limit?: number };
+      const path = `/block/${height}/txs?limit=${Math.min(1000, Math.max(1, limit ?? 50))}`;
+      const d = await getDetailed(path);
+      if (d.kind !== "ok") {
+        return {
+          sourceHost: base,
+          unavailable: reason(path, d),
+          height,
+          txCount: null,
+          txs: [],
+        } as T;
+      }
+      const rows =
+        (d.body.transactions as Array<Record<string, unknown>>) ?? [];
+      return {
+        sourceHost: base,
+        unavailable: null,
+        height,
+        txCount: numOf(d.body, ["tx_count"]),
+        txs: rows
+          .map((t) => {
+            const hash = typeof t.hash === "string" ? strip0x(t.hash) : null;
+            if (!hash) return null;
+            return {
+              index: numOf(t, ["index"]) ?? 0,
+              hash,
+              txType: strOf(t, ["tx_type"]),
+              from: typeof t.from === "string" ? strip0x(t.from) : null,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null),
+      } as T;
+    }
+    case "lookup_tx": {
+      const raw = (args as { hash: string }).hash;
+      const hash = strip0x(raw);
+      const shell = {
+        sourceHost: base,
+        hash,
+        blockHeight: null,
+        blockHash: null,
+        txIndex: null,
+        success: null,
+        gasUsed: null,
+      };
+      if (hash.length !== 64 || !/^[0-9a-f]+$/.test(hash)) {
+        return {
+          ...shell,
+          status: "invalid_hash",
+          unavailable: `A transaction hash is 64 hex characters (an optional 0x prefix is fine). That one is ${hash.length}.`,
+        } as T;
+      }
+      const path = `/tx/${hash}`;
+      const d = await getDetailed(path);
+      if (d.kind === "ok") {
+        return {
+          ...shell,
+          unavailable: null,
+          status: "mined",
+          blockHeight: numOf(d.body, ["block_height"]),
+          blockHash:
+            typeof d.body.block_hash === "string"
+              ? strip0x(d.body.block_hash)
+              : null,
+          txIndex: numOf(d.body, ["index"]),
+          success:
+            typeof d.body.success === "boolean" ? d.body.success : null,
+          gasUsed: numOf(d.body, ["gas_used"]),
+        } as T;
+      }
+      // A 404 is ALSO what a pending attestation looks like — /tx/{hash} is a
+      // receipt lookup and a mempool tx has no receipt. Never "invalid".
+      if (d.kind === "notFound") {
+        return { ...shell, unavailable: null, status: "not_found" } as T;
+      }
+      if (d.kind === "badRequest") {
+        return {
+          ...shell,
+          status: "invalid_hash",
+          unavailable: `${base} rejected that hash as malformed.`,
+        } as T;
+      }
+      return {
+        ...shell,
+        status: "error",
+        unavailable: reason(path, d),
+      } as T;
+    }
     case "open_external":
       window.open((args as { url: string }).url, "_blank");
       return undefined as T;
     case "clear_crash":
       return undefined as T;
-    case "check_for_update":
-      return { hasUpdate: false, version: "0.5.2" } as T;
     case "ensure_binary":
       // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
@@ -543,25 +1923,19 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "get_autostart":
       return false as T;
+    case "update_install_policy":
+      return {
+        canInstall: false,
+        channel: "package-manager",
+        instructions: "Browser previews cannot install application updates.",
+      } as T;
     case "list_model_tiers":
       return [
         {
-          id: "tiny",
-          displayName: "TinyLlama 1.1B (Q4_K_M)",
-          sizeBytes: 669_262_336,
-          url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        },
-        {
           id: "standard",
-          displayName: "Llama-2 7B Chat (Q4_K_M)",
-          sizeBytes: 4_081_004_544,
-          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
-        },
-        {
-          id: "big",
-          displayName: "Llama-2 13B Chat (Q4_K_M)",
-          sizeBytes: 7_866_070_016,
-          url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
+          displayName: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
+          sizeBytes: 4_081_004_224,
+          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
         },
       ] as T;
     case "recommended_tier":
@@ -579,15 +1953,58 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 // Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
+let mockWorkerThreads: number | null = null;
 const mockLogs: LogEntry[] = [];
-let mockEarnings: Earnings = {
-  totalArc: 12_847.5,
-  todayArc: 247.12,
-  pendingArc: 18.4,
-  rank: 147,
-  attestations: 1283,
-  lastPayoutAt: Date.now() - 1000 * 60 * 12,
+// Explicit browser-preview fixture for a hypothetical host whose candidate
+// receipt contract is ready. These are static layout values, never a claim
+// about the public fleet and never increased merely because a process runs.
+const mockEarnings: Earnings = {
+  totalArc: 5,
+  todayArc: null,
+  pendingArc: null,
+  rank: null,
+  attestations: 2,
+  lastPayoutAt: null,
+  lastPayoutBlock: 123_462,
+  confirmedReceipts: [
+    {
+      txHash: `0x${"aa".repeat(32)}`,
+      jobId: `0x${"01".repeat(32)}`,
+      blockHeight: 123_461,
+      blockHash: `0x${"10".repeat(32)}`,
+      rewardBase: 2_500_000_000,
+      rewardArc: 2.5,
+      receiptUrl: `/community/reward_receipt/0x${"aa".repeat(32)}`,
+      recoveryEpoch: 1,
+      validatorSetId: 1,
+    },
+    {
+      txHash: `0x${"ab".repeat(32)}`,
+      jobId: `0x${"02".repeat(32)}`,
+      blockHeight: 123_462,
+      blockHash: `0x${"11".repeat(32)}`,
+      rewardBase: 2_500_000_000,
+      rewardArc: 2.5,
+      receiptUrl: `/community/reward_receipt/0x${"ab".repeat(32)}`,
+      recoveryEpoch: 1,
+      validatorSetId: 1,
+    },
+  ],
+  projectedDailyArc: 5,
+  projectedDailyUnavailableReason: null,
+  recoveryEpoch: 1,
+  validatorSetId: 1,
+  unavailableReason: null,
+  receiptSource: RETAINED_EARNINGS_SOURCE,
+  archiveMode: false,
+  historyCompleteSinceRecovery: false,
+  historyScope: RETAINED_EARNINGS_SCOPE,
+  fromChain: true,
 };
+
+// The mock deliberately exercises raw 0x16 claims, two distinct successful
+// mined 0x25 payment receipts, another worker's activity, and old-seed padding.
+const MOCK_ADDRESS = "99".repeat(32);
 
 const mockAttestations: Attestation[] = [
   {
@@ -597,8 +2014,15 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 42,
     latencyMs: 147,
-    rewardArc: 12.5,
     timestamp: Date.now() - 1000 * 34,
+    blockHeight: 123_462,
+    txType: "Inference",
+    recordKind: "mined_inference_attestation",
+    computed: true,
+    paid: false,
+    earned: false,
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
   {
@@ -608,29 +2032,147 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 128,
     latencyMs: 412,
-    rewardArc: 34.8,
     timestamp: Date.now() - 1000 * 89,
+    blockHeight: 123_455,
+    txType: "Inference",
+    recordKind: "mined_inference_attestation",
+    computed: true,
+    paid: false,
+    earned: false,
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
   {
+    // Someone else's work, flat shape, no telemetry: no reward, no token
+    // count, no timestamp. The UI must render this without inventing any of
+    // the three.
     txHash: "0x14ab23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca28335f2",
-    inputPreview: "Explain zero-knowledge proofs to a 10 year old",
-    outputHash: "0xbe91fe12aab4c7d2e44a88b1f91023c8",
-    modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
-    tokens: 256,
-    latencyMs: 783,
-    rewardArc: 67.2,
-    timestamp: Date.now() - 1000 * 214,
+    inputPreview: "",
+    outputHash: "",
+    modelHash: "",
+    tokens: null,
+    latencyMs: null,
+    timestamp: null,
+    blockHeight: 123_401,
+    txType: "Inference",
+    recordKind: "mined_inference_attestation",
+    computed: true,
+    paid: false,
+    earned: false,
+    from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+    mine: false,
+    verified: true,
+  },
+  {
+    // Old-seed PADDING. `/inference/attestations` on the deployed v0.7.9 seeds
+    // tops its list up with unrelated transactions tagged `tx_type: "Other"`
+    // once genuine attestation rows run out — at limit=500 some seeds returned
+    // 500 of these and zero real ones. The Network screen filters them out;
+    // this row is here so that filter is demonstrably doing something.
+    txHash: "0x77cc23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833aa1",
+    inputPreview: "",
+    outputHash: "",
+    modelHash: "",
+    tokens: null,
+    latencyMs: null,
+    timestamp: null,
+    blockHeight: 123_390,
+    txType: "Other",
+    recordKind: null,
+    computed: false,
+    paid: false,
+    earned: false,
+    from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+    mine: false,
+    verified: true,
+  },
+  {
+    txHash: `0x${"aa".repeat(32)}`,
+    inputPreview: "Verified community inference reward",
+    outputHash: `0x${"21".repeat(32)}`,
+    modelHash: `0x${"31".repeat(32)}`,
+    tokens: 42,
+    latencyMs: 147,
+    timestamp: Date.now() - 1000 * 28,
+    blockHeight: 123_461,
+    txType: "CommunityInferenceReward",
+    recordKind: "mined_community_inference_reward",
+    computed: true,
+    paid: true,
+    earned: true,
+    from: MOCK_ADDRESS,
+    mine: true,
+    verified: true,
+  },
+  {
+    txHash: `0x${"ab".repeat(32)}`,
+    inputPreview: "Verified community inference reward",
+    outputHash: `0x${"22".repeat(32)}`,
+    modelHash: `0x${"32".repeat(32)}`,
+    tokens: 128,
+    latencyMs: 412,
+    timestamp: Date.now() - 1000 * 18,
+    blockHeight: 123_462,
+    txType: "CommunityInferenceReward",
+    recordKind: "mined_community_inference_reward",
+    computed: true,
+    paid: true,
+    earned: true,
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
 ];
+
+/** The seed the mock pretends to have pinned. Mirrors mock `node_status`. */
+const MOCK_CHAIN_HOST = "http://140.82.16.112:9090";
+
+/**
+ * Fourteen validators, four of them at stake 0.
+ *
+ * This fixture preserves an older host response in which four registered
+ * entries had zero stake. It exists to keep the Network screen's active versus
+ * registered distinction testable; it is not a current fleet claim.
+ */
+const MOCK_VALIDATORS = Array.from({ length: 14 }, (_, i) => ({
+  address: `${(i + 1).toString(16).padStart(2, "0")}cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e93${(i + 16).toString(16)}`,
+  stake: i < 10 ? 500_000 * ARC_BASE_UNITS : 0,
+  active: i < 10,
+}));
+
+/**
+ * Recent blocks, descending. Heights and gaps are fixed literals rather than
+ * derived from `Date.now()`: a fabricated "seconds ago" ladder that shifts on
+ * every poll is exactly the class of invention this app removed.
+ */
+const MOCK_BLOCKS = [
+  { height: 123_469, gapSecs: 400, txCount: 2 },
+  { height: 123_468, gapSecs: 407, txCount: 0 },
+  { height: 123_467, gapSecs: 415, txCount: 1 },
+  { height: 123_466, gapSecs: 422, txCount: 0 },
+  { height: 123_465, gapSecs: 430, txCount: 3 },
+  { height: 123_464, gapSecs: 438, txCount: 0 },
+  { height: 123_463, gapSecs: 445, txCount: 0 },
+  { height: 123_462, gapSecs: 453, txCount: 1 },
+  { height: 123_461, gapSecs: 460, txCount: 0 },
+  { height: 123_460, gapSecs: 468, txCount: 2 },
+].map((b) => ({
+  height: b.height,
+  hash: `${b.height.toString(16)}c41ab77e0d5c3b8a16e94f20d7a5589cc31be4470a2e6d1f8039b5ca7e4`
+    .padEnd(64, "0")
+    .slice(0, 64),
+  timestampMs: Date.now() - b.gapSecs * 1000,
+  txCount: b.txCount,
+  proposer: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+}));
 
 function seedMockLogs() {
   if (mockLogs.length > 0) return;
   const now = Date.now();
   const entries: Array<[LogEntry["level"], string, number]> = [
     ["info", "arc-node v0.5.2 starting", 12_000],
-    ["info", "Loaded identity arc1qxy...8z3p", 11_800],
+    ["info", `Loaded identity ${MOCK_ADDRESS.slice(0, 8)}...${MOCK_ADDRESS.slice(-4)}`, 11_800],
     ["info", "Connecting to 8 testnet seeds", 11_500],
     ["ok", "Handshake complete with 149.28.32.76", 10_200],
     ["ok", "Handshake complete with 140.82.16.112", 10_100],
@@ -663,9 +2205,8 @@ const DEFAULT_HARDWARE: HardwareInfo = {
   ramGb: 64,
   gpuName: "Apple M2 Ultra (76-core)",
   gpuVramGb: 64,
-  recommendedModel: "Llama-2-13B Q4_K_M (7.3 GB)",
+  recommendedModel: "Llama-2-7B Q4_K_M (3.8 GB, ARC compatible)",
   recommendedRole: "worker",
-  estimatedDailyArc: 420,
 };
 
 async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
@@ -677,25 +2218,36 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
+  // Test seam (see `mockOverride`). Checked after the production guard above,
+  // so it cannot fabricate anything in a real bundle.
+  const override = mockOverride<T>(cmd);
+  if (override !== undefined) {
+    await new Promise((r) => setTimeout(r, 20));
+    return override;
+  }
   await new Promise((r) => setTimeout(r, 120));
   switch (cmd) {
     case "detect_hardware":
       return DEFAULT_HARDWARE as T;
     case "generate_identity":
       return {
-        address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
+        address: MOCK_ADDRESS,
         publicKey:
           "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
-        seedPhrase:
-          "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment",
         createdAt: Date.now(),
       } as T;
+    case "reveal_seed_phrase":
+      return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
     case "save_config":
       return undefined as T;
     case "load_config":
       return null as T;
+    case "load_data_migration_notice":
+      return null as T;
+    case "dismiss_data_migration_notice":
+      return undefined as T;
     case "node_status": {
       const running = mockStartedAt !== null;
       const uptime = running
@@ -705,16 +2257,24 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.5.2",
+        version: "0.8.0",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
         height: running ? 43_820 + Math.floor(uptime / 4) : 0,
         uptimeSeconds: uptime,
-        address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
-        rpcPort: 9944,
+        address: MOCK_ADDRESS,
+        rpcPort: 9090,
         lastError: null,
         coordinatorUrl: null,
+        // Chain numbers are the network's, not this node's - and the mock
+        // reflects the real testnet's stalled block production.
+        chainHost: "http://140.82.16.112:9090",
+        chainHeight: 123_469,
+        chainRound: 9_596_644,
+        chainBlockAgeSeconds: 400,
+        workerThreads: running ? mockWorkerThreads : null,
+        cpuCores: 24,
       } as T;
     }
     case "start_node":
@@ -722,6 +2282,13 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "stop_node":
       mockStartedAt = null;
+      return undefined as T;
+    case "prepare_update_relaunch":
+      mockStartedAt = null;
+      return undefined as T;
+    case "begin_update_handoff":
+      return undefined as T;
+    case "abort_update_relaunch":
       return undefined as T;
     case "restart_node":
       mockStartedAt = Date.now();
@@ -734,14 +2301,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         message: "Cleared cached peer list. Rebootstrapping from testnet seeds.",
       } as T;
     case "fetch_earnings": {
-      if (mockStartedAt) {
-        const elapsed = (Date.now() - mockStartedAt) / 1000;
-        mockEarnings = {
-          ...mockEarnings,
-          todayArc: 247.12 + elapsed * 0.05,
-          totalArc: 12_847.5 + elapsed * 0.05,
-        };
-      }
       return mockEarnings as T;
     }
     case "fetch_attestations":
@@ -755,27 +2314,209 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         avgTps: 33_221,
         latestBlock: 43_821,
       } as T;
+    // ── Chain visibility + projection ────────────────────────────────────
+    // Populated, so browser preview and the screenshot suite show the real
+    // layout. The 404 / no-history / degraded paths are reached by tests via
+    // `window.__ARC_MOCK__` — see `mockOverride`.
+    case "fetch_reward_economics":
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        rewardPerAttestation: MOCK_REWARD_PER_RECEIPT,
+        treasuryBalanceArc: 4_182_500,
+        treasuryBalanceUnavailableReason: null,
+        // A COUNT of successful reward receipts the treasury can still fund:
+        // 4,182,500 ARC / 2.5 ARC = 1,673,000.
+        attestationsRemaining: 1_673_000,
+        attestationsRemainingUnavailableReason: null,
+        treasuryIsFinite: true,
+        // Verified community reward certificates carry no worker bond.
+        bondPerAttestation: 0,
+        challengePeriodBlocks: null,
+        bondRefundedAfterChallengePeriod: null,
+        fundingDetail:
+          "Transferred from a pre-funded testnet treasury account. Not an emission and not revenue share.",
+      } as T;
+    case "fetch_earnings_projection":
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        rewardPerAttestation: MOCK_REWARD_PER_RECEIPT,
+        rewardRateSource: "chain",
+        communityRewardsEnabled: true,
+        projectedDailyArc: 108,
+        projectedDailyUnavailableReason: null,
+        rewardPolicyHash: "0xpreview-policy",
+        rewardBudgetEpoch: 2,
+        rewardsRemainingThisEpoch: 31,
+        workerRewardsRemainingThisEpoch: 7,
+        coordinatorRewardsRemainingThisEpoch: 11,
+        issuanceReadyForWorker: true,
+        rewardProgram: "protocol-capped testnet promotional compute subsidy",
+        rewardIsCustomerDemand: false,
+        attestationsTotal: 1_283,
+        firstAttestationBlock: 118_011,
+        attestationsPerDay: 43.2,
+        rateUnavailableReason: null,
+        observedOverBlocks: 5_458,
+        rateCaveat:
+          "Derived from the first and last attestation timestamps in this node's scan window; a node offline for part of that window will read low.",
+      } as T;
+    case "fetch_node_contribution":
+      return {
+        sourceHost: "http://127.0.0.1:9090",
+        unavailable: null,
+        source: "contribution",
+        threadsInUse: mockWorkerThreads ?? 24,
+        threadsAvailable: 24,
+        layersHeld: "0..6",
+        layerCount: 6,
+        totalLayers: 32,
+        runsServed: 15,
+        cacheHits: 3,
+        hopMsMean: 182,
+        hopSamples: 15,
+        hopUnavailableReason: null,
+      } as T;
+    case "fetch_network_overview":
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        networkName: "arc-testnet-1",
+        networkNameUnavailableReason: null,
+        chainId: "arc-testnet-1",
+        // The host declares itself NOT mainnet. The UI must never say mainnet
+        // unless this is explicitly true.
+        declaresMainnet: false,
+        isBlockProducing: false,
+        isBlockProducingBasis:
+          "no block sealed within block_production_fresh_secs (120s)",
+        hostVersion: "0.7.9",
+        height: 123_469,
+        // Matches the mock node_status: the real testnet's block production
+        // is stalled, and the mock reflects that rather than a healthy fiction.
+        lastBlockAgeSecs: 400,
+        dagRound: 9_596_644,
+        dagCommitted: 9_596_640,
+        peers: 8,
+        validatorsActive: 10,
+        validatorsRegistered: 14,
+        minActiveStake: 500_000,
+        validatorSplitDerived: false,
+        validators: MOCK_VALIDATORS,
+      } as T;
+    case "fetch_recent_blocks": {
+      const limit = (args as { limit?: number } | undefined)?.limit ?? 10;
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        blocks: MOCK_BLOCKS.slice(0, limit),
+      } as T;
+    }
+    case "fetch_block_txs": {
+      const { height } = args as { height: number };
+      const block = MOCK_BLOCKS.find((b) => b.height === height);
+      const n = block?.txCount ?? 0;
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        height,
+        txCount: n,
+        // Derived from the block's own tx_count so an expanded block never
+        // shows more rows than the list said it had.
+        txs: Array.from({ length: n }, (_, i) => ({
+          index: i,
+          hash: strip0x(
+            mockAttestations[i % mockAttestations.length].txHash,
+          ),
+          txType: i === 0 ? "Inference" : "Transfer",
+          from: MOCK_ADDRESS,
+        })),
+      } as T;
+    }
+    case "lookup_tx": {
+      const hash = strip0x((args as { hash: string }).hash);
+      const shell = {
+        sourceHost: MOCK_CHAIN_HOST,
+        hash,
+        blockHeight: null,
+        blockHash: null,
+        txIndex: null,
+        success: null,
+        gasUsed: null,
+      };
+      if (hash.length !== 64 || !/^[0-9a-f]+$/.test(hash)) {
+        return {
+          ...shell,
+          status: "invalid_hash",
+          unavailable: `A transaction hash is 64 hex characters (an optional 0x prefix is fine). That one is ${hash.length}.`,
+        } as T;
+      }
+      // The first mock attestation is mined; anything else well-formed is
+      // treated as not yet in a block, which is the honest answer for a hash
+      // this host has no receipt for.
+      const mined = strip0x(mockAttestations[0].txHash);
+      if (hash === mined) {
+        return {
+          ...shell,
+          unavailable: null,
+          status: "mined",
+          blockHeight: 123_462,
+          blockHash:
+            "9f2c41ab77e0d5c3b8a16e94f20d7a5589cc31be4470a2e6d1f8039b5ca7e412",
+          txIndex: 0,
+          success: true,
+          gasUsed: 21_000,
+        } as T;
+      }
+      return { ...shell, unavailable: null, status: "not_found" } as T;
+    }
     case "open_external":
       return undefined as T;
     case "fetch_balance":
       return {
         address: "fakehex0000000000000000000000000000000000000000000000000000000000",
-        balance: 28_500,
+        balanceBase: "28500000000000",
+        balanceArc: "28500",
         nonce: 3,
-        stakedBalance: 0,
+        stakedBalanceBase: "0",
+        stakedBalanceArc: "0",
       } as T;
     case "faucet_claim":
       return {
         txHash:
-          "0x8f31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
-        amount: 10_000,
-        message: "Sent 10000 ARC to fakehex…",
+          "8f31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
+        amountBase: "1000000000",
+        amountArc: "1",
+        receiptStatus: "pending",
+        mined: false,
+        success: null,
+        blockHeight: null,
+        blockHash: null,
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        message: "Faucet claim was accepted and is waiting for a mined receipt.",
+      } as T;
+    case "send_arc":
+      return {
+        txHash:
+          "8e31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
+        amountBase: "1250000000",
+        amountArc: "1.25",
+        receiptStatus: "pending",
+        mined: false,
+        success: null,
+        blockHeight: null,
+        blockHash: null,
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        message: "Transfer was accepted and is waiting for a mined receipt.",
       } as T;
     case "run_inference": {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 900));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output: "  This is a mock response for local preview mode.",
         outputHash:
           "0xbe91fe12aab4c7d2e44a88b1f91023c811112222333344445555666677778888",
@@ -786,17 +2527,41 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         txHash:
           "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
         deterministic: true,
+        profileBound: false,
+        quorumVerified: false,
+        executionProfile: "local mock",
         engine: "mock",
         explorerUrl: "/tx/0x1a2b3c4d5e6f7a8b",
+        servedLocally: true,
       } as T;
+    }
+    case "fetch_community_reward_receipt": {
+      const expected = args as CommunityRewardReceiptExpectation;
+      return parseCommunityRewardReceiptBody(
+        {
+          status: "pending_mined_receipt",
+          tx_type: "0x25",
+          tx_hash: expected.txHash,
+          job_id: expected.jobId,
+          worker: expected.worker,
+          submitted: true,
+          included: false,
+          confirmed: false,
+          success: null,
+          reward_base: null,
+          reward_arc: null,
+          receipt_url: expected.receiptUrl,
+        },
+        expected,
+      ) as T;
     }
     case "run_inference_via_coordinator": {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 1200));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
-          "  Mock coordinator response - browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
+          "  Mock coordinator response — browser preview only. An installed build asks the selected coordinator for its agreement evidence; a host-reported quorum is not proof of payment or a healthy shared public chain.",
         outputHash:
           "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
         modelHash: "",
@@ -804,8 +2569,13 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         inferenceMs: 18_400,
         txHash: "",
         deterministic: true,
+        profileBound: true,
+        quorumVerified: true,
+        executionProfile:
+          "INT8 integer (per-row, cross-platform deterministic)",
         engine: "consensus",
         explorerUrl: "",
+        servedLocally: false,
         consensus: {
           k: 3,
           votesTotal: 48,
@@ -821,42 +2591,30 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 800));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
-          "  Mock direct-coordinator response - browser preview. In Tauri + live testnet, this hits a single coordinator's /inference/run as a fallback when the sharded /inference/run_consensus path is degraded.",
+          "  Mock direct-coordinator response — browser preview only. An installed build may ask one coordinator directly, but that response alone does not prove independent recomputation, community assignment, mining, or payment.",
         outputHash:
           "0xe5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
         modelHash:
           "0xabec2d582beb97a876c21d7ccc5e8e4833e8fd34aee0cb5b64e9f14f5ea57fdb",
         tokensGenerated: 28,
         inferenceMs: 7_800,
-        txHash: "0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+        txHash: "0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         deterministic: true,
+        profileBound: false,
+        quorumVerified: false,
+        executionProfile:
+          "INT8 integer (per-row, cross-platform deterministic)",
         engine: "INT8 integer (cross-platform deterministic)",
-        explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+        explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         consensus: undefined,
         coordinator: "http://140.82.16.112:9090",
+        servedLocally: false,
       } as T;
     }
     case "tier1_submit": {
-      await new Promise((r) => setTimeout(r, 300));
-      const requestId =
-        "0x" +
-        [...crypto.getRandomValues(new Uint8Array(32))]
-          .map((b) => b.toString(16).padStart(2, "0"))
-          .join("");
-      return {
-        requestId,
-        txHash:
-          "0x" +
-          [...crypto.getRandomValues(new Uint8Array(32))]
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join(""),
-        anchorHeight: 12345,
-        committeeSize: 5,
-        deadlineBlocks: 20,
-        maxReward: 10,
-      } as T;
+      throw settlementWriteUnavailable("Tier 1 on-chain inference");
     }
     case "tier1_result": {
       const { requestId } = args as { requestId: string };
@@ -894,42 +2652,30 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     }
     case "run_paid_inference": {
-      const { prompt, maxFee } = args as {
-        prompt: string;
-        maxTokens?: number;
-        maxFee?: number;
-      };
-      await new Promise((r) => setTimeout(r, 1500));
-      return {
-        input: `[INST] ${prompt} [/INST]`,
-        output:
-          "  Mock paid-inference response - browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
-        outputHash:
-          "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
-        tokensGenerated: 28,
-        inferenceMs: 22_100,
-        coordinator: "http://149.28.32.76:9090",
-        consensus: {
-          k: 3,
-          votesTotal: 48,
-          unanimous: 48,
-          majority: 0,
-          split: 0,
-          divergentReplicaCount: 0,
-        },
-        payerAddress:
-          "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        maxFee: maxFee ?? 10_000,
-        openTxHash:
-          "0x0open111111111111111111111111111111111111111111111111111111111111",
-        releaseTxHash:
-          "0x0release1111111111111111111111111111111111111111111111111111111",
-      } as T;
+      throw settlementWriteUnavailable("Paid inference escrow");
     }
     case "clear_crash":
       return undefined as T;
-    case "check_for_update":
-      return { hasUpdate: false, version: "0.5.2" } as T;
+    case "save_logs":
+      return {
+        path: "/mock/Downloads/arc-node-20260817-120000.log",
+        lines: mockLogs.length,
+      } as T;
+    case "set_worker_threads": {
+      const { threads } = args as { threads: number };
+      mockWorkerThreads = threads;
+      // Mirrors the real fallback: no /node/threads endpoint exists yet, so
+      // applying a new width restarts the node.
+      if (mockStartedAt !== null) mockStartedAt = Date.now();
+      return {
+        workerThreads: threads,
+        restarted: mockStartedAt !== null,
+        message:
+          mockStartedAt !== null
+            ? `Restarted the node with ${threads} cores.`
+            : `Saved. The node will use ${threads} cores when it starts.`,
+      } as T;
+    }
     case "ensure_binary":
       // Mock path - no real download. Pretend it completed instantly.
       return {
@@ -940,25 +2686,19 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "get_autostart":
       return true as T;
+    case "update_install_policy":
+      return {
+        canInstall: true,
+        channel: "native",
+        instructions: "ARC can install this signed update in place.",
+      } as T;
     case "list_model_tiers":
       return [
         {
-          id: "tiny",
-          displayName: "TinyLlama 1.1B (Q4_K_M)",
-          sizeBytes: 669_262_336,
-          url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        },
-        {
           id: "standard",
-          displayName: "Llama-2 7B Chat (Q4_K_M)",
-          sizeBytes: 4_081_004_544,
-          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
-        },
-        {
-          id: "big",
-          displayName: "Llama-2 13B Chat (Q4_K_M)",
-          sizeBytes: 7_866_070_016,
-          url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
+          displayName: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
+          sizeBytes: 4_081_004_224,
+          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
         },
       ] as T;
     case "recommended_tier":
@@ -983,6 +2723,11 @@ async function realInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   if (IS_TAURI) return realInvoke<T>(cmd, args);
+  if (IS_PROD_TAURI_BUNDLE) {
+    throw new Error(
+      "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
+    );
+  }
   if (liveBase()) return liveInvoke<T>(cmd, args);
   return mockInvoke<T>(cmd, args);
 }
@@ -993,10 +2738,25 @@ export const api = {
   detectHardware: () => invoke<HardwareInfo>("detect_hardware"),
   generateIdentity: () => invoke<Identity>("generate_identity"),
   loadIdentity: () => invoke<Identity | null>("load_identity"),
+  /**
+   * Fetch the BIP-39 recovery phrase for the backup screen.
+   *
+   * The result MUST NOT be persisted, logged, or put into app state that
+   * gets serialized. It exists only for as long as the user is looking at
+   * it. See `IdentityPublic` in the Rust types for why.
+   */
+  revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
+  loadDataMigrationNotice: () =>
+    invoke<DataMigrationNotice | null>("load_data_migration_notice"),
+  dismissDataMigrationNotice: () =>
+    invoke<void>("dismiss_data_migration_notice"),
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
   stopNode: () => invoke<void>("stop_node"),
+  prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),
+  beginUpdateHandoff: () => invoke<void>("begin_update_handoff"),
+  abortUpdateRelaunch: () => invoke<void>("abort_update_relaunch"),
   restartNode: () => invoke<void>("restart_node"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
@@ -1005,22 +2765,84 @@ export const api = {
     invoke<Attestation[]>("fetch_attestations", { limit }),
   fetchLogs: (limit = 200) => invoke<LogEntry[]>("fetch_logs", { limit }),
   fetchNetworkStats: () => invoke<NetworkStats>("fetch_network_stats"),
+
+  // ── Chain visibility + projection ──────────────────────────────────────
+  // Each of these resolves to a struct carrying `unavailable` rather than
+  // rejecting, because "this host does not serve that endpoint" is a fact to
+  // display, not an exception to swallow. Callers render the reason.
+  /** The finite reward treasury — the ceiling on any projection. */
+  fetchRewardEconomics: () =>
+    invoke<RewardEconomics>("fetch_reward_economics"),
+  /** Measured inputs for the earnings projection. */
+  fetchEarningsProjection: () =>
+    invoke<EarningsProjection>("fetch_earnings_projection"),
+  /** What the node on THIS machine is contributing. */
+  fetchNodeContribution: () =>
+    invoke<NodeContribution>("fetch_node_contribution"),
+  /** Height, block age, validator split and peers for the pinned host. */
+  fetchNetworkOverview: () =>
+    invoke<NetworkOverview>("fetch_network_overview"),
+  fetchRecentBlocks: (limit = 10) =>
+    invoke<RecentBlocks>("fetch_recent_blocks", { limit }),
+  /** Transactions in one block. Called on expand, never on the poll path. */
+  fetchBlockTxs: (height: number, limit = 50) =>
+    invoke<BlockTxs>("fetch_block_txs", { height, limit }),
+  /** Resolve one tx/attestation hash against the pinned host. */
+  lookupTx: (hash: string) => invoke<TxLookup>("lookup_tx", { hash }),
   fetchBalance: () => invoke<AccountBalance>("fetch_balance"),
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
-  runInference: (prompt: string, maxTokens = 32) =>
-    invoke<InferenceResult>("run_inference", { prompt, maxTokens }),
-  runInferenceViaCoordinator: (prompt: string, maxTokens = 32, k = 3) =>
+  sendArc: (to: string, amountArc: string) =>
+    invoke<WalletTxResult>("send_arc", { to, amountArc }),
+  // `chatTemplate` asks the serving node to apply the loaded model's own
+  // chat template. The client no longer wraps prompts in Llama-2's
+  // `[INST] ... [/INST]` tags, which were wrong for other architectures and
+  // got double-applied when the node templated too.
+  runInference: (prompt: string, maxTokens = 32, chatTemplate = true) =>
+    invoke<InferenceResult>("run_inference", { prompt, maxTokens, chatTemplate }),
+  runInferenceViaCoordinator: (
+    prompt: string,
+    maxTokens = 32,
+    k = 3,
+    chatTemplate = true,
+  ) =>
     invoke<InferenceResult>("run_inference_via_coordinator", {
       prompt,
       maxTokens,
       k,
+      chatTemplate,
     }),
-  runInferenceViaCoordinatorDirect: (prompt: string, maxTokens = 32) =>
+  runInferenceViaCoordinatorDirect: (
+    prompt: string,
+    maxTokens = 32,
+    chatTemplate = true,
+  ) =>
     invoke<InferenceResult>("run_inference_via_coordinator_direct", {
       prompt,
       maxTokens,
+      chatTemplate,
     }),
-  // ── Tier 1 on-chain inference ────────────────────────────────────────────
+  /**
+   * Independently fetch an exact 0x25 receipt from the host that served the
+   * inference. Native code pins/allowlists the origin and validates the full
+   * transaction, job, worker, URL, and state matrix.
+   */
+  fetchCommunityRewardReceipt: (
+    sourceHost: string,
+    txHash: string,
+    jobId: string,
+    worker: string,
+    receiptUrl: string,
+  ) =>
+    invoke<InferenceSettlement>("fetch_community_reward_receipt", {
+      sourceHost,
+      txHash,
+      jobId,
+      worker,
+      receiptUrl,
+    }),
+  // Write commands remain in the IPC surface for compatibility, but every
+  // native/browser implementation rejects them before signing or network I/O.
+  // `tier1Result` is read-only inspection for IDs created by older builds.
   tier1Submit: (
     prompt: string,
     maxTokens = 32,
@@ -1051,10 +2873,19 @@ export const api = {
     }),
   clearCrash: () => invoke<void>("clear_crash"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
-  checkForUpdate: () =>
-    invoke<{ hasUpdate: boolean; version: string }>("check_for_update"),
+  /**
+   * Write the log ring to a file via a native save dialog. Replaces a
+   * `Blob` + `<a download>` click, which WKWebView silently ignores — so
+   * the button did nothing at all on macOS.
+   */
+  saveLogs: () => invoke<SavedLogs>("save_logs"),
+  /** Change how many cores the node contributes. */
+  setWorkerThreads: (threads: number) =>
+    invoke<ThreadsApplied>("set_worker_threads", { threads }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
+  updateInstallPolicy: () =>
+    invoke<UpdateInstallPolicy>("update_install_policy"),
   listModelTiers: () => invoke<ModelTierInfo[]>("list_model_tiers"),
   recommendedTier: () => invoke<string>("recommended_tier"),
   existingModelForTier: (tier: string) =>
@@ -1064,3 +2895,16 @@ export const api = {
 };
 
 export const isTauri = IS_TAURI;
+/**
+ * A plain Vite browser build is a visual test fixture, never a network client.
+ * Keep this exported so every screen can make that boundary unmistakable.
+ */
+export const isSyntheticPreview =
+  !IS_TAURI && !IS_PROD_TAURI_BUNDLE && liveBase() === null;
+
+/**
+ * A production Tauri bundle opened as ordinary HTML must render a blocker and
+ * refuse every IPC call. It must never degrade into the synthetic preview.
+ */
+export const isBlockedProductionBrowser =
+  !IS_TAURI && IS_PROD_TAURI_BUNDLE;

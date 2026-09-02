@@ -33,15 +33,19 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let sep2 = PredefinedMenuItem::separator(app)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit ARC Node", true, None::<&str>)?;
 
-    let menu = Menu::with_items(
-        app,
-        &[&open_i, &sep1, &status_i, &round_i, &sep2, &quit_i],
-    )?;
+    let menu = Menu::with_items(app, &[&open_i, &sep1, &status_i, &round_i, &sep2, &quit_i])?;
+
+    // Left-click-to-open is a macOS/Windows menu-bar convention, and
+    // `TrayIconEvent::Click` is what implements it. Linux AppIndicator never
+    // delivers that event, so on Linux a left click would do nothing at all
+    // unless it opens the menu — which is the platform convention there
+    // anyway, and the only route to Quit.
+    let menu_on_left_click = cfg!(target_os = "linux");
 
     let tray = TrayIconBuilder::with_id("main")
         .tooltip("ARC Node")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(menu_on_left_click)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
                 if let Some(win) = app.get_webview_window("main") {
@@ -115,18 +119,10 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 .await;
             let (status_text, round_text) = match resp {
                 Ok(r) if r.status().is_success() => {
-                    let v: serde_json::Value =
-                        r.json().await.unwrap_or(serde_json::Value::Null);
-                    let peers =
-                        v.get("peers").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let uptime = v
-                        .get("uptime_secs")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    let round = v
-                        .get("dag_round")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
+                    let v: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
+                    let peers = v.get("peers").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let uptime = v.get("uptime_secs").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let round = v.get("dag_round").and_then(|x| x.as_u64()).unwrap_or(0);
                     let health = if peers == 0 || uptime < 8 {
                         "syncing"
                     } else {
@@ -137,10 +133,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                         format!("Round: {}", round),
                     )
                 }
-                _ => (
-                    "Status: offline".to_string(),
-                    "Round: -".to_string(),
-                ),
+                _ => ("Status: offline".to_string(), "Round: -".to_string()),
             };
             let _ = status_item.set_text(status_text);
             let _ = round_item.set_text(round_text);

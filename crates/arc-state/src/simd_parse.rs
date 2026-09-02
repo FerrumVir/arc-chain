@@ -282,12 +282,12 @@ pub fn serialize_batch(txs: &[ParsedTx]) -> Vec<u8> {
         let tx_len = MIN_TX_BODY as u32;
         buf.extend_from_slice(&tx_len.to_le_bytes()); // 4-byte length prefix
 
-        buf.extend_from_slice(&tx.sender);            // 32
-        buf.extend_from_slice(&tx.receiver);           // 32
-        buf.extend_from_slice(&tx.amount.to_le_bytes());  // 8
-        buf.extend_from_slice(&tx.nonce.to_le_bytes());   // 8
+        buf.extend_from_slice(&tx.sender); // 32
+        buf.extend_from_slice(&tx.receiver); // 32
+        buf.extend_from_slice(&tx.amount.to_le_bytes()); // 8
+        buf.extend_from_slice(&tx.nonce.to_le_bytes()); // 8
         buf.extend_from_slice(&tx.signature_offset.to_le_bytes()); // 4
-        buf.extend_from_slice(&tx.hash);               // 32
+        buf.extend_from_slice(&tx.hash); // 32
     }
 
     buf
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn test_single_roundtrip() {
         let tx = make_tx(1);
-        let batch = serialize_batch(&[tx.clone()]);
+        let batch = serialize_batch(std::slice::from_ref(&tx));
         let parser = SimdParser::new();
         let result = parser.parse_batch(&batch);
         assert_eq!(result.parsed_count, 1);
@@ -427,7 +427,7 @@ mod tests {
     // 2. Multi-tx batch round-trip.
     #[test]
     fn test_batch_roundtrip() {
-        let txs: Vec<ParsedTx> = (0..100).map(|i| make_tx(i)).collect();
+        let txs: Vec<ParsedTx> = (0..100).map(make_tx).collect();
         let batch = serialize_batch(&txs);
         let parser = SimdParser::new();
         let result = parser.parse_batch(&batch);
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn test_zero_copy_ref_parse() {
         let tx = make_tx(5);
-        let batch = serialize_batch(&[tx.clone()]);
+        let batch = serialize_batch(std::slice::from_ref(&tx));
         let parser = SimdParser::new();
         let refs = parser.parse_batch_ref(&batch);
         assert_eq!(refs.len(), 1);
@@ -497,7 +497,7 @@ mod tests {
     // 8. Serialize / re-parse preserves exact bytes.
     #[test]
     fn test_serialize_determinism() {
-        let txs: Vec<ParsedTx> = (0..10).map(|i| make_tx(i)).collect();
+        let txs: Vec<ParsedTx> = (0..10).map(make_tx).collect();
         let a = serialize_batch(&txs);
         let b = serialize_batch(&txs);
         assert_eq!(a, b, "serialization must be deterministic");
@@ -516,7 +516,7 @@ mod tests {
     // 10. sum_amounts with u128 accumulator.
     #[test]
     fn test_sum_amounts() {
-        let txs: Vec<ParsedTx> = (1..=10).map(|i| make_tx(i)).collect();
+        let txs: Vec<ParsedTx> = (1..=10).map(make_tx).collect();
         // amounts = 1000, 2000, ..., 10_000 => sum = 55_000
         let total = sum_amounts(&txs);
         assert_eq!(total, 55_000u128);
@@ -525,7 +525,7 @@ mod tests {
     // 11. SimdBatchResult elapsed is non-zero for a real batch.
     #[test]
     fn test_elapsed_timing() {
-        let txs: Vec<ParsedTx> = (0..50).map(|i| make_tx(i)).collect();
+        let txs: Vec<ParsedTx> = (0..50).map(make_tx).collect();
         let batch = serialize_batch(&txs);
         let parser = SimdParser::new();
         let result = parser.parse_batch(&batch);
@@ -539,17 +539,17 @@ mod tests {
     fn test_mixed_valid_invalid() {
         // Build a valid tx.
         let tx = make_tx(1);
-        let valid_batch = serialize_batch(&[tx.clone()]);
+        let valid_batch = serialize_batch(std::slice::from_ref(&tx));
 
         // Build an invalid tx (body shorter than MIN_TX_BODY).
         let short_body = vec![0xAA; 20];
         let short_len = short_body.len() as u32;
 
         let mut buf = Vec::new();
-        buf.extend_from_slice(&valid_batch);                    // valid
-        buf.extend_from_slice(&short_len.to_le_bytes());         // len prefix
-        buf.extend_from_slice(&short_body);                      // short body
-        buf.extend_from_slice(&valid_batch);                    // valid again
+        buf.extend_from_slice(&valid_batch); // valid
+        buf.extend_from_slice(&short_len.to_le_bytes()); // len prefix
+        buf.extend_from_slice(&short_body); // short body
+        buf.extend_from_slice(&valid_batch); // valid again
 
         let parser = SimdParser::new();
         let result = parser.parse_batch(&buf);
@@ -560,7 +560,7 @@ mod tests {
     // 13. Prefetch toggle does not affect correctness.
     #[test]
     fn test_prefetch_toggle() {
-        let txs: Vec<ParsedTx> = (0..20).map(|i| make_tx(i)).collect();
+        let txs: Vec<ParsedTx> = (0..20).map(make_tx).collect();
         let batch = serialize_batch(&txs);
 
         let mut parser = SimdParser::new();

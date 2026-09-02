@@ -69,10 +69,7 @@ impl MultiVersionMemory {
 
     /// Record a write from transaction `tx_idx` for the given key.
     fn write(&self, key: [u8; 32], tx_idx: usize, value: WriteValue) {
-        self.data
-            .entry(key)
-            .or_insert_with(BTreeMap::new)
-            .insert(tx_idx, value);
+        self.data.entry(key).or_default().insert(tx_idx, value);
     }
 
     /// Read the most recent write to `key` from any transaction with index < `tx_idx`.
@@ -189,8 +186,7 @@ impl BlockSTM {
             // so they see predecessor writes.
             for &i in &conflicts {
                 mvm.clear_tx(i);
-                let exec =
-                    self.execute_tx_speculative(&transactions[i], i, &mvm, false);
+                let exec = self.execute_tx_speculative(&transactions[i], i, &mvm, false);
                 for (&key, &wv) in &exec.write_set {
                     mvm.write(key, i, wv);
                 }
@@ -335,7 +331,12 @@ impl BlockSTM {
 
     /// Read an account's balance/nonce, first checking the multi-version memory
     /// for writes from predecessors, then falling back to the base state.
-    fn read_account(&self, key: [u8; 32], tx_idx: usize, mvm: &MultiVersionMemory) -> AccountSnapshot {
+    fn read_account(
+        &self,
+        key: [u8; 32],
+        tx_idx: usize,
+        mvm: &MultiVersionMemory,
+    ) -> AccountSnapshot {
         if let Some(wv) = mvm.read_from_predecessor(&key, tx_idx) {
             AccountSnapshot {
                 balance: wv.balance,
@@ -473,10 +474,7 @@ mod tests {
 
     #[test]
     fn test_single_transfer() {
-        let state = Arc::new(StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]));
+        let state = Arc::new(StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]));
         let stm = BlockSTM::new(Arc::clone(&state));
 
         let txs = vec![Transaction::new_transfer(addr(1), addr(2), 100, 0)];
@@ -590,10 +588,7 @@ mod tests {
 
     #[test]
     fn test_wrong_nonce_fails() {
-        let state = Arc::new(StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]));
+        let state = Arc::new(StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]));
         let stm = BlockSTM::new(Arc::clone(&state));
 
         // Nonce should be 0 but we provide 5.
@@ -628,6 +623,9 @@ mod tests {
 
         assert_eq!(result.success.len(), 100);
         assert!(result.success.iter().all(|&s| s));
-        assert_eq!(result.reexecutions, 0, "disjoint batch should have zero re-executions");
+        assert_eq!(
+            result.reexecutions, 0,
+            "disjoint batch should have zero re-executions"
+        );
     }
 }

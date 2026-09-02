@@ -1,4 +1,4 @@
-import type { Address, Hash256, HealthResponse, InfoResponse, NodeInfoResponse, StatsResponse, BlockDetail, BlocksResponse, BlocksQueryOptions, BlockTxsResponse, BlockTxsQueryOptions, BlockProofsResponse, TxReceipt, TxProof, FullTransaction, TxSubmitResponse, TxSubmitBatchResponse, TxSubmitPayload, Account, AccountTxs, ValidatorsResponse, ContractInfo, ContractCallResult, ContractCallOptions, LightSnapshot, SyncSnapshotInfo, FaucetClaimResponse, FaucetStatus, FaucetHealth } from "./types";
+import type { Address, Hash256, HealthResponse, InfoResponse, NodeInfoResponse, StatsResponse, BlockDetail, BlocksResponse, BlocksQueryOptions, BlockTxsResponse, BlockTxsQueryOptions, BlockProofsResponse, TxReceipt, TxProof, FullTransaction, SignedTransferTransaction, TxSubmitResponse, TxSubmitBatchResponse, TxSubmitPayload, TransactionDomainInfo, Account, AccountTxs, ValidatorsResponse, ContractInfo, ContractCallResult, ContractCallOptions, LightSnapshot, SyncSnapshotInfo, FaucetClaimResponse, FaucetStatus, FaucetHealth, U64 } from "./types.js";
 /**
  * Error thrown when an RPC request fails.
  * Carries the HTTP status code and the response body text.
@@ -14,13 +14,13 @@ export declare class ArcRpcError extends Error {
  * ARC Chain RPC client.
  *
  * Wraps the full ARC native REST API with typed methods.
- * Uses the built-in `fetch` — no external dependencies required.
+ * Uses the built-in `fetch` - no external dependencies required.
  *
  * @example
  * ```ts
  * import { ArcClient } from "@arc-chain/sdk";
  *
- * const client = new ArcClient("http://localhost:9090");
+ * const client = new ArcClient("http://localhost:9944");
  *
  * const health = await client.getHealth();
  * console.log(health.status); // "ok"
@@ -36,7 +36,7 @@ export declare class ArcClient {
     /**
      * Create a new ARC Chain RPC client.
      *
-     * @param rpcUrl - Base URL of the ARC Chain node (e.g. `"http://localhost:9090"`).
+     * @param rpcUrl - Base URL of the ARC Chain node (e.g. `"http://localhost:9944"`).
      * @param options - Optional configuration.
      * @param options.timeout - Request timeout in milliseconds (default: 30000).
      * @param options.headers - Additional headers to include on every request.
@@ -45,16 +45,16 @@ export declare class ArcClient {
         timeout?: number;
         headers?: Record<string, string>;
     });
-    /** `GET /health` — Node health check. */
+    /** `GET /health` - Node health check. */
     getHealth(): Promise<HealthResponse>;
-    /** `GET /info` — Chain information including GPU status. */
+    /** `GET /info` - Chain information including GPU status. */
     getInfo(): Promise<InfoResponse>;
-    /** `GET /node/info` — Validator-specific node information. */
+    /** `GET /node/info` - Validator-specific node information. */
     getNodeInfo(): Promise<NodeInfoResponse>;
-    /** `GET /stats` — Aggregate chain statistics. */
+    /** `GET /stats` - Aggregate chain statistics. */
     getStats(): Promise<StatsResponse>;
     /**
-     * `GET /block/{height}` — Fetch a block by height.
+     * `GET /block/{height}` - Fetch a block by height.
      *
      * Returns the full block detail including header, transaction hashes,
      * and the block hash.
@@ -63,7 +63,7 @@ export declare class ArcClient {
      */
     getBlock(height: number): Promise<BlockDetail>;
     /**
-     * `GET /blocks` — Paginated block listing.
+     * `GET /blocks` - Paginated block listing.
      *
      * @param options.from - Start height (inclusive, default 0).
      * @param options.to - End height (inclusive, default chain tip).
@@ -71,7 +71,7 @@ export declare class ArcClient {
      */
     getBlocks(options?: BlocksQueryOptions): Promise<BlocksResponse>;
     /**
-     * `GET /block/{height}/txs` — Paginated transactions for a block.
+     * `GET /block/{height}/txs` - Paginated transactions for a block.
      *
      * For benchmark blocks, transactions are reconstructed on-demand.
      *
@@ -82,11 +82,11 @@ export declare class ArcClient {
      */
     getBlockTxs(height: number, options?: BlockTxsQueryOptions): Promise<BlockTxsResponse>;
     /**
-     * `GET /block/{height}/proofs` — All Merkle inclusion proofs for a block.
+     * `GET /block/{height}/proofs` - All Merkle inclusion proofs for a block.
      */
     getBlockProofs(height: number): Promise<BlockProofsResponse>;
     /**
-     * `GET /tx/{hash}` — Look up a transaction receipt by hash.
+     * `GET /tx/{hash}` - Look up a transaction receipt by hash.
      *
      * Falls back to on-demand reconstruction for benchmark transactions.
      *
@@ -95,7 +95,7 @@ export declare class ArcClient {
      */
     getTx(hash: Hash256): Promise<TxReceipt>;
     /**
-     * `GET /tx/{hash}/full` — Full transaction with type-specific body fields,
+     * `GET /tx/{hash}/full` - Full transaction with type-specific body fields,
      * signature information, and receipt data.
      *
      * Supports all 21 transaction types.
@@ -105,7 +105,7 @@ export declare class ArcClient {
      */
     getTxFull(hash: Hash256): Promise<FullTransaction>;
     /**
-     * `GET /tx/{hash}/proof` — Merkle inclusion proof for a transaction.
+     * `GET /tx/{hash}/proof` - Merkle inclusion proof for a transaction.
      *
      * The proof can be verified client-side using BLAKE3 with the
      * `ARC-chain-tx-v1` domain separator.
@@ -115,7 +115,7 @@ export declare class ArcClient {
      */
     getTxProof(hash: Hash256): Promise<TxProof>;
     /**
-     * `POST /tx/submit` — Submit a transaction to the mempool.
+     * `POST /tx/submit` - Submit a transaction to the mempool.
      *
      * @param tx - Transaction payload (from, to, amount, nonce, optional tx_type).
      * @throws {ArcRpcError} 400 if addresses are invalid hex.
@@ -123,20 +123,27 @@ export declare class ArcClient {
      */
     submitTx(tx: TxSubmitPayload): Promise<TxSubmitResponse>;
     /**
-     * `POST /tx/submit` — Submit a fully-formed signed transaction.
+     * `POST /tx/submit` - Submit a fully-formed signed transaction.
      *
      * Use this when you have constructed and signed the transaction yourself.
      */
-    submitSignedTx(tx: FullTransaction): Promise<TxSubmitResponse>;
+    submitSignedTx(tx: SignedTransferTransaction): Promise<TxSubmitResponse>;
     /**
-     * `POST /tx/submit_batch` — Submit multiple transactions in one request.
+     * `POST /tx/submit_batch` - Submit multiple transactions in one request.
      *
      * Each transaction is processed independently; some may be accepted
      * while others are rejected.
      */
     submitTxBatch(transactions: TxSubmitPayload[]): Promise<TxSubmitBatchResponse>;
     /**
-     * `GET /account/{address}` — Fetch account state.
+     * Fetch the exact transaction-signing domain advertised by the node.
+     * Legacy nodes without `/network/info` use the v1 null domain.
+     */
+    getTransactionDomain(): Promise<TransactionDomainInfo["transaction_domain"]>;
+    private _assertTransactionDomain;
+    private _requireMatchingTransactionDomain;
+    /**
+     * `GET /account/{address}` - Fetch account state.
      *
      * @param address - 64-character hex address.
      * @throws {ArcRpcError} 400 if address is not valid hex.
@@ -144,30 +151,28 @@ export declare class ArcClient {
      */
     getAccount(address: Address): Promise<Account>;
     /**
-     * `GET /account/{address}/txs` — Transaction hashes involving an account.
+     * `GET /account/{address}/txs` - Transaction hashes involving an account.
      *
      * @param address - 64-character hex address.
      */
     getAccountTxs(address: Address): Promise<AccountTxs>;
-    /**
-     * Convenience: get account balance as a number.
-     */
-    getBalance(address: Address): Promise<number>;
+    /** Convenience: get an exact account balance (`bigint` above 2^53 - 1). */
+    getBalance(address: Address): Promise<U64>;
     /**
      * Convenience: get account nonce.
      */
-    getNonce(address: Address): Promise<number>;
-    /** `GET /validators` — List all validators with stake and tier. */
+    getNonce(address: Address): Promise<U64>;
+    /** `GET /validators` - List all validators with stake and tier. */
     getValidators(): Promise<ValidatorsResponse>;
     /**
-     * `GET /contract/{address}` — Get deployed contract information.
+     * `GET /contract/{address}` - Get deployed contract information.
      *
      * @param address - 64-character hex contract address.
      * @throws {ArcRpcError} 404 if no contract at address.
      */
     getContract(address: Address): Promise<ContractInfo>;
     /**
-     * `POST /contract/{address}/call` — Read-only contract call.
+     * `POST /contract/{address}/call` - Read-only contract call.
      *
      * Executes the function in a sandbox without modifying state.
      *
@@ -178,19 +183,19 @@ export declare class ArcClient {
      * @param options.gasLimit - Gas limit for execution.
      */
     callContract(address: Address, fn: string, options?: ContractCallOptions): Promise<ContractCallResult>;
-    /** `GET /light/snapshot` — Lightweight snapshot for light client bootstrapping. */
+    /** `GET /light/snapshot` - Lightweight snapshot for light client bootstrapping. */
     getLightSnapshot(): Promise<LightSnapshot>;
-    /** `GET /sync/snapshot/info` — Metadata about the available state snapshot. */
+    /** `GET /sync/snapshot/info` - Metadata about the available state snapshot. */
     getSyncSnapshotInfo(): Promise<SyncSnapshotInfo>;
     /**
-     * `GET /sync/snapshot` — Download the full state snapshot as LZ4-compressed bincode.
+     * `GET /sync/snapshot` - Download the full state snapshot as LZ4-compressed bincode.
      *
      * Returns the raw response so you can stream or save the binary data.
      * Use `response.arrayBuffer()` or pipe `response.body` for large snapshots.
      */
     getSyncSnapshot(): Promise<Response>;
     /**
-     * `POST /claim` — Request test tokens from the faucet.
+     * `POST /claim` - Request test tokens from the faucet.
      *
      * The faucet is a separate service (default port 3001).
      * If your faucet runs on a different URL, create a second `ArcClient`
@@ -199,9 +204,9 @@ export declare class ArcClient {
      * @param address - 64-character hex address to receive tokens.
      */
     faucetClaim(address: Address): Promise<FaucetClaimResponse>;
-    /** `GET /status` — Faucet operational status. */
+    /** `GET /status` - Faucet operational status. */
     faucetStatus(): Promise<FaucetStatus>;
-    /** `GET /health` — Faucet health check (same path as node health, different service). */
+    /** `GET /health` - Faucet health check (same path as node health, different service). */
     faucetHealth(): Promise<FaucetHealth>;
     /**
      * Send a raw ETH JSON-RPC 2.0 request.
@@ -219,19 +224,19 @@ export declare class ArcClient {
      */
     ethRpc<T = unknown>(method: string, params?: unknown[], id?: number | string): Promise<T>;
     /**
-     * `eth_chainId` — Returns the ARC Chain ID (`0x415243` = 4,281,923).
+     * `eth_chainId` - Returns the ARC Chain ID (`0x415243` = 4,281,923).
      */
     ethChainId(): Promise<string>;
     /**
-     * `eth_blockNumber` — Current block height as hex.
+     * `eth_blockNumber` - Current block height as hex.
      */
     ethBlockNumber(): Promise<string>;
     /**
-     * `eth_getBalance` — Account balance in hex wei.
+     * `eth_getBalance` - Account balance in hex wei.
      */
     ethGetBalance(address: string, block?: string): Promise<string>;
     /**
-     * `eth_getTransactionCount` — Account nonce as hex.
+     * `eth_getTransactionCount` - Account nonce as hex.
      */
     ethGetTransactionCount(address: string, block?: string): Promise<string>;
     /**

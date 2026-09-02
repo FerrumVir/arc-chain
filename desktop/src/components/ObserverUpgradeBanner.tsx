@@ -55,9 +55,8 @@ export function ObserverUpgradeBanner() {
       ([loadedTiers, rec]) => {
         if (cancelled) return;
         setTiers(loadedTiers);
-        const safeRec = rec === "none" ? "tiny" : rec;
-        setRecommendedTier(safeRec);
-        setSelectedTier(safeRec);
+        setRecommendedTier(rec);
+        setSelectedTier(rec === "none" ? null : rec);
       },
     );
     return () => {
@@ -150,7 +149,7 @@ export function ObserverUpgradeBanner() {
         </div>
         <div style={{ flex: 1 }}>
           <div style={{ fontWeight: 500, color: "var(--text)", marginBottom: 2 }}>
-            Start earning ARC
+            Make compatible compute available
           </div>
           <div
             style={{
@@ -159,9 +158,10 @@ export function ObserverUpgradeBanner() {
               lineHeight: 1.5,
             }}
           >
-            Your node is running as an observer — it validates blocks but
-            doesn't serve inference, so it earns nothing. Download a model to
-            switch to worker mode and start collecting attestation rewards.
+            This observer does not execute local model inference. Downloading a
+            complete model can make it a worker candidate, but work is assigned
+            only when the requested artifact ID matches exactly. A model, a
+            peer connection, or worker mode alone never guarantees a reward.
           </div>
         </div>
         <button
@@ -219,7 +219,7 @@ export function ObserverUpgradeBanner() {
                 marginBottom: "var(--space-2)",
               }}
             >
-              Pick a model tier
+              Enable ARC-compatible compute
             </h2>
             <p
               style={{
@@ -229,8 +229,10 @@ export function ObserverUpgradeBanner() {
                 marginBottom: "var(--space-5)",
               }}
             >
-              We've pre-selected the tier that fits your machine. Larger models
-              earn more per attestation but use more disk and RAM.
+              ARC work currently accepts one exact 7B artifact. It is
+              pre-selected only on machines with at least 16 GB RAM. A complete
+              verified download makes the node eligible; it does not guarantee
+              assignment or a mined reward receipt.
             </p>
 
             {!busy && (
@@ -408,7 +410,7 @@ export function ObserverUpgradeBanner() {
                   disabled={!selectedTier}
                   data-testid="btn-confirm-upgrade"
                 >
-                  {error ? "Retry" : "Download & become worker"}{" "}
+                  {error ? "Retry" : "Download & enable worker mode"}{" "}
                   <Sparkles size={14} />
                 </button>
               </div>

@@ -21,7 +21,8 @@
 //! Usage:
 //!   arc-bench-production [--txs 100000] [--batch 10000] [--proposers 1]
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
+mod ephemeral_keys;
+
 use arc_crypto::Hash256;
 use arc_node::pipeline::{Pipeline, PipelineBatch};
 use arc_state::StateDB;
@@ -68,18 +69,14 @@ fn format_tps(tps: f64) -> String {
 /// Pre-sign a batch of transactions for a given proposer's sender partition.
 /// Each proposer gets senders [start..start+count), receivers from a separate range.
 fn presign_transactions(
-    sender_start: u8,
+    _sender_start: u8,
     sender_count: u8,
     total_txs: usize,
 ) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
-    let keypairs: Vec<_> = (sender_start..sender_start + sender_count)
-        .map(|i| (benchmark_keypair(i), benchmark_address(i)))
-        .collect();
+    let keypairs = ephemeral_keys::signing_keypairs(sender_count as usize);
 
     // Receiver addresses (don't overlap with senders)
-    let receivers: Vec<Hash256> = (200u8..=255)
-        .map(benchmark_address)
-        .collect();
+    let receivers = ephemeral_keys::addresses(56);
 
     // Genesis accounts: fund all senders and receivers
     let mut genesis: Vec<(Hash256, u64)> = keypairs
@@ -101,14 +98,8 @@ fn presign_transactions(
 
         let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
-        // Real Ed25519 signing
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
+        tx.sign(sk)
+            .expect("ephemeral benchmark signing must succeed");
 
         nonces[kp_idx] += 1;
         transactions.push(tx);
@@ -130,7 +121,8 @@ fn run_single_proposer(
 
     // Pre-sign all transactions
     let sign_start = Instant::now();
-    let (transactions, genesis) = presign_transactions(sender_start, senders_per_proposer, total_txs);
+    let (transactions, genesis) =
+        presign_transactions(sender_start, senders_per_proposer, total_txs);
     let sign_elapsed = sign_start.elapsed();
 
     println!(
@@ -146,7 +138,7 @@ fn run_single_proposer(
 
     // Create the actual production pipeline
     let pipeline = Pipeline::new(Arc::clone(&state));
-    let producer = benchmark_address(255);
+    let producer = genesis[0].0;
 
     // Feed batches into the pipeline and collect results
     let pipeline_start = Instant::now();
@@ -155,7 +147,7 @@ fn run_single_proposer(
     let mut total_success = 0usize;
 
     // Submit all batches
-    let num_batches = (transactions.len() + batch_size - 1) / batch_size;
+    let num_batches = transactions.len().div_ceil(batch_size);
     let mut tx_iter = transactions.into_iter();
 
     for _ in 0..num_batches {
@@ -253,8 +245,10 @@ fn main() {
 
         println!();
         println!("  Results:");
-        println!("    Transactions:  {} submitted, {} processed, {} success",
-            args.txs, processed, success);
+        println!(
+            "    Transactions:  {} submitted, {} processed, {} success",
+            args.txs, processed, success
+        );
         println!("    Pipeline time: {:.2}s", elapsed.as_secs_f64());
         println!("    Throughput:    {} TPS", format_tps(tps));
         println!();
@@ -272,8 +266,14 @@ fn main() {
         // Conservative: same TPS per machine (reality varies by hardware)
         let per_machine = tps;
         let three_machine = per_machine * 3.0 * 0.90; // 90% efficiency for network overhead
-        println!("    1 machine (this):    {:>12} TPS (measured)", format_tps(per_machine));
-        println!("    3 machines (yours):   {:>12} TPS (projected, 90% efficiency)", format_tps(three_machine));
+        println!(
+            "    1 machine (this):    {:>12} TPS (measured)",
+            format_tps(per_machine)
+        );
+        println!(
+            "    3 machines (yours):   {:>12} TPS (projected, 90% efficiency)",
+            format_tps(three_machine)
+        );
         println!();
 
         let gap_to_1b = 1_000_000_000.0 / three_machine;
@@ -290,15 +290,23 @@ fn main() {
             println!();
             let gpu_optimistic = three_machine * 80.0;
             let gpu_aggressive = three_machine * 300.0;
-            println!("    With GPU optimizations (conservative): {} TPS", format_tps(gpu_optimistic));
-            println!("    With GPU optimizations (aggressive):   {} TPS", format_tps(gpu_aggressive));
+            println!(
+                "    With GPU optimizations (conservative): {} TPS",
+                format_tps(gpu_optimistic)
+            );
+            println!(
+                "    With GPU optimizations (aggressive):   {} TPS",
+                format_tps(gpu_aggressive)
+            );
             println!();
             if gpu_optimistic >= 1_000_000_000.0 {
                 println!("    VERDICT: 1B TPS is ACHIEVABLE with GPU compute kernels");
                 println!("    BUT those kernels don't exist yet in this codebase.");
                 println!("    GPU Ed25519 MSM shader = months of specialized crypto work.");
             } else if gpu_aggressive >= 1_000_000_000.0 {
-                println!("    VERDICT: 1B TPS is POSSIBLE but requires aggressive GPU optimization");
+                println!(
+                    "    VERDICT: 1B TPS is POSSIBLE but requires aggressive GPU optimization"
+                );
                 println!("    AND all three optimizations (GPU sigs + GPU hash + Block-STM).");
                 println!("    This is best-case, not guaranteed.");
             } else {
@@ -306,7 +314,6 @@ fn main() {
                 println!("    Would need datacenter GPUs (H100s) or more nodes.");
             }
         }
-
     } else {
         // ── Multi-Proposer Simulation ──────────────────────────────────
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -349,7 +356,11 @@ fn main() {
             total_success += success;
             println!(
                 "    Proposer {}: {} processed, {} success, {:.2}s, {} TPS",
-                id, processed, success, elapsed.as_secs_f64(), format_tps(tps),
+                id,
+                processed,
+                success,
+                elapsed.as_secs_f64(),
+                format_tps(tps),
             );
         }
 
@@ -362,15 +373,31 @@ fn main() {
         println!("  Aggregate Results:");
         println!("    Total processed:     {}", total_processed);
         println!("    Total success:       {}", total_success);
-        println!("    Wall-clock time:     {:.2}s", overall_elapsed.as_secs_f64());
-        println!("    Aggregate TPS:       {} (total / wall-clock)", format_tps(aggregate_tps));
-        println!("    Sum individual TPS:  {} (sum of per-proposer)", format_tps(sum_individual_tps));
-        println!("    Avg per proposer:    {}", format_tps(avg_individual_tps));
+        println!(
+            "    Wall-clock time:     {:.2}s",
+            overall_elapsed.as_secs_f64()
+        );
+        println!(
+            "    Aggregate TPS:       {} (total / wall-clock)",
+            format_tps(aggregate_tps)
+        );
+        println!(
+            "    Sum individual TPS:  {} (sum of per-proposer)",
+            format_tps(sum_individual_tps)
+        );
+        println!(
+            "    Avg per proposer:    {}",
+            format_tps(avg_individual_tps)
+        );
         println!();
 
-        let scaling = aggregate_tps / per_proposer_tps.get(0).copied().unwrap_or(1.0);
-        println!("    Scaling efficiency:  {:.1}x from {} proposers ({:.0}% of linear)",
-            scaling, args.proposers, (scaling / args.proposers as f64) * 100.0);
+        let scaling = aggregate_tps / per_proposer_tps.first().copied().unwrap_or(1.0);
+        println!(
+            "    Scaling efficiency:  {:.1}x from {} proposers ({:.0}% of linear)",
+            scaling,
+            args.proposers,
+            (scaling / args.proposers as f64) * 100.0
+        );
     }
 
     println!();

@@ -198,10 +198,7 @@ impl RollupState {
     }
 
     /// Verify that a batch produces the claimed state transition.
-    pub fn verify_batch(
-        &self,
-        batch: &RollupBatch,
-    ) -> Result<bool, String> {
+    pub fn verify_batch(&self, batch: &RollupBatch) -> Result<bool, String> {
         // Pre-state root must match.
         let current_root = self.compute_state_root();
         if current_root != batch.pre_state_root {
@@ -267,10 +264,7 @@ impl RollupVerifier {
     }
 
     /// Verify a full state transition: proof + state roots.
-    pub fn verify_state_transition(
-        &self,
-        batch: &RollupBatch,
-    ) -> bool {
+    pub fn verify_state_transition(&self, batch: &RollupBatch) -> bool {
         // Must have a proof.
         let proof = match &batch.proof {
             Some(p) => p,
@@ -535,7 +529,7 @@ mod tests {
 
         // Compute expected post root.
         let mut clone = state.clone();
-        let post_root = clone.apply_batch(&[tx.clone()]).unwrap();
+        let post_root = clone.apply_batch(std::slice::from_ref(&tx)).unwrap();
 
         let batch = RollupBatch {
             batch_id: 0,
@@ -593,7 +587,7 @@ mod tests {
 
         let tx = make_tx(alice(), bob(), 100, 0);
         let mut exec_state = state.clone();
-        let post_root = exec_state.apply_batch(&[tx.clone()]).unwrap();
+        let post_root = exec_state.apply_batch(std::slice::from_ref(&tx)).unwrap();
 
         let batch = RollupBatch {
             batch_id: 0,

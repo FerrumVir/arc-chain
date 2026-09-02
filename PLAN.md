@@ -1,8 +1,17 @@
-# ARC Chain - "any model, any node, any time" execution plan
+# ARC Chain - "any model, any node, any time" execution plan (ARCHIVED)
 
-The testnet is live (6 seeds, 3× replication, self-healing, signed desktop
-app auto-updating with auto-start + tray). The desktop app onboards a
-user in 3 clicks and they become an observer-node with a faucet balance.
+> **ARCHIVED HISTORICAL PLAN — DO NOT USE AS A RUNBOOK.** This records
+> assumptions, experiments, and public-v2 fleet operations from April 2026.
+> It is not current network status. In particular, its rolling restart,
+> in-place upgrade, state-reset, self-heal, firewall, and earnings directions
+> are retired. v2 and v3 validators must never overlap. Current validator
+> recovery requires a fully quiesced fleet, sealed checkpoint and manifest,
+> preserved source history, fresh v3 data paths, and the gates in
+> [`docs/VALIDATOR-FLEET-ROLLOUT.md`](docs/VALIDATOR-FLEET-ROLLOUT.md) and
+> [`scripts/recovery/README.md`](scripts/recovery/README.md).
+
+At the time of this snapshot, the testnet reported 6 seeds, 3× replication,
+self-healing, and a signed desktop app with auto-start and tray behavior.
 
 This document sequences the work from "observer joins and validates" to
 **"any model runs as a pipeline-parallel mesh across thousands of
@@ -10,17 +19,16 @@ consumer machines, pays operators per inference, adapts to churn in
 60 s, and scales to thousands of models in parallel without a
 hand-assigned shard map."**
 
-Read this top-to-bottom before starting. Every milestone lists exact
+This document historically listed exact
 files to touch, new tx types to add, acceptance criteria, test matrix,
-and the rollout plan. No step is "bolt on a placeholder" - each
-milestone is a real protocol extension that a rolling upgrade across
-the 6 seeds has to absorb safely.
+and the then-proposed rollout plan. Those operational directions are retained
+only as evidence; they are not approved procedures.
 
 ---
 
-## Where we are today (2026-04-22, SHA `adc3f52b`)
+## Historical snapshot (2026-04-22, SHA `adc3f52b`)
 
-### Live infrastructure
+### Historical infrastructure report
 - 6 testnet seeds: NYC / LAX / AMS / LHR / NRT / SGP. SAO + JNB retired (#32).
 - Chain at round 1.39 M+, 3× replication per layer range, Llama-2-7B served via
   `/inference/run_consensus` (k=3) with 48/48 unanimous hash verification.
@@ -121,8 +129,8 @@ replicas that actually answered, refunded on failure.
 **Status 2026-04-27**: protocol surface + state + run_consensus wiring
 + desktop UI shipped on PR #40 (head `15fe888c`, tagged
 `v0.5.3-mb1` https://github.com/FerrumVir/arc-chain/releases/tag/v0.5.3-mb1).
-Binary `240cef61cb8c9ff7cc29a787754fdf3a` deployed to all 6 testnet
-seeds via rolling upgrade. 172/172 `arc-state` lib tests + 81/81
+Binary `240cef61cb8c9ff7cc29a787754fdf3a` was historically deployed to
+all 6 testnet seeds by the then-current process. 172/172 `arc-state` lib tests + 81/81
 `arc-node` lib tests pass. Latent DashMap-entry-guard deadlock in
 `index_account_tx` fixed in-passing (scoped outer guard).
 
@@ -214,9 +222,11 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
 - Desktop Inference screen shows the fee + resulting tx hash + balance delta.
 
 ### Rollout
-- Build binary on NYC.
-- Rolling-upgrade 6 seeds one-at-a-time using `scripts/rolling-upgrade.sh --only=X` (self-heal daemon paused per seed).
-- Dashboard updated to show per-replica earnings (Fee earned today / Lifetime).
+
+**Retired proposal.** Do not build on a validator, mutate one validator at a
+time, or use any legacy rolling tool. Current validator activation is the
+coordinated, fenced, manifest-bound checkpoint cutover in the recovery runbook.
+The dashboard may claim earnings only from confirmed mined v3 reward receipts.
 
 ### Estimated effort: **1–2 days**
 
@@ -224,8 +234,9 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
 
 ## Session 2026-04-28: chain stabilization attempt + B-open wedge
 
-P1 - Rolling rebuild of all 6 seeds completed. Binary `0f4ca561` deployed
-to NYC, LAX, AMS, LHR (with `--reset-state`), NRT, SGP. All 6 healthy at
+P1 - A historical rebuild of all 6 seeds completed. Binary `0f4ca561` was
+deployed to NYC, LAX, AMS, LHR (including a destructive state reset), NRT,
+SGP. All 6 were reported healthy at
 peers≥3, in sync at round 2,242,000+. LHR's pre-reset h=38 fixed via
 clean state.
 
@@ -295,8 +306,9 @@ constructs the release but doesn't submit/persist it. This is a
 distinct bug from the open-path issue - needs separate fix in
 `/inference/run_consensus` post-success path.
 
-LHR is at h=36 vs NYC h=3493 - diverged again post-firewall. Needs
-another `--reset-state` rolling redeploy.
+LHR was at h=36 vs NYC h=3493 and had diverged again post-firewall. The
+historical plan called for another destructive redeploy; that response is no
+longer approved.
 
 P4–P7 still blocked on P3.release coordinator submit-fix.
 
@@ -482,48 +494,37 @@ Write these into tests, not just docs:
 
 ---
 
-## Rules that hold across every milestone
+## Current safety correction to the historical milestone rules
 
-1. **Never restart all nodes at once.** Rolling upgrade, 1 at a time,
-   verify peers > 0 and round advancing before touching the next.
-   Self-heal daemon is ON each seed; pause it during that seed's upgrade
-   (`systemctl stop arc-self-heal`), restart after.
+1. **Do not roll, restart, or upgrade public validators from this plan.** v2
+   and v3 reject each other, so one-at-a-time replacement is unsafe. The only
+   supported validator path is a fully quiesced and fenced fleet followed by
+   the manifest-bound checkpoint cutover and explicit rollback gates.
 2. **Never skip hooks**. Never `--no-verify`. Fix the underlying issue.
 3. **No mock tests on critical paths.** A fee payout test that doesn't
    assert real balance deltas is worthless.
-4. **Every milestone must include a live test against the 6-seed testnet**
-   before merge. Mock suite is table stakes; live is the gate.
+4. **Do not target the forked public-v2 fleet from milestone tests.** Use the
+   local multi-node harness and only the sealed canary/activation probes named
+   by the approved recovery runbook.
 5. **Don't break the existing `/inference/run_consensus` contract.**
    Add fields, don't rename. Existing clients (dashboard, current
    desktop app) keep working on old paths.
 6. **Every new tx type has a genesis-compatible `Default` path.** No
    flag-day consensus changes.
-7. **Self-heal / auto-start / auto-update must continue to function
-   after every rolling upgrade.** Tests asserting tray exists,
+7. **Self-heal / auto-start / auto-update must be tested after every supported
+   release or coordinated cutover.** Tests asserting tray exists,
    LaunchAgent registered, updater pubkey matches - all must still
    pass.
 8. **Only commit when the user asks.** Leave uncommitted work visible.
 
 ---
 
-## First-session kickoff checklist
+## Archived first-session checklist
 
-When starting the next session:
-
-1. Read this file.
-2. Read `memory/project_arc_autopilot_20260421.md`, `feedback_never_restart_chain.md`, `feedback_no_manual_restarts.md`.
-3. Run the health check in `project_arc_autopilot_20260421.md` across the 6 seeds.
-4. `git log --oneline -10` to see what landed last session.
-5. Pick the next milestone. Default: A if not done. Otherwise B.
-6. Write GH issues #35, #36, #37, #38, #39 corresponding to A/B/C/D/E **before coding** so progress is auditable.
-7. Execute the milestone end-to-end: code → unit tests → live test against testnet → rolling upgrade → dashboard / desktop app observation → commit → push → close GH issue.
-8. Update this file: mark the completed milestone with a ✅ at the top of its section and a link to the PR / commit SHA. Move the next-up milestone to "in progress."
-
-If a milestone is taking longer than its stated estimate + 50 %, STOP.
-Re-read the acceptance criteria. Often the "extra day" is scope creep
-hiding as perfectionism. Ship the minimum that passes the criteria, open
-a follow-up issue for the improvements, move on to the next milestone.
-The timeline for A+B+C+D+E is 4–7 weeks; each delayed milestone cascades.
+The original checklist was operational guidance for the superseded v2 fleet
+and has been removed. Do not probe, restart, upgrade, reset, or reconfigure a
+public validator from this document. Use the current release gates and the
+manifest-bound recovery runbook linked at the top.
 
 ---
 
@@ -587,15 +588,11 @@ LAX doesn't know about the publisher's account at all - its state
 shows `balance=0 nonce=0` for the publisher key (which has 9000/2 on
 NYC).
 
-Resolution path for next session:
-1. Roll the new `83c28aca` binary out to the other 5 seeds (NYC
-   already has it). Use `--reset-state` on LHR.
-2. After all 6 are on the same binary AND a recent shared snapshot,
-   re-fire the live_milestones_cde driver. The published-fix-only
-   blocker disappears once the chain is no longer split.
-3. Add a self-heal rule that detects state-divergence past
-   ~50 blocks and triggers a `--reset-state` with the latest
-   majority-snapshot, instead of letting NYC drift into a solo fork.
+Archived proposal for the next session (not approved): the team planned to
+replace binaries, destructively reset LHR, rerun milestone traffic, and make
+self-heal reset divergent state. None of those actions is safe under the
+current recovery contract; canonical history now comes only from the sealed
+checkpoint and coordinated v3 cutover.
 
 ### Session 2026-04-29 final: ALL milestones B + C + D + E ✅ on fresh testnet
 
@@ -654,9 +651,9 @@ the current canonical chain.
 
 ### Session 2026-04-29 (earlier): coordinated reset + partial receipts on fresh genesis
 
-After the full-fleet rollout still left the chain split, did a coordinated
-`--reset-state` across all 8 nodes (NYC/LAX/AMS/LHR/NRT/SGP + reactivated
-SAO/JNB) via the 8/8 sweep of `rolling-upgrade.sh --skip-build --reset-state`.
+After the full-fleet rollout still left the chain split, operators historically
+performed a destructive coordinated reset across all 8 nodes
+(NYC/LAX/AMS/LHR/NRT/SGP + reactivated SAO/JNB) using the now-retired tooling.
 All 8 came back at peers≥5, dag_round within ±50 of each other.
 
 Post-reset on fresh genesis:
@@ -695,8 +692,8 @@ one Open and trace which step drops the tx. Without that
 instrumentation we're black-box guessing. After identifying the drop,
 fix the underlying race / filter and re-fire the milestone drivers.
 
-`83c28aca` is now on all 6 seeds (LAX, AMS, NRT, SGP via `--skip-build`;
-LHR via `--skip-build --reset-state`; NYC was already on it). Each
+At that historical snapshot, `83c28aca` was on all 6 seeds; LHR had also been
+destructively reset and NYC was already on that binary. Each
 seed has peers≥4, dag_round within ±2 of each other (~2,427,800 at
 deploy completion).
 
@@ -728,9 +725,11 @@ a structural state-fork: each seed's `arc-data/state.wal` carries a
 different chain head from prior sessions, and the new binary's
 WAL replay restored that separate state on boot.
 
-The only clean fix is a coordinated `--reset-state` on ALL 6 seeds
-simultaneously (or a fresh genesis), so they all start from h=0 and
-execute the same DAG-committed txs forward. Doing this loses every
+The historical plan concluded that a destructive reset of all 6 seeds or a
+fresh genesis was the only clean fix, so they would all start from h=0 and
+execute the same DAG-committed txs forward. That conclusion predates the
+history-preserving v3 checkpoint recovery and is not current guidance. The
+proposed reset would have lost every
 historical receipt INCLUDING the B-fix receipt
 `0x0e8c4ef6` / `0x7176b114` from earlier this session.
 
@@ -784,9 +783,9 @@ checked against the live chain and is genuinely still pending.
      `iptables-persistent` package.
    - Apply on the other 5 seeds (only NYC has the rule today).
 
-3. **LHR re-reset**. h=37 vs NYC 3497. WAL is unrecoverable. Run
-   `bash scripts/rolling-upgrade.sh --only=LHR --reset-state` and
-   verify it rejoins majority height before continuing.
+3. **Archived LHR reset proposal (do not execute).** At that snapshot LHR was
+   h=37 vs NYC 3497. The proposed one-node destructive reset is superseded by
+   the history-preserving, all-validator v3 checkpoint cutover.
 
 4. **C/D/E live receipts**. Only `ModelRegistration 0x53a7136c` exists.
    Run `cargo run --release --example live_milestones_cde -p arc-node`

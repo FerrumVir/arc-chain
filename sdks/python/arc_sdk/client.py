@@ -21,7 +21,6 @@ from .types import (
     HealthInfo,
     NodeInfo,
     Receipt,
-    SubmitResult,
 )
 
 
@@ -231,15 +230,12 @@ class ArcClient:
         """
         POST /tx/submit -- Submit a transaction to the mempool.
 
-        Accepts either:
-        - A signed transaction from TransactionBuilder.sign() (recommended)
-        - A raw dict ({from, to, amount, nonce}) (unsigned, will warn)
-
-        Signed transactions include Ed25519 signature and public key,
-        which are verified by the node before acceptance.
+        Accepts only a signed transfer from ``TransactionBuilder.sign()`` or
+        the exact flat signed-transfer wire shape. Unsigned writes and nested
+        non-transfer read projections fail locally before any POST.
 
         Args:
-            tx: Transaction dict (signed or unsigned).
+            tx: Signed transfer dict carrying the exact signing domain.
 
         Returns:
             Transaction hash string.
@@ -250,20 +246,48 @@ class ArcClient:
         payload: Dict[str, Any]
         if "body" in tx and "tx_type" in tx:
             body = tx["body"]
+            if tx.get("tx_type") != "Transfer" or body.get("type") != "Transfer":
+                raise ArcTransactionError(
+                    "POST /tx/submit only accepts signed Transfer transactions"
+                )
+            signature = tx.get("signature")
+            if not isinstance(signature, dict):
+                raise ArcTransactionError("Signed transfer requires an Ed25519 signature")
+            sig_data = signature.get("Ed25519")
+            if not isinstance(sig_data, dict):
+                raise ArcTransactionError("Signed transfer requires an Ed25519 signature")
             payload = {
                 "from": tx["from"],
-                "to": body.get("to", "0" * 64),
-                "amount": body.get("amount", 0),
-                "nonce": tx.get("nonce", 0),
-                "tx_type": tx.get("tx_type"),
+                "to": body["to"],
+                "amount": body["amount"],
+                "nonce": tx["nonce"],
+                "fee": tx["fee"],
+                "tx_type": "Transfer",
+                "signature": sig_data.get("signature"),
+                "public_key": sig_data.get("public_key"),
             }
-            # Include signature if present (from TransactionBuilder.sign())
-            if "signature" in tx and isinstance(tx["signature"], dict):
-                sig_data = tx["signature"].get("Ed25519", {})
-                payload["signature"] = sig_data.get("signature", "")
-                payload["public_key"] = sig_data.get("public_key", "")
         else:
-            payload = tx
+            required = {
+                "from",
+                "to",
+                "amount",
+                "nonce",
+                "fee",
+                "signature",
+                "public_key",
+                "transaction_domain",
+            }
+            if not required.issubset(tx):
+                raise ArcTransactionError(
+                    "Signed transfer requires from, to, amount, nonce, fee, "
+                    "signature, public_key, and transaction_domain"
+                )
+            payload = {key: value for key, value in tx.items() if key != "transaction_domain"}
+
+        self._validate_signed_transfer_wire(payload)
+        self._require_matching_transaction_domain(
+            tx.get("transaction_domain"), self.get_transaction_domain()
+        )
 
         data = self._post("/tx/submit", payload)
         return data.get("tx_hash", "")
@@ -307,20 +331,101 @@ class ArcClient:
         Returns:
             Dict with accepted, rejected, tx_hashes.
         """
+        advertised = self.get_transaction_domain()
         normalized: List[Dict[str, Any]] = []
         for tx in txs:
-            if "body" in tx and "tx_type" in tx:
-                body = tx["body"]
-                normalized.append({
+            self._require_matching_transaction_domain(tx.get("transaction_domain"), advertised)
+            if "body" in tx:
+                if tx.get("tx_type") != "Transfer" or tx["body"].get("type") != "Transfer":
+                    raise ArcTransactionError(
+                        "POST /tx/submit_batch only accepts signed Transfer transactions"
+                    )
+                sig_data = (tx.get("signature") or {}).get("Ed25519")
+                if not isinstance(sig_data, dict):
+                    raise ArcTransactionError("Signed transfer requires an Ed25519 signature")
+                payload = {
                     "from": tx["from"],
-                    "to": body.get("to", "0" * 64),
-                    "amount": body.get("amount", 0),
-                    "nonce": tx.get("nonce", 0),
-                })
+                    "to": tx["body"]["to"],
+                    "amount": tx["body"]["amount"],
+                    "nonce": tx["nonce"],
+                    "fee": tx["fee"],
+                    "tx_type": "Transfer",
+                    "signature": sig_data.get("signature"),
+                    "public_key": sig_data.get("public_key"),
+                }
             else:
-                normalized.append(tx)
+                payload = {key: value for key, value in tx.items() if key != "transaction_domain"}
+            self._validate_signed_transfer_wire(payload)
+            normalized.append(payload)
 
         return self._post("/tx/submit_batch", {"transactions": normalized})
+
+    def get_transaction_domain(self) -> Optional[str]:
+        """Return the node's exact v3 signing domain, or ``None`` on legacy v1."""
+        try:
+            value = self._get("/network/info")
+        except ArcError as error:
+            if error.status_code == 404:
+                return None
+            raise
+        raw = value.get("transaction_domain")
+        try:
+            protocol_major = int(str(value.get("protocol_version") or "0").split(".")[0])
+        except ValueError:
+            protocol_major = 0
+        if raw is None:
+            if value.get("recovery_active") is True or protocol_major >= 3:
+                raise ArcTransactionError(
+                    "Node requires recovery-domain signatures but omitted transaction_domain"
+                )
+            return None
+        return self._normalize_transaction_domain(raw)
+
+    @staticmethod
+    def _normalize_transaction_domain(value: Any) -> str:
+        if not isinstance(value, str):
+            raise ArcTransactionError(
+                "Transaction signature domain must be a non-zero 32-byte hex value"
+            )
+        raw = value[2:] if value.lower().startswith("0x") else value
+        try:
+            encoded = bytes.fromhex(raw)
+        except ValueError as error:
+            raise ArcTransactionError(
+                "Transaction signature domain must be a non-zero 32-byte hex value"
+            ) from error
+        if len(encoded) != 32 or not any(encoded):
+            raise ArcTransactionError(
+                "Transaction signature domain must be a non-zero 32-byte hex value"
+            )
+        return f"0x{raw.lower()}"
+
+    @classmethod
+    def _require_matching_transaction_domain(
+        cls, signed_domain: Any, advertised: Optional[str]
+    ) -> None:
+        normalized = (
+            None if signed_domain is None else cls._normalize_transaction_domain(signed_domain)
+        )
+        if normalized != advertised:
+            raise ArcTransactionError(
+                "Transaction signature domain mismatch: signed for "
+                f"{normalized or 'legacy-v1'}, node requires {advertised or 'legacy-v1'}"
+            )
+
+    @staticmethod
+    def _validate_signed_transfer_wire(payload: Dict[str, Any]) -> None:
+        for field in ("signature", "public_key"):
+            value = payload.get(field)
+            expected = 128 if field == "signature" else 64
+            if not isinstance(value, str) or len(value) != expected:
+                raise ArcTransactionError(
+                    f"Signed transfer {field} must be {expected} hexadecimal characters"
+                )
+            try:
+                bytes.fromhex(value)
+            except ValueError as error:
+                raise ArcTransactionError(f"Signed transfer {field} must be hexadecimal") from error
 
     def submit_batch_typed(self, txs: List[dict]) -> BatchResult:
         """Submit a batch and parse the result into a typed BatchResult."""

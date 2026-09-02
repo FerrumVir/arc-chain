@@ -12,7 +12,8 @@
 //!   3. Aggregate TPS across all proposers
 //!   4. Fraud detection: tampered diff caught by verifier
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
+mod ephemeral_keys;
+
 use arc_crypto::Hash256;
 // Pipeline not used - we call execute_block() directly to avoid channel overhead
 use arc_state::StateDB;
@@ -65,94 +66,47 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Build a genesis balance set for proposer `proposer_id`.
-/// Each proposer gets its own non-overlapping set of senders and receivers
-/// so there are zero cross-proposer conflicts.
-fn build_proposer_genesis(
-    proposer_id: usize,
-    senders_per_proposer: u8,
-) -> Vec<(Hash256, u64)> {
-    let sender_base = (proposer_id as u8) * senders_per_proposer;
-    let mut genesis = Vec::new();
-
-    // Senders with large balances
-    for i in 0..senders_per_proposer {
-        let addr = benchmark_address(sender_base + i);
-        genesis.push((addr, u64::MAX / 4));
-    }
-
-    // Receivers (shared pool is fine - propose-verify doesn't require
-    // non-overlapping receivers, only that each proposer's diff is
-    // independently verifiable)
-    for r in 200u8..=255 {
-        genesis.push((benchmark_address(r), 0));
-    }
-
-    genesis
-}
-
-/// Build a unified genesis (all proposers' senders + receivers) for
-/// the verifier StateDB that checks all diffs.
-fn build_verifier_genesis(
+/// Generate one process-local identity set, its unified genesis, and each
+/// proposer's signed transaction partition.
+fn build_benchmark_inputs(
     num_proposers: usize,
     senders_per_proposer: u8,
-) -> Vec<(Hash256, u64)> {
-    let mut genesis = Vec::new();
+    txs_per_proposer: usize,
+) -> (Vec<Vec<Transaction>>, Vec<(Hash256, u64)>) {
+    let senders_per_proposer = senders_per_proposer as usize;
+    let keypairs = ephemeral_keys::signing_keypairs(num_proposers * senders_per_proposer);
+    let receivers = ephemeral_keys::addresses(56);
+    let mut genesis: Vec<(Hash256, u64)> = keypairs
+        .iter()
+        .map(|(_, address)| (*address, u64::MAX / 4))
+        .collect();
+    genesis.extend(receivers.iter().map(|address| (*address, 0)));
 
-    for p in 0..num_proposers {
-        let sender_base = (p as u8) * senders_per_proposer;
-        for i in 0..senders_per_proposer {
-            genesis.push((benchmark_address(sender_base + i), u64::MAX / 4));
-        }
-    }
-
-    for r in 200u8..=255 {
-        genesis.push((benchmark_address(r), 0));
-    }
-
-    genesis
-}
-
-/// Pre-sign transactions for one proposer.
-fn presign_for_proposer(
-    proposer_id: usize,
-    senders_per_proposer: u8,
-    total_txs: usize,
-) -> Vec<Transaction> {
-    use ed25519_dalek::Signer;
-
-    let sender_base = (proposer_id as u8) * senders_per_proposer;
-    let keypairs: Vec<_> = (0..senders_per_proposer)
-        .map(|i| (benchmark_keypair(sender_base + i), benchmark_address(sender_base + i)))
+    let proposer_txs = (0..num_proposers)
+        .map(|proposer_id| {
+            let sender_start = proposer_id * senders_per_proposer;
+            let proposer_keys = &keypairs[sender_start..sender_start + senders_per_proposer];
+            let mut nonces = vec![0u64; proposer_keys.len()];
+            (0..txs_per_proposer)
+                .map(|tx_idx| {
+                    let key_index = tx_idx % proposer_keys.len();
+                    let (keypair, sender) = &proposer_keys[key_index];
+                    let mut tx = Transaction::new_transfer(
+                        *sender,
+                        receivers[tx_idx % receivers.len()],
+                        1,
+                        nonces[key_index],
+                    );
+                    tx.sign(keypair)
+                        .expect("ephemeral benchmark signing must succeed");
+                    nonces[key_index] += 1;
+                    tx
+                })
+                .collect()
+        })
         .collect();
 
-    let receivers: Vec<Hash256> = (200u8..=255)
-        .map(benchmark_address)
-        .collect();
-
-    let mut transactions = Vec::with_capacity(total_txs);
-    let mut nonces = vec![0u64; keypairs.len()];
-
-    for tx_idx in 0..total_txs {
-        let kp_idx = tx_idx % keypairs.len();
-        let (sk, sender) = &keypairs[kp_idx];
-        let receiver = receivers[tx_idx % receivers.len()];
-        let nonce = nonces[kp_idx];
-
-        let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
-
-        let sig = sk.sign(tx.hash.as_bytes());
-        let vk = sk.verifying_key();
-        tx.signature = arc_crypto::signature::Signature::Ed25519 {
-            public_key: *vk.as_bytes(),
-            signature: sig.to_bytes().to_vec(),
-        };
-
-        nonces[kp_idx] += 1;
-        transactions.push(tx);
-    }
-
-    transactions
+    (proposer_txs, genesis)
 }
 
 /// Run one proposer: execute all transactions, then export the state diff.
@@ -163,7 +117,7 @@ fn run_proposer(
     batch_size: usize,
 ) -> (Duration, usize, arc_types::StateDiff) {
     let state = Arc::new(StateDB::with_genesis(genesis));
-    let producer = benchmark_address(250);
+    let producer = genesis[0].0;
 
     // Collect all touched addresses from transactions (execute_block drains
     // dirty_accounts internally via compute_state_root, so we track them here)
@@ -171,12 +125,24 @@ fn run_proposer(
     for tx in transactions {
         touched.insert(tx.from);
         match &tx.body {
-            arc_types::TxBody::Transfer(b) => { touched.insert(b.to); }
-            arc_types::TxBody::Settle(b)   => { touched.insert(b.agent_id); }
-            arc_types::TxBody::Swap(b)     => { touched.insert(b.counterparty); }
-            arc_types::TxBody::Stake(b)    => { touched.insert(b.validator); }
-            arc_types::TxBody::WasmCall(b) => { touched.insert(b.contract); }
-            arc_types::TxBody::Escrow(b)   => { touched.insert(b.beneficiary); }
+            arc_types::TxBody::Transfer(b) => {
+                touched.insert(b.to);
+            }
+            arc_types::TxBody::Settle(b) => {
+                touched.insert(b.agent_id);
+            }
+            arc_types::TxBody::Swap(b) => {
+                touched.insert(b.counterparty);
+            }
+            arc_types::TxBody::Stake(b) => {
+                touched.insert(b.validator);
+            }
+            arc_types::TxBody::WasmCall(b) => {
+                touched.insert(b.contract);
+            }
+            arc_types::TxBody::Escrow(b) => {
+                touched.insert(b.beneficiary);
+            }
             _ => {}
         }
     }
@@ -212,7 +178,10 @@ fn main() {
     println!("  Proposers:          {}", args.proposers);
     println!("  Txs/proposer:       {}", args.txs_per_proposer);
     println!("  Senders/proposer:   {}", args.senders_per_proposer);
-    println!("  Total txs:          {}", args.proposers * args.txs_per_proposer);
+    println!(
+        "  Total txs:          {}",
+        args.proposers * args.txs_per_proposer
+    );
     println!("  Batch size:         {}", args.batch);
     println!("  CPU cores:          {}", rayon::current_num_threads());
     println!();
@@ -223,14 +192,21 @@ fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let sign_start = Instant::now();
-    let proposer_txs: Vec<Vec<Transaction>> = (0..args.proposers)
-        .map(|p| presign_for_proposer(p, args.senders_per_proposer, args.txs_per_proposer))
-        .collect();
+    let (proposer_txs, all_genesis) = build_benchmark_inputs(
+        args.proposers,
+        args.senders_per_proposer,
+        args.txs_per_proposer,
+    );
     let sign_elapsed = sign_start.elapsed();
 
     let total_txs = args.proposers * args.txs_per_proposer;
     let sign_rate = total_txs as f64 / sign_elapsed.as_secs_f64();
-    println!("    Signed {} txs in {} ({}/sec)", total_txs, format_duration(sign_elapsed), format_tps(sign_rate));
+    println!(
+        "    Signed {} txs in {} ({}/sec)",
+        total_txs,
+        format_duration(sign_elapsed),
+        format_tps(sign_rate)
+    );
     println!();
 
     // ── Phase 2: Single proposer baseline ───────────────────────────────
@@ -238,18 +214,18 @@ fn main() {
     println!("  Phase 2: Single-Proposer Baseline (1 node executes everything)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let all_genesis = build_verifier_genesis(args.proposers, args.senders_per_proposer);
-
     // Run each proposer's tx set sequentially on a single node (how ETH/Solana work).
     // We keep proposer ordering intact to preserve nonce correctness.
     let single_state = Arc::new(StateDB::with_genesis(&all_genesis));
-    let single_producer = benchmark_address(255);
+    let single_producer = all_genesis[0].0;
 
     let single_start = Instant::now();
     let mut single_success = 0usize;
 
     for proposer_tx_set in &proposer_txs {
-        if let Ok((_block, receipts)) = single_state.execute_block_gpu_verified(proposer_tx_set, single_producer) {
+        if let Ok((_block, receipts)) =
+            single_state.execute_block_gpu_verified(proposer_tx_set, single_producer)
+        {
             single_success += receipts.iter().filter(|r| r.success).count();
         }
     }
@@ -265,7 +241,10 @@ fn main() {
 
     // ── Phase 3: Multi-proposer parallel execution ──────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  Phase 3: Multi-Proposer (propose-verify, {} proposers in parallel)", args.proposers);
+    println!(
+        "  Phase 3: Multi-Proposer (propose-verify, {} proposers in parallel)",
+        args.proposers
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // Run all proposers in parallel threads
@@ -278,9 +257,7 @@ fn main() {
             let genesis = all_genesis.clone();
             let batch = args.batch;
 
-            std::thread::spawn(move || {
-                run_proposer(p, &txs, &genesis, batch)
-            })
+            std::thread::spawn(move || run_proposer(p, &txs, &genesis, batch))
         })
         .collect();
 
@@ -297,8 +274,14 @@ fn main() {
             max_proposer_time = *elapsed;
         }
         let tps = *success as f64 / elapsed.as_secs_f64();
-        println!("    Proposer {}:  {} txs in {} = {} TPS  (diff: {} account changes)",
-            i, success, format_duration(*elapsed), format_tps(tps), diff.changes.len());
+        println!(
+            "    Proposer {}:  {} txs in {} = {} TPS  (diff: {} account changes)",
+            i,
+            success,
+            format_duration(*elapsed),
+            format_tps(tps),
+            diff.changes.len()
+        );
     }
 
     // Aggregate TPS = total txs / wall-clock time (proposers ran in parallel)
@@ -306,13 +289,22 @@ fn main() {
 
     println!();
     println!("    Total txs executed:    {}", total_proposer_success);
-    println!("    Wall-clock time:       {}", format_duration(proposer_total_elapsed));
-    println!("    Aggregate throughput:  {} TPS", format_tps(aggregate_tps));
+    println!(
+        "    Wall-clock time:       {}",
+        format_duration(proposer_total_elapsed)
+    );
+    println!(
+        "    Aggregate throughput:  {} TPS",
+        format_tps(aggregate_tps)
+    );
     println!();
 
     // ── Phase 4: Verifier applies all diffs ─────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  Phase 4: Verifier (apply + verify all {} state diffs)", args.proposers);
+    println!(
+        "  Phase 4: Verifier (apply + verify all {} state diffs)",
+        args.proposers
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let verify_start = Instant::now();
@@ -328,11 +320,19 @@ fn main() {
         let v_elapsed = v_start.elapsed();
 
         if verified {
-            println!("    Diff {}: VERIFIED  ({} changes in {})",
-                i, diff.changes.len(), format_duration(v_elapsed));
+            println!(
+                "    Diff {}: VERIFIED  ({} changes in {})",
+                i,
+                diff.changes.len(),
+                format_duration(v_elapsed)
+            );
         } else {
-            println!("    Diff {}: ✗ FRAUD DETECTED  ({} changes in {})",
-                i, diff.changes.len(), format_duration(v_elapsed));
+            println!(
+                "    Diff {}: ✗ FRAUD DETECTED  ({} changes in {})",
+                i,
+                diff.changes.len(),
+                format_duration(v_elapsed)
+            );
             all_verified = false;
         }
     }
@@ -341,9 +341,18 @@ fn main() {
     let verify_tps = total_proposer_success as f64 / verify_elapsed.as_secs_f64();
 
     println!();
-    println!("    Total verification time:  {}", format_duration(verify_elapsed));
-    println!("    Verification throughput:  {} TPS equivalent", format_tps(verify_tps));
-    println!("    All diffs valid:          {}", if all_verified { "YES ✓" } else { "NO ✗" });
+    println!(
+        "    Total verification time:  {}",
+        format_duration(verify_elapsed)
+    );
+    println!(
+        "    Verification throughput:  {} TPS equivalent",
+        format_tps(verify_tps)
+    );
+    println!(
+        "    All diffs valid:          {}",
+        if all_verified { "YES ✓" } else { "NO ✗" }
+    );
     println!();
 
     // ── Phase 5: Fraud detection test ───────────────────────────────────
@@ -359,7 +368,14 @@ fn main() {
         tampered.new_root = Hash256([0xFF; 32]); // Clearly wrong root
 
         let fraud_detected = !fraud_state1.verify_state_diff(&tampered);
-        println!("    Tampered root:    {} ", if fraud_detected { "CAUGHT ✓" } else { "MISSED ✗" });
+        println!(
+            "    Tampered root:    {} ",
+            if fraud_detected {
+                "CAUGHT ✓"
+            } else {
+                "MISSED ✗"
+            }
+        );
 
         // Test 2: tampered balance
         let fraud_state2 = Arc::new(StateDB::with_genesis(&all_genesis));
@@ -368,12 +384,26 @@ fn main() {
             change.account.balance += 999_999; // Inflate a balance
         }
         let fraud_detected2 = !fraud_state2.verify_state_diff(&tampered2);
-        println!("    Tampered balance: {} ", if fraud_detected2 { "CAUGHT ✓" } else { "MISSED ✗" });
+        println!(
+            "    Tampered balance: {} ",
+            if fraud_detected2 {
+                "CAUGHT ✓"
+            } else {
+                "MISSED ✗"
+            }
+        );
 
         // Test 3: verify the VALID diff still passes
         let fraud_state3 = Arc::new(StateDB::with_genesis(&all_genesis));
         let valid = fraud_state3.verify_state_diff(good_diff);
-        println!("    Valid diff:       {} ", if valid { "ACCEPTED ✓" } else { "REJECTED ✗" });
+        println!(
+            "    Valid diff:       {} ",
+            if valid {
+                "ACCEPTED ✓"
+            } else {
+                "REJECTED ✗"
+            }
+        );
     }
 
     println!();
@@ -383,19 +413,35 @@ fn main() {
     println!("  SUMMARY");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
-    println!("    Single-node (re-execute all):       {} TPS", format_tps(single_tps));
-    println!("    Multi-proposer ({} nodes):           {} TPS", args.proposers, format_tps(aggregate_tps));
-    println!("    Speedup:                            {:.2}x", aggregate_tps / single_tps);
-    println!("    Verification overhead:              {}", format_duration(verify_elapsed));
-    println!("    Verification vs execution:          {:.1}x faster",
-        proposer_total_elapsed.as_secs_f64() / verify_elapsed.as_secs_f64().max(0.0001));
+    println!(
+        "    Single-node (re-execute all):       {} TPS",
+        format_tps(single_tps)
+    );
+    println!(
+        "    Multi-proposer ({} nodes):           {} TPS",
+        args.proposers,
+        format_tps(aggregate_tps)
+    );
+    println!(
+        "    Speedup:                            {:.2}x",
+        aggregate_tps / single_tps
+    );
+    println!(
+        "    Verification overhead:              {}",
+        format_duration(verify_elapsed)
+    );
+    println!(
+        "    Verification vs execution:          {:.1}x faster",
+        proposer_total_elapsed.as_secs_f64() / verify_elapsed.as_secs_f64().max(0.0001)
+    );
     println!();
     println!("    ┌────────────────────────────────────────────────────────┐");
     println!("    │  PROJECTIONS (based on measured single-proposer TPS)  │");
     println!("    ├────────────────────────────────────────────────────────┤");
 
     let per_proposer_tps = if !proposer_results.is_empty() {
-        let sum: f64 = proposer_results.iter()
+        let sum: f64 = proposer_results
+            .iter()
             .map(|(e, s, _)| *s as f64 / e.as_secs_f64())
             .sum();
         sum / proposer_results.len() as f64
@@ -416,8 +462,12 @@ fn main() {
     for (nodes, efficiency) in projections {
         let projected = per_proposer_tps * nodes as f64 * efficiency;
         let eth_weighted = projected / 3.93; // ETH-equivalent weight
-        println!("    │  {:>4} proposers: {:>8} TPS ({:>8} ETH-weighted) │",
-            nodes, format_tps(projected), format_tps(eth_weighted));
+        println!(
+            "    │  {:>4} proposers: {:>8} TPS ({:>8} ETH-weighted) │",
+            nodes,
+            format_tps(projected),
+            format_tps(eth_weighted)
+        );
     }
 
     println!("    └────────────────────────────────────────────────────────┘");
@@ -427,8 +477,15 @@ fn main() {
     let eth_tps = 15.0;
     println!("    vs Ethereum ({:.0} TPS):", eth_tps);
     println!("      Single-node:    {:.0}x faster", single_tps / eth_tps);
-    println!("      {}-proposer:     {:.0}x faster", args.proposers, aggregate_tps / eth_tps);
-    println!("      100-proposer:   {:.0}x faster (projected)", per_proposer_tps * 100.0 * 0.82 / eth_tps);
+    println!(
+        "      {}-proposer:     {:.0}x faster",
+        args.proposers,
+        aggregate_tps / eth_tps
+    );
+    println!(
+        "      100-proposer:   {:.0}x faster (projected)",
+        per_proposer_tps * 100.0 * 0.82 / eth_tps
+    );
     println!();
 
     println!("════════════════════════════════════════════════════════════════");

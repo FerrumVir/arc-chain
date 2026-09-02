@@ -6,7 +6,7 @@
 //!
 //! Usage: cargo run --release --example pq_bench
 
-use arc_crypto::{hash_bytes, KeyPair};
+use arc_crypto::{KeyPair, hash_bytes};
 use std::time::Instant;
 
 const KEYGEN_N: usize = 100;
@@ -84,10 +84,19 @@ fn bench(label: &str, make: fn() -> KeyPair) {
 fn bincode_len(sig: &arc_crypto::Signature) -> usize {
     use arc_crypto::Signature as S;
     match sig {
-        S::Ed25519 { public_key, signature } => public_key.len() + signature.len(),
+        S::Ed25519 {
+            public_key,
+            signature,
+        } => public_key.len() + signature.len(),
         S::Secp256k1 { signature } => signature.len(),
-        S::MlDsa65 { public_key, signature } => public_key.len() + signature.len(),
-        S::Falcon512 { public_key, signature } => public_key.len() + signature.len(),
+        S::MlDsa65 {
+            public_key,
+            signature,
+        } => public_key.len() + signature.len(),
+        S::Falcon512 {
+            public_key,
+            signature,
+        } => public_key.len() + signature.len(),
     }
 }
 

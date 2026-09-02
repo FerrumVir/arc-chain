@@ -21,8 +21,7 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice The ARC ERC-20 token contract.
-    IERC20 public constant ARC_TOKEN =
-        IERC20(0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499);
+    IERC20 public constant ARC_TOKEN = IERC20(0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499);
 
     // -------------------------------------------------------------------------
     // State
@@ -47,22 +46,11 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
     // Events
     // -------------------------------------------------------------------------
 
-    event Locked(
-        address indexed sender,
-        uint256 amount,
-        uint256 indexed nonce
-    );
+    event Locked(address indexed sender, uint256 amount, uint256 indexed nonce);
 
-    event Unlocked(
-        address indexed to,
-        uint256 amount,
-        uint256 indexed nonce
-    );
+    event Unlocked(address indexed to, uint256 amount, uint256 indexed nonce);
 
-    event StateRootCommitted(
-        uint256 indexed blockHeight,
-        bytes32 stateRoot
-    );
+    event StateRootCommitted(uint256 indexed blockHeight, bytes32 stateRoot);
 
     event RelayerUpdated(address indexed oldRelayer, address indexed newRelayer);
 
@@ -81,10 +69,7 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
 
     /// @param initialOwner The admin address (can pause, set relayer).
     /// @param _relayer     The initial authorized relayer address.
-    constructor(
-        address initialOwner,
-        address _relayer
-    ) Ownable(initialOwner) {
+    constructor(address initialOwner, address _relayer) Ownable(initialOwner) {
         require(_relayer != address(0), "ArcBridge: zero relayer");
         relayer = _relayer;
     }
@@ -113,13 +98,11 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
     /// @param nonce     The bridge nonce (must not have been used before).
     /// @param stateRoot The state root to verify against (must match a committed root).
     /// @param proof     The Merkle proof (array of sibling hashes).
-    function unlock(
-        address to,
-        uint256 amount,
-        uint256 nonce,
-        bytes32 stateRoot,
-        bytes32[] calldata proof
-    ) external nonReentrant whenNotPaused {
+    function unlock(address to, uint256 amount, uint256 nonce, bytes32 stateRoot, bytes32[] calldata proof)
+        external
+        nonReentrant
+        whenNotPaused
+    {
         require(to != address(0), "ArcBridge: zero recipient");
         require(amount > 0, "ArcBridge: zero amount");
         require(!usedNonces[nonce], "ArcBridge: nonce already used");
@@ -127,19 +110,13 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
         // Verify the state root has been committed by the relayer.
         // We search for a matching committed root. The caller provides the root they
         // built their proof against; we check it matches the on-chain record.
-        require(
-            _isCommittedStateRoot(stateRoot),
-            "ArcBridge: unknown state root"
-        );
+        require(_isCommittedStateRoot(stateRoot), "ArcBridge: unknown state root");
 
         // Reconstruct the leaf from the unlock parameters.
         bytes32 leaf = keccak256(abi.encodePacked(to, amount, nonce));
 
         // Verify the Merkle proof.
-        require(
-            _verifyProof(proof, stateRoot, leaf),
-            "ArcBridge: invalid proof"
-        );
+        require(_verifyProof(proof, stateRoot, leaf), "ArcBridge: invalid proof");
 
         usedNonces[nonce] = true;
 
@@ -155,15 +132,9 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
     /// @notice Commit a state root from ARC Chain at a given block height.
     /// @param blockHeight The ARC Chain block height.
     /// @param stateRoot   The state root hash at that height.
-    function commitStateRoot(
-        uint256 blockHeight,
-        bytes32 stateRoot
-    ) external onlyRelayer whenNotPaused {
+    function commitStateRoot(uint256 blockHeight, bytes32 stateRoot) external onlyRelayer whenNotPaused {
         require(stateRoot != bytes32(0), "ArcBridge: zero state root");
-        require(
-            blockHeight > latestCommittedHeight,
-            "ArcBridge: height not increasing"
-        );
+        require(blockHeight > latestCommittedHeight, "ArcBridge: height not increasing");
 
         stateRoots[blockHeight] = stateRoot;
         latestCommittedHeight = blockHeight;
@@ -222,11 +193,7 @@ contract ArcBridge is Ownable, Pausable, ReentrancyGuard {
     /// @param root  The expected Merkle root.
     /// @param leaf  The leaf hash to prove inclusion of.
     /// @return True if the proof is valid.
-    function _verifyProof(
-        bytes32[] calldata proof,
-        bytes32 root,
-        bytes32 leaf
-    ) internal pure returns (bool) {
+    function _verifyProof(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
         bytes32 computedHash = leaf;
 
         for (uint256 i = 0; i < proof.length; i++) {

@@ -1,8 +1,16 @@
 # ARC Node - Desktop App
 
-A Tauri 2 desktop app that wraps the `arc-node` binary so anyone can run an ARC node by double-clicking a `.dmg`, `.msi`, or `.AppImage`. No terminal, no curl-pipe-bash.
+A Tauri 2 desktop app that resolves the exact matching `arc-node` release
+binary so a user can run an ARC observer or worker from a `.dmg`, NSIS/MSI
+installer, or Linux package without a terminal.
 
-Built to remove the single biggest onboarding barrier for "every user is a node": unsigned installers, Windows support, and a clear earnings dashboard.
+> **Source-freeze release status (2026-08-31; tag-stable):** At this review
+> cutoff, the source tree was the unreleased v0.8.0 recovery candidate. Public
+> v0.7.11 did not contain this full updater, evidence, or node-download
+> behavior, and the public seeds did not run v0.8.0. This is historical status,
+> not a live probe. See [`../README.md`](../README.md) and require exact release
+> plus rollout evidence before presenting a build as released, deployed,
+> synced, or reward-producing.
 
 ## What's inside
 
@@ -23,14 +31,14 @@ desktop/
 │   │   └── store.rs         Persists identity & config to the OS app-data dir
 │   ├── capabilities/    Tauri 2 permission manifest
 │   └── tauri.conf.json  Bundle identifier, window, CSP
-└── tests/               Playwright E2E suite (26 tests)
+└── tests/               Playwright browser/evidence/resilience suites
 ```
 
 ## Quick start
 
 ```bash
 cd desktop
-npm install
+npm ci
 npx playwright install chromium
 npm run build           # TypeScript + Vite → dist/
 npm test                # Playwright (runs against the preview server)
@@ -56,8 +64,11 @@ Requires Rust + platform prerequisites (https://tauri.app/start/prerequisites).
 npm run tauri:dev       # Opens the native window, connects to ~/.arc/bin/arc-node
 ```
 
-The Rust side expects the node binary at `~/.arc/bin/arc-node` (matches the
-community installer). Override with `ARC_NODE_BINARY=/path/to/arc-node`.
+The Rust side first honors `ARC_NODE_BIN=/absolute/path/to/arc-node` (the
+legacy `ARC_NODE_BINARY` alias remains accepted). Otherwise it reuses an exact
+version match or downloads the current platform's node from the exact
+`v{desktop-version}` release, verifies `SHA256SUMS`, verifies `--version`, and
+installs it at `~/.arc/bin/arc-node` (`arc-node.exe` on Windows).
 
 ## Production build
 
@@ -65,41 +76,26 @@ community installer). Override with `ARC_NODE_BINARY=/path/to/arc-node`.
 npm run tauri:build
 ```
 
-Outputs to `src-tauri/target/release/bundle/`:
+Local outputs land under `src-tauri/target/.../release/bundle/`. The unified
+publisher normalizes them to:
 
-- **macOS**: `.app`, `.dmg` (ships signed + notarized once identity is configured)
-- **Windows**: `.msi`, `.exe` (Authenticode-signed when cert is configured)
-- **Linux**: `.AppImage`, `.deb`, `.rpm`
+- **macOS arm64/x86_64**: `.dmg`; signed `.app.tar.gz` updater payload
+- **Windows x86_64**: NSIS `-setup.exe`, `.msi`; signed NSIS updater payload
+- **Linux x86_64**: `.AppImage`, `.deb`, `.rpm`; signed AppImage updater payload
 
-### Code signing - the single biggest UX investment
+Linux ARM64 is headless-only. Tauri updater signatures are required and
+cryptographically checked by the release workflow. They are not Apple
+notarization or Windows Authenticode signatures: v0.8.0 does not claim either
+OS trust signature, so Gatekeeper/SmartScreen approval may still be required.
 
-Without signing, Gatekeeper (macOS) and SmartScreen (Windows) block the installer
-by default. This is the reason most "run from source" apps see <10% conversion.
+### Operating-system code signing
 
-**macOS:**
-
-```bash
-# Env vars for tauri.conf.json → bundle.macOS.signingIdentity
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export APPLE_ID="your-apple-id@example.com"
-export APPLE_PASSWORD="@keychain:AC_PASSWORD"   # app-specific password
-export APPLE_TEAM_ID="TEAMID"
-
-npm run tauri:build
-# Tauri runs codesign + xcrun notarytool submit + stapler automatically.
-```
-
-**Windows:**
-
-```bash
-# Put an EV or OV code-signing cert in the Windows cert store and set:
-export WINDOWS_CERTIFICATE_THUMBPRINT="<sha1>"
-npm run tauri:build
-```
-
-**Linux:**
-
-No signing required; the `.AppImage` / `.deb` run as-is.
+The checked-in macOS bundle uses ad-hoc signing (`signingIdentity: "-"`) and
+the Windows certificate thumbprint is null. A future OS-signed release must add
+owner-controlled Developer ID/notarization and Authenticode configuration to
+the protected release environment, then verify the produced signatures before
+changing user-facing copy. Do not paste signing secrets into this file or the
+repository. Linux packages do not use either OS trust system.
 
 ## Testing
 
@@ -108,16 +104,13 @@ npm test                # all suites, headless
 npm run test:ui         # Playwright UI mode (time-travel debugger)
 ```
 
-**Coverage**: 26 tests across 6 suites:
-
-- `onboarding.spec.ts` - 4 tests: five-step flow, progress dots, back button, seed-reveal gate
-- `dashboard.spec.ts` - 6 tests: shell, earnings ticker, start/stop toggle, stat grid, attestation feed, clipboard
-- `navigation.spec.ts` - 6 tests: each of 5 routes + aria-current
-- `settings.spec.ts` - 3 tests: save, reset, update check
-- `accessibility.spec.ts` - 3 tests: heading structure, keyboard focus, preview badge
-- `visual.spec.ts` - 4 tests: gradient logo, gradient earnings text, live pulse animation, active-nav glow
-
-There's also a `screenshots.spec.ts` that captures a 10-screen design gallery into `screenshots/`.
+At this audited tree state, `npx playwright test --list` enumerates 225 tests in
+20 files. Native test inventory is intentionally not hard-coded: run
+`cargo test --manifest-path src-tauri/Cargo.toml -- --list`, and treat only a
+successful compiling listing as evidence. The suites cover onboarding,
+dashboard/evidence semantics, earnings,
+inference, updates, peer recovery, persistence, accessibility, resilience,
+navigation, wallet behavior, and visual/screenshots contracts.
 
 The tests run against the Vite preview server (`npm run build && npm run preview`) using the same frontend the native app ships - just with mock Tauri IPC. Native integration (child-process spawning, file I/O) is covered by Rust unit tests.
 
@@ -155,13 +148,22 @@ every Playwright test).
 
 - **zustand** + `localStorage` for UI-only state (route, onboarded flag)
 - **Rust `store.rs`** writes identity + config to the OS app-data dir
-  (e.g. `~/Library/Application Support/ARC Node/store.json` on macOS)
-- Recovery phrase is **never** stored on disk - user is forced to reveal and save it during onboarding
+  (for example `~/Library/Application Support/network.arc.desktop/store.json`
+  on macOS). The recovery phrase is present in this native store for
+  backup/restoration and to
+  verify or recreate the persistent node keyfile; the node itself receives
+  only that keyfile path. The app-data directory and store are owner-validated
+  through open handles (`0700`/`0600` on Unix and a protected DACL on Windows),
+  writes are atomic, and symlink/reparse destinations are refused. v0.8.0 does
+  not yet use an OS keychain, so users still need a protected offline backup.
+- Frontend state is scrubbed of the recovery phrase; an explicit native IPC
+  call reveals it only on the backup screen.
 
 ### Design tokens
 
-Every color, font size, spacing, and animation duration comes from CSS custom
-properties in `src/styles/tokens.css`. No hardcoded hex in components.
+The shared theme, typography, spacing, and animation scales live in
+`src/styles/tokens.css`. A small number of diagnostic-state overrides remain
+local to screens; use the tokens for new general UI styling.
 
 - Background gradients drift subtly (20s cycle, pauses on reduced-motion)
 - Pulse indicators use ring-expansion + fade, not color-blinking
@@ -176,10 +178,20 @@ properties in `src/styles/tokens.css`. No hardcoded hex in components.
 - Focus rings use a brand-consistent 2px indigo ring, never removed
 - Keyboard-reachable: tab through nav, space/enter to activate buttons
 
-## Next steps (not in this PR)
+## Remaining distribution boundaries
 
-- **Auto-update** via `tauri-plugin-updater` - wire to the same GitHub release feed the CLI installer uses
-- **Tray icon** for quiet background mode (macOS `NSStatusItem`, Windows tray)
-- **Model management** screen: list available GGUF models, download progress, per-model earnings
-- **Hardware wallet signing** via Tauri's WebUSB bridge (Ledger Nano)
-- **Deeplink handler** for `arc://` URIs (opens attestations in the app)
+- Apple Developer ID signing/notarization and Windows Authenticode are not
+  configured in the v0.8.0 release contract.
+- Recovery material is protected as a private local file, not by the native OS
+  keychain/credential store.
+- The app and earnings UI can report only selected-host and mined-receipt
+  evidence. The bundled recovered genesis schedules reward activation at block
+  137146, but issuance and earnings still fail closed until the public-v3
+  cutover and independent runtime gate are proven live.
+- `.deb` and `.rpm` installs remain package-manager updates; only macOS,
+  Windows NSIS, and AppImage consume the in-app signed updater payload.
+- The v0.8+ desktop channel discovers only protected-publisher, immutable ARC
+  releases and hands Tauri an exact-tag manifest. It does not consume GitHub's
+  global `latest` pointer, which remains reserved while unsigned v0.7 headless
+  updaters are retired; downloaded application bytes still must pass Tauri's
+  embedded-key signature verification before installation.

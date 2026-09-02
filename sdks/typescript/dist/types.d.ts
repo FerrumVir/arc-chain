@@ -3,6 +3,8 @@
  *
  * Interfaces matching the ARC Chain RPC response shapes.
  */
+import type { U64 } from "./u64";
+export type { U64 } from "./u64";
 /** 32-byte hex-encoded hash (BLAKE3 digest, no `0x` prefix). */
 export type Hash256 = string;
 /** 32-byte hex-encoded account address (BLAKE3 of pubkey). */
@@ -13,7 +15,7 @@ export type TxType = "Transfer" | "Settle" | "Swap" | "Escrow" | "Stake" | "Wasm
 export interface TransferBody {
     type: "Transfer";
     to: string;
-    amount: number;
+    amount: U64;
     amount_commitment?: string | null;
 }
 /** Contract deployment body. */
@@ -21,7 +23,7 @@ export interface DeployContractBody {
     type: "DeployContract";
     bytecode: string;
     constructor_args: string;
-    state_rent_deposit: number;
+    state_rent_deposit: U64;
 }
 /** WASM contract call body. */
 export interface WasmCallBody {
@@ -29,13 +31,13 @@ export interface WasmCallBody {
     contract: string;
     function: string;
     calldata: string;
-    value: number;
-    gas_limit: number;
+    value: U64;
+    gas_limit: U64;
 }
 /** Stake/unstake body. */
 export interface StakeBody {
     type: "Stake";
-    amount: number;
+    amount: U64;
     is_stake: boolean;
     validator: string;
 }
@@ -44,8 +46,8 @@ export interface SettleBody {
     type: "Settle";
     agent_id: string;
     service_hash: string;
-    amount: number;
-    usage_units: number;
+    amount: U64;
+    usage_units: U64;
     amount_commitment?: string | null;
 }
 /** Channel open body. */
@@ -90,19 +92,43 @@ export interface Ed25519Signature {
 export interface Transaction {
     tx_type: TxType;
     from: string;
-    nonce: number;
-    fee: number;
-    gas_limit: number;
+    nonce: U64;
+    fee: U64;
+    gas_limit: U64;
     body: TxBody;
     hash: string;
     signature: Ed25519Signature | null;
+    /** Exact domain used for the signing hash; null on pre-v3 chains. */
+    transaction_domain: string | null;
     to?: string;
-    amount?: number;
+    amount?: U64;
+}
+/** Transfer builder output before signing. */
+export interface TransferTransaction extends Omit<Transaction, "tx_type" | "body"> {
+    tx_type: "Transfer";
+    body: TransferBody;
+}
+/** Transfer builder output after signing. */
+export interface SignedTransferTransaction extends Omit<TransferTransaction, "signature"> {
+    signature: Ed25519Signature;
+}
+/** Exact flat write contract accepted by `POST /tx/submit`. */
+export interface SignedTransferSubmitPayload {
+    from: Address;
+    to: Address;
+    amount: U64;
+    nonce: U64;
+    fee: U64;
+    tx_type?: "Transfer";
+    signature: string;
+    public_key: string;
+    /** Checked against `/network/info` and omitted from the HTTP body. */
+    transaction_domain: string | null;
 }
 export interface Account {
     address: string;
-    balance: number;
-    nonce: number;
+    balance: U64;
+    nonce: U64;
     code_hash?: string;
     storage_root?: string;
 }
@@ -143,7 +169,7 @@ export interface Receipt {
     block_hash: string;
     index: number;
     success: boolean;
-    gas_used: number;
+    gas_used: U64;
     value_commitment?: string | null;
     inclusion_proof?: string | null;
     logs: EventLog[];
@@ -175,7 +201,7 @@ export interface HealthInfo {
 }
 export interface NodeInfo {
     validator: string;
-    stake: number;
+    stake: U64;
     tier: string;
     height: number;
     version: string;
@@ -207,7 +233,7 @@ export interface ContractInfo {
 }
 export interface ContractCallResult {
     success: boolean;
-    gas_used?: number;
+    gas_used?: U64;
     return_data?: string;
     error?: string;
     logs?: string[];
@@ -220,7 +246,7 @@ export interface LightSnapshot {
     height: number;
     state_root: string;
     account_count: number;
-    total_supply: number;
+    total_supply: U64;
     latest_block_hash: string;
 }
 export interface SyncSnapshotInfo {

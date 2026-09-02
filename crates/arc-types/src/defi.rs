@@ -238,10 +238,7 @@ impl LiquidityPool {
                 self.reserve_b - amount_out,
             )
         } else {
-            (
-                self.reserve_a - amount_out,
-                self.reserve_b + amount_in,
-            )
+            (self.reserve_a - amount_out, self.reserve_b + amount_in)
         };
 
         Ok(SwapResult {
@@ -258,11 +255,7 @@ impl LiquidityPool {
     ///
     /// For the first deposit, shares = sqrt(amount_a * amount_b).
     /// For subsequent deposits, shares are proportional to the smaller ratio.
-    pub fn add_liquidity(
-        &mut self,
-        amount_a: u128,
-        amount_b: u128,
-    ) -> Result<u128, DeFiError> {
+    pub fn add_liquidity(&mut self, amount_a: u128, amount_b: u128) -> Result<u128, DeFiError> {
         if amount_a == 0 || amount_b == 0 {
             return Err(DeFiError::ZeroAmount);
         }
@@ -351,8 +344,8 @@ impl LiquidityPool {
         // Effective price: amount_out / amount_in_after_fee.
         // Impact = 1 - (effective / spot)
         //        = 1 - (amount_out * reserve_in) / (amount_in_after_fee * reserve_out)
-        let effective_numerator = amount_out as u128 * reserve_in as u128;
-        let effective_denominator = amount_in_after_fee as u128 * reserve_out as u128;
+        let effective_numerator = amount_out * reserve_in;
+        let effective_denominator = amount_in_after_fee * reserve_out;
 
         if effective_denominator == 0 {
             return 10_000;
@@ -362,8 +355,8 @@ impl LiquidityPool {
         if effective_numerator >= effective_denominator {
             return 0; // No negative impact (shouldn't happen in AMM)
         }
-        let impact = 10_000 - (effective_numerator * 10_000 / effective_denominator) as u16;
-        impact
+
+        10_000 - (effective_numerator * 10_000 / effective_denominator) as u16
     }
 
     /// Total value locked in USD (18-decimal fixed point).
@@ -483,11 +476,7 @@ impl StablecoinVault {
     /// Mint arcUSD stablecoin against deposited collateral.
     ///
     /// `current_price` is the collateral token price in USD (18 decimals).
-    pub fn mint_stablecoin(
-        &mut self,
-        amount: u128,
-        current_price: u128,
-    ) -> Result<(), DeFiError> {
+    pub fn mint_stablecoin(&mut self, amount: u128, current_price: u128) -> Result<(), DeFiError> {
         if amount == 0 {
             return Err(DeFiError::ZeroAmount);
         }
@@ -538,9 +527,7 @@ impl StablecoinVault {
         }
 
         let elapsed = current_height - self.last_fee_update;
-        let fee = self.debt_amount as u128
-            * self.stability_fee_bps as u128
-            * elapsed as u128
+        let fee = self.debt_amount * self.stability_fee_bps as u128 * elapsed as u128
             / (10_000u128 * blocks_per_year as u128);
 
         self.debt_amount = self.debt_amount.saturating_add(fee);
@@ -570,10 +557,7 @@ impl StablecoinVault {
         // This works as long as collateral * price_bps fits in u128,
         // which holds for collateral up to ~10^34 and price_bps up to ~10^5.
         let price_bps = price * 10_000 / PRICE_PRECISION;
-        let ratio = collateral
-            .checked_mul(price_bps)
-            .unwrap_or(u128::MAX)
-            / debt;
+        let ratio = collateral.saturating_mul(price_bps) / debt;
         ratio.min(u16::MAX as u128) as u16
     }
 }
@@ -675,7 +659,7 @@ fn isqrt(n: u128) -> u128 {
         return 0;
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x.div_ceil(2);
     while y < x {
         x = y;
         y = (x + n / x) / 2;
@@ -706,7 +690,10 @@ mod tests {
         assert_eq!(pool.token_a, token(1));
         assert_eq!(pool.token_b, token(2));
         assert_eq!(pool.cumulative_volume, 0);
-        assert_ne!(pool.pool_id, [0u8; 32], "pool_id should be deterministic and non-zero");
+        assert_ne!(
+            pool.pool_id, [0u8; 32],
+            "pool_id should be deterministic and non-zero"
+        );
     }
 
     // 2. Initial liquidity deposit sets the ratio and mints sqrt(a*b) shares
@@ -843,10 +830,18 @@ mod tests {
         );
 
         // Small trade should have minimal impact
-        assert!(small_impact < 100, "Small trade impact should be < 1%, got {} bps", small_impact);
+        assert!(
+            small_impact < 100,
+            "Small trade impact should be < 1%, got {} bps",
+            small_impact
+        );
 
         // Huge trade should have significant impact
-        assert!(large_impact > 1000, "Large trade impact should be > 10%, got {} bps", large_impact);
+        assert!(
+            large_impact > 1000,
+            "Large trade impact should be > 10%, got {} bps",
+            large_impact
+        );
     }
 
     // 9. New stablecoin vault is empty
@@ -875,7 +870,9 @@ mod tests {
         // Collateral value = 1000 * $2 = $2000
         // At 150% ratio, max debt = $2000 / 1.5 = ~$1333
         // Mint $1000 (should succeed: ratio = 2000/1000 = 200%)
-        vault.mint_stablecoin(1_000 * PRICE_PRECISION, price).unwrap();
+        vault
+            .mint_stablecoin(1_000 * PRICE_PRECISION, price)
+            .unwrap();
 
         assert_eq!(vault.debt_amount, 1_000 * PRICE_PRECISION);
 
@@ -905,7 +902,9 @@ mod tests {
         vault.deposit_collateral(1_000 * PRICE_PRECISION);
 
         let good_price = 2 * PRICE_PRECISION; // $2
-        vault.mint_stablecoin(1_000 * PRICE_PRECISION, good_price).unwrap();
+        vault
+            .mint_stablecoin(1_000 * PRICE_PRECISION, good_price)
+            .unwrap();
 
         // At $2: ratio = 200%, not liquidatable
         assert!(!vault.is_liquidatable(good_price));
@@ -931,11 +930,11 @@ mod tests {
         let mut order = LimitOrder::new(
             token(1),
             token(2),
-            true,  // buy order
+            true,            // buy order
             PRICE_PRECISION, // price = 1.0
-            1_000, // total amount
-            100,   // TTL: 100 blocks
-            50,    // current height
+            1_000,           // total amount
+            100,             // TTL: 100 blocks
+            50,              // current height
         );
 
         assert_eq!(order.status, OrderStatus::Open);
@@ -962,7 +961,7 @@ mod tests {
         let order = LimitOrder::new(
             token(1),
             token(2),
-            false, // sell order
+            false,               // sell order
             PRICE_PRECISION * 2, // price = 2.0
             500,
             100, // TTL: 100 blocks

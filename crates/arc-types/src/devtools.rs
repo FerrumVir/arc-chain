@@ -109,7 +109,10 @@ impl AbiFunction {
     // ── internal ──
 
     fn build_signature(name: &str, inputs: &[AbiParam]) -> String {
-        let param_types: Vec<String> = inputs.iter().map(|p| abi_type_string(&p.param_type)).collect();
+        let param_types: Vec<String> = inputs
+            .iter()
+            .map(|p| abi_type_string(&p.param_type))
+            .collect();
         format!("{}({})", name, param_types.join(","))
     }
 }
@@ -126,7 +129,7 @@ fn abi_type_string(t: &AbiType) -> String {
         AbiType::BytesN(n) => format!("bytes{}", n),
         AbiType::Array(inner) => format!("{}[]", abi_type_string(inner)),
         AbiType::Tuple(types) => {
-            let inner: Vec<String> = types.iter().map(|t| abi_type_string(t)).collect();
+            let inner: Vec<String> = types.iter().map(abi_type_string).collect();
             format!("({})", inner.join(","))
         }
     }
@@ -242,7 +245,10 @@ impl ContractManifest {
 #[derive(Debug, Clone)]
 pub enum TestAction {
     DeployContract {
-        manifest: ContractManifest,
+        /// Boxed: a bare `ContractManifest` is ~312 bytes and would make every
+        /// `TestAction` that big, including the tiny `AdvanceBlocks`/`SetTimestamp`
+        /// ones that get pushed by the hundreds into a scenario's action list.
+        manifest: Box<ContractManifest>,
         bytecode: Vec<u8>,
     },
     CallFunction {
@@ -427,12 +433,7 @@ mod tests {
     #[test]
     fn test_contract_manifest_creation() {
         let hash = test_hash(0xAB);
-        let manifest = ContractManifest::new(
-            "token".to_string(),
-            VmTarget::Wasm,
-            hash,
-            4096,
-        );
+        let manifest = ContractManifest::new("token".to_string(), VmTarget::Wasm, hash, 4096);
 
         assert_eq!(manifest.name, "token");
         assert_eq!(manifest.version, "0.1.0");
@@ -454,12 +455,19 @@ mod tests {
         let transfer = AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
-            vec![
-                AbiParam { name: "success".to_string(), param_type: AbiType::Bool },
-            ],
+            vec![AbiParam {
+                name: "success".to_string(),
+                param_type: AbiType::Bool,
+            }],
             StateMutability::NonPayable,
         );
 
@@ -496,8 +504,14 @@ mod tests {
         let transfer = AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
             vec![],
             StateMutability::NonPayable,
@@ -507,12 +521,14 @@ mod tests {
 
         let balance_of = AbiFunction::new(
             "balanceOf",
-            vec![
-                AbiParam { name: "owner".to_string(), param_type: AbiType::Address },
-            ],
-            vec![
-                AbiParam { name: "balance".to_string(), param_type: AbiType::Uint256 },
-            ],
+            vec![AbiParam {
+                name: "owner".to_string(),
+                param_type: AbiType::Address,
+            }],
+            vec![AbiParam {
+                name: "balance".to_string(),
+                param_type: AbiType::Uint256,
+            }],
             StateMutability::View,
         );
         abi.add_function(balance_of);
@@ -532,8 +548,14 @@ mod tests {
         let func = AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
             vec![],
             StateMutability::NonPayable,
@@ -560,7 +582,10 @@ mod tests {
             vec![],
             StateMutability::NonPayable,
         );
-        assert_eq!(complex.signature(), "batchTransfer(address[],(uint256,bool))");
+        assert_eq!(
+            complex.signature(),
+            "batchTransfer(address[],(uint256,bool))"
+        );
     }
 
     // 6. Test case creation - create with actions and assertions.
@@ -683,14 +708,14 @@ mod tests {
 
         assert_eq!(stats.chain_id, 1);
         assert_eq!(stats.block_height, 0);
-        assert_eq!(stats.tps_current, 0.0);
-        assert_eq!(stats.tps_peak, 0.0);
+        assert!(stats.tps_current.abs() < f64::EPSILON);
+        assert!(stats.tps_peak.abs() < f64::EPSILON);
         assert_eq!(stats.validator_count, 0);
         assert_eq!(stats.total_staked, 0);
         assert_eq!(stats.total_accounts, 0);
         assert_eq!(stats.total_transactions, 0);
         assert_eq!(stats.total_contracts, 0);
         assert_eq!(stats.avg_block_time_ms, 400);
-        assert_eq!(stats.uptime_percentage, 100.0);
+        assert!((stats.uptime_percentage - 100.0).abs() < f64::EPSILON);
     }
 }

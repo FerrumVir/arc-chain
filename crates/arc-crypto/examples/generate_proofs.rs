@@ -100,9 +100,13 @@ fn main() {
 
         // Deterministic weights from label hash
         let mut rng: u64 = 0;
-        for b in label.bytes() { rng = rng.wrapping_mul(31).wrapping_add(b as u64); }
+        for b in label.bytes() {
+            rng = rng.wrapping_mul(31).wrapping_add(b as u64);
+        }
         let mut next = || -> i64 {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((rng >> 33) as i64) % 10 - 5
         };
 
@@ -123,9 +127,17 @@ fn main() {
 
         // Compute hashes for verification
         let input_hash = arc_crypto::hash_bytes(
-            &input.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            &input
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
         let output_hash = arc_crypto::hash_bytes(
-            &output.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            &output
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
 
         let entry = serde_json::json!({
             "idx": idx,
@@ -142,8 +154,10 @@ fn main() {
         manifest.push(entry);
 
         let macs = out_size * in_size;
-        println!("[{:2}/{}] {:20} {:4}x{:4} ({:>8} MACs) -> {:3}B proof in {:>5}ms",
-            idx, total, label, out_size, in_size, macs, proof_size, elapsed);
+        println!(
+            "[{:2}/{}] {:20} {:4}x{:4} ({:>8} MACs) -> {:3}B proof in {:>5}ms",
+            idx, total, label, out_size, in_size, macs, proof_size, elapsed
+        );
     }
 
     let total_elapsed = total_start.elapsed();
@@ -157,7 +171,13 @@ fn main() {
     println!("=== SUMMARY ===");
     println!("Total proofs: {}", total);
     println!("Total time: {:.1}s", total_elapsed.as_secs_f64());
-    println!("Total proof size: {} bytes", manifest.iter().map(|e| e["proof_size"].as_u64().unwrap()).sum::<u64>());
+    println!(
+        "Total proof size: {} bytes",
+        manifest
+            .iter()
+            .map(|e| e["proof_size"].as_u64().unwrap())
+            .sum::<u64>()
+    );
     println!("Manifest: {}", manifest_path);
     println!("All proofs are REAL Circle STARK (Stwo) - cryptographically verifiable");
 }

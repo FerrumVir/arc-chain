@@ -2,8 +2,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ARC Chain - Check On-Chain Inference Attestations
 #
-# Lists recent inference attestations from the network.
-# Proves every inference that happened is cryptographically logged on-chain.
+# Lists recent inference-attestation records returned by one selected node.
+# This is a node-local retained view, not proof of every inference or payment.
 #
 # Usage:
 #   ./scripts/check-attestations.sh                   # Your local node
@@ -24,6 +24,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}${BOLD}ARC Chain - Recent Inference Attestations${NC}"
 echo "  Node: ${NODE}"
+echo "  Note: raw 0x16 attestations pay nothing; earnings require a successful mined 0x25 receipt."
 echo ""
 
 curl -sf "http://${NODE}/inference/attestations?limit=${LIMIT}" 2>/dev/null | python3 -c "
@@ -44,10 +45,10 @@ try:
         print(f'    Model:    {inf.get(\"model\", \"?\")}')
         print(f'    Hash:     {inf.get(\"output_hash\", \"?\")}')
         print(f'    Speed:    {inf.get(\"ms_per_token\", \"?\")} ms/tok')
-        print(f'    Verified: {inf.get(\"deterministic\", False)}')
+        print(f'    Node reports deterministic: {inf.get(\"deterministic\", False)}')
         print('')
 
-    print(f'${GREEN}Total: {data.get(\"count\", len(atts))} attestations at chain height {data.get(\"chain_height\", \"?\")}${NC}')
+    print(f'${GREEN}Node-retained rows: {data.get(\"count\", len(atts))} at reported chain height {data.get(\"chain_height\", \"?\")}${NC}')
 except Exception as e:
     print(f'Error: {e}')
     sys.exit(1)

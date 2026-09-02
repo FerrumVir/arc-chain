@@ -9,10 +9,19 @@
 //! Level 3 (<5s):    Object-centric patterns (covers ~54% of ARC tasks)
 //! Level 4 (<10s):   Common composite ARC patterns
 
-use crate::{Grid, Color, Object};
 use crate::primitives::{grid, object};
+use crate::{Color, Grid, Object};
 use std::collections::BTreeSet;
 use std::time::Instant;
+
+/// A grid->grid transform paired with the name used for it in a program string.
+type NamedGridFn = (&'static str, fn(&Grid) -> Grid);
+
+/// An object->cell-set function paired with the name used for it in a program string.
+type NamedRegionFn = (&'static str, fn(&Object) -> BTreeSet<(usize, usize)>);
+
+/// Cells grouped by color: color -> set of (color, (row, col)).
+type ColorGroups = std::collections::HashMap<u8, BTreeSet<(u8, (usize, usize))>>;
 
 /// Result of synthesis.
 pub struct SynthResult {
@@ -41,25 +50,33 @@ pub fn synthesize(
     if let Some(r) = level_0(train_pairs, test_inputs) {
         return Some(r);
     }
-    if elapsed_ms(&start) > timeout_ms { return None; }
+    if elapsed_ms(&start) > timeout_ms {
+        return None;
+    }
 
     // --- Level 1: parameterized single primitives (<50ms) ---
     if let Some(r) = level_1(train_pairs, test_inputs, &colors, &start, timeout_ms) {
         return Some(r);
     }
-    if elapsed_ms(&start) > timeout_ms { return None; }
+    if elapsed_ms(&start) > timeout_ms {
+        return None;
+    }
 
     // --- Level 2: two-step compositions (<500ms) ---
     if let Some(r) = level_2(train_pairs, test_inputs, &colors, &start, timeout_ms) {
         return Some(r);
     }
-    if elapsed_ms(&start) > timeout_ms { return None; }
+    if elapsed_ms(&start) > timeout_ms {
+        return None;
+    }
 
     // --- Level 3: object-centric patterns (<5s) ---
     if let Some(r) = level_3(train_pairs, test_inputs, &colors, &start, timeout_ms) {
         return Some(r);
     }
-    if elapsed_ms(&start) > timeout_ms { return None; }
+    if elapsed_ms(&start) > timeout_ms {
+        return None;
+    }
 
     // --- Level 4: common ARC patterns (<10s) ---
     level_4(train_pairs, test_inputs, &colors, &start, timeout_ms)
@@ -104,10 +121,14 @@ fn collect_colors(pairs: &[(Grid, Grid)]) -> Vec<Color> {
     let mut seen = [false; 10];
     for (inp, out) in pairs {
         for row in inp {
-            for &c in row { seen[c as usize] = true; }
+            for &c in row {
+                seen[c as usize] = true;
+            }
         }
         for row in out {
-            for &c in row { seen[c as usize] = true; }
+            for &c in row {
+                seen[c as usize] = true;
+            }
         }
     }
     (0u8..10).filter(|&c| seen[c as usize]).collect()
@@ -117,33 +138,28 @@ fn collect_colors(pairs: &[(Grid, Grid)]) -> Vec<Color> {
 // Level 0: unary Grid->Grid primitives
 // ============================================================
 
-fn level_0(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<SynthResult> {
-    let unary_prims: Vec<(&str, fn(&Grid) -> Grid)> = vec![
-        ("rot90",       grid::rot90),
-        ("rot180",      grid::rot180),
-        ("rot270",      grid::rot270),
-        ("hmirror",     grid::hmirror),
-        ("vmirror",     grid::vmirror),
-        ("dmirror",     grid::dmirror),
-        ("cmirror",     grid::cmirror),
-        ("tophalf",     grid::tophalf),
-        ("bottomhalf",  grid::bottomhalf),
-        ("lefthalf",    grid::lefthalf),
-        ("righthalf",   grid::righthalf),
-        ("trim",        grid::trim),
-        ("compress",    grid::compress),
+fn level_0(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<SynthResult> {
+    let unary_prims: Vec<NamedGridFn> = vec![
+        ("rot90", grid::rot90),
+        ("rot180", grid::rot180),
+        ("rot270", grid::rot270),
+        ("hmirror", grid::hmirror),
+        ("vmirror", grid::vmirror),
+        ("dmirror", grid::dmirror),
+        ("cmirror", grid::cmirror),
+        ("tophalf", grid::tophalf),
+        ("bottomhalf", grid::bottomhalf),
+        ("lefthalf", grid::lefthalf),
+        ("righthalf", grid::righthalf),
+        ("trim", grid::trim),
+        ("compress", grid::compress),
     ];
 
     for (name, f) in &unary_prims {
         let f_ref = *f;
-        if let Some(test_outputs) = verify_and_apply(
-            &move |g: &Grid| f_ref(g),
-            train_pairs,
-            test_inputs,
-        ) {
+        if let Some(test_outputs) =
+            verify_and_apply(&move |g: &Grid| f_ref(g), train_pairs, test_inputs)
+        {
             return Some(SynthResult {
                 program_desc: name.to_string(),
                 test_outputs,
@@ -153,11 +169,12 @@ fn level_0(
     }
 
     // Identity: output == input
-    if let Some(test_outputs) = verify_and_apply(
-        &|g: &Grid| g.clone(),
-        train_pairs, test_inputs,
-    ) {
-        return Some(SynthResult { program_desc: "identity".into(), test_outputs, level: 0 });
+    if let Some(test_outputs) = verify_and_apply(&|g: &Grid| g.clone(), train_pairs, test_inputs) {
+        return Some(SynthResult {
+            program_desc: "identity".into(),
+            test_outputs,
+            level: 0,
+        });
     }
 
     None
@@ -177,8 +194,12 @@ fn level_1(
     // 1a. replace_color(grid, c1, c2) for all color pairs
     for &c1 in colors {
         for &c2 in colors {
-            if c1 == c2 { continue; }
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if c1 == c2 {
+                continue;
+            }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|g: &Grid| grid::replace_color(g, c1, c2),
                 train_pairs,
@@ -196,7 +217,9 @@ fn level_1(
     // 1b. switch_colors(grid, a, b)
     for (i, &a) in colors.iter().enumerate() {
         for &b in &colors[i + 1..] {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|g: &Grid| grid::switch_colors(g, a, b),
                 train_pairs,
@@ -213,7 +236,9 @@ fn level_1(
 
     // 1c. upscale(grid, factor) for factors 2-5
     for factor in 2..=5usize {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|g: &Grid| grid::upscale(g, factor),
             train_pairs,
@@ -229,7 +254,9 @@ fn level_1(
 
     // 1d. downscale(grid, factor) for factors 2-5
     for factor in 2..=5usize {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|g: &Grid| grid::downscale(g, factor),
             train_pairs,
@@ -248,12 +275,18 @@ fn level_1(
         let out_h = first_out.len();
         let out_w = if out_h > 0 { first_out[0].len() } else { 0 };
         let in_h = train_pairs[0].0.len();
-        let in_w = if in_h > 0 { train_pairs[0].0[0].len() } else { 0 };
+        let in_w = if in_h > 0 {
+            train_pairs[0].0[0].len()
+        } else {
+            0
+        };
         let max_h = in_h.min(out_h + 2);
         let max_w = in_w.min(out_w + 2);
         for h in 1..=max_h {
             for w in 1..=max_w {
-                if elapsed_ms(start) > timeout_ms { return None; }
+                if elapsed_ms(start) > timeout_ms {
+                    return None;
+                }
                 for sr in 0..=in_h.saturating_sub(h) {
                     for sc in 0..=in_w.saturating_sub(w) {
                         if let Some(test_outputs) = verify_and_apply(
@@ -279,79 +312,116 @@ fn level_1(
         let mut valid = true;
 
         for (inp, out) in train_pairs {
-            if inp.len() != out.len() || (inp.len() > 0 && inp[0].len() != out[0].len()) {
+            if inp.len() != out.len() || (!inp.is_empty() && inp[0].len() != out[0].len()) {
                 valid = false;
                 break;
             }
             let mut this_map: Vec<(u8, u8)> = Vec::new();
             let mut consistent = true;
-            for (_r, (irow, orow)) in inp.iter().zip(out.iter()).enumerate() {
-                for (_c, (&iv, &ov)) in irow.iter().zip(orow.iter()).enumerate() {
+            for (irow, orow) in inp.iter().zip(out.iter()) {
+                for (&iv, &ov) in irow.iter().zip(orow.iter()) {
                     if let Some(&(_, mapped)) = this_map.iter().find(|&&(from, _)| from == iv) {
-                        if mapped != ov { consistent = false; break; }
+                        if mapped != ov {
+                            consistent = false;
+                            break;
+                        }
                     } else {
                         this_map.push((iv, ov));
                     }
                 }
-                if !consistent { break; }
+                if !consistent {
+                    break;
+                }
             }
-            if !consistent { valid = false; break; }
+            if !consistent {
+                valid = false;
+                break;
+            }
             match &color_map {
                 None => color_map = Some(this_map),
                 Some(existing) => {
                     // Verify same mapping across pairs
                     for &(from, to) in &this_map {
-                        if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from) {
-                            if eto != to { valid = false; break; }
+                        if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from)
+                            && eto != to
+                        {
+                            valid = false;
+                            break;
                         }
                     }
-                    if !valid { break; }
+                    if !valid {
+                        break;
+                    }
                 }
             }
         }
-        if valid {
-            if let Some(mapping) = color_map {
-                if let Some(test_outputs) = verify_and_apply(
-                    &|g: &Grid| {
-                        g.iter().map(|row| {
-                            row.iter().map(|&c| {
-                                mapping.iter().find(|&&(from, _)| from == c)
-                                    .map(|&(_, to)| to).unwrap_or(c)
-                            }).collect()
-                        }).collect()
-                    },
-                    train_pairs, test_inputs,
-                ) {
-                    return Some(SynthResult {
-                        program_desc: format!("color_map({:?})", mapping),
-                        test_outputs, level: 1,
-                    });
-                }
-            }
+        if valid
+            && let Some(mapping) = color_map
+            && let Some(test_outputs) = verify_and_apply(
+                &|g: &Grid| {
+                    g.iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|&c| {
+                                    mapping
+                                        .iter()
+                                        .find(|&&(from, _)| from == c)
+                                        .map(|&(_, to)| to)
+                                        .unwrap_or(c)
+                                })
+                                .collect()
+                        })
+                        .collect()
+                },
+                train_pairs,
+                test_inputs,
+            )
+        {
+            return Some(SynthResult {
+                program_desc: format!("color_map({:?})", mapping),
+                test_outputs,
+                level: 1,
+            });
         }
     }
 
     // 1f. Self-concat patterns
-    let concat_patterns: Vec<(&str, fn(&Grid) -> Grid)> = vec![
-        ("hconcat(I,I)",            |g| grid::hconcat(g, g)),
-        ("vconcat(I,I)",            |g| grid::vconcat(g, g)),
-        ("hconcat(I,vmirror(I))",   |g| grid::hconcat(g, &grid::vmirror(g))),
-        ("vconcat(I,hmirror(I))",   |g| grid::vconcat(g, &grid::hmirror(g))),
-        ("hconcat(vmirror(I),I)",   |g| grid::hconcat(&grid::vmirror(g), g)),
-        ("vconcat(hmirror(I),I)",   |g| grid::vconcat(&grid::hmirror(g), g)),
-        ("hconcat(I,rot180(I))",    |g| grid::hconcat(g, &grid::rot180(g))),
-        ("vconcat(I,rot180(I))",    |g| grid::vconcat(g, &grid::rot180(g))),
-        ("hconcat(I,dmirror(I))",   |g| grid::hconcat(g, &grid::dmirror(g))),
-        ("vconcat(I,dmirror(I))",   |g| grid::vconcat(g, &grid::dmirror(g))),
+    let concat_patterns: Vec<NamedGridFn> = vec![
+        ("hconcat(I,I)", |g| grid::hconcat(g, g)),
+        ("vconcat(I,I)", |g| grid::vconcat(g, g)),
+        ("hconcat(I,vmirror(I))", |g| {
+            grid::hconcat(g, &grid::vmirror(g))
+        }),
+        ("vconcat(I,hmirror(I))", |g| {
+            grid::vconcat(g, &grid::hmirror(g))
+        }),
+        ("hconcat(vmirror(I),I)", |g| {
+            grid::hconcat(&grid::vmirror(g), g)
+        }),
+        ("vconcat(hmirror(I),I)", |g| {
+            grid::vconcat(&grid::hmirror(g), g)
+        }),
+        ("hconcat(I,rot180(I))", |g| {
+            grid::hconcat(g, &grid::rot180(g))
+        }),
+        ("vconcat(I,rot180(I))", |g| {
+            grid::vconcat(g, &grid::rot180(g))
+        }),
+        ("hconcat(I,dmirror(I))", |g| {
+            grid::hconcat(g, &grid::dmirror(g))
+        }),
+        ("vconcat(I,dmirror(I))", |g| {
+            grid::vconcat(g, &grid::dmirror(g))
+        }),
     ];
     for (name, f) in &concat_patterns {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         let f_ref = *f;
-        if let Some(test_outputs) = verify_and_apply(
-            &move |g: &Grid| f_ref(g),
-            train_pairs,
-            test_inputs,
-        ) {
+        if let Some(test_outputs) =
+            verify_and_apply(&move |g: &Grid| f_ref(g), train_pairs, test_inputs)
+        {
             return Some(SynthResult {
                 program_desc: name.to_string(),
                 test_outputs,
@@ -374,26 +444,28 @@ fn level_2(
     start: &Instant,
     timeout_ms: u64,
 ) -> Option<SynthResult> {
-    let unary_prims: Vec<(&str, fn(&Grid) -> Grid)> = vec![
-        ("rot90",       grid::rot90),
-        ("rot180",      grid::rot180),
-        ("rot270",      grid::rot270),
-        ("hmirror",     grid::hmirror),
-        ("vmirror",     grid::vmirror),
-        ("dmirror",     grid::dmirror),
-        ("cmirror",     grid::cmirror),
-        ("tophalf",     grid::tophalf),
-        ("bottomhalf",  grid::bottomhalf),
-        ("lefthalf",    grid::lefthalf),
-        ("righthalf",   grid::righthalf),
-        ("trim",        grid::trim),
-        ("compress",    grid::compress),
+    let unary_prims: Vec<NamedGridFn> = vec![
+        ("rot90", grid::rot90),
+        ("rot180", grid::rot180),
+        ("rot270", grid::rot270),
+        ("hmirror", grid::hmirror),
+        ("vmirror", grid::vmirror),
+        ("dmirror", grid::dmirror),
+        ("cmirror", grid::cmirror),
+        ("tophalf", grid::tophalf),
+        ("bottomhalf", grid::bottomhalf),
+        ("lefthalf", grid::lefthalf),
+        ("righthalf", grid::righthalf),
+        ("trim", grid::trim),
+        ("compress", grid::compress),
     ];
 
     // 2a. All pairs of unary Grid->Grid: f(g(input))
     for (name_f, f) in &unary_prims {
         for (name_g, g) in &unary_prims {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             let f_ref = *f;
             let g_ref = *g;
             if let Some(test_outputs) = verify_and_apply(
@@ -414,8 +486,12 @@ fn level_2(
     for (name_f, f) in &unary_prims {
         for &c1 in colors {
             for &c2 in colors {
-                if c1 == c2 { continue; }
-                if elapsed_ms(start) > timeout_ms { return None; }
+                if c1 == c2 {
+                    continue;
+                }
+                if elapsed_ms(start) > timeout_ms {
+                    return None;
+                }
 
                 // f(replace_color(input, c1, c2))
                 let f_ref = *f;
@@ -450,12 +526,20 @@ fn level_2(
     // 2c. Two replace_color operations in sequence
     for &c1 in colors {
         for &c2 in colors {
-            if c1 == c2 { continue; }
+            if c1 == c2 {
+                continue;
+            }
             for &c3 in colors {
                 for &c4 in colors {
-                    if c3 == c4 { continue; }
-                    if (c1, c2) == (c3, c4) { continue; }
-                    if elapsed_ms(start) > timeout_ms { return None; }
+                    if c3 == c4 {
+                        continue;
+                    }
+                    if (c1, c2) == (c3, c4) {
+                        continue;
+                    }
+                    if elapsed_ms(start) > timeout_ms {
+                        return None;
+                    }
                     if let Some(test_outputs) = verify_and_apply(
                         &|inp: &Grid| {
                             grid::replace_color(&grid::replace_color(inp, c1, c2), c3, c4)
@@ -486,19 +570,21 @@ fn level_2(
 
 /// The 4 canonical object extraction modes used throughout the crate.
 const OBJ_MODES: [(bool, bool, bool, &str); 8] = [
-    (true,  true,  true,  "TTT"),
-    (true,  false, true,  "TFT"),
-    (false, true,  true,  "FTT"),
-    (false, false, true,  "FFT"),
-    (true,  true,  false, "TTF"),
-    (true,  false, false, "TFF"),
-    (false, true,  false, "FTF"),
+    (true, true, true, "TTT"),
+    (true, false, true, "TFT"),
+    (false, true, true, "FTT"),
+    (false, false, true, "FFT"),
+    (true, true, false, "TTF"),
+    (true, false, false, "TFF"),
+    (false, true, false, "FTF"),
     (false, false, false, "FFF"),
 ];
 
 fn center_of(obj: &Object) -> (usize, usize) {
     let positions = obj.positions();
-    if positions.is_empty() { return (0, 0); }
+    if positions.is_empty() {
+        return (0, 0);
+    }
     let sum_r: usize = positions.iter().map(|p| p.0).sum();
     let sum_c: usize = positions.iter().map(|p| p.1).sum();
     let n = positions.len();
@@ -514,7 +600,9 @@ fn level_3(
 ) -> Option<SynthResult> {
     // 3a. subgrid(selector(objects(input, ...)), input) for each mode x selector
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // argmax_size
         if let Some(test_outputs) = verify_and_apply(
@@ -558,7 +646,9 @@ fn level_3(
     // 3b. subgrid(colorfilter(objects(input, ...), color)[0], input)
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
 
             // First object of that color
             if let Some(test_outputs) = verify_and_apply(
@@ -635,8 +725,12 @@ fn level_3(
     // 3c. fill(input, fill_color, ofcolor(input, source_color))
     for &source_color in colors {
         for &fill_color in colors {
-            if source_color == fill_color { continue; }
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if source_color == fill_color {
+                continue;
+            }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
 
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
@@ -647,10 +741,7 @@ fn level_3(
                 test_inputs,
             ) {
                 return Some(SynthResult {
-                    program_desc: format!(
-                        "fill(I, {}, ofcolor(I, {}))",
-                        fill_color, source_color
-                    ),
+                    program_desc: format!("fill(I, {}, ofcolor(I, {}))", fill_color, source_color),
                     test_outputs,
                     level: 3,
                 });
@@ -661,16 +752,18 @@ fn level_3(
     // 3d. fill(input, fill_color, region(selector(objects(input, ...))))
     //     region in {delta, backdrop, obj_box}
     //     selector in {argmax_size, argmin_size}
-    let region_fns: Vec<(&str, fn(&Object) -> BTreeSet<(usize, usize)>)> = vec![
-        ("delta",    object::delta),
+    let region_fns: Vec<NamedRegionFn> = vec![
+        ("delta", object::delta),
         ("backdrop", object::backdrop),
-        ("obj_box",  object::obj_box),
+        ("obj_box", object::obj_box),
     ];
 
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_color in colors {
             for &(region_name, region_fn) in &region_fns {
-                if elapsed_ms(start) > timeout_ms { return None; }
+                if elapsed_ms(start) > timeout_ms {
+                    return None;
+                }
 
                 // argmax_size
                 if let Some(test_outputs) = verify_and_apply(
@@ -727,7 +820,9 @@ fn level_3(
 
     // 3e. cover(input, selector(objects(input, ...))) -- erase an object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // cover argmax
         if let Some(test_outputs) = verify_and_apply(
@@ -742,9 +837,7 @@ fn level_3(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "cover(I, argmax_size(objects(I, {})))", mode_name
-                ),
+                program_desc: format!("cover(I, argmax_size(objects(I, {})))", mode_name),
                 test_outputs,
                 level: 3,
             });
@@ -763,9 +856,7 @@ fn level_3(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "cover(I, argmin_size(objects(I, {})))", mode_name
-                ),
+                program_desc: format!("cover(I, argmin_size(objects(I, {})))", mode_name),
                 test_outputs,
                 level: 3,
             });
@@ -773,7 +864,9 @@ fn level_3(
 
         // cover by color
         for &color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -789,7 +882,8 @@ fn level_3(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "cover_all(I, colorfilter(objects(I, {}), {}))", mode_name, color
+                        "cover_all(I, colorfilter(objects(I, {}), {}))",
+                        mode_name, color
                     ),
                     test_outputs,
                     level: 3,
@@ -801,7 +895,9 @@ fn level_3(
     // 3f. paint all objects of one mode onto a blank canvas
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &bg_color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -818,7 +914,8 @@ fn level_3(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "paint_all(canvas({}, H, W), objects(I, {}))", bg_color, mode_name
+                        "paint_all(canvas({}, H, W), objects(I, {}))",
+                        bg_color, mode_name
                     ),
                     test_outputs,
                     level: 3,
@@ -830,7 +927,9 @@ fn level_3(
     // 3g. fill(input, fill_color, delta(each_object)) -- fill holes in every object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -846,7 +945,8 @@ fn level_3(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "fill_all_deltas(I, {}, objects(I, {}))", fill_color, mode_name
+                        "fill_all_deltas(I, {}, objects(I, {}))",
+                        fill_color, mode_name
                     ),
                     test_outputs,
                     level: 3,
@@ -857,7 +957,9 @@ fn level_3(
 
     // 3h. fill(input, obj.primary_color(), delta(obj)) -- fill holes with object's own color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -873,9 +975,7 @@ fn level_3(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "fill_deltas_own_color(I, objects(I, {}))", mode_name
-                ),
+                program_desc: format!("fill_deltas_own_color(I, objects(I, {}))", mode_name),
                 test_outputs,
                 level: 3,
             });
@@ -884,11 +984,15 @@ fn level_3(
 
     // 3i. Merge all objects and extract subgrid
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
-                if objs.is_empty() { return inp.clone(); }
+                if objs.is_empty() {
+                    return inp.clone();
+                }
                 let merged = object::merge_objects(&objs);
                 object::subgrid(&merged, inp)
             },
@@ -896,9 +1000,7 @@ fn level_3(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "subgrid(merge_objects(objects(I, {})), I)", mode_name
-                ),
+                program_desc: format!("subgrid(merge_objects(objects(I, {})), I)", mode_name),
                 test_outputs,
                 level: 3,
             });
@@ -908,7 +1010,9 @@ fn level_3(
     // 3j. Replace color of objects: for each object, replace its color with another
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &new_color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -924,7 +1028,8 @@ fn level_3(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "recolor_all(I, {}, objects(I, {}))", new_color, mode_name
+                        "recolor_all(I, {}, objects(I, {}))",
+                        new_color, mode_name
                     ),
                     test_outputs,
                     level: 3,
@@ -936,7 +1041,9 @@ fn level_3(
     // 3k. Outline objects: draw bounding box of each object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &box_color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -952,7 +1059,8 @@ fn level_3(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "outline_all(I, {}, objects(I, {}))", box_color, mode_name
+                        "outline_all(I, {}, objects(I, {}))",
+                        box_color, mode_name
                     ),
                     test_outputs,
                     level: 3,
@@ -964,14 +1072,16 @@ fn level_3(
     // 3l. Partition by color (group cells by color as objects)
     {
         fn partition(grid: &Grid) -> Vec<Object> {
-            let mut color_groups: std::collections::HashMap<u8, BTreeSet<(u8, (usize, usize))>> =
-                std::collections::HashMap::new();
+            let mut color_groups: ColorGroups = std::collections::HashMap::new();
             for (r, row) in grid.iter().enumerate() {
                 for (c, &v) in row.iter().enumerate() {
                     color_groups.entry(v).or_default().insert((v, (r, c)));
                 }
             }
-            color_groups.into_values().map(|cells| Object { cells }).collect()
+            color_groups
+                .into_values()
+                .map(|cells| Object { cells })
+                .collect()
         }
 
         // Subgrid of largest partition (non-background)
@@ -979,19 +1089,19 @@ fn level_3(
             &|inp: &Grid| {
                 let bg = grid::mostcolor(inp);
                 let parts = partition(inp);
-                let non_bg: Vec<_> = parts.iter()
-                    .filter(|o| o.primary_color() != bg)
-                    .collect();
+                let non_bg: Vec<_> = parts.iter().filter(|o| o.primary_color() != bg).collect();
                 match non_bg.iter().max_by_key(|o| o.size()) {
                     Some(obj) => object::subgrid(obj, inp),
                     None => inp.clone(),
                 }
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: "subgrid(argmax(partition_nobg(I)), I)".into(),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1000,26 +1110,28 @@ fn level_3(
             &|inp: &Grid| {
                 let bg = grid::mostcolor(inp);
                 let parts = partition(inp);
-                let non_bg: Vec<_> = parts.iter()
-                    .filter(|o| o.primary_color() != bg)
-                    .collect();
+                let non_bg: Vec<_> = parts.iter().filter(|o| o.primary_color() != bg).collect();
                 match non_bg.iter().min_by_key(|o| o.size()) {
                     Some(obj) => object::subgrid(obj, inp),
                     None => inp.clone(),
                 }
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: "subgrid(argmin(partition_nobg(I)), I)".into(),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
 
     // 3m. Fill backdrop of each object with object's own color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -1031,11 +1143,13 @@ fn level_3(
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("fill_backdrop_own_color(I, objects(I, {}))", mode_name),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
@@ -1043,13 +1157,15 @@ fn level_3(
     // 3n. Connect same-color objects with lines
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &line_color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
                     let mut result = inp.clone();
                     for i in 0..objs.len() {
-                        for j in (i+1)..objs.len() {
+                        for j in (i + 1)..objs.len() {
                             if objs[i].primary_color() == objs[j].primary_color() {
                                 // Connect centers
                                 let (ri, ci) = center_of(&objs[i]);
@@ -1061,11 +1177,16 @@ fn level_3(
                     }
                     result
                 },
-                train_pairs, test_inputs,
+                train_pairs,
+                test_inputs,
             ) {
                 return Some(SynthResult {
-                    program_desc: format!("connect_same_color(I, {}, objects(I, {}))", line_color, mode_name),
-                    test_outputs, level: 3,
+                    program_desc: format!(
+                        "connect_same_color(I, {}, objects(I, {}))",
+                        line_color, mode_name
+                    ),
+                    test_outputs,
+                    level: 3,
                 });
             }
         }
@@ -1073,20 +1194,30 @@ fn level_3(
 
     // 3o. Gravity: sort non-background cells to bottom/top/left/right
     for &(_uni, _diag, _nobg, _mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // Gravity down (per column)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = grid::canvas(bg, h, w);
                 for c in 0..w {
-                    let non_bg: Vec<u8> = (0..h).filter_map(|r| {
-                        if inp[r][c] != bg { Some(inp[r][c]) } else { None }
-                    }).collect();
+                    let non_bg: Vec<u8> = (0..h)
+                        .filter_map(|r| {
+                            if inp[r][c] != bg {
+                                Some(inp[r][c])
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     let start_row = h - non_bg.len();
                     for (i, &v) in non_bg.iter().enumerate() {
                         result[start_row + i][c] = v;
@@ -1094,11 +1225,13 @@ fn level_3(
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: "gravity_down(I)".into(),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1106,25 +1239,35 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = grid::canvas(bg, h, w);
                 for c in 0..w {
-                    let non_bg: Vec<u8> = (0..h).filter_map(|r| {
-                        if inp[r][c] != bg { Some(inp[r][c]) } else { None }
-                    }).collect();
+                    let non_bg: Vec<u8> = (0..h)
+                        .filter_map(|r| {
+                            if inp[r][c] != bg {
+                                Some(inp[r][c])
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     for (i, &v) in non_bg.iter().enumerate() {
                         result[i][c] = v;
                     }
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: "gravity_up(I)".into(),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1132,25 +1275,35 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = grid::canvas(bg, h, w);
                 for r in 0..h {
-                    let non_bg: Vec<u8> = (0..w).filter_map(|c| {
-                        if inp[r][c] != bg { Some(inp[r][c]) } else { None }
-                    }).collect();
+                    let non_bg: Vec<u8> = (0..w)
+                        .filter_map(|c| {
+                            if inp[r][c] != bg {
+                                Some(inp[r][c])
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     for (i, &v) in non_bg.iter().enumerate() {
                         result[r][i] = v;
                     }
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: "gravity_left(I)".into(),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1158,14 +1311,22 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = grid::canvas(bg, h, w);
                 for r in 0..h {
-                    let non_bg: Vec<u8> = (0..w).filter_map(|c| {
-                        if inp[r][c] != bg { Some(inp[r][c]) } else { None }
-                    }).collect();
+                    let non_bg: Vec<u8> = (0..w)
+                        .filter_map(|c| {
+                            if inp[r][c] != bg {
+                                Some(inp[r][c])
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     let start_col = w - non_bg.len();
                     for (i, &v) in non_bg.iter().enumerate() {
                         result[r][start_col + i] = v;
@@ -1173,11 +1334,13 @@ fn level_3(
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: "gravity_right(I)".into(),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1187,11 +1350,15 @@ fn level_3(
     // 3p. Flood fill from border: fill all cells reachable from border with a color
     // (this catches "fill enclosed regions" patterns)
     for &fill_c in colors {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 // BFS from all border bg cells
@@ -1199,16 +1366,22 @@ fn level_3(
                 let mut queue = std::collections::VecDeque::new();
                 for r in 0..h {
                     for c in 0..w {
-                        if (r == 0 || r == h-1 || c == 0 || c == w-1) && inp[r][c] == bg {
-                            if !reachable[r][c] {
-                                reachable[r][c] = true;
-                                queue.push_back((r, c));
-                            }
+                        if (r == 0 || r == h - 1 || c == 0 || c == w - 1)
+                            && inp[r][c] == bg
+                            && !reachable[r][c]
+                        {
+                            reachable[r][c] = true;
+                            queue.push_back((r, c));
                         }
                     }
                 }
                 while let Some((r, c)) = queue.pop_front() {
-                    for (nr, nc) in [(r.wrapping_sub(1), c), (r+1, c), (r, c.wrapping_sub(1)), (r, c+1)] {
+                    for (nr, nc) in [
+                        (r.wrapping_sub(1), c),
+                        (r + 1, c),
+                        (r, c.wrapping_sub(1)),
+                        (r, c + 1),
+                    ] {
                         if nr < h && nc < w && !reachable[nr][nc] && inp[nr][nc] == bg {
                             reachable[nr][nc] = true;
                             queue.push_back((nr, nc));
@@ -1226,24 +1399,30 @@ fn level_3(
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("fill_enclosed(I, {})", fill_c),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
 
     // 3q. Unique object: find the object that differs from all others (different size/color)
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // Unique by size (only one object with that size)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
-                if objs.len() < 2 { return inp.clone(); }
+                if objs.len() < 2 {
+                    return inp.clone();
+                }
                 let sizes: Vec<usize> = objs.iter().map(|o| o.size()).collect();
                 for (i, obj) in objs.iter().enumerate() {
                     let s = sizes[i];
@@ -1253,11 +1432,13 @@ fn level_3(
                 }
                 inp.clone()
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("subgrid(unique_by_size(objects(I, {})), I)", mode_name),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1265,7 +1446,9 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
-                if objs.len() < 2 { return inp.clone(); }
+                if objs.len() < 2 {
+                    return inp.clone();
+                }
                 let clrs: Vec<u8> = objs.iter().map(|o| o.primary_color()).collect();
                 for (i, obj) in objs.iter().enumerate() {
                     let c = clrs[i];
@@ -1275,11 +1458,13 @@ fn level_3(
                 }
                 inp.clone()
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("subgrid(unique_by_color(objects(I, {})), I)", mode_name),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
@@ -1293,8 +1478,10 @@ fn level_3(
         if ih > 0 && iw > 0 && oh % ih == 0 && ow % iw == 0 {
             let nr = oh / ih;
             let nc = ow / iw;
-            if nr >= 1 && nc >= 1 && (nr > 1 || nc > 1) {
-                if let Some(test_outputs) = verify_and_apply(
+            if nr >= 1
+                && nc >= 1
+                && (nr > 1 || nc > 1)
+                && let Some(test_outputs) = verify_and_apply(
                     &|inp: &Grid| {
                         let h = inp.len();
                         let w = if h > 0 { inp[0].len() } else { 0 };
@@ -1310,13 +1497,15 @@ fn level_3(
                         }
                         result
                     },
-                    train_pairs, test_inputs,
-                ) {
-                    return Some(SynthResult {
-                        program_desc: format!("tile(I, {}, {})", nr, nc),
-                        test_outputs, level: 3,
-                    });
-                }
+                    train_pairs,
+                    test_inputs,
+                )
+            {
+                return Some(SynthResult {
+                    program_desc: format!("tile(I, {}, {})", nr, nc),
+                    test_outputs,
+                    level: 3,
+                });
             }
         }
     }
@@ -1329,7 +1518,7 @@ fn level_3(
         let ow = if oh > 0 { first_out[0].len() } else { 0 };
         if ih > 0 && iw > 0 && oh == ih * 2 && ow == iw * 2 {
             // Try 2x2 arrangements with transforms
-            let transforms: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+            let transforms: Vec<NamedGridFn> = vec![
                 ("id", |g: &Grid| g.clone()),
                 ("rot90", grid::rot90 as fn(&Grid) -> Grid),
                 ("rot180", grid::rot180 as fn(&Grid) -> Grid),
@@ -1341,19 +1530,26 @@ fn level_3(
                 for (_, tr) in &transforms {
                     for (_, bl) in &transforms {
                         for (_, br) in &transforms {
-                            if elapsed_ms(start) > timeout_ms { return None; }
-                            let tl = *tl; let tr = *tr; let bl = *bl; let br = *br;
+                            if elapsed_ms(start) > timeout_ms {
+                                return None;
+                            }
+                            let tl = *tl;
+                            let tr = *tr;
+                            let bl = *bl;
+                            let br = *br;
                             if let Some(test_outputs) = verify_and_apply(
                                 &|inp: &Grid| {
                                     let top = grid::hconcat(&tl(inp), &tr(inp));
                                     let bot = grid::hconcat(&bl(inp), &br(inp));
                                     grid::vconcat(&top, &bot)
                                 },
-                                train_pairs, test_inputs,
+                                train_pairs,
+                                test_inputs,
                             ) {
                                 return Some(SynthResult {
                                     program_desc: "tile_2x2_transformed(I)".into(),
-                                    test_outputs, level: 3,
+                                    test_outputs,
+                                    level: 3,
                                 });
                             }
                         }
@@ -1365,11 +1561,15 @@ fn level_3(
 
     // 3t. Add/remove border: output = input with 1-cell border of a color
     for &border_c in colors {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let mut result = vec![vec![border_c; w + 2]; h + 2];
                 for r in 0..h {
@@ -1379,11 +1579,13 @@ fn level_3(
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("add_border(I, {})", border_c),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
@@ -1391,7 +1593,9 @@ fn level_3(
     // 3u. Underfill: fill background cells within each object's bbox with a color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_c in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -1407,11 +1611,16 @@ fn level_3(
                     }
                     result
                 },
-                train_pairs, test_inputs,
+                train_pairs,
+                test_inputs,
             ) {
                 return Some(SynthResult {
-                    program_desc: format!("underfill_backdrop(I, {}, objects(I, {}))", fill_c, mode_name),
-                    test_outputs, level: 3,
+                    program_desc: format!(
+                        "underfill_backdrop(I, {}, objects(I, {}))",
+                        fill_c, mode_name
+                    ),
+                    test_outputs,
+                    level: 3,
                 });
             }
         }
@@ -1421,14 +1630,18 @@ fn level_3(
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
-            if h == 0 { return inp.clone(); }
+            if h == 0 {
+                return inp.clone();
+            }
             let w = inp[0].len();
             let bg = grid::mostcolor(inp);
-            let mut min_r = h; let mut max_r = 0;
-            let mut min_c = w; let mut max_c = 0;
-            for r in 0..h {
-                for c in 0..w {
-                    if inp[r][c] != bg {
+            let mut min_r = h;
+            let mut max_r = 0;
+            let mut min_c = w;
+            let mut max_c = 0;
+            for (r, row) in inp.iter().enumerate() {
+                for (c, &cell) in row.iter().enumerate() {
+                    if cell != bg {
                         min_r = min_r.min(r);
                         max_r = max_r.max(r);
                         min_c = min_c.min(c);
@@ -1436,36 +1649,44 @@ fn level_3(
                     }
                 }
             }
-            if min_r > max_r { return inp.clone(); }
+            if min_r > max_r {
+                return inp.clone();
+            }
             grid::crop(inp, min_r, min_c, max_r - min_r + 1, max_c - min_c + 1)
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "crop_to_content(I)".into(),
-            test_outputs, level: 3,
+            test_outputs,
+            level: 3,
         });
     }
 
     // 3w. Extract the second-largest or second-smallest object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         // Second largest
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let mut objs = object::objects(inp, uni, diag, nobg);
-                objs.sort_by(|a, b| b.size().cmp(&a.size()));
+                objs.sort_by_key(|o| std::cmp::Reverse(o.size()));
                 if objs.len() >= 2 {
                     object::subgrid(&objs[1], inp)
                 } else {
                     inp.clone()
                 }
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("subgrid(second_largest(objects(I, {})), I)", mode_name),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
@@ -1473,11 +1694,15 @@ fn level_3(
     // 3x. Flood fill from each non-background cell outward (spreading pattern)
     // For each color, find cells of that color and expand them to fill adjacent background cells
     for &spread_c in colors {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = inp.clone();
@@ -1486,7 +1711,12 @@ fn level_3(
                 for r in 0..h {
                     for c in 0..w {
                         if inp[r][c] == spread_c {
-                            for (nr, nc) in [(r.wrapping_sub(1), c), (r+1, c), (r, c.wrapping_sub(1)), (r, c+1)] {
+                            for (nr, nc) in [
+                                (r.wrapping_sub(1), c),
+                                (r + 1, c),
+                                (r, c.wrapping_sub(1)),
+                                (r, c + 1),
+                            ] {
                                 if nr < h && nc < w && inp[nr][nc] == bg {
                                     to_fill.push((nr, nc));
                                 }
@@ -1499,46 +1729,64 @@ fn level_3(
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("spread_1(I, {})", spread_c),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
 
     // 3y. For each non-bg color, fill the row and column through each cell of that color
     for &line_c in colors {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         // Cross pattern: fill row AND column
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = inp.clone();
-                let positions: Vec<(usize, usize)> = (0..h).flat_map(|r| {
-                    (0..w).filter_map(move |c| {
-                        if inp[r][c] == line_c { Some((r, c)) } else { None }
+                let positions: Vec<(usize, usize)> = (0..h)
+                    .flat_map(|r| {
+                        (0..w).filter_map(move |c| {
+                            if inp[r][c] == line_c {
+                                Some((r, c))
+                            } else {
+                                None
+                            }
+                        })
                     })
-                }).collect();
+                    .collect();
                 for &(r, c) in &positions {
-                    for cc in 0..w {
-                        if result[r][cc] == bg { result[r][cc] = line_c; }
+                    for cell in result[r].iter_mut().take(w) {
+                        if *cell == bg {
+                            *cell = line_c;
+                        }
                     }
-                    for rr in 0..h {
-                        if result[rr][c] == bg { result[rr][c] = line_c; }
+                    for row in result.iter_mut().take(h) {
+                        if row[c] == bg {
+                            row[c] = line_c;
+                        }
                     }
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("cross_fill(I, {})", line_c),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1546,24 +1794,30 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = inp.clone();
                 for r in 0..h {
                     if (0..w).any(|c| inp[r][c] == line_c) {
-                        for c in 0..w {
-                            if result[r][c] == bg { result[r][c] = line_c; }
+                        for cell in result[r].iter_mut().take(w) {
+                            if *cell == bg {
+                                *cell = line_c;
+                            }
                         }
                     }
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("row_fill(I, {})", line_c),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
 
@@ -1571,24 +1825,30 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
-                if h == 0 { return inp.clone(); }
+                if h == 0 {
+                    return inp.clone();
+                }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = inp.clone();
                 for c in 0..w {
                     if (0..h).any(|r| inp[r][c] == line_c) {
-                        for r in 0..h {
-                            if result[r][c] == bg { result[r][c] = line_c; }
+                        for row in result.iter_mut().take(h) {
+                            if row[c] == bg {
+                                row[c] = line_c;
+                            }
                         }
                     }
                 }
                 result
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("col_fill(I, {})", line_c),
-                test_outputs, level: 3,
+                test_outputs,
+                level: 3,
             });
         }
     }
@@ -1598,11 +1858,19 @@ fn level_3(
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
-            if h == 0 { return inp.clone(); }
+            if h == 0 {
+                return inp.clone();
+            }
             let w = inp[0].len();
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
             for r in 0..h {
+                // allow: each cell is filled in place from the mirrored row of the
+                // SAME grid we are writing, and later rows can legitimately read
+                // cells that earlier rows already changed. An iterator over one row
+                // cannot read another row of the same grid, so any rewrite would
+                // need a defensive copy and would change what this reads.
+                #[allow(clippy::needless_range_loop)]
                 for c in 0..w {
                     let mirror_r = h - 1 - r;
                     if result[r][c] == bg && result[mirror_r][c] != bg {
@@ -1612,11 +1880,13 @@ fn level_3(
             }
             result
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "complete_h_symmetry(I)".into(),
-            test_outputs, level: 3,
+            test_outputs,
+            level: 3,
         });
     }
 
@@ -1624,25 +1894,29 @@ fn level_3(
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
-            if h == 0 { return inp.clone(); }
+            if h == 0 {
+                return inp.clone();
+            }
             let w = inp[0].len();
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
-            for r in 0..h {
+            for row in result.iter_mut().take(h) {
                 for c in 0..w {
                     let mirror_c = w - 1 - c;
-                    if result[r][c] == bg && result[r][mirror_c] != bg {
-                        result[r][c] = result[r][mirror_c];
+                    if row[c] == bg && row[mirror_c] != bg {
+                        row[c] = row[mirror_c];
                     }
                 }
             }
             result
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "complete_v_symmetry(I)".into(),
-            test_outputs, level: 3,
+            test_outputs,
+            level: 3,
         });
     }
 
@@ -1650,7 +1924,9 @@ fn level_3(
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
-            if h == 0 { return inp.clone(); }
+            if h == 0 {
+                return inp.clone();
+            }
             let w = inp[0].len();
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
@@ -1662,20 +1938,26 @@ fn level_3(
                         if result[r][c] == bg {
                             let mr = h - 1 - r;
                             let mc = w - 1 - c;
-                            if prev[mr][c] != bg { result[r][c] = prev[mr][c]; }
-                            else if prev[r][mc] != bg { result[r][c] = prev[r][mc]; }
-                            else if prev[mr][mc] != bg { result[r][c] = prev[mr][mc]; }
+                            if prev[mr][c] != bg {
+                                result[r][c] = prev[mr][c];
+                            } else if prev[r][mc] != bg {
+                                result[r][c] = prev[r][mc];
+                            } else if prev[mr][mc] != bg {
+                                result[r][c] = prev[mr][mc];
+                            }
                         }
                     }
                 }
             }
             result
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "complete_hv_symmetry(I)".into(),
-            test_outputs, level: 3,
+            test_outputs,
+            level: 3,
         });
     }
 
@@ -1683,11 +1965,19 @@ fn level_3(
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
-            if h == 0 { return inp.clone(); }
+            if h == 0 {
+                return inp.clone();
+            }
             let w = inp[0].len();
-            if h != w { return inp.clone(); }
+            if h != w {
+                return inp.clone();
+            }
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
+            // allow: this reads the transposed cell result[c][r] of the same grid it
+            // writes, in place, so an earlier cell can change what a later one sees.
+            // Iterating rows would make the transposed read impossible to express.
+            #[allow(clippy::needless_range_loop)]
             for r in 0..h {
                 for c in 0..w {
                     if result[r][c] == bg && result[c][r] != bg {
@@ -1697,11 +1987,13 @@ fn level_3(
             }
             result
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "complete_d_symmetry(I)".into(),
-            test_outputs, level: 3,
+            test_outputs,
+            level: 3,
         });
     }
 
@@ -1721,7 +2013,9 @@ fn level_4(
 ) -> Option<SynthResult> {
     // 4a. Fill enclosed regions with grid-derived color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // Fill each object's delta with leastcolor
         if let Some(test_outputs) = verify_and_apply(
@@ -1739,9 +2033,7 @@ fn level_4(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "fill_deltas(I, leastcolor(I), objects(I, {}))", mode_name
-                ),
+                program_desc: format!("fill_deltas(I, leastcolor(I), objects(I, {}))", mode_name),
                 test_outputs,
                 level: 4,
             });
@@ -1763,9 +2055,7 @@ fn level_4(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "fill_deltas(I, mostcolor(I), objects(I, {}))", mode_name
-                ),
+                program_desc: format!("fill_deltas(I, mostcolor(I), objects(I, {}))", mode_name),
                 test_outputs,
                 level: 4,
             });
@@ -1774,13 +2064,17 @@ fn level_4(
 
     // 4b. Majority voting: split grid, overlay, pick most common color per cell
     for n_splits in [2usize, 3] {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // Horizontal split + majority
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let parts = grid::hsplit(inp, n_splits);
-                if parts.is_empty() { return inp.clone(); }
+                if parts.is_empty() {
+                    return inp.clone();
+                }
                 majority_vote(&parts)
             },
             train_pairs,
@@ -1797,7 +2091,9 @@ fn level_4(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let parts = grid::vsplit(inp, n_splits);
-                if parts.is_empty() { return inp.clone(); }
+                if parts.is_empty() {
+                    return inp.clone();
+                }
                 majority_vote(&parts)
             },
             train_pairs,
@@ -1812,17 +2108,19 @@ fn level_4(
     }
 
     // 4c. hconcat/vconcat of transformed halves
-    let half_transforms: Vec<(&str, fn(&Grid) -> Grid)> = vec![
-        ("rot90",    grid::rot90),
-        ("rot180",   grid::rot180),
-        ("rot270",   grid::rot270),
-        ("hmirror",  grid::hmirror),
-        ("vmirror",  grid::vmirror),
-        ("dmirror",  grid::dmirror),
+    let half_transforms: Vec<NamedGridFn> = vec![
+        ("rot90", grid::rot90),
+        ("rot180", grid::rot180),
+        ("rot270", grid::rot270),
+        ("hmirror", grid::hmirror),
+        ("vmirror", grid::vmirror),
+        ("dmirror", grid::dmirror),
     ];
 
     for (t_name, t_fn) in &half_transforms {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
         let t = *t_fn;
 
         // hconcat(transform(lefthalf), righthalf)
@@ -1896,7 +2194,9 @@ fn level_4(
 
     // 4d. cellwise overlay of halves with each possible fallback color
     for &fallback in colors {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // cellwise(lefthalf, righthalf, fallback)
         if let Some(test_outputs) = verify_and_apply(
@@ -1909,9 +2209,7 @@ fn level_4(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "cellwise(lefthalf(I), righthalf(I), {})", fallback
-                ),
+                program_desc: format!("cellwise(lefthalf(I), righthalf(I), {})", fallback),
                 test_outputs,
                 level: 4,
             });
@@ -1928,9 +2226,7 @@ fn level_4(
             test_inputs,
         ) {
             return Some(SynthResult {
-                program_desc: format!(
-                    "cellwise(tophalf(I), bottomhalf(I), {})", fallback
-                ),
+                program_desc: format!("cellwise(tophalf(I), bottomhalf(I), {})", fallback),
                 test_outputs,
                 level: 4,
             });
@@ -1940,7 +2236,9 @@ fn level_4(
     // 4e. underfill patterns: fill background cells at certain positions
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_color in colors {
-            if elapsed_ms(start) > timeout_ms { return None; }
+            if elapsed_ms(start) > timeout_ms {
+                return None;
+            }
 
             // underfill delta of each object
             if let Some(test_outputs) = verify_and_apply(
@@ -1958,7 +2256,8 @@ fn level_4(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "underfill_deltas(I, {}, objects(I, {}))", fill_color, mode_name
+                        "underfill_deltas(I, {}, objects(I, {}))",
+                        fill_color, mode_name
                     ),
                     test_outputs,
                     level: 4,
@@ -1981,7 +2280,8 @@ fn level_4(
             ) {
                 return Some(SynthResult {
                     program_desc: format!(
-                        "underfill_backdrops(I, {}, objects(I, {}))", fill_color, mode_name
+                        "underfill_backdrops(I, {}, objects(I, {}))",
+                        fill_color, mode_name
                     ),
                     test_outputs,
                     level: 4,
@@ -1992,31 +2292,46 @@ fn level_4(
 
     // 4f. XOR overlay of halves (keep cells that differ between halves)
     for &fallback in colors {
-        if elapsed_ms(start) > timeout_ms { return None; }
+        if elapsed_ms(start) > timeout_ms {
+            return None;
+        }
 
         // XOR of left/right halves
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let lh = grid::lefthalf(inp);
                 let rh = grid::righthalf(inp);
-                if lh.is_empty() || rh.is_empty() { return inp.clone(); }
+                if lh.is_empty() || rh.is_empty() {
+                    return inp.clone();
+                }
                 let h = lh.len().min(rh.len());
                 let w = lh[0].len().min(rh[0].len());
                 let bg = grid::mostcolor(inp);
-                (0..h).map(|r| {
-                    (0..w).map(|c| {
-                        if lh[r][c] != bg && rh[r][c] == bg { lh[r][c] }
-                        else if rh[r][c] != bg && lh[r][c] == bg { rh[r][c] }
-                        else if lh[r][c] != bg && rh[r][c] != bg { fallback }
-                        else { bg }
-                    }).collect()
-                }).collect()
+                (0..h)
+                    .map(|r| {
+                        (0..w)
+                            .map(|c| {
+                                if lh[r][c] != bg && rh[r][c] == bg {
+                                    lh[r][c]
+                                } else if rh[r][c] != bg && lh[r][c] == bg {
+                                    rh[r][c]
+                                } else if lh[r][c] != bg && rh[r][c] != bg {
+                                    fallback
+                                } else {
+                                    bg
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("xor_halves_h(I, {})", fallback),
-                test_outputs, level: 4,
+                test_outputs,
+                level: 4,
             });
         }
 
@@ -2025,24 +2340,37 @@ fn level_4(
             &|inp: &Grid| {
                 let th = grid::tophalf(inp);
                 let bh = grid::bottomhalf(inp);
-                if th.is_empty() || bh.is_empty() { return inp.clone(); }
+                if th.is_empty() || bh.is_empty() {
+                    return inp.clone();
+                }
                 let h = th.len().min(bh.len());
                 let w = th[0].len().min(bh[0].len());
                 let bg = grid::mostcolor(inp);
-                (0..h).map(|r| {
-                    (0..w).map(|c| {
-                        if th[r][c] != bg && bh[r][c] == bg { th[r][c] }
-                        else if bh[r][c] != bg && th[r][c] == bg { bh[r][c] }
-                        else if th[r][c] != bg && bh[r][c] != bg { fallback }
-                        else { bg }
-                    }).collect()
-                }).collect()
+                (0..h)
+                    .map(|r| {
+                        (0..w)
+                            .map(|c| {
+                                if th[r][c] != bg && bh[r][c] == bg {
+                                    th[r][c]
+                                } else if bh[r][c] != bg && th[r][c] == bg {
+                                    bh[r][c]
+                                } else if th[r][c] != bg && bh[r][c] != bg {
+                                    fallback
+                                } else {
+                                    bg
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
             },
-            train_pairs, test_inputs,
+            train_pairs,
+            test_inputs,
         ) {
             return Some(SynthResult {
                 program_desc: format!("xor_halves_v(I, {})", fallback),
-                test_outputs, level: 4,
+                test_outputs,
+                level: 4,
             });
         }
     }
@@ -2052,22 +2380,33 @@ fn level_4(
         &|inp: &Grid| {
             let lh = grid::lefthalf(inp);
             let rh = grid::righthalf(inp);
-            if lh.is_empty() || rh.is_empty() { return inp.clone(); }
+            if lh.is_empty() || rh.is_empty() {
+                return inp.clone();
+            }
             let h = lh.len().min(rh.len());
             let w = lh[0].len().min(rh[0].len());
             let bg = grid::mostcolor(inp);
-            (0..h).map(|r| {
-                (0..w).map(|c| {
-                    if lh[r][c] != bg && rh[r][c] != bg { lh[r][c] }
-                    else { bg }
-                }).collect()
-            }).collect()
+            (0..h)
+                .map(|r| {
+                    (0..w)
+                        .map(|c| {
+                            if lh[r][c] != bg && rh[r][c] != bg {
+                                lh[r][c]
+                            } else {
+                                bg
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "and_halves_h(I)".into(),
-            test_outputs, level: 4,
+            test_outputs,
+            level: 4,
         });
     }
 
@@ -2075,22 +2414,33 @@ fn level_4(
         &|inp: &Grid| {
             let th = grid::tophalf(inp);
             let bh = grid::bottomhalf(inp);
-            if th.is_empty() || bh.is_empty() { return inp.clone(); }
+            if th.is_empty() || bh.is_empty() {
+                return inp.clone();
+            }
             let h = th.len().min(bh.len());
             let w = th[0].len().min(bh[0].len());
             let bg = grid::mostcolor(inp);
-            (0..h).map(|r| {
-                (0..w).map(|c| {
-                    if th[r][c] != bg && bh[r][c] != bg { th[r][c] }
-                    else { bg }
-                }).collect()
-            }).collect()
+            (0..h)
+                .map(|r| {
+                    (0..w)
+                        .map(|c| {
+                            if th[r][c] != bg && bh[r][c] != bg {
+                                th[r][c]
+                            } else {
+                                bg
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "and_halves_v(I)".into(),
-            test_outputs, level: 4,
+            test_outputs,
+            level: 4,
         });
     }
 
@@ -2099,13 +2449,19 @@ fn level_4(
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
-            if h == 0 { return inp.clone(); }
+            if h == 0 {
+                return inp.clone();
+            }
             let w = inp[0].len();
             // Try all possible tile sizes
-            for th in 1..=h/2 {
-                if h % th != 0 { continue; }
-                for tw in 1..=w/2 {
-                    if w % tw != 0 { continue; }
+            for th in 1..=h / 2 {
+                if !h.is_multiple_of(th) {
+                    continue;
+                }
+                for tw in 1..=w / 2 {
+                    if !w.is_multiple_of(tw) {
+                        continue;
+                    }
                     let tile = grid::crop(inp, 0, 0, th, tw);
                     let mut matches = true;
                     'outer: for tr in (0..h).step_by(th) {
@@ -2127,11 +2483,13 @@ fn level_4(
             }
             inp.clone()
         },
-        train_pairs, test_inputs,
+        train_pairs,
+        test_inputs,
     ) {
         return Some(SynthResult {
             program_desc: "extract_tile(I)".into(),
-            test_outputs, level: 4,
+            test_outputs,
+            level: 4,
         });
     }
 
@@ -2141,9 +2499,13 @@ fn level_4(
 /// Majority vote across multiple same-size grids.
 /// For each cell position, pick the most frequently occurring color.
 fn majority_vote(grids: &[Grid]) -> Grid {
-    if grids.is_empty() { return vec![]; }
+    if grids.is_empty() {
+        return vec![];
+    }
     let h = grids[0].len();
-    if h == 0 { return vec![]; }
+    if h == 0 {
+        return vec![];
+    }
     let w = grids[0][0].len();
 
     let mut out = vec![vec![0u8; w]; h];
@@ -2194,10 +2556,7 @@ mod tests {
         let test_in = vec![vec![0, 1], vec![2, 3]];
         let expected_test = vec![vec![2, 0], vec![3, 1]];
 
-        let (train, test) = make_task(
-            vec![(inp1, out1), (inp2, out2)],
-            vec![test_in],
-        );
+        let (train, test) = make_task(vec![(inp1, out1), (inp2, out2)], vec![test_in]);
 
         let result = synthesize(&train, &test, 10_000);
         assert!(result.is_some(), "Should solve rot90 task");
@@ -2219,10 +2578,7 @@ mod tests {
         let test_in = vec![vec![1, 2, 0], vec![0, 1, 1]];
         let expected_test = vec![vec![3, 2, 0], vec![0, 3, 3]];
 
-        let (train, test) = make_task(
-            vec![(inp1, out1), (inp2, out2)],
-            vec![test_in],
-        );
+        let (train, test) = make_task(vec![(inp1, out1), (inp2, out2)], vec![test_in]);
 
         let result = synthesize(&train, &test, 10_000);
         assert!(result.is_some(), "Should solve replace_color task");
@@ -2247,10 +2603,7 @@ mod tests {
         let test_in = vec![vec![0, 1], vec![2, 3]];
         let expected_test = grid::vmirror(&grid::rot90(&test_in));
 
-        let (train, test) = make_task(
-            vec![(inp1, out1), (inp2, out2)],
-            vec![test_in],
-        );
+        let (train, test) = make_task(vec![(inp1, out1), (inp2, out2)], vec![test_in]);
 
         let result = synthesize(&train, &test, 10_000);
         assert!(result.is_some(), "Should solve vmirror(rot90(I)) task");
@@ -2261,17 +2614,11 @@ mod tests {
 
     #[test]
     fn test_verify_and_apply_rejects_wrong() {
-        let train = vec![
-            (vec![vec![1, 2], vec![3, 4]], vec![vec![9, 9], vec![9, 9]]),
-        ];
+        let train = vec![(vec![vec![1, 2], vec![3, 4]], vec![vec![9, 9], vec![9, 9]])];
         let test = vec![vec![vec![0, 0]]];
 
         // rot90 does not produce [[9,9],[9,9]] from [[1,2],[3,4]]
-        let result = verify_and_apply(
-            &|g: &Grid| grid::rot90(g),
-            &train,
-            &test,
-        );
+        let result = verify_and_apply(&|g: &Grid| grid::rot90(g), &train, &test);
         assert!(result.is_none());
     }
 
@@ -2293,9 +2640,7 @@ mod tests {
     #[test]
     fn test_timeout_respected() {
         // Give a 0ms timeout -- should return None quickly
-        let train = vec![
-            (vec![vec![1, 2], vec![3, 4]], vec![vec![9, 9], vec![9, 9]]),
-        ];
+        let train = vec![(vec![vec![1, 2], vec![3, 4]], vec![vec![9, 9], vec![9, 9]])];
         let test = vec![vec![vec![0, 0]]];
         let result = synthesize(&train, &test, 0);
         // Level 0 checks happen instantly before timeout is checked,
@@ -2313,11 +2658,7 @@ mod tests {
         let test1 = vec![vec![5, 6], vec![7, 8]];
         let test2 = vec![vec![0, 1], vec![2, 3]];
 
-        let result = synthesize(
-            &[(inp, out)],
-            &[test1.clone(), test2.clone()],
-            10_000,
-        );
+        let result = synthesize(&[(inp, out)], &[test1.clone(), test2.clone()], 10_000);
         assert!(result.is_some());
         let r = result.unwrap();
         assert_eq!(r.test_outputs.len(), 2);

@@ -1,3 +1,4 @@
+import type { U64 } from "./u64.js";
 /**
  * Check whether a string is a valid ARC Chain address.
  *
@@ -20,7 +21,7 @@ export declare function isValidAddress(addr: string): boolean;
 /**
  * Check whether a string is a valid ARC Chain transaction hash.
  *
- * Same format as addresses — 64 hex characters (32-byte BLAKE3).
+ * Same format as addresses - 64 hex characters (32-byte BLAKE3).
  *
  * @example
  * ```ts
@@ -48,7 +49,7 @@ export declare function formatHash(hash: string, prefixLen?: number, suffixLen?:
  *
  * ARC uses 6 decimal places by default.
  *
- * @param amount - Raw balance as a number.
+ * @param amount - Raw balance as a safe number or exact bigint.
  * @param decimals - Decimal places (default 6).
  *
  * @example
@@ -57,7 +58,7 @@ export declare function formatHash(hash: string, prefixLen?: number, suffixLen?:
  * formatArc(500);       // "0.000500"
  * ```
  */
-export declare function formatArc(amount: number, decimals?: number): string;
+export declare function formatArc(amount: U64, decimals?: number): string;
 /**
  * Convert a hex string to a `Uint8Array`.
  *

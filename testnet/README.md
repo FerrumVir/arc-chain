@@ -1,65 +1,39 @@
-# ARC Chain Testnet
+# ARC testnet recovery notice
 
-## Quick Join (Non-Technical)
+There is currently no supported “quick join” or validator-deployment command.
+The public v2 fleet has mixed versions and divergent chain state, and the
+v0.8.0 recovery candidate is not published or deployed. Do not pipe a script
+from the mutable `main` branch into a shell, derive a validator identity from a
+label, assign yourself stake, or treat one host's `/health` response as proof
+that the network is live.
 
-Download and run the ARC Node desktop app (coming soon) or:
+Community nodes are stake-zero observers. After an approved v0.8.0 release is
+published with the complete checksummed headless asset matrix, follow the exact
+tag-pinned process in [`../docs/HEADLESS_INSTALL.md`](../docs/HEADLESS_INSTALL.md).
+That does not enroll the node as a validator or guarantee inference work,
+rewards, or synchronization with a canonical chain.
 
-```bash
-curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
-```
+Validator recovery requires a separately approved v3 fleet manifest. It must
+pin binary and model digests, unique off-repository validator public identities,
+the canonical genesis/checkpoint hashes, peer membership, verified host keys,
+and one coordinated activation/rollback plan. The retired scripts under
+[`../deploy/`](../deploy/) and the live-fleet operator scripts documented in
+[`../scripts/README.md`](../scripts/README.md) must not be used.
 
-## Manual Join
+## Supported local testing
 
-```bash
-# Clone and build
-git clone https://github.com/FerrumVir/arc-chain.git
-cd arc-chain && cargo build --release
+The legacy shell launchers `scripts/create-testnet.sh`, `scripts/testnet.sh`,
+and `scripts/run_cluster.sh` are retired. They generated fields rejected by the
+v3 genesis/keyfile contract or launched seed-derived staked identities without
+the explicit test authorization and approved genesis now required. They exit
+before writing a key/config, starting a process, killing a process, or creating
+state.
 
-# Start with testnet seeds
-cargo run --release -p arc-node -- \
-    --seeds-file testnet/seeds.txt \
-    --validator-seed "$(openssl rand -hex 16)"
-```
+Use the Rust multi-node integration tests as the supported local harness. There
+is no approved v3 shell launcher yet.
 
-## Create Your Own Testnet
-
-```bash
-# Generate a 4-validator testnet
-bash scripts/create-testnet.sh 4
-
-# Start seed node
-cargo run --release -p arc-node -- --config testnet/validator-0.toml
-
-# On other machines, start validators pointing to seed node
-cargo run --release -p arc-node -- --config testnet/validator-1.toml --peers SEED_IP:9091
-```
-
-## Monitor
-
-```bash
-bash scripts/monitor-testnet.sh localhost:9944 localhost:9190 localhost:9290 localhost:9390
-```
-
-## Testnet Goals
-
-| Day | Target | How to Verify |
-|-----|--------|--------------|
-| 1 | 4+ nodes connected, producing blocks | `curl localhost:9944/health` shows peers > 0 |
-| 2 | Sustained 10K+ TPS across network | `curl localhost:9944/stats` shows tps > 10000 |
-| 3 | AI agent deployed and running inference | Run sentiment-agent against testnet RPC |
-| 7 | No crashes, no forks, no stalls for 7 days | Monitor dashboard shows continuous operation |
-| 14 | 10+ community nodes joined | `/validators` endpoint shows 10+ validators |
-| 30 | Bridge tested (ETH testnet ↔ ARC testnet) | Bridge relayer processes test locks |
-
-## Testnet Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| Chain ID | 0x415243 ("ARC") |
-| Block time | ~12ms/round (finality ~24ms, 2-round DAG) |
-| Consensus | DAG (Mysticeti-inspired), 2-round finality |
-| Min stake (Observer) | 50,000 ARC |
-| Min stake (Verifier) | 500,000 ARC |
-| Min stake (Proposer) | 5,000,000 ARC |
-| Faucet | Available at node /faucet endpoint |
-| Explorer | http://localhost:3100 (run from /explorer) |
+When diagnosing any purpose-built test cluster, report each process's exact version,
+genesis hash, checkpoint/state root, peer set, and advancing finalized height.
+An HTTP 200 or `{"status":"ok"}` by itself means only that one process can
+answer HTTP; it is not evidence of shared consensus, absence of a fork, finality,
+community inference assignment, or payment.

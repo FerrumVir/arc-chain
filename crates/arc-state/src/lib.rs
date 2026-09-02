@@ -1,35 +1,117 @@
-pub mod mmap_state;
-pub mod simd_parse;
 pub mod block_stm;
 pub mod gpu_state;
 pub mod io_backend;
 pub mod jmt_store;
 pub mod light_client;
+pub mod mmap_state;
+pub mod recovery;
+pub mod simd_parse;
 pub mod wal;
 
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
-use arc_types::{Account, Address, Identity, IdentityLevel, Transaction, TxBody, TxType, TxReceipt, TransferBody, Block, BlockHeader, ProtocolVersion};
-use arc_types::block::{StateDiff, AccountChange};
 use arc_types::economics::StateRentConfig;
 use arc_types::transaction::{
-    GasMeter, gas_costs, CapacityAdvertisementBody, InferenceEscrowOpenBody,
-    ModelRegistrationBody, ModelRequestBody, ShardCoverageClaimBody,
-    MIN_MODEL_REGISTRATION_FEE,
+    CapacityAdvertisementBody, GasMeter, InferenceEscrowOpenBody, MIN_MODEL_REGISTRATION_FEE,
+    ModelRegistrationBody, ModelRequestBody, ShardCoverageClaimBody, gas_costs,
+};
+use arc_types::{
+    Account, Address, Block, BlockHeader, Identity, IdentityLevel, Transaction, TransferBody,
+    TxBody, TxReceipt, TxType,
 };
 
 use crate::jmt_store::JmtStateTree;
-use light_client::{StateProof, HeaderProof, TxInclusionProof, LightSnapshot};
-use serde::{Serialize, Deserialize};
 use dashmap::{DashMap, DashSet};
+use light_client::{HeaderProof, LightSnapshot, StateProof, TxInclusionProof};
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-pub use wal::{WalWriter, WalOp, WalEntry, Snapshot, PersistenceConfig, read_wal, read_wal_dir, find_last_checkpoint, latest_block_height_in_wal_dir};
+pub use wal::{
+    PersistenceConfig, Snapshot, WalEntry, WalError, WalOp, WalWriter, find_last_checkpoint,
+    latest_block_height_in_wal_dir, read_wal, read_wal_dir, read_wal_strict,
+};
+
+/// Protocol-v3 transfers pay at least one base unit into the fixed generic
+/// treasury. This makes every valid user-created history entry economically
+/// bounded while conserving supply.
+pub const V3_MIN_TRANSFER_FEE: u64 = 1;
+/// Hard ingress bound before any signature or body work.
+pub const V3_MAX_TRANSACTION_BYTES: u64 = 64 * 1024;
+/// Conservative launch bound for one canonical state block.
+pub const V3_MAX_TRANSACTIONS_PER_BLOCK: usize = 1_024;
+/// Launch policy: one transaction from an address per canonical state block.
+pub const V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK: usize = 1;
+
+pub const V3_COMMUNITY_REWARD_EPOCH_BLOCKS: u64 = 216_000;
+pub const V3_COMMUNITY_REWARD_MAX_PER_BLOCK: u64 = 1;
+pub const V3_COMMUNITY_REWARD_MAX_PER_EPOCH: u64 = 40;
+pub const V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH: u64 = 8;
+pub const V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH: u64 = 16;
+
+pub fn v3_fee_treasury_address() -> Address {
+    hash_bytes(b"arc-treasury")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CommunityRewardIssuancePolicy {
+    pub reward_amount: u64,
+    pub epoch_blocks: u64,
+    pub max_per_block: u64,
+    pub max_per_epoch: u64,
+    pub max_per_worker_epoch: u64,
+    pub max_per_coordinator_epoch: u64,
+}
+
+pub const fn community_reward_issuance_policy() -> CommunityRewardIssuancePolicy {
+    CommunityRewardIssuancePolicy {
+        reward_amount: arc_types::economics::INFERENCE_ATTESTATION_REWARD,
+        epoch_blocks: V3_COMMUNITY_REWARD_EPOCH_BLOCKS,
+        max_per_block: V3_COMMUNITY_REWARD_MAX_PER_BLOCK,
+        max_per_epoch: V3_COMMUNITY_REWARD_MAX_PER_EPOCH,
+        max_per_worker_epoch: V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH,
+        max_per_coordinator_epoch: V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH,
+    }
+}
+
+pub fn community_reward_issuance_policy_hash() -> Hash256 {
+    let policy = community_reward_issuance_policy();
+    let bytes = bincode::serialize(&policy).expect("issuance policy is serializable");
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-community-reward-issuance-policy-v3");
+    hasher.update(&bytes);
+    Hash256(*hasher.finalize().as_bytes())
+}
+
+pub const fn community_reward_epoch_index(block_height: u64) -> u64 {
+    block_height / V3_COMMUNITY_REWARD_EPOCH_BLOCKS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CommunityRewardBudgetStatus {
+    pub block_height: u64,
+    pub epoch: u64,
+    pub issued_this_block: u64,
+    pub remaining_this_block: u64,
+    pub issued_this_epoch: u64,
+    pub remaining_this_epoch: u64,
+    pub worker_issued_this_epoch: u64,
+    pub worker_remaining_this_epoch: u64,
+    pub coordinator_issued_this_epoch: u64,
+    pub coordinator_remaining_this_epoch: u64,
+    pub policy_hash: Hash256,
+}
+
+#[derive(Debug)]
+struct CommunityRewardBudgetCandidates {
+    block: (Address, Account),
+    epoch: (Address, Account),
+    worker: (Address, Account),
+    coordinator: (Address, Account),
+}
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -56,9 +138,172 @@ pub enum StateError {
     #[error("sync incomplete: {received}/{total} chunks received")]
     SyncIncomplete { received: u32, total: u32 },
     #[error("state root mismatch: expected {expected}, computed {computed}")]
-    StateRootMismatch { expected: Hash256, computed: Hash256 },
+    StateRootMismatch {
+        expected: Hash256,
+        computed: Hash256,
+    },
+    #[error(
+        "unauthenticated legacy peer snapshots cannot mutate persistent state; use a quorum-certified ARCCHKPT import"
+    )]
+    UnauthenticatedPersistentStateSync,
 }
 
+fn uuid_staging_name(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+}
+
+fn internal_wal_target_name(name: &str) -> bool {
+    if name == "state.wal" || uuid_staging_name(name, ".state.wal.genesis-", ".tmp") {
+        return true;
+    }
+    let Some(segment) = name
+        .strip_prefix("wal-")
+        .and_then(|value| value.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    segment.len() == 8 && segment.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn wal_file_staging_name(name: &str, operation: &str) -> bool {
+    let Some(value) = name.strip_prefix('.') else {
+        return false;
+    };
+    let delimiter = format!(".{operation}-");
+    let Some((target, identifier)) = value.rsplit_once(&delimiter) else {
+        return false;
+    };
+    let Some(identifier) = identifier.strip_suffix(".tmp") else {
+        return false;
+    };
+    internal_wal_target_name(target) && uuid::Uuid::parse_str(identifier).is_ok()
+}
+
+fn state_staging_name(name: &str) -> bool {
+    if uuid_staging_name(name, ".state.wal.genesis-", ".tmp")
+        || uuid_staging_name(name, ".state.wal.quarantine-rebarrier-", "")
+        || wal_file_staging_name(name, "create")
+        || wal_file_staging_name(name, "rebarrier")
+    {
+        return true;
+    }
+    let Some(value) = name.strip_prefix(".state.wal.quarantine-tmp-") else {
+        return false;
+    };
+    let Some((pid, serial)) = value.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.parse::<u32>().is_ok()
+        && !serial.is_empty()
+        && serial.bytes().all(|byte| byte.is_ascii_digit())
+        && serial.parse::<u32>().is_ok_and(|serial| serial < 100)
+}
+
+fn cleanup_state_staging_files(wal_dir: &Path) -> Result<(), StateError> {
+    // Restore semantic WAL bytes before inspecting/deleting inert staging.
+    // On Windows a crash can occur while an existing live name is being moved
+    // through its deterministic write-through rebarrier sibling.
+    wal::restore_interrupted_wal_namespace_rebarriers(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to restore interrupted state WAL namespace in {wal_dir:?}: {error}"
+        ))
+    })?;
+    for entry in std::fs::read_dir(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect state staging directory {wal_dir:?}: {error}"
+        ))
+    })? {
+        let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !state_staging_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "state WAL staging artifact is not a regular file: {path:?}"
+            )));
+        }
+        if let Err(error) = std::fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?path, %error, "deferring cleanup of incomplete state WAL staging file");
+            }
+            continue;
+        }
+        if let Err(error) = arc_crypto::secret_file::sync_parent_directory(&path) {
+            // The staging name is never interpreted as live state. If a late
+            // parent-fsync error lets it reappear, this exact cleanup retries.
+            tracing::warn!(path = ?path, %error, "state WAL staging cleanup barrier will be retried");
+        }
+    }
+    Ok(())
+}
+
+/// Restore, create, and durably prove one persistent-state directory leaf
+/// before any caller decides whether its binding/WAL history exists. The
+/// returned parent-sibling guard must stay live through those startup
+/// decisions so a second cooperating constructor cannot create a split root.
+pub(crate) fn prepare_persistent_state_directory(
+    requested: &Path,
+) -> Result<arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock, StateError> {
+    let parent = requested
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) if parent.is_dir() => {}
+        Ok(_) => {
+            return Err(StateError::PersistenceError(format!(
+                "persistent state parent is not a directory: {parent:?}"
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            arc_crypto::secret_file::create_private_directory_tree(parent).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to create persistent state parent {parent:?}: {error}"
+                ))
+            })?;
+        }
+        Err(error) => {
+            return Err(StateError::PersistenceError(format!(
+                "failed to inspect persistent state parent {parent:?}: {error}"
+            )));
+        }
+    }
+    let namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(
+        requested,
+    )
+    .map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to lock persistent state directory namespace {requested:?}: {error}"
+        ))
+    })?;
+    namespace_lock.restore_interrupted().map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to restore persistent state directory namespace {requested:?}: {error}"
+        ))
+    })?;
+    arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target()).map_err(
+        |error| {
+            StateError::PersistenceError(format!(
+                "failed to secure persistent state directory {requested:?}: {error}"
+            ))
+        },
+    )?;
+    namespace_lock.rebarrier_into_prepared().map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to rebarrier persistent state directory namespace {requested:?}: {error}"
+        ))
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Chunked State Snapshot Protocol - types for fast state sync
@@ -139,6 +384,94 @@ pub struct StateSummary {
 /// WASM module magic bytes: `\0asm`.
 const WASM_MAGIC: &[u8; 4] = b"\0asm";
 
+#[inline]
+fn below_policy_minimum(value: u64, minimum: u64) -> bool {
+    value < minimum
+}
+
+/// Historical fixed reserves used by legacy faucet collision checks. Keep
+/// this exact set stable so archived v2 blocks retain their execution rules.
+pub fn is_legacy_reserved_system_account(address: &Address) -> bool {
+    // The first three content-derived accounts are finite protocol reserves:
+    // public faucet, community-reward treasury, and recovery validator-funding
+    // reserve. The legacy bridge/model treasuries are also state-machine-owned.
+    [
+        arc_types::transaction::faucet_pool_address(),
+        arc_types::transaction::inference_reward_treasury_address(),
+        hash_bytes(&[2u8]),
+        hash_bytes(b"ARC-bridge-escrow"),
+        v3_fee_treasury_address(),
+    ]
+    .contains(address)
+}
+
+/// Whether protocol-v3 admission must prevent externally authorized state
+/// writes to this fixed or dynamically namespaced state-machine account.
+pub fn is_reserved_system_account(address: &Address) -> bool {
+    is_legacy_reserved_system_account(address)
+        || *address == hash_bytes(b"arc-treasury")
+        || arc_types::transaction::is_v3_system_account(address)
+}
+
+fn community_reward_budget_address(
+    namespace: arc_types::transaction::V3SystemAccountKind,
+    derivation_key: &'static str,
+    height_or_epoch: u64,
+    identity: Option<&Address>,
+) -> Address {
+    let mut hasher = blake3::Hasher::new_derive_key(derivation_key);
+    hasher.update(&height_or_epoch.to_le_bytes());
+    if let Some(identity) = identity {
+        hasher.update(identity.as_ref());
+    }
+    arc_types::transaction::v3_system_account_address(
+        namespace,
+        &Hash256(*hasher.finalize().as_bytes()),
+    )
+}
+
+fn community_reward_block_budget_address(height: u64) -> Address {
+    community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardBlockBudget,
+        "ARC-community-reward-block-budget-v3",
+        height,
+        None,
+    )
+}
+
+fn community_reward_epoch_budget_address(epoch: u64) -> Address {
+    community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardEpochBudget,
+        "ARC-community-reward-epoch-budget-v3",
+        epoch,
+        None,
+    )
+}
+
+fn community_reward_worker_budget_address(epoch: u64, worker: &Address) -> Address {
+    community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardWorkerBudget,
+        "ARC-community-reward-worker-epoch-budget-v3",
+        epoch,
+        Some(worker),
+    )
+}
+
+fn community_reward_coordinator_budget_address(epoch: u64, coordinator: &Address) -> Address {
+    community_reward_budget_address(
+        arc_types::transaction::V3SystemAccountKind::CommunityRewardCoordinatorBudget,
+        "ARC-community-reward-coordinator-epoch-budget-v3",
+        epoch,
+        Some(coordinator),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V3TransactionFamilyPolicy {
+    Allowed,
+    Denied,
+}
+
 // ── Tier 1 on-chain inference status bytes ────────────────────────────────
 // Stored in the first byte of the request escrow's `code_hash` field. See
 // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md` for the lifecycle.
@@ -146,6 +479,39 @@ pub const TIER1_STATUS_OPEN: u8 = 0;
 pub const TIER1_STATUS_VOTING: u8 = 1;
 pub const TIER1_STATUS_FINALIZED: u8 = 2;
 pub const TIER1_STATUS_REFUNDED: u8 = 3;
+
+// ── Tier 2 optimistic-attestation escrow encoding ─────────────────────────
+// A Tier 2 attestation bond is locked in a deterministic escrow account keyed
+// by BLAKE3("arc-inference" || attestation_tx_hash). Its balance holds the
+// bond; the other Account fields carry INTERNAL metadata (never wire-
+// serialized tx data) that the maturation sweep needs to refund the bond:
+//
+//   balance      = locked funds (attester bond, plus challenger bond if
+//                  the attestation was challenged)
+//   code_hash    = the original attester's address (refund target)
+//   nonce        = release height (deadline = apply_height + challenge_period);
+//                  the sweep refunds once current_height >= this value
+//   storage_root = [ MAGIC (8 bytes) | STATUS (1 byte) | zero... ]
+//
+// The 8-byte MAGIC lets `rebuild_pending_bond_releases()` re-identify these
+// escrows on restart with ~2^-64 false-positive odds (no collision with the
+// Tier 1 escrows, which key their status off `code_hash[0]`). The STATUS byte
+// distinguishes an OPEN (refundable-after-deadline) escrow from a CHALLENGED
+// one, whose bond stays locked pending dispute resolution.
+//
+// NOTE: this is escrow-account *storage*, not `TxBody`/`Transaction` wire
+// layout — changing it does not touch the v0.7.2 112-byte attestation wire
+// format or the `#[serde(skip)] beneficiary` field.
+const ATTEST_ESCROW_MAGIC: [u8; 8] = *b"ARCATB2\x01";
+pub const ATTEST_STATUS_OPEN: u8 = 0;
+pub const ATTEST_STATUS_CHALLENGED: u8 = 1;
+
+/// Max Tier 2 bonds refunded per block by the maturation sweep. Bounds the
+/// per-block work so a backlog of matured escrows can never stall block
+/// production; any excess is carried to the next block (still in deterministic
+/// order). Community workers attest with `bond == 0` (no escrow is created),
+/// so on the demo path this sweep is a no-op.
+pub const MAX_BOND_RELEASES_PER_BLOCK: usize = 256;
 
 /// Read-only snapshot of a Tier 1 inference request — returned by
 /// `StateDB::tier1_request_snapshot()` so the validator inference task can
@@ -183,6 +549,7 @@ fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
 /// A batch of benchmark transactions to be indexed asynchronously.
 /// Contains metadata for the indexer to lazily reconstruct Transaction objects,
 /// avoiding 2GB+ heap allocation in the hot execution path.
+#[cfg(feature = "benchmark-tools")]
 pub struct IndexerBatch {
     pub block_hash: Hash256,
     pub height: u64,
@@ -222,14 +589,19 @@ pub struct StateDB {
     /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
     /// Async indexer channel - sends batches to background threads.
+    #[cfg(feature = "benchmark-tools")]
     indexer_tx: Option<crossbeam::channel::Sender<IndexerBatch>>,
     /// Benchmark block nonce bases: height → nonce_base for deterministic tx reconstruction.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_nonces: DashMap<u64, u64>,
     /// Cached sender array for benchmark tx reconstruction.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_senders: parking_lot::RwLock<Option<Arc<Vec<Hash256>>>>,
     /// Cached receiver array for benchmark tx reconstruction.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_receivers: parking_lot::RwLock<Option<Arc<Vec<Hash256>>>>,
     /// Transactions per sender in benchmark blocks.
+    #[cfg(feature = "benchmark-tools")]
     benchmark_txs_per_sender: AtomicU64,
     /// Signed benchmark block data: height → (transactions, success_flags, block_hash).
     /// Stored for blocks produced by execute_block_signed_benchmark()
@@ -260,14 +632,72 @@ pub struct StateDB {
     /// Archive mode - when true, skips all pruning (keeps full history).
     /// Used by block explorers and analytics nodes.
     pub archive_mode: bool,
+    /// Earliest block at or after the initial protocol-v3 recovery boundary
+    /// whose complete transaction/receipt history was verified. `u64::MAX`
+    /// means the claim has not been established.
+    archive_history_boundary: AtomicU64,
+    /// Highest block whose full block → tx index → body → receipt bindings
+    /// were verified while archive mode was already enabled.
+    archive_history_verified_through: AtomicU64,
+    /// Canonical genesis-committed activation height for community reward v1.
+    /// `u64::MAX` means disabled. This runtime copy is not mutable through RPC;
+    /// nodes derive it from the genesis configuration whose semantic hash is
+    /// authenticated during the P2P handshake.
+    community_rewards_v1_activation_height: AtomicU64,
     /// Index of open Tier 1 inference requests (request_id → anchor_height).
     /// Populated by `apply_inference_request`, cleared by
     /// `apply_inference_finalize`. The `inference_validator` background task
     /// polls this to discover requests where its address is in the committee.
     pub tier1_pending: DashMap<[u8; 32], u64>,
+    /// Maturation queue for Tier 2 attestation bond escrows:
+    /// `release_height → sorted list of escrow addresses`. Populated when an
+    /// attestation with `bond > 0` is applied; drained deterministically by
+    /// `sweep_matured_bond_releases()` inside `commit_executed_block`. A
+    /// derived, in-memory index with no WAL op of its own — rebuilt on restart
+    /// from the surviving escrow accounts by `rebuild_pending_bond_releases()`.
+    pending_bond_releases: parking_lot::Mutex<BTreeMap<u64, Vec<[u8; 32]>>>,
+    /// Present only after a quorum-certified ARCCHKPT H+1 transition.
+    /// `None` preserves legacy state-root and protocol behavior byte-for-byte.
+    recovery_context: RwLock<Option<recovery::RecoveryContext>>,
+    /// Exact operator-approved manifest that established `recovery_context`.
+    recovery_manifest_hash: RwLock<Option<Hash256>>,
 }
 
 impl StateDB {
+    fn wal_state_error(error: WalError) -> StateError {
+        StateError::PersistenceError(error.to_string())
+    }
+
+    /// Persistence failures are fatal for subsequent block application. A
+    /// caller must never mutate another block after the WAL lost durability.
+    fn require_healthy_wal(&self) -> Result<(), StateError> {
+        self.wal.check_health().map_err(Self::wal_state_error)
+    }
+
+    /// Complete the durable block boundary before returning a block to the
+    /// consensus caller. This includes every queued append, flush, and fsync.
+    fn durable_wal_barrier(&self) -> Result<(), StateError> {
+        self.wal.sync().map_err(Self::wal_state_error)
+    }
+
+    /// Whether this database acknowledges mutations through a durable WAL.
+    pub fn is_persistent(&self) -> bool {
+        self.wal.directory().is_some()
+    }
+
+    fn validate_next_protocol_block_admission(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), StateError> {
+        if self.active_protocol_version().major == 3 {
+            let height = self.height().checked_add(1).ok_or_else(|| {
+                StateError::ExecutionError("prospective v3 block height overflow".to_string())
+            })?;
+            self.validate_v3_block_admission_at(transactions, height)?;
+        }
+        Ok(())
+    }
+
     /// Create a new empty state (no persistence - benchmark mode).
     pub fn new() -> Self {
         Self {
@@ -284,10 +714,15 @@ impl StateDB {
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
+            #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
+            #[cfg(feature = "benchmark-tools")]
             benchmark_nonces: DashMap::new(),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_senders: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_receivers: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_txs_per_sender: AtomicU64::new(0),
             signed_block_data: DashMap::new(),
             incremental_merkle: parking_lot::Mutex::new(IncrementalMerkle::new()),
@@ -299,14 +734,20 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            archive_history_boundary: AtomicU64::new(u64::MAX),
+            archive_history_verified_through: AtomicU64::new(u64::MAX),
+            community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
+            pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
+            recovery_context: RwLock::new(None),
+            recovery_manifest_hash: RwLock::new(None),
         }
     }
 
     /// Create a new state with WAL persistence.
     pub fn with_persistence(wal_path: impl AsRef<Path>) -> Result<Self, StateError> {
-        let wal = WalWriter::new(wal_path)
-            .map_err(|e| StateError::PersistenceError(e.to_string()))?;
+        let wal =
+            WalWriter::new(wal_path).map_err(|e| StateError::PersistenceError(e.to_string()))?;
         Ok(Self {
             accounts: DashMap::new(),
             storage: DashMap::new(),
@@ -321,10 +762,15 @@ impl StateDB {
             full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
             benchmark_tx_count: AtomicU64::new(0),
+            #[cfg(feature = "benchmark-tools")]
             indexer_tx: None,
+            #[cfg(feature = "benchmark-tools")]
             benchmark_nonces: DashMap::new(),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_senders: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_receivers: parking_lot::RwLock::new(None),
+            #[cfg(feature = "benchmark-tools")]
             benchmark_txs_per_sender: AtomicU64::new(0),
             signed_block_data: DashMap::new(),
             incremental_merkle: parking_lot::Mutex::new(IncrementalMerkle::new()),
@@ -336,7 +782,13 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            archive_history_boundary: AtomicU64::new(u64::MAX),
+            archive_history_verified_through: AtomicU64::new(u64::MAX),
+            community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
+            pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
+            recovery_context: RwLock::new(None),
+            recovery_manifest_hash: RwLock::new(None),
         })
     }
 
@@ -356,7 +808,10 @@ impl StateDB {
     ///
     /// Hot accounts are stored in GPU unified/managed memory for ~40x bandwidth
     /// improvement. Falls back to CPU-only if no GPU is detected.
-    pub fn with_genesis_gpu(prefunded: &[(Address, u64)], gpu_config: gpu_state::GpuStateCacheConfig) -> Self {
+    pub fn with_genesis_gpu(
+        prefunded: &[(Address, u64)],
+        gpu_config: gpu_state::GpuStateCacheConfig,
+    ) -> Self {
         let cache = Arc::new(gpu_state::GpuStateCache::new(gpu_config));
         let mut state = Self::with_genesis(prefunded);
         // Pre-load genesis accounts into GPU cache.
@@ -382,7 +837,10 @@ impl StateDB {
             }
         }
         self.gpu_cache = Some(cache);
-        tracing::info!(loaded = loaded, "GPU state cache enabled, pre-loaded accounts");
+        tracing::info!(
+            loaded = loaded,
+            "GPU state cache enabled, pre-loaded accounts"
+        );
     }
 
     /// Get the GPU state cache (if enabled) for direct access.
@@ -390,22 +848,42 @@ impl StateDB {
         self.gpu_cache.as_ref()
     }
 
-    /// Create state with WAL persistence + genesis accounts.
-    /// On startup: if WAL exists, replay it to recover state. Otherwise start fresh with genesis.
-    pub fn with_genesis_persistent(prefunded: &[(Address, u64)], wal_dir: impl AsRef<Path>) -> Result<Self, StateError> {
-        let wal_dir = wal_dir.as_ref();
+    /// Create state with WAL persistence + genesis accounts, bound to one
+    /// authenticated genesis/network hash.
+    ///
+    /// A pre-existing WAL without the binding file is deliberately rejected:
+    /// replaying legacy state under a new genesis can make peers authenticate
+    /// as one network while executing different histories. Operators must use
+    /// a fresh data directory or an explicitly approved checkpoint migration.
+    pub fn with_genesis_persistent(
+        prefunded: &[(Address, u64)],
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+    ) -> Result<Self, StateError> {
+        let namespace_lock = prepare_persistent_state_directory(wal_dir.as_ref())?;
+        let result = Self::with_genesis_persistent_in_prepared_dir(
+            prefunded,
+            namespace_lock.target(),
+            expected_genesis_hash,
+        );
+        drop(namespace_lock);
+        result
+    }
 
-        // Ensure the data directory exists
-        std::fs::create_dir_all(wal_dir)
-            .map_err(|e| StateError::PersistenceError(format!("failed to create data dir {:?}: {}", wal_dir, e)))?;
+    fn with_genesis_persistent_in_prepared_dir(
+        prefunded: &[(Address, u64)],
+        wal_dir: &Path,
+        expected_genesis_hash: Hash256,
+    ) -> Result<Self, StateError> {
+        cleanup_state_staging_files(wal_dir)?;
 
         let wal_path = wal_dir.join("state.wal");
+        Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), expected_genesis_hash)?;
 
         if wal_path.exists() {
             // WAL exists - replay to recover state
+            let entries = Self::prepare_normal_wal_replay(&wal_path, prefunded)?;
             let state = Self::with_persistence(&wal_path)?;
-
-            let entries = wal::read_wal(&wal_path);
             let entry_count = entries.len();
             for entry in &entries {
                 state.apply_wal_op(&entry.op);
@@ -425,8 +903,12 @@ impl StateDB {
 
             Ok(state)
         } else {
-            // No WAL - fresh start with genesis accounts and persistence enabled
-            let state = Self::with_persistence(&wal_path)?;
+            // Build the complete genesis WAL at an inert staging name. The
+            // live state.wal name is published only after every configured
+            // account and the genesis block passed one fsync barrier.
+            let staging_path =
+                wal_dir.join(format!(".state.wal.genesis-{}.tmp", uuid::Uuid::new_v4()));
+            let mut state = Self::with_persistence(&staging_path)?;
 
             for (addr, balance) in prefunded {
                 let account = Account::new(*addr, *balance);
@@ -439,7 +921,32 @@ impl StateDB {
             let genesis = Block::genesis();
             state.blocks.insert(0, genesis.clone());
             state.wal.append(WalOp::SetBlock(0, genesis), 0);
-            state.wal.sync();
+            state
+                .wal
+                .append(WalOp::Checkpoint(state.get_state_root()), 0);
+            if let Err(error) = state.durable_wal_barrier() {
+                drop(state);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(error);
+            }
+            if let Err(error) = state.wal.shutdown() {
+                drop(state);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(Self::wal_state_error(error));
+            }
+            if let Err(error) = arc_crypto::secret_file::durably_publish_existing_private_no_replace(
+                &staging_path,
+                &wal_path,
+            ) {
+                drop(state);
+                let _ = std::fs::remove_file(&staging_path);
+                return Err(StateError::PersistenceError(format!(
+                    "failed to publish complete genesis WAL {:?}: {error}",
+                    wal_path
+                )));
+            }
+            state.wal = WalWriter::new(&wal_path)
+                .map_err(|error| StateError::PersistenceError(error.to_string()))?;
 
             tracing::info!(
                 "Fresh state initialized with {} genesis accounts, WAL at {:?}",
@@ -449,6 +956,281 @@ impl StateDB {
 
             Ok(state)
         }
+    }
+
+    fn verify_or_create_genesis_binding(
+        wal_dir: &Path,
+        wal_exists: bool,
+        expected: Hash256,
+    ) -> Result<(), StateError> {
+        let binding_path = wal_dir.join("genesis.network-hash");
+        let verify_existing = |value: &str| -> Result<(), StateError> {
+            let actual = Hash256::from_hex(value.trim()).map_err(|_| {
+                StateError::PersistenceError(format!(
+                    "invalid genesis binding in {:?}; refusing WAL replay",
+                    binding_path
+                ))
+            })?;
+            if actual != expected {
+                return Err(StateError::PersistenceError(format!(
+                    "data directory genesis mismatch: {:?} is bound to {}, configured genesis is {}; use a fresh data directory or an approved checkpoint migration",
+                    wal_dir,
+                    actual.to_hex(),
+                    expected.to_hex()
+                )));
+            }
+            Ok(())
+        };
+        match std::fs::read_to_string(&binding_path) {
+            Ok(value) => {
+                verify_existing(&value)?;
+                let contents = format!("{}\n", expected.to_hex());
+                arc_crypto::secret_file::durably_replace_private(&binding_path, contents.as_bytes())
+                    .map_err(|e| {
+                        StateError::PersistenceError(format!(
+                            "failed to rebarrier genesis binding {:?}: {}",
+                            binding_path, e
+                        ))
+                    })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && wal_exists => {
+                Err(StateError::PersistenceError(format!(
+                    "legacy data directory {:?} contains a WAL but no authenticated genesis binding; refusing replay under the configured network. Back it up, then use a fresh data directory or an approved checkpoint migration",
+                    wal_dir
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let contents = format!("{}\n", expected.to_hex());
+                match arc_crypto::secret_file::durably_publish_new_private(
+                    &binding_path,
+                    contents.as_bytes(),
+                ) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let value = std::fs::read_to_string(&binding_path).map_err(|e| {
+                            StateError::PersistenceError(format!(
+                                "failed to verify concurrently-created genesis binding {:?}: {}",
+                                binding_path, e
+                            ))
+                        })?;
+                        verify_existing(&value)?;
+                        arc_crypto::secret_file::durably_replace_private(
+                            &binding_path,
+                            contents.as_bytes(),
+                        )
+                        .map_err(|e| {
+                            StateError::PersistenceError(format!(
+                                "failed to rebarrier concurrently-created genesis binding {:?}: {}",
+                                binding_path, e
+                            ))
+                        })
+                    }
+                    Err(e) => Err(StateError::PersistenceError(format!(
+                        "failed to durably create genesis binding {:?}: {}",
+                        binding_path, e
+                    ))),
+                }
+            }
+            Err(error) => Err(StateError::PersistenceError(format!(
+                "failed to read genesis binding {:?}: {}",
+                binding_path, error
+            ))),
+        }
+    }
+
+    fn verify_complete_genesis_wal_prefix(
+        entries: &[WalEntry],
+        prefunded: &[(Address, u64)],
+    ) -> Result<(), StateError> {
+        let required = prefunded.len().checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("genesis WAL prefix length overflow".into())
+        })?;
+        if entries.len() < required {
+            return Err(StateError::PersistenceError(format!(
+                "state WAL has an incomplete genesis prefix: found {} entries, require {required}",
+                entries.len()
+            )));
+        }
+        let mut expected_accounts = prefunded
+            .iter()
+            .map(|(address, balance)| {
+                bincode::serialize(&(*address, Account::new(*address, *balance)))
+                    .map_err(|error| StateError::PersistenceError(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut actual_accounts = Vec::with_capacity(prefunded.len());
+        for (index, entry) in entries.iter().take(prefunded.len()).enumerate() {
+            let WalOp::SetAccount(actual_address, actual_account) = &entry.op else {
+                return Err(StateError::PersistenceError(format!(
+                    "state WAL genesis entry {index} is not the expected account"
+                )));
+            };
+            if entry.block_height != 0 {
+                return Err(StateError::PersistenceError(format!(
+                    "state WAL genesis account entry {index} differs from configured genesis"
+                )));
+            }
+            actual_accounts.push(
+                bincode::serialize(&(*actual_address, actual_account.clone()))
+                    .map_err(|error| StateError::PersistenceError(error.to_string()))?,
+            );
+        }
+        expected_accounts.sort();
+        actual_accounts.sort();
+        if actual_accounts != expected_accounts {
+            return Err(StateError::PersistenceError(
+                "state WAL genesis account set differs from configured genesis".into(),
+            ));
+        }
+        let genesis_entry = &entries[prefunded.len()];
+        let WalOp::SetBlock(height, block) = &genesis_entry.op else {
+            return Err(StateError::PersistenceError(
+                "state WAL genesis prefix omits the genesis block".into(),
+            ));
+        };
+        let actual = bincode::serialize(block)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let expected = bincode::serialize(&Block::genesis())
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if genesis_entry.block_height != 0 || *height != 0 || actual != expected {
+            return Err(StateError::PersistenceError(
+                "state WAL genesis block differs from configured genesis".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_normal_wal_replay(
+        wal_path: &Path,
+        prefunded: &[(Address, u64)],
+    ) -> Result<Vec<WalEntry>, StateError> {
+        let mut read = wal::read_repairable_wal_prefix(wal_path).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "state WAL contains non-repairable corruption; refusing replay: {error}"
+            ))
+        })?;
+        Self::verify_complete_genesis_wal_prefix(&read.entries, prefunded)?;
+        let genesis_boundary = prefunded
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| StateError::PersistenceError("genesis WAL boundary overflow".into()))?;
+        let mut accepted_entries = genesis_boundary;
+        let mut last_checkpoint_height = 0u64;
+        let mut previous_block_hash = Block::genesis().hash;
+        let mut pending_block: Option<(u64, Block)> = None;
+        let validation = Self::new();
+        for entry in read.entries.iter().take(genesis_boundary) {
+            validation.apply_wal_op(&entry.op);
+        }
+        for (index, entry) in read.entries.iter().enumerate().skip(genesis_boundary) {
+            match &entry.op {
+                WalOp::SetBlock(height, block) => {
+                    if pending_block.is_some() {
+                        return Err(StateError::PersistenceError(
+                            "state WAL contains two block records without an intervening checkpoint"
+                                .into(),
+                        ));
+                    }
+                    pending_block = Some((*height, block.clone()));
+                    validation.apply_wal_op(&entry.op);
+                }
+                WalOp::Checkpoint(root) => {
+                    let checkpoint_height = if let Some((height, block)) = pending_block.take() {
+                        let expected_height =
+                            last_checkpoint_height.checked_add(1).ok_or_else(|| {
+                                StateError::PersistenceError("state WAL height overflow".into())
+                            })?;
+                        if height != expected_height
+                            || entry.block_height != height
+                            || block.header.height != height
+                            || Block::compute_hash(&block.header) != block.hash
+                            || block.header.parent_hash != previous_block_hash
+                            || block.header.state_root != *root
+                        {
+                            return Err(StateError::PersistenceError(format!(
+                                "state WAL checkpoint at height {} is not the next canonical block boundary",
+                                entry.block_height
+                            )));
+                        }
+                        previous_block_hash = block.hash;
+                        last_checkpoint_height = height;
+                        height
+                    } else {
+                        // Some public persistence APIs durably commit auxiliary
+                        // rows or an authenticated state diff without adding a
+                        // second block. Their checkpoint must remain at the
+                        // current canonical height and commit the exact same
+                        // state-root domain; it can never advance or rewrite
+                        // block history.
+                        if entry.block_height != last_checkpoint_height {
+                            return Err(StateError::PersistenceError(format!(
+                                "state WAL standalone checkpoint height {} differs from current canonical height {}",
+                                entry.block_height, last_checkpoint_height
+                            )));
+                        }
+                        last_checkpoint_height
+                    };
+                    if validation.height() != checkpoint_height {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL checkpoint height {checkpoint_height} differs from replayed height {}",
+                            validation.height()
+                        )));
+                    }
+                    let actual_root = validation.get_state_root();
+                    if actual_root != *root {
+                        return Err(StateError::PersistenceError(format!(
+                            "state WAL checkpoint root mismatch: expected {root}, replayed {actual_root}"
+                        )));
+                    }
+                    accepted_entries = index + 1;
+                }
+                _ => validation.apply_wal_op(&entry.op),
+            }
+        }
+        let accepted_bytes = *read
+            .frame_end_offsets
+            .get(accepted_entries.saturating_sub(1))
+            .ok_or_else(|| {
+                StateError::PersistenceError("genesis WAL byte boundary is missing".into())
+            })?;
+
+        let original_bytes = read.original_bytes;
+        let original_hash = read.original_hash;
+        let tail_reason = read
+            .torn_tail
+            .map(|tail| tail.stable_reason())
+            .unwrap_or("complete_uncheckpointed_suffix");
+        read.entries.truncate(accepted_entries);
+        if accepted_bytes < original_bytes {
+            let quarantine = wal::quarantine_and_truncate_wal_tail(
+                wal_path,
+                accepted_bytes,
+                original_bytes,
+                original_hash,
+            )
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to quarantine uncommitted state WAL tail: {error}"
+                ))
+            })?;
+            tracing::warn!(
+                accepted_bytes,
+                original_bytes,
+                reason = tail_reason,
+                quarantine = ?quarantine,
+                "quarantined state WAL bytes after the last durable checkpoint"
+            );
+        } else {
+            wal::verify_wal_file_identity(wal_path, original_bytes, original_hash).map_err(
+                |error| {
+                    StateError::PersistenceError(format!(
+                        "state WAL changed after validation; refusing replay: {error}"
+                    ))
+                },
+            )?;
+        }
+
+        Ok(read.entries)
     }
 
     /// Recover state from a snapshot and WAL replay.
@@ -491,6 +1273,7 @@ impl StateDB {
         match op {
             WalOp::SetAccount(addr, account) => {
                 self.accounts.insert(addr.0, account.clone());
+                self.dirty_accounts.insert(addr.0);
             }
             WalOp::SetStorage(addr, key, val) => {
                 self.storage
@@ -504,7 +1287,26 @@ impl StateDB {
                 }
             }
             WalOp::SetBlock(height, block) => {
-                self.blocks.insert(*height, block.clone());
+                // `tx_index` is derived from canonical block bodies and has no
+                // independent WAL record. Rebuild it while replaying each
+                // durable block so archive completeness can be recomputed
+                // after restart rather than depending on pre-crash memory.
+                if let Some(replaced) = self.blocks.insert(*height, block.clone()) {
+                    for old_hash in replaced.tx_hashes {
+                        let points_to_replaced_height = self
+                            .tx_index
+                            .get(&old_hash.0)
+                            .is_some_and(|location| location.value().0 == *height);
+                        if points_to_replaced_height {
+                            self.tx_index.remove(&old_hash.0);
+                        }
+                    }
+                }
+                for (index, tx_hash) in block.tx_hashes.iter().enumerate() {
+                    if let Ok(index) = u32::try_from(index) {
+                        self.tx_index.insert(tx_hash.0, (*height, index));
+                    }
+                }
                 let mut h = self.height.write();
                 if *height > *h {
                     *h = *height;
@@ -518,6 +1320,28 @@ impl StateDB {
             }
             WalOp::SetContract(addr, bytecode) => {
                 self.contracts.insert(addr.0, bytecode.clone());
+            }
+            WalOp::SetFullTransaction(hash, transaction) => {
+                self.full_transactions
+                    .insert(hash.0, transaction.as_ref().clone());
+            }
+            WalOp::SetEventLogs(height, logs) => {
+                self.event_logs.insert(*height, logs.clone());
+            }
+            WalOp::SetIdentity(address, identity) => {
+                self.identities.insert(address.0, identity.clone());
+            }
+            WalOp::SetValidatorState(validators, staking_pool) => {
+                self.validators.clear();
+                for (address, stake) in validators {
+                    self.validators.insert(address.0, *stake);
+                }
+                self.staking_pool.store(*staking_pool, Ordering::Release);
+            }
+            WalOp::SetRecoveryContext(context, activation_height) => {
+                *self.recovery_context.write() = Some(context.clone());
+                self.community_rewards_v1_activation_height
+                    .store(activation_height.unwrap_or(u64::MAX), Ordering::Release);
             }
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational - no state change
@@ -542,7 +1366,7 @@ impl StateDB {
                 .map(|e| (Hash256(*e.key()), e.value().clone()))
                 .collect();
 
-            let storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)> = self
+            let storage: wal::ContractStorage = self
                 .storage
                 .iter()
                 .map(|e| {
@@ -565,7 +1389,8 @@ impl StateDB {
             if height_before != height_after {
                 tracing::warn!(
                     "Snapshot height changed ({} → {}), retrying for consistency",
-                    height_before, height_after
+                    height_before,
+                    height_after
                 );
                 continue; // Retry - a block was applied during iteration
             }
@@ -584,7 +1409,8 @@ impl StateDB {
     /// Deploy a contract (store bytecode in the contracts cache).
     pub fn deploy_contract(&self, address: &Address, bytecode: Vec<u8>) {
         self.contracts.insert(address.0, bytecode.clone());
-        self.wal.append(WalOp::SetContract(*address, bytecode), self.height());
+        self.wal
+            .append(WalOp::SetContract(*address, bytecode), self.height());
     }
 
     /// Get contract bytecode.
@@ -599,11 +1425,11 @@ impl StateDB {
             return Some(tx);
         }
         // Check signed benchmark block data
-        if let Some(&(height, idx)) = self.tx_index.get(tx_hash).as_deref() {
-            if let Some(block_data) = self.signed_block_data.get(&height) {
-                let (txs_vec, _, _) = &*block_data;
-                return txs_vec.get(idx as usize).cloned();
-            }
+        if let Some(&(height, idx)) = self.tx_index.get(tx_hash).as_deref()
+            && let Some(block_data) = self.signed_block_data.get(&height)
+        {
+            let (txs_vec, _, _) = &*block_data;
+            return txs_vec.get(idx as usize).cloned();
         }
         None
     }
@@ -667,9 +1493,7 @@ impl StateDB {
     /// such escrow exists. Used by the validator task to check status,
     /// gather votes, and decide whether to vote/finalize.
     pub fn tier1_request_snapshot(&self, request_id: &[u8; 32]) -> Option<Tier1RequestSnapshot> {
-        let escrow_addr = arc_crypto::hash_bytes(
-            &[b"arc-infreq", request_id.as_ref()].concat(),
-        );
+        let escrow_addr = arc_crypto::hash_bytes(&[b"arc-infreq", request_id.as_ref()].concat());
         let escrow = self.get_account(&escrow_addr)?;
         if escrow.balance == 0 && escrow.code_hash == Hash256::ZERO {
             return None;
@@ -685,8 +1509,7 @@ impl StateDB {
         let votes_bytes = self
             .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.votes"))
             .unwrap_or_default();
-        let votes: Vec<(Address, Hash256)> =
-            bincode::deserialize(&votes_bytes).unwrap_or_default();
+        let votes: Vec<(Address, Hash256)> = bincode::deserialize(&votes_bytes).unwrap_or_default();
         let requester_bytes = self
             .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.requester"))
             .unwrap_or_default();
@@ -733,7 +1556,7 @@ impl StateDB {
             .iter()
             .map(|kv| Hash256(*kv.key()))
             .collect();
-        eligible.sort_by(|a, b| a.0.cmp(&b.0));
+        eligible.sort_by_key(|a| a.0);
         let mut scored: Vec<(Address, Hash256)> = eligible
             .into_iter()
             .map(|a| {
@@ -743,7 +1566,7 @@ impl StateDB {
                 (a, arc_crypto::hash_bytes(&input))
             })
             .collect();
-        scored.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
+        scored.sort_by_key(|a| a.1.0);
         scored
             .into_iter()
             .take(committee_size as usize)
@@ -757,10 +1580,8 @@ impl StateDB {
             .entry(contract.0)
             .or_default()
             .insert(key, value.clone());
-        self.wal.append(
-            WalOp::SetStorage(*contract, key, value),
-            self.height(),
-        );
+        self.wal
+            .append(WalOp::SetStorage(*contract, key, value), self.height());
     }
 
     /// Get a storage value for a contract.
@@ -783,10 +1604,8 @@ impl StateDB {
         if let Some(map) = self.storage.get(&contract.0) {
             map.remove(key);
         }
-        self.wal.append(
-            WalOp::DeleteStorage(*contract, *key),
-            self.height(),
-        );
+        self.wal
+            .append(WalOp::DeleteStorage(*contract, *key), self.height());
     }
 
     /// Get an account (returns None if not found).
@@ -795,10 +1614,10 @@ impl StateDB {
     /// bandwidth improvement on hot accounts.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
         // Fast path: check GPU cache first.
-        if let Some(ref cache) = self.gpu_cache {
-            if let Some(acct) = cache.get_account_fast(&addr.0) {
-                return Some(acct);
-            }
+        if let Some(ref cache) = self.gpu_cache
+            && let Some(acct) = cache.get_account_fast(&addr.0)
+        {
+            return Some(acct);
         }
         self.accounts.get(&addr.0).map(|a| a.clone())
     }
@@ -836,7 +1655,30 @@ impl StateDB {
     /// Store event logs for a specific block height.
     pub fn store_event_logs(&self, height: u64, logs: Vec<arc_types::EventLog>) {
         if !logs.is_empty() {
-            self.event_logs.entry(height).or_default().extend(logs);
+            if self.is_persistent() && self.recovery_context().is_some() {
+                // Recovery replay currently accepts only signed transition
+                // state followed by canonical SetBlock+Checkpoint boundaries.
+                // Do not emit a standalone durable record that this stricter
+                // planner would reject on the next restart.
+                tracing::error!(
+                    height,
+                    "standalone event-log persistence is unavailable on recovery-bound state; include logs in the canonical block commit"
+                );
+                return;
+            }
+            let combined = {
+                let mut entry = self.event_logs.entry(height).or_default();
+                entry.extend(logs);
+                entry.clone()
+            };
+            let checkpoint_height = self.height();
+            self.wal
+                .append(WalOp::SetEventLogs(height, combined), checkpoint_height);
+            self.wal
+                .append(WalOp::Checkpoint(self.get_state_root()), checkpoint_height);
+            if let Err(error) = self.durable_wal_barrier() {
+                tracing::error!(height, error = %error, "event logs were not durably persisted");
+            }
         }
     }
 
@@ -850,6 +1692,32 @@ impl StateDB {
         self.staking_pool.load(Ordering::Relaxed)
     }
 
+    fn add_staking_pool_checked(&self, amount: u64) -> Result<(), StateError> {
+        self.staking_pool
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(amount)
+            })
+            .map(|_| ())
+            .map_err(|current| {
+                StateError::ExecutionError(format!(
+                    "staking pool overflow: current={current}, add={amount}"
+                ))
+            })
+    }
+
+    fn subtract_staking_pool_checked(&self, amount: u64) -> Result<(), StateError> {
+        self.staking_pool
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(amount)
+            })
+            .map(|_| ())
+            .map_err(|current| {
+                StateError::ExecutionError(format!(
+                    "staking pool underflow: current={current}, subtract={amount}"
+                ))
+            })
+    }
+
     /// Get the staked amount for a specific validator address.
     pub fn get_validator_stake(&self, addr: &Address) -> Option<u64> {
         self.validators.get(&addr.0).map(|v| *v)
@@ -861,6 +1729,29 @@ impl StateDB {
             .get(&addr.0)
             .map(|v| *v >= Self::MIN_VALIDATOR_STAKE)
             .unwrap_or(false)
+    }
+
+    /// Install the consensus activation schedule parsed from canonical
+    /// genesis. Call once during boot before state sync or consensus starts.
+    pub fn set_community_rewards_v1_activation_height(&self, height: Option<u64>) {
+        self.community_rewards_v1_activation_height
+            .store(height.unwrap_or(u64::MAX), Ordering::Release);
+    }
+
+    pub fn community_rewards_v1_activation_height(&self) -> Option<u64> {
+        match self
+            .community_rewards_v1_activation_height
+            .load(Ordering::Acquire)
+        {
+            u64::MAX => None,
+            height => Some(height),
+        }
+    }
+
+    /// Whether tx 0x25 is a valid state transition at the current height.
+    pub fn community_rewards_v1_active(&self) -> bool {
+        self.community_rewards_v1_activation_height()
+            .is_some_and(|activation| self.height() >= activation)
     }
 
     /// Reset the validator set to exactly the genesis validators at startup.
@@ -898,6 +1789,898 @@ impl StateDB {
             .collect()
     }
 
+    /// Verify reward-v1's independent off-chain authorization quorum.
+    ///
+    /// Policy is deliberately stronger than either identity count or stake
+    /// alone: approvals must contain strictly more than two thirds of active
+    /// validator identities (`floor(2N/3) + 1`) AND strictly more than two
+    /// thirds of active stake (`floor(2S/3) + 1`). Every signer is unique, active at execution
+    /// time, and uses the fixed Ed25519-only approval representation. The
+    /// outer transaction signer is merely an aggregator and is not counted
+    /// unless it also supplied an explicit approval.
+    fn verify_community_reward_validator_approvals(
+        &self,
+        body: &arc_types::transaction::CommunityInferenceRewardBody,
+    ) -> Result<(), StateError> {
+        use arc_types::transaction::MAX_COMMUNITY_REWARD_APPROVALS;
+
+        if body.validator_approvals.len() > MAX_COMMUNITY_REWARD_APPROVALS {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: {} validator approvals exceeds protocol maximum {}",
+                body.validator_approvals.len(),
+                MAX_COMMUNITY_REWARD_APPROVALS
+            )));
+        }
+
+        let active = self.active_validators();
+        if active.is_empty() {
+            return Err(StateError::ExecutionError(
+                "community inference reward: active validator set is empty".to_string(),
+            ));
+        }
+        if active.len() > MAX_COMMUNITY_REWARD_APPROVALS {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: active validator set size {} exceeds reward-v1 maximum {}",
+                active.len(),
+                MAX_COMMUNITY_REWARD_APPROVALS
+            )));
+        }
+        // Protocol-v3 production recovery fixes this authorization committee
+        // at five of six. Legacy/dev states retain the generic strict-BFT
+        // verifier below solely for backward-compatible local fixtures; a
+        // production coordinator cannot advertise issuance-ready without a
+        // recovery context.
+        if self.recovery_context().is_some()
+            && active.len() != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: protocol-v3 committee has {} active validators; exactly {} required",
+                active.len(),
+                arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+            )));
+        }
+
+        let active_identity_count = u64::try_from(active.len()).map_err(|_| {
+            StateError::ExecutionError(
+                "community inference reward: active validator count exceeds u64::MAX".to_string(),
+            )
+        })?;
+        let required_identities = usize::try_from(arc_types::strict_supermajority_threshold(
+            active_identity_count,
+        ))
+        .map_err(|_| {
+            StateError::ExecutionError(
+                "community inference reward: identity threshold exceeds usize::MAX".to_string(),
+            )
+        })?;
+        let required_identities = if self.recovery_context().is_some() {
+            arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED
+        } else {
+            required_identities
+        };
+        if body.validator_approvals.len() < required_identities {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: insufficient validator approval identities: have {}, need {} of {} active validators",
+                body.validator_approvals.len(),
+                required_identities,
+                active.len()
+            )));
+        }
+
+        let active_stakes: HashMap<[u8; 32], u64> = active
+            .iter()
+            .map(|(address, stake)| (address.0, *stake))
+            .collect();
+        let total_active_stake: u128 = active.iter().map(|(_, stake)| u128::from(*stake)).sum();
+        let required_stake = total_active_stake * 2 / 3 + 1;
+        let commitment = body.validator_approval_commitment();
+        let mut seen = HashSet::with_capacity(body.validator_approvals.len());
+        let mut approved_stake = 0u128;
+
+        for approval in &body.validator_approvals {
+            if !seen.insert(approval.validator.0) {
+                return Err(StateError::ExecutionError(format!(
+                    "community inference reward: duplicate validator approval from {}",
+                    approval.validator.to_hex()
+                )));
+            }
+            let Some(stake) = active_stakes.get(&approval.validator.0) else {
+                return Err(StateError::ExecutionError(format!(
+                    "community inference reward: approval signer {} is not an active validator",
+                    approval.validator.to_hex()
+                )));
+            };
+            approval
+                .as_signature()
+                .verify(&commitment, &approval.validator)
+                .map_err(|_| {
+                    StateError::ExecutionError(format!(
+                        "community inference reward: invalid Ed25519 approval from {}",
+                        approval.validator.to_hex()
+                    ))
+                })?;
+            approved_stake += u128::from(*stake);
+        }
+
+        if approved_stake < required_stake {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: insufficient approved stake: have {}, need {} of {} active stake",
+                approved_stake, required_stake, total_active_stake
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_v3_transaction_envelope(&self, tx: &Transaction) -> Result<(), StateError> {
+        if tx.tx_type != tx.body.tx_type() {
+            return Err(StateError::ExecutionError(format!(
+                "transaction type/body mismatch: envelope {:?}, body {:?}",
+                tx.tx_type,
+                tx.body.tx_type()
+            )));
+        }
+        if !Self::v3_allows_transaction(&tx.body) {
+            return Err(StateError::ExecutionError(format!(
+                "transaction type {:?} is unavailable in recovery protocol v3",
+                tx.tx_type
+            )));
+        }
+        let serialized_size = bincode::serialize(tx)
+            .map_err(|error| {
+                StateError::ExecutionError(format!(
+                    "transaction cannot be size-checked for v3 admission: {error}"
+                ))
+            })?
+            .len() as u64;
+        if serialized_size > V3_MAX_TRANSACTION_BYTES {
+            return Err(StateError::ExecutionError(format!(
+                "transaction size {serialized_size} exceeds v3 maximum {V3_MAX_TRANSACTION_BYTES}"
+            )));
+        }
+        let operation_gas = Self::gas_cost_for_tx(tx);
+        if tx.gas_limit != 0
+            && (tx.gas_limit < operation_gas || tx.gas_limit > gas_costs::BLOCK_GAS_LIMIT)
+        {
+            return Err(StateError::ExecutionError(format!(
+                "transaction gas limit {} is outside [{operation_gas}, {}]",
+                tx.gas_limit,
+                gas_costs::BLOCK_GAS_LIMIT
+            )));
+        }
+        // `sig_verified` is an in-memory performance hint, not an
+        // authorization capability. Reverify at the v3 state boundary so no
+        // alternate executor, RPC path, or forged local flag can bypass the
+        // recovery-domain signature check.
+        self.verify_transaction_signature(tx).map_err(|_| {
+            StateError::ExecutionError(
+                "invalid transaction signature for recovery protocol v3".to_string(),
+            )
+        })
+    }
+
+    fn validate_v3_transfer_admission(
+        &self,
+        tx: &Transaction,
+        body: &TransferBody,
+    ) -> Result<(), StateError> {
+        if body.amount == 0 {
+            return Err(StateError::ExecutionError(
+                "v3 transfer amount must be positive".to_string(),
+            ));
+        }
+        if tx.fee < V3_MIN_TRANSFER_FEE {
+            return Err(StateError::ExecutionError(format!(
+                "v3 transfer fee {} is below minimum {V3_MIN_TRANSFER_FEE}",
+                tx.fee
+            )));
+        }
+        if body.amount_commitment.is_some() {
+            return Err(StateError::ExecutionError(
+                "v3 transfer amount commitments are not active".to_string(),
+            ));
+        }
+        let fee_treasury = v3_fee_treasury_address();
+        if tx.from == body.to
+            || is_reserved_system_account(&tx.from)
+            || is_reserved_system_account(&body.to)
+            || tx.from == fee_treasury
+            || body.to == fee_treasury
+        {
+            return Err(StateError::ExecutionError(
+                "v3 transfer sender/recipient/system account collision".to_string(),
+            ));
+        }
+        let sender = self
+            .get_account(&tx.from)
+            .ok_or(StateError::InsufficientBalance {
+                have: 0,
+                need: body.amount.saturating_add(tx.fee),
+            })?;
+        if sender.nonce != tx.nonce {
+            return Err(StateError::InvalidNonce {
+                expected: sender.nonce,
+                got: tx.nonce,
+            });
+        }
+        sender
+            .nonce
+            .checked_add(1)
+            .ok_or_else(|| StateError::ExecutionError("transfer nonce overflow".to_string()))?;
+        let total_debit = body.amount.checked_add(tx.fee).ok_or_else(|| {
+            StateError::ExecutionError("transfer amount plus fee overflow".to_string())
+        })?;
+        if sender.balance < total_debit {
+            return Err(StateError::InsufficientBalance {
+                have: sender.balance,
+                need: total_debit,
+            });
+        }
+        let receiver = self
+            .get_account(&body.to)
+            .unwrap_or_else(|| Account::new(body.to, 0));
+        receiver.balance.checked_add(body.amount).ok_or_else(|| {
+            StateError::ExecutionError("transfer recipient balance overflow".to_string())
+        })?;
+        let treasury = self
+            .get_account(&fee_treasury)
+            .unwrap_or_else(|| Account::new(fee_treasury, 0));
+        treasury.balance.checked_add(tx.fee).ok_or_else(|| {
+            StateError::ExecutionError("transfer fee treasury balance overflow".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn validate_v3_faucet_admission(
+        &self,
+        tx: &Transaction,
+        body: &arc_types::transaction::FaucetClaimBody,
+    ) -> Result<(), StateError> {
+        if tx.fee != 0 {
+            return Err(StateError::ExecutionError(
+                "faucet claim cannot charge an unaccounted transaction fee".to_string(),
+            ));
+        }
+        if self.active_validators().len()
+            != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+        {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim requires the exact {}-validator recovery authority set",
+                arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+            )));
+        }
+        if !self.is_validator(&tx.from) {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: signer {} is not an active validator",
+                tx.from.to_hex()
+            )));
+        }
+        if body.amount == 0 || body.amount > arc_types::transaction::FAUCET_CLAIM_MAX {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: amount {} outside [1, {}]",
+                body.amount,
+                arc_types::transaction::FAUCET_CLAIM_MAX
+            )));
+        }
+        let pool = arc_types::transaction::faucet_pool_address();
+        let marker = arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient);
+        let legacy_marker =
+            arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+        let recipient_is_existing_faucet_marker =
+            self.get_account(&body.recipient).is_some_and(|account| {
+                account.balance == 0
+                    && account.nonce == 1
+                    && account.code_hash != Hash256::ZERO
+                    && arc_types::transaction::FaucetClaimBody::marker_address(&account.code_hash)
+                        == body.recipient
+            });
+        if is_reserved_system_account(&body.recipient)
+            || marker == pool
+            || marker == body.recipient
+            || recipient_is_existing_faucet_marker
+        {
+            return Err(StateError::ExecutionError(
+                "faucet claim: system account address collision".to_string(),
+            ));
+        }
+        if self.accounts.contains_key(&marker.0) {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: recipient {} has already claimed",
+                body.recipient
+            )));
+        }
+        if self.get_account(&legacy_marker).is_some_and(|account| {
+            account.balance == 0
+                && account.staked_balance == 0
+                && account.nonce == 1
+                && account.code_hash == body.recipient
+                && account.storage_root != Hash256::ZERO
+        }) {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: recipient {} already claimed under legacy marker semantics",
+                body.recipient
+            )));
+        }
+        let pool_account = self.get_account(&pool).ok_or_else(|| {
+            StateError::ExecutionError(
+                "faucet claim: system faucet pool account is not prefunded".to_string(),
+            )
+        })?;
+        if pool_account.balance < body.amount {
+            return Err(StateError::InsufficientBalance {
+                have: pool_account.balance,
+                need: body.amount,
+            });
+        }
+        let recipient = self
+            .get_account(&body.recipient)
+            .unwrap_or_else(|| Account::new(body.recipient, 0));
+        recipient.balance.checked_add(body.amount).ok_or_else(|| {
+            StateError::ExecutionError("faucet claim: recipient balance overflow".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn next_community_reward_budget_counter(
+        &self,
+        address: Address,
+        code_hash: Hash256,
+        limit: u64,
+        label: &str,
+    ) -> Result<Account, StateError> {
+        let policy_hash = community_reward_issuance_policy_hash();
+        let mut account = self
+            .get_account(&address)
+            .unwrap_or_else(|| Account::new(address, 0));
+        if account.nonce != 0 || account.code_hash != Hash256::ZERO {
+            if account.balance != 0
+                || account.staked_balance != 0
+                || account.code_hash != code_hash
+                || account.storage_root != policy_hash
+            {
+                return Err(StateError::ExecutionError(format!(
+                    "community inference reward: invalid {label} budget account"
+                )));
+            }
+        } else if account.balance != 0
+            || account.staked_balance != 0
+            || account.storage_root != Hash256::ZERO
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: {label} budget address collides with live state"
+            )));
+        }
+        let next = account.nonce.checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError(format!(
+                "community inference reward: {label} budget counter overflow"
+            ))
+        })?;
+        if next > limit {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: {label} issuance limit {limit} reached"
+            )));
+        }
+        account.nonce = next;
+        account.code_hash = code_hash;
+        account.storage_root = policy_hash;
+        Ok(account)
+    }
+
+    fn community_reward_budget_candidates_at(
+        &self,
+        body: &arc_types::transaction::CommunityInferenceRewardBody,
+        height: u64,
+    ) -> Result<CommunityRewardBudgetCandidates, StateError> {
+        let epoch = height / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+        let block_address = community_reward_block_budget_address(height);
+        let epoch_address = community_reward_epoch_budget_address(epoch);
+        let worker_address = community_reward_worker_budget_address(epoch, &body.worker);
+        let coordinator_address =
+            community_reward_coordinator_budget_address(epoch, &body.coordinator);
+        let addresses = [
+            block_address,
+            epoch_address,
+            worker_address,
+            coordinator_address,
+        ];
+        let unique: HashSet<_> = addresses.iter().map(|address| address.0).collect();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+            &body.chain_domain,
+            &body.job_id,
+        );
+        let certificate_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                &body.chain_domain,
+                &body.worker,
+                &body.worker_certificate.attestation_hash,
+            );
+        let recovery_probe_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
+            );
+        if unique.len() != addresses.len()
+            || addresses
+                .iter()
+                .any(|address| !arc_types::transaction::is_v3_system_account(address))
+            || addresses.iter().any(|address| {
+                *address == treasury
+                    || *address == body.worker
+                    || *address == body.coordinator
+                    || *address == job_marker
+                    || *address == certificate_marker
+                    || recovery_probe_marker == Some(*address)
+            })
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: issuance budget address collision".to_string(),
+            ));
+        }
+        let block = self.next_community_reward_budget_counter(
+            block_address,
+            hash_bytes(b"ARC-community-reward-block-budget-v3"),
+            V3_COMMUNITY_REWARD_MAX_PER_BLOCK,
+            "block",
+        )?;
+        let epoch_account = self.next_community_reward_budget_counter(
+            epoch_address,
+            hash_bytes(b"ARC-community-reward-epoch-budget-v3"),
+            V3_COMMUNITY_REWARD_MAX_PER_EPOCH,
+            "epoch",
+        )?;
+        let worker = self.next_community_reward_budget_counter(
+            worker_address,
+            body.worker,
+            V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH,
+            "worker epoch",
+        )?;
+        let coordinator = self.next_community_reward_budget_counter(
+            coordinator_address,
+            body.coordinator,
+            V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH,
+            "coordinator epoch",
+        )?;
+        Ok(CommunityRewardBudgetCandidates {
+            block: (block_address, block),
+            epoch: (epoch_address, epoch_account),
+            worker: (worker_address, worker),
+            coordinator: (coordinator_address, coordinator),
+        })
+    }
+
+    pub fn community_reward_budget_status(
+        &self,
+        worker: Address,
+        coordinator: Address,
+        block_height: u64,
+    ) -> CommunityRewardBudgetStatus {
+        let epoch = community_reward_epoch_index(block_height);
+        let count = |address: Address| {
+            self.get_account(&address)
+                .map(|account| account.nonce)
+                .unwrap_or(0)
+        };
+        let issued_this_block = count(community_reward_block_budget_address(block_height));
+        let issued_this_epoch = count(community_reward_epoch_budget_address(epoch));
+        let worker_issued_this_epoch =
+            count(community_reward_worker_budget_address(epoch, &worker));
+        let coordinator_issued_this_epoch = count(community_reward_coordinator_budget_address(
+            epoch,
+            &coordinator,
+        ));
+        CommunityRewardBudgetStatus {
+            block_height,
+            epoch,
+            issued_this_block,
+            remaining_this_block: V3_COMMUNITY_REWARD_MAX_PER_BLOCK
+                .saturating_sub(issued_this_block),
+            issued_this_epoch,
+            remaining_this_epoch: V3_COMMUNITY_REWARD_MAX_PER_EPOCH
+                .saturating_sub(issued_this_epoch),
+            worker_issued_this_epoch,
+            worker_remaining_this_epoch: V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH
+                .saturating_sub(worker_issued_this_epoch),
+            coordinator_issued_this_epoch,
+            coordinator_remaining_this_epoch: V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH
+                .saturating_sub(coordinator_issued_this_epoch),
+            policy_hash: community_reward_issuance_policy_hash(),
+        }
+    }
+
+    pub fn current_community_reward_budget_status(
+        &self,
+        worker: Address,
+        coordinator: Address,
+    ) -> CommunityRewardBudgetStatus {
+        self.community_reward_budget_status(worker, coordinator, self.height())
+    }
+
+    fn validate_community_reward_admission(
+        &self,
+        tx: &Transaction,
+        body: &arc_types::transaction::CommunityInferenceRewardBody,
+        execution_height: u64,
+    ) -> Result<(), StateError> {
+        if tx.fee != 0 {
+            return Err(StateError::ExecutionError(
+                "community inference reward cannot charge an unaccounted transaction fee"
+                    .to_string(),
+            ));
+        }
+        if self
+            .community_rewards_v1_activation_height()
+            .is_none_or(|activation| execution_height < activation)
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: protocol feature is not active at this height"
+                    .to_string(),
+            ));
+        }
+        if !self.is_validator(&tx.from) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: signer {} is not an active validator",
+                tx.from.to_hex()
+            )));
+        }
+        let expected_domain =
+            arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+        if body.chain_domain != expected_domain {
+            return Err(StateError::ExecutionError(
+                "community inference reward: wrong chain domain".to_string(),
+            ));
+        }
+        if body.job_id == Hash256::ZERO {
+            return Err(StateError::ExecutionError(
+                "community inference reward: job_id cannot be zero".to_string(),
+            ));
+        }
+        if body.coordinator != tx.from || !self.is_validator(&body.coordinator) {
+            return Err(StateError::ExecutionError(
+                "community inference reward: assignment coordinator must be the active outer signer"
+                    .to_string(),
+            ));
+        }
+        if body.assignment_epoch == Hash256::ZERO {
+            return Err(StateError::ExecutionError(
+                "community inference reward: assignment_epoch cannot be zero".to_string(),
+            ));
+        }
+        match self.recovery_context() {
+            Some(context)
+                if body.recovery_epoch == context.recovery_epoch
+                    && body.validator_set_id == context.validator_set_id
+                    && body.transaction_domain == context.domain_hash() => {}
+            Some(_) => {
+                return Err(StateError::ExecutionError(
+                    "community inference reward: recovery epoch, validator-set ID, or transaction domain does not match active state"
+                        .to_string(),
+                ));
+            }
+            None if body.recovery_epoch == 0
+                && body.validator_set_id == 0
+                && body.transaction_domain == Hash256::ZERO => {}
+            None => {
+                return Err(StateError::ExecutionError(
+                    "community inference reward: recovery binding is non-zero on legacy/dev state"
+                        .to_string(),
+                ));
+            }
+        }
+        let expected_job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &body.coordinator,
+            &body.assignment_epoch,
+            body.job_nonce,
+            &body.model_id,
+            &body.input_hash,
+            body.max_tokens,
+        );
+        if body.job_id != expected_job_id {
+            return Err(StateError::ExecutionError(
+                "community inference reward: job_id does not match its exact assignment commitment"
+                    .to_string(),
+            ));
+        }
+        if body.max_tokens == 0 {
+            return Err(StateError::ExecutionError(
+                "community inference reward: max_tokens must be positive".to_string(),
+            ));
+        }
+        if execution_height > body.expires_at_height {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: job expired at height {} (current {})",
+                body.expires_at_height, execution_height
+            )));
+        }
+        let worker_attestation = body.reconstruct_worker_attestation();
+        self.verify_transaction_signature(&worker_attestation)
+            .map_err(|_| {
+                StateError::ExecutionError(
+                    "community inference reward: invalid worker certificate signature".to_string(),
+                )
+            })?;
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let worker_stake = self.get_validator_stake(&body.worker).unwrap_or(0);
+        if below_policy_minimum(
+            worker_stake,
+            arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+        ) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: worker stake {} is below active policy minimum {}",
+                worker_stake,
+                arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE
+            )));
+        }
+        if body.worker == treasury
+            || is_reserved_system_account(&body.worker)
+            || is_reserved_system_account(&body.coordinator)
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: worker/coordinator cannot be a system account"
+                    .to_string(),
+            ));
+        }
+        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+            &body.chain_domain,
+            &body.job_id,
+        );
+        let certificate_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                &body.chain_domain,
+                &body.worker,
+                &body.worker_certificate.attestation_hash,
+            );
+        let recovery_probe_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
+            );
+        if job_marker == certificate_marker
+            || job_marker == body.worker
+            || certificate_marker == body.worker
+            || job_marker == treasury
+            || certificate_marker == treasury
+            || recovery_probe_marker.is_some_and(|marker| {
+                marker == job_marker
+                    || marker == certificate_marker
+                    || marker == body.worker
+                    || marker == body.coordinator
+                    || marker == treasury
+            })
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: marker address collision".to_string(),
+            ));
+        }
+        if self.accounts.contains_key(&job_marker.0) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: job {} already paid",
+                body.job_id.to_hex()
+            )));
+        }
+        if self.accounts.contains_key(&certificate_marker.0) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: worker certificate {} already paid",
+                body.worker_certificate.attestation_hash.to_hex()
+            )));
+        }
+        if let Some(marker) = recovery_probe_marker
+            && self.accounts.contains_key(&marker.0)
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: recovery probe {} already paid",
+                body.assignment_epoch.to_hex()
+            )));
+        }
+        // Historical v2 marker keys remain valid replay evidence after the
+        // upgrade, but an arbitrary transfer to a predictable legacy hash is
+        // not. Only the exact state-machine marker shape blocks v3 issuance.
+        let legacy_job_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                &body.chain_domain,
+                &body.job_id,
+            );
+        if self.get_account(&legacy_job_marker).is_some_and(|account| {
+            account.balance == 0
+                && account.staked_balance == 0
+                && account.nonce == 1
+                && account.code_hash != Hash256::ZERO
+        }) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: job {} already paid under legacy marker semantics",
+                body.job_id.to_hex()
+            )));
+        }
+        let legacy_certificate_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                &body.chain_domain,
+                &body.worker,
+                &body.worker_certificate.attestation_hash,
+            );
+        if self
+            .get_account(&legacy_certificate_marker)
+            .is_some_and(|account| {
+                account.balance == 0
+                    && account.staked_balance == 0
+                    && account.nonce == 1
+                    && account.code_hash != Hash256::ZERO
+            })
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: worker certificate {} already paid under legacy marker semantics",
+                body.worker_certificate.attestation_hash.to_hex()
+            )));
+        }
+        if let Some(legacy_probe_marker) =
+            arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                &body.chain_domain,
+                &body.assignment_epoch,
+            )
+            && self
+                .get_account(&legacy_probe_marker)
+                .is_some_and(|account| {
+                    account.balance == 0
+                        && account.staked_balance == 0
+                        && account.nonce == 1
+                        && account.code_hash != Hash256::ZERO
+                })
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: recovery probe {} already paid under legacy marker semantics",
+                body.assignment_epoch.to_hex()
+            )));
+        }
+        self.verify_community_reward_validator_approvals(body)?;
+        let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+        let worker = self
+            .get_account(&body.worker)
+            .unwrap_or_else(|| Account::new(body.worker, 0));
+        worker.balance.checked_add(reward).ok_or_else(|| {
+            StateError::ExecutionError(
+                "community inference reward: worker balance overflow".to_string(),
+            )
+        })?;
+        let treasury_account = self.get_account(&treasury).ok_or_else(|| {
+            StateError::ExecutionError(
+                "community inference reward: treasury is not funded".to_string(),
+            )
+        })?;
+        if treasury_account.balance < reward {
+            return Err(StateError::InsufficientBalance {
+                have: treasury_account.balance,
+                need: reward,
+            });
+        }
+        if self.active_protocol_version().major == 3 {
+            self.community_reward_budget_candidates_at(body, execution_height)?;
+        }
+        Ok(())
+    }
+
+    /// Side-effect-free protocol-v3 ingress validation. RPC, gossip, DAG, and
+    /// restore paths use this before retaining a transaction; the state
+    /// executor independently enforces the same conditions before writes.
+    pub fn validate_v3_transaction_admission(&self, tx: &Transaction) -> Result<(), StateError> {
+        let execution_height = self.height().checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError("prospective v3 block height overflow".to_string())
+        })?;
+        self.validate_v3_transaction_admission_at(tx, execution_height)
+    }
+
+    /// Exact-height variant used by canonical DAG/block validation.
+    pub fn validate_v3_transaction_admission_at(
+        &self,
+        tx: &Transaction,
+        execution_height: u64,
+    ) -> Result<(), StateError> {
+        if self.active_protocol_version().major != 3 {
+            return Err(StateError::ExecutionError(
+                "protocol-v3 admission requested without an active recovery context".to_string(),
+            ));
+        }
+        self.validate_v3_transaction_envelope(tx)?;
+        match &tx.body {
+            TxBody::Transfer(body) => self.validate_v3_transfer_admission(tx, body),
+            TxBody::FaucetClaim(body) => self.validate_v3_faucet_admission(tx, body),
+            TxBody::CommunityInferenceReward(body) => {
+                self.validate_community_reward_admission(tx, body, execution_height)
+            }
+            // Keep this list exhaustive rather than using a wildcard: a new
+            // transaction family must be consciously classified and wired
+            // before the crate can compile.
+            TxBody::Settle(_)
+            | TxBody::Swap(_)
+            | TxBody::Escrow(_)
+            | TxBody::Stake(_)
+            | TxBody::WasmCall(_)
+            | TxBody::MultiSig(_)
+            | TxBody::DeployContract(_)
+            | TxBody::RegisterAgent(_)
+            | TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_)
+            | TxBody::Governance(_)
+            | TxBody::BridgeLock(_)
+            | TxBody::BridgeMint(_)
+            | TxBody::BatchSettle(_)
+            | TxBody::ChannelOpen(_)
+            | TxBody::ChannelClose(_)
+            | TxBody::ChannelDispute(_)
+            | TxBody::ShardProof(_)
+            | TxBody::InferenceAttestation(_)
+            | TxBody::InferenceChallenge(_)
+            | TxBody::InferenceRegister(_)
+            | TxBody::InferenceEscrowOpen(_)
+            | TxBody::InferenceEscrowRelease(_)
+            | TxBody::InferenceEscrowRefund(_)
+            | TxBody::ModelRegistration(_)
+            | TxBody::ModelRequest(_)
+            | TxBody::ShardCoverageClaim(_)
+            | TxBody::CapacityAdvertisement(_)
+            | TxBody::ShardAssignmentProposal(_)
+            | TxBody::InferenceRequest(_)
+            | TxBody::InferenceVote(_)
+            | TxBody::InferenceFinalize(_) => Err(StateError::ExecutionError(
+                "transaction family has no protocol-v3 admission handler".to_string(),
+            )),
+        }
+    }
+
+    /// Validate a complete candidate v3 state block without mutation. The
+    /// launch policy permits one transaction per sender and rejects any
+    /// overlapping static account access sets, ensuring that individually
+    /// valid preflights cannot invalidate one another before execution.
+    pub fn validate_v3_block_admission(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), StateError> {
+        let execution_height = self.height().checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError("prospective v3 block height overflow".to_string())
+        })?;
+        self.validate_v3_block_admission_at(transactions, execution_height)
+    }
+
+    /// Exact-height candidate-block validation for consensus.
+    pub fn validate_v3_block_admission_at(
+        &self,
+        transactions: &[Transaction],
+        execution_height: u64,
+    ) -> Result<(), StateError> {
+        if transactions.len() > V3_MAX_TRANSACTIONS_PER_BLOCK {
+            return Err(StateError::ExecutionError(format!(
+                "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",
+                transactions.len()
+            )));
+        }
+        let mut senders = HashMap::<[u8; 32], usize>::new();
+        let mut hashes = HashSet::with_capacity(transactions.len());
+        let mut accessed = HashSet::new();
+        for tx in transactions {
+            if !hashes.insert(tx.hash.0) {
+                return Err(StateError::ExecutionError(
+                    "v3 block contains a duplicate transaction hash".to_string(),
+                ));
+            }
+            let sender_count = senders.entry(tx.from.0).or_default();
+            *sender_count += 1;
+            if *sender_count > V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK {
+                return Err(StateError::ExecutionError(format!(
+                    "v3 block exceeds per-sender transaction limit for {}",
+                    tx.from.to_hex()
+                )));
+            }
+            self.validate_v3_transaction_admission_at(tx, execution_height)?;
+            for account in crate::block_stm::tx_access_set(tx).accounts {
+                if !accessed.insert(account) {
+                    return Err(StateError::ExecutionError(
+                        "v3 block contains overlapping transaction state access".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Get current block height.
     pub fn height(&self) -> u64 {
         *self.height.read()
@@ -908,6 +2691,14 @@ impl StateDB {
     /// entries (DashMap has no insertion order; a proper LRU would require
     /// an ordered map, but this simple cap prevents OOM).
     pub fn evict_transactions(&self, max_entries: usize) {
+        // Archive mode is a durability contract, not merely a longer cache.
+        // Removing a body here also makes an old mined reward disappear from
+        // `/worker/earnings`, and deleting its WAL segment makes that loss
+        // survive restart.  Archive operators explicitly accept unbounded
+        // history growth and must retain both the in-memory index and WAL.
+        if self.archive_mode {
+            return;
+        }
         let current = self.full_transactions.len();
         if current <= max_entries {
             return;
@@ -932,10 +2723,10 @@ impl StateDB {
         // delete_segments_before() was never called. Keep segments
         // from the last 1000 entries for crash recovery.
         let wal_seq = self.wal.sequence();
-        if wal_seq > 1000 {
-            if let Err(e) = self.wal.delete_segments_before(wal_seq - 1000) {
-                tracing::warn!("WAL segment cleanup failed: {}", e);
-            }
+        if wal_seq > 1000
+            && let Err(e) = self.wal.delete_segments_before(wal_seq - 1000)
+        {
+            tracing::warn!("WAL segment cleanup failed: {}", e);
         }
     }
 
@@ -948,10 +2739,10 @@ impl StateDB {
     pub fn get_block_by_hash(&self, hash: &[u8; 32]) -> Option<Block> {
         let h = self.height();
         for height in (0..=h).rev() {
-            if let Some(block) = self.blocks.get(&height) {
-                if block.hash.0 == *hash {
-                    return Some(block.clone());
-                }
+            if let Some(block) = self.blocks.get(&height)
+                && block.hash.0 == *hash
+            {
+                return Some(block.clone());
             }
         }
         None
@@ -964,6 +2755,8 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -993,17 +2786,20 @@ impl StateDB {
             );
 
             // Pre-size receipts with placeholders so we can write by index
-            receipts.resize(transactions.len(), TxReceipt {
-                tx_hash: Hash256::ZERO,
-                block_height: height,
-                block_hash: Hash256::ZERO,
-                index: 0,
-                success: false,
-                gas_used: 0,
-                value_commitment: None,
-                inclusion_proof: None,
-                logs: vec![],
-            });
+            receipts.resize(
+                transactions.len(),
+                TxReceipt {
+                    tx_hash: Hash256::ZERO,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: 0,
+                    success: false,
+                    gas_used: 0,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                },
+            );
 
             // Collect all tx hashes up front (order must match input)
             for tx in transactions.iter() {
@@ -1082,6 +2878,14 @@ impl StateDB {
         }
 
         // Build Merkle tree from transaction hashes
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
 
@@ -1100,7 +2904,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1124,21 +2928,23 @@ impl StateDB {
 
         // Store block + WAL
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % 10_000 == 0 {
+        if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
             // Snapshot is taken asynchronously in production - here we just log
         }
 
         Ok((block, receipts))
     }
-
 
     /// Execute a batch of transactions with signature verification.
     /// Unsigned or invalid-signature transactions are marked as failed.
@@ -1155,42 +2961,72 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.execute_block_adaptive_at(transactions, producer, timestamp)
+    }
+
+    /// Execute the canonical transaction sequence using a consensus-provided
+    /// timestamp. Validators committing the same DAG block must build the same
+    /// linear block hash; sampling each machine's wall clock during local
+    /// re-execution made otherwise-identical validators expose different block
+    /// hashes and then carry different parent hashes forever.
+    pub fn execute_block_adaptive_at(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.execute_block_adaptive_at_with_proof(transactions, producer, timestamp, Hash256::ZERO)
+    }
+
+    /// Execute one canonical consensus decision and bind its authenticated DAG
+    /// identity directly into the resulting linear block header. Protocol-v3
+    /// consensus uses a domain-separated commitment to the exact DAG hash and
+    /// round; legacy and direct execution paths retain a zero proof hash.
+    pub fn execute_block_adaptive_at_with_proof(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+        proof_hash: Hash256,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mode = crate::block_stm::choose_execution_mode(transactions);
         match mode {
-            crate::block_stm::AdaptiveMode::Sequential => {
-                self.execute_block_verified(transactions, producer)
-            }
+            crate::block_stm::AdaptiveMode::Sequential => self
+                .execute_block_verified_at_with_proof(
+                    transactions,
+                    producer,
+                    timestamp,
+                    proof_hash,
+                ),
             crate::block_stm::AdaptiveMode::BlockSTM => {
                 // Use BlockSTM partitioned execution
-                self.execute_block_blockstm(transactions, producer)
+                self.execute_block_blockstm_at(transactions, producer, timestamp, proof_hash)
             }
         }
     }
 
     /// Execute a block using BlockSTM partitioned parallel execution.
-    fn execute_block_blockstm(
+    fn execute_block_blockstm_at(
         &self,
         transactions: &[Transaction],
         producer: Address,
+        timestamp: u64,
+        proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         use rayon::prelude::*;
 
-        // ── Pre-sort by (sender, nonce) to reduce BlockSTM conflicts ──────
-        // Build a sorted index so same-sender TXs are adjacent in nonce order.
-        // This makes the partition algorithm place them in sequential batches
-        // naturally, reducing cross-batch conflicts.
-        let mut sorted_indices: Vec<usize> = (0..transactions.len()).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            transactions[a].from.0.cmp(&transactions[b].from.0)
-                .then(transactions[a].nonce.cmp(&transactions[b].nonce))
-        });
-
-        // Build a re-ordered transaction slice for partitioning.
-        let sorted_txs: Vec<Transaction> = sorted_indices.iter()
-            .map(|&i| transactions[i].clone())
-            .collect();
-        // Map from sorted position back to original index.
-        let batches = crate::block_stm::partition_batches(&sorted_txs);
+        // The transaction slice is already in canonical block/DAG order.
+        // Re-sorting by sender used to reverse cross-sender conflicts (shared
+        // treasury, reward marker, challenge escrow, etc.) while merely moving
+        // receipts back to their original slots. Partition that canonical
+        // sequence directly; partition_batches preserves every conflict edge.
+        let batches = crate::block_stm::partition_batches(transactions);
         let mut receipts = vec![None; transactions.len()];
         let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
 
@@ -1200,26 +3036,26 @@ impl StateDB {
             *h
         };
 
-        let parent = self.blocks.get(&(height - 1))
+        let parent = self
+            .blocks
+            .get(&(height - 1))
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
         // Execute batches: within each batch, TXs run in parallel.
         // Batches run sequentially (they may have cross-batch dependencies).
-        // Note: batch indices refer to positions in sorted_txs; we map back
-        // to original positions via sorted_indices for receipt/hash placement.
+        // Batch indices are the original canonical transaction indices.
         for batch in &batches {
             let batch_results: Vec<(usize, bool, u64)> = batch
                 .par_iter()
-                .map(|&sorted_idx| {
-                    let orig_idx = sorted_indices[sorted_idx];
-                    let tx = &transactions[orig_idx];
+                .map(|&idx| {
+                    let tx = &transactions[idx];
                     self.mark_tx_accounts_dirty(tx);
                     let result = if tx.sig_verified {
                         self.execute_tx(tx) // Pre-verified (faucet/RPC) - skip sig check
                     } else if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
-                    } else if tx.verify_signature().is_err() {
+                    } else if self.verify_transaction_signature(tx).is_err() {
                         Err(StateError::ExecutionError("invalid signature".into()))
                     } else {
                         self.execute_tx(tx)
@@ -1228,17 +3064,17 @@ impl StateDB {
                         Ok(gas) => (true, gas),
                         Err(_) => (false, Self::gas_cost_for_tx(tx)),
                     };
-                    (orig_idx, success, gas_used)
+                    (idx, success, gas_used)
                 })
                 .collect();
 
-            for (orig_idx, success, gas_used) in batch_results {
-                tx_hashes[orig_idx] = transactions[orig_idx].hash;
-                receipts[orig_idx] = Some(TxReceipt {
-                    tx_hash: transactions[orig_idx].hash,
+            for (idx, success, gas_used) in batch_results {
+                tx_hashes[idx] = transactions[idx].hash;
+                receipts[idx] = Some(TxReceipt {
+                    tx_hash: transactions[idx].hash,
                     block_height: height,
                     block_hash: Hash256::ZERO,
-                    index: orig_idx as u32,
+                    index: idx as u32,
                     success,
                     gas_used,
                     value_commitment: None,
@@ -1249,43 +3085,51 @@ impl StateDB {
         }
 
         // Unwrap all receipts (all slots should be filled)
-        let receipts: Vec<TxReceipt> = receipts.into_iter()
+        let receipts: Vec<TxReceipt> = receipts
+            .into_iter()
             .enumerate()
-            .map(|(i, r)| r.unwrap_or(TxReceipt {
-                tx_hash: transactions[i].hash,
-                block_height: height,
-                block_hash: Hash256::ZERO,
-                index: i as u32,
-                success: false,
-                gas_used: 0,
-                value_commitment: None,
-                inclusion_proof: None,
-                logs: vec![],
-            }))
+            .map(|(i, r)| {
+                r.unwrap_or(TxReceipt {
+                    tx_hash: transactions[i].hash,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: i as u32,
+                    success: false,
+                    gas_used: 0,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                })
+            })
             .collect();
 
         // Build block (same as sequential path)
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp,
             parent_hash: parent,
             tx_root,
             state_root,
-            proof_hash: Hash256::ZERO,
+            proof_hash,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
-        let mut block = Block::new(header, tx_hashes);
+        let block = Block::new(header, tx_hashes);
 
         let mut final_receipts = receipts;
         for (i, receipt) in final_receipts.iter_mut().enumerate() {
@@ -1303,8 +3147,11 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &final_receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         Ok((block, final_receipts))
     }
@@ -1315,6 +3162,32 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.execute_block_verified_at(transactions, producer, timestamp)
+    }
+
+    /// Sequential verified execution with a canonical consensus timestamp.
+    pub fn execute_block_verified_at(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.execute_block_verified_at_with_proof(transactions, producer, timestamp, Hash256::ZERO)
+    }
+
+    fn execute_block_verified_at_with_proof(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+        proof_hash: Hash256,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -1335,6 +3208,7 @@ impl StateDB {
         // batch operation (~2x faster than individual verification).
         // Transactions already verified at mempool insertion are skipped.
         let mut batch_sig_valid = vec![None; transactions.len()]; // None = needs individual check
+        let recovery_domain = self.transaction_domain_hash();
         {
             let mut ed_indices: Vec<usize> = Vec::new();
             let mut ed_msgs: Vec<Vec<u8>> = Vec::new();
@@ -1346,21 +3220,38 @@ impl StateDB {
                     continue; // unsigned handled below; pre-verified skipped
                 }
                 // Hash integrity check
-                if tx.compute_hash() != tx.hash {
+                let expected_hash = match recovery_domain {
+                    Some(domain) => tx.compute_hash_in_domain(&domain),
+                    None => tx.compute_hash(),
+                };
+                if expected_hash != tx.hash {
                     batch_sig_valid[i] = Some(false);
                     continue;
                 }
-                if let arc_crypto::signature::Signature::Ed25519 { public_key, signature } = &tx.signature {
-                    if signature.len() == 64 {
-                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key) {
-                            let mut sig_bytes = [0u8; 64];
-                            sig_bytes.copy_from_slice(signature);
-                            ed_indices.push(i);
-                            ed_msgs.push(tx.hash.0.to_vec());
-                            ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
-                            ed_vks.push(vk);
-                            continue;
-                        }
+                if let arc_crypto::signature::Signature::Ed25519 {
+                    public_key,
+                    signature,
+                } = &tx.signature
+                {
+                    // Batch verification proves that `public_key` signed the
+                    // hash, but it does not bind that key to `tx.from`.
+                    // Without this check an attacker could sign a transfer
+                    // from a funded victim with the attacker's own valid key;
+                    // an all-valid batch would then skip `verify_signature`.
+                    if arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from {
+                        batch_sig_valid[i] = Some(false);
+                        continue;
+                    }
+                    if signature.len() == 64
+                        && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+                    {
+                        let mut sig_bytes = [0u8; 64];
+                        sig_bytes.copy_from_slice(signature);
+                        ed_indices.push(i);
+                        ed_msgs.push(tx.hash.0.to_vec());
+                        ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
+                        ed_vks.push(vk);
+                        continue;
                     }
                     batch_sig_valid[i] = Some(false); // malformed
                 }
@@ -1379,7 +3270,9 @@ impl StateDB {
                     Err(_) => {
                         // Batch failed - fall back to individual verification to find bad ones
                         for &idx in &ed_indices {
-                            let valid = transactions[idx].verify_signature().is_ok();
+                            let valid = self
+                                .verify_transaction_signature(&transactions[idx])
+                                .is_ok();
                             batch_sig_valid[idx] = Some(valid);
                         }
                     }
@@ -1404,7 +3297,7 @@ impl StateDB {
                 } else {
                     Err(StateError::ExecutionError("invalid signature".into()))
                 }
-            } else if tx.verify_signature().is_err() {
+            } else if self.verify_transaction_signature(tx).is_err() {
                 Err(StateError::ExecutionError("invalid signature".into()))
             } else {
                 self.execute_tx(tx)
@@ -1430,6 +3323,14 @@ impl StateDB {
         }
 
         // Build Merkle tree from transaction hashes
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
 
@@ -1438,17 +3339,14 @@ impl StateDB {
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp,
             parent_hash: parent,
             tx_root,
             state_root,
-            proof_hash: Hash256::ZERO,
+            proof_hash,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1472,14 +3370,17 @@ impl StateDB {
 
         // Store block + WAL
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % 10_000 == 0 {
+        if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
         }
 
@@ -1497,6 +3398,8 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
 
         let height = {
@@ -1519,16 +3422,29 @@ impl StateDB {
         let mut ed_tasks: Vec<VerifyTask> = Vec::new();
         let mut other_indices: Vec<usize> = Vec::new();
         let mut sig_valid = vec![false; transactions.len()];
+        let recovery_domain = self.transaction_domain_hash();
 
         for (i, tx) in transactions.iter().enumerate() {
             // Hash integrity check
-            if tx.compute_hash() != tx.hash {
+            let expected_hash = match recovery_domain {
+                Some(domain) => tx.compute_hash_in_domain(&domain),
+                None => tx.compute_hash(),
+            };
+            if expected_hash != tx.hash {
                 continue; // sig_valid[i] stays false
             }
 
             match &tx.signature {
-                arc_crypto::signature::Signature::Ed25519 { public_key, signature } => {
-                    if signature.len() == 64 {
+                arc_crypto::signature::Signature::Ed25519 {
+                    public_key,
+                    signature,
+                } => {
+                    // GPU/CPU batch verifiers validate the signature against
+                    // the supplied public key; authorize the claimed sender
+                    // separately before accepting the fast-path result.
+                    if signature.len() == 64
+                        && arc_crypto::address_from_ed25519_pubkey(public_key) == tx.from
+                    {
                         let mut sig_bytes = [0u8; 64];
                         sig_bytes.copy_from_slice(signature);
                         ed_tasks.push(VerifyTask {
@@ -1570,17 +3486,20 @@ impl StateDB {
             // Block-STM parallel path for large batches
             let batches = block_stm::partition_batches(transactions);
 
-            receipts.resize(transactions.len(), TxReceipt {
-                tx_hash: Hash256::ZERO,
-                block_height: height,
-                block_hash: Hash256::ZERO,
-                index: 0,
-                success: false,
-                gas_used: 0,
-                value_commitment: None,
-                inclusion_proof: None,
-                logs: vec![],
-            });
+            receipts.resize(
+                transactions.len(),
+                TxReceipt {
+                    tx_hash: Hash256::ZERO,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: 0,
+                    success: false,
+                    gas_used: 0,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                },
+            );
 
             for tx in transactions.iter() {
                 tx_hashes.push(tx.hash);
@@ -1653,8 +3572,20 @@ impl StateDB {
         // ── Phase 3: Finalize block ──────────────────────────────────────
         let total_gas: u64 = receipts.iter().map(|r| r.gas_used).sum();
         if total_gas > gas_costs::BLOCK_GAS_LIMIT * 80 / 100 {
-            tracing::warn!(total_gas, limit = gas_costs::BLOCK_GAS_LIMIT, "Block nearing gas limit");
+            tracing::warn!(
+                total_gas,
+                limit = gas_costs::BLOCK_GAS_LIMIT,
+                "Block nearing gas limit"
+            );
         }
+
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -1672,7 +3603,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1693,11 +3624,14 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % 10_000 == 0 {
+        if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
         }
 
@@ -1710,6 +3644,8 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -1769,6 +3705,14 @@ impl StateDB {
             })
             .collect();
 
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
@@ -1785,7 +3729,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1807,8 +3751,11 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         Ok((block, receipts))
     }
@@ -1825,6 +3772,8 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -1855,18 +3804,21 @@ impl StateDB {
                 // Single tx -- no rayon overhead
                 let idx = batch[0];
                 match self.execute_tx(&transactions[idx]) {
-                    Ok(gas) => { receipt_success[idx] = true; receipt_gas[idx] = gas; }
-                    Err(_) => { receipt_gas[idx] = Self::gas_cost_for_tx(&transactions[idx]); }
+                    Ok(gas) => {
+                        receipt_success[idx] = true;
+                        receipt_gas[idx] = gas;
+                    }
+                    Err(_) => {
+                        receipt_gas[idx] = Self::gas_cost_for_tx(&transactions[idx]);
+                    }
                 }
             } else {
                 // Parallel execution within the batch
                 let results: Vec<(usize, bool, u64)> = batch
                     .par_iter()
-                    .map(|&idx| {
-                        match self.execute_tx(&transactions[idx]) {
-                            Ok(gas) => (idx, true, gas),
-                            Err(_) => (idx, false, Self::gas_cost_for_tx(&transactions[idx])),
-                        }
+                    .map(|&idx| match self.execute_tx(&transactions[idx]) {
+                        Ok(gas) => (idx, true, gas),
+                        Err(_) => (idx, false, Self::gas_cost_for_tx(&transactions[idx])),
                     })
                     .collect();
                 for (idx, ok, gas) in results {
@@ -1894,6 +3846,14 @@ impl StateDB {
             })
             .collect();
 
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
@@ -1910,7 +3870,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1932,17 +3892,17 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         Ok((block, receipts))
     }
 
     /// Optimistic parallel execution - pre-sorted by sender nonce for maximum throughput.
-    pub fn execute_optimistic(
-        &self,
-        transactions: &[Transaction],
-    ) -> (usize, usize) {
+    pub fn execute_optimistic(&self, transactions: &[Transaction]) -> (usize, usize) {
         let mut shards: HashMap<[u8; 32], Vec<&Transaction>> = HashMap::new();
         for tx in transactions {
             self.mark_tx_accounts_dirty(tx);
@@ -1971,6 +3931,7 @@ impl StateDB {
 
     /// Start background indexer threads for async hash→(height, index) mapping.
     /// Call once before benchmark execution begins.
+    #[cfg(feature = "benchmark-tools")]
     pub fn start_benchmark_indexer(self: &Arc<Self>) {
         let (tx, rx) = crossbeam::channel::unbounded::<IndexerBatch>();
 
@@ -1993,8 +3954,7 @@ impl StateDB {
                                 amount_commitment: None,
                             }))
                             .expect("serializable");
-                            let mut base_hasher =
-                                blake3::Hasher::new_derive_key("ARC-chain-tx-v1");
+                            let mut base_hasher = blake3::Hasher::new_derive_key("ARC-chain-tx-v1");
                             base_hasher.update(&[TxType::Transfer as u8]);
                             base_hasher.update(sender.as_ref());
 
@@ -2002,11 +3962,8 @@ impl StateDB {
                                 batch.nonce_start + shard_idx as u64 * batch.txs_per_sender;
                             for j in 0..batch.txs_per_sender {
                                 let nonce = nonce_start + j;
-                                let hash = compute_benchmark_tx_hash(
-                                    &base_hasher,
-                                    nonce,
-                                    &body_bytes,
-                                );
+                                let hash =
+                                    compute_benchmark_tx_hash(&base_hasher, nonce, &body_bytes);
                                 // Single DashMap insert: hash → (height, global_index)
                                 state.tx_index.insert(hash.0, (batch.height, global_idx));
                                 global_idx += 1;
@@ -2035,6 +3992,7 @@ impl StateDB {
     /// Block state_root is computed from all account states.
     /// Every tx is reconstructable on-demand from deterministic parameters.
     /// Merkle inclusion proofs are generated on-demand when queried.
+    #[cfg(feature = "benchmark-tools")]
     pub fn execute_block_benchmark(
         &self,
         tx_per_block: u64,
@@ -2043,6 +4001,11 @@ impl StateDB {
         producer: Address,
         nonce_base: &mut u64,
     ) -> Result<Block, StateError> {
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "unsigned benchmark execution is unavailable in recovery protocol v3".to_string(),
+            ));
+        }
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2115,9 +4078,7 @@ impl StateDB {
                 base_hasher.update(sender.as_ref());
 
                 (0..txs_per_sender)
-                    .map(|j| {
-                        compute_benchmark_tx_hash(&base_hasher, nonce_start + j, &body_bytes)
-                    })
+                    .map(|j| compute_benchmark_tx_hash(&base_hasher, nonce_start + j, &body_bytes))
                     .collect::<Vec<Hash256>>()
             })
             .collect();
@@ -2140,7 +4101,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: tx_per_block as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -2190,6 +4151,13 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<Block, StateError> {
+        self.require_healthy_wal()?;
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "non-WAL benchmark execution is unavailable in recovery protocol v3".to_string(),
+            ));
+        }
+        self.validate_next_protocol_block_admission(transactions)?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2204,6 +4172,7 @@ impl StateDB {
 
         let tx_count = transactions.len();
         let t0 = std::time::Instant::now();
+        let recovery_domain = self.transaction_domain_hash();
 
         // ── 1. Batch verify Ed25519 signatures (parallel chunks) ──────────
         // Extract (message, signature, verifying_key) for batch verification.
@@ -2219,7 +4188,24 @@ impl StateDB {
 
                 for tx in chunk {
                     match &tx.signature {
-                        arc_crypto::Signature::Ed25519 { public_key, signature } => {
+                        arc_crypto::Signature::Ed25519 {
+                            public_key,
+                            signature,
+                        } => {
+                            // The batch primitive does not check either hash
+                            // integrity or the ARC address derived from the
+                            // verifying key. Both are consensus authorization
+                            // requirements, even on the benchmark path.
+                            let expected_hash = match recovery_domain {
+                                Some(domain) => tx.compute_hash_in_domain(&domain),
+                                None => tx.compute_hash(),
+                            };
+                            if expected_hash != tx.hash
+                                || arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from
+                            {
+                                valid = false;
+                                break;
+                            }
                             if let (Ok(vk), Ok(sig)) = (
                                 ed25519_dalek::VerifyingKey::from_bytes(public_key),
                                 <[u8; 64]>::try_from(signature.as_slice())
@@ -2246,11 +4232,17 @@ impl StateDB {
                         vec![true; chunk.len()]
                     } else {
                         // Batch failed - fall back to individual verification
-                        chunk.iter().map(|tx| tx.verify_signature().is_ok()).collect()
+                        chunk
+                            .iter()
+                            .map(|tx| self.verify_transaction_signature(tx).is_ok())
+                            .collect()
                     }
                 } else {
                     // Non-Ed25519 or parse error - verify individually
-                    chunk.iter().map(|tx| tx.verify_signature().is_ok()).collect()
+                    chunk
+                        .iter()
+                        .map(|tx| self.verify_transaction_signature(tx).is_ok())
+                        .collect()
                 }
             })
             .collect();
@@ -2322,7 +4314,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: tx_count as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -2332,10 +4324,8 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
 
         // ── 7. Store success flags for receipt reconstruction ────────────
-        self.signed_block_data.insert(
-            height,
-            (vec![], receipt_success, block.hash),
-        );
+        self.signed_block_data
+            .insert(height, (vec![], receipt_success, block.hash));
 
         // ── 8. Build indexes in parallel ─────────────────────────────────
         // Hash→(height,idx) index + full tx bodies for /tx/{hash}/full
@@ -2365,6 +4355,7 @@ impl StateDB {
 
     /// Reconstruct a benchmark transaction on-demand from (height, tx_index).
     /// Returns the full Transaction object with correct hash and real ed25519 signature.
+    #[cfg(feature = "benchmark-tools")]
     pub fn reconstruct_benchmark_tx(&self, height: u64, tx_index: u32) -> Option<Transaction> {
         let nonce_base = self.benchmark_nonces.get(&height)?;
         let nonce_base = *nonce_base;
@@ -2402,12 +4393,15 @@ impl StateDB {
         Some(tx)
     }
 
+    /// Deterministic transaction reconstruction is deliberately unavailable
+    /// in production/default builds.
+    #[cfg(not(feature = "benchmark-tools"))]
+    pub fn reconstruct_benchmark_tx(&self, _height: u64, _tx_index: u32) -> Option<Transaction> {
+        None
+    }
+
     /// Reconstruct a benchmark receipt on-demand from (height, tx_index).
-    pub fn reconstruct_benchmark_receipt(
-        &self,
-        height: u64,
-        tx_index: u32,
-    ) -> Option<TxReceipt> {
+    pub fn reconstruct_benchmark_receipt(&self, height: u64, tx_index: u32) -> Option<TxReceipt> {
         let tx = self.reconstruct_benchmark_tx(height, tx_index)?;
         let block = self.blocks.get(&height)?;
 
@@ -2426,6 +4420,7 @@ impl StateDB {
 
     /// Reconstruct a Merkle inclusion proof for a benchmark transaction.
     /// This is expensive (~130ms for 10M txs) - only called on-demand for /tx/{hash}/proof.
+    #[cfg(feature = "benchmark-tools")]
     pub fn reconstruct_benchmark_proof(
         &self,
         height: u64,
@@ -2474,6 +4469,16 @@ impl StateDB {
         // Build full Merkle tree and extract proof
         let tree = MerkleTree::from_leaves(all_hashes);
         tree.proof(tx_index as usize)
+    }
+
+    /// Deterministic benchmark proofs depend on the gated reconstruction path.
+    #[cfg(not(feature = "benchmark-tools"))]
+    pub fn reconstruct_benchmark_proof(
+        &self,
+        _height: u64,
+        _tx_index: u32,
+    ) -> Option<arc_crypto::MerkleProof> {
+        None
     }
 
     /// Reconstruct a benchmark transaction by looking up its hash in tx_index,
@@ -2571,6 +4576,7 @@ impl StateDB {
             TxBody::ChannelDispute(_) => gas_costs::CHANNEL_DISPUTE,
             TxBody::ShardProof(_) => gas_costs::SHARD_PROOF,
             TxBody::InferenceAttestation(_) => gas_costs::INFERENCE_ATTESTATION,
+            TxBody::CommunityInferenceReward(_) => gas_costs::COMMUNITY_INFERENCE_REWARD,
             TxBody::InferenceChallenge(_) => gas_costs::INFERENCE_CHALLENGE,
             TxBody::InferenceRegister(_) => gas_costs::INFERENCE_ATTESTATION, // same gas as attestation
             TxBody::InferenceEscrowOpen(_) => gas_costs::INFERENCE_ESCROW_OPEN,
@@ -2588,12 +4594,79 @@ impl StateDB {
         }
     }
 
+    /// Protocol v3 deliberately exposes a tiny, audited transaction surface.
+    ///
+    /// Keep this match exhaustive (no wildcard): adding a new `TxType` (and
+    /// therefore a new `TxBody::tx_type()` mapping) must fail compilation
+    /// until the new family is explicitly classified. Most
+    /// legacy families remain decodable/replayable, but cannot enter new v3
+    /// consensus state until their authorization, atomicity, and conservation
+    /// invariants are proven.
+    fn v3_transaction_family_policy(tx_type: TxType) -> V3TransactionFamilyPolicy {
+        match tx_type {
+            TxType::Transfer | TxType::CommunityInferenceReward | TxType::FaucetClaim => {
+                V3TransactionFamilyPolicy::Allowed
+            }
+            TxType::InferenceAttestation
+            | TxType::Settle
+            | TxType::Swap
+            | TxType::Escrow
+            | TxType::Stake
+            | TxType::WasmCall
+            | TxType::MultiSig
+            | TxType::DeployContract
+            | TxType::RegisterAgent
+            | TxType::JoinValidator
+            | TxType::LeaveValidator
+            | TxType::ClaimRewards
+            | TxType::UpdateStake
+            | TxType::Governance
+            | TxType::BridgeLock
+            | TxType::BridgeMint
+            | TxType::BatchSettle
+            | TxType::ChannelOpen
+            | TxType::ChannelClose
+            | TxType::ChannelDispute
+            | TxType::ShardProof
+            | TxType::InferenceChallenge
+            | TxType::InferenceRegister
+            | TxType::InferenceEscrowOpen
+            | TxType::InferenceEscrowRelease
+            | TxType::InferenceEscrowRefund
+            | TxType::ModelRegistration
+            | TxType::ModelRequest
+            | TxType::ShardCoverageClaim
+            | TxType::CapacityAdvertisement
+            | TxType::ShardAssignmentProposal
+            | TxType::InferenceRequest
+            | TxType::InferenceVote
+            | TxType::InferenceFinalize => V3TransactionFamilyPolicy::Denied,
+        }
+    }
+
+    fn v3_allows_transaction(body: &TxBody) -> bool {
+        match Self::v3_transaction_family_policy(body.tx_type()) {
+            V3TransactionFamilyPolicy::Allowed => true,
+            V3TransactionFamilyPolicy::Denied => false,
+        }
+    }
+
     /// Execute a single transaction against state, enforcing gas metering.
     ///
     /// Returns the gas consumed on success. When `gas_limit == 0` (backward
     /// compat / benchmark mode), an effectively unlimited gas budget is used
     /// so that no existing transaction can fail due to gas exhaustion.
     fn execute_tx(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if tx.tx_type != tx.body.tx_type() {
+            return Err(StateError::ExecutionError(format!(
+                "transaction type/body mismatch: envelope {:?}, body {:?}",
+                tx.tx_type,
+                tx.body.tx_type()
+            )));
+        }
+        if self.active_protocol_version().major == 3 {
+            self.validate_v3_transaction_envelope(tx)?;
+        }
         // --- Gas metering setup ---
         let effective_limit = if tx.gas_limit > 0 {
             tx.gas_limit
@@ -2610,58 +4683,144 @@ impl StateDB {
 
         match &tx.body {
             TxBody::Transfer(body) => {
-                // Use get_mut for zero-copy in-place modification
-                {
-                    let mut sender = self.accounts
-                        .get_mut(&tx.from.0)
-                        .ok_or_else(|| {
-                            // Lazy create if not found
-                            self.accounts.insert(tx.from.0, Account::new(tx.from, 0));
-                            StateError::InsufficientBalance { have: 0, need: body.amount }
+                if self.active_protocol_version().major == 3 {
+                    self.validate_v3_transfer_admission(tx, body)?;
+                    let fee_treasury_addr = v3_fee_treasury_address();
+                    let total_debit = body.amount.checked_add(tx.fee).ok_or_else(|| {
+                        StateError::ExecutionError("transfer amount plus fee overflow".to_string())
+                    })?;
+                    let mut sender = self.get_account(&tx.from).ok_or_else(|| {
+                        StateError::ExecutionError(
+                            "v3 transfer sender disappeared after preflight".to_string(),
+                        )
+                    })?;
+                    let mut receiver = self
+                        .get_account(&body.to)
+                        .unwrap_or_else(|| Account::new(body.to, 0));
+                    let mut fee_treasury = self
+                        .get_account(&fee_treasury_addr)
+                        .unwrap_or_else(|| Account::new(fee_treasury_addr, 0));
+                    sender.balance = sender.balance.checked_sub(total_debit).ok_or_else(|| {
+                        StateError::ExecutionError("transfer sender balance underflow".to_string())
+                    })?;
+                    sender.nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                        StateError::ExecutionError("transfer nonce overflow".to_string())
+                    })?;
+                    receiver.balance =
+                        receiver.balance.checked_add(body.amount).ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "transfer recipient balance overflow".to_string(),
+                            )
                         })?;
-                    if sender.nonce != tx.nonce {
-                        return Err(StateError::InvalidNonce {
-                            expected: sender.nonce,
-                            got: tx.nonce,
-                        });
-                    }
-                    if sender.balance < body.amount {
-                        return Err(StateError::InsufficientBalance {
-                            have: sender.balance,
-                            need: body.amount,
-                        });
-                    }
-                    sender.balance -= body.amount;
-                    sender.nonce += 1;
-                    // Eagerly update JMT leaf for sender.
+                    fee_treasury.balance =
+                        fee_treasury.balance.checked_add(tx.fee).ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "transfer fee treasury balance overflow".to_string(),
+                            )
+                        })?;
+
+                    self.accounts.insert(tx.from.0, sender.clone());
+                    self.accounts.insert(body.to.0, receiver.clone());
+                    self.accounts
+                        .insert(fee_treasury_addr.0, fee_treasury.clone());
                     if self.use_jmt {
-                        let sender_hash = hash_bytes(&bincode::serialize(sender.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(tx.from.0, sender_hash);
+                        let mut jmt = self.jmt.lock();
+                        for (address, account) in [
+                            (tx.from, &sender),
+                            (body.to, &receiver),
+                            (fee_treasury_addr, &fee_treasury),
+                        ] {
+                            let value =
+                                hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                            jmt.update_leaf(address.0, value);
+                        }
                     }
-                    // WAL snapshot only if WAL is active (null WAL returns early)
                     if self.wal.is_active() {
-                        let snap = sender.clone();
-                        drop(sender);
-                        self.wal.append(WalOp::SetAccount(tx.from, snap), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(tx.from, sender), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(body.to, receiver), self.height());
+                        self.wal.append(
+                            WalOp::SetAccount(fee_treasury_addr, fee_treasury),
+                            self.height(),
+                        );
                     }
+                    return Ok(gas.consumed);
                 }
 
-                // Credit receiver in-place
-                {
-                    let mut receiver = self.accounts
-                        .entry(body.to.0)
-                        .or_insert_with(|| Account::new(body.to, 0));
-                    receiver.balance = receiver.balance.saturating_add(body.amount);
-                    // Eagerly update JMT leaf for receiver.
+                // Build the complete transition from detached snapshots. A
+                // missing sender, bad nonce, insufficient funds, nonce
+                // overflow, or recipient overflow must fail without creating
+                // or partially updating any account.
+                let mut sender =
+                    self.get_account(&tx.from)
+                        .ok_or(StateError::InsufficientBalance {
+                            have: 0,
+                            need: body.amount,
+                        })?;
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("transfer nonce overflow".to_string())
+                })?;
+                if sender.balance < body.amount {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.amount,
+                    });
+                }
+
+                if body.to == tx.from {
+                    // A self-transfer conserves value and consumes exactly one
+                    // nonce; applying debit and credit to separate snapshots
+                    // would otherwise overwrite one half of the transition.
+                    sender.nonce = next_nonce;
+                    self.accounts.insert(tx.from.0, sender.clone());
                     if self.use_jmt {
-                        let recv_hash = hash_bytes(&bincode::serialize(receiver.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(body.to.0, recv_hash);
+                        let value = hash_bytes(&bincode::serialize(&sender).unwrap_or_default());
+                        self.jmt.lock().update_leaf(tx.from.0, value);
                     }
                     if self.wal.is_active() {
-                        let snap = receiver.clone();
-                        drop(receiver);
-                        self.wal.append(WalOp::SetAccount(body.to, snap), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(tx.from, sender), self.height());
                     }
+                    return Ok(gas.consumed);
+                }
+
+                let mut receiver = self
+                    .get_account(&body.to)
+                    .unwrap_or_else(|| Account::new(body.to, 0));
+                let sender_balance = sender.balance.checked_sub(body.amount).ok_or_else(|| {
+                    StateError::ExecutionError("transfer sender balance underflow".to_string())
+                })?;
+                let receiver_balance =
+                    receiver.balance.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError(
+                            "transfer recipient balance overflow".to_string(),
+                        )
+                    })?;
+                sender.balance = sender_balance;
+                sender.nonce = next_nonce;
+                receiver.balance = receiver_balance;
+
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.accounts.insert(body.to.0, receiver.clone());
+                if self.use_jmt {
+                    let mut jmt = self.jmt.lock();
+                    for (address, account) in [(tx.from, &sender), (body.to, &receiver)] {
+                        let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
+                    }
+                }
+                if self.wal.is_active() {
+                    self.wal
+                        .append(WalOp::SetAccount(tx.from, sender), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(body.to, receiver), self.height());
                 }
 
                 Ok(gas.consumed)
@@ -2683,12 +4842,14 @@ impl StateDB {
                 sender.balance -= body.amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let mut agent = self.get_or_create_account(&body.agent_id);
                 agent.balance = agent.balance.saturating_add(body.amount);
                 self.accounts.insert(body.agent_id.0, agent.clone());
-                self.wal.append(WalOp::SetAccount(body.agent_id, agent), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.agent_id, agent), self.height());
 
                 Ok(gas.consumed)
             }
@@ -2756,6 +4917,10 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender
+                    .nonce
+                    .checked_add(1)
+                    .ok_or_else(|| StateError::ExecutionError("stake nonce overflow".into()))?;
 
                 if body.is_stake {
                     // --- Stake: move funds from balance to staked_balance ---
@@ -2765,19 +4930,30 @@ impl StateDB {
                             need: body.amount,
                         });
                     }
-                    sender.balance -= body.amount;
-                    sender.staked_balance += body.amount;
+                    let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
+                    if sender.staked_balance < prev_stake {
+                        return Err(StateError::ExecutionError(format!(
+                            "validator account stake {} is below tracked validator stake {prev_stake}",
+                            sender.staked_balance
+                        )));
+                    }
+                    let new_balance = sender.balance.checked_sub(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("stake balance underflow".into())
+                    })?;
+                    let new_account_stake = sender
+                        .staked_balance
+                        .checked_add(body.amount)
+                        .ok_or_else(|| {
+                            StateError::ExecutionError("account stake overflow".into())
+                        })?;
+                    let new_stake = prev_stake.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("validator stake overflow".into())
+                    })?;
+                    self.add_staking_pool_checked(body.amount)?;
 
-                    // Update validator tracking
-                    let prev_stake = self.validators
-                        .get(&tx.from.0)
-                        .map(|v| *v)
-                        .unwrap_or(0);
-                    let new_stake = prev_stake.saturating_add(body.amount);
+                    sender.balance = new_balance;
+                    sender.staked_balance = new_account_stake;
                     self.validators.insert(tx.from.0, new_stake);
-
-                    // Update global staking pool
-                    self.staking_pool.fetch_add(body.amount, Ordering::Relaxed);
 
                     // Register as validator if crossing threshold
                     if prev_stake < Self::MIN_VALIDATOR_STAKE
@@ -2790,33 +4966,43 @@ impl StateDB {
                         );
                     }
                 } else {
-                    // --- Unstake: move funds from staked_balance back to balance ---
-                    if sender.staked_balance < body.amount {
+                    // --- Unstake only the validator-map component. The same
+                    // account field may also contain an inference-provider
+                    // bond, which is not withdrawable through this tx. ---
+                    let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
+                    if prev_stake < body.amount {
                         return Err(StateError::InsufficientBalance {
-                            have: sender.staked_balance,
+                            have: prev_stake,
                             need: body.amount,
                         });
                     }
-                    sender.staked_balance -= body.amount;
-                    sender.balance = body.amount;
+                    if sender.staked_balance < prev_stake {
+                        return Err(StateError::ExecutionError(format!(
+                            "validator account stake {} is below tracked validator stake {prev_stake}",
+                            sender.staked_balance
+                        )));
+                    }
+                    let new_account_stake = sender
+                        .staked_balance
+                        .checked_sub(body.amount)
+                        .ok_or_else(|| {
+                            StateError::ExecutionError("account stake underflow".into())
+                        })?;
+                    let new_balance = sender.balance.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("unstake balance overflow".into())
+                    })?;
+                    let new_stake = prev_stake.checked_sub(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("validator stake underflow".into())
+                    })?;
+                    self.subtract_staking_pool_checked(body.amount)?;
 
-                    // Update validator tracking
-                    let prev_stake = self.validators
-                        .get(&tx.from.0)
-                        .map(|v| *v)
-                        .unwrap_or(0);
-                    let new_stake = prev_stake.saturating_sub(body.amount);
+                    sender.staked_balance = new_account_stake;
+                    sender.balance = new_balance;
                     if new_stake == 0 {
                         self.validators.remove(&tx.from.0);
                     } else {
                         self.validators.insert(tx.from.0, new_stake);
                     }
-
-                    // Update global staking pool
-                    self.staking_pool.fetch_sub(
-                        body.amount.min(self.staking_pool.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
 
                     // Log validator removal if dropping below threshold
                     if prev_stake >= Self::MIN_VALIDATOR_STAKE
@@ -2830,49 +5016,50 @@ impl StateDB {
                     }
                 }
 
-                sender.nonce += 1;
+                sender.nonce = next_nonce;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
                 Ok(gas.consumed)
             }
             TxBody::WasmCall(body) => {
-                // --- Sender validation ---
-                let mut sender = self.get_or_create_account(&tx.from);
-                if sender.nonce != tx.nonce {
-                    return Err(StateError::InvalidNonce {
-                        expected: sender.nonce,
-                        got: tx.nonce,
-                    });
-                }
-
                 // --- Contract lookup ---
-                let bytecode = self.get_contract(&body.contract)
+                let bytecode = self
+                    .get_contract(&body.contract)
                     .ok_or(StateError::ContractNotFound(body.contract))?;
 
                 let is_evm = bytecode.len() < 4 || &bytecode[..4] != WASM_MAGIC;
 
                 if is_evm {
-                    // --- EVM contract ---
-                    // Balance validation only (revm handles the actual transfer
-                    // and execution via evm_execute in the node layer).
-                    if body.value > 0 && sender.balance < body.value {
-                        return Err(StateError::InsufficientBalance {
-                            have: sender.balance,
-                            need: body.value,
-                        });
-                    }
-                    // Nonce increment - revm will see the updated state.
-                    sender.nonce += 1;
-                    self.accounts.insert(tx.from.0, sender.clone());
-                    self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
-                    // Actual EVM execution delegated to node layer (arc-vm::evm).
-                    tracing::debug!(
-                        contract = ?body.contract,
-                        calldata_len = body.calldata.len(),
-                        "EVM contract call - nonce incremented, execution delegated"
-                    );
+                    // State-changing EVM execution used to happen in arc-node
+                    // *after* this executor had computed and durably
+                    // checkpointed the block state root. That made the live
+                    // account/storage state differ from the authenticated
+                    // block and made restart fail on the trailing WAL writes.
+                    //
+                    // Protocol v3 therefore fails closed until EVM effects
+                    // can be produced and applied atomically inside this
+                    // canonical transition. This check deliberately precedes
+                    // sender lookup/creation, nonce changes, balance changes,
+                    // storage writes, logs, and WAL appends.
+                    return Err(StateError::ExecutionError(
+                        "state-changing EVM calls are unavailable until canonical pre-root execution is activated"
+                            .to_string(),
+                    ));
                 } else {
                     // --- WASM contract ---
+                    // Use a detached sender candidate so lookup failures above
+                    // and future preflight failures cannot fabricate an
+                    // account merely by submitting a rejected call.
+                    let mut sender = self
+                        .get_account(&tx.from)
+                        .unwrap_or_else(|| Account::new(tx.from, 0));
+                    if sender.nonce != tx.nonce {
+                        return Err(StateError::InvalidNonce {
+                            expected: sender.nonce,
+                            got: tx.nonce,
+                        });
+                    }
                     // Value transfer (WASM runtime doesn't handle it internally).
                     if body.value > 0 {
                         if sender.balance < body.value {
@@ -2886,14 +5073,19 @@ impl StateDB {
                         let mut contract_acct = self.get_or_create_account(&body.contract);
                         contract_acct.balance = body.value;
                         self.accounts.insert(body.contract.0, contract_acct.clone());
-                        self.wal.append(WalOp::SetAccount(body.contract, contract_acct), self.height());
+                        self.wal.append(
+                            WalOp::SetAccount(body.contract, contract_acct),
+                            self.height(),
+                        );
                     }
 
                     // WASM execution via wasmer with full host imports.
                     {
                         use std::sync::Mutex as StdMutex;
-                        use wasmer::{imports, Function, FunctionEnv, FunctionEnvMut,
-                                     Instance, Memory, Module as WasmModule, Store};
+                        use wasmer::{
+                            Function, FunctionEnv, FunctionEnvMut, Instance, Memory,
+                            Module as WasmModule, Store, imports,
+                        };
 
                         // Shared state for host functions
                         struct WasmHostState {
@@ -2910,7 +5102,11 @@ impl StateDB {
                             memory: StdMutex<Option<Memory>>,
                         }
 
-                        let wasm_gas_limit = if body.gas_limit > 0 { body.gas_limit } else { 10_000_000 };
+                        let wasm_gas_limit = if body.gas_limit > 0 {
+                            body.gas_limit
+                        } else {
+                            10_000_000
+                        };
                         let host = WasmHostState {
                             gas_used: std::sync::atomic::AtomicU64::new(0),
                             gas_limit: wasm_gas_limit,
@@ -2930,11 +5126,16 @@ impl StateDB {
 
                         // Host: use_gas(amount: i64)
                         let h_use_gas = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, amount: i64| {
-                                if amount <= 0 { return; }
+                                if amount <= 0 {
+                                    return;
+                                }
                                 let data = env.data_mut();
-                                let prev = data.gas_used.fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
+                                let prev = data
+                                    .gas_used
+                                    .fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
                                 if prev + amount as u64 > data.gas_limit {
                                     *data.out_of_gas.lock().unwrap() = true;
                                 }
@@ -2943,16 +5144,18 @@ impl StateDB {
 
                         // Host: log(ptr: i32, len: i32)
                         let h_log = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32, len: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 if let Some(ref mem) = *data.memory.lock().unwrap() {
                                     let view = mem.view(&wstore);
                                     let mut buf = vec![0u8; len as usize];
                                     if view.read(ptr as u64, &mut buf).is_ok() {
-                                        data.logs.lock().unwrap().push(
-                                            String::from_utf8_lossy(&buf).to_string()
-                                        );
+                                        data.logs
+                                            .lock()
+                                            .unwrap()
+                                            .push(String::from_utf8_lossy(&buf).to_string());
                                     }
                                 }
                             },
@@ -2960,8 +5163,12 @@ impl StateDB {
 
                         // Host: storage_get(key_ptr: i32, val_ptr: i32) -> i32
                         let h_storage_get = Function::new_typed_with_env(
-                            &mut store, &func_env,
-                            |mut env: FunctionEnvMut<'_, WasmHostState>, key_ptr: i32, val_ptr: i32| -> i32 {
+                            &mut store,
+                            &func_env,
+                            |mut env: FunctionEnvMut<'_, WasmHostState>,
+                             key_ptr: i32,
+                             val_ptr: i32|
+                             -> i32 {
                                 let (data, wstore) = env.data_and_store_mut();
                                 let mem_guard = data.memory.lock().unwrap();
                                 let mem = match *mem_guard {
@@ -2971,14 +5178,18 @@ impl StateDB {
                                 drop(mem_guard);
                                 let view = mem.view(&wstore);
                                 let mut key = [0u8; 32];
-                                if view.read(key_ptr as u64, &mut key).is_err() { return -1; }
+                                if view.read(key_ptr as u64, &mut key).is_err() {
+                                    return -1;
+                                }
                                 let cache = data.storage_cache.lock().unwrap();
                                 match cache.get(&key) {
                                     Some(Some(val)) => {
                                         let val = val.clone();
                                         drop(cache);
                                         let view2 = mem.view(&wstore);
-                                        if view2.write(val_ptr as u64, &val).is_err() { return -1; }
+                                        if view2.write(val_ptr as u64, &val).is_err() {
+                                            return -1;
+                                        }
                                         val.len() as i32
                                     }
                                     Some(None) => -1,
@@ -2989,8 +5200,12 @@ impl StateDB {
 
                         // Host: storage_set(key_ptr: i32, val_ptr: i32, val_len: i32)
                         let h_storage_set = Function::new_typed_with_env(
-                            &mut store, &func_env,
-                            |mut env: FunctionEnvMut<'_, WasmHostState>, key_ptr: i32, val_ptr: i32, val_len: i32| {
+                            &mut store,
+                            &func_env,
+                            |mut env: FunctionEnvMut<'_, WasmHostState>,
+                             key_ptr: i32,
+                             val_ptr: i32,
+                             val_len: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 let mem_guard = data.memory.lock().unwrap();
                                 let mem = match *mem_guard {
@@ -3000,17 +5215,25 @@ impl StateDB {
                                 drop(mem_guard);
                                 let view = mem.view(&wstore);
                                 let mut key = [0u8; 32];
-                                if view.read(key_ptr as u64, &mut key).is_err() { return; }
+                                if view.read(key_ptr as u64, &mut key).is_err() {
+                                    return;
+                                }
                                 let mut val = vec![0u8; val_len as usize];
-                                if view.read(val_ptr as u64, &mut val).is_err() { return; }
-                                data.storage_cache.lock().unwrap().insert(key, Some(val.clone()));
+                                if view.read(val_ptr as u64, &mut val).is_err() {
+                                    return;
+                                }
+                                data.storage_cache
+                                    .lock()
+                                    .unwrap()
+                                    .insert(key, Some(val.clone()));
                                 data.storage_writes.lock().unwrap().push((key, val));
                             },
                         );
 
                         // Host: caller(ptr: i32) - write caller address to WASM memory
                         let h_caller = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3022,7 +5245,8 @@ impl StateDB {
 
                         // Host: self_address(ptr: i32)
                         let h_self_address = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3034,7 +5258,8 @@ impl StateDB {
 
                         // Host: block_height() -> i64
                         let h_block_height = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |env: FunctionEnvMut<'_, WasmHostState>| -> i64 {
                                 env.data().block_height as i64
                             },
@@ -3042,7 +5267,8 @@ impl StateDB {
 
                         // Host: tx_value() -> i64
                         let h_tx_value = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |env: FunctionEnvMut<'_, WasmHostState>| -> i64 {
                                 env.data().call_value as i64
                             },
@@ -3050,7 +5276,8 @@ impl StateDB {
 
                         // Host: gas_remaining() -> i64
                         let h_gas_remaining = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |env: FunctionEnvMut<'_, WasmHostState>| -> i64 {
                                 let data = env.data();
                                 let used = data.gas_used.load(std::sync::atomic::Ordering::Relaxed);
@@ -3072,14 +5299,18 @@ impl StateDB {
                             }
                         };
 
-                        let module = WasmModule::new(&store, &bytecode)
-                            .map_err(|e| StateError::ExecutionError(format!("WASM compile: {}", e)))?;
-                        let instance = Instance::new(&mut store, &module, &import_object)
-                            .map_err(|e| StateError::ExecutionError(format!("WASM instantiate: {}", e)))?;
+                        let module = WasmModule::new(&store, &bytecode).map_err(|e| {
+                            StateError::ExecutionError(format!("WASM compile: {}", e))
+                        })?;
+                        let instance =
+                            Instance::new(&mut store, &module, &import_object).map_err(|e| {
+                                StateError::ExecutionError(format!("WASM instantiate: {}", e))
+                            })?;
 
                         // Wire up memory reference so host functions can access it
                         if let Ok(memory) = instance.exports.get_memory("memory") {
-                            *func_env.as_mut(&mut store).memory.lock().unwrap() = Some(memory.clone());
+                            *func_env.as_mut(&mut store).memory.lock().unwrap() =
+                                Some(memory.clone());
                         }
 
                         // Pre-populate storage cache from StateDB
@@ -3090,16 +5321,20 @@ impl StateDB {
                             }
                         }
 
-                        let func = instance.exports.get_function(&body.function)
-                            .map_err(|e| StateError::ExecutionError(
-                                format!("function '{}' not found: {}", body.function, e)
-                            ))?;
+                        let func = instance.exports.get_function(&body.function).map_err(|e| {
+                            StateError::ExecutionError(format!(
+                                "function '{}' not found: {}",
+                                body.function, e
+                            ))
+                        })?;
 
                         let call_result = func.call(&mut store, &[]);
 
                         // Check gas exhaustion
                         let host_state = func_env.as_ref(&store);
-                        let wasm_gas_used = host_state.gas_used.load(std::sync::atomic::Ordering::Relaxed);
+                        let wasm_gas_used = host_state
+                            .gas_used
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         let was_out_of_gas = *host_state.out_of_gas.lock().unwrap();
 
                         if was_out_of_gas || wasm_gas_used > wasm_gas_limit {
@@ -3113,9 +5348,8 @@ impl StateDB {
                         match call_result {
                             Ok(_) => {
                                 // Flush storage writes to StateDB on success
-                                let writes = std::mem::take(
-                                    &mut *host_state.storage_writes.lock().unwrap()
-                                );
+                                let writes =
+                                    std::mem::take(&mut *host_state.storage_writes.lock().unwrap());
                                 for (key, value) in writes {
                                     self.set_storage(&body.contract, Hash256(key), value);
                                 }
@@ -3135,20 +5369,24 @@ impl StateDB {
                                     // Persist reverted sender balance
                                     self.accounts.insert(tx.from.0, sender.clone());
 
-                                    if let Some(mut contract_acct) = self.accounts.get_mut(&body.contract.0) {
+                                    if let Some(mut contract_acct) =
+                                        self.accounts.get_mut(&body.contract.0)
+                                    {
                                         contract_acct.balance -= body.value;
                                     }
                                 }
-                                return Err(StateError::ExecutionError(
-                                    format!("WASM exec failed: {}", e)
-                                ));
+                                return Err(StateError::ExecutionError(format!(
+                                    "WASM exec failed: {}",
+                                    e
+                                )));
                             }
                         }
                     }
 
                     sender.nonce += 1;
                     self.accounts.insert(tx.from.0, sender.clone());
-                    self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(tx.from, sender), self.height());
                 }
 
                 Ok(gas.consumed)
@@ -3205,15 +5443,20 @@ impl StateDB {
                 let code_hash = hash_bytes(&body.bytecode);
                 let contract_acct = Account::new_contract(contract_addr, code_hash);
                 self.accounts.insert(contract_addr.0, contract_acct.clone());
-                self.wal.append(WalOp::SetAccount(contract_addr, contract_acct), self.height());
+                self.wal.append(
+                    WalOp::SetAccount(contract_addr, contract_acct),
+                    self.height(),
+                );
 
                 // --- Constructor execution ---
                 if !body.constructor_args.is_empty() {
                     // Compile the module and call `init` with full host imports.
                     // Uses wasmer directly to avoid circular arc-vm dependency.
-                    use std::sync::{Mutex as StdMutex};
-                    use wasmer::{imports, Function, FunctionEnv, FunctionEnvMut,
-                                 Instance, Memory, Module as WasmModule, Store};
+                    use std::sync::Mutex as StdMutex;
+                    use wasmer::{
+                        Function, FunctionEnv, FunctionEnvMut, Instance, Memory,
+                        Module as WasmModule, Store, imports,
+                    };
 
                     struct InitHostState {
                         gas_used: std::sync::atomic::AtomicU64,
@@ -3246,34 +5489,45 @@ impl StateDB {
                     let func_env = FunctionEnv::new(&mut store, init_host);
 
                     let h_use_gas = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, amount: i64| {
-                            if amount <= 0 { return; }
+                            if amount <= 0 {
+                                return;
+                            }
                             let data = env.data_mut();
-                            let prev = data.gas_used.fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
+                            let prev = data
+                                .gas_used
+                                .fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
                             if prev + amount as u64 > data.gas_limit {
                                 *data.out_of_gas.lock().unwrap() = true;
                             }
                         },
                     );
                     let h_log = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, ptr: i32, len: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             if let Some(ref mem) = *data.memory.lock().unwrap() {
                                 let view = mem.view(&wstore);
                                 let mut buf = vec![0u8; len as usize];
                                 if view.read(ptr as u64, &mut buf).is_ok() {
-                                    data.logs.lock().unwrap().push(
-                                        String::from_utf8_lossy(&buf).to_string()
-                                    );
+                                    data.logs
+                                        .lock()
+                                        .unwrap()
+                                        .push(String::from_utf8_lossy(&buf).to_string());
                                 }
                             }
                         },
                     );
                     let h_storage_get = Function::new_typed_with_env(
-                        &mut store, &func_env,
-                        |mut env: FunctionEnvMut<'_, InitHostState>, key_ptr: i32, val_ptr: i32| -> i32 {
+                        &mut store,
+                        &func_env,
+                        |mut env: FunctionEnvMut<'_, InitHostState>,
+                         key_ptr: i32,
+                         val_ptr: i32|
+                         -> i32 {
                             let (data, wstore) = env.data_and_store_mut();
                             let mem_guard = data.memory.lock().unwrap();
                             let mem = match *mem_guard {
@@ -3283,14 +5537,18 @@ impl StateDB {
                             drop(mem_guard);
                             let view = mem.view(&wstore);
                             let mut key = [0u8; 32];
-                            if view.read(key_ptr as u64, &mut key).is_err() { return -1; }
+                            if view.read(key_ptr as u64, &mut key).is_err() {
+                                return -1;
+                            }
                             let cache = data.storage_cache.lock().unwrap();
                             match cache.get(&key) {
                                 Some(Some(val)) => {
                                     let val = val.clone();
                                     drop(cache);
                                     let view2 = mem.view(&wstore);
-                                    if view2.write(val_ptr as u64, &val).is_err() { return -1; }
+                                    if view2.write(val_ptr as u64, &val).is_err() {
+                                        return -1;
+                                    }
                                     val.len() as i32
                                 }
                                 _ => -1,
@@ -3298,8 +5556,12 @@ impl StateDB {
                         },
                     );
                     let h_storage_set = Function::new_typed_with_env(
-                        &mut store, &func_env,
-                        |mut env: FunctionEnvMut<'_, InitHostState>, key_ptr: i32, val_ptr: i32, val_len: i32| {
+                        &mut store,
+                        &func_env,
+                        |mut env: FunctionEnvMut<'_, InitHostState>,
+                         key_ptr: i32,
+                         val_ptr: i32,
+                         val_len: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             let mem_guard = data.memory.lock().unwrap();
                             let mem = match *mem_guard {
@@ -3309,15 +5571,23 @@ impl StateDB {
                             drop(mem_guard);
                             let view = mem.view(&wstore);
                             let mut key = [0u8; 32];
-                            if view.read(key_ptr as u64, &mut key).is_err() { return; }
+                            if view.read(key_ptr as u64, &mut key).is_err() {
+                                return;
+                            }
                             let mut val = vec![0u8; val_len as usize];
-                            if view.read(val_ptr as u64, &mut val).is_err() { return; }
-                            data.storage_cache.lock().unwrap().insert(key, Some(val.clone()));
+                            if view.read(val_ptr as u64, &mut val).is_err() {
+                                return;
+                            }
+                            data.storage_cache
+                                .lock()
+                                .unwrap()
+                                .insert(key, Some(val.clone()));
                             data.storage_writes.lock().unwrap().push((key, val));
                         },
                     );
                     let h_caller = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, ptr: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3327,7 +5597,8 @@ impl StateDB {
                         },
                     );
                     let h_self_address = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, ptr: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3337,17 +5608,20 @@ impl StateDB {
                         },
                     );
                     let h_block_height = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |env: FunctionEnvMut<'_, InitHostState>| -> i64 {
                             env.data().block_height as i64
                         },
                     );
                     let h_tx_value = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |_env: FunctionEnvMut<'_, InitHostState>| -> i64 { 0i64 },
                     );
                     let h_gas_remaining = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |env: FunctionEnvMut<'_, InitHostState>| -> i64 {
                             let data = env.data();
                             let used = data.gas_used.load(std::sync::atomic::Ordering::Relaxed);
@@ -3371,8 +5645,10 @@ impl StateDB {
 
                     let module = WasmModule::new(&store, &body.bytecode)
                         .map_err(|e| StateError::ExecutionError(format!("WASM compile: {}", e)))?;
-                    let instance = Instance::new(&mut store, &module, &import_object)
-                        .map_err(|e| StateError::ExecutionError(format!("WASM instantiate: {}", e)))?;
+                    let instance =
+                        Instance::new(&mut store, &module, &import_object).map_err(|e| {
+                            StateError::ExecutionError(format!("WASM instantiate: {}", e))
+                        })?;
 
                     if let Ok(memory) = instance.exports.get_memory("memory") {
                         *func_env.as_mut(&mut store).memory.lock().unwrap() = Some(memory.clone());
@@ -3385,16 +5661,15 @@ impl StateDB {
                         let was_out_of_gas = *host_state.out_of_gas.lock().unwrap();
                         if was_out_of_gas {
                             return Err(StateError::ExecutionError(
-                                "constructor out of gas".into()
+                                "constructor out of gas".into(),
                             ));
                         }
 
                         match call_result {
                             Ok(_) => {
                                 // Flush constructor storage writes to StateDB
-                                let writes = std::mem::take(
-                                    &mut *host_state.storage_writes.lock().unwrap()
-                                );
+                                let writes =
+                                    std::mem::take(&mut *host_state.storage_writes.lock().unwrap());
                                 for (key, value) in writes {
                                     self.set_storage(&contract_addr, Hash256(key), value);
                                 }
@@ -3407,9 +5682,10 @@ impl StateDB {
                                 // Constructor failed - remove the deployed contract
                                 self.contracts.remove(&contract_addr.0);
                                 self.accounts.remove(&contract_addr.0);
-                                return Err(StateError::ExecutionError(
-                                    format!("constructor exec: {}", e)
-                                ));
+                                return Err(StateError::ExecutionError(format!(
+                                    "constructor exec: {}",
+                                    e
+                                )));
                             }
                         }
                     }
@@ -3419,7 +5695,8 @@ impl StateDB {
                 sender.balance -= total_cost;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::info!(
                     contract = ?contract_addr,
@@ -3458,6 +5735,9 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("validator join nonce overflow".into())
+                })?;
                 if sender.balance < body.initial_stake {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -3467,21 +5747,43 @@ impl StateDB {
                 if body.initial_stake < Self::MIN_VALIDATOR_STAKE {
                     return Err(StateError::ExecutionError(format!(
                         "initial stake {} below minimum {}",
-                        body.initial_stake, Self::MIN_VALIDATOR_STAKE
+                        body.initial_stake,
+                        Self::MIN_VALIDATOR_STAKE
+                    )));
+                }
+                let current_stake = self
+                    .validators
+                    .get(&tx.from.0)
+                    .map(|value| *value)
+                    .unwrap_or(0);
+                if current_stake != 0 {
+                    return Err(StateError::ExecutionError(format!(
+                        "validator already has {current_stake} tracked stake; use UpdateStake"
                     )));
                 }
 
-                // Move balance to staked_balance
-                sender.balance -= body.initial_stake;
-                sender.staked_balance += body.initial_stake;
-                sender.nonce += 1;
+                let new_balance = sender
+                    .balance
+                    .checked_sub(body.initial_stake)
+                    .ok_or_else(|| StateError::ExecutionError("join balance underflow".into()))?;
+                let new_account_stake = sender
+                    .staked_balance
+                    .checked_add(body.initial_stake)
+                    .ok_or_else(|| StateError::ExecutionError("account stake overflow".into()))?;
+                self.add_staking_pool_checked(body.initial_stake)?;
+
+                // Move only the new validator component. Any existing
+                // inference-provider bond remains locked alongside it.
+                sender.balance = new_balance;
+                sender.staked_balance = new_account_stake;
+                sender.nonce = next_nonce;
 
                 // Register in validator set
                 self.validators.insert(tx.from.0, body.initial_stake);
-                self.staking_pool.fetch_add(body.initial_stake, Ordering::Relaxed);
 
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::info!(
                     validator = ?tx.from,
@@ -3499,24 +5801,42 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("validator exit nonce overflow".into())
+                })?;
 
-                // Return all staked balance
-                let staked = self.validators
-                    .remove(&tx.from.0)
-                    .map(|(_, v)| v)
+                // Return exactly the validator-map component. Provider bonds
+                // and any other non-validator lock share staked_balance and
+                // must remain untouched.
+                let staked = self
+                    .validators
+                    .get(&tx.from.0)
+                    .map(|value| *value)
                     .unwrap_or(0);
                 if staked > 0 {
-                    sender.staked_balance = sender.staked_balance.saturating_sub(staked);
-                    sender.balance = staked;
-                    self.staking_pool.fetch_sub(
-                        staked.min(self.staking_pool.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
+                    if sender.staked_balance < staked {
+                        return Err(StateError::ExecutionError(format!(
+                            "validator account stake {} is below tracked validator stake {staked}",
+                            sender.staked_balance
+                        )));
+                    }
+                    let new_account_stake =
+                        sender.staked_balance.checked_sub(staked).ok_or_else(|| {
+                            StateError::ExecutionError("account stake underflow".into())
+                        })?;
+                    let new_balance = sender.balance.checked_add(staked).ok_or_else(|| {
+                        StateError::ExecutionError("validator exit balance overflow".into())
+                    })?;
+                    self.subtract_staking_pool_checked(staked)?;
+                    sender.staked_balance = new_account_stake;
+                    sender.balance = new_balance;
+                    self.validators.remove(&tx.from.0);
                 }
 
-                sender.nonce += 1;
+                sender.nonce = next_nonce;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::info!(
                     validator = ?tx.from,
@@ -3535,7 +5855,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
                 // Actual reward distribution is epoch-based
                 Ok(gas.consumed)
             }
@@ -3547,11 +5868,17 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("validator stake nonce overflow".into())
+                })?;
 
-                let current_stake = self.validators
-                    .get(&tx.from.0)
-                    .map(|v| *v)
-                    .unwrap_or(0);
+                let current_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
+                if sender.staked_balance < current_stake {
+                    return Err(StateError::ExecutionError(format!(
+                        "validator account stake {} is below tracked validator stake {current_stake}",
+                        sender.staked_balance
+                    )));
+                }
 
                 if body.new_stake > current_stake {
                     // Increasing stake: deduct difference from balance
@@ -3562,18 +5889,29 @@ impl StateDB {
                             need: diff,
                         });
                     }
-                    sender.balance -= diff;
-                    sender.staked_balance += diff;
-                    self.staking_pool.fetch_add(diff, Ordering::Relaxed);
+                    let new_balance = sender.balance.checked_sub(diff).ok_or_else(|| {
+                        StateError::ExecutionError("stake increase balance underflow".into())
+                    })?;
+                    let new_account_stake =
+                        sender.staked_balance.checked_add(diff).ok_or_else(|| {
+                            StateError::ExecutionError("account stake overflow".into())
+                        })?;
+                    self.add_staking_pool_checked(diff)?;
+                    sender.balance = new_balance;
+                    sender.staked_balance = new_account_stake;
                 } else if body.new_stake < current_stake {
                     // Decreasing stake: return difference to balance
                     let diff = current_stake - body.new_stake;
-                    sender.staked_balance = sender.staked_balance.saturating_sub(diff);
-                    sender.balance = diff;
-                    self.staking_pool.fetch_sub(
-                        diff.min(self.staking_pool.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
+                    let new_account_stake =
+                        sender.staked_balance.checked_sub(diff).ok_or_else(|| {
+                            StateError::ExecutionError("account stake underflow".into())
+                        })?;
+                    let new_balance = sender.balance.checked_add(diff).ok_or_else(|| {
+                        StateError::ExecutionError("stake decrease balance overflow".into())
+                    })?;
+                    self.subtract_staking_pool_checked(diff)?;
+                    sender.staked_balance = new_account_stake;
+                    sender.balance = new_balance;
                 }
 
                 // Update or remove validator entry
@@ -3583,9 +5921,10 @@ impl StateDB {
                     self.validators.insert(tx.from.0, body.new_stake);
                 }
 
-                sender.nonce += 1;
+                sender.nonce = next_nonce;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::debug!(
                     validator = ?tx.from,
@@ -3609,7 +5948,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 match body.action {
                     arc_types::transaction::GovernanceAction::Execute => {
@@ -3642,14 +5982,16 @@ impl StateDB {
                 sender.balance -= body.amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit bridge escrow account (well-known address)
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 escrow.balance = body.amount;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 tracing::info!(
                     from = ?tx.from,
@@ -3679,13 +6021,15 @@ impl StateDB {
                 // Increment sender nonce (bridge relayer)
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit recipient
                 let mut recipient = self.get_or_create_account(&body.recipient);
                 recipient.balance = body.amount;
                 self.accounts.insert(body.recipient.0, recipient.clone());
-                self.wal.append(WalOp::SetAccount(body.recipient, recipient), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.recipient, recipient), self.height());
 
                 tracing::info!(
                     recipient = ?body.recipient,
@@ -3729,7 +6073,8 @@ impl StateDB {
                 }
 
                 // Net balances per recipient (multiple entries to same agent get summed)
-                let mut net_credits: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+                let mut net_credits: std::collections::HashMap<[u8; 32], u64> =
+                    std::collections::HashMap::new();
                 for entry in &body.entries {
                     *net_credits.entry(entry.agent_id.0).or_insert(0) += entry.amount;
                 }
@@ -3738,7 +6083,8 @@ impl StateDB {
                 sender.balance -= total_amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit each unique recipient once (netted)
                 for (agent_addr, net_amount) in &net_credits {
@@ -3746,7 +6092,8 @@ impl StateDB {
                     let mut agent = self.get_or_create_account(&agent_address);
                     agent.balance = agent.balance.saturating_add(*net_amount);
                     self.accounts.insert(*agent_addr, agent.clone());
-                    self.wal.append(WalOp::SetAccount(agent_address, agent), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(agent_address, agent), self.height());
                 }
 
                 Ok(gas.consumed)
@@ -3771,7 +6118,8 @@ impl StateDB {
                 sender.balance -= body.deposit;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Record channel deposit in a deterministic escrow address
                 // Channel escrow = BLAKE3("arc-channel" || channel_id)
@@ -3786,7 +6134,8 @@ impl StateDB {
                 escrow.code_hash = tx.from;
                 escrow.storage_root = body.counterparty;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 Ok(gas.consumed)
             }
@@ -3826,23 +6175,28 @@ impl StateDB {
                 }
 
                 // Validate final balances don't exceed locked funds
-                let claimed_total = body.opener_balance.saturating_add(body.counterparty_balance);
+                let claimed_total = body
+                    .opener_balance
+                    .saturating_add(body.counterparty_balance);
                 if claimed_total > total_locked {
-                    return Err(StateError::ExecutionError(
-                        format!("channel close exceeds locked funds: claimed={}, locked={}", claimed_total, total_locked),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "channel close exceeds locked funds: claimed={}, locked={}",
+                        claimed_total, total_locked
+                    )));
                 }
 
                 // Drain escrow
                 let mut escrow_mut = self.get_or_create_account(&escrow_addr);
                 escrow_mut.balance = 0;
                 self.accounts.insert(escrow_addr.0, escrow_mut.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
 
                 // Credit opener - ADD back their channel share to existing balance
                 sender.balance += body.opener_balance;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit counterparty - address was stored in escrow.storage_root
                 // during ChannelOpen (see above). This is the definitive on-chain
@@ -3851,8 +6205,12 @@ impl StateDB {
                 if body.counterparty_balance > 0 && counterparty_addr != Hash256::ZERO {
                     let mut counterparty = self.get_or_create_account(&counterparty_addr);
                     counterparty.balance += body.counterparty_balance;
-                    self.accounts.insert(counterparty_addr.0, counterparty.clone());
-                    self.wal.append(WalOp::SetAccount(counterparty_addr, counterparty), self.height());
+                    self.accounts
+                        .insert(counterparty_addr.0, counterparty.clone());
+                    self.wal.append(
+                        WalOp::SetAccount(counterparty_addr, counterparty),
+                        self.height(),
+                    );
                 }
 
                 Ok(gas.consumed)
@@ -3876,7 +6234,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Validate escrow exists and has locked funds
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
@@ -3905,30 +6264,29 @@ impl StateDB {
                 // the state is already finalized - no further disputes allowed.
                 if escrow.staked_balance > 0 && self.height() >= escrow.staked_balance {
                     return Err(StateError::ExecutionError(
-                        "channel dispute: challenge period has expired, state is finalized".to_string(),
+                        "channel dispute: challenge period has expired, state is finalized"
+                            .to_string(),
                     ));
                 }
 
                 // State nonce must be strictly higher than the previously disputed state.
                 // This prevents replay attacks with old channel states.
                 if escrow.staked_balance > 0 && body.state_nonce <= escrow.nonce {
-                    return Err(StateError::ExecutionError(
-                        format!(
-                            "channel dispute: state_nonce {} must exceed previously disputed nonce {}",
-                            body.state_nonce, escrow.nonce
-                        ),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "channel dispute: state_nonce {} must exceed previously disputed nonce {}",
+                        body.state_nonce, escrow.nonce
+                    )));
                 }
 
                 // Validate balance conservation: claimed split must not exceed locked funds.
-                let claimed_total = body.opener_balance.saturating_add(body.counterparty_balance);
+                let claimed_total = body
+                    .opener_balance
+                    .saturating_add(body.counterparty_balance);
                 if claimed_total > escrow.balance {
-                    return Err(StateError::ExecutionError(
-                        format!(
-                            "channel dispute: claimed balances ({}) exceed locked funds ({})",
-                            claimed_total, escrow.balance
-                        ),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "channel dispute: claimed balances ({}) exceed locked funds ({})",
+                        claimed_total, escrow.balance
+                    )));
                 }
 
                 // Update dispute state in escrow.
@@ -3936,7 +6294,8 @@ impl StateDB {
                 escrow.nonce = body.state_nonce;
                 escrow.staked_balance = challenge_expiry;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 Ok(gas.consumed)
             }
@@ -3951,7 +6310,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Validate proof is non-empty
                 if body.proof_data.is_empty() {
@@ -3981,7 +6341,10 @@ impl StateDB {
                         merkle_siblings: vec![vec![]], // single-child: no siblings needed
                         expected_merkle_root: body.block_hash.0, // single-child: root = child hash
                     };
-                    if !arc_crypto::stwo_air::verify_recursive_proof(&recursive_input, &body.proof_data) {
+                    if !arc_crypto::stwo_air::verify_recursive_proof(
+                        &recursive_input,
+                        &body.proof_data,
+                    ) {
                         return Err(StateError::ExecutionError(
                             "shard proof: STARK proof verification failed".to_string(),
                         ));
@@ -4000,25 +6363,42 @@ impl StateDB {
                 let mut proof_record = self.get_or_create_account(&proof_key);
                 // Store proof hash in the "balance" field as a u64 fingerprint
                 // (first 8 bytes of BLAKE3 hash). Full proof data is in the TX itself.
-                proof_record.balance = u64::from_le_bytes(proof_hash.0[..8].try_into().unwrap_or([0u8; 8]));
+                proof_record.balance =
+                    u64::from_le_bytes(proof_hash.0[..8].try_into().unwrap_or([0u8; 8]));
                 proof_record.nonce = body.block_height;
                 self.accounts.insert(proof_key.0, proof_record.clone());
-                self.wal.append(WalOp::SetAccount(proof_key, proof_record), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(proof_key, proof_record), self.height());
 
                 Ok(gas.consumed)
             }
             TxBody::InferenceAttestation(body) => {
                 // --- Tier 2 Optimistic Inference Attestation ---
-                // 1. Verify sender nonce
-                let mut sender = self.get_or_create_account(&tx.from);
+                //
+                // This transaction records a provider's signed model/input/
+                // output commitment and optionally locks a challenge bond. It
+                // does NOT pay a reward by itself: a raw self-signed
+                // attestation has no coordinator-issued job or assignment and
+                // used to let anyone drain the treasury with bond=0. Verified
+                // community jobs are paid by `CommunityInferenceReward`.
+
+                // 1. Verify sender nonce against a detached account. A stale
+                // transaction from a previously unseen sender must not create
+                // an unpersisted zero account on its failure path.
+                let mut sender = self
+                    .get_account(&tx.from)
+                    .unwrap_or_else(|| Account::new(tx.from, 0));
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
                         expected: sender.nonce,
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("inference attestation nonce overflow".to_string())
+                })?;
 
-                // 2. Verify sender has sufficient balance for bond
+                // 2. Verify sender has sufficient balance for the bond.
                 if sender.balance < body.bond {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -4026,28 +6406,403 @@ impl StateDB {
                     });
                 }
 
-                // 3. Debit bond from sender and increment nonce
-                sender.balance -= body.bond;
-                sender.nonce += 1;
-                self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                // 3. Prebuild optional escrow state before the first write.
+                //    bond == 0 (community-worker path): nothing to lock, so no
+                //    escrow is created. bond > 0: lock the bond in a
+                //    deterministic escrow keyed by BLAKE3("arc-inference" ||
+                //    attestation_hash) and queue it for release after
+                //    `challenge_period` blocks. See the escrow encoding at the
+                //    top of this file (code_hash = attester, nonce = release
+                //    height, storage_root = MAGIC|status).
+                let escrow_candidate = if body.bond > 0 {
+                    let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+                    if self.accounts.contains_key(&escrow_addr.0) {
+                        return Err(StateError::ExecutionError(
+                            "inference attestation escrow already exists".to_string(),
+                        ));
+                    }
+                    let release_height = self
+                        .height()
+                        .checked_add(body.challenge_period)
+                        .ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "inference attestation release height overflow".to_string(),
+                            )
+                        })?;
+                    let mut escrow = Account::new(escrow_addr, 0);
+                    escrow.balance = body.bond;
+                    escrow.code_hash = tx.from; // refund target
+                    escrow.nonce = release_height; // maturation deadline
+                    let mut sr = [0u8; 32];
+                    sr[..8].copy_from_slice(&ATTEST_ESCROW_MAGIC);
+                    sr[8] = ATTEST_STATUS_OPEN;
+                    escrow.storage_root = Hash256(sr);
+                    Some((escrow_addr, release_height, escrow))
+                } else {
+                    None
+                };
 
-                // 4. Lock bond in deterministic escrow: BLAKE3("arc-inference" || attestation_hash)
-                let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
-                let mut escrow = self.get_or_create_account(&escrow_addr);
-                escrow.balance = body.bond;
-                // Store model_id fingerprint in nonce (for lookup)
-                escrow.nonce = u64::from_le_bytes(body.model_id.0[..8].try_into().unwrap_or([0u8; 8]));
-                // Store the current block height in storage_root (as metadata)
-                // so the challenge period can be verified later.
-                let mut meta_input = Vec::new();
-                meta_input.extend_from_slice(&body.input_hash.0);
-                meta_input.extend_from_slice(&body.output_hash.0);
-                meta_input.extend_from_slice(&body.challenge_period.to_le_bytes());
-                meta_input.extend_from_slice(&self.height().to_le_bytes());
-                escrow.storage_root = hash_bytes(&meta_input);
-                self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                // 4. Commit only after every fallible precondition succeeded.
+                sender.balance = sender.balance.checked_sub(body.bond).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "inference attestation balance underflow".to_string(),
+                    )
+                })?;
+                sender.nonce = next_nonce;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                if let Some((escrow_addr, release_height, escrow)) = escrow_candidate {
+                    self.accounts.insert(escrow_addr.0, escrow.clone());
+                    self.wal
+                        .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+
+                    // Queue for the maturation sweep. Buckets are kept sorted
+                    // so the per-block drain order is deterministic.
+                    let mut q = self.pending_bond_releases.lock();
+                    let bucket = q.entry(release_height).or_default();
+                    if let Err(pos) = bucket.binary_search(&escrow_addr.0) {
+                        bucket.insert(pos, escrow_addr.0);
+                    }
+                }
+
+                Ok(gas.consumed)
+            }
+            TxBody::CommunityInferenceReward(body) => {
+                if self.active_protocol_version().major == 3 {
+                    self.validate_community_reward_admission(tx, body, self.height())?;
+                }
+                if !self.community_rewards_v1_active() {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: protocol feature is not active at this height"
+                            .to_string(),
+                    ));
+                }
+                // The outer signer is an active-validator aggregator. It does
+                // not by itself certify off-chain verification; the bounded
+                // approval quorum below is the authorization boundary.
+                if !self.is_validator(&tx.from) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: signer {} is not an active validator",
+                        tx.from.to_hex()
+                    )));
+                }
+                self.verify_transaction_signature(tx).map_err(|_| {
+                    StateError::ExecutionError(
+                        "community inference reward: invalid validator signature".to_string(),
+                    )
+                })?;
+                let expected_domain =
+                    arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+                if body.chain_domain != expected_domain {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: wrong chain domain".to_string(),
+                    ));
+                }
+                if body.job_id == Hash256::ZERO {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: job_id cannot be zero".to_string(),
+                    ));
+                }
+                if body.coordinator != tx.from || !self.is_validator(&body.coordinator) {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: assignment coordinator must be the active outer signer"
+                            .to_string(),
+                    ));
+                }
+                if body.assignment_epoch == Hash256::ZERO {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: assignment_epoch cannot be zero".to_string(),
+                    ));
+                }
+                match self.recovery_context() {
+                    Some(context)
+                        if body.recovery_epoch == context.recovery_epoch
+                            && body.validator_set_id == context.validator_set_id
+                            && body.transaction_domain == context.domain_hash() => {}
+                    Some(_) => {
+                        return Err(StateError::ExecutionError(
+                            "community inference reward: recovery epoch, validator-set ID, or transaction domain does not match active state"
+                                .to_string(),
+                        ));
+                    }
+                    None if body.recovery_epoch == 0
+                        && body.validator_set_id == 0
+                        && body.transaction_domain == Hash256::ZERO => {}
+                    None => {
+                        return Err(StateError::ExecutionError(
+                            "community inference reward: recovery binding is non-zero on legacy/dev state"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let expected_job_id =
+                    arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+                        &body.coordinator,
+                        &body.assignment_epoch,
+                        body.job_nonce,
+                        &body.model_id,
+                        &body.input_hash,
+                        body.max_tokens,
+                    );
+                if body.job_id != expected_job_id {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: job_id does not match its exact assignment commitment"
+                            .to_string(),
+                    ));
+                }
+                if body.max_tokens == 0 {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: max_tokens must be positive".to_string(),
+                    ));
+                }
+                if self.height() > body.expires_at_height {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: job expired at height {} (current {})",
+                        body.expires_at_height,
+                        self.height()
+                    )));
+                }
+
+                let worker_attestation = body.reconstruct_worker_attestation();
+                self.verify_transaction_signature(&worker_attestation)
+                    .map_err(|_| {
+                        StateError::ExecutionError(
+                            "community inference reward: invalid worker certificate signature"
+                                .to_string(),
+                        )
+                    })?;
+
+                let treasury_addr = arc_types::transaction::inference_reward_treasury_address();
+                let worker_stake = self.get_validator_stake(&body.worker).unwrap_or(0);
+                if below_policy_minimum(
+                    worker_stake,
+                    arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+                ) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: worker stake {} is below active policy minimum {}",
+                        worker_stake,
+                        arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE
+                    )));
+                }
+                if body.worker == treasury_addr {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: treasury cannot be the worker".to_string(),
+                    ));
+                }
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                let job_marker_addr = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                };
+                if self.accounts.contains_key(&job_marker_addr.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: job {} already paid",
+                        body.job_id.to_hex()
+                    )));
+                }
+                let certificate_marker_addr = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                };
+                if self.accounts.contains_key(&certificate_marker_addr.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: worker certificate {} already paid",
+                        body.worker_certificate.attestation_hash.to_hex()
+                    )));
+                }
+                let recovery_probe_marker_addr = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                };
+                if let Some(marker) = recovery_probe_marker_addr
+                    && self.accounts.contains_key(&marker.0)
+                {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: recovery probe {} already paid",
+                        body.assignment_epoch.to_hex()
+                    )));
+                }
+
+                // All cheap structural, certificate, and replay checks happen
+                // before the approval quorum's Ed25519 work. No state has been
+                // mutated yet, so every failure remains atomic.
+                self.verify_community_reward_validator_approvals(body)?;
+
+                // Rewards are all-or-nothing. Partial tail payouts made worker
+                // selection depend on parallel lock order and could fork state.
+                let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+                // Validate the recipient credit before mutating the treasury.
+                // State transitions are not automatically rolled back when an
+                // executor arm returns an error, so every fallible check must
+                // happen before the first write.
+                // Build a detached candidate account. `get_or_create_account`
+                // inserts immediately, which would mutate state even when the
+                // treasury check below fails. Failed reward execution must be
+                // atomic and must not leave an un-WALed zero-balance worker.
+                let mut worker = self
+                    .get_account(&body.worker)
+                    .unwrap_or_else(|| Account::new(body.worker, 0));
+                worker.balance = worker.balance.checked_add(reward).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "community inference reward: worker balance overflow".to_string(),
+                    )
+                })?;
+                let mut treasury = self.get_account(&treasury_addr).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "community inference reward: treasury is not funded".to_string(),
+                    )
+                })?;
+                if treasury.balance < reward {
+                    return Err(StateError::InsufficientBalance {
+                        have: treasury.balance,
+                        need: reward,
+                    });
+                }
+                treasury.balance = treasury.balance.checked_sub(reward).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "community inference reward: treasury balance underflow".to_string(),
+                    )
+                })?;
+
+                // Marker candidates are detached too. Although the addresses
+                // are cryptographic hashes, reject every semantic collision so
+                // a future hash/domain change cannot overwrite a live account.
+                if job_marker_addr == certificate_marker_addr
+                    || job_marker_addr == body.worker
+                    || certificate_marker_addr == body.worker
+                    || job_marker_addr == treasury_addr
+                    || certificate_marker_addr == treasury_addr
+                    || recovery_probe_marker_addr.is_some_and(|marker| {
+                        marker == job_marker_addr
+                            || marker == certificate_marker_addr
+                            || marker == body.worker
+                            || marker == body.coordinator
+                            || marker == treasury_addr
+                    })
+                {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: marker address collision".to_string(),
+                    ));
+                }
+                let mut job_marker = Account::new(job_marker_addr, 0);
+                job_marker.nonce = 1;
+                job_marker.code_hash = body.worker;
+                job_marker.storage_root = body.output_hash;
+                let mut certificate_marker = Account::new(certificate_marker_addr, 0);
+                certificate_marker.nonce = 1;
+                certificate_marker.code_hash = body.worker;
+                certificate_marker.storage_root = body.job_id;
+                let recovery_probe_marker = recovery_probe_marker_addr.map(|address| {
+                    let mut marker = Account::new(address, 0);
+                    marker.nonce = 1;
+                    marker.code_hash = body.coordinator;
+                    marker.storage_root = body.job_id;
+                    (address, marker)
+                });
+                let budget_candidates = if protocol_v3 {
+                    Some(self.community_reward_budget_candidates_at(body, self.height())?)
+                } else {
+                    None
+                };
+
+                self.accounts.insert(treasury_addr.0, treasury.clone());
+                self.accounts.insert(body.worker.0, worker.clone());
+                self.accounts.insert(job_marker_addr.0, job_marker.clone());
+                self.accounts
+                    .insert(certificate_marker_addr.0, certificate_marker.clone());
+                if let Some((address, marker)) = &recovery_probe_marker {
+                    self.accounts.insert(address.0, marker.clone());
+                }
+                if let Some(budget) = &budget_candidates {
+                    for (address, account) in [
+                        &budget.block,
+                        &budget.epoch,
+                        &budget.worker,
+                        &budget.coordinator,
+                    ] {
+                        self.accounts.insert(address.0, account.clone());
+                    }
+                }
+                if self.use_jmt {
+                    let mut jmt = self.jmt.lock();
+                    for (address, account) in [
+                        (treasury_addr, &treasury),
+                        (body.worker, &worker),
+                        (job_marker_addr, &job_marker),
+                        (certificate_marker_addr, &certificate_marker),
+                    ] {
+                        let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
+                    }
+                    if let Some((address, marker)) = &recovery_probe_marker {
+                        let value = hash_bytes(&bincode::serialize(marker).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
+                    }
+                    if let Some(budget) = &budget_candidates {
+                        for (address, account) in [
+                            &budget.block,
+                            &budget.epoch,
+                            &budget.worker,
+                            &budget.coordinator,
+                        ] {
+                            let value =
+                                hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                            jmt.update_leaf(address.0, value);
+                        }
+                    }
+                }
+                self.wal
+                    .append(WalOp::SetAccount(treasury_addr, treasury), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.worker, worker), self.height());
+                self.wal.append(
+                    WalOp::SetAccount(job_marker_addr, job_marker),
+                    self.height(),
+                );
+                self.wal.append(
+                    WalOp::SetAccount(certificate_marker_addr, certificate_marker),
+                    self.height(),
+                );
+                if let Some((address, marker)) = recovery_probe_marker {
+                    self.wal
+                        .append(WalOp::SetAccount(address, marker), self.height());
+                }
+                if let Some(budget) = budget_candidates {
+                    for (address, account) in [
+                        budget.block,
+                        budget.epoch,
+                        budget.worker,
+                        budget.coordinator,
+                    ] {
+                        self.wal
+                            .append(WalOp::SetAccount(address, account), self.height());
+                    }
+                }
 
                 Ok(gas.consumed)
             }
@@ -4071,11 +6826,13 @@ impl StateDB {
                 }
 
                 // 3. Look up the attestation escrow
-                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                let escrow_addr =
+                    hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
-                        "inference challenge: attestation escrow not found or already resolved".to_string(),
+                        "inference challenge: attestation escrow not found or already resolved"
+                            .to_string(),
                     ));
                 }
 
@@ -4083,14 +6840,25 @@ impl StateDB {
                 sender.balance -= body.challenger_bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // 5. Lock challenger's bond in the same escrow
+                // 5. Lock challenger's bond in the same escrow AND mark the
+                //    escrow CHALLENGED so the bond-maturation sweep leaves it
+                //    locked. A disputed/slashed bond must never be auto-refunded
+                //    to the attester; it stays escrowed pending dispute
+                //    resolution (see the escrow-encoding note at file top).
                 let total_bond = escrow.balance + body.challenger_bond;
                 let mut escrow = escrow.clone();
                 escrow.balance = total_bond;
+                let mut sr = escrow.storage_root.0;
+                if sr[..8] == ATTEST_ESCROW_MAGIC {
+                    sr[8] = ATTEST_STATUS_CHALLENGED;
+                    escrow.storage_root = Hash256(sr);
+                }
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 // 6. Dispute resolution: if challenger_output_hash differs from the
                 //    attested output, the dispute is recorded.  On-chain re-execution
@@ -4117,9 +6885,10 @@ impl StateDB {
 
                 // Validate tier (1-4)
                 if body.tier == 0 || body.tier > 4 {
-                    return Err(StateError::ExecutionError(
-                        format!("inference register: invalid tier {}, must be 1-4", body.tier),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "inference register: invalid tier {}, must be 1-4",
+                        body.tier
+                    )));
                 }
 
                 // Validate sufficient balance for stake bond
@@ -4134,12 +6903,10 @@ impl StateDB {
                 let min_stakes = [0u64, 1_000, 5_000, 10_000, 25_000];
                 let min_stake = min_stakes[body.tier as usize];
                 if body.stake_bond < min_stake {
-                    return Err(StateError::ExecutionError(
-                        format!(
-                            "inference register: stake {} below minimum {} for tier {}",
-                            body.stake_bond, min_stake, body.tier
-                        ),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "inference register: stake {} below minimum {} for tier {}",
+                        body.stake_bond, min_stake, body.tier
+                    )));
                 }
 
                 // Lock stake: move from balance to staked_balance
@@ -4147,7 +6914,8 @@ impl StateDB {
                 sender.staked_balance += body.stake_bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4171,8 +6939,7 @@ impl StateDB {
                     });
                 }
 
-                let escrow_addr_bytes =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr_bytes = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 let escrow_addr = Hash256(escrow_addr_bytes);
                 let existing = self.get_or_create_account(&escrow_addr);
                 if existing.balance != 0 {
@@ -4187,7 +6954,8 @@ impl StateDB {
                 sender.balance -= body.max_fee;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit escrow + stash metadata commitment.
                 let commitment = InferenceEscrowOpenBody::metadata_commitment(
@@ -4222,13 +6990,11 @@ impl StateDB {
                 }
                 if body.replicas.is_empty() {
                     return Err(StateError::ExecutionError(
-                        "inference escrow release: must name at least one replica"
-                            .into(),
+                        "inference escrow release: must name at least one replica".into(),
                     ));
                 }
 
-                let escrow_addr_bytes =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr_bytes = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 let escrow_addr = Hash256(escrow_addr_bytes);
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -4247,15 +7013,15 @@ impl StateDB {
                 );
                 if escrow.storage_root.0 != expected {
                     return Err(StateError::ExecutionError(
-                        "inference escrow release: metadata commitment mismatch"
-                            .into(),
+                        "inference escrow release: metadata commitment mismatch".into(),
                     ));
                 }
 
                 // Advance release-submitter nonce.
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // 40/25/15/20 split; treasury absorbs all truncation residue.
                 let total = escrow.balance;
@@ -4264,14 +7030,12 @@ impl StateDB {
                 let observer_share = total * 15 / 100;
                 let per_replica = replicas_pool / body.replicas.len() as u64;
                 let replicas_paid = per_replica * body.replicas.len() as u64;
-                let treasury_share =
-                    total - proposer_share - replicas_paid - observer_share;
+                let treasury_share = total - proposer_share - replicas_paid - observer_share;
 
                 // Credit proposer.
                 let mut proposer_acc = self.get_or_create_account(&body.proposer);
                 proposer_acc.balance += proposer_share;
-                self.accounts
-                    .insert(body.proposer.0, proposer_acc.clone());
+                self.accounts.insert(body.proposer.0, proposer_acc.clone());
                 self.wal.append(
                     WalOp::SetAccount(body.proposer, proposer_acc),
                     self.height(),
@@ -4289,10 +7053,8 @@ impl StateDB {
                 let mut obs = self.get_or_create_account(&body.observer_pool);
                 obs.balance += observer_share;
                 self.accounts.insert(body.observer_pool.0, obs.clone());
-                self.wal.append(
-                    WalOp::SetAccount(body.observer_pool, obs),
-                    self.height(),
-                );
+                self.wal
+                    .append(WalOp::SetAccount(body.observer_pool, obs), self.height());
 
                 // Credit treasury (includes rounding residue).
                 let mut tre = self.get_or_create_account(&body.treasury);
@@ -4307,10 +7069,8 @@ impl StateDB {
                 released.balance = 0;
                 released.storage_root = Hash256::ZERO;
                 self.accounts.insert(escrow_addr_bytes, released.clone());
-                self.wal.append(
-                    WalOp::SetAccount(escrow_addr, released),
-                    self.height(),
-                );
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, released), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4343,8 +7103,7 @@ impl StateDB {
                 }
                 // Reject duplicate registrations (same model_id already
                 // on-chain). Keeps the registry tamper-evident.
-                let registry_addr_bytes =
-                    ModelRegistrationBody::registry_account(&body.model_id);
+                let registry_addr_bytes = ModelRegistrationBody::registry_account(&body.model_id);
                 let registry_addr = Hash256(registry_addr_bytes);
                 let existing = self.get_or_create_account(&registry_addr);
                 if existing.storage_root != Hash256::ZERO {
@@ -4357,13 +7116,15 @@ impl StateDB {
                 sender.balance -= fee;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let treasury = Hash256(arc_crypto::hash_bytes(b"arc-treasury").0);
                 let mut tre = self.get_or_create_account(&treasury);
                 tre.balance += fee;
                 self.accounts.insert(treasury.0, tre.clone());
-                self.wal.append(WalOp::SetAccount(treasury, tre), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(treasury, tre), self.height());
 
                 // Write the registry entry.
                 let commitment = ModelRegistrationBody::metadata_commitment(
@@ -4380,7 +7141,8 @@ impl StateDB {
                 // patch can meter royalty payouts from this pool.
                 reg.balance = 0; // fees already sent to treasury; reg holds no value today
                 self.accounts.insert(registry_addr_bytes, reg.clone());
-                self.wal.append(WalOp::SetAccount(registry_addr, reg), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(registry_addr, reg), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4398,10 +7160,10 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                let req_addr_bytes =
-                    ModelRequestBody::request_account(&body.request_id);
+                let req_addr_bytes = ModelRequestBody::request_account(&body.request_id);
                 let req_addr = Hash256(req_addr_bytes);
                 let mut req = self.get_or_create_account(&req_addr);
                 // Encode request state in existing account slots:
@@ -4418,7 +7180,8 @@ impl StateDB {
                 meta.extend_from_slice(&tx.from.0);
                 req.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(req_addr_bytes, req.clone());
-                self.wal.append(WalOp::SetAccount(req_addr, req), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(req_addr, req), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4453,15 +7216,14 @@ impl StateDB {
                 sender.balance -= body.bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Lock bond in the deterministic claim account. Ranges
                 // are committed via storage_root so slashing/release can
                 // verify what was claimed without a separate DashMap.
-                let claim_addr_bytes = ShardCoverageClaimBody::claim_account(
-                    &body.model_id,
-                    &body.node_pubkey,
-                );
+                let claim_addr_bytes =
+                    ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
                 let claim_addr = Hash256(claim_addr_bytes);
                 let mut claim = self.get_or_create_account(&claim_addr);
                 if claim.balance != 0 {
@@ -4484,7 +7246,8 @@ impl StateDB {
                 meta.extend_from_slice(&tx.from.0);
                 claim.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(claim_addr_bytes, claim.clone());
-                self.wal.append(WalOp::SetAccount(claim_addr, claim), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(claim_addr, claim), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4507,10 +7270,10 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                let cap_addr_bytes =
-                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr_bytes = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 let cap_addr = Hash256(cap_addr_bytes);
                 let mut cap = self.get_or_create_account(&cap_addr);
                 // Encode capacity in storage_root so a replay of history
@@ -4528,7 +7291,8 @@ impl StateDB {
                 cap.nonce = self.height(); // advertised_at
                 cap.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(cap_addr_bytes, cap.clone());
-                self.wal.append(WalOp::SetAccount(cap_addr, cap), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(cap_addr, cap), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4553,15 +7317,19 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Derive a proposal-specific account from the input
                 // snapshot hash so replays collide and the latest
                 // proposer for a given input wins (last-write in
                 // block order).
-                let prop_addr = Hash256(arc_crypto::hash_bytes(
-                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
-                ).0);
+                let prop_addr = Hash256(
+                    arc_crypto::hash_bytes(
+                        &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
+                    )
+                    .0,
+                );
                 let mut prop = self.get_or_create_account(&prop_addr);
                 // Serialize compact representation into storage_root so
                 // the exact assignment replayed from history matches.
@@ -4579,7 +7347,8 @@ impl StateDB {
                 prop.nonce = self.height();
                 prop.storage_root = arc_crypto::hash_bytes(&buf);
                 self.accounts.insert(prop_addr.0, prop.clone());
-                self.wal.append(WalOp::SetAccount(prop_addr, prop), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(prop_addr, prop), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4597,8 +7366,7 @@ impl StateDB {
                     });
                 }
 
-                let escrow_addr_bytes =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr_bytes = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 let escrow_addr = Hash256(escrow_addr_bytes);
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -4635,16 +7403,15 @@ impl StateDB {
                 sender.balance += escrow.balance;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let mut refunded = escrow;
                 refunded.balance = 0;
                 refunded.storage_root = Hash256::ZERO;
                 self.accounts.insert(escrow_addr_bytes, refunded.clone());
-                self.wal.append(
-                    WalOp::SetAccount(escrow_addr, refunded),
-                    self.height(),
-                );
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, refunded), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4725,12 +7492,11 @@ impl StateDB {
                 sender.balance -= body.max_reward;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // ── 4. Create request escrow ──
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance != 0 || escrow.code_hash != Hash256::ZERO {
                     return Err(StateError::ExecutionError(
@@ -4760,7 +7526,8 @@ impl StateDB {
                 meta.extend_from_slice(&self.height().to_le_bytes());
                 escrow.storage_root = hash_bytes(&meta);
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 // Store the requester address so finalize knows whom to refund.
                 self.set_storage(
@@ -4779,8 +7546,7 @@ impl StateDB {
                 self.set_storage(
                     &escrow_addr,
                     hash_bytes(b"tier1.votes"),
-                    bincode::serialize(&Vec::<(Address, Hash256)>::new())
-                        .unwrap_or_default(),
+                    bincode::serialize(&Vec::<(Address, Hash256)>::new()).unwrap_or_default(),
                 );
                 // Persist the request_id at a known storage key so a node
                 // restart can rebuild `tier1_pending` (which is in-memory
@@ -4836,9 +7602,7 @@ impl StateDB {
                 }
 
                 // ── 3. Look up request escrow ──
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
@@ -4877,7 +7641,7 @@ impl StateDB {
                     .map(|kv| Hash256(*kv.key()))
                     .collect();
                 // Deterministic ordering before scoring (HashMap iteration is not).
-                eligible.sort_by(|a, b| a.0.cmp(&b.0));
+                eligible.sort_by_key(|a| a.0);
                 let mut scored: Vec<(Address, Hash256)> = eligible
                     .into_iter()
                     .map(|a| {
@@ -4887,7 +7651,7 @@ impl StateDB {
                         (a, hash_bytes(&input))
                     })
                     .collect();
-                scored.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+                scored.sort_by_key(|a| a.1.0);
                 let members: Vec<Address> = scored
                     .into_iter()
                     .take(committee_size)
@@ -4902,9 +7666,7 @@ impl StateDB {
 
                 // ── 5. Load existing votes, reject duplicates, append ──
                 let key = hash_bytes(b"tier1.votes");
-                let existing = self
-                    .get_storage(&escrow_addr, &key)
-                    .unwrap_or_default();
+                let existing = self.get_storage(&escrow_addr, &key).unwrap_or_default();
                 let mut votes: Vec<(Address, Hash256)> =
                     bincode::deserialize(&existing).unwrap_or_default();
                 if votes.iter().any(|(v, _)| v.0 == tx.from.0) {
@@ -4913,10 +7675,9 @@ impl StateDB {
                     ));
                 }
                 votes.push((tx.from, body.output_hash));
-                let encoded =
-                    bincode::serialize(&votes).map_err(|e| StateError::ExecutionError(
-                        format!("tier1 vote: serialize votes: {}", e),
-                    ))?;
+                let encoded = bincode::serialize(&votes).map_err(|e| {
+                    StateError::ExecutionError(format!("tier1 vote: serialize votes: {}", e))
+                })?;
                 self.set_storage(&escrow_addr, key, encoded);
 
                 // ── 6. If voter attached blob, store it for the requester ──
@@ -4931,7 +7692,8 @@ impl StateDB {
                 // ── 7. Bump signer nonce ──
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // ── 8. Flip status to Voting (if still Open) ──
                 if status == TIER1_STATUS_OPEN {
@@ -4960,12 +7722,11 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // ── 2. Look up request escrow ──
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
@@ -4993,8 +7754,7 @@ impl StateDB {
                 let vote_count = votes.len();
 
                 // ── 4. Determine if finalization is eligible ──
-                let timeout_reached =
-                    now >= anchor_height.saturating_add(deadline_blocks);
+                let timeout_reached = now >= anchor_height.saturating_add(deadline_blocks);
                 let all_voted = vote_count >= committee_size;
                 if !timeout_reached && !all_voted {
                     return Err(StateError::ExecutionError(format!(
@@ -5037,15 +7797,11 @@ impl StateDB {
                 let new_status: u8;
                 if majority.1 >= min_agreement {
                     // Consensus reached: pay agreeing voters, rebate requester, treasury cut.
-                    let voters_pool =
-                        max_reward * ttx::TIER1_REWARD_SHARE_VOTERS_BPS / 10_000;
-                    let refund =
-                        max_reward * ttx::TIER1_REWARD_SHARE_REFUND_BPS / 10_000;
-                    let treasury =
-                        max_reward * ttx::TIER1_REWARD_SHARE_TREASURY_BPS / 10_000;
+                    let voters_pool = max_reward * ttx::TIER1_REWARD_SHARE_VOTERS_BPS / 10_000;
+                    let refund = max_reward * ttx::TIER1_REWARD_SHARE_REFUND_BPS / 10_000;
+                    let treasury = max_reward * ttx::TIER1_REWARD_SHARE_TREASURY_BPS / 10_000;
                     // Anti-rounding remainder goes to treasury.
-                    let remainder = max_reward
-                        .saturating_sub(voters_pool + refund + treasury);
+                    let remainder = max_reward.saturating_sub(voters_pool + refund + treasury);
 
                     let agreeing: Vec<Address> = votes
                         .iter()
@@ -5057,8 +7813,7 @@ impl StateDB {
                     } else {
                         voters_pool / agreeing.len() as u64
                     };
-                    let voter_rem =
-                        voters_pool.saturating_sub(per_voter * agreeing.len() as u64);
+                    let voter_rem = voters_pool.saturating_sub(per_voter * agreeing.len() as u64);
 
                     // Credit each agreeing voter.
                     for v in &agreeing {
@@ -5130,6 +7885,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::FaucetClaim(body) => {
+                if self.active_protocol_version().major == 3 {
+                    self.validate_v3_faucet_admission(tx, body)?;
+                }
                 // Validator-authorized faucet drain. The signer (tx.from)
                 // must be in the active validator set — that authorization
                 // is what lets us debit a shared pool the signer doesn't
@@ -5154,9 +7912,10 @@ impl StateDB {
                 // No signer-nonce check or bump. A validator-signed
                 // FaucetClaim is authorized by the Ed25519 signature plus
                 // is_validator(tx.from) — both deterministic across peers.
-                // Replay protection comes from the tx_hash receipt dedup
-                // in consensus.rs:966-973 plus the per-address rate limit
-                // in the /faucet/claim handler.
+                // The canonical recipient marker below provides chain-wide
+                // exactly-once protection even when different validators sign
+                // distinct transaction hashes for the same recipient. RPC
+                // rate limits are only an additional abuse control.
                 //
                 // We INTENTIONALLY do NOT enforce signer.nonce == tx.nonce
                 // here. Peers' committed-state nonce for a validator
@@ -5168,52 +7927,93 @@ impl StateDB {
                 // the bug v0.7.1 was meant to fix. Signer balance is also
                 // not touched: the pool is the shared source.
 
-                // Debit the system faucet pool. Account exists on every
-                // seed because it's prefunded in genesis.toml as the first
-                // [[accounts]] entry (blake3(&[0u8])).
                 let pool_addr = arc_types::transaction::faucet_pool_address();
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                let marker_addr = if protocol_v3 {
+                    arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient)
+                } else {
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient)
+                };
+                let recipient_is_existing_faucet_marker =
+                    self.get_account(&body.recipient).is_some_and(|account| {
+                        account.balance == 0
+                            && account.nonce == 1
+                            && account.code_hash != Hash256::ZERO
+                            && arc_types::transaction::FaucetClaimBody::marker_address(
+                                &account.code_hash,
+                            ) == body.recipient
+                    });
+                let recipient_is_reserved = if protocol_v3 {
+                    is_reserved_system_account(&body.recipient)
+                } else {
+                    is_legacy_reserved_system_account(&body.recipient)
+                };
+                if recipient_is_reserved
+                    || marker_addr == pool_addr
+                    || marker_addr == body.recipient
+                    || recipient_is_existing_faucet_marker
                 {
-                    let mut pool = self
-                        .accounts
-                        .get_mut(&pool_addr.0)
-                        .ok_or_else(|| StateError::ExecutionError(
-                            "faucet claim: system faucet pool account is not prefunded".into(),
-                        ))?;
-                    if pool.balance < body.amount {
-                        return Err(StateError::InsufficientBalance {
-                            have: pool.balance,
-                            need: body.amount,
-                        });
-                    }
-                    pool.balance -= body.amount;
-                    if self.use_jmt {
-                        let h = hash_bytes(&bincode::serialize(pool.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(pool_addr.0, h);
-                    }
-                    if self.wal.is_active() {
-                        let snap = pool.clone();
-                        drop(pool);
-                        self.wal.append(WalOp::SetAccount(pool_addr, snap), self.height());
-                    }
+                    return Err(StateError::ExecutionError(
+                        "faucet claim: system account address collision".to_string(),
+                    ));
+                }
+                if self.accounts.contains_key(&marker_addr.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "faucet claim: recipient {} has already claimed",
+                        body.recipient
+                    )));
                 }
 
-                // Credit recipient.
-                {
-                    let mut recipient = self
-                        .accounts
-                        .entry(body.recipient.0)
-                        .or_insert_with(|| Account::new(body.recipient, 0));
-                    recipient.balance = recipient.balance.saturating_add(body.amount);
-                    if self.use_jmt {
-                        let h = hash_bytes(&bincode::serialize(recipient.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(body.recipient.0, h);
-                    }
-                    if self.wal.is_active() {
-                        let snap = recipient.clone();
-                        drop(recipient);
-                        self.wal.append(WalOp::SetAccount(body.recipient, snap), self.height());
+                // Validate every fallible condition against detached account
+                // copies before the first write. A failed faucet transaction
+                // must be atomic and must never leave a debited pool or a
+                // fabricated recipient account.
+                let mut pool = self.get_account(&pool_addr).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "faucet claim: system faucet pool account is not prefunded".into(),
+                    )
+                })?;
+                if pool.balance < body.amount {
+                    return Err(StateError::InsufficientBalance {
+                        have: pool.balance,
+                        need: body.amount,
+                    });
+                }
+                let mut recipient = self
+                    .get_account(&body.recipient)
+                    .unwrap_or_else(|| Account::new(body.recipient, 0));
+                recipient.balance =
+                    recipient.balance.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError(
+                            "faucet claim: recipient balance overflow".into(),
+                        )
+                    })?;
+                pool.balance -= body.amount;
+                let mut marker = Account::new(marker_addr, 0);
+                marker.nonce = 1;
+                marker.code_hash = body.recipient;
+                marker.storage_root = hash_bytes(&body.amount.to_be_bytes());
+
+                self.accounts.insert(pool_addr.0, pool.clone());
+                self.accounts.insert(body.recipient.0, recipient.clone());
+                self.accounts.insert(marker_addr.0, marker.clone());
+                if self.use_jmt {
+                    let mut jmt = self.jmt.lock();
+                    for (address, account) in [
+                        (pool_addr, &pool),
+                        (body.recipient, &recipient),
+                        (marker_addr, &marker),
+                    ] {
+                        let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
                     }
                 }
+                self.wal
+                    .append(WalOp::SetAccount(pool_addr, pool), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.recipient, recipient), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(marker_addr, marker), self.height());
 
                 Ok(gas.consumed)
             }
@@ -5228,6 +8028,12 @@ impl StateDB {
     /// execute stage which runs on a dedicated thread.
     /// Returns gas consumed on success.
     pub fn execute_tx_pub(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "pipeline/direct transaction execution is unavailable in recovery protocol v3"
+                    .to_string(),
+            ));
+        }
         self.execute_tx(tx)
     }
 
@@ -5247,6 +8053,12 @@ impl StateDB {
         receipt_success: &[bool],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "pre-executed pipeline commit is unavailable in recovery protocol v3".to_string(),
+            ));
+        }
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -5276,6 +8088,14 @@ impl StateDB {
             })
             .collect();
 
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
@@ -5292,7 +8112,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -5314,8 +8134,11 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.durable_wal_barrier()?;
 
         // Auto-prune old state every 100 blocks unless in archive mode.
         // Archive nodes keep full history for block explorers and analytics.
@@ -5327,10 +8150,316 @@ impl StateDB {
         Ok((block, receipts))
     }
 
+    /// Refund matured, unchallenged Tier 2 attestation bonds to their original
+    /// attesters and zero the escrows.
+    ///
+    /// Runs during block commit at the new `current_height`. Deterministic and
+    /// bounded: it drains up to [`MAX_BOND_RELEASES_PER_BLOCK`] escrows whose
+    /// release height is `<= current_height`, visiting them in
+    /// `pending_bond_releases` order (ascending release height, then ascending
+    /// escrow address — no map-iteration-order or wall-clock dependence). Each
+    /// escrow is validated against live account state before refunding.
+    /// Missing/already-zeroed escrows are dropped; CHALLENGED escrows are
+    /// dropped with the bond left locked pending dispute resolution; an OPEN,
+    /// matured escrow has its `balance` refunded to the attester
+    /// (`escrow.code_hash`) and is then zeroed.
+    ///
+    /// Conservation: every unit removed from an escrow is credited to exactly
+    /// one attester — a pure move, never a mint. Returns the number of bonds
+    /// refunded.
+    pub fn sweep_matured_bond_releases(&self, current_height: u64) -> usize {
+        // Phase 1: under the queue lock, collect up to the per-block cap of due
+        // escrow addresses and remove them from the queue. Kept short so the
+        // account mutations below run without holding the queue lock.
+        let due: Vec<[u8; 32]> = {
+            let mut q = self.pending_bond_releases.lock();
+            let mut picked: Vec<[u8; 32]> = Vec::new();
+            let mut empty_heights: Vec<u64> = Vec::new();
+            for (&h, bucket) in q.range_mut(..=current_height) {
+                if picked.len() >= MAX_BOND_RELEASES_PER_BLOCK {
+                    break;
+                }
+                let remaining = MAX_BOND_RELEASES_PER_BLOCK - picked.len();
+                let take = remaining.min(bucket.len());
+                picked.extend(bucket.drain(..take));
+                if bucket.is_empty() {
+                    empty_heights.push(h);
+                }
+            }
+            for h in empty_heights {
+                q.remove(&h);
+            }
+            picked
+        };
+
+        // Phase 2: refund each due escrow (order is already deterministic).
+        let mut refunded = 0usize;
+        for escrow_key in due {
+            let escrow_addr = Hash256(escrow_key);
+            let escrow = match self.accounts.get(&escrow_key) {
+                Some(e) => e.clone(),
+                None => continue, // already pruned/resolved
+            };
+            if escrow.balance == 0 {
+                continue; // already resolved
+            }
+            if escrow.storage_root.0[..8] != ATTEST_ESCROW_MAGIC {
+                continue; // not a Tier 2 attestation escrow
+            }
+            if escrow.storage_root.0[8] != ATTEST_STATUS_OPEN {
+                continue; // challenged/slashed: leave locked
+            }
+            if current_height < escrow.nonce {
+                // Not actually matured — defensive; the queue key equals the
+                // release height, so this only fires on a corrupt rebuild.
+                // Re-queue and skip rather than refund early.
+                let mut q = self.pending_bond_releases.lock();
+                let bucket = q.entry(escrow.nonce).or_default();
+                if let Err(pos) = bucket.binary_search(&escrow_key) {
+                    bucket.insert(pos, escrow_key);
+                }
+                continue;
+            }
+
+            let attester = escrow.code_hash;
+            let amount = escrow.balance;
+
+            // Credit the attester (mirrors the FaucetClaim credit conventions:
+            // JMT leaf update when enabled, WAL append when active).
+            {
+                let mut acct = self
+                    .accounts
+                    .entry(attester.0)
+                    .or_insert_with(|| Account::new(attester, 0));
+                acct.balance = acct.balance.saturating_add(amount);
+                if self.use_jmt {
+                    let h = hash_bytes(&bincode::serialize(acct.value()).unwrap_or_default());
+                    self.jmt.lock().update_leaf(attester.0, h);
+                }
+                if self.wal.is_active() {
+                    let snap = acct.clone();
+                    drop(acct);
+                    self.wal
+                        .append(WalOp::SetAccount(attester, snap), current_height);
+                }
+            }
+            self.dirty_accounts.insert(attester.0);
+
+            // Zero the escrow and clear the MAGIC (marks it resolved: a later
+            // challenge sees balance==0 and a rebuild will not re-queue it).
+            {
+                let mut esc = self
+                    .accounts
+                    .entry(escrow_key)
+                    .or_insert_with(|| Account::new(escrow_addr, 0));
+                esc.balance = 0;
+                esc.storage_root = Hash256::ZERO;
+                if self.use_jmt {
+                    let h = hash_bytes(&bincode::serialize(esc.value()).unwrap_or_default());
+                    self.jmt.lock().update_leaf(escrow_key, h);
+                }
+                if self.wal.is_active() {
+                    let snap = esc.clone();
+                    drop(esc);
+                    self.wal
+                        .append(WalOp::SetAccount(escrow_addr, snap), current_height);
+                }
+            }
+            self.dirty_accounts.insert(escrow_key);
+
+            refunded += 1;
+        }
+        refunded
+    }
+
+    /// Rebuild `pending_bond_releases` from surviving escrow accounts. Call
+    /// once at startup after any WAL replay / snapshot load (parallel to
+    /// [`rebuild_tier1_pending`]), since the queue is a derived, in-memory
+    /// index with no WAL op of its own.
+    ///
+    /// Strategy: scan every account whose `storage_root` carries the Tier 2
+    /// attestation MAGIC and is still OPEN with a non-zero balance, and
+    /// re-queue it under its release height (`escrow.nonce`). Zeroed/challenged
+    /// escrows are skipped. Returns the count re-queued.
+    pub fn rebuild_pending_bond_releases(&self) -> usize {
+        let mut q = self.pending_bond_releases.lock();
+        q.clear();
+        let mut rebuilt = 0usize;
+        for entry in self.accounts.iter() {
+            let acct = entry.value();
+            if acct.balance == 0 {
+                continue;
+            }
+            if acct.storage_root.0[..8] != ATTEST_ESCROW_MAGIC {
+                continue;
+            }
+            if acct.storage_root.0[8] != ATTEST_STATUS_OPEN {
+                continue;
+            }
+            let release_height = acct.nonce;
+            let escrow_key = *entry.key();
+            let bucket = q.entry(release_height).or_default();
+            if let Err(pos) = bucket.binary_search(&escrow_key) {
+                bucket.insert(pos, escrow_key);
+            }
+            rebuilt += 1;
+        }
+        rebuilt
+    }
+
+    /// Test/introspection helper: number of escrows currently queued for
+    /// bond release across all maturation heights.
+    #[cfg(test)]
+    fn pending_bond_release_count(&self) -> usize {
+        self.pending_bond_releases
+            .lock()
+            .values()
+            .map(|v| v.len())
+            .sum()
+    }
+
+    /// Enable no-pruning mode and prove whether this data set is complete from
+    /// the *initial* protocol-v3 recovery boundary.
+    ///
+    /// Merely toggling archive mode cannot establish historical completeness:
+    /// a node may already have pruned transaction bodies or receipts. The
+    /// proof walks every v3-and-later block once and binds its committed
+    /// transaction vector to the tx index, full body, and exact receipt. A
+    /// future recovery checkpoint that omits any earlier v3 row therefore
+    /// stays incomplete even though pruning is disabled after import.
+    pub fn enable_archive_mode(&mut self) -> bool {
+        self.archive_mode = true;
+        self.archive_history_boundary
+            .store(u64::MAX, Ordering::Release);
+        self.archive_history_verified_through
+            .store(u64::MAX, Ordering::Release);
+
+        if self.recovery_context().is_none() {
+            return false;
+        }
+        let current = self.height();
+        let boundary = (0..=current).find(|height| {
+            self.get_block(*height)
+                .is_some_and(|block| block.header.protocol_version.major >= 3)
+        });
+        let Some(boundary) = boundary else {
+            return false;
+        };
+        if !self.verify_archive_history_range(boundary, current) {
+            return false;
+        }
+        self.archive_history_boundary
+            .store(boundary, Ordering::Release);
+        self.archive_history_verified_through
+            .store(current, Ordering::Release);
+        true
+    }
+
+    /// True only after [`Self::enable_archive_mode`] proved every canonical
+    /// transaction and receipt from the initial v3 recovery boundary. New
+    /// archive blocks are checked incrementally before extending the claim.
+    pub fn archive_reward_history_complete_since_v3_recovery(&self) -> bool {
+        if !self.archive_mode || self.recovery_context().is_none() {
+            return false;
+        }
+        let boundary = self.archive_history_boundary.load(Ordering::Acquire);
+        let verified = self
+            .archive_history_verified_through
+            .load(Ordering::Acquire);
+        if boundary == u64::MAX || verified == u64::MAX || verified < boundary {
+            return false;
+        }
+        let current = self.height();
+        if current < verified {
+            return false;
+        }
+        if current == verified {
+            return true;
+        }
+        if !self.verify_archive_history_range(verified.saturating_add(1), current) {
+            // A block can be observed between the height increment and its
+            // final index publication. Return a transient false without
+            // destroying the already-proven prefix.
+            return false;
+        }
+        self.archive_history_verified_through
+            .store(current, Ordering::Release);
+        true
+    }
+
+    fn verify_archive_history_range(&self, from: u64, through: u64) -> bool {
+        if from > through {
+            return true;
+        }
+        // A later recovery epoch changes the signing domain. Reward bodies
+        // retain their exact historical domain, and every protected recovery
+        // rollout mines canonical reward canaries, so the archive can verify
+        // all retained transaction bodies without incorrectly applying only
+        // today's domain to older v3 blocks.
+        let mut recovery_domains = HashSet::new();
+        if let Some(domain) = self.transaction_domain_hash() {
+            recovery_domains.insert(domain);
+        }
+        for transaction in self.full_transactions.iter() {
+            if let TxBody::CommunityInferenceReward(body) = &transaction.body
+                && body.transaction_domain != Hash256::ZERO
+            {
+                recovery_domains.insert(body.transaction_domain);
+            }
+        }
+        for height in from..=through {
+            let Some(block) = self.get_block(height) else {
+                return false;
+            };
+            if block.header.height != height
+                || block.hash != Block::compute_hash(&block.header)
+                || block.header.tx_count as usize != block.tx_hashes.len()
+                || MerkleTree::from_leaves(block.tx_hashes.clone()).root() != block.header.tx_root
+            {
+                return false;
+            }
+            for (index, tx_hash) in block.tx_hashes.iter().enumerate() {
+                let Ok(index_u32) = u32::try_from(index) else {
+                    return false;
+                };
+                if self
+                    .tx_index
+                    .get(&tx_hash.0)
+                    .is_none_or(|location| *location.value() != (height, index_u32))
+                {
+                    return false;
+                }
+                let Some(transaction) = self.full_transactions.get(&tx_hash.0) else {
+                    return false;
+                };
+                if transaction.hash != *tx_hash
+                    || transaction.tx_type != transaction.body.tx_type()
+                    || !recovery_domains
+                        .iter()
+                        .any(|domain| transaction.compute_hash_in_domain(domain) == *tx_hash)
+                {
+                    return false;
+                }
+                if self.receipts.get(&tx_hash.0).is_none_or(|receipt| {
+                    receipt.tx_hash != *tx_hash
+                        || receipt.block_height != height
+                        || receipt.block_hash != block.hash
+                        || receipt.index != index_u32
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Prune old JMT state, keeping the last `keep_versions` versions.
     /// This frees memory for historical state that is no longer needed for
     /// rollback or proofs.
     pub fn prune_old_state(&self, keep_versions: u64) {
+        if self.archive_mode {
+            return;
+        }
         let mut jmt = self.jmt.lock();
         let current = jmt.version();
         if current > keep_versions {
@@ -5344,6 +8473,9 @@ impl StateDB {
     /// This prevents unbounded memory growth at high TPS by discarding
     /// historical receipt data that is no longer needed for normal operation.
     pub fn prune_old_receipts(&self, keep_blocks: u64) {
+        if self.archive_mode {
+            return;
+        }
         let current = self.height();
         if current <= keep_blocks {
             return;
@@ -5351,10 +8483,12 @@ impl StateDB {
         let cutoff = current - keep_blocks;
 
         // Remove receipts whose block_height is at or below the cutoff.
-        self.receipts.retain(|_, receipt| receipt.block_height > cutoff);
+        self.receipts
+            .retain(|_, receipt| receipt.block_height > cutoff);
 
         // Remove tx_index entries that point to pruned blocks.
-        self.tx_index.retain(|_, &mut (block_height, _)| block_height > cutoff);
+        self.tx_index
+            .retain(|_, &mut (block_height, _)| block_height > cutoff);
 
         // Remove full transactions for pruned blocks.
         self.full_transactions.retain(|hash, _| {
@@ -5439,6 +8573,41 @@ impl StateDB {
         blocks
     }
 
+    /// Persist the non-account records required to reconstruct a complete
+    /// post-block state. The checkpoint is appended only after these records,
+    /// and callers fsync immediately after the checkpoint.
+    fn persist_restart_artifacts(
+        &self,
+        transactions: &[Transaction],
+        receipts: &[TxReceipt],
+        height: u64,
+    ) {
+        for (transaction, receipt) in transactions.iter().zip(receipts) {
+            self.wal
+                .append(WalOp::SetReceipt(transaction.hash, receipt.clone()), height);
+            self.wal.append(
+                WalOp::SetFullTransaction(transaction.hash, Box::new(transaction.clone())),
+                height,
+            );
+        }
+        let mut validators: Vec<_> = self
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        validators.sort_by_key(|entry| entry.0.0);
+        self.wal.append(
+            WalOp::SetValidatorState(validators, self.staking_pool.load(Ordering::Acquire)),
+            height,
+        );
+        if let Some(context) = self.recovery_context() {
+            self.wal.append(
+                WalOp::SetRecoveryContext(context, self.community_rewards_v1_activation_height()),
+                height,
+            );
+        }
+    }
+
     /// Index a transaction's sender and recipient addresses for `account_txs` lookups.
     /// Caps per-account history at 10K entries to prevent unbounded memory growth.
     fn index_account_tx(&self, tx: &Transaction) {
@@ -5462,6 +8631,12 @@ impl StateDB {
         match &tx.body {
             TxBody::Transfer(body) => {
                 self.account_txs.entry(body.to.0).or_default().push(tx.hash);
+                if self.active_protocol_version().major == 3 {
+                    self.account_txs
+                        .entry(v3_fee_treasury_address().0)
+                        .or_default()
+                        .push(tx.hash);
+                }
             }
             TxBody::Settle(body) => {
                 self.account_txs
@@ -5494,45 +8669,130 @@ impl StateDB {
                     .push(tx.hash);
             }
             TxBody::MultiSig(_) | TxBody::DeployContract(_) | TxBody::RegisterAgent(_) => {}
-            TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::ClaimRewards | TxBody::UpdateStake(_) => {}
+            TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_) => {}
             TxBody::Governance(_) => {}
             TxBody::BridgeLock(_) => {
                 // Escrow account is well-known; index it
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
-                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::BridgeMint(body) => {
-                self.account_txs.entry(body.recipient.0).or_default().push(tx.hash);
+                self.account_txs
+                    .entry(body.recipient.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::BatchSettle(body) => {
                 for entry in &body.entries {
-                    self.account_txs.entry(entry.agent_id.0).or_default().push(tx.hash);
+                    self.account_txs
+                        .entry(entry.agent_id.0)
+                        .or_default()
+                        .push(tx.hash);
                 }
             }
             TxBody::ChannelOpen(_) | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_) => {}
             TxBody::ShardProof(_) => {}
             TxBody::InferenceAttestation(_) => {
                 let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
-                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::CommunityInferenceReward(body) => {
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                let job_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                };
+                let certificate_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                };
+                self.account_txs
+                    .entry(body.worker.0)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(job_marker.0)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(certificate_marker.0)
+                    .or_default()
+                    .push(tx.hash);
+                let recovery_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                };
+                if let Some(marker) = recovery_marker {
+                    self.account_txs.entry(marker.0).or_default().push(tx.hash);
+                }
+                self.account_txs
+                    .entry(arc_types::transaction::inference_reward_treasury_address().0)
+                    .or_default()
+                    .push(tx.hash);
+                if protocol_v3 {
+                    let epoch = self.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+                    for address in [
+                        community_reward_block_budget_address(self.height()),
+                        community_reward_epoch_budget_address(epoch),
+                        community_reward_worker_budget_address(epoch, &body.worker),
+                        community_reward_coordinator_budget_address(epoch, &body.coordinator),
+                    ] {
+                        self.account_txs.entry(address.0).or_default().push(tx.hash);
+                    }
+                }
             }
             TxBody::InferenceChallenge(body) => {
-                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
-                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+                let escrow_addr =
+                    hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::InferenceRegister(_) => {
                 // Registration modifies sender's staked_balance; sender is already tracked.
             }
             TxBody::InferenceEscrowOpen(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
                     .entry(escrow_addr)
                     .or_default()
                     .push(tx.hash);
             }
             TxBody::InferenceEscrowRelease(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
                     .entry(escrow_addr)
                     .or_default()
@@ -5554,8 +8814,7 @@ impl StateDB {
                     .push(tx.hash);
             }
             TxBody::InferenceEscrowRefund(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
                     .entry(escrow_addr)
                     .or_default()
@@ -5570,15 +8829,15 @@ impl StateDB {
                 self.account_txs.entry(req_addr).or_default().push(tx.hash);
             }
             TxBody::ShardCoverageClaim(body) => {
-                let claim_addr = ShardCoverageClaimBody::claim_account(
-                    &body.model_id,
-                    &body.node_pubkey,
-                );
-                self.account_txs.entry(claim_addr).or_default().push(tx.hash);
+                let claim_addr =
+                    ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
+                self.account_txs
+                    .entry(claim_addr)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::CapacityAdvertisement(body) => {
-                let cap_addr =
-                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 self.account_txs.entry(cap_addr).or_default().push(tx.hash);
             }
             TxBody::ShardAssignmentProposal(_) => {
@@ -5595,32 +8854,35 @@ impl StateDB {
                     .entry(pool_addr.0)
                     .or_default()
                     .push(tx.hash);
+                let marker_addr = if self.active_protocol_version().major == 3 {
+                    arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient)
+                } else {
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient)
+                };
+                self.account_txs
+                    .entry(marker_addr.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::InferenceRequest(body) => {
                 // Index against the request escrow address so a polling
                 // client (`GET /inference/onchain/result/:id`) can find
                 // the create tx by request_id.
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
                     .or_default()
                     .push(tx.hash);
             }
             TxBody::InferenceVote(body) => {
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
                     .or_default()
                     .push(tx.hash);
             }
             TxBody::InferenceFinalize(body) => {
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
                     .or_default()
@@ -5633,19 +8895,37 @@ impl StateDB {
     fn mark_tx_accounts_dirty(&self, tx: &Transaction) {
         self.dirty_accounts.insert(tx.from.0);
         match &tx.body {
-            TxBody::Transfer(body) => { self.dirty_accounts.insert(body.to.0); }
-            TxBody::Settle(body) => { self.dirty_accounts.insert(body.agent_id.0); }
-            TxBody::Swap(body) => { self.dirty_accounts.insert(body.counterparty.0); }
-            TxBody::Stake(body) => { self.dirty_accounts.insert(body.validator.0); }
-            TxBody::WasmCall(body) => { self.dirty_accounts.insert(body.contract.0); }
-            TxBody::Escrow(body) => { self.dirty_accounts.insert(body.beneficiary.0); }
+            TxBody::Transfer(body) => {
+                self.dirty_accounts.insert(body.to.0);
+                if self.active_protocol_version().major == 3 {
+                    self.dirty_accounts.insert(v3_fee_treasury_address().0);
+                }
+            }
+            TxBody::Settle(body) => {
+                self.dirty_accounts.insert(body.agent_id.0);
+            }
+            TxBody::Swap(body) => {
+                self.dirty_accounts.insert(body.counterparty.0);
+            }
+            TxBody::Stake(body) => {
+                self.dirty_accounts.insert(body.validator.0);
+            }
+            TxBody::WasmCall(body) => {
+                self.dirty_accounts.insert(body.contract.0);
+            }
+            TxBody::Escrow(body) => {
+                self.dirty_accounts.insert(body.beneficiary.0);
+            }
             TxBody::DeployContract(_) => {
                 // The contract address is deterministic - mark it dirty
                 let contract_addr = compute_contract_address(&tx.from, tx.nonce);
                 self.dirty_accounts.insert(contract_addr.0);
             }
             TxBody::RegisterAgent(_) | TxBody::MultiSig(_) => {}
-            TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::ClaimRewards | TxBody::UpdateStake(_) => {}
+            TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_) => {}
             TxBody::Governance(_) => {}
             TxBody::BridgeLock(_) => {
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
@@ -5669,10 +8949,10 @@ impl StateDB {
                 self.dirty_accounts.insert(escrow_addr.0);
                 // Also mark the counterparty as dirty - their balance is modified during close.
                 // The counterparty address is stored in the escrow account's storage_root.
-                if let Some(escrow) = self.accounts.get(&escrow_addr.0) {
-                    if escrow.storage_root != Hash256::ZERO {
-                        self.dirty_accounts.insert(escrow.storage_root.0);
-                    }
+                if let Some(escrow) = self.accounts.get(&escrow_addr.0)
+                    && escrow.storage_root != Hash256::ZERO
+                {
+                    self.dirty_accounts.insert(escrow.storage_root.0);
                 }
             }
             TxBody::ChannelDispute(body) => {
@@ -5691,21 +8971,77 @@ impl StateDB {
                 let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
+            TxBody::CommunityInferenceReward(body) => {
+                let protocol_v3 = self.active_protocol_version().major == 3;
+                self.dirty_accounts.insert(body.worker.0);
+                self.dirty_accounts
+                    .insert(arc_types::transaction::inference_reward_treasury_address().0);
+                let job_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                };
+                self.dirty_accounts.insert(job_marker.0);
+                let certificate_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                };
+                self.dirty_accounts.insert(certificate_marker.0);
+                let recovery_marker = if protocol_v3 {
+                    arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                } else {
+                    arc_types::transaction::CommunityInferenceRewardBody::recovery_probe_marker_address(
+                        &body.chain_domain,
+                        &body.assignment_epoch,
+                    )
+                };
+                if let Some(marker) = recovery_marker {
+                    self.dirty_accounts.insert(marker.0);
+                }
+                if protocol_v3 {
+                    let epoch = self.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+                    for address in [
+                        community_reward_block_budget_address(self.height()),
+                        community_reward_epoch_budget_address(epoch),
+                        community_reward_worker_budget_address(epoch, &body.worker),
+                        community_reward_coordinator_budget_address(epoch, &body.coordinator),
+                    ] {
+                        self.dirty_accounts.insert(address.0);
+                    }
+                }
+            }
             TxBody::InferenceChallenge(body) => {
-                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                let escrow_addr =
+                    hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
             TxBody::InferenceRegister(_) => {
                 // Sender account is already marked dirty (line above match).
             }
             TxBody::InferenceEscrowOpen(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
             }
             TxBody::InferenceEscrowRelease(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
                 self.dirty_accounts.insert(body.proposer.0);
                 for r in &body.replicas {
@@ -5715,8 +9051,7 @@ impl StateDB {
                 self.dirty_accounts.insert(body.treasury.0);
             }
             TxBody::InferenceEscrowRefund(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
             }
             TxBody::ModelRegistration(body) => {
@@ -5730,21 +9065,17 @@ impl StateDB {
                 self.dirty_accounts.insert(req_addr);
             }
             TxBody::ShardCoverageClaim(body) => {
-                let claim_addr = ShardCoverageClaimBody::claim_account(
-                    &body.model_id,
-                    &body.node_pubkey,
-                );
+                let claim_addr =
+                    ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
                 self.dirty_accounts.insert(claim_addr);
             }
             TxBody::CapacityAdvertisement(body) => {
-                let cap_addr =
-                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 self.dirty_accounts.insert(cap_addr);
             }
             TxBody::ShardAssignmentProposal(body) => {
                 let prop_addr = arc_crypto::hash_bytes(
-                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()]
-                        .concat(),
+                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
                 )
                 .0;
                 self.dirty_accounts.insert(prop_addr);
@@ -5753,12 +9084,16 @@ impl StateDB {
                 self.dirty_accounts.insert(body.recipient.0);
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(pool_addr.0);
+                let marker = if self.active_protocol_version().major == 3 {
+                    arc_types::transaction::FaucetClaimBody::v3_marker_address(&body.recipient)
+                } else {
+                    arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient)
+                };
+                self.dirty_accounts.insert(marker.0);
             }
             TxBody::InferenceRequest(body) => {
                 // Request: signer balance debited + escrow created.
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
             TxBody::InferenceVote(_body) => {
@@ -5771,9 +9106,7 @@ impl StateDB {
                 // (this runs before/parallel-to execute_tx in some paths). Mark the escrow
                 // and the treasury; agreeing voters are marked by execute_tx via direct
                 // accounts.insert (which the dirty tracker also picks up).
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(treasury_addr.0);
@@ -5790,6 +9123,12 @@ impl StateDB {
     /// rebuild → O(n).  This is the same cost as the old approach but
     /// happens rarely (most blocks only modify existing accounts).
     fn compute_state_root(&self) -> Hash256 {
+        // Protocol-v3 recovery commits every consensus-relevant persisted
+        // domain. Legacy nodes retain the account-only Merkle root exactly.
+        if let Some(context) = self.recovery_context() {
+            return self.compute_recovery_state_root(&context);
+        }
+
         // Delegate to JMT if enabled.
         if self.use_jmt {
             return self.compute_state_root_jmt();
@@ -5811,8 +9150,10 @@ impl StateDB {
         let cold_start = tree.is_empty() && !self.accounts.is_empty();
 
         if cold_start {
-            // First time: insert every account into the incremental tree.
-            let mut pairs: Vec<([u8; 32], Hash256)> = self
+            // First time: bulk-build the keyed tree. Calling `update` once per
+            // account rebuilds its index on every structural insertion and is
+            // quadratic for production snapshots.
+            let pairs: Vec<([u8; 32], Hash256)> = self
                 .accounts
                 .iter()
                 .map(|entry| {
@@ -5820,11 +9161,7 @@ impl StateDB {
                     (*entry.key(), hash_bytes(&bytes))
                 })
                 .collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            for (k, h) in pairs {
-                tree.update(k, h);
-            }
-            tree.rebuild();
+            *tree = IncrementalMerkle::from_keyed_leaves(pairs);
             return tree.root();
         }
 
@@ -5962,9 +9299,29 @@ impl StateDB {
         *self.height.read()
     }
 
-    /// Flush WAL to disk (call at block boundaries for durability).
+    /// Return the WAL's first fatal durability error, if any.
+    pub fn wal_failure(&self) -> Option<WalError> {
+        self.wal.failure()
+    }
+
+    /// Return the directory containing the active state WAL.
+    ///
+    /// Benchmark/in-memory states use a null WAL and return `None`.
+    pub fn persistence_dir(&self) -> Option<std::path::PathBuf> {
+        self.wal.directory().map(Path::to_path_buf)
+    }
+
+    /// Flush WAL to disk and report whether the barrier was durable.
+    pub fn try_sync_wal(&self) -> Result<(), StateError> {
+        self.durable_wal_barrier()
+    }
+
+    /// Best-effort compatibility wrapper for shutdown callers. Consensus block
+    /// paths use the fallible barrier directly and never acknowledge failures.
     pub fn sync_wal(&self) {
-        self.wal.sync();
+        if let Err(error) = self.try_sync_wal() {
+            tracing::error!(error = %error, "WAL shutdown sync failed");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5974,16 +9331,19 @@ impl StateDB {
     /// Export the current state as a snapshot for state sync.
     /// New nodes can download this to bootstrap without replaying from genesis.
     pub fn export_snapshot(&self) -> Snapshot {
-        let accounts: Vec<(Address, Account)> = self.accounts
+        let accounts: Vec<(Address, Account)> = self
+            .accounts
             .iter()
             .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
             .collect();
 
-        let storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)> = self.storage
+        let storage: wal::ContractStorage = self
+            .storage
             .iter()
             .map(|entry| {
                 let key = Hash256(*entry.key());
-                let values: Vec<(Hash256, Vec<u8>)> = entry.value()
+                let values: Vec<(Hash256, Vec<u8>)> = entry
+                    .value()
                     .iter()
                     .map(|inner| (*inner.key(), inner.value().clone()))
                     .collect();
@@ -5991,7 +9351,8 @@ impl StateDB {
             })
             .collect();
 
-        let contracts: Vec<(Address, Vec<u8>)> = self.contracts
+        let contracts: Vec<(Address, Vec<u8>)> = self
+            .contracts
             .iter()
             .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
             .collect();
@@ -6095,24 +9456,107 @@ impl StateDB {
         StateDiff { changes, new_root }
     }
 
-    /// Apply a state diff from a proposer and return the resulting state root.
+    /// Atomically apply a state diff whose declared root matches the resulting
+    /// state. A malformed or mismatched diff leaves both accounts and the
+    /// incremental state-root cache exactly as they were before this call.
     ///
-    /// Called by verifier nodes.  Applies the account changes, marks them dirty,
-    /// and recomputes the state root.  The caller compares the returned root
-    /// against `diff.new_root` - a mismatch indicates a fraudulent proposal.
-    pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Hash256 {
+    /// This is only a safe *application primitive*. A self-consistent diff does
+    /// not prove that its changes were produced by a committed block, so
+    /// consensus must authenticate its sender and independently execute the
+    /// committed transactions before treating the diff as valid.
+    pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Result<Hash256, StateError> {
+        use std::collections::HashSet;
+
+        if self.is_persistent() && self.recovery_context().is_some() {
+            return Err(StateError::PersistenceError(
+                "standalone state-diff persistence is unavailable on recovery-bound state; authenticate and commit the matching canonical block"
+                    .into(),
+            ));
+        }
+        self.require_healthy_wal()?;
+
+        // Flush any state changes that predate this diff so rollback has a
+        // stable root to restore. Reject ambiguous/malformed change sets before
+        // the first write.
+        let original_root = self.compute_state_root();
+        let mut seen = HashSet::with_capacity(diff.changes.len());
         for change in &diff.changes {
-            self.accounts.insert(change.address.0, change.account.clone());
+            if change.address != change.account.address {
+                return Err(StateError::ExecutionError(format!(
+                    "state diff account key {} does not match embedded address {}",
+                    change.address, change.account.address
+                )));
+            }
+            if !seen.insert(change.address.0) {
+                return Err(StateError::ExecutionError(format!(
+                    "state diff contains duplicate account {}",
+                    change.address
+                )));
+            }
+        }
+
+        // Snapshot exactly the keys this diff may mutate. No WAL entry is
+        // emitted until validation succeeds, so a rejected diff has no durable
+        // side effects either.
+        let originals: Vec<([u8; 32], Option<Account>)> = diff
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    change.address.0,
+                    self.accounts.get(&change.address.0).map(|a| a.clone()),
+                )
+            })
+            .collect();
+
+        for change in &diff.changes {
+            self.accounts
+                .insert(change.address.0, change.account.clone());
             self.dirty_accounts.insert(change.address.0);
         }
-        self.compute_state_root()
+        let computed_root = self.compute_state_root();
+        if computed_root != diff.new_root {
+            for (key, original) in originals {
+                match original {
+                    Some(account) => {
+                        self.accounts.insert(key, account);
+                    }
+                    None => {
+                        self.accounts.remove(&key);
+                    }
+                }
+                self.dirty_accounts.insert(key);
+            }
+            let restored_root = self.compute_state_root();
+            if restored_root != original_root {
+                return Err(StateError::PersistenceError(format!(
+                    "state diff rollback failed: expected root {}, restored {}",
+                    original_root, restored_root
+                )));
+            }
+            return Err(StateError::ExecutionError(format!(
+                "state diff root mismatch: declared {}, computed {}",
+                diff.new_root, computed_root
+            )));
+        }
+
+        // Persist only a fully validated diff. This keeps restart state aligned
+        // with the in-memory state without making rejected writes durable.
+        let height = self.height();
+        for change in &diff.changes {
+            self.wal.append(
+                WalOp::SetAccount(change.address, change.account.clone()),
+                height,
+            );
+        }
+        self.wal.append(WalOp::Checkpoint(computed_root), height);
+        self.durable_wal_barrier()?;
+        Ok(computed_root)
     }
 
-    /// Verify a state diff: apply it and check if the root matches.
-    /// Returns true if the roots match (valid diff), false if fraud detected.
+    /// Verify and atomically apply a state diff.
     pub fn verify_state_diff(&self, diff: &arc_types::StateDiff) -> bool {
-        let computed_root = self.apply_state_diff(diff);
-        computed_root == diff.new_root
+        self.apply_state_diff(diff).is_ok()
     }
 
     /// Collect the current dirty account addresses (snapshot for export_state_diff).
@@ -6127,7 +9571,11 @@ impl StateDB {
 
     /// Register an on-chain identity for an account.
     pub fn register_identity(&self, identity: Identity) {
-        self.identities.insert(identity.address.0, identity);
+        self.identities.insert(identity.address.0, identity.clone());
+        self.wal.append(
+            WalOp::SetIdentity(identity.address, identity),
+            self.height(),
+        );
     }
 
     /// Look up the identity record for an address.
@@ -6140,7 +9588,10 @@ impl StateDB {
     pub fn is_compliant(&self, address: &Address) -> bool {
         match self.get_identity(address) {
             Some(id) => {
-                let level_ok = matches!(id.level, IdentityLevel::Verified | IdentityLevel::Institutional);
+                let level_ok = matches!(
+                    id.level,
+                    IdentityLevel::Verified | IdentityLevel::Institutional
+                );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -6184,11 +9635,11 @@ impl StateDB {
         let tree = self.incremental_merkle.lock();
         let index = tree
             .get_index(&address.0)
-            .ok_or_else(|| StateError::AccountNotFound(*address))?;
+            .ok_or(StateError::AccountNotFound(*address))?;
 
-        let merkle_proof = tree.proof(index).ok_or_else(|| {
-            StateError::ExecutionError("failed to generate Merkle proof".into())
-        })?;
+        let merkle_proof = tree
+            .proof(index)
+            .ok_or_else(|| StateError::ExecutionError("failed to generate Merkle proof".into()))?;
 
         let height = self.height();
         let timestamp = self
@@ -6231,9 +9682,9 @@ impl StateDB {
             .get_tx_location(&tx_hash.0)
             .ok_or_else(|| StateError::ExecutionError("transaction not found".into()))?;
 
-        let block = self
-            .get_block(block_height)
-            .ok_or_else(|| StateError::ExecutionError(format!("block {} not found", block_height)))?;
+        let block = self.get_block(block_height).ok_or_else(|| {
+            StateError::ExecutionError(format!("block {} not found", block_height))
+        })?;
 
         let tree = MerkleTree::from_leaves(block.tx_hashes.clone());
         let merkle_proof = tree.proof(tx_index as usize).ok_or_else(|| {
@@ -6302,16 +9753,13 @@ impl StateDB {
         let total_chunks = if all_accounts.is_empty() {
             1 // Even empty state produces one (empty) chunk
         } else {
-            ((all_accounts.len() + chunk_size - 1) / chunk_size) as u32
+            all_accounts.len().div_ceil(chunk_size) as u32
         };
 
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         let mut chunk_proofs = Vec::with_capacity(total_chunks as usize);
 
-        for (i, accounts_slice) in all_accounts
-            .chunks(chunk_size)
-            .enumerate()
-        {
+        for (i, accounts_slice) in all_accounts.chunks(chunk_size).enumerate() {
             let chunk_data = bincode::serialize(accounts_slice).expect("serializable");
             let chunk_proof = hash_bytes(&chunk_data);
             chunk_proofs.push(chunk_proof);
@@ -6328,8 +9776,8 @@ impl StateDB {
 
         // Handle the empty-state case: produce a single empty chunk.
         if chunks.is_empty() {
-            let empty_data = bincode::serialize(&Vec::<(Address, Account)>::new())
-                .expect("serializable");
+            let empty_data =
+                bincode::serialize(&Vec::<(Address, Account)>::new()).expect("serializable");
             let chunk_proof = hash_bytes(&empty_data);
             chunk_proofs.push(chunk_proof);
             chunks.push(StateSnapshot {
@@ -6385,7 +9833,7 @@ impl StateDB {
         let total_chunks = if all_accounts.is_empty() {
             1u32
         } else {
-            ((all_accounts.len() + chunk_size - 1) / chunk_size) as u32
+            all_accounts.len().div_ceil(chunk_size) as u32
         };
 
         if chunk_index >= total_chunks {
@@ -6426,6 +9874,15 @@ impl StateDB {
     /// "state root mismatch" — the exact failure mode that stranded LHR at
     /// round 0 after every `--reset-state`.
     pub fn import_snapshot_chunk(&self, chunk: &StateSnapshot) -> Result<u32, StateError> {
+        // The legacy HTTP snapshot carries only self-hashes supplied by one
+        // peer: it has no validator quorum certificate, canonical block proof,
+        // storage/contracts, or crash-atomic activation record. It is useful
+        // only for ephemeral tests/benchmarks and must never overwrite a node
+        // whose state is expected to survive restart.
+        if self.is_persistent() {
+            return Err(StateError::UnauthenticatedPersistentStateSync);
+        }
+
         // Verify chunk proof: re-hash the chunk's account data and compare.
         let chunk_data = bincode::serialize(&chunk.accounts).expect("serializable");
         let computed_proof = hash_bytes(&chunk_data);
@@ -6511,15 +9968,21 @@ impl StateDB {
         let total_chunks = if total_accounts == 0 {
             1u32
         } else {
-            ((total_accounts as usize + chunk_size - 1) / chunk_size) as u32
+            (total_accounts as usize).div_ceil(chunk_size) as u32
         };
 
         let version = self.height();
         let state_root = self.compute_state_root();
 
         // Hash the manifest metadata (excluding manifest_hash itself).
-        let pre_hash_data = bincode::serialize(&(version, &state_root, total_accounts, total_chunks, chunk_size))
-            .expect("serializable");
+        let pre_hash_data = bincode::serialize(&(
+            version,
+            &state_root,
+            total_accounts,
+            total_chunks,
+            chunk_size,
+        ))
+        .expect("serializable");
         let manifest_hash = hash_bytes(&pre_hash_data);
 
         SnapshotManifest {
@@ -6538,6 +10001,9 @@ impl StateDB {
     /// to recompute the state root and verify integrity. Updates the internal
     /// block height to match the snapshot version.
     pub fn finalize_sync(&self, progress: &SyncProgress) -> Result<(), StateError> {
+        if self.is_persistent() {
+            return Err(StateError::UnauthenticatedPersistentStateSync);
+        }
         if !Self::is_sync_complete(progress) {
             return Err(StateError::SyncIncomplete {
                 received: progress.verified_chunks,
@@ -6614,6 +10080,7 @@ impl Default for StateDB {
 /// Uses the exact same algorithm as Transaction::compute_hash() but with
 /// a precomputed base hasher (tx_type + from already hashed) and body_bytes.
 /// Only the nonce varies per call - enables massive parallelism.
+#[cfg(feature = "benchmark-tools")]
 #[inline]
 fn compute_benchmark_tx_hash(
     base_hasher: &blake3::Hasher,
@@ -6639,7 +10106,7 @@ fn compute_merkle_root_only(mut leaves: Vec<Hash256>) -> Hash256 {
         return leaves[0];
     }
     // Pad to even length
-    if leaves.len() % 2 != 0 {
+    if !leaves.len().is_multiple_of(2) {
         leaves.push(*leaves.last().unwrap());
     }
     while leaves.len() > 1 {
@@ -6647,7 +10114,7 @@ fn compute_merkle_root_only(mut leaves: Vec<Hash256>) -> Hash256 {
             .par_chunks(2)
             .map(|pair| hash_pair(&pair[0], &pair[1]))
             .collect();
-        if leaves.len() > 1 && leaves.len() % 2 != 0 {
+        if leaves.len() > 1 && !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
     }
@@ -6660,6 +10127,420 @@ mod tests {
 
     fn addr(n: u8) -> Address {
         hash_bytes(&[n])
+    }
+
+    fn persistent_test_dir(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("arc-state-{name}-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn persistent_state_is_bound_to_the_authenticated_genesis() {
+        let dir = persistent_test_dir("genesis-binding");
+        let genesis_a = hash_bytes(b"genesis-a");
+        let genesis_b = hash_bytes(b"genesis-b");
+        let prefunded = [(addr(1), 123)];
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_a).unwrap();
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 123);
+        drop(state);
+
+        let binding = std::fs::read_to_string(dir.join("genesis.network-hash")).unwrap();
+        assert_eq!(binding.trim(), genesis_a.to_hex());
+
+        let recovered = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_a).unwrap();
+        assert_eq!(recovered.get_account(&addr(1)).unwrap().balance, 123);
+        drop(recovered);
+
+        let error = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_b)
+            .err()
+            .expect("mismatched genesis must fail")
+            .to_string();
+        assert!(error.contains("data directory genesis mismatch"), "{error}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_constructor_restores_a_staged_full_root_before_wal_discovery() {
+        let parent = persistent_test_dir("staged-full-root-parent");
+        arc_crypto::secret_file::create_private_directory_tree(&parent).unwrap();
+        let dir = parent.join("state");
+        let genesis_hash = hash_bytes(b"staged-full-root-genesis");
+        let prefunded = [(addr(1), 123)];
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        let (block, _) = state.execute_block(&[], addr(99)).unwrap();
+        let expected_root = state.get_state_root();
+        drop(state);
+
+        let digest = arc_crypto::secret_file::namespace_path_digest(&dir).unwrap();
+        let staged = parent.join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&dir, &staged, false).unwrap();
+        assert!(!dir.exists());
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 1);
+        assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(!staged.exists());
+        drop(restarted);
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn persistent_startup_reclaims_only_exact_state_wal_staging_files() {
+        let dir = persistent_test_dir("genesis-staging-cleanup");
+        arc_crypto::secret_file::create_private_directory_tree(&dir).unwrap();
+        let genesis_identifier = uuid::Uuid::new_v4();
+        let stale = [
+            dir.join(format!(".state.wal.genesis-{}.tmp", uuid::Uuid::new_v4())),
+            dir.join(format!(
+                ".state.wal.quarantine-rebarrier-{}",
+                uuid::Uuid::new_v4()
+            )),
+            dir.join(".state.wal.quarantine-tmp-1-0"),
+            dir.join(".state.wal.quarantine-tmp-4294967295-99"),
+            dir.join(format!(".state.wal.create-{}.tmp", uuid::Uuid::new_v4())),
+            dir.join(format!(
+                "..state.wal.genesis-{genesis_identifier}.tmp.create-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+            dir.join(format!(
+                ".wal-00000000.bin.create-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+            dir.join(format!(".state.wal.rebarrier-{}.tmp", uuid::Uuid::new_v4())),
+        ];
+        let unrelated = [
+            dir.join(".state.wal.genesis-not-a-uuid.tmp"),
+            dir.join(".state.wal.quarantine-rebarrier-not-a-uuid"),
+            dir.join(".state.wal.quarantine-tmp-1-100"),
+            dir.join(".state.wal.quarantine-tmp-pid-0"),
+            dir.join(format!(".operator.create-{}.tmp", uuid::Uuid::new_v4())),
+            dir.join(format!(
+                ".wal-000000000.bin.create-{}.tmp",
+                uuid::Uuid::new_v4()
+            )),
+        ];
+        for path in &stale {
+            std::fs::write(path, b"incomplete internal state WAL staging").unwrap();
+        }
+        for path in &unrelated {
+            std::fs::write(path, b"operator file").unwrap();
+        }
+
+        let state = StateDB::with_genesis_persistent(
+            &[(addr(1), 123)],
+            &dir,
+            hash_bytes(b"genesis-staging-cleanup"),
+        )
+        .unwrap();
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert!(unrelated.iter().all(|path| path.exists()));
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_state_rejects_every_incomplete_genesis_wal_prefix() {
+        let prefunded = [(addr(1), 123), (addr(2), 456), (addr(3), 789)];
+        let genesis_hash = hash_bytes(b"genesis-prefix-crash");
+
+        for account_prefix in 0..=prefunded.len() {
+            let dir = persistent_test_dir(&format!("genesis-prefix-{account_prefix}"));
+            arc_crypto::secret_file::create_private_directory_tree(&dir).unwrap();
+            StateDB::verify_or_create_genesis_binding(&dir, false, genesis_hash).unwrap();
+            let wal_path = dir.join("state.wal");
+            let writer = WalWriter::new(&wal_path).unwrap();
+            for (address, balance) in prefunded.iter().take(account_prefix) {
+                writer.append(
+                    WalOp::SetAccount(*address, Account::new(*address, *balance)),
+                    0,
+                );
+            }
+            writer.sync().unwrap();
+            drop(writer);
+
+            let error = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash)
+                .err()
+                .expect("an incomplete genesis prefix must fail closed")
+                .to_string();
+            assert!(error.contains("incomplete genesis prefix"), "{error}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn persistent_genesis_account_order_is_configuration_order_independent() {
+        let dir = persistent_test_dir("genesis-order");
+        let genesis_hash = hash_bytes(b"genesis-order");
+        let original = [(addr(1), 123), (addr(2), 456), (addr(3), 789)];
+        let reordered = [original[2], original[0], original[1]];
+
+        drop(StateDB::with_genesis_persistent(&original, &dir, genesis_hash).unwrap());
+        let restarted = StateDB::with_genesis_persistent(&reordered, &dir, genesis_hash).unwrap();
+        for (address, balance) in original {
+            assert_eq!(restarted.get_account(&address).unwrap().balance, balance);
+        }
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_legacy_genesis_without_height_zero_checkpoint_still_restarts() {
+        let dir = persistent_test_dir("legacy-genesis-no-checkpoint");
+        let genesis_hash = hash_bytes(b"legacy-genesis-no-checkpoint");
+        let prefunded = [(addr(1), 123), (addr(2), 456)];
+        arc_crypto::secret_file::create_private_directory_tree(&dir).unwrap();
+        StateDB::verify_or_create_genesis_binding(&dir, false, genesis_hash).unwrap();
+        let writer = WalWriter::new(dir.join("state.wal")).unwrap();
+        for (address, balance) in prefunded {
+            writer.append(
+                WalOp::SetAccount(address, Account::new(address, balance)),
+                0,
+            );
+        }
+        writer.append(WalOp::SetBlock(0, Block::genesis()), 0);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(restarted.get_account(&addr(1)).unwrap().balance, 123);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_keeps_a_complete_checkpointed_block() {
+        let dir = persistent_test_dir("checkpointed-block-restart");
+        let genesis_hash = hash_bytes(b"checkpointed-block-restart");
+        let state =
+            StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, genesis_hash).unwrap();
+        let (block, _) = state.execute_block(&[], addr(99)).unwrap();
+        let root = state.get_state_root();
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 1);
+        assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(restarted.get_state_root(), root);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_keeps_a_same_height_state_diff_checkpoint() {
+        let dir = persistent_test_dir("same-height-state-diff-restart");
+        let genesis_hash = hash_bytes(b"same-height-state-diff-restart");
+        let prefunded = [(addr(1), 123)];
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+
+        let proposer = StateDB::with_genesis(&prefunded);
+        let mut changed = proposer.get_account(&addr(1)).unwrap();
+        changed.balance = 987;
+        proposer.update_account(&addr(1), changed);
+        let diff = proposer.export_state_diff(&[addr(1)]);
+        assert_eq!(state.apply_state_diff(&diff).unwrap(), diff.new_root);
+        drop(state);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(restarted.get_account(&addr(1)).unwrap().balance, 987);
+        assert_eq!(restarted.get_state_root(), diff.new_root);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_keeps_post_checkpoint_event_logs() {
+        let dir = persistent_test_dir("post-checkpoint-event-logs-restart");
+        let genesis_hash = hash_bytes(b"post-checkpoint-event-logs-restart");
+        let state = StateDB::with_genesis_persistent(&[], &dir, genesis_hash).unwrap();
+        let (block, _) = state.execute_block(&[], addr(99)).unwrap();
+        let log = arc_types::EventLog {
+            address: addr(7),
+            topics: vec![hash_bytes(b"event-topic")],
+            data: b"durable-event-data".to_vec(),
+            block_height: block.header.height,
+            tx_hash: hash_bytes(b"event-transaction"),
+            log_index: 3,
+        };
+        state.store_event_logs(block.header.height, vec![log.clone()]);
+        drop(state);
+
+        let restarted = StateDB::with_genesis_persistent(&[], &dir, genesis_hash).unwrap();
+        let restored = restarted
+            .event_logs
+            .get(&block.header.height)
+            .expect("event logs survive restart");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].address, log.address);
+        assert_eq!(restored[0].topics, log.topics);
+        assert_eq!(restored[0].data, log.data);
+        assert_eq!(restored[0].block_height, log.block_height);
+        assert_eq!(restored[0].tx_hash, log.tx_hash);
+        assert_eq!(restored[0].log_index, log.log_index);
+        drop(restored);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_quarantines_complete_uncheckpointed_suffix() {
+        let dir = persistent_test_dir("complete-uncheckpointed-suffix");
+        let genesis_hash = hash_bytes(b"complete-uncheckpointed-suffix");
+        let prefunded = [(addr(1), 123)];
+        drop(StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap());
+        let wal_path = dir.join("state.wal");
+        let accepted_bytes = std::fs::metadata(&wal_path).unwrap().len();
+        let writer = WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetAccount(addr(9), Account::new(addr(9), 999)), 1);
+        writer.sync().unwrap();
+        drop(writer);
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > accepted_bytes);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert!(restarted.get_account(&addr(9)).is_none());
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), accepted_bytes);
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("state.wal.quarantine-")
+                })
+                .count(),
+            1
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_restart_quarantines_a_torn_final_frame() {
+        use std::io::Write as _;
+
+        let dir = persistent_test_dir("torn-final-frame");
+        let genesis_hash = hash_bytes(b"torn-final-frame");
+        let prefunded = [(addr(1), 123)];
+        drop(StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap());
+        let wal_path = dir.join("state.wal");
+        let accepted_bytes = std::fs::metadata(&wal_path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        file.write_all(&[0, 0]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), accepted_bytes);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unauthenticated_snapshot_sync_cannot_mutate_persistent_state_or_wal() {
+        let dir = persistent_test_dir("persistent-snapshot-rejection");
+        let genesis_hash = hash_bytes(b"persistent-snapshot-rejection");
+        let state =
+            StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, genesis_hash).unwrap();
+        let source = StateDB::with_genesis(&[(addr(9), 999)]);
+        let (manifest, chunks) = source.export_chunked_snapshot(100);
+        let before_root = state.get_state_root();
+        let before_wal = std::fs::read(dir.join("state.wal")).unwrap();
+
+        assert!(matches!(
+            state.import_snapshot_chunk(&chunks[0]),
+            Err(StateError::UnauthenticatedPersistentStateSync)
+        ));
+        let progress = StateDB::begin_sync(manifest);
+        assert!(matches!(
+            state.finalize_sync(&progress),
+            Err(StateError::UnauthenticatedPersistentStateSync)
+        ));
+        assert_eq!(state.height(), 0);
+        assert_eq!(state.get_state_root(), before_root);
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 123);
+        assert!(state.get_account(&addr(9)).is_none());
+        state.sync_wal();
+        assert_eq!(std::fs::read(dir.join("state.wal")).unwrap(), before_wal);
+
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_directory_is_exposed_only_for_durable_state() {
+        assert_eq!(StateDB::new().persistence_dir(), None);
+
+        let dir = persistent_test_dir("persistence-directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = StateDB::with_persistence(dir.join("state.wal")).unwrap();
+        assert_eq!(state.persistence_dir().as_deref(), Some(dir.as_path()));
+        drop(state);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn block_is_not_acknowledged_when_wal_fsync_fails() {
+        let dir = persistent_test_dir("wal-boundary-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = StateDB::with_persistence(dir.join("state.wal")).unwrap();
+        state.wal.inject_failure(crate::wal::WalFaultPoint::Fsync);
+
+        let error = state
+            .execute_block(&[], addr(99))
+            .expect_err("block boundary must propagate fsync failure");
+        assert!(matches!(error, StateError::PersistenceError(_)));
+        assert_eq!(state.wal_failure().unwrap().operation(), "fsync");
+
+        // The in-memory mutation happened before the filesystem reported the
+        // failure, but the sticky latch prevents any subsequent block attempt
+        // from advancing state or being acknowledged.
+        let failed_height = state.height();
+        let retry = state
+            .execute_block(&[], addr(99))
+            .expect_err("a failed WAL remains fatal");
+        assert!(matches!(retry, StateError::PersistenceError(_)));
+        assert_eq!(state.height(), failed_height);
+
+        drop(state);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_unbound_wal_fails_closed() {
+        let dir = persistent_test_dir("legacy-unbound");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.wal"), []).unwrap();
+
+        let error = StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, hash_bytes(b"g"))
+            .err()
+            .expect("unbound legacy WAL must fail")
+            .to_string();
+        assert!(
+            error.contains("no authenticated genesis binding"),
+            "{error}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -6740,12 +10621,212 @@ mod tests {
         assert!(state.get_storage(&contract, &key).is_none());
     }
 
+    fn signed_evm_call(
+        signer: &arc_crypto::signature::KeyPair,
+        contract: Address,
+        nonce: u64,
+        tag: u8,
+    ) -> Transaction {
+        let mut transaction = Transaction::new_wasm_call(
+            signer.address(),
+            contract,
+            String::new(),
+            vec![tag],
+            7,
+            1_000_000,
+            nonce,
+        );
+        transaction.sign(signer).unwrap();
+        transaction
+    }
+
+    fn assert_evm_call_left_no_state(
+        state: &StateDB,
+        sender: Address,
+        contract: Address,
+        storage_key: Hash256,
+        expected_root: Hash256,
+    ) {
+        let account = state.get_account(&sender).expect("funded sender remains");
+        assert_eq!(account.balance, 1_000_000);
+        assert_eq!(account.nonce, 0, "rejected EVM call cannot consume nonce");
+        assert_eq!(
+            state.get_storage(&contract, &storage_key),
+            Some(b"before".to_vec()),
+            "rejected EVM call cannot write storage"
+        );
+        assert!(
+            state.event_logs.is_empty(),
+            "rejected call cannot emit logs"
+        );
+        assert_eq!(
+            state.compute_state_root(),
+            expected_root,
+            "rejected call cannot change the authenticated state"
+        );
+    }
+
+    #[test]
+    fn state_changing_evm_call_fails_before_any_mutation() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(81);
+        let storage_key = hash_bytes(b"evm-atomic-storage");
+        let state = StateDB::with_genesis(&[(signer.address(), 1_000_000)]);
+        state.deploy_contract(&contract, vec![0x60, 0x00]);
+        state.set_storage(&contract, storage_key, b"before".to_vec());
+        let before_root = state.compute_state_root();
+
+        let error = state
+            .execute_tx_pub(&signed_evm_call(&signer, contract, 0, 1))
+            .expect_err("state-changing EVM execution must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("state-changing EVM calls are unavailable"),
+            "{error}"
+        );
+        assert_evm_call_left_no_state(&state, signer.address(), contract, storage_key, before_root);
+    }
+
+    #[test]
+    fn rejected_evm_call_matches_sequential_and_blockstm_roots() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(82);
+        let storage_key = hash_bytes(b"evm-engine-storage");
+        let genesis = [(signer.address(), 1_000_000)];
+        let sequential = StateDB::with_genesis(&genesis);
+        let blockstm = StateDB::with_genesis(&genesis);
+        for state in [&sequential, &blockstm] {
+            state.deploy_contract(&contract, vec![0x60, 0x01]);
+            state.set_storage(&contract, storage_key, b"before".to_vec());
+        }
+        let before_root = sequential.compute_state_root();
+        assert_eq!(before_root, blockstm.compute_state_root());
+        let transaction = signed_evm_call(&signer, contract, 0, 2);
+        let timestamp = 1_800_000_001_000;
+
+        let (sequential_block, sequential_receipts) = sequential
+            .execute_block_verified_at(std::slice::from_ref(&transaction), addr(99), timestamp)
+            .unwrap();
+        let (blockstm_block, blockstm_receipts) = blockstm
+            .execute_block_blockstm_at(&[transaction], addr(99), timestamp, Hash256::ZERO)
+            .unwrap();
+
+        assert!(!sequential_receipts[0].success);
+        assert!(!blockstm_receipts[0].success);
+        assert_eq!(sequential_block.header.state_root, before_root);
+        assert_eq!(blockstm_block.header.state_root, before_root);
+        assert_eq!(sequential_block.hash, blockstm_block.hash);
+        assert_evm_call_left_no_state(
+            &sequential,
+            signer.address(),
+            contract,
+            storage_key,
+            before_root,
+        );
+        assert_evm_call_left_no_state(
+            &blockstm,
+            signer.address(),
+            contract,
+            storage_key,
+            before_root,
+        );
+    }
+
+    #[test]
+    fn rejected_evm_calls_do_not_disturb_following_nonce_order() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(83);
+        let recipient = addr(84);
+        let state = StateDB::with_genesis(&[(signer.address(), 1_000_000), (recipient, 0)]);
+        state.deploy_contract(&contract, vec![0x60, 0x02]);
+
+        let first = signed_evm_call(&signer, contract, 0, 3);
+        let second = signed_evm_call(&signer, contract, 1, 4);
+        let mut transfer = Transaction::new_transfer(signer.address(), recipient, 11, 0);
+        transfer.sign(&signer).unwrap();
+        let (_, receipts) = state
+            .execute_block_blockstm_at(
+                &[first, second, transfer],
+                addr(99),
+                1_800_000_001_001,
+                Hash256::ZERO,
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.success)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        let sender = state.get_account(&signer.address()).unwrap();
+        assert_eq!(sender.nonce, 1);
+        assert_eq!(sender.balance, 1_000_000 - 11);
+        assert_eq!(state.get_account(&recipient).unwrap().balance, 11);
+        assert!(state.event_logs.is_empty());
+    }
+
+    #[test]
+    fn rejected_evm_call_is_restart_stable() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(85);
+        let storage_key = hash_bytes(b"evm-restart-storage");
+        let directory = persistent_test_dir("evm-reject-restart");
+        let genesis_hash = hash_bytes(b"evm-reject-genesis");
+        let prefunded = [(signer.address(), 1_000_000)];
+        let state = StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.deploy_contract(&contract, vec![0x60, 0x03]);
+        state.set_storage(&contract, storage_key, b"before".to_vec());
+
+        let (block, receipts) = state
+            .execute_block_verified_at(
+                &[signed_evm_call(&signer, contract, 0, 5)],
+                addr(99),
+                1_800_000_001_002,
+            )
+            .unwrap();
+        assert!(!receipts[0].success);
+        let durable_root = block.header.state_root;
+        assert_evm_call_left_no_state(
+            &state,
+            signer.address(),
+            contract,
+            storage_key,
+            durable_root,
+        );
+        drop(state);
+
+        let recovered =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        assert_eq!(recovered.height(), 1);
+        assert_eq!(
+            recovered.get_block(1).unwrap().header.state_root,
+            durable_root
+        );
+        assert_evm_call_left_no_state(
+            &recovered,
+            signer.address(),
+            contract,
+            storage_key,
+            durable_root,
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn test_snapshot_roundtrip() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 500_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
 
         state.deploy_contract(&addr(10), vec![0x00, 0x61, 0x73, 0x6d]);
         state.set_storage(&addr(10), hash_bytes(b"k"), b"v".to_vec());
@@ -6776,6 +10857,289 @@ mod tests {
         assert!(!receipts2[0].success);
     }
 
+    #[test]
+    fn batch_verified_ed25519_cannot_spend_from_a_different_address() {
+        use arc_crypto::signature::KeyPair;
+
+        let victim = KeyPair::generate_ed25519();
+        let attacker = KeyPair::generate_ed25519();
+        let recipient = addr(73);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
+
+        // The transaction hash commits to the victim as `from`, while the
+        // cryptographically valid signature and public key belong to the
+        // attacker. A bare Ed25519 batch check succeeds for that supplied key;
+        // the executor must still reject the ARC-address mismatch.
+        let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
+        forged.sign(&attacker).unwrap();
+        assert!(forged.verify_signature().is_err());
+
+        let (_, receipts) = state.execute_block_verified(&[forged], addr(99)).unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&victim.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn gpu_verified_rejects_ed25519_signature_from_a_different_address() {
+        use arc_crypto::signature::KeyPair;
+
+        let victim = KeyPair::generate_ed25519();
+        let attacker = KeyPair::generate_ed25519();
+        let recipient = addr(74);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
+
+        let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
+        forged.sign(&attacker).unwrap();
+        assert!(forged.verify_signature().is_err());
+
+        let (_, receipts) = state
+            .execute_block_gpu_verified(&[forged], addr(99))
+            .unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&victim.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn gpu_verified_rejects_stale_transaction_hash() {
+        use arc_crypto::signature::KeyPair;
+
+        let sender = KeyPair::generate_ed25519();
+        let recipient = addr(75);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(sender.address(), starting_balance)]);
+
+        let mut stale = Transaction::new_transfer(sender.address(), recipient, 500, 0);
+        stale.sign(&sender).unwrap();
+        match &mut stale.body {
+            TxBody::Transfer(body) => body.amount = 750,
+            _ => unreachable!("new_transfer must create a transfer body"),
+        }
+        assert_ne!(stale.compute_hash(), stale.hash);
+
+        let (_, receipts) = state
+            .execute_block_gpu_verified(&[stale], addr(99))
+            .unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&sender.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn signed_benchmark_rejects_ed25519_signature_from_a_different_address() {
+        use arc_crypto::signature::KeyPair;
+
+        let victim = KeyPair::generate_ed25519();
+        let attacker = KeyPair::generate_ed25519();
+        let recipient = addr(76);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
+
+        let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
+        forged.sign(&attacker).unwrap();
+        assert!(forged.verify_signature().is_err());
+
+        let block = state
+            .execute_block_signed_benchmark(&[forged], addr(99))
+            .unwrap();
+        let stored = state
+            .signed_block_data
+            .get(&block.header.height)
+            .expect("benchmark block must retain its success flags");
+        assert_eq!(stored.value().1.as_slice(), &[false]);
+        assert_eq!(
+            state.get_account(&victim.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn signed_benchmark_rejects_stale_transaction_hash() {
+        use arc_crypto::signature::KeyPair;
+
+        let sender = KeyPair::generate_ed25519();
+        let recipient = addr(77);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(sender.address(), starting_balance)]);
+
+        let mut stale = Transaction::new_transfer(sender.address(), recipient, 500, 0);
+        stale.sign(&sender).unwrap();
+        match &mut stale.body {
+            TxBody::Transfer(body) => body.amount = 750,
+            _ => unreachable!("new_transfer must create a transfer body"),
+        }
+        assert_ne!(stale.compute_hash(), stale.hash);
+
+        let block = state
+            .execute_block_signed_benchmark(&[stale], addr(99))
+            .unwrap();
+        let stored = state
+            .signed_block_data
+            .get(&block.header.height)
+            .expect("benchmark block must retain its success flags");
+        assert_eq!(stored.value().1.as_slice(), &[false]);
+        assert_eq!(
+            state.get_account(&sender.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn consensus_timestamp_makes_linear_block_hashes_cross_node_deterministic() {
+        use arc_crypto::signature::KeyPair;
+
+        let sender = KeyPair::generate_ed25519();
+        let producer = addr(91);
+        let genesis = [(sender.address(), 1_000_000)];
+        let first = StateDB::with_genesis(&genesis);
+        let second = StateDB::with_genesis(&genesis);
+        let mut tx = Transaction::new_transfer(sender.address(), addr(92), 500, 0);
+        tx.sign(&sender).unwrap();
+
+        let (first_block, first_receipts) = first
+            .execute_block_adaptive_at(std::slice::from_ref(&tx), producer, 1_800_000_000_123)
+            .unwrap();
+        let (second_block, second_receipts) = second
+            .execute_block_adaptive_at(&[tx], producer, 1_800_000_000_123)
+            .unwrap();
+
+        assert!(first_receipts[0].success && second_receipts[0].success);
+        assert_eq!(first_block.header.timestamp, 1_800_000_000_123);
+        assert_eq!(
+            first_block.header.state_root,
+            second_block.header.state_root
+        );
+        assert_eq!(first_block.hash, second_block.hash);
+
+        // The next block also shares the same parent hash, proving divergence
+        // is not merely deferred one height.
+        let (first_next, _) = first
+            .execute_block_adaptive_at(&[], producer, 1_800_000_000_456)
+            .unwrap();
+        let (second_next, _) = second
+            .execute_block_adaptive_at(&[], producer, 1_800_000_000_456)
+            .unwrap();
+        assert_eq!(first_next.header.parent_hash, first_block.hash);
+        assert_eq!(second_next.header.parent_hash, second_block.hash);
+        assert_eq!(first_next.hash, second_next.hash);
+    }
+
+    #[test]
+    fn consensus_proof_hash_is_persisted_in_the_canonical_block_identity() {
+        let producer = addr(93);
+        let proof = hash_bytes(b"recovery-domain DAG decision round 42");
+        let first = StateDB::with_genesis(&[]);
+        let second = StateDB::with_genesis(&[]);
+
+        let (bound, _) = first
+            .execute_block_adaptive_at_with_proof(&[], producer, 1_800_000_000_500, proof)
+            .unwrap();
+        let (unbound, _) = second
+            .execute_block_adaptive_at(&[], producer, 1_800_000_000_500)
+            .unwrap();
+
+        assert_eq!(bound.header.proof_hash, proof);
+        assert_eq!(unbound.header.proof_hash, Hash256::ZERO);
+        assert_ne!(bound.hash, unbound.hash);
+        let stored = first.get_block(bound.header.height).unwrap();
+        assert_eq!(stored.hash, bound.hash);
+        assert_eq!(stored.header.proof_hash, proof);
+    }
+
+    #[test]
+    fn consensus_timestamp_makes_blockstm_hashes_cross_node_deterministic() {
+        use arc_crypto::signature::KeyPair;
+
+        const TX_COUNT: usize = 128;
+        const TIMESTAMP: u64 = 1_800_000_000_789;
+
+        let senders: Vec<KeyPair> = (0..TX_COUNT).map(|_| KeyPair::generate_ed25519()).collect();
+        let genesis: Vec<(Address, u64)> = senders
+            .iter()
+            .map(|sender| (sender.address(), 1_000))
+            .collect();
+        let transactions: Vec<Transaction> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, sender)| {
+                let recipient = hash_bytes(&[0xb1, index as u8]);
+                let mut tx = Transaction::new_transfer(sender.address(), recipient, 1, 0);
+                tx.sign(sender).unwrap();
+                tx
+            })
+            .collect();
+
+        assert_eq!(
+            crate::block_stm::choose_execution_mode(&transactions),
+            crate::block_stm::AdaptiveMode::BlockSTM,
+            "the regression must exercise execute_block_blockstm_at"
+        );
+
+        let producer = addr(93);
+        let first = StateDB::with_genesis(&genesis);
+        let second = StateDB::with_genesis(&genesis);
+        let (first_block, first_receipts) = first
+            .execute_block_adaptive_at(&transactions, producer, TIMESTAMP)
+            .unwrap();
+        let (second_block, second_receipts) = second
+            .execute_block_adaptive_at(&transactions, producer, TIMESTAMP)
+            .unwrap();
+
+        assert!(first_receipts.iter().all(|receipt| receipt.success));
+        assert!(second_receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(first_block.header.timestamp, TIMESTAMP);
+        assert_eq!(second_block.header.timestamp, TIMESTAMP);
+        assert_eq!(first_block.header.tx_root, second_block.header.tx_root);
+        assert_eq!(
+            first_block.header.state_root,
+            second_block.header.state_root
+        );
+        assert_eq!(first_block.hash, second_block.hash);
+    }
 
     #[test]
     fn test_identity_registry() {
@@ -6854,10 +11218,7 @@ mod tests {
     fn test_propose_verify_state_diff() {
         // Proposer: execute a block and export state diff.
         // The proposer knows affected accounts from the tx bodies.
-        let proposer_state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]);
+        let proposer_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let tx = Transaction::new_transfer(addr(1), addr(2), 500, 0);
         let (block, _receipts) = proposer_state.execute_block(&[tx], addr(99)).unwrap();
 
@@ -6867,11 +11228,8 @@ mod tests {
         assert_eq!(diff.new_root, block.header.state_root);
 
         // Verifier: apply the state diff (without re-executing)
-        let verifier_state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]);
-        let verifier_root = verifier_state.apply_state_diff(&diff);
+        let verifier_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
+        let verifier_root = verifier_state.apply_state_diff(&diff).unwrap();
 
         // Root must match the diff's declared root
         assert_eq!(verifier_root, diff.new_root);
@@ -6894,10 +11252,17 @@ mod tests {
         let mut diff = state.export_state_diff(&affected);
         diff.new_root = Hash256([0xDE; 32]); // tamper with the root
 
-        // Verifier applies diff and gets a different root
+        // A bad root rejects atomically; no attacker-controlled account state
+        // survives the failed verification.
         let verifier = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
-        let verifier_root = verifier.apply_state_diff(&diff);
-        assert_ne!(verifier_root, diff.new_root, "fraud should be detected");
+        let before_root = verifier.get_state_root();
+        let before_sender = verifier.get_account(&addr(1)).unwrap();
+        assert!(verifier.apply_state_diff(&diff).is_err());
+        assert_eq!(verifier.get_state_root(), before_root);
+        let restored_sender = verifier.get_account(&addr(1)).unwrap();
+        assert_eq!(restored_sender.balance, before_sender.balance);
+        assert_eq!(restored_sender.nonce, before_sender.nonce);
+        assert!(verifier.get_account(&addr(2)).is_none());
     }
 
     #[test]
@@ -6908,14 +11273,17 @@ mod tests {
 
         // Create some accounts
         db.accounts.insert(addr1.0, Account::new(addr1, 1000));
-        db.accounts.insert(addr2.0, Account {
-            address: addr2,
-            balance: 2000,
-            nonce: 5,
-            code_hash: Hash256::ZERO,
-            storage_root: Hash256::ZERO,
-            staked_balance: 0,
-        });
+        db.accounts.insert(
+            addr2.0,
+            Account {
+                address: addr2,
+                balance: 2000,
+                nonce: 5,
+                code_hash: Hash256::ZERO,
+                storage_root: Hash256::ZERO,
+                staked_balance: 0,
+            },
+        );
 
         // Mark as dirty
         db.dirty_accounts.insert(addr1.0);
@@ -6936,15 +11304,20 @@ mod tests {
         let addr2 = hash_bytes(&[2]);
 
         // Proposer executes transactions
-        proposer_db.accounts.insert(addr1.0, Account {
-            address: addr1,
-            balance: 900,
-            nonce: 1,
-            code_hash: Hash256::ZERO,
-            storage_root: Hash256::ZERO,
-            staked_balance: 0,
-        });
-        proposer_db.accounts.insert(addr2.0, Account::new(addr2, 100));
+        proposer_db.accounts.insert(
+            addr1.0,
+            Account {
+                address: addr1,
+                balance: 900,
+                nonce: 1,
+                code_hash: Hash256::ZERO,
+                storage_root: Hash256::ZERO,
+                staked_balance: 0,
+            },
+        );
+        proposer_db
+            .accounts
+            .insert(addr2.0, Account::new(addr2, 100));
         proposer_db.dirty_accounts.insert(addr1.0);
         proposer_db.dirty_accounts.insert(addr2.0);
 
@@ -6964,14 +11337,17 @@ mod tests {
         let addr1 = hash_bytes(&[1]);
 
         // Proposer creates a diff
-        proposer_db.accounts.insert(addr1.0, Account {
-            address: addr1,
-            balance: 900,
-            nonce: 1,
-            code_hash: Hash256::ZERO,
-            storage_root: Hash256::ZERO,
-            staked_balance: 0,
-        });
+        proposer_db.accounts.insert(
+            addr1.0,
+            Account {
+                address: addr1,
+                balance: 900,
+                nonce: 1,
+                code_hash: Hash256::ZERO,
+                storage_root: Hash256::ZERO,
+                staked_balance: 0,
+            },
+        );
         proposer_db.dirty_accounts.insert(addr1.0);
 
         let affected = vec![addr1];
@@ -6982,6 +11358,65 @@ mod tests {
 
         // Verifier detects fraud
         assert!(!verifier_db.verify_state_diff(&diff));
+        assert!(verifier_db.get_account(&addr1).is_none());
+    }
+
+    #[test]
+    fn state_diff_rejects_duplicate_and_mismatched_account_keys_without_mutation() {
+        use arc_types::{AccountChange, StateDiff};
+
+        let state = StateDB::with_genesis(&[(addr(1), 1_000)]);
+        let before_root = state.get_state_root();
+        let changed = Account::new(addr(1), 123);
+
+        let duplicate = StateDiff {
+            changes: vec![
+                AccountChange {
+                    address: addr(1),
+                    account: changed.clone(),
+                },
+                AccountChange {
+                    address: addr(1),
+                    account: changed,
+                },
+            ],
+            new_root: Hash256::ZERO,
+        };
+        assert!(state.apply_state_diff(&duplicate).is_err());
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 1_000);
+        assert_eq!(state.get_state_root(), before_root);
+
+        let mismatched_key = StateDiff {
+            changes: vec![AccountChange {
+                address: addr(2),
+                account: Account::new(addr(3), 999_999),
+            }],
+            new_root: Hash256::ZERO,
+        };
+        assert!(state.apply_state_diff(&mismatched_key).is_err());
+        assert!(state.get_account(&addr(2)).is_none());
+        assert!(state.get_account(&addr(3)).is_none());
+        assert_eq!(state.get_state_root(), before_root);
+    }
+
+    #[test]
+    fn state_diff_root_mismatch_rolls_back_jmt_cache() {
+        use arc_types::{AccountChange, StateDiff};
+
+        let mut state = StateDB::with_genesis(&[(addr(1), 1_000)]);
+        state.enable_jmt();
+        let before_root = state.get_state_root();
+        let diff = StateDiff {
+            changes: vec![AccountChange {
+                address: addr(2),
+                account: Account::new(addr(2), u64::MAX),
+            }],
+            new_root: hash_bytes(b"attacker-declared-root"),
+        };
+
+        assert!(state.apply_state_diff(&diff).is_err());
+        assert!(state.get_account(&addr(2)).is_none());
+        assert_eq!(state.get_state_root(), before_root);
     }
 
     // -----------------------------------------------------------------------
@@ -6990,10 +11425,7 @@ mod tests {
 
     #[test]
     fn test_chunked_snapshot_export_single_chunk() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000),
-            (addr(2), 2_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000), (addr(2), 2_000)]);
 
         // chunk_size large enough to fit everything in one chunk
         let (manifest, chunks) = state.export_chunked_snapshot(100);
@@ -7101,11 +11533,7 @@ mod tests {
 
     #[test]
     fn test_chunked_snapshot_manifest_hash_deterministic() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000),
-            (addr(2), 2_000),
-            (addr(3), 3_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000), (addr(2), 2_000), (addr(3), 3_000)]);
 
         let (m1, _) = state.export_chunked_snapshot(2);
         let (m2, _) = state.export_chunked_snapshot(2);
@@ -7181,11 +11609,8 @@ mod tests {
 
     #[test]
     fn test_state_summary() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 500_000),
-            (addr(3), 250_000),
-        ]);
+        let state =
+            StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000), (addr(3), 250_000)]);
 
         let summary = state.state_summary();
         assert_eq!(summary.account_count, 3);
@@ -7208,10 +11633,7 @@ mod tests {
 
     #[test]
     fn test_prune_old_receipts() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 10_000_000),
-            (addr(2), 10_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 10_000_000), (addr(2), 10_000_000)]);
 
         // Execute several blocks to build up receipts.
         for i in 0..5 {
@@ -7229,17 +11651,17 @@ mod tests {
         // Only receipts from blocks 4 and 5 should remain.
         assert_eq!(state.receipts.len(), 2);
         for entry in state.receipts.iter() {
-            assert!(entry.value().block_height > 3,
-                "receipt at height {} should have been pruned", entry.value().block_height);
+            assert!(
+                entry.value().block_height > 3,
+                "receipt at height {} should have been pruned",
+                entry.value().block_height
+            );
         }
     }
 
     #[test]
     fn test_prune_old_receipts_noop_when_young() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 10_000_000),
-            (addr(2), 10_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 10_000_000), (addr(2), 10_000_000)]);
 
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
@@ -7249,13 +11671,326 @@ mod tests {
         assert_eq!(state.receipts.len(), 1);
     }
 
+    #[test]
+    fn archive_mode_disables_receipt_transaction_and_wal_pruning_across_restart() {
+        let directory = persistent_test_dir("archive-history-restart");
+        let genesis_hash = hash_bytes(b"archive-history-genesis");
+        let prefunded = [(addr(1), 10_000_000), (addr(2), 10_000_000)];
+        let mut state =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.enable_archive_mode();
+
+        let mut hashes = Vec::new();
+        for nonce in 0..3 {
+            let transaction = Transaction::new_transfer(addr(1), addr(2), 100, nonce);
+            hashes.push(transaction.hash.0);
+            state.execute_block(&[transaction], addr(99)).unwrap();
+        }
+        state.sync_wal();
+        let wal_bytes = std::fs::metadata(directory.join("state.wal"))
+            .unwrap()
+            .len();
+
+        state.prune_old_receipts(0);
+        state.evict_transactions(0);
+        assert_eq!(state.receipts.len(), 3);
+        assert_eq!(state.full_transactions.len(), 3);
+        assert_eq!(
+            std::fs::metadata(directory.join("state.wal"))
+                .unwrap()
+                .len(),
+            wal_bytes
+        );
+        drop(state);
+
+        let mut recovered =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        recovered.enable_archive_mode();
+        for hash in hashes {
+            assert!(recovered.get_transaction(&hash).is_some());
+            assert!(recovered.get_receipt(&hash).is_some());
+        }
+        recovered.evict_transactions(0);
+        recovered.prune_old_receipts(0);
+        assert_eq!(recovered.receipts.len(), 3);
+        assert_eq!(recovered.full_transactions.len(), 3);
+        drop(recovered);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn archive_lifetime_history_requires_complete_v3_block_body_and_receipt_bindings() {
+        let mut state = StateDB::new();
+        let recovery_context = recovery::RecoveryContext::new(
+            "arc-history-test",
+            hash_bytes(b"archive-history-recovery-genesis"),
+            1,
+            1,
+        );
+        *state.recovery_context.write() = Some(recovery_context.clone());
+        *state.recovery_manifest_hash.write() = Some(hash_bytes(b"archive-history-manifest"));
+
+        let mut transaction = Transaction::new_transfer(addr(1), addr(2), 1, 0);
+        transaction.hash = transaction.compute_hash_in_domain(&recovery_context.domain_hash());
+        let transaction_hash = transaction.hash;
+        let tx_hashes = vec![transaction_hash];
+        let header = BlockHeader {
+            height: 0,
+            timestamp: 1,
+            parent_hash: Hash256::ZERO,
+            tx_root: MerkleTree::from_leaves(tx_hashes.clone()).root(),
+            state_root: Hash256::ZERO,
+            proof_hash: Hash256::ZERO,
+            tx_count: 1,
+            producer: addr(9),
+            protocol_version: recovery::RECOVERY_PROTOCOL_VERSION,
+            state_diff: None,
+        };
+        let block = Block::new(header, tx_hashes);
+        state.blocks.insert(0, block.clone());
+        state.tx_index.insert(transaction_hash.0, (0, 0));
+        state
+            .full_transactions
+            .insert(transaction_hash.0, transaction);
+        *state.height.write() = 0;
+
+        assert!(
+            !state.enable_archive_mode(),
+            "archive mode cannot manufacture a missing historical receipt"
+        );
+        assert!(!state.archive_reward_history_complete_since_v3_recovery());
+
+        state.receipts.insert(
+            transaction_hash.0,
+            TxReceipt {
+                tx_hash: transaction_hash,
+                block_height: 0,
+                block_hash: block.hash,
+                index: 0,
+                success: true,
+                gas_used: 0,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        );
+        assert!(state.enable_archive_mode());
+        assert!(state.archive_reward_history_complete_since_v3_recovery());
+
+        // A node that ran without archive retention and lost a historical row
+        // cannot regain the lifetime claim merely by toggling the flag later.
+        state.archive_mode = false;
+        state.receipts.remove(&transaction_hash.0);
+        assert!(!state.enable_archive_mode());
+        assert!(!state.archive_reward_history_complete_since_v3_recovery());
+    }
+
+    fn install_historical_archive_reward(
+        state: &StateDB,
+        historical_context: &recovery::RecoveryContext,
+        current_context: &recovery::RecoveryContext,
+        height: u64,
+        parent_hash: Hash256,
+        tag: &[u8],
+    ) -> (Hash256, Block, TxReceipt) {
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        *state.recovery_context.write() = Some(historical_context.clone());
+        let transaction = make_recovery_signed_community_reward(
+            state,
+            &validators[0],
+            &worker,
+            &validators,
+            height,
+            tag,
+        );
+        *state.recovery_context.write() = Some(current_context.clone());
+
+        let transaction_hash = transaction.hash;
+        let tx_hashes = vec![transaction_hash];
+        let header = BlockHeader {
+            height,
+            timestamp: 1_787_857_623_010 + height,
+            parent_hash,
+            tx_root: MerkleTree::from_leaves(tx_hashes.clone()).root(),
+            state_root: Hash256::ZERO,
+            proof_hash: Hash256::ZERO,
+            tx_count: 1,
+            producer: validators[0].address(),
+            protocol_version: recovery::RECOVERY_PROTOCOL_VERSION,
+            state_diff: None,
+        };
+        let block = Block::new(header, tx_hashes);
+        let receipt = TxReceipt {
+            tx_hash: transaction_hash,
+            block_height: height,
+            block_hash: block.hash,
+            index: 0,
+            success: true,
+            gas_used: 0,
+            value_commitment: None,
+            inclusion_proof: None,
+            logs: Vec::new(),
+        };
+        state.blocks.insert(height, block.clone());
+        state.tx_index.insert(transaction_hash.0, (height, 0));
+        state
+            .full_transactions
+            .insert(transaction_hash.0, transaction);
+        state.receipts.insert(transaction_hash.0, receipt.clone());
+        *state.height.write() = height;
+        (transaction_hash, block, receipt)
+    }
+
+    #[test]
+    fn archive_history_completeness_recomputes_from_durable_v3_evidence_after_restart() {
+        let directory = persistent_test_dir("archive-completeness-restart");
+        let genesis_hash = hash_bytes(b"archive-completeness-restart-genesis");
+        let historical_context =
+            recovery::RecoveryContext::new("arc-history-restart", genesis_hash, 1, 7);
+        let current_context =
+            recovery::RecoveryContext::new("arc-history-restart", genesis_hash, 2, 8);
+        let mut state = StateDB::with_genesis_persistent(&[], &directory, genesis_hash).unwrap();
+        let parent_hash = state.get_block(0).expect("durable genesis block").hash;
+        let (transaction_hash, block, receipt) = install_historical_archive_reward(
+            &state,
+            &historical_context,
+            &current_context,
+            1,
+            parent_hash,
+            b"durable-historical-reward",
+        );
+        state.wal.append(WalOp::SetBlock(1, block.clone()), 1);
+        state.wal.append(
+            WalOp::SetFullTransaction(
+                transaction_hash,
+                Box::new(
+                    state
+                        .get_transaction(&transaction_hash.0)
+                        .expect("installed full transaction"),
+                ),
+            ),
+            1,
+        );
+        state
+            .wal
+            .append(WalOp::SetReceipt(transaction_hash, receipt.clone()), 1);
+        state.wal.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+        state.sync_wal();
+
+        assert!(state.enable_archive_mode());
+        assert!(state.archive_reward_history_complete_since_v3_recovery());
+        drop(state);
+
+        let mut restarted =
+            StateDB::with_genesis_persistent(&[], &directory, genesis_hash).unwrap();
+        *restarted.recovery_context.write() = Some(current_context.clone());
+        assert!(
+            !restarted.archive_reward_history_complete_since_v3_recovery(),
+            "the in-memory completeness marker itself must not survive restart"
+        );
+        assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(
+            restarted.get_transaction(&transaction_hash.0).unwrap().hash,
+            transaction_hash
+        );
+        let restored_receipt = restarted.get_receipt(&transaction_hash.0).unwrap();
+        assert_eq!(restored_receipt.tx_hash, receipt.tx_hash);
+        assert_eq!(restored_receipt.block_height, receipt.block_height);
+        assert_eq!(restored_receipt.block_hash, receipt.block_hash);
+        assert_eq!(restored_receipt.index, receipt.index);
+        assert_eq!(restored_receipt.success, receipt.success);
+        assert_eq!(restarted.get_tx_location(&transaction_hash.0), Some((1, 0)));
+        assert!(
+            restarted.enable_archive_mode(),
+            "restored canonical block/body/receipt/index evidence must re-establish completeness"
+        );
+        assert!(restarted.archive_reward_history_complete_since_v3_recovery());
+        drop(restarted);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn historical_archive_state(tag: &[u8]) -> (StateDB, Hash256, Hash256) {
+        let state = StateDB::new();
+        let genesis_hash = hash_bytes(b"archive-historical-domain-corruption");
+        let historical_context =
+            recovery::RecoveryContext::new("arc-history-corruption", genesis_hash, 1, 7);
+        let current_context =
+            recovery::RecoveryContext::new("arc-history-corruption", genesis_hash, 2, 8);
+        let historical_domain = historical_context.domain_hash();
+        let (transaction_hash, _, _) = install_historical_archive_reward(
+            &state,
+            &historical_context,
+            &current_context,
+            0,
+            Hash256::ZERO,
+            tag,
+        );
+        (state, transaction_hash, historical_domain)
+    }
+
+    #[test]
+    fn archive_history_rejects_discriminator_and_body_hash_corruption_in_historical_domain() {
+        let (mut valid, valid_hash, historical_domain) =
+            historical_archive_state(b"historical-valid");
+        assert_ne!(
+            valid.transaction_domain_hash().unwrap(),
+            historical_domain,
+            "the fixture must exercise an earlier recovery domain"
+        );
+        assert_eq!(
+            valid
+                .get_transaction(&valid_hash.0)
+                .unwrap()
+                .compute_hash_in_domain(&historical_domain),
+            valid_hash
+        );
+        assert!(valid.enable_archive_mode());
+
+        let (mut wrong_discriminator, discriminator_hash, _) =
+            historical_archive_state(b"historical-wrong-discriminator");
+        wrong_discriminator
+            .full_transactions
+            .get_mut(&discriminator_hash.0)
+            .unwrap()
+            .tx_type = TxType::Transfer;
+        assert!(
+            !wrong_discriminator.enable_archive_mode(),
+            "an envelope discriminator that differs from the retained body must fail closed"
+        );
+        assert!(!wrong_discriminator.archive_reward_history_complete_since_v3_recovery());
+
+        let (mut wrong_body, body_hash, historical_domain) =
+            historical_archive_state(b"historical-wrong-body-hash");
+        {
+            let mut transaction = wrong_body.full_transactions.get_mut(&body_hash.0).unwrap();
+            let TxBody::CommunityInferenceReward(body) = &mut transaction.body else {
+                panic!("historical archive fixture must contain a 0x25 body");
+            };
+            body.output_hash = hash_bytes(b"corrupted-retained-output");
+            assert_ne!(
+                transaction.compute_hash_in_domain(&historical_domain),
+                body_hash
+            );
+        }
+        assert!(
+            !wrong_body.enable_archive_mode(),
+            "a retained body that no longer hashes to its historical-domain key must fail closed"
+        );
+        assert!(!wrong_body.archive_reward_history_complete_since_v3_recovery());
+    }
+
     // ── State rent tests ──────────────────────────────────────────────────
 
     #[test]
     fn test_collect_rent_deducts_balance() {
         let state = StateDB::with_genesis(&[
-            (addr(1), 5_000_000),   // above dust threshold (1_000_000)
-            (addr(2), 10_000_000),  // above dust threshold
+            (addr(1), 5_000_000),  // above dust threshold (1_000_000)
+            (addr(2), 10_000_000), // above dust threshold
         ]);
 
         let config = StateRentConfig::default();
@@ -7278,9 +12013,7 @@ mod tests {
     fn test_collect_rent_marks_dormant() {
         // Account with balance just above dust threshold → rent pushes it below.
         let balance = 1_000_100; // dust = 1_000_000, rent = 128 → after: 999_972 < 1_000_000
-        let state = StateDB::with_genesis(&[
-            (addr(1), balance),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), balance)]);
 
         let config = StateRentConfig::default();
         let (collected, dormant) = state.collect_rent(&config);
@@ -7311,9 +12044,7 @@ mod tests {
 
     #[test]
     fn test_collect_rent_zero_rent_noop() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 5_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 5_000_000)]);
 
         let config = StateRentConfig {
             cost_per_byte_per_epoch: 0,
@@ -7328,7 +12059,9 @@ mod tests {
     // ── Channel integration tests ────────────────────────────────────────
 
     use arc_types::transaction::{
-        ChannelOpenBody, ChannelCloseBody, ChannelDisputeBody, InferenceRegisterBody,
+        BridgeLockBody, BridgeMintBody, ChannelCloseBody, ChannelDisputeBody, ChannelOpenBody,
+        DeployBody, EscrowBody, InferenceRegisterBody, JoinValidatorBody, ShardProofBody,
+        StakeBody, SwapBody, UpdateStakeBody, WasmCallBody,
     };
 
     fn make_channel_tx(from: Address, nonce: u64, body: TxBody, tx_type: TxType) -> Transaction {
@@ -7352,12 +12085,17 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let channel_id = hash_bytes(b"test-channel-1");
 
-        let tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
 
         let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(receipts[0].success, "ChannelOpen should succeed");
@@ -7370,8 +12108,8 @@ mod tests {
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 100_000);
-        assert_eq!(escrow.code_hash, addr(1));      // opener
-        assert_eq!(escrow.storage_root, addr(2));    // counterparty
+        assert_eq!(escrow.code_hash, addr(1)); // opener
+        assert_eq!(escrow.storage_root, addr(2)); // counterparty
     }
 
     #[test]
@@ -7380,23 +12118,33 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-2");
 
         // Open
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         let (_, r) = state.execute_block(&[open_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
         // Close (opener closes, split 60K/40K)
-        let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
-            channel_id,
-            opener_balance: 60_000,
-            counterparty_balance: 40_000,
-            counterparty_sig: vec![0u8; 64],
-            state_nonce: 1,
-        }), TxType::ChannelClose);
+        let close_tx = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ChannelClose(ChannelCloseBody {
+                channel_id,
+                opener_balance: 60_000,
+                counterparty_balance: 40_000,
+                counterparty_sig: vec![0u8; 64],
+                state_nonce: 1,
+            }),
+            TxType::ChannelClose,
+        );
         let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
         assert!(r[0].success, "ChannelClose should succeed");
 
@@ -7420,32 +12168,42 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-3");
 
         // Open channel
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // Dispute from counterparty (addr(2))
-        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 70_000,
-            counterparty_balance: 30_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 5,
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let dispute_tx = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 70_000,
+                counterparty_balance: 30_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 5,
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success, "ChannelDispute should succeed");
 
         // Check escrow state updated
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
-        assert_eq!(escrow.nonce, 5);                // state_nonce recorded
-        assert!(escrow.staked_balance > 0);          // challenge_expiry set
-        assert_eq!(escrow.balance, 100_000);         // funds still locked
+        assert_eq!(escrow.nonce, 5); // state_nonce recorded
+        assert!(escrow.staked_balance > 0); // challenge_expiry set
+        assert_eq!(escrow.balance, 100_000); // funds still locked
     }
 
     #[test]
@@ -7454,35 +12212,50 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-4");
 
         // Open
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // First dispute with nonce 10
-        let d1 = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 60_000,
-            counterparty_balance: 40_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 10,
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let d1 = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 60_000,
+                counterparty_balance: 40_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 10,
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[d1], addr(99)).unwrap();
         assert!(r[0].success);
 
         // Second dispute with lower nonce (5) - should fail
-        let d2 = make_channel_tx(addr(1), 1, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 80_000,
-            counterparty_balance: 20_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 5, // lower than 10!
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let d2 = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 80_000,
+                counterparty_balance: 20_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 5, // lower than 10!
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[d2], addr(99)).unwrap();
         assert!(!r[0].success, "Dispute with lower nonce should be rejected");
     }
@@ -7493,36 +12266,54 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-5");
 
         // Open
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // Dispute (sets challenge_expiry far in the future)
-        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 60_000,
-            counterparty_balance: 40_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 1,
-            challenge_period: 100_000, // very long
-        }), TxType::ChannelDispute);
+        let dispute_tx = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 60_000,
+                counterparty_balance: 40_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 1,
+                challenge_period: 100_000, // very long
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
         // Try to close - should fail (active dispute)
-        let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
-            channel_id,
-            opener_balance: 100_000,
-            counterparty_balance: 0,
-            counterparty_sig: vec![0u8; 64],
-            state_nonce: 1,
-        }), TxType::ChannelClose);
+        let close_tx = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ChannelClose(ChannelCloseBody {
+                channel_id,
+                opener_balance: 100_000,
+                counterparty_balance: 0,
+                counterparty_sig: vec![0u8; 64],
+                state_nonce: 1,
+            }),
+            TxType::ChannelClose,
+        );
         let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
-        assert!(!r[0].success, "Close should be blocked during active dispute");
+        assert!(
+            !r[0].success,
+            "Close should be blocked during active dispute"
+        );
     }
 
     #[test]
@@ -7531,42 +12322,60 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-6");
 
         // Open with 100K deposit
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // Dispute claiming more than deposited - should fail
-        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 80_000,
-            counterparty_balance: 40_000, // 80K + 40K = 120K > 100K!
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 1,
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let dispute_tx = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 80_000,
+                counterparty_balance: 40_000, // 80K + 40K = 120K > 100K!
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 1,
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
-        assert!(!r[0].success, "Dispute exceeding deposit should be rejected");
+        assert!(
+            !r[0].success,
+            "Dispute exceeding deposit should be rejected"
+        );
     }
 
     #[test]
     fn test_inference_register_locks_stake() {
         let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
 
-        let tx = make_channel_tx(addr(1), 0, TxBody::InferenceRegister(InferenceRegisterBody {
-            tier: 2,
-            stake_bond: 5_000,
-        }), TxType::InferenceRegister);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceRegister(InferenceRegisterBody {
+                tier: 2,
+                stake_bond: 5_000,
+            }),
+            TxType::InferenceRegister,
+        );
 
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success, "InferenceRegister should succeed");
 
         let acct = state.get_account(&addr(1)).unwrap();
-        assert_eq!(acct.balance, 95_000);        // 100K - 5K
-        assert_eq!(acct.staked_balance, 5_000);  // locked
+        assert_eq!(acct.balance, 95_000); // 100K - 5K
+        assert_eq!(acct.staked_balance, 5_000); // locked
     }
 
     #[test]
@@ -7574,13 +12383,1071 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
 
         // Tier 2 requires 5K minimum, try with only 1K
-        let tx = make_channel_tx(addr(1), 0, TxBody::InferenceRegister(InferenceRegisterBody {
-            tier: 2,
-            stake_bond: 1_000, // below min for tier 2
-        }), TxType::InferenceRegister);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceRegister(InferenceRegisterBody {
+                tier: 2,
+                stake_bond: 1_000, // below min for tier 2
+            }),
+            TxType::InferenceRegister,
+        );
 
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
-        assert!(!r[0].success, "InferenceRegister with insufficient stake should fail");
+        assert!(
+            !r[0].success,
+            "InferenceRegister with insufficient stake should fail"
+        );
+    }
+
+    #[test]
+    fn validator_exit_paths_preserve_overlapping_provider_bond_and_supply() {
+        let worker = addr(31);
+        let state = StateDB::with_genesis(&[(worker, 1_000_000)]);
+        let initial_supply = 1_000_000u128;
+        let assert_state = |balance, locked, validator_stake, pool, nonce| {
+            let account = state.get_account(&worker).unwrap();
+            assert_eq!(account.balance, balance);
+            assert_eq!(account.staked_balance, locked);
+            assert_eq!(account.nonce, nonce);
+            assert_eq!(
+                state.get_validator_stake(&worker).unwrap_or(0),
+                validator_stake
+            );
+            assert_eq!(state.total_staked(), pool);
+            assert_eq!(
+                u128::from(account.balance) + u128::from(account.staked_balance),
+                initial_supply
+            );
+        };
+
+        let register = make_channel_tx(
+            worker,
+            0,
+            TxBody::InferenceRegister(InferenceRegisterBody {
+                tier: 4,
+                stake_bond: 25_000,
+            }),
+            TxType::InferenceRegister,
+        );
+        assert!(state.execute_tx(&register).is_ok());
+        assert_state(975_000, 25_000, 0, 0, 1);
+
+        // A provider bond alone is never validator stake and cannot be
+        // withdrawn through the generic unstake transaction.
+        let steal_provider_bond = make_channel_tx(
+            worker,
+            1,
+            TxBody::Stake(StakeBody {
+                amount: 25_000,
+                is_stake: false,
+                validator: worker,
+            }),
+            TxType::Stake,
+        );
+        assert!(state.execute_tx(&steal_provider_bond).is_err());
+        assert_state(975_000, 25_000, 0, 0, 1);
+
+        let join = make_channel_tx(
+            worker,
+            1,
+            TxBody::JoinValidator(JoinValidatorBody {
+                pubkey: [0u8; 32],
+                initial_stake: 100_000,
+            }),
+            TxType::JoinValidator,
+        );
+        assert!(state.execute_tx(&join).is_ok());
+        assert_state(875_000, 125_000, 100_000, 100_000, 2);
+
+        let partial_unstake = make_channel_tx(
+            worker,
+            2,
+            TxBody::Stake(StakeBody {
+                amount: 40_000,
+                is_stake: false,
+                validator: worker,
+            }),
+            TxType::Stake,
+        );
+        assert!(state.execute_tx(&partial_unstake).is_ok());
+        assert_state(915_000, 85_000, 60_000, 60_000, 3);
+
+        let update = make_channel_tx(
+            worker,
+            3,
+            TxBody::UpdateStake(UpdateStakeBody { new_stake: 50_000 }),
+            TxType::UpdateStake,
+        );
+        assert!(state.execute_tx(&update).is_ok());
+        assert_state(925_000, 75_000, 50_000, 50_000, 4);
+
+        let leave = make_channel_tx(worker, 4, TxBody::LeaveValidator, TxType::LeaveValidator);
+        assert!(state.execute_tx(&leave).is_ok());
+        assert_state(975_000, 25_000, 0, 0, 5);
+
+        let second_steal = make_channel_tx(
+            worker,
+            5,
+            TxBody::Stake(StakeBody {
+                amount: 25_000,
+                is_stake: false,
+                validator: worker,
+            }),
+            TxType::Stake,
+        );
+        assert!(state.execute_tx(&second_steal).is_err());
+        assert_state(975_000, 25_000, 0, 0, 5);
+    }
+
+    #[test]
+    fn validator_exit_arithmetic_failure_is_atomic() {
+        let validator = addr(32);
+        let state = StateDB::with_genesis(&[(validator, u64::MAX)]);
+        let mut account = state.get_account(&validator).unwrap();
+        account.staked_balance = StateDB::MIN_VALIDATOR_STAKE;
+        state.accounts.insert(validator.0, account.clone());
+        state
+            .validators
+            .insert(validator.0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .staking_pool
+            .store(StateDB::MIN_VALIDATOR_STAKE, Ordering::Release);
+        let leave = make_channel_tx(validator, 0, TxBody::LeaveValidator, TxType::LeaveValidator);
+        let error = state.execute_tx(&leave).unwrap_err();
+        assert!(error.to_string().contains("balance overflow"));
+        let unchanged = state.get_account(&validator).unwrap();
+        assert_eq!(unchanged.balance, u64::MAX);
+        assert_eq!(unchanged.staked_balance, StateDB::MIN_VALIDATOR_STAKE);
+        assert_eq!(unchanged.nonce, 0);
+        assert_eq!(
+            state.get_validator_stake(&validator),
+            Some(StateDB::MIN_VALIDATOR_STAKE)
+        );
+        assert_eq!(state.total_staked(), StateDB::MIN_VALIDATOR_STAKE);
+
+        // A corrupt pool also fails before changing the account or map.
+        state.staking_pool.store(0, Ordering::Release);
+        let error = state.execute_tx(&leave).unwrap_err();
+        assert!(error.to_string().contains("balance overflow"));
+        // Remove the balance-overflow condition so the pool check becomes the
+        // first failing invariant.
+        let mut account = state.get_account(&validator).unwrap();
+        account.balance = 0;
+        state.accounts.insert(validator.0, account);
+        let error = state.execute_tx(&leave).unwrap_err();
+        assert!(error.to_string().contains("staking pool underflow"));
+        let unchanged = state.get_account(&validator).unwrap();
+        assert_eq!(unchanged.balance, 0);
+        assert_eq!(unchanged.staked_balance, StateDB::MIN_VALIDATOR_STAKE);
+        assert_eq!(unchanged.nonce, 0);
+        assert_eq!(
+            state.get_validator_stake(&validator),
+            Some(StateDB::MIN_VALIDATOR_STAKE)
+        );
+        assert_eq!(state.total_staked(), 0);
+    }
+
+    #[test]
+    fn recovery_v3_allowlist_classifies_every_family_and_rejects_unsafe_mutations() {
+        use V3TransactionFamilyPolicy::{Allowed, Denied};
+
+        // Every currently defined transaction family is classified here, and
+        // the production match is exhaustive. A new TxType therefore fails
+        // compilation until it receives an explicit v3 policy and a test row.
+        let policies = [
+            (TxType::Transfer, Allowed),
+            (TxType::Settle, Denied),
+            (TxType::Swap, Denied),
+            (TxType::Escrow, Denied),
+            (TxType::Stake, Denied),
+            (TxType::WasmCall, Denied),
+            (TxType::MultiSig, Denied),
+            (TxType::DeployContract, Denied),
+            (TxType::RegisterAgent, Denied),
+            (TxType::JoinValidator, Denied),
+            (TxType::LeaveValidator, Denied),
+            (TxType::ClaimRewards, Denied),
+            (TxType::UpdateStake, Denied),
+            (TxType::Governance, Denied),
+            (TxType::BridgeLock, Denied),
+            (TxType::BridgeMint, Denied),
+            (TxType::BatchSettle, Denied),
+            (TxType::ChannelOpen, Denied),
+            (TxType::ChannelClose, Denied),
+            (TxType::ChannelDispute, Denied),
+            (TxType::ShardProof, Denied),
+            (TxType::InferenceAttestation, Denied),
+            (TxType::InferenceChallenge, Denied),
+            (TxType::InferenceRegister, Denied),
+            (TxType::InferenceEscrowOpen, Denied),
+            (TxType::InferenceEscrowRelease, Denied),
+            (TxType::InferenceEscrowRefund, Denied),
+            (TxType::ModelRegistration, Denied),
+            (TxType::ModelRequest, Denied),
+            (TxType::ShardCoverageClaim, Denied),
+            (TxType::CapacityAdvertisement, Denied),
+            (TxType::ShardAssignmentProposal, Denied),
+            (TxType::FaucetClaim, Allowed),
+            (TxType::InferenceRequest, Denied),
+            (TxType::InferenceVote, Denied),
+            (TxType::InferenceFinalize, Denied),
+            (TxType::CommunityInferenceReward, Allowed),
+        ];
+        assert_eq!(policies.len(), 0x25);
+        let mut discriminants: Vec<_> =
+            policies.iter().map(|(tx_type, _)| *tx_type as u8).collect();
+        discriminants.sort_unstable();
+        assert_eq!(discriminants, (1u8..=0x25).collect::<Vec<_>>());
+        for (tx_type, expected) in policies {
+            assert_eq!(
+                StateDB::v3_transaction_family_policy(tx_type),
+                expected,
+                "unexpected v3 policy for {tx_type:?}"
+            );
+        }
+
+        let directory = persistent_test_dir("v3-denylist");
+        let signer = arc_crypto::KeyPair::generate_ed25519();
+        let counterparty = addr(41);
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let mut prefunded = vec![(signer.address(), 1_000_000), (counterparty, 500_000)];
+        prefunded.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        let state = StateDB::with_genesis_persistent(
+            &prefunded,
+            &directory,
+            hash_bytes(b"v3-denylist-genesis"),
+        )
+        .unwrap();
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(
+            validator_set.iter().map(|entry| entry.1).sum(),
+            Ordering::Release,
+        );
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-denylist-genesis"),
+            1,
+            1,
+        ));
+        state.wal.sync().unwrap();
+
+        let channel_id = hash_bytes(b"unsafe-channel");
+        let denied = vec![
+            (
+                "swap",
+                TxBody::Swap(SwapBody {
+                    counterparty,
+                    offer_amount: 1,
+                    receive_amount: 500_000,
+                    offer_asset: Hash256::ZERO,
+                    receive_asset: Hash256::ZERO,
+                }),
+            ),
+            (
+                "escrow-release",
+                TxBody::Escrow(EscrowBody {
+                    beneficiary: signer.address(),
+                    amount: u64::MAX,
+                    conditions_hash: Hash256::ZERO,
+                    is_create: false,
+                }),
+            ),
+            (
+                "stake",
+                TxBody::Stake(StakeBody {
+                    amount: 100_000,
+                    is_stake: true,
+                    validator: signer.address(),
+                }),
+            ),
+            (
+                "wasm-call",
+                TxBody::WasmCall(WasmCallBody {
+                    contract: addr(42),
+                    function: "trap".into(),
+                    calldata: vec![0xff],
+                    value: 1,
+                    gas_limit: 1,
+                }),
+            ),
+            (
+                "deploy-invalid-compile",
+                TxBody::DeployContract(DeployBody {
+                    bytecode: b"\0asm-invalid".to_vec(),
+                    constructor_args: vec![0xff],
+                    state_rent_deposit: 1,
+                }),
+            ),
+            (
+                "join-validator",
+                TxBody::JoinValidator(JoinValidatorBody {
+                    pubkey: [1u8; 32],
+                    initial_stake: 100_000,
+                }),
+            ),
+            ("leave-validator", TxBody::LeaveValidator),
+            (
+                "update-stake",
+                TxBody::UpdateStake(UpdateStakeBody { new_stake: 1 }),
+            ),
+            (
+                "bridge-lock",
+                TxBody::BridgeLock(BridgeLockBody {
+                    destination_chain: 1,
+                    destination_address: [2u8; 32],
+                    amount: 10,
+                }),
+            ),
+            (
+                "bridge-mint",
+                TxBody::BridgeMint(BridgeMintBody {
+                    source_chain: 1,
+                    source_tx_hash: hash_bytes(b"replayable-source"),
+                    recipient: signer.address(),
+                    amount: u64::MAX,
+                    merkle_proof: vec![0],
+                }),
+            ),
+            (
+                "channel-open",
+                TxBody::ChannelOpen(ChannelOpenBody {
+                    channel_id,
+                    counterparty,
+                    deposit: 10,
+                    timeout_blocks: 10,
+                }),
+            ),
+            (
+                "channel-close",
+                TxBody::ChannelClose(ChannelCloseBody {
+                    channel_id,
+                    opener_balance: u64::MAX,
+                    counterparty_balance: 0,
+                    counterparty_sig: vec![],
+                    state_nonce: 1,
+                }),
+            ),
+            (
+                "channel-dispute",
+                TxBody::ChannelDispute(ChannelDisputeBody {
+                    channel_id,
+                    opener_balance: 1,
+                    counterparty_balance: 1,
+                    other_party_sig: vec![],
+                    state_nonce: 1,
+                    challenge_period: 1,
+                }),
+            ),
+            (
+                "shard-proof",
+                TxBody::ShardProof(ShardProofBody {
+                    shard_id: 0,
+                    block_height: 1,
+                    block_hash: hash_bytes(b"forged-shard-block"),
+                    prev_state_root: Hash256::ZERO,
+                    post_state_root: hash_bytes(b"forged-root"),
+                    tx_count: 1,
+                    proof_data: vec![0],
+                }),
+            ),
+        ];
+
+        let before_account =
+            bincode::serialize(&state.get_account(&signer.address()).unwrap()).unwrap();
+        let before_counterparty =
+            bincode::serialize(&state.get_account(&counterparty).unwrap()).unwrap();
+        let before_root = state.get_state_root();
+        let before_height = state.height();
+        let before_accounts = state.accounts.len();
+        let mut before_validators = state.active_validators();
+        before_validators.sort_by_key(|entry| entry.0.0);
+        let before_wal = std::fs::metadata(directory.join("state.wal"))
+            .unwrap()
+            .len();
+        let before_supply: u128 = state
+            .accounts
+            .iter()
+            .map(|account| {
+                u128::from(account.value().balance) + u128::from(account.value().staked_balance)
+            })
+            .sum();
+
+        for (label, body) in denied {
+            let mut transaction =
+                make_channel_tx(signer.address(), 0, body.clone(), body.tx_type());
+            state.sign_transaction(&mut transaction, &signer).unwrap();
+            state.verify_transaction_signature(&transaction).unwrap();
+            let error = state
+                .execute_tx(&transaction)
+                .expect_err("v3 denylisted transaction must fail before execution");
+            assert!(
+                error.to_string().contains("unavailable"),
+                "{label}: {error}"
+            );
+            state.wal.sync().unwrap();
+            assert_eq!(
+                bincode::serialize(&state.get_account(&signer.address()).unwrap()).unwrap(),
+                before_account,
+                "{label} changed signer"
+            );
+            assert_eq!(
+                bincode::serialize(&state.get_account(&counterparty).unwrap()).unwrap(),
+                before_counterparty,
+                "{label} changed counterparty"
+            );
+            assert_eq!(state.get_state_root(), before_root, "{label} changed root");
+            assert_eq!(state.height(), before_height, "{label} changed height");
+            assert_eq!(
+                state.accounts.len(),
+                before_accounts,
+                "{label} created account"
+            );
+            assert_eq!(
+                std::fs::metadata(directory.join("state.wal"))
+                    .unwrap()
+                    .len(),
+                before_wal,
+                "{label} wrote WAL"
+            );
+            assert_eq!(
+                state.active_validators().len(),
+                6,
+                "{label} changed committee"
+            );
+            let mut current_validators = state.active_validators();
+            current_validators.sort_by_key(|entry| entry.0.0);
+            assert_eq!(
+                current_validators, before_validators,
+                "{label} changed validator identities/stakes"
+            );
+            assert_eq!(
+                state
+                    .accounts
+                    .iter()
+                    .map(|account| {
+                        u128::from(account.value().balance)
+                            + u128::from(account.value().staked_balance)
+                    })
+                    .sum::<u128>(),
+                before_supply,
+                "{label} changed supply"
+            );
+        }
+
+        // Raw zero-bond attestations are intentionally not a v3 ingress
+        // family. Otherwise an attacker can generate unlimited fresh keys and
+        // permanently create one zero-balance nonce account per transaction.
+        for index in 0..32u8 {
+            let fresh_worker = arc_crypto::KeyPair::generate_ed25519();
+            assert!(state.get_account(&fresh_worker.address()).is_none());
+            let mut attestation = make_attestation(
+                fresh_worker.address(),
+                0,
+                0,
+                100,
+                &[b"v3-attestation-flood-".as_slice(), &[index]].concat(),
+            );
+            state
+                .sign_transaction(&mut attestation, &fresh_worker)
+                .unwrap();
+            let error = state.execute_tx(&attestation).unwrap_err();
+            assert!(error.to_string().contains("unavailable"));
+            assert!(
+                state.get_account(&fresh_worker.address()).is_none(),
+                "raw attestation {index} created a sender account"
+            );
+        }
+        state.wal.sync().unwrap();
+        assert_eq!(state.accounts.len(), before_accounts);
+        assert_eq!(state.get_state_root(), before_root);
+        assert_eq!(
+            std::fs::metadata(directory.join("state.wal"))
+                .unwrap()
+                .len(),
+            before_wal,
+            "rejected raw-attestation flood wrote WAL"
+        );
+
+        // A real recovery member is frozen just like an outsider.
+        let member = &validators[0];
+        for body in [
+            TxBody::LeaveValidator,
+            TxBody::UpdateStake(UpdateStakeBody { new_stake: 0 }),
+        ] {
+            let mut transaction =
+                make_channel_tx(member.address(), 0, body.clone(), body.tx_type());
+            state.sign_transaction(&mut transaction, member).unwrap();
+            assert!(state.execute_tx(&transaction).is_err());
+        }
+        assert_eq!(state.active_validators().len(), 6);
+        let mut current_validators = state.active_validators();
+        current_validators.sort_by_key(|entry| entry.0.0);
+        assert_eq!(current_validators, before_validators);
+        assert_eq!(state.get_state_root(), before_root);
+
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_v3_transfer_is_checked_atomic_and_domain_authenticated() {
+        let directory = persistent_test_dir("v3-transfer-atomic");
+        let sender = arc_crypto::KeyPair::generate_ed25519();
+        let receiver = arc_crypto::KeyPair::generate_ed25519();
+        let overflow_receiver = arc_crypto::KeyPair::generate_ed25519();
+        let second_sender = arc_crypto::KeyPair::generate_ed25519();
+        let second_receiver = arc_crypto::KeyPair::generate_ed25519();
+        let wrong_signer = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis_persistent(
+            &[
+                (sender.address(), 100),
+                (receiver.address(), 0),
+                (overflow_receiver.address(), u64::MAX),
+                (second_sender.address(), 100),
+                (second_receiver.address(), 0),
+            ],
+            &directory,
+            hash_bytes(b"v3-transfer-atomic-genesis"),
+        )
+        .unwrap();
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-transfer-atomic-genesis"),
+            1,
+            1,
+        ));
+        state.wal.sync().unwrap();
+
+        let chain_domain =
+            arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+        let digest = hash_bytes(b"v3-transfer-dust-target");
+        let mut probe_id = [0u8; 32];
+        probe_id[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_id[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(4);
+        let reserved_targets = [
+            arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                &chain_domain,
+                &digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                &chain_domain,
+                &receiver.address(),
+                &digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &chain_domain,
+                &Hash256(probe_id),
+            )
+            .unwrap(),
+            community_reward_block_budget_address(7),
+            community_reward_epoch_budget_address(8),
+            community_reward_worker_budget_address(8, &receiver.address()),
+            community_reward_coordinator_budget_address(8, &sender.address()),
+            arc_types::transaction::FaucetClaimBody::v3_marker_address(&receiver.address()),
+        ];
+        for target in reserved_targets {
+            assert!(is_reserved_system_account(&target));
+            let mut dust = make_channel_tx(
+                sender.address(),
+                0,
+                TxBody::Transfer(TransferBody {
+                    to: target,
+                    amount: 1,
+                    amount_commitment: None,
+                }),
+                TxType::Transfer,
+            );
+            dust.fee = V3_MIN_TRANSFER_FEE;
+            state.sign_transaction(&mut dust, &sender).unwrap();
+            let error = state.validate_v3_transaction_admission(&dust).unwrap_err();
+            assert!(error.to_string().contains("collision"), "{error}");
+            assert!(state.execute_tx(&dust).is_err());
+            assert!(state.get_account(&target).is_none());
+        }
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 100);
+        assert_eq!(state.get_account(&sender.address()).unwrap().nonce, 0);
+
+        let mut zero_fee = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        state.sign_transaction(&mut zero_fee, &sender).unwrap();
+        let error = state
+            .validate_v3_transaction_admission(&zero_fee)
+            .unwrap_err();
+        assert!(error.to_string().contains("below minimum"), "{error}");
+        assert!(state.execute_tx(&zero_fee).is_err());
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 100);
+
+        // A v3 self-transfer is rejected: without a fee-bearing value move it
+        // is an inexpensive way to grow permanent history.
+        let mut self_transfer = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: sender.address(),
+                amount: 75,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        self_transfer.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut self_transfer, &sender).unwrap();
+        assert!(
+            state
+                .execute_tx(&self_transfer)
+                .unwrap_err()
+                .to_string()
+                .contains("collision")
+        );
+        let after_self = state.get_account(&sender.address()).unwrap();
+        assert_eq!(after_self.balance, 100);
+        assert_eq!(after_self.nonce, 0);
+
+        // Recipient overflow fails before sender debit/nonce/WAL mutation.
+        state.wal.sync().unwrap();
+        let before_sender = state.get_account(&sender.address()).unwrap();
+        let before_overflow = state.get_account(&overflow_receiver.address()).unwrap();
+        let before_accounts = state.accounts.len();
+        let before_wal = std::fs::metadata(directory.join("state.wal"))
+            .unwrap()
+            .len();
+        let mut overflow = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: overflow_receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        overflow.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut overflow, &sender).unwrap();
+        assert!(
+            state
+                .execute_tx(&overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        state.wal.sync().unwrap();
+        assert_eq!(
+            bincode::serialize(&state.get_account(&sender.address()).unwrap()).unwrap(),
+            bincode::serialize(&before_sender).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&state.get_account(&overflow_receiver.address()).unwrap()).unwrap(),
+            bincode::serialize(&before_overflow).unwrap()
+        );
+        assert_eq!(state.accounts.len(), before_accounts);
+        assert_eq!(
+            std::fs::metadata(directory.join("state.wal"))
+                .unwrap()
+                .len(),
+            before_wal
+        );
+
+        // Missing senders and a forged sig_verified hint both fail without
+        // materializing an account.
+        let missing = arc_crypto::KeyPair::generate_ed25519();
+        let mut missing_tx = make_channel_tx(
+            missing.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        missing_tx.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut missing_tx, &missing).unwrap();
+        assert!(matches!(
+            state.execute_tx(&missing_tx),
+            Err(StateError::InsufficientBalance { have: 0, need: 2 })
+        ));
+        assert!(state.get_account(&missing.address()).is_none());
+
+        let mut forged = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        forged.fee = V3_MIN_TRANSFER_FEE;
+        forged.sig_verified = true;
+        assert!(
+            state
+                .execute_tx(&forged)
+                .unwrap_err()
+                .to_string()
+                .contains("signature")
+        );
+        assert_eq!(
+            bincode::serialize(&state.get_account(&sender.address()).unwrap()).unwrap(),
+            bincode::serialize(&before_sender).unwrap()
+        );
+
+        // A normal domain-signed transfer commits both account candidates.
+        let mut transfer = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 40,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        transfer.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut transfer, &sender).unwrap();
+        state
+            .validate_v3_transaction_admission_at(&transfer, state.height() + 1)
+            .unwrap();
+        state
+            .validate_v3_block_admission_at(std::slice::from_ref(&transfer), state.height() + 1)
+            .unwrap();
+
+        let mut denied_attestation =
+            make_attestation(sender.address(), 0, 0, 100, b"denied-block-attestation");
+        state
+            .sign_transaction(&mut denied_attestation, &sender)
+            .unwrap();
+
+        let mut bad_nonce = make_channel_tx(
+            sender.address(),
+            9,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        bad_nonce.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut bad_nonce, &sender).unwrap();
+
+        let mut invalid_signature = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        invalid_signature.fee = V3_MIN_TRANSFER_FEE;
+        state
+            .sign_transaction(&mut invalid_signature, &wrong_signer)
+            .unwrap();
+
+        let mut wrong_domain = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        wrong_domain.fee = V3_MIN_TRANSFER_FEE;
+        wrong_domain
+            .sign(&sender)
+            .expect("legacy-domain signature is well-formed but wrong for v3");
+
+        let mut same_sender_second = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: second_receiver.address(),
+                amount: 2,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        same_sender_second.fee = V3_MIN_TRANSFER_FEE;
+        state
+            .sign_transaction(&mut same_sender_second, &sender)
+            .unwrap();
+
+        let mut overlapping_treasury = make_channel_tx(
+            second_sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: second_receiver.address(),
+                amount: 3,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        overlapping_treasury.fee = V3_MIN_TRANSFER_FEE;
+        state
+            .sign_transaction(&mut overlapping_treasury, &second_sender)
+            .unwrap();
+        state
+            .validate_v3_transaction_admission_at(&overlapping_treasury, state.height() + 1)
+            .unwrap();
+
+        state.wal.sync().unwrap();
+        let fingerprint = || {
+            let mut accounts: Vec<_> = state
+                .accounts
+                .iter()
+                .map(|entry| {
+                    (
+                        *entry.key(),
+                        bincode::serialize(entry.value()).expect("account serializes"),
+                    )
+                })
+                .collect();
+            accounts.sort_by_key(|entry| entry.0);
+            (
+                state.height(),
+                state.get_state_root(),
+                accounts,
+                state.blocks.len(),
+                state.receipts.len(),
+                state.tx_index.len(),
+                state.full_transactions.len(),
+                std::fs::metadata(directory.join("state.wal"))
+                    .unwrap()
+                    .len(),
+            )
+        };
+        let before_rejections = fingerprint();
+        let oversized = vec![transfer.clone(); V3_MAX_TRANSACTIONS_PER_BLOCK + 1];
+        let rejected_blocks = vec![
+            ("denied family", vec![denied_attestation]),
+            ("bad nonce", vec![bad_nonce]),
+            ("invalid signature", vec![invalid_signature]),
+            ("wrong recovery domain", vec![wrong_domain]),
+            ("duplicate hash", vec![transfer.clone(), transfer.clone()]),
+            ("same sender", vec![transfer.clone(), same_sender_second]),
+            (
+                "overlapping state access",
+                vec![transfer.clone(), overlapping_treasury],
+            ),
+            ("too many transactions", oversized),
+        ];
+        for (label, candidate) in rejected_blocks {
+            let error = state
+                .execute_block_verified_at(&candidate, sender.address(), 1_787_857_623_001)
+                .expect_err("invalid v3 block must fail before state mutation");
+            state.wal.sync().unwrap();
+            assert_eq!(fingerprint(), before_rejections, "{label}: {error}");
+        }
+
+        let (block, receipts) = state
+            .execute_block_verified_at(
+                std::slice::from_ref(&transfer),
+                sender.address(),
+                1_787_857_623_002,
+            )
+            .unwrap();
+        assert_eq!(block.header.height, 1);
+        assert!(receipts[0].success);
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 59);
+        assert_eq!(state.get_account(&sender.address()).unwrap().nonce, 1);
+        assert_eq!(state.get_account(&receiver.address()).unwrap().balance, 40);
+        assert_eq!(
+            state
+                .get_account(&v3_fee_treasury_address())
+                .unwrap()
+                .balance,
+            V3_MIN_TRANSFER_FEE
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_v3_faucet_rejects_reserved_and_marker_aliases_without_minting() {
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let validator = &validators[0];
+        let ordinary_recipient = arc_crypto::KeyPair::generate_ed25519().address();
+        let pool = arc_types::transaction::faucet_pool_address();
+        let reward_treasury = arc_types::transaction::inference_reward_treasury_address();
+        let recovery_reserve = hash_bytes(&[2u8]);
+        let legacy_bridge = hash_bytes(b"ARC-bridge-escrow");
+        let legacy_model_treasury = hash_bytes(b"arc-treasury");
+        let chain_domain =
+            arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+        let namespace_digest = hash_bytes(b"v3-reserved-namespace-admission-test");
+        let mut probe_id = [0u8; 32];
+        probe_id[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_id[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(3);
+        let dynamic_reserved = [
+            arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+                &chain_domain,
+                &namespace_digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_certificate_marker_address(
+                &chain_domain,
+                &ordinary_recipient,
+                &namespace_digest,
+            ),
+            arc_types::transaction::CommunityInferenceRewardBody::v3_recovery_probe_marker_address(
+                &chain_domain,
+                &Hash256(probe_id),
+            )
+            .unwrap(),
+            community_reward_block_budget_address(42),
+            community_reward_epoch_budget_address(9),
+            community_reward_worker_budget_address(9, &ordinary_recipient),
+            community_reward_coordinator_budget_address(9, &validator.address()),
+            FaucetClaimBody::v3_marker_address(&ordinary_recipient),
+        ];
+        assert!(
+            dynamic_reserved.iter().all(is_reserved_system_account),
+            "every dynamic state-owned v3 family must be admission-recognizable"
+        );
+        let mut genesis = vec![
+            (pool, 10 * arc_types::transaction::FAUCET_CLAIM_MAX),
+            (reward_treasury, 20),
+            (recovery_reserve, 30),
+            (legacy_bridge, 40),
+            (legacy_model_treasury, 50),
+        ];
+        genesis.extend(validators.iter().map(|key| (key.address(), 0)));
+        let state = StateDB::with_genesis(&genesis);
+        state.seed_genesis_validators(
+            &validators
+                .iter()
+                .map(|key| (key.address(), StateDB::MIN_VALIDATOR_STAKE))
+                .collect::<Vec<_>>(),
+        );
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-faucet-alias-genesis"),
+            1,
+            1,
+        ));
+        let initial_supply = sum_all_balances(&state);
+
+        let mut forbidden_recipients = vec![
+            pool,
+            reward_treasury,
+            recovery_reserve,
+            legacy_bridge,
+            legacy_model_treasury,
+        ];
+        forbidden_recipients.extend(dynamic_reserved);
+        for recipient in forbidden_recipients {
+            let mut claim = make_channel_tx(
+                validator.address(),
+                0,
+                TxBody::FaucetClaim(FaucetClaimBody {
+                    recipient,
+                    amount: 1,
+                }),
+                TxType::FaucetClaim,
+            );
+            state.sign_transaction(&mut claim, validator).unwrap();
+            assert!(
+                state
+                    .execute_tx(&claim)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collision")
+            );
+            assert_eq!(sum_all_balances(&state), initial_supply);
+        }
+
+        // Create one legitimate marker, then prove it cannot be used as a
+        // recipient in a second claim.
+        let mut valid = make_channel_tx(
+            validator.address(),
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: ordinary_recipient,
+                amount: 1,
+            }),
+            TxType::FaucetClaim,
+        );
+        state.sign_transaction(&mut valid, validator).unwrap();
+        let legacy_marker = FaucetClaimBody::marker_address(&ordinary_recipient);
+        let mut genuine_legacy_marker = Account::new(legacy_marker, 0);
+        genuine_legacy_marker.nonce = 1;
+        genuine_legacy_marker.code_hash = ordinary_recipient;
+        genuine_legacy_marker.storage_root = hash_bytes(&1u64.to_be_bytes());
+        state
+            .accounts
+            .insert(legacy_marker.0, genuine_legacy_marker);
+        let legacy_replay = state.execute_tx(&valid).unwrap_err();
+        assert!(
+            legacy_replay
+                .to_string()
+                .contains("legacy marker semantics")
+        );
+
+        // Simulate a pre-v3 transfer to the old predictable marker without
+        // inflating supply. Its ordinary EOA shape cannot suppress the new
+        // protected marker and must remain untouched.
+        let mut pool_for_dust = state.get_account(&pool).unwrap();
+        pool_for_dust.balance -= 1;
+        state.accounts.insert(pool.0, pool_for_dust);
+        state
+            .accounts
+            .insert(legacy_marker.0, Account::new(legacy_marker, 1));
+        state.execute_tx(&valid).unwrap();
+        let marker = FaucetClaimBody::v3_marker_address(&ordinary_recipient);
+        assert_eq!(state.get_account(&legacy_marker).unwrap().balance, 1);
+        let supply_after_valid = sum_all_balances(&state);
+        assert_eq!(supply_after_valid, initial_supply);
+        let pool_after_valid = state.get_account(&pool).unwrap().balance;
+
+        let mut marker_claim = make_channel_tx(
+            validator.address(),
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: marker,
+                amount: 1,
+            }),
+            TxType::FaucetClaim,
+        );
+        state
+            .sign_transaction(&mut marker_claim, validator)
+            .unwrap();
+        assert!(
+            state
+                .execute_tx(&marker_claim)
+                .unwrap_err()
+                .to_string()
+                .contains("collision")
+        );
+        assert_eq!(state.get_account(&pool).unwrap().balance, pool_after_valid);
+        assert_eq!(sum_all_balances(&state), supply_after_valid);
     }
 
     // ── Milestone B: InferenceEscrow integration tests ───────────────────
@@ -7590,7 +13457,7 @@ mod tests {
     // increase by their share; total conserved."
 
     use arc_types::transaction::{
-        InferenceEscrowOpenBody, InferenceEscrowReleaseBody, InferenceEscrowRefundBody,
+        InferenceEscrowOpenBody, InferenceEscrowRefundBody, InferenceEscrowReleaseBody,
     };
 
     /// Convenience: same 32-byte request_id in every test, keyed on test name
@@ -7629,17 +13496,11 @@ mod tests {
         assert_eq!(payer.nonce, 1);
 
         // Escrow account holds the max_fee.
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 10_000);
         // The escrow's storage_root commits to the payer's identity.
-        let expected = InferenceEscrowOpenBody::metadata_commitment(
-            &addr(1),
-            &model_id(),
-            32,
-            10,
-        );
+        let expected = InferenceEscrowOpenBody::metadata_commitment(&addr(1), &model_id(), 32, 10);
         assert_eq!(escrow.storage_root.0, expected);
     }
 
@@ -7746,8 +13607,7 @@ mod tests {
         let r3 = state.get_account(&addr(5)).unwrap();
         let obs = state.get_account(&addr(10)).unwrap();
         let tre = state.get_account(&addr(11)).unwrap();
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         let escrow = state.get_account(&escrow_addr).unwrap();
 
         // 40% proposer, 25% replicas (split 3 ways evenly with rounding → treasury),
@@ -7764,8 +13624,8 @@ mod tests {
         assert_eq!(tre.balance, 2_001);
 
         // Conservation: payer is short 10_000; beneficiaries are up 10_000.
-        let credited = proposer.balance + r1.balance + r2.balance + r3.balance
-            + obs.balance + tre.balance;
+        let credited =
+            proposer.balance + r1.balance + r2.balance + r3.balance + obs.balance + tre.balance;
         assert_eq!(credited, 10_000);
         assert_eq!(payer.balance, 990_000);
 
@@ -7813,8 +13673,7 @@ mod tests {
         assert!(rs[0].success);
         assert!(!rs[1].success, "release with wrong payer must fail");
         // Escrow still holds funds; nobody got paid.
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 5_000);
     }
 
@@ -7898,8 +13757,7 @@ mod tests {
         assert!(rs[0].success, "refund after timeout should succeed");
 
         assert_eq!(state.get_account(&addr(1)).unwrap().balance, 1_000_000);
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
     }
 
@@ -7939,10 +13797,7 @@ mod tests {
     #[test]
     fn test_escrow_refund_rejects_non_payer() {
         // addr(1) opens; addr(2) tries to refund → rejected (not original payer).
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 100_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 100_000)]);
         let request_id = req(b"not-your-money");
         let open = make_channel_tx(
             addr(1),
@@ -7984,8 +13839,8 @@ mod tests {
     // (duplicate registration, insufficient balance, empty ranges).
 
     use arc_types::transaction::{
-        CapacityAdvertisementBody, ModelRegistrationBody, ModelRequestBody,
-        ShardCoverageClaimBody, MIN_MODEL_REGISTRATION_FEE,
+        CapacityAdvertisementBody, MIN_MODEL_REGISTRATION_FEE, ModelRegistrationBody,
+        ModelRequestBody, ShardCoverageClaimBody,
     };
 
     fn test_model_id() -> Hash256 {
@@ -8059,7 +13914,10 @@ mod tests {
         let (_, r1) = state.execute_block(&[tx1], addr(99)).unwrap();
         assert!(r1[0].success);
         let (_, r2) = state.execute_block(&[tx2], addr(99)).unwrap();
-        assert!(!r2[0].success, "second registration for same model_id must fail");
+        assert!(
+            !r2[0].success,
+            "second registration for same model_id must fail"
+        );
     }
 
     #[test]
@@ -8246,13 +14104,20 @@ mod tests {
     // Lives at the bottom of the test module so the helpers above (`addr`,
     // `make_channel_tx`) are in scope.
 
-    use arc_types::transaction::{FaucetClaimBody, FAUCET_CLAIM_MAX};
+    use arc_types::transaction::{FAUCET_CLAIM_MAX, FaucetClaimBody};
 
     /// Convenience: seed a validator at `signer` with stake = MIN_VALIDATOR_STAKE
     /// so `is_validator(&signer)` returns true without paying the
     /// JoinValidator-debit / nonce-bump path.
     fn seed_validator(state: &StateDB, signer: Address) {
-        state.validators.insert(signer.0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .validators
+            .insert(signer.0, StateDB::MIN_VALIDATOR_STAKE);
+    }
+
+    fn activate_community_rewards(state: &StateDB) {
+        state.set_community_rewards_v1_activation_height(Some(0));
+        assert!(state.community_rewards_v1_active());
     }
 
     #[test]
@@ -8295,10 +14160,7 @@ mod tests {
     fn test_faucet_claim_rejects_non_validator_signer() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let not_a_validator = addr(8);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000),
-            (not_a_validator, 0),
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000), (not_a_validator, 0)]);
         // Deliberately do NOT seed_validator.
 
         let tx = make_channel_tx(
@@ -8320,16 +14182,17 @@ mod tests {
         // Pool untouched, recipient never created.
         let pool = state.get_account(&pool_addr).unwrap();
         assert_eq!(pool.balance, 1_000_000);
-        assert!(state.get_account(&addr(43)).is_none() || state.get_account(&addr(43)).unwrap().balance == 0);
+        assert!(
+            state.get_account(&addr(43)).is_none()
+                || state.get_account(&addr(43)).unwrap().balance == 0
+        );
     }
 
     #[test]
     fn test_faucet_claim_rejects_amount_over_max() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let validator = addr(9);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000_000)]);
         seed_validator(&state, validator);
 
         let tx = make_channel_tx(
@@ -8349,9 +14212,7 @@ mod tests {
     fn test_faucet_claim_rejects_zero_amount() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let validator = addr(10);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000)]);
         seed_validator(&state, validator);
 
         let tx = make_channel_tx(
@@ -8389,6 +14250,101 @@ mod tests {
         assert!(!r[0].success, "underfunded pool must reject the claim");
         // Pool balance unchanged.
         assert_eq!(state.get_account(&pool_addr).unwrap().balance, 500);
+        assert!(
+            state
+                .get_account(&FaucetClaimBody::marker_address(&addr(46)))
+                .is_none(),
+            "a failed claim must not consume the recipient's exactly-once marker"
+        );
+        assert!(
+            state.get_account(&addr(46)).is_none(),
+            "a failed claim must not fabricate a recipient account"
+        );
+    }
+
+    #[test]
+    fn test_faucet_claim_is_exactly_once_across_validators() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator_a = addr(111);
+        let validator_b = addr(112);
+        let recipient = addr(113);
+        let state = StateDB::with_genesis(&[(pool_addr, 3 * FAUCET_CLAIM_MAX)]);
+        seed_validator(&state, validator_a);
+        seed_validator(&state, validator_b);
+
+        // These are distinct, independently authorized transactions, exactly
+        // as a recipient could obtain by calling two public validators.
+        let claim_a = make_channel_tx(
+            validator_a,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: FAUCET_CLAIM_MAX,
+            }),
+            TxType::FaucetClaim,
+        );
+        let claim_b = make_channel_tx(
+            validator_b,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: FAUCET_CLAIM_MAX,
+            }),
+            TxType::FaucetClaim,
+        );
+
+        let (_, receipts) = state
+            .execute_block(&[claim_a, claim_b], addr(99))
+            .expect("the block itself remains valid");
+        assert!(receipts[0].success);
+        assert!(!receipts[1].success, "a second validator cannot pay twice");
+        assert_eq!(
+            state.get_account(&recipient).unwrap().balance,
+            FAUCET_CLAIM_MAX
+        );
+        assert_eq!(
+            state.get_account(&pool_addr).unwrap().balance,
+            2 * FAUCET_CLAIM_MAX
+        );
+        let marker = state
+            .get_account(&FaucetClaimBody::marker_address(&recipient))
+            .expect("successful claim writes a durable marker");
+        assert_eq!(marker.nonce, 1);
+        assert_eq!(marker.code_hash, recipient);
+    }
+
+    #[test]
+    fn test_faucet_claim_overflow_is_atomic() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator = addr(114);
+        let recipient = addr(115);
+        let state =
+            StateDB::with_genesis(&[(pool_addr, 2 * FAUCET_CLAIM_MAX), (recipient, u64::MAX)]);
+        seed_validator(&state, validator);
+        let claim = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: FAUCET_CLAIM_MAX,
+            }),
+            TxType::FaucetClaim,
+        );
+
+        let (_, receipts) = state.execute_block(&[claim], addr(99)).unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&pool_addr).unwrap().balance,
+            2 * FAUCET_CLAIM_MAX,
+            "overflow must not debit the faucet"
+        );
+        assert_eq!(state.get_account(&recipient).unwrap().balance, u64::MAX);
+        assert!(
+            state
+                .get_account(&FaucetClaimBody::marker_address(&recipient))
+                .is_none(),
+            "overflow must not consume the recipient marker"
+        );
     }
 
     #[test]
@@ -8406,25 +14362,27 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let validator = kp.address();
 
-        let proposer_state = StateDB::with_genesis(&[
-            (pool_addr, 100_000_000),
-        ]);
+        let proposer_state = StateDB::with_genesis(&[(pool_addr, 100_000_000)]);
         seed_validator(&proposer_state, validator);
 
         let mut tx = Transaction::new_faucet_claim(validator, addr(50), 10_000, 0);
         tx.sign(&kp).expect("sign ok");
         let wire = bincode::serialize(&tx).expect("serialize tx");
 
-        let peer_state = StateDB::with_genesis(&[
-            (pool_addr, 100_000_000),
-        ]);
+        let peer_state = StateDB::with_genesis(&[(pool_addr, 100_000_000)]);
         seed_validator(&peer_state, validator);
 
         // sig_verified is `#[serde(default)]` so the peer deserializes
         // with the flag cleared — same as a real network hop.
         let peer_tx: Transaction = bincode::deserialize(&wire).expect("deserialize tx");
-        assert!(!peer_tx.sig_verified, "wire-format tx must arrive with sig_verified=false");
-        assert!(!peer_tx.is_unsigned(), "wire-format tx must still carry the validator sig");
+        assert!(
+            !peer_tx.sig_verified,
+            "wire-format tx must arrive with sig_verified=false"
+        );
+        assert!(
+            !peer_tx.is_unsigned(),
+            "wire-format tx must still carry the validator sig"
+        );
 
         let (_, r) = peer_state.execute_block(&[peer_tx], addr(99)).unwrap();
         assert!(
@@ -8449,8 +14407,8 @@ mod tests {
         committee_size: u8,
         deadline_blocks: u64,
     ) -> arc_types::transaction::Transaction {
-        use arc_types::transaction::{InferenceRequestBody, Transaction, TxBody, TxType};
         use arc_crypto::Signature;
+        use arc_types::transaction::{InferenceRequestBody, Transaction, TxBody, TxType};
         let input_blob = b"[INST] hi [/INST]".to_vec();
         let input_hash = hash_bytes(&input_blob);
         let body = TxBody::InferenceRequest(InferenceRequestBody {
@@ -8486,8 +14444,8 @@ mod tests {
         committee_seed: Hash256,
         output_hash: Hash256,
     ) -> arc_types::transaction::Transaction {
-        use arc_types::transaction::{InferenceVoteBody, Transaction, TxBody, TxType};
         use arc_crypto::Signature;
+        use arc_types::transaction::{InferenceVoteBody, Transaction, TxBody, TxType};
         let body = TxBody::InferenceVote(InferenceVoteBody {
             request_id,
             output_hash,
@@ -8515,8 +14473,8 @@ mod tests {
         nonce: u64,
         request_id: [u8; 32],
     ) -> arc_types::transaction::Transaction {
-        use arc_types::transaction::{InferenceFinalizeBody, Transaction, TxBody, TxType};
         use arc_crypto::Signature;
+        use arc_types::transaction::{InferenceFinalizeBody, Transaction, TxBody, TxType};
         let body = TxBody::InferenceFinalize(InferenceFinalizeBody { request_id });
         let mut tx = Transaction {
             tx_type: TxType::InferenceFinalize,
@@ -8538,7 +14496,9 @@ mod tests {
         let requester = addr(1);
         let state = StateDB::with_genesis(&[(requester, 100)]);
         // Register a validator so block production has a proposer.
-        state.validators.insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .validators
+            .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
 
         let req_id = [42u8; 32];
         let tx = build_tier1_request(requester, 0, req_id, 10, 1, 20);
@@ -8562,13 +14522,15 @@ mod tests {
     fn tier1_request_rejects_oversized_input() {
         let requester = addr(1);
         let state = StateDB::with_genesis(&[(requester, 1_000_000)]);
-        state.validators.insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .validators
+            .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
 
         // Construct an oversized prompt directly.
-        use arc_types::transaction::{
-            InferenceRequestBody, Transaction, TxBody, TxType, TIER1_INPUT_BLOB_MAX,
-        };
         use arc_crypto::Signature;
+        use arc_types::transaction::{
+            InferenceRequestBody, TIER1_INPUT_BLOB_MAX, Transaction, TxBody, TxType,
+        };
         let oversized = vec![0u8; TIER1_INPUT_BLOB_MAX + 1];
         let body = TxBody::InferenceRequest(InferenceRequestBody {
             request_id: [1u8; 32],
@@ -8703,5 +14665,1595 @@ mod tests {
             !r2[0].success,
             "vote from non-committee member must be rejected"
         );
+    }
+
+    // ── Tier 2 attestation bonds + authorized community rewards ────────────
+    //
+    // Raw attestations only commit model/input/output and lock an optional
+    // challenge bond. Treasury income is a separate validator-authorized,
+    // job-bound and replay-marked state transition.
+
+    const REWARD: u64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+
+    /// Total spendable + staked balance across every account (escrows and the
+    /// treasury included). The conservation invariant for all tests below.
+    fn sum_all_balances(state: &StateDB) -> u128 {
+        state
+            .accounts
+            .iter()
+            .map(|e| e.value().balance as u128 + e.value().staked_balance as u128)
+            .sum()
+    }
+
+    fn make_attestation(
+        from: Address,
+        nonce: u64,
+        bond: u64,
+        challenge_period: u64,
+        tag: &[u8],
+    ) -> Transaction {
+        make_channel_tx(
+            from,
+            nonce,
+            TxBody::InferenceAttestation(arc_types::transaction::InferenceAttestationBody {
+                model_id: model_id(),
+                input_hash: hash_bytes(tag),
+                output_hash: hash_bytes(&[tag, b"-out"].concat()),
+                challenge_period,
+                bond,
+                beneficiary: None,
+            }),
+            TxType::InferenceAttestation,
+        )
+    }
+
+    fn make_signed_community_reward(
+        validator: &arc_crypto::KeyPair,
+        worker: &arc_crypto::KeyPair,
+        reward_nonce: u64,
+        tag: &[u8],
+        expires_at_height: u64,
+    ) -> Transaction {
+        make_signed_community_reward_with_approvers(
+            validator,
+            worker,
+            reward_nonce,
+            tag,
+            expires_at_height,
+            &[validator],
+        )
+    }
+
+    fn make_signed_community_reward_with_approvers(
+        aggregator: &arc_crypto::KeyPair,
+        worker: &arc_crypto::KeyPair,
+        reward_nonce: u64,
+        tag: &[u8],
+        expires_at_height: u64,
+        approvers: &[&arc_crypto::KeyPair],
+    ) -> Transaction {
+        let mut worker_attestation = make_attestation(worker.address(), 0, 0, 100, tag);
+        worker_attestation.sign(worker).expect("worker signs");
+        let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+            unreachable!();
+        };
+        let assignment_epoch = hash_bytes(&[b"community-assignment-epoch-v1", tag].concat());
+        let job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &aggregator.address(),
+            &assignment_epoch,
+            reward_nonce,
+            &attestation.model_id,
+            &attestation.input_hash,
+            16,
+        );
+        let mut body = arc_types::transaction::CommunityInferenceRewardBody {
+            chain_domain:
+                arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id,
+            coordinator: aggregator.address(),
+            assignment_epoch,
+            job_nonce: reward_nonce,
+            recovery_epoch: 0,
+            validator_set_id: 0,
+            transaction_domain: Hash256::ZERO,
+            worker: worker.address(),
+            model_id: attestation.model_id,
+            input_hash: attestation.input_hash,
+            output_hash: attestation.output_hash,
+            max_tokens: 16,
+            expires_at_height,
+            worker_certificate: arc_types::transaction::WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: attestation.challenge_period,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = approvers
+            .iter()
+            .map(|approver| {
+                let signature = approver.sign(&commitment).expect("validator approves");
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    approver.address(),
+                    signature,
+                )
+                .expect("reward approvals require Ed25519 validators")
+            })
+            .collect();
+        let mut tx =
+            Transaction::new_community_inference_reward(aggregator.address(), reward_nonce, body);
+        tx.sign(aggregator).expect("aggregator signs");
+        tx
+    }
+
+    fn make_recovery_signed_community_reward(
+        state: &StateDB,
+        aggregator: &arc_crypto::KeyPair,
+        worker: &arc_crypto::KeyPair,
+        approvers: &[arc_crypto::KeyPair],
+        job_nonce: u64,
+        tag: &[u8],
+    ) -> Transaction {
+        let mut worker_attestation = make_attestation(worker.address(), 0, 0, 100, tag);
+        state
+            .sign_transaction(&mut worker_attestation, worker)
+            .unwrap();
+        let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+            unreachable!();
+        };
+        let context = state.recovery_context().expect("recovery context");
+        let assignment_epoch = hash_bytes(&[b"v3-assignment-epoch", tag].concat());
+        let job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &aggregator.address(),
+            &assignment_epoch,
+            job_nonce,
+            &attestation.model_id,
+            &attestation.input_hash,
+            16,
+        );
+        let mut body = arc_types::transaction::CommunityInferenceRewardBody {
+            chain_domain:
+                arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id,
+            coordinator: aggregator.address(),
+            assignment_epoch,
+            job_nonce,
+            recovery_epoch: context.recovery_epoch,
+            validator_set_id: context.validator_set_id,
+            transaction_domain: context.domain_hash(),
+            worker: worker.address(),
+            model_id: attestation.model_id,
+            input_hash: attestation.input_hash,
+            output_hash: attestation.output_hash,
+            max_tokens: 16,
+            expires_at_height: state.height() + 100,
+            worker_certificate: arc_types::transaction::WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: attestation.challenge_period,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = approvers
+            .iter()
+            .take(5)
+            .map(|validator| {
+                let signature = validator.sign(&commitment).unwrap();
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    validator.address(),
+                    signature,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut reward =
+            Transaction::new_community_inference_reward(aggregator.address(), job_nonce, body);
+        state.sign_transaction(&mut reward, aggregator).unwrap();
+        reward
+    }
+
+    fn activated_reward_state(
+        worker: Address,
+        treasury_balance: u64,
+        validators: &[(&arc_crypto::KeyPair, u64)],
+    ) -> StateDB {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let state = StateDB::with_genesis(&[(pool, treasury_balance), (worker, 0)]);
+        let validator_stakes: Vec<(Address, u64)> = validators
+            .iter()
+            .map(|(validator, stake)| (validator.address(), *stake))
+            .collect();
+        state.seed_genesis_validators(&validator_stakes);
+        activate_community_rewards(&state);
+        state
+    }
+
+    #[test]
+    fn recovery_probe_marker_blocks_cross_coordinator_payment_and_outer_nonce_is_not_account_nonce()
+    {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let first_validator = arc_crypto::KeyPair::generate_ed25519();
+        let second_validator = arc_crypto::KeyPair::generate_ed25519();
+        let first_worker = arc_crypto::KeyPair::generate_ed25519();
+        let second_worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD)]);
+        seed_validator(&state, first_validator.address());
+        activate_community_rewards(&state);
+
+        let mut probe_bytes = [0u8; 32];
+        probe_bytes[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_bytes[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(9);
+        let probe_id = Hash256(probe_bytes);
+
+        let bind_probe = |mut tx: Transaction,
+                          validator: &arc_crypto::KeyPair,
+                          outer_nonce: u64|
+         -> Transaction {
+            let TxBody::CommunityInferenceReward(body) = &mut tx.body else {
+                unreachable!();
+            };
+            body.assignment_epoch = probe_id;
+            body.job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+                &body.coordinator,
+                &body.assignment_epoch,
+                body.job_nonce,
+                &body.model_id,
+                &body.input_hash,
+                body.max_tokens,
+            );
+            body.validator_approvals.clear();
+            let commitment = body.validator_approval_commitment();
+            body.validator_approvals.push(
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    validator.address(),
+                    validator.sign(&commitment).unwrap(),
+                )
+                .unwrap(),
+            );
+            tx.nonce = outer_nonce;
+            tx.sign(validator).unwrap();
+            tx
+        };
+
+        let first = bind_probe(
+            make_signed_community_reward(
+                &first_validator,
+                &first_worker,
+                17,
+                b"recovery-probe-first",
+                100,
+            ),
+            &first_validator,
+            u64::MAX - 1,
+        );
+        let coordinator_nonce_before = state
+            .get_account(&first_validator.address())
+            .map(|account| account.nonce)
+            .unwrap_or(0);
+        let (_, first_receipts) = state
+            .execute_block(&[first], first_validator.address())
+            .unwrap();
+        assert!(first_receipts[0].success);
+        assert_eq!(
+            state
+                .get_account(&first_validator.address())
+                .map(|account| account.nonce)
+                .unwrap_or(0),
+            coordinator_nonce_before,
+            "0x25 outer nonce is a deterministic envelope salt, not an account nonce"
+        );
+        seed_validator(&state, second_validator.address());
+
+        let second = bind_probe(
+            make_signed_community_reward(
+                &second_validator,
+                &second_worker,
+                23,
+                b"recovery-probe-second",
+                100,
+            ),
+            &second_validator,
+            1,
+        );
+        let replay_error = state.execute_tx(&second).unwrap_err();
+        assert!(replay_error.to_string().contains("recovery probe"));
+        assert!(replay_error.to_string().contains("already paid"));
+        assert_eq!(
+            state.get_account(&first_worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(
+            state
+                .get_account(&second_worker.address())
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn recovery_v3_reward_accepts_embedded_domain_certificate_while_raw_tx_is_denied() {
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let mut genesis = vec![(treasury, 2 * REWARD)];
+        genesis.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        let state = StateDB::with_genesis(&genesis);
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(40_000_000, Ordering::Release);
+        state.set_community_rewards_v1_activation_height(Some(0));
+        let context = crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-community-reward-genesis"),
+            7,
+            11,
+        );
+        *state.recovery_context.write() = Some(context.clone());
+
+        let mut worker_attestation = make_attestation(worker.address(), 0, 0, 100, b"v3-job");
+        state
+            .sign_transaction(&mut worker_attestation, &worker)
+            .unwrap();
+        let before_accounts = state.accounts.len();
+        let raw_error = state.execute_tx(&worker_attestation).unwrap_err();
+        assert!(raw_error.to_string().contains("unavailable"));
+        assert_eq!(state.accounts.len(), before_accounts);
+        assert!(state.get_account(&worker.address()).is_none());
+
+        let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+            unreachable!();
+        };
+        let assignment_epoch = hash_bytes(b"v3-assignment-epoch");
+        let job_nonce = 23;
+        let job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &validators[0].address(),
+            &assignment_epoch,
+            job_nonce,
+            &attestation.model_id,
+            &attestation.input_hash,
+            16,
+        );
+        let mut body = arc_types::transaction::CommunityInferenceRewardBody {
+            chain_domain:
+                arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id,
+            coordinator: validators[0].address(),
+            assignment_epoch,
+            job_nonce,
+            recovery_epoch: context.recovery_epoch,
+            validator_set_id: context.validator_set_id,
+            transaction_domain: context.domain_hash(),
+            worker: worker.address(),
+            model_id: attestation.model_id,
+            input_hash: attestation.input_hash,
+            output_hash: attestation.output_hash,
+            max_tokens: 16,
+            expires_at_height: 100,
+            worker_certificate: arc_types::transaction::WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: attestation.challenge_period,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = validators
+            .iter()
+            .take(5)
+            .map(|validator| {
+                let signature = validator.sign(&commitment).unwrap();
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    validator.address(),
+                    signature,
+                )
+                .unwrap()
+            })
+            .collect();
+        let coordinator_nonce_before = state
+            .get_account(&validators[0].address())
+            .expect("genesis validator account")
+            .nonce;
+        let mut reward =
+            Transaction::new_community_inference_reward(validators[0].address(), u64::MAX, body);
+        state.sign_transaction(&mut reward, &validators[0]).unwrap();
+        let TxBody::CommunityInferenceReward(reward_body) = &reward.body else {
+            unreachable!();
+        };
+        let legacy_job_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                &reward_body.chain_domain,
+                &reward_body.job_id,
+            );
+        let mut genuine_legacy_marker = Account::new(legacy_job_marker, 0);
+        genuine_legacy_marker.nonce = 1;
+        genuine_legacy_marker.code_hash = hash_bytes(b"historical-worker");
+        genuine_legacy_marker.storage_root = hash_bytes(b"historical-output");
+        state
+            .accounts
+            .insert(legacy_job_marker.0, genuine_legacy_marker);
+        let legacy_replay = state
+            .validate_v3_transaction_admission(&reward)
+            .unwrap_err();
+        assert!(
+            legacy_replay
+                .to_string()
+                .contains("legacy marker semantics")
+        );
+
+        // A pre-upgrade ordinary transfer could only create a balance-bearing
+        // EOA at the old predictable hash. It must not permanently suppress
+        // the protected v3 marker and cannot be overwritten by reward state.
+        state
+            .accounts
+            .insert(legacy_job_marker.0, Account::new(legacy_job_marker, 1));
+        state
+            .validate_v3_transaction_admission(&reward)
+            .expect("0x25 outer nonce is not account-nonce admission");
+
+        let supply_before = sum_all_balances(&state);
+        state.execute_tx(&reward).unwrap();
+        let v3_job_marker = arc_types::transaction::CommunityInferenceRewardBody::v3_marker_address(
+            &reward_body.chain_domain,
+            &reward_body.job_id,
+        );
+        assert!(is_reserved_system_account(&v3_job_marker));
+        assert!(state.get_account(&v3_job_marker).is_some());
+        assert_eq!(
+            state.get_account(&legacy_job_marker).unwrap().balance,
+            1,
+            "v3 must neither trust nor overwrite a pre-dusted legacy marker key"
+        );
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(state.get_account(&treasury).unwrap().balance, REWARD);
+        assert_eq!(
+            state.get_account(&validators[0].address()).unwrap().nonce,
+            coordinator_nonce_before,
+            "0x25 execution must not consume the coordinator account nonce"
+        );
+        assert_eq!(sum_all_balances(&state), supply_before);
+
+        let status = state.community_reward_budget_status(
+            worker.address(),
+            validators[0].address(),
+            state.height(),
+        );
+        assert_eq!(status.issued_this_block, 1);
+        assert_eq!(status.remaining_this_block, 0);
+        assert_eq!(status.issued_this_epoch, 1);
+        assert_eq!(
+            status.remaining_this_epoch,
+            V3_COMMUNITY_REWARD_MAX_PER_EPOCH - 1
+        );
+        assert_eq!(status.worker_issued_this_epoch, 1);
+        assert_eq!(
+            status.worker_remaining_this_epoch,
+            V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH - 1
+        );
+        assert_eq!(status.coordinator_issued_this_epoch, 1);
+        assert_eq!(
+            status.coordinator_remaining_this_epoch,
+            V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH - 1
+        );
+        assert_eq!(status.policy_hash, community_reward_issuance_policy_hash());
+
+        let second = make_recovery_signed_community_reward(
+            &state,
+            &validators[0],
+            &worker,
+            &validators,
+            24,
+            b"v3-job-second",
+        );
+        let treasury_after_first = state.get_account(&treasury).unwrap().balance;
+        let worker_after_first = state.get_account(&worker.address()).unwrap().balance;
+        let error = state
+            .validate_v3_transaction_admission_at(&second, state.height())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("block issuance limit"),
+            "{error}"
+        );
+        assert!(state.execute_tx(&second).is_err());
+        assert_eq!(
+            state.get_account(&treasury).unwrap().balance,
+            treasury_after_first
+        );
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            worker_after_first
+        );
+
+        // Exercise every epoch cap with valid consensus-marker metadata.
+        *state.height.write() = 1;
+        let epoch = state.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+        let worker_budget = community_reward_worker_budget_address(epoch, &worker.address());
+        let mut worker_counter = state.get_account(&worker_budget).unwrap();
+        worker_counter.nonce = V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH;
+        state
+            .accounts
+            .insert(worker_budget.0, worker_counter.clone());
+        let error = state
+            .validate_v3_transaction_admission(&second)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("worker epoch issuance limit"),
+            "{error}"
+        );
+
+        worker_counter.nonce = 1;
+        state.accounts.insert(worker_budget.0, worker_counter);
+        let coordinator_budget =
+            community_reward_coordinator_budget_address(epoch, &validators[0].address());
+        let mut coordinator_counter = state.get_account(&coordinator_budget).unwrap();
+        coordinator_counter.nonce = V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH;
+        state
+            .accounts
+            .insert(coordinator_budget.0, coordinator_counter.clone());
+        let error = state
+            .validate_v3_transaction_admission(&second)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("coordinator epoch issuance limit"),
+            "{error}"
+        );
+
+        coordinator_counter.nonce = 1;
+        state
+            .accounts
+            .insert(coordinator_budget.0, coordinator_counter);
+        let epoch_budget = community_reward_epoch_budget_address(epoch);
+        let mut epoch_counter = state.get_account(&epoch_budget).unwrap();
+        epoch_counter.nonce = V3_COMMUNITY_REWARD_MAX_PER_EPOCH;
+        state.accounts.insert(epoch_budget.0, epoch_counter);
+        let error = state
+            .validate_v3_transaction_admission(&second)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("epoch issuance limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recovery_v3_reward_budget_counters_are_rooted_and_wal_restartable() {
+        let directory = persistent_test_dir("v3-reward-budget-restart");
+        let genesis_hash = hash_bytes(b"v3-reward-budget-restart-genesis");
+        let context = crate::recovery::RecoveryContext::new("0x415243", genesis_hash, 9, 12);
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let mut prefunded = vec![(treasury, 4 * REWARD)];
+        prefunded.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(40_000_000, Ordering::Release);
+        state.set_community_rewards_v1_activation_height(Some(0));
+        *state.recovery_context.write() = Some(context.clone());
+
+        let reward = make_recovery_signed_community_reward(
+            &state,
+            &validators[0],
+            &worker,
+            &validators,
+            0,
+            b"persistent-budget-job",
+        );
+        let (block, receipts) = state
+            .execute_block_verified_at(
+                std::slice::from_ref(&reward),
+                validators[0].address(),
+                1_787_857_623_010,
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        state.wal.sync().unwrap();
+        let rooted_state = state.get_state_root();
+        assert_eq!(block.header.state_root, rooted_state);
+        let status =
+            state.current_community_reward_budget_status(worker.address(), validators[0].address());
+        assert_eq!(status.issued_this_block, 1);
+        assert_eq!(status.issued_this_epoch, 1);
+        assert_eq!(status.worker_issued_this_epoch, 1);
+        assert_eq!(status.coordinator_issued_this_epoch, 1);
+        let receipt_hash = receipts[0].tx_hash;
+        let block_hash = block.hash;
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        restarted.set_community_rewards_v1_activation_height(Some(0));
+        *restarted.recovery_context.write() = Some(context);
+        assert_eq!(restarted.height(), 1);
+        assert_eq!(restarted.get_state_root(), rooted_state);
+        assert_eq!(restarted.get_block(1).unwrap().hash, block_hash);
+        assert_eq!(
+            restarted.get_receipt(&receipt_hash.0).unwrap().block_hash,
+            block_hash
+        );
+        let restarted_status = restarted
+            .current_community_reward_budget_status(worker.address(), validators[0].address());
+        assert_eq!(restarted_status, status);
+        assert_eq!(
+            restarted.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(
+            restarted.get_account(&treasury).unwrap().balance,
+            3 * REWARD
+        );
+
+        drop(restarted);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn reward_rejection(state: &StateDB, reward: &Transaction) -> String {
+        state
+            .execute_tx(reward)
+            .expect_err("adversarial reward must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn raw_attestation_locks_bond_without_treasury_reward() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let worker = addr(60);
+        let treasury_start = 10 * REWARD;
+        let worker_start = 5 * REWARD;
+        let bond = REWARD / 2;
+        let state = StateDB::with_genesis(&[(pool, treasury_start), (worker, worker_start)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, 100, b"job-1");
+        let att_hash = tx.hash;
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Attester: start − bond, nonce +1. Raw attestations do not pay.
+        let w = state.get_account(&worker).unwrap();
+        assert_eq!(w.balance, worker_start - bond);
+        assert_eq!(w.nonce, 1);
+
+        // Treasury is untouched until an authorized reward transaction.
+        assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start);
+
+        // Bond locked in escrow, tagged OPEN, refund target = worker.
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let esc = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(esc.balance, bond);
+        assert_eq!(esc.code_hash, worker);
+        assert_eq!(esc.storage_root.0[8], ATTEST_STATUS_OPEN);
+
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn raw_bond_zero_attestation_creates_no_escrow_or_reward() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let worker = addr(61);
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 0)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, 0, 100, b"job-community");
+        let att_hash = tx.hash;
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        assert_eq!(
+            state.get_account(&worker).unwrap().balance,
+            0,
+            "an unattached self-signed attestation must never earn"
+        );
+        // No escrow account is created for a zero bond.
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        assert!(
+            state
+                .get_account(&escrow_addr)
+                .map(|e| e.balance)
+                .unwrap_or(0)
+                == 0
+        );
+        assert_eq!(state.pending_bond_release_count(), 0);
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn authorized_stake_zero_community_reward_pays_exactly_once() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let faucet = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state =
+            StateDB::with_genesis(&[(pool, 3 * REWARD), (faucet, 99), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+        let before = sum_all_balances(&state);
+
+        let reward = make_signed_community_reward(&validator, &worker, 7, b"paid-job", 100);
+        let marker = match &reward.body {
+            TxBody::CommunityInferenceReward(body) => {
+                arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                    &body.chain_domain,
+                    &body.job_id,
+                )
+            }
+            _ => unreachable!(),
+        };
+        let (_, receipts) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(state.get_account(&faucet).unwrap().balance, 99);
+        let paid = state.get_account(&marker).expect("replay marker");
+        assert_eq!(paid.nonce, 1);
+        assert_eq!(paid.code_hash, worker.address());
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn community_reward_is_rejected_before_genesis_activation() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        state.set_community_rewards_v1_activation_height(Some(10));
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"too-early", 100);
+        let (_, receipts) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn community_reward_accepts_strict_identity_and_stake_supermajority() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = activated_reward_state(
+            worker.address(),
+            2 * REWARD,
+            &validators
+                .iter()
+                .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+                .collect::<Vec<_>>(),
+        );
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"threshold-success",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+
+        state
+            .execute_tx(&reward)
+            .expect("3 of 4 equal-stake validators");
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_missing_approvals() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"missing-approvals",
+            100,
+            &[],
+        );
+
+        assert!(
+            reward_rejection(&state, &reward)
+                .contains("insufficient validator approval identities")
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_duplicate_approval_signer() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"duplicate-approval",
+            100,
+            &[&validators[0], &validators[1], &validators[1]],
+        );
+
+        assert!(reward_rejection(&state, &reward).contains("duplicate validator approval"));
+    }
+
+    #[test]
+    fn community_reward_rejects_inactive_approval_signer() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let outsider = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let mut stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        stakes.push((&outsider, StateDB::MIN_VALIDATOR_STAKE - 1));
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"inactive-approval",
+            100,
+            &[&validators[0], &validators[1], &outsider],
+        );
+
+        assert!(reward_rejection(&state, &reward).contains("is not an active validator"));
+    }
+
+    #[test]
+    fn community_reward_rejects_insufficient_identity_count_even_with_quorum_stake() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let unit = StateDB::MIN_VALIDATOR_STAKE;
+        let stakes = [
+            (&validators[0], 10 * unit),
+            (&validators[1], 10 * unit),
+            (&validators[2], unit),
+            (&validators[3], unit),
+        ];
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"identity-shortfall",
+            100,
+            &[&validators[0], &validators[1]],
+        );
+
+        assert!(reward_rejection(&state, &reward).contains("have 2, need 3"));
+    }
+
+    #[test]
+    fn community_reward_rejects_exactly_two_thirds_of_validator_identities() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"exact-two-thirds-identities",
+            100,
+            &[
+                &validators[0],
+                &validators[1],
+                &validators[2],
+                &validators[3],
+            ],
+        );
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("have 4, need 5"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_rejects_below_two_thirds_approved_stake() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let unit = StateDB::MIN_VALIDATOR_STAKE;
+        // Three identities satisfy the 3-of-4 count requirement, but the
+        // omitted validator owns most of the active stake.
+        let stakes = [
+            (&validators[0], unit),
+            (&validators[1], unit),
+            (&validators[2], unit),
+            (&validators[3], 10 * unit),
+        ];
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"stake-shortfall",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("insufficient approved stake"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_rejects_exactly_two_thirds_approved_stake() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let unit = StateDB::MIN_VALIDATOR_STAKE;
+        // Three identities meet the 3-of-4 count policy, but their stake is
+        // exactly 6/9 = 2/3. Reward authorization requires strictly >2/3.
+        let stakes = [
+            (&validators[0], unit),
+            (&validators[1], unit),
+            (&validators[2], 4 * unit),
+            (&validators[3], 3 * unit),
+        ];
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"exact-two-thirds-stake",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("insufficient approved stake"), "{error}");
+        assert!(error.contains("need 600001"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_rejects_approval_after_semantic_field_mutation() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let mut reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"tampered-approval",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+        let TxBody::CommunityInferenceReward(body) = &mut reward.body else {
+            unreachable!();
+        };
+        body.max_tokens += 1;
+        body.job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &body.coordinator,
+            &body.assignment_epoch,
+            body.job_nonce,
+            &body.model_id,
+            &body.input_hash,
+            body.max_tokens,
+        );
+        reward.sign(&validators[0]).unwrap();
+
+        assert!(reward_rejection(&state, &reward).contains("invalid Ed25519 approval"));
+    }
+
+    #[test]
+    fn community_reward_rejects_wrong_recovery_binding() {
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = activated_reward_state(
+            worker.address(),
+            2 * REWARD,
+            &[(&validator, StateDB::MIN_VALIDATOR_STAKE)],
+        );
+        let mut reward =
+            make_signed_community_reward(&validator, &worker, 1, b"wrong-recovery", 100);
+        let TxBody::CommunityInferenceReward(body) = &mut reward.body else {
+            unreachable!();
+        };
+        body.recovery_epoch = 1;
+        reward.sign(&validator).unwrap();
+
+        let error = reward_rejection(&state, &reward);
+        assert!(
+            error.contains("recovery binding is non-zero on legacy/dev state"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_more_than_64_approvals_before_verification() {
+        use arc_types::transaction::MAX_COMMUNITY_REWARD_APPROVALS;
+
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = activated_reward_state(
+            worker.address(),
+            2 * REWARD,
+            &[(&validator, StateDB::MIN_VALIDATOR_STAKE)],
+        );
+        let mut reward =
+            make_signed_community_reward(&validator, &worker, 1, b"too-many-approvals", 100);
+        let TxBody::CommunityInferenceReward(body) = &mut reward.body else {
+            unreachable!();
+        };
+        let approval = body.validator_approvals[0].clone();
+        body.validator_approvals = vec![approval; MAX_COMMUNITY_REWARD_APPROVALS + 1];
+        reward.sign(&validator).unwrap();
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("exceeds protocol maximum 64"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_replay_with_fresh_nonce_cannot_pay_twice() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let first = make_signed_community_reward(&validator, &worker, 1, b"same-job", 100);
+        let second = make_signed_community_reward(&validator, &worker, 2, b"same-job", 100);
+        assert!(
+            state
+                .execute_block(&[first], validator.address())
+                .unwrap()
+                .1[0]
+                .success
+        );
+        let pool_after_first = state.get_account(&pool).unwrap().balance;
+        let (_, replay_receipt) = state.execute_block(&[second], validator.address()).unwrap();
+        assert!(!replay_receipt[0].success);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(state.get_account(&pool).unwrap().balance, pool_after_first);
+    }
+
+    #[test]
+    fn community_reward_cannot_rewrap_one_certificate_under_a_fresh_job_id() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let first = make_signed_community_reward(&validator, &worker, 1, b"certificate", 100);
+        let mut rewrapped = first.clone();
+        rewrapped.nonce = 2;
+        let TxBody::CommunityInferenceReward(body) = &mut rewrapped.body else {
+            unreachable!();
+        };
+        body.job_id = hash_bytes(b"attacker-controlled-fresh-job-id");
+        rewrapped.sign(&validator).unwrap();
+
+        assert!(
+            state
+                .execute_block(&[first], validator.address())
+                .unwrap()
+                .1[0]
+                .success
+        );
+        let treasury_after_first = state.get_account(&pool).unwrap().balance;
+        let (_, receipts) = state
+            .execute_block(&[rewrapped], validator.address())
+            .unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&pool).unwrap().balance,
+            treasury_after_first
+        );
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_unauthorized_or_mismatched_certificates() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let outsider = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let other_worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 5 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let unauthorized =
+            make_signed_community_reward(&outsider, &worker, 1, b"unauthorized", 100);
+        assert!(!state.execute_block(&[unauthorized], addr(99)).unwrap().1[0].success);
+
+        let mut mismatch = make_signed_community_reward(&validator, &worker, 2, b"mismatch", 100);
+        if let TxBody::CommunityInferenceReward(body) = &mut mismatch.body {
+            body.worker = other_worker.address();
+        }
+        mismatch.sign(&validator).unwrap();
+        assert!(!state.execute_block(&[mismatch], addr(99)).unwrap().1[0].success);
+
+        let mut wrong_domain =
+            make_signed_community_reward(&validator, &worker, 3, b"wrong-domain", 100);
+        if let TxBody::CommunityInferenceReward(body) = &mut wrong_domain.body {
+            body.chain_domain = hash_bytes(b"another-chain");
+        }
+        wrong_domain.sign(&validator).unwrap();
+        assert!(!state.execute_block(&[wrong_domain], addr(99)).unwrap().1[0].success);
+
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 5 * REWARD);
+    }
+
+    #[test]
+    fn community_reward_is_all_or_nothing_when_treasury_is_low() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let partial = REWARD - 1;
+        let state = StateDB::with_genesis(&[(pool, partial), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"low-pool", 100);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, partial);
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn failed_community_reward_does_not_create_an_absent_worker_account() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, REWARD - 1)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+        assert!(state.get_account(&worker.address()).is_none());
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"absent-worker", 100);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, REWARD - 1);
+        assert!(
+            state.get_account(&worker.address()).is_none(),
+            "a failed reward must not create state that was never WAL-persisted"
+        );
+    }
+
+    #[test]
+    fn community_reward_overflow_failure_does_not_debit_treasury() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), u64::MAX)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"overflow", 100);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_expired_job() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        // execute_block increments height to 1 before applying this claim.
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"expired", 0);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn community_reward_sequential_and_blockstm_state_match_at_treasury_tail() {
+        let pool = arc_types::transaction::inference_reward_treasury_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker_a = arc_crypto::KeyPair::generate_ed25519();
+        let worker_b = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = REWARD + REWARD / 2;
+        let genesis = [
+            (pool, treasury),
+            (worker_a.address(), 0),
+            (worker_b.address(), 0),
+        ];
+        let sequential = StateDB::with_genesis(&genesis);
+        let parallel = StateDB::with_genesis(&genesis);
+        seed_validator(&sequential, validator.address());
+        seed_validator(&parallel, validator.address());
+        activate_community_rewards(&sequential);
+        activate_community_rewards(&parallel);
+
+        let txs = vec![
+            make_signed_community_reward(&validator, &worker_a, 1, b"ordered-a", 100),
+            make_signed_community_reward(&validator, &worker_b, 2, b"ordered-b", 100),
+        ];
+        let (seq_block, seq_receipts) =
+            sequential.execute_block(&txs, validator.address()).unwrap();
+        let (stm_block, stm_receipts) = parallel
+            .execute_block_stm(&txs, validator.address())
+            .unwrap();
+
+        assert_eq!(
+            seq_receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert_eq!(
+            stm_receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert_eq!(
+            sequential.get_account(&worker_a.address()).unwrap().balance,
+            parallel.get_account(&worker_a.address()).unwrap().balance
+        );
+        assert_eq!(
+            sequential.get_account(&worker_b.address()).unwrap().balance,
+            parallel.get_account(&worker_b.address()).unwrap().balance
+        );
+        assert_eq!(seq_block.header.state_root, stm_block.header.state_root);
+    }
+
+    #[test]
+    fn attestation_unfunded_attester_still_insufficient_balance() {
+        // A worker whose balance is below the bond must still fail with the
+        // unchanged InsufficientBalance error — the treasury-funded reward does
+        // NOT relax the bond check.
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(62);
+        let bond = REWARD;
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 100)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, 100, b"job-broke");
+        let err = state.execute_tx_pub(&tx).unwrap_err();
+        assert!(
+            matches!(err, StateError::InsufficientBalance { have: 100, need } if need == bond),
+            "error must be unchanged InsufficientBalance, got {:?}",
+            err
+        );
+
+        // Treasury untouched (reward never paid), worker untouched.
+        assert_eq!(state.get_account(&pool).unwrap().balance, 10 * REWARD);
+        let w = state.get_account(&worker).unwrap();
+        assert_eq!(w.balance, 100);
+        assert_eq!(w.nonce, 0);
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn raw_attestation_never_drains_partial_treasury() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(63);
+        let treasury_start = REWARD / 5; // less than a full reward
+        let state = StateDB::with_genesis(&[(pool, treasury_start), (worker, 0)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, 0, 100, b"job-drain");
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        assert_eq!(state.get_account(&worker).unwrap().balance, 0);
+        assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start);
+        assert_eq!(sum_all_balances(&state), before, "no tokens minted");
+    }
+
+    #[test]
+    fn attestation_treasury_absent_skips_reward() {
+        // With no faucet-pool account at all, the reward is skipped (no panic,
+        // no synthetic balance) and the attester is simply −bond into escrow.
+        let worker = addr(64);
+        let bond = REWARD / 4;
+        let state = StateDB::with_genesis(&[(worker, REWARD)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, 100, b"job-notreasury");
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        assert_eq!(state.get_account(&worker).unwrap().balance, REWARD - bond);
+        assert!(
+            state
+                .get_account(&arc_types::transaction::faucet_pool_address())
+                .is_none()
+        );
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn bond_released_after_challenge_window_conserved() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(65);
+        let bond = REWARD / 2;
+        let cp = 3u64;
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 2 * REWARD)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, cp, b"job-release");
+        let att_hash = tx.hash;
+        assert!(state.execute_block(&[tx], addr(99)).unwrap().1[0].success);
+
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let release_h = state.get_account(&escrow_addr).unwrap().nonce;
+        assert_eq!(release_h, 1 + cp, "attestation anchored at block 1");
+        let worker_after_attest = state.get_account(&worker).unwrap().balance;
+        assert_eq!(worker_after_attest, 2 * REWARD - bond);
+
+        // Not released before the window: a sweep one block early is a no-op.
+        assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, bond);
+        assert_eq!(
+            state.get_account(&worker).unwrap().balance,
+            worker_after_attest
+        );
+
+        // Released exactly at the deadline: escrow → 0, worker regains the bond.
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
+        assert_eq!(
+            state.get_account(&worker).unwrap().balance,
+            worker_after_attest + bond
+        );
+        // Idempotent: sweeping again does nothing.
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 0);
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn challenged_bond_not_released_and_conserved() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(66);
+        let challenger = addr(67);
+        let bond = REWARD / 2;
+        let ch_bond = REWARD;
+        let cp = 3u64;
+        let state = StateDB::with_genesis(&[
+            (pool, 10 * REWARD),
+            (worker, 2 * REWARD),
+            (challenger, 3 * REWARD),
+        ]);
+        let before = sum_all_balances(&state);
+
+        // Block 1: attestation.
+        let att = make_attestation(worker, 0, bond, cp, b"job-challenged");
+        let att_hash = att.hash;
+        assert!(state.execute_block(&[att], addr(99)).unwrap().1[0].success);
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let release_h = state.get_account(&escrow_addr).unwrap().nonce;
+
+        // Block 2: challenge (challenger bonds ch_bond).
+        let challenge = make_channel_tx(
+            challenger,
+            0,
+            TxBody::InferenceChallenge(arc_types::transaction::InferenceChallengeBody {
+                attestation_hash: att_hash,
+                challenger_output_hash: hash_bytes(b"disagree"),
+                challenger_bond: ch_bond,
+            }),
+            TxType::InferenceChallenge,
+        );
+        assert!(state.execute_block(&[challenge], addr(99)).unwrap().1[0].success);
+
+        // Escrow now holds both bonds and is marked CHALLENGED.
+        let esc = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(esc.balance, bond + ch_bond);
+        assert_eq!(esc.storage_root.0[8], ATTEST_STATUS_CHALLENGED);
+
+        // A challenged/slashed escrow is NEVER auto-refunded, at the deadline or
+        // long after it.
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 0);
+        assert_eq!(state.sweep_matured_bond_releases(release_h + 100), 0);
+        assert_eq!(
+            state.get_account(&escrow_addr).unwrap().balance,
+            bond + ch_bond,
+            "challenged bond stays locked pending dispute resolution"
+        );
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn conservation_across_faucet_attestation_challenge_release() {
+        // A full multi-step scenario mixing every settlement operation; the
+        // total balance (treasury + workers + challenger + escrows) is invariant
+        // after every single block.
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = addr(70);
+        let worker_c = addr(71); // community worker (bond 0)
+        let worker_b = addr(72); // bonded worker whose bond is later released
+        let worker_x = addr(73); // bonded worker whose attestation is challenged
+        let challenger = addr(74);
+        let state = StateDB::with_genesis(&[
+            (pool, 50 * REWARD),
+            (validator, 0),
+            (worker_c, 0),
+            (worker_b, 5 * REWARD),
+            (worker_x, 5 * REWARD),
+            (challenger, 5 * REWARD),
+        ]);
+        seed_validator(&state, validator);
+        let genesis_total = sum_all_balances(&state);
+
+        macro_rules! conserved {
+            () => {
+                assert_eq!(
+                    sum_all_balances(&state),
+                    genesis_total,
+                    "supply must be conserved at height {}",
+                    state.height()
+                );
+            };
+        }
+
+        // Block 1: faucet the community worker.
+        let faucet = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: worker_c,
+                amount: 10_000,
+            }),
+            TxType::FaucetClaim,
+        );
+        assert!(state.execute_block(&[faucet], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 2: community worker attests (bond 0); no implicit reward.
+        let a_c = make_attestation(worker_c, 0, 0, 5, b"c");
+        assert!(state.execute_block(&[a_c], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 3: bonded worker (release path) attests, cp = 4 → matures at 7.
+        let a_b = make_attestation(worker_b, 0, REWARD, 4, b"b");
+        let hb = a_b.hash;
+        assert!(state.execute_block(&[a_b], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 4: bonded worker (challenge path) attests with a long window.
+        let a_x = make_attestation(worker_x, 0, REWARD, 50, b"x");
+        let hx = a_x.hash;
+        assert!(state.execute_block(&[a_x], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 5: challenge worker_x's attestation.
+        let ch = make_channel_tx(
+            challenger,
+            0,
+            TxBody::InferenceChallenge(arc_types::transaction::InferenceChallengeBody {
+                attestation_hash: hx,
+                challenger_output_hash: hash_bytes(b"nope"),
+                challenger_bond: 2 * REWARD,
+            }),
+            TxType::InferenceChallenge,
+        );
+        assert!(state.execute_block(&[ch], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Advance empty blocks until worker_b's bond matures; the in-block
+        // sweep refunds it during ordinary block application.
+        let esc_b = hash_bytes(&[b"arc-inference", hb.as_ref()].concat());
+        let release_b = state.get_account(&esc_b).unwrap().nonce;
+        assert!(release_b > state.height(), "not matured yet");
+        while state.height() < release_b {
+            state.execute_block(&[], validator).unwrap();
+            conserved!();
+        }
+
+        // worker_b's bond was auto-released by the sweep.
+        assert_eq!(state.get_account(&esc_b).unwrap().balance, 0);
+        // worker_x's escrow remains locked (challenged), never auto-released.
+        let esc_x = hash_bytes(&[b"arc-inference", hx.as_ref()].concat());
+        assert_eq!(state.get_account(&esc_x).unwrap().balance, 3 * REWARD);
+        assert_eq!(
+            state.get_account(&esc_x).unwrap().storage_root.0[8],
+            ATTEST_STATUS_CHALLENGED
+        );
+        conserved!();
+    }
+
+    #[test]
+    fn rebuild_pending_bond_releases_recovers_open_escrows() {
+        // Restart durability: the in-memory release queue is rebuilt from the
+        // surviving OPEN escrow accounts, and a rebuilt queue releases exactly
+        // like the original.
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(75);
+        let bond = REWARD / 2;
+        let cp = 3u64;
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 2 * REWARD)]);
+        let tx = make_attestation(worker, 0, bond, cp, b"job-rebuild");
+        let att_hash = tx.hash;
+        assert!(state.execute_block(&[tx], addr(99)).unwrap().1[0].success);
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let release_h = state.get_account(&escrow_addr).unwrap().nonce;
+
+        // Simulate a restart: the queue is empty but the escrow account
+        // survives. Rebuild it from account state.
+        state.pending_bond_releases.lock().clear();
+        assert_eq!(state.pending_bond_release_count(), 0);
+        assert_eq!(state.rebuild_pending_bond_releases(), 1);
+        assert_eq!(state.pending_bond_release_count(), 1);
+
+        // The rebuilt queue releases at the correct deadline.
+        assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
     }
 }

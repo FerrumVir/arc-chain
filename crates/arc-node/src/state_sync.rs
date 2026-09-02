@@ -12,10 +12,10 @@
 //! 4. **Resume**: The node then joins consensus and catches up on blocks
 //!    produced since the snapshot height.
 
-use arc_state::{SnapshotManifest, StateDB, StateSnapshot, SyncProgress};
+use arc_state::{SnapshotManifest, StateDB, StateSnapshot};
 use reqwest::Client;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum number of parallel chunk downloads.
 const MAX_PARALLEL_CHUNKS: usize = 8;
@@ -60,6 +60,12 @@ pub struct StateSyncManager {
     client: Client,
 }
 
+impl Default for StateSyncManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StateSyncManager {
     /// Create a new sync manager with default settings.
     pub fn new() -> Self {
@@ -75,20 +81,20 @@ impl StateSyncManager {
         let url = format!("http://{}/sync/manifest", peer_rpc);
         info!("Fetching snapshot manifest from {}", url);
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SyncError::ManifestFetchFailed {
-                url: url.clone(),
-                source: e,
-            })?;
-
-        let manifest: SnapshotManifest =
-            resp.json()
+        let resp =
+            self.client
+                .get(&url)
+                .send()
                 .await
-                .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
+                .map_err(|e| SyncError::ManifestFetchFailed {
+                    url: url.clone(),
+                    source: e,
+                })?;
+
+        let manifest: SnapshotManifest = resp
+            .json()
+            .await
+            .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
 
         info!(
             "Manifest received: height={}, accounts={}, chunks={}",
@@ -105,25 +111,22 @@ impl StateSyncManager {
     ) -> Result<StateSnapshot, SyncError> {
         let url = format!("http://{}/sync/chunk/{}", peer_rpc, chunk_index);
 
-        let resp =
-            self.client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| SyncError::ChunkFetchFailed {
-                    url: url.clone(),
-                    index: chunk_index,
-                    source: e,
-                })?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| SyncError::ChunkFetchFailed {
+                url: url.clone(),
+                index: chunk_index,
+                source: e,
+            })?;
 
-        let chunk: StateSnapshot =
-            resp.json()
-                .await
-                .map_err(|e| SyncError::ChunkFetchFailed {
-                    url,
-                    index: chunk_index,
-                    source: e,
-                })?;
+        let chunk: StateSnapshot = resp.json().await.map_err(|e| SyncError::ChunkFetchFailed {
+            url,
+            index: chunk_index,
+            source: e,
+        })?;
 
         Ok(chunk)
     }
@@ -164,6 +167,11 @@ impl StateSyncManager {
         peer_rpc: &str,
         state: &Arc<StateDB>,
     ) -> Result<u64, SyncError> {
+        if state.is_persistent() {
+            return Err(SyncError::StateError(
+                arc_state::StateError::UnauthenticatedPersistentStateSync,
+            ));
+        }
         // 1. Fetch manifest
         let manifest = self.fetch_manifest(peer_rpc).await?;
         let total_chunks = manifest.total_chunks;
@@ -239,14 +247,16 @@ impl StateSyncManager {
         Ok(target_height)
     }
 
-    /// Fetch a peer's current DAG round state for consensus catch-up.
-    /// Returns (current_round, last_committed_round) so we can initialize
-    /// our consensus engine at the right round instead of starting from 0.
+    /// Fetch a peer's claimed DAG round state for diagnostics.
+    ///
+    /// The returned cursors are unauthenticated and must never initialize or
+    /// advance the consensus engine.
     pub async fn fetch_dag_state(&self, peer_rpc: &str) -> Result<(u64, u64), SyncError> {
         let url = format!("http://{}/sync/dag_state", peer_rpc);
         info!("Fetching DAG state from {}", url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -262,7 +272,9 @@ impl StateSyncManager {
             last_committed_round: u64,
         }
 
-        let state: DagState = resp.json().await
+        let state: DagState = resp
+            .json()
+            .await
             .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
 
         info!(
@@ -272,8 +284,11 @@ impl StateSyncManager {
         Ok((state.current_round, state.last_committed_round))
     }
 
-    /// Full sync: fetch state snapshot + DAG round from a peer.
-    /// This is the complete catch-up protocol for late-joining nodes.
+    /// Fetch an account-state snapshot plus diagnostic DAG cursors from a peer.
+    ///
+    /// This is not complete consensus catch-up: the snapshot and peer cursors
+    /// cannot advance consensus without a separately verified checkpoint and
+    /// quorum certificate.
     pub async fn full_sync_from_peer(
         &self,
         peer_rpc: &str,
@@ -283,15 +298,20 @@ impl StateSyncManager {
         // 1. Sync account state
         let height = self.sync_from_peer(peer_rpc, state).await?;
 
-        // 2. Sync DAG round state so consensus starts at the right round
+        // 2. Treat peer DAG cursors as diagnostic hints only. Account transfer
+        // does not authenticate skipped consensus history or finality.
         match self.fetch_dag_state(peer_rpc).await {
             Ok((round, committed)) => {
-                engine.set_initial_round(round, committed);
-                info!("DAG state synced: starting at round {} (committed {})", round, committed);
+                engine.observe_untrusted_round_hint(round, committed);
+                info!(
+                    "Observed peer DAG hint: round {} (committed {}); local consensus cursors unchanged",
+                    round, committed
+                );
             }
             Err(e) => {
                 // Non-fatal: old peers may not have this endpoint yet.
-                // Node will catch up via round fast-forward on first block.
+                // Consensus remains at its locally authenticated cursor until
+                // a verified checkpoint/state-sync protocol is available.
                 warn!("Could not sync DAG state (peer may be old version): {}", e);
             }
         }
@@ -307,5 +327,31 @@ mod tests {
     #[test]
     fn test_sync_manager_creation() {
         let _mgr = StateSyncManager::new();
+    }
+
+    #[tokio::test]
+    async fn persistent_sync_rejects_before_contacting_a_peer() {
+        let directory = std::env::temp_dir().join(format!(
+            "arc-state-sync-persistent-reject-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = Arc::new(
+            StateDB::with_genesis_persistent(
+                &[],
+                &directory,
+                arc_crypto::hash_bytes(b"persistent-sync-reject"),
+            )
+            .unwrap(),
+        );
+        let error = StateSyncManager::new()
+            .sync_from_peer("this-peer-must-never-be-resolved.invalid:1", &state)
+            .await
+            .expect_err("persistent legacy snapshot sync must fail closed");
+        assert!(matches!(
+            error,
+            SyncError::StateError(arc_state::StateError::UnauthenticatedPersistentStateSync)
+        ));
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

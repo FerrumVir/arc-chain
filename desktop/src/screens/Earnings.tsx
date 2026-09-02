@@ -1,13 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowUpRight, Calendar, FileSignature } from "lucide-react";
-import { useMemo } from "react";
+import { FileSignature, Search } from "lucide-react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
 import { NumberTicker } from "../components/NumberTicker";
+import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { api } from "../lib/tauri";
-import { formatHash, formatInt, formatRelativeTime } from "../lib/format";
+import { formatArc, formatHash, formatInt, formatRelativeTime } from "../lib/format";
+import { useAppStore } from "../lib/store";
 
 export function Earnings() {
+  const lookupHash = useAppStore((s) => s.lookupHash);
   const { data: earnings } = useQuery({
     queryKey: ["earnings"],
     queryFn: api.fetchEarnings,
@@ -19,43 +21,29 @@ export function Earnings() {
     refetchInterval: 5000,
   });
 
-  // 7-day bucketed earnings derived from real attestation timestamps.
-  // Each attestation contributes its rewardArc to the UTC-day bucket it
-  // falls in. Days with no activity show as empty bars - honest about how
-  // much this node has actually earned across the week rather than the
-  // placeholder Math.random() chart.
-  const weekly = useMemo(() => {
-    const WEEK_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const now = new Date();
-    const todayStart = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-    ).getTime();
-    const DAY_MS = 86_400_000;
-    const buckets: Array<{ label: string; value: number; dayStart: number }> =
-      [];
-    for (let i = 6; i >= 0; i--) {
-      const start = todayStart - i * DAY_MS;
-      const date = new Date(start);
-      buckets.push({
-        label: WEEK_LABELS[date.getUTCDay()],
-        value: 0,
-        dayStart: start,
-      });
-    }
-    for (const a of attestations ?? []) {
-      const bucketIdx = buckets.findIndex(
-        (b) => a.timestamp >= b.dayStart && a.timestamp < b.dayStart + DAY_MS,
-      );
-      if (bucketIdx !== -1) {
-        buckets[bucketIdx].value += a.rewardArc;
-      }
-    }
-    return buckets;
-  }, [attestations]);
-
-  // Floor at 1 so all-zero weeks still render visible (flat) bars instead
-  // of dividing by zero.
-  const max = Math.max(1, ...weekly.map((d) => d.value));
+  const activity = (attestations ?? []).filter((row) =>
+    row.txType == null
+    || row.txType === "Inference"
+    || row.txType === "InferenceAttestation"
+    || row.txType === "CommunityInferenceReward");
+  const mineCount = activity.filter((a) => a.mine).length;
+  const rewardByTx = new Map(
+    (earnings?.confirmedReceipts ?? []).map((receipt) => [
+      receipt.txHash.toLowerCase(),
+      receipt.rewardArc,
+    ]),
+  );
+  // The legacy attestation feed is 0x16 computation claims. It must never
+  // make the reward screen look funded. Only the selected host's mined reward
+  // receipt index can establish that a receipt exists; a zero-valued receipt
+  // must not be relabelled as "no receipt."
+  const hasConfirmedRewards =
+    earnings?.fromChain === true && earnings.attestations > 0;
+  const hasCompleteCanonicalHistory =
+    earnings?.archiveMode === true &&
+    earnings.historyCompleteSinceRecovery === true &&
+    earnings.historyScope ===
+      "complete canonical reward history since the v3 recovery boundary";
 
   return (
     <div className="main-inner" data-testid="earnings-screen">
@@ -63,126 +51,176 @@ export function Earnings() {
         <div>
           <h1 className="page-title">Earnings</h1>
           <p className="page-subtitle">
-            Your share of network rewards, paid in ARC.
+            Successful mined community-reward receipts reported by the selected
+            chain host. Testnet ARC has no monetary value.
           </p>
         </div>
       </div>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, 1fr)",
-          gap: "var(--space-4)",
-          marginBottom: "var(--space-6)",
-        }}
-      >
-        <Card>
-          <div className="stat-label">Today</div>
-          <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
-            <NumberTicker value={earnings?.todayArc ?? 0} digits={2} />
-            <span className="unit">ARC</span>
-          </div>
-        </Card>
-        <Card>
-          <div className="stat-label">Lifetime</div>
-          <div
-            className="big-number gradient"
-            style={{ marginTop: "var(--space-2)" }}
-          >
-            <NumberTicker value={earnings?.totalArc ?? 0} digits={2} />
-            <span className="unit">ARC</span>
-          </div>
-        </Card>
-        <Card>
-          <div className="stat-label">Pending</div>
-          <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
-            <NumberTicker value={earnings?.pendingArc ?? 0} digits={2} />
-            <span className="unit">ARC</span>
-          </div>
-        </Card>
+      {/* Primary home for the projection. Placed above retained-window totals
+          because "what will this earn me" is the question people arrive with,
+          and it is the one figure that must never be guessed. */}
+      <div style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-projection">
+        <ProjectedEarnings />
       </div>
 
-      <Card style={{ marginBottom: "var(--space-6)" }}>
-        <CardHeader
-          title="Last 7 days"
-          action={
-            <span
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                fontSize: "var(--text-xs)",
-                color: "var(--text-muted)",
-              }}
-            >
-              <Calendar size={12} /> Weekly
-            </span>
-          }
-        />
+      {/* An unavailable/malformed receipt index is not a confirmed zero. Keep
+          it separate from the valid candidate response whose retained row
+          count is exactly zero. */}
+      {earnings == null ? (
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading">
+          <CardHeader title="Checking retained reward receipts…" />
+        </Card>
+      ) : !earnings.fromChain ? (
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-unavailable">
+          <CardHeader title="Reward receipt index unavailable" />
+          <p style={{ margin: 0, color: "var(--text-secondary)", lineHeight: 1.7 }}>
+            {earnings.unavailableReason
+              ?? "The selected chain host did not provide a usable mined-reward receipt index."}
+          </p>
+          <p style={{ marginBottom: 0, color: "var(--text-muted)", lineHeight: 1.7 }}>
+            No zero balance or zero earnings claim is inferred from this failure.
+            Try another healthy v3 host or retry after connectivity is restored.
+          </p>
+        </Card>
+      ) : !hasConfirmedRewards ? (
+        <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-empty">
+          <CardHeader title={hasCompleteCanonicalHistory
+            ? "No mined reward receipts in canonical v3 history"
+            : "No reward receipts retained by this host"} />
+          <div
+            style={{
+              color: "var(--text-secondary)",
+              fontSize: "var(--text-sm)",
+              lineHeight: 1.7,
+            }}
+          >
+            <p style={{ marginTop: 0 }}>
+              {hasCompleteCanonicalHistory
+                ? "This archive-backed host has no successful mined reward receipt for this address since the canonical v3 recovery boundary. It is a confirmed gross-reward zero for that chain segment, not a claim about wallet transfers or any earlier legacy history."
+                : "This is a confirmed zero in the selected host's current retained receipt window—not proof that this address has never earned a reward. Older rows can be pruned on a non-archive host."}
+            </p>
+            <p>
+              A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
+              computation claim and pays nothing. Any policy-reported ARC reward
+              applies only when a separate <code>CommunityInferenceReward</code>{" "}
+              (<code>0x25</code>) transaction succeeds in a mined block.
+            </p>
+            <p>All of these gates have to pass first:</p>
+            <ol style={{ paddingLeft: "1.2em" }}>
+              <li>
+                The node fully loaded the <strong>exact model artifact</strong>{" "}
+                requested; a matching filename or model shape is not enough.
+              </li>
+              <li>
+                A coordinator actually <strong>assigned work</strong> to this
+                worker and independently verified every token through its
+                authenticated range quorum.
+              </li>
+              <li>
+                Reward activation and validator approval collection are ready,
+                and the signed worker certificate receives strict
+                greater-than-two-thirds validator identity and active-stake
+                approval. Six equal validators require five approvals.
+              </li>
+              <li>
+                The resulting <code>0x25</code> transaction is included with a
+                <strong>successful mined receipt</strong> on this same chain
+                host. Pending, failed, pruned, or raw <code>0x16</code> records
+                are not counted.
+              </li>
+            </ol>
+            <p style={{ marginBottom: 0, color: "var(--text-muted)" }}>
+              Reward issuance fails closed whenever activation, validator
+              approval collection, treasury capacity, or mined-receipt
+              evidence is unavailable. Running a prompt from the Inference tab
+              tests the selected inference path; it does not guarantee that
+              your worker receives the job or a reward.
+            </p>
+          </div>
+        </Card>
+      ) : (
         <div
           style={{
-            display: "flex",
-            alignItems: "stretch",
-            gap: "var(--space-3)",
-            height: 200,
-            padding: "var(--space-2) 0",
+            display: "grid",
+            gridTemplateColumns: "repeat(3, 1fr)",
+            gap: "var(--space-4)",
+            marginBottom: "var(--space-6)",
           }}
         >
-          {weekly.map((d, i) => {
-            const barHeight = Math.max(6, (d.value / max) * 140);
-            return (
-              <div
-                key={i}
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "flex-end",
-                  gap: "var(--space-2)",
-                }}
-              >
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: "var(--text-muted)",
-                    fontVariantNumeric: "tabular-nums",
-                    marginBottom: 4,
-                  }}
+          <Card>
+            <div className="stat-label">Today</div>
+            <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
+              {/* null ≠ 0. The chain not reporting a daily figure is not the
+                  same as having earned nothing today. */}
+              {earnings?.todayArc != null ? (
+                <>
+                  <NumberTicker value={earnings.todayArc} digits={2} />
+                  <span className="unit">ARC</span>
+                </>
+              ) : (
+                <span
+                  style={{ color: "var(--text-muted)" }}
+                  title="This chain host doesn't report a daily breakdown."
                 >
-                  {d.value.toFixed(0)}
-                </div>
-                <div
-                  style={{
-                    width: "100%",
-                    maxWidth: 40,
-                    height: barHeight,
-                    background: "var(--gradient-earnings)",
-                    borderRadius: "var(--radius-sm)",
-                    transition: "height 0.6s var(--ease-out)",
-                    boxShadow: "0 4px 14px rgba(232, 93, 47, 0.22)",
-                  }}
-                />
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "var(--text-muted)",
-                    letterSpacing: "var(--tracking-wide)",
-                    textTransform: "uppercase",
-                    fontWeight: 500,
-                  }}
-                >
-                  {d.label}
-                </div>
-              </div>
-            );
-          })}
+                  —
+                </span>
+              )}
+            </div>
+          </Card>
+          <Card>
+            <div className="stat-label">
+              {hasCompleteCanonicalHistory
+                ? "Gross mined rewards · canonical v3"
+                : "Retained by selected host"}
+            </div>
+            <div
+              className="big-number gradient"
+              style={{ marginTop: "var(--space-2)" }}
+            >
+              <NumberTicker value={earnings?.totalArc ?? 0} digits={2} />
+              <span className="unit">ARC</span>
+            </div>
+            <div
+              data-testid="earnings-retained-window-note"
+              title={earnings.receiptSource ?? undefined}
+              style={{
+                marginTop: "var(--space-2)",
+                color: "var(--text-muted)",
+                fontSize: "var(--text-xs)",
+                lineHeight: 1.5,
+              }}
+            >
+              {hasCompleteCanonicalHistory
+                ? "Archive-backed successful 0x25 receipts since the v3 recovery boundary. Gross rewards are not the same as the wallet's current balance after spending or transfers."
+                : "Current host-retained receipt window; older rows may be pruned. This is not lifetime earnings."}
+            </div>
+          </Card>
+          <Card>
+            <div className="stat-label">Last reward receipt</div>
+            {/* Replaces the old invented "Pending" card. The candidate
+                endpoint reports the block of the last successful mined 0x25
+                reward receipt; absent remains absent. */}
+            <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
+              {earnings?.lastPayoutBlock != null ? (
+                <span style={{ fontSize: "0.7em" }}>
+                  block #{formatInt(earnings.lastPayoutBlock)}
+                </span>
+              ) : earnings?.lastPayoutAt != null ? (
+                <span style={{ fontSize: "0.7em" }}>
+                  {formatRelativeTime(earnings.lastPayoutAt)}
+                </span>
+              ) : (
+                <span style={{ color: "var(--text-muted)" }}>—</span>
+              )}
+            </div>
+          </Card>
         </div>
-      </Card>
+      )}
 
       <Card>
         <CardHeader
-          title="All attestations"
+          title="Inference activity"
           action={
             <span
               style={{
@@ -190,53 +228,77 @@ export function Earnings() {
                 color: "var(--text-muted)",
               }}
             >
-              {formatInt(attestations?.length ?? 0)} total shown
+              {formatInt(mineCount)} yours ·{" "}
+              {formatInt(activity.length)} shown
             </span>
           }
         />
         <div className="feed" data-testid="all-attestations">
-          {!attestations || attestations.length === 0 ? (
+          {activity.length === 0 ? (
             <EmptyState
               icon={FileSignature}
-              title="No attestations yet"
-              description="Run inference to start earning."
+              title="No inference claims on this host"
+              description="Running a prompt can test the selected inference path, but it does not guarantee worker assignment or payment."
             />
           ) : (
-            attestations.map((a) => (
+            activity.map((a) => (
               <div key={a.txHash} className="feed-item">
                 <div className="feed-item-icon">
                   <FileSignature />
                 </div>
                 <div className="feed-item-body">
-                  <div className="feed-item-title">{a.inputPreview}</div>
+                  <div className="feed-item-title">
+                    {a.inputPreview || (
+                      <span style={{ color: "var(--text-muted)" }}>
+                        Inference activity
+                      </span>
+                    )}
+                  </div>
                   <div className="feed-item-meta">
                     <span>{formatHash(a.txHash, 10)}</span>
-                    <span>{a.tokens} tok</span>
-                    <span>{a.latencyMs}ms</span>
-                    <span>{formatRelativeTime(a.timestamp)}</span>
+                    {a.tokens != null && <span>{a.tokens} tok</span>}
+                    {a.latencyMs != null && <span>{a.latencyMs}ms</span>}
+                    {a.blockHeight != null && (
+                      <span>#{formatInt(a.blockHeight)}</span>
+                    )}
+                    <span>
+                      {a.timestamp != null
+                        ? formatRelativeTime(a.timestamp)
+                        : "recent"}
+                    </span>
                   </div>
                 </div>
                 <div
                   style={{
                     fontFamily: "var(--font-mono)",
                     fontSize: "var(--text-sm)",
-                    color: "var(--success)",
+                    color: a.mine ? "var(--success)" : "var(--text-muted)",
                     fontWeight: 600,
                     flexShrink: 0,
+                    whiteSpace: "nowrap",
                   }}
+                  data-testid={`activity-status-${a.txHash.slice(0, 10)}`}
+                  title={a.paid
+                    ? "Successful mined CommunityInferenceReward (0x25) receipt."
+                    : "Successful computation claim; no payment receipt is represented by this row."}
                 >
-                  +{a.rewardArc.toFixed(2)} ARC
+                  {a.paid
+                    ? `${rewardByTx.has(a.txHash.toLowerCase())
+                      ? `+${formatArc(rewardByTx.get(a.txHash.toLowerCase())!)} ARC · `
+                      : ""}COMPUTED + PAID`
+                    : `COMPUTED · NOT PAYMENT · ${a.mine ? "yours" : "network"}`}
                 </div>
+                {/* Was openExternal to a hardcoded LAX :3200 URL — the wrong
+                    host for this session and not a block explorer. Resolves
+                    against the pinned chain host instead, which is the only
+                    place this hash can be confirmed. */}
                 <button
                   className="btn btn-ghost btn-sm"
-                  onClick={() =>
-                    api.openExternal(
-                      `http://140.82.16.112:3200/tx/${a.txHash}`,
-                    )
-                  }
-                  aria-label="Open in explorer"
+                  onClick={() => lookupHash(a.txHash)}
+                  data-testid={`btn-lookup-earnings-${a.txHash.slice(0, 10)}`}
+                  aria-label="Look up on the pinned chain host"
                 >
-                  <ArrowUpRight size={13} />
+                  <Search size={13} />
                 </button>
               </div>
             ))

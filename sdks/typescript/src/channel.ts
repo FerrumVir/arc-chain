@@ -15,6 +15,12 @@
 
 import { Hash256, Address, TransactionBody } from './types';
 
+function assertSafeU64Number(value: number, fieldName: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${fieldName} must be a non-negative safe integer`);
+  }
+}
+
 /** Channel lifecycle states. */
 export enum ChannelState {
   Opening = 'Opening',
@@ -62,6 +68,7 @@ export class Channel {
     role: Role,
     totalDeposit: number,
   ) {
+    assertSafeU64Number(totalDeposit, 'totalDeposit');
     this.channelId = channelId;
     this.role = role;
     this.totalDeposit = totalDeposit;
@@ -102,6 +109,7 @@ export class Channel {
       throw new Error(`Cannot pay: channel is ${this.state}`);
     }
 
+    assertSafeU64Number(amount, 'amount');
     if (amount > this.myBalance()) {
       throw new Error(`Insufficient balance: have ${this.myBalance()}, need ${amount}`);
     }
@@ -115,6 +123,9 @@ export class Channel {
       newCounter = this.counterpartyBalance - amount;
     }
 
+    assertSafeU64Number(newOpener, 'openerBalance');
+    assertSafeU64Number(newCounter, 'counterpartyBalance');
+
     return this.proposeState(newOpener, newCounter);
   }
 
@@ -124,13 +135,19 @@ export class Channel {
       throw new Error(`Cannot propose: channel is ${this.state}`);
     }
 
-    if (openerBalance + counterpartyBalance !== this.totalDeposit) {
+    assertSafeU64Number(openerBalance, 'openerBalance');
+    assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
+    if (
+      BigInt(openerBalance) + BigInt(counterpartyBalance) !==
+      BigInt(this.totalDeposit)
+    ) {
       throw new Error(
         `Conservation violated: ${openerBalance} + ${counterpartyBalance} != ${this.totalDeposit}`
       );
     }
 
     const newNonce = this.nonce + 1;
+    assertSafeU64Number(newNonce, 'nonce');
 
     const commitment: StateCommitment = {
       channelId: this.channelId,
@@ -157,11 +174,17 @@ export class Channel {
       throw new Error('Channel ID mismatch');
     }
 
+    assertSafeU64Number(commitment.nonce, 'nonce');
+    assertSafeU64Number(commitment.openerBalance, 'openerBalance');
+    assertSafeU64Number(commitment.counterpartyBalance, 'counterpartyBalance');
     if (commitment.nonce <= this.nonce) {
       throw new Error(`Nonce must increase: got ${commitment.nonce}, current ${this.nonce}`);
     }
 
-    if (commitment.openerBalance + commitment.counterpartyBalance !== this.totalDeposit) {
+    if (
+      BigInt(commitment.openerBalance) + BigInt(commitment.counterpartyBalance) !==
+      BigInt(this.totalDeposit)
+    ) {
       throw new Error('Conservation violated');
     }
 
@@ -185,6 +208,16 @@ export class Channel {
   finalizeState(commitment: StateCommitment): void {
     if (!commitment.acceptorSig) {
       throw new Error('Commitment not fully signed');
+    }
+
+    assertSafeU64Number(commitment.nonce, 'nonce');
+    assertSafeU64Number(commitment.openerBalance, 'openerBalance');
+    assertSafeU64Number(commitment.counterpartyBalance, 'counterpartyBalance');
+    if (
+      BigInt(commitment.openerBalance) + BigInt(commitment.counterpartyBalance) !==
+      BigInt(this.totalDeposit)
+    ) {
+      throw new Error('Conservation violated');
     }
 
     this.nonce = commitment.nonce;
@@ -232,6 +265,8 @@ export class Channel {
     deposit: number,
     timeoutBlocks: number = 100,
   ): TransactionBody {
+    assertSafeU64Number(deposit, 'deposit');
+    assertSafeU64Number(timeoutBlocks, 'timeoutBlocks');
     return {
       type: 'ChannelOpen',
       channel_id: channelId,
@@ -249,6 +284,9 @@ export class Channel {
     counterpartySig: number[],
     stateNonce: number,
   ): TransactionBody {
+    assertSafeU64Number(openerBalance, 'openerBalance');
+    assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
+    assertSafeU64Number(stateNonce, 'stateNonce');
     return {
       type: 'ChannelClose',
       channel_id: channelId,
@@ -268,6 +306,10 @@ export class Channel {
     stateNonce: number,
     challengePeriod: number = 100,
   ): TransactionBody {
+    assertSafeU64Number(openerBalance, 'openerBalance');
+    assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
+    assertSafeU64Number(stateNonce, 'stateNonce');
+    assertSafeU64Number(challengePeriod, 'challengePeriod');
     return {
       type: 'ChannelDispute',
       channel_id: channelId,

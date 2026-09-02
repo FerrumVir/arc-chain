@@ -6,21 +6,23 @@
 // fake-output InferenceAttestation, submit it, and verify
 // /worker/earnings reflects the on-chain credit.
 //
-// Run against a live seed:
-//   ARC_SEED=http://140.82.16.112:9090 \
-//   cargo run --release -p arc-node --example v070_e2e_attestation
-//
-// Default ARC_SEED is the local node at 127.0.0.1:9090.
+// This mutating example accepts only a numeric loopback IP. ARC_SEED may
+// select another local port, but hostnames and non-loopback origins fail
+// before client construction.
 
-use arc_crypto::{hash_bytes, Hash256, KeyPair, Signature};
-use arc_types::{transaction::InferenceAttestationBody, Transaction, TxBody, TxType};
+use arc_crypto::{Hash256, KeyPair, Signature, hash_bytes};
+use arc_types::{Transaction, TxBody, TxType, transaction::InferenceAttestationBody};
 use serde_json::Value;
 use std::time::Duration;
 
+#[path = "support/local_rpc.rs"]
+mod local_rpc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let seed = std::env::var("ARC_SEED")
-        .unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
+    let requested_seed =
+        std::env::var("ARC_SEED").unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
+    let seed = local_rpc::require_loopback_rpc(&requested_seed)?;
 
     println!("=== v0.7.0 end-to-end attestation test ===");
     println!("Seed: {}", seed);
@@ -30,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     //    for this address.
     let kp = KeyPair::generate_ed25519();
     let address = kp.address();
-    let address_hex = format!("0x{}", hex::encode(&address.0));
+    let address_hex = format!("0x{}", hex::encode(address.0));
     println!("Generated worker address: {}", address_hex);
 
     let client = reqwest::Client::builder()
@@ -55,7 +57,11 @@ async fn main() -> anyhow::Result<()> {
     // 3. Verify starting earnings = 0
     println!("\n[2/7] Initial /worker/earnings ...");
     let initial: Value = client
-        .get(format!("{}/worker/earnings/{}", seed, address_hex.trim_start_matches("0x")))
+        .get(format!(
+            "{}/worker/earnings/{}",
+            seed,
+            address_hex.trim_start_matches("0x")
+        ))
         .send()
         .await?
         .json()
@@ -143,7 +149,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Worker nonce: query the chain
     let acct: Value = client
-        .get(format!("{}/account/{}", seed, address_hex.trim_start_matches("0x")))
+        .get(format!(
+            "{}/account/{}",
+            seed,
+            address_hex.trim_start_matches("0x")
+        ))
         .send()
         .await?
         .json()
@@ -172,8 +182,8 @@ async fn main() -> anyhow::Result<()> {
     tx.sign(&kp)?;
     let bytes = bincode::serialize(&tx)?;
     let signed_hex = format!("0x{}", hex::encode(&bytes));
-    println!("  ↳ tx_hash {}", hex::encode(&tx.hash.0));
-    println!("  ↳ from    {}", hex::encode(&tx.from.0));
+    println!("  ↳ tx_hash {}", hex::encode(tx.hash.0));
+    println!("  ↳ from    {}", hex::encode(tx.from.0));
     println!("  ↳ nonce   {}", tx.nonce);
     println!("  ↳ {} bytes signed", bytes.len());
 
@@ -186,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
             "worker_id": address_hex,
             "success": true,
             "output": output_text,
-            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "output_hash": format!("0x{}", hex::encode(output_hash.0)),
             "tokens_generated": 1,
             "total_ms": 50,
             "ms_per_token": 50,
@@ -221,7 +231,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let final_earnings: Value = client
-        .get(format!("{}/worker/earnings/{}", seed, address_hex.trim_start_matches("0x")))
+        .get(format!(
+            "{}/worker/earnings/{}",
+            seed,
+            address_hex.trim_start_matches("0x")
+        ))
         .send()
         .await?
         .json()

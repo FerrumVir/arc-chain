@@ -32,18 +32,20 @@ pub enum MessageType {
     SnapshotChunkRequest = 0x09,
     /// State Sync - response with a snapshot chunk.
     SnapshotChunkResponse = 0x0A,
-    /// Inference request - routed to peers with GPU/model capability.
+    /// Legacy P2P inference request. The current node does not execute work from
+    /// this surface; active community assignment uses the signed RPC protocol.
     InferenceRequest = 0x0B,
-    /// Inference response - result from a community GPU node.
+    /// Legacy P2P inference response. Retained for v3 wire compatibility only.
     InferenceResponse = 0x0C,
     /// Heartbeat - lightweight liveness probe with round info.
     /// Sent during reconnect to detect dead QUIC streams and partitions.
     Heartbeat = 0x0D,
-    /// Shard activation forward - send layer activations to next shard holder.
+    /// Legacy P2P shard activation forward. The current shard pipeline uses
+    /// HTTP/RPC and does not consume this transport surface.
     ShardForward = 0x0E,
-    /// Shard result - final logits/token from last shard back to coordinator.
+    /// Legacy P2P shard result. Retained for v3 wire compatibility only.
     ShardResult = 0x0F,
-    /// Shard registration - announce which model layers this node holds.
+    /// Legacy P2P shard registration. Retained for v3 wire compatibility only.
     ShardAnnounce = 0x10,
     /// DAG round sync request - ask peer for their current round state.
     RoundSyncRequest = 0x11,
@@ -81,14 +83,33 @@ impl MessageType {
 
 /// Exchanged on peer connection.
 ///
-/// Each peer proves identity by signing a random nonce with their validator key.
-/// The receiver verifies: (1) public_key hashes to validator_address,
-/// (2) challenge_sig is a valid Ed25519 signature over
-/// `BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)`.
-/// Current wire protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Each peer proves identity by signing a domain-separated transcript bound to
+/// exporter bytes from the current QUIC/TLS session. The receiver verifies the
+/// public key derives to `validator_address`, the complete transcript has a
+/// valid Ed25519 signature, and the exporter binding matches this connection.
+/// Current wire protocol version. Version 3 is the explicit cutover for the
+/// incompatible consensus/network behavior introduced after the v2 fleet.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Minimum protocol version we can talk to.
-pub const MIN_COMPATIBLE_VERSION: u32 = 1;
+///
+/// This intentionally equals [`PROTOCOL_VERSION`] for the v3 cutover. A v3
+/// node rejects v1/v2, and the advertised minimum makes an unmodified v2 node
+/// reject v3 as too new, preventing a mixed fleet from appearing connected
+/// while interpreting consensus traffic differently.
+pub const MIN_COMPATIBLE_VERSION: u32 = 3;
+
+/// Whether the inclusive protocol ranges advertised by two peers overlap.
+///
+/// Kept as the single compatibility predicate so the handshake path and the
+/// cutover regression tests cannot drift into one-sided version acceptance.
+pub(crate) const fn protocol_ranges_overlap(
+    local_current: u32,
+    local_minimum: u32,
+    peer_current: u32,
+    peer_minimum: u32,
+) -> bool {
+    peer_minimum <= local_current && local_minimum <= peer_current
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
@@ -98,10 +119,13 @@ pub struct HandshakeMessage {
     pub genesis_hash: Hash256,
     /// Ed25519 public key bytes (32 bytes). Receiver verifies it hashes to validator_address.
     pub public_key: Vec<u8>,
-    /// Random 32-byte nonce (prevents replay attacks).
+    /// RFC 5705 keying material exported from this QUIC/TLS session. A proof
+    /// replayed on another connection therefore has a different transcript.
+    /// The field name is retained to keep the compact v3 wire layout stable.
     pub nonce: [u8; 32],
-    /// Ed25519 signature over BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash).
-    /// Proves the sender controls the private key for validator_address.
+    /// Ed25519 signature over the domain-separated v3 transcript: session
+    /// binding plus every semantic handshake field. Proves both key ownership
+    /// and freshness on this exact connection.
     pub challenge_sig: Vec<u8>,
     /// Protocol version (added in v2). Old nodes deserializing via bincode
     /// will use serde default (0) which we treat as v1.
@@ -182,7 +206,8 @@ pub struct InferenceRequestMessage {
     pub input: String,
     /// Max tokens to generate.
     pub max_tokens: u32,
-    /// Requester's validator address (for response routing).
+    /// Requester's validator address (for response routing). At ingress this
+    /// must equal the peer identity authenticated by the QUIC handshake.
     pub requester: Hash256,
 }
 
@@ -199,7 +224,8 @@ pub struct InferenceResponseMessage {
     pub model_hash: Hash256,
     /// Milliseconds per token.
     pub ms_per_token: u64,
-    /// Responder's validator address.
+    /// Responder's validator address. At ingress this must equal the peer
+    /// identity authenticated by the QUIC handshake.
     pub responder: Hash256,
 }
 
@@ -247,7 +273,8 @@ pub struct ShardResultMessage {
     pub token_id: u32,
     /// BLAKE3 hash of the full logits vector (for determinism verification).
     pub logits_hash: Hash256,
-    /// Responder's validator address.
+    /// Responder's validator address. At ingress this must equal the peer
+    /// identity authenticated by the QUIC handshake.
     pub responder: Hash256,
 }
 
@@ -262,7 +289,8 @@ pub struct ShardAnnounceMessage {
     pub end_layer: u32,
     /// For MoE: which expert indices this node holds (empty for dense models).
     pub expert_indices: Vec<u32>,
-    /// Node's validator address.
+    /// Node's validator address. At ingress this must equal the peer identity
+    /// authenticated by the QUIC handshake.
     pub node_address: Hash256,
     /// Available memory (bytes) for additional shards.
     pub available_memory: u64,
@@ -301,8 +329,59 @@ pub struct HeartbeatMessage {
 
 // ─── Framing ────────────────────────────────────────────────────────────────
 
-/// Maximum message payload size (16 MiB - generous for large blocks).
-const MAX_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum message payload size (16 MiB - generous for large blocks and
+/// snapshot chunks).
+pub(crate) const MAX_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Read and validate only the fixed-size frame header.
+///
+/// Keeping this separate from the payload read lets the transport apply its
+/// authenticated per-peer message and byte budgets before allocating an
+/// attacker-controlled body. Protocol v3 requires an exact version match, so
+/// an unknown type is a protocol error rather than a forward-compatibility
+/// signal to skip an arbitrary body.
+pub(crate) async fn read_message_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<(MessageType, u32)> {
+    let type_byte = reader.read_u8().await?;
+    let len = reader.read_u32().await?;
+    if len > MAX_PAYLOAD_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload too large: {len} bytes"),
+        ));
+    }
+    let msg_type = MessageType::from_u8(type_byte).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown message type: 0x{type_byte:02x}"),
+        )
+    })?;
+    Ok((msg_type, len))
+}
+
+/// Read an already-validated frame body.
+pub(crate) async fn read_message_payload<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: u32,
+) -> io::Result<Vec<u8>> {
+    debug_assert!(len <= MAX_PAYLOAD_SIZE);
+    let mut payload = vec![0u8; len as usize];
+    reader.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+/// Deserialize an untrusted wire payload with the legacy fixed-width integer
+/// encoding used by `bincode::serialize`, but with an explicit byte limit and
+/// no ignored suffix. The compatibility `bincode::deserialize` entry point
+/// deliberately retains legacy trailing-byte behavior and a broader trusted-
+/// persistence ceiling, neither of which is appropriate for peer input.
+pub(crate) fn deserialize_message<'a, T>(payload: &'a [u8]) -> bincode::Result<T>
+where
+    T: Deserialize<'a>,
+{
+    bincode::deserialize_limited_exact::<T, { MAX_PAYLOAD_SIZE as usize }>(payload)
+}
 
 /// Write a framed message to a QUIC send stream.
 pub async fn write_message<W: AsyncWrite + Unpin>(
@@ -310,6 +389,12 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     msg_type: MessageType,
     payload: &[u8],
 ) -> io::Result<()> {
+    if payload.len() > MAX_PAYLOAD_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("payload too large: {} bytes", payload.len()),
+        ));
+    }
     let len = payload.len() as u32;
     writer.write_u8(msg_type as u8).await?;
     writer.write_u32(len).await?;
@@ -321,45 +406,58 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 /// Read a framed message from a QUIC recv stream.
 ///
 /// Returns `(MessageType, payload_bytes)`.
-/// Unknown message types are properly skipped (reads and discards the payload)
-/// to keep the stream synchronized for forward compatibility.
+/// Unknown message types are rejected. Protocol v3 handshakes require exact
+/// compatibility, and rejecting at the header avoids allocating or draining an
+/// unauthenticated extension frame.
 pub async fn read_message<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> io::Result<(MessageType, Vec<u8>)> {
-    loop {
-        let type_byte = reader.read_u8().await?;
-        let len = reader.read_u32().await?;
-        if len > MAX_PAYLOAD_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("payload too large: {} bytes", len),
-            ));
-        }
-
-        match MessageType::from_u8(type_byte) {
-            Some(msg_type) => {
-                let mut buf = vec![0u8; len as usize];
-                reader.read_exact(&mut buf).await?;
-                return Ok((msg_type, buf));
-            }
-            None => {
-                // Unknown message type from a newer protocol version.
-                // Read and discard the payload to keep the stream in sync,
-                // then continue reading the next message.
-                let mut discard = vec![0u8; len as usize];
-                reader.read_exact(&mut discard).await?;
-                tracing::debug!(
-                    "Skipped unknown message type 0x{:02x} ({} bytes) - peer may be newer version",
-                    type_byte, len
-                );
-            }
-        }
-    }
+    let (msg_type, len) = read_message_header(reader).await?;
+    let payload = read_message_payload(reader, len).await?;
+    Ok((msg_type, payload))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    struct StringPayload {
+        text: String,
+    }
+
+    #[test]
+    fn v3_cutover_is_mutually_incompatible_with_v2() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(MIN_COMPATIBLE_VERSION, 3);
+
+        // New v3 node receives the version range advertised by the old v2
+        // implementation (current=2, minimum=1).
+        assert!(!protocol_ranges_overlap(
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+            2,
+            1,
+        ));
+
+        // Old v2 node receives the new v3 range (current=3, minimum=3).
+        assert!(!protocol_ranges_overlap(
+            2,
+            1,
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+        ));
+    }
+
+    #[test]
+    fn v3_peers_remain_compatible_with_each_other() {
+        assert!(protocol_ranges_overlap(
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+        ));
+    }
 
     #[tokio::test]
     async fn roundtrip_framing() {
@@ -376,10 +474,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_unknown_type() {
-        let buf = vec![0xFF, 0, 0, 0, 0]; // unknown type, zero-length payload
+    async fn reject_unknown_type_before_reading_its_payload() {
+        let buf = vec![0xFF, 0, 0, 0, 4]; // body is deliberately absent
         let mut cursor = io::Cursor::new(buf);
-        let result = read_message(&mut cursor).await;
-        assert!(result.is_err());
+        let error = read_message(&mut cursor).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unknown message type"));
+    }
+
+    #[tokio::test]
+    async fn reject_oversized_header_before_allocating_payload() {
+        let mut buf = vec![MessageType::DagBlockWithTxs as u8];
+        buf.extend_from_slice(&(MAX_PAYLOAD_SIZE + 1).to_be_bytes());
+        let mut cursor = io::Cursor::new(buf);
+        let error = read_message(&mut cursor).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("payload too large"));
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_oversized_payload_without_writing_a_header() {
+        let payload = vec![0_u8; MAX_PAYLOAD_SIZE as usize + 1];
+        let mut output = Vec::new();
+        let error = write_message(&mut output, MessageType::DagBlockWithTxs, &payload)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn bounded_deserializer_rejects_forged_string_length() {
+        // Fixed-width bincode encodes a String length as u64. There are no body
+        // bytes here, and the declared allocation is intentionally enormous.
+        let forged = (u64::from(MAX_PAYLOAD_SIZE) + 1).to_le_bytes();
+        assert!(deserialize_message::<StringPayload>(&forged).is_err());
+    }
+
+    #[test]
+    fn bounded_deserializer_accepts_exact_canonical_payload_only() {
+        let value = StringPayload {
+            text: "bounded".to_string(),
+        };
+        let canonical = bincode::serialize(&value).unwrap();
+        assert_eq!(
+            deserialize_message::<StringPayload>(&canonical).unwrap(),
+            value
+        );
+
+        let mut suffixed = canonical;
+        suffixed.push(0);
+        assert!(deserialize_message::<StringPayload>(&suffixed).is_err());
     }
 }

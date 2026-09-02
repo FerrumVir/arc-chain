@@ -1,11 +1,18 @@
 //! Typed program enumeration.
 
-use crate::{Grid, Color, PosSet};
 use crate::primitives::grid;
 use crate::primitives::object;
+use crate::{Color, Grid, PosSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum DagType { Grid, Objects, Object, Indices, Color, Int }
+pub enum DagType {
+    Grid,
+    Objects,
+    Object,
+    Indices,
+    Color,
+    Int,
+}
 
 #[derive(Clone, Debug)]
 pub enum DagValue {
@@ -29,42 +36,58 @@ impl DagValue {
         }
     }
     pub fn as_grid(&self) -> Option<&Grid> {
-        if let DagValue::Grid(g) = self { Some(g) } else { None }
+        if let DagValue::Grid(g) = self {
+            Some(g)
+        } else {
+            None
+        }
     }
 }
+
+/// The body of a catalog primitive: takes its already-evaluated arguments and
+/// returns the result, or `None` if the arguments do not fit.
+pub type PrimitiveApply = Box<dyn Fn(&[DagValue]) -> Option<DagValue> + Send + Sync>;
+
+/// A grid->grid transform paired with the name used for it in a program string.
+type NamedGridFn = (&'static str, fn(&Grid) -> Grid);
 
 pub struct TypedPrimitive {
     pub name: &'static str,
     pub input_types: Vec<DagType>,
     pub output_type: DagType,
-    pub apply: Box<dyn Fn(&[DagValue]) -> Option<DagValue> + Send + Sync>,
+    pub apply: PrimitiveApply,
 }
 
 pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
     let mut cat: Vec<TypedPrimitive> = Vec::new();
 
     // Unary Grid → Grid
-    let g2g: Vec<(&str, fn(&Grid) -> Grid)> = vec![
-        ("rot90", grid::rot90), ("rot180", grid::rot180), ("rot270", grid::rot270),
-        ("hmirror", grid::hmirror), ("vmirror", grid::vmirror),
-        ("dmirror", grid::dmirror), ("cmirror", grid::cmirror),
-        ("tophalf", grid::tophalf), ("bottomhalf", grid::bottomhalf),
-        ("lefthalf", grid::lefthalf), ("righthalf", grid::righthalf),
-        ("compress", grid::compress), ("trim", grid::trim),
+    let g2g: Vec<NamedGridFn> = vec![
+        ("rot90", grid::rot90),
+        ("rot180", grid::rot180),
+        ("rot270", grid::rot270),
+        ("hmirror", grid::hmirror),
+        ("vmirror", grid::vmirror),
+        ("dmirror", grid::dmirror),
+        ("cmirror", grid::cmirror),
+        ("tophalf", grid::tophalf),
+        ("bottomhalf", grid::bottomhalf),
+        ("lefthalf", grid::lefthalf),
+        ("righthalf", grid::righthalf),
+        ("compress", grid::compress),
+        ("trim", grid::trim),
     ];
     for (name, f) in g2g {
         cat.push(TypedPrimitive {
             name,
             input_types: vec![DagType::Grid],
             output_type: DagType::Grid,
-            apply: Box::new(move |args| {
-                Some(DagValue::Grid(f(args[0].as_grid()?)))
-            }),
+            apply: Box::new(move |args| Some(DagValue::Grid(f(args[0].as_grid()?)))),
         });
     }
 
     // Self-concat patterns
-    let concat_patterns: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let concat_patterns: Vec<NamedGridFn> = vec![
         ("hconcat_self", |g| grid::hconcat(g, g)),
         ("vconcat_self", |g| grid::vconcat(g, g)),
         ("hconcat_vm", |g| grid::hconcat(g, &grid::vmirror(g))),
@@ -77,9 +100,7 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             name,
             input_types: vec![DagType::Grid],
             output_type: DagType::Grid,
-            apply: Box::new(move |args| {
-                Some(DagValue::Grid(f(args[0].as_grid()?)))
-            }),
+            apply: Box::new(move |args| Some(DagValue::Grid(f(args[0].as_grid()?)))),
         });
     }
 
@@ -114,7 +135,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
                 object::argmax_size(objs).cloned().map(DagValue::Object)
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -124,7 +147,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
                 object::argmin_size(objs).cloned().map(DagValue::Object)
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -136,21 +161,29 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let (DagValue::Object(obj), DagValue::Grid(g)) = (&args[0], &args[1]) {
                 Some(DagValue::Grid(object::subgrid(obj, g)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
     // Parameterized: replace colors
     for &c1 in colors {
         for &c2 in colors {
-            if c1 == c2 { continue; }
+            if c1 == c2 {
+                continue;
+            }
             let name: &'static str = Box::leak(format!("replace_{c1}_{c2}").into_boxed_str());
             cat.push(TypedPrimitive {
                 name,
                 input_types: vec![DagType::Grid],
                 output_type: DagType::Grid,
                 apply: Box::new(move |args| {
-                    Some(DagValue::Grid(grid::replace_color(args[0].as_grid()?, c1, c2)))
+                    Some(DagValue::Grid(grid::replace_color(
+                        args[0].as_grid()?,
+                        c1,
+                        c2,
+                    )))
                 }),
             });
         }
@@ -178,15 +211,23 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Indices(idx) = &args[0] {
                 // Backdrop of indices = bounding box
-                if idx.is_empty() { return Some(DagValue::Indices(PosSet::new())); }
+                if idx.is_empty() {
+                    return Some(DagValue::Indices(PosSet::new()));
+                }
                 let min_r = idx.iter().map(|p| p.0).min().unwrap();
                 let max_r = idx.iter().map(|p| p.0).max().unwrap();
                 let min_c = idx.iter().map(|p| p.1).min().unwrap();
                 let max_c = idx.iter().map(|p| p.1).max().unwrap();
                 let mut bd = PosSet::new();
-                for r in min_r..=max_r { for c in min_c..=max_c { bd.insert((r, c)); } }
+                for r in min_r..=max_r {
+                    for c in min_c..=max_c {
+                        bd.insert((r, c));
+                    }
+                }
                 Some(DagValue::Indices(bd))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -195,17 +236,25 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         output_type: DagType::Indices,
         apply: Box::new(|args| {
             if let DagValue::Indices(idx) = &args[0] {
-                if idx.is_empty() { return Some(DagValue::Indices(PosSet::new())); }
+                if idx.is_empty() {
+                    return Some(DagValue::Indices(PosSet::new()));
+                }
                 let min_r = idx.iter().map(|p| p.0).min().unwrap();
                 let max_r = idx.iter().map(|p| p.0).max().unwrap();
                 let min_c = idx.iter().map(|p| p.1).min().unwrap();
                 let max_c = idx.iter().map(|p| p.1).max().unwrap();
                 let mut d = PosSet::new();
-                for r in min_r..=max_r { for c in min_c..=max_c {
-                    if !idx.contains(&(r, c)) { d.insert((r, c)); }
-                }}
+                for r in min_r..=max_r {
+                    for c in min_c..=max_c {
+                        if !idx.contains(&(r, c)) {
+                            d.insert((r, c));
+                        }
+                    }
+                }
                 Some(DagValue::Indices(d))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -215,7 +264,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Indices(idx) = &args[0] {
                 Some(DagValue::Indices(object::mapply_neighbors(idx)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -233,19 +284,39 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             apply: Box::new(move |args| {
                 if let DagValue::Object(obj) = &args[0] {
                     Some(DagValue::Indices(f(obj)))
-                } else { None }
+                } else {
+                    None
+                }
             }),
         });
     }
 
     // Objects → merged Indices via region functions
     for (name, region_fn) in [
-        ("mapply_delta", object::delta as fn(&crate::Object) -> PosSet),
-        ("mapply_backdrop", object::backdrop as fn(&crate::Object) -> PosSet),
-        ("mapply_box", object::obj_box as fn(&crate::Object) -> PosSet),
-        ("mapply_corners", object::corners as fn(&crate::Object) -> PosSet),
-        ("mapply_inbox", object::inbox as fn(&crate::Object) -> PosSet),
-        ("mapply_outbox", object::outbox as fn(&crate::Object) -> PosSet),
+        (
+            "mapply_delta",
+            object::delta as fn(&crate::Object) -> PosSet,
+        ),
+        (
+            "mapply_backdrop",
+            object::backdrop as fn(&crate::Object) -> PosSet,
+        ),
+        (
+            "mapply_box",
+            object::obj_box as fn(&crate::Object) -> PosSet,
+        ),
+        (
+            "mapply_corners",
+            object::corners as fn(&crate::Object) -> PosSet,
+        ),
+        (
+            "mapply_inbox",
+            object::inbox as fn(&crate::Object) -> PosSet,
+        ),
+        (
+            "mapply_outbox",
+            object::outbox as fn(&crate::Object) -> PosSet,
+        ),
     ] {
         cat.push(TypedPrimitive {
             name,
@@ -254,9 +325,13 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             apply: Box::new(move |args| {
                 if let DagValue::Objects(objs) = &args[0] {
                     let mut all = PosSet::new();
-                    for obj in objs { all.extend(region_fn(obj)); }
+                    for obj in objs {
+                        all.extend(region_fn(obj));
+                    }
                     Some(DagValue::Indices(all))
-                } else { None }
+                } else {
+                    None
+                }
             }),
         });
     }
@@ -273,7 +348,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
                     all.extend(object::mapply_neighbors(&obj.positions()));
                 }
                 Some(DagValue::Indices(all))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -287,7 +364,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             apply: Box::new(move |args| {
                 if let (DagValue::Indices(idx), DagValue::Grid(g)) = (&args[0], &args[1]) {
                     Some(DagValue::Grid(grid::fill(g, c, idx)))
-                } else { None }
+                } else {
+                    None
+                }
             }),
         });
         let name: &'static str = Box::leak(format!("underfill_idx_{c}").into_boxed_str());
@@ -298,7 +377,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             apply: Box::new(move |args| {
                 if let (DagValue::Indices(idx), DagValue::Grid(g)) = (&args[0], &args[1]) {
                     Some(DagValue::Grid(grid::underfill(g, c, idx)))
-                } else { None }
+                } else {
+                    None
+                }
             }),
         });
     }
@@ -313,8 +394,12 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             apply: Box::new(move |args| {
                 if let DagValue::Objects(objs) = &args[0] {
                     let filtered = object::colorfilter(objs, c);
-                    object::argmax_size(&filtered).cloned().map(DagValue::Object)
-                } else { None }
+                    object::argmax_size(&filtered)
+                        .cloned()
+                        .map(DagValue::Object)
+                } else {
+                    None
+                }
             }),
         });
     }
@@ -327,14 +412,18 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let (DagValue::Object(obj), DagValue::Grid(g)) = (&args[0], &args[1]) {
                 Some(DagValue::Grid(object::cover(g, obj)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
     // Object movement (fixed offsets)
     for (dr, dc, name) in [
-        (1isize, 0isize, "move_down"), (-1, 0, "move_up"),
-        (0, 1, "move_right"), (0, -1, "move_left"),
+        (1isize, 0isize, "move_down"),
+        (-1, 0, "move_up"),
+        (0, 1, "move_right"),
+        (0, -1, "move_left"),
     ] {
         cat.push(TypedPrimitive {
             name,
@@ -343,7 +432,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
             apply: Box::new(move |args| {
                 if let (DagValue::Object(obj), DagValue::Grid(g)) = (&args[0], &args[1]) {
                     Some(DagValue::Grid(object::move_obj(g, obj, dr, dc)))
-                } else { None }
+                } else {
+                    None
+                }
             }),
         });
     }
@@ -356,7 +447,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Int(object::obj_height(obj)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -366,7 +459,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Int(object::obj_width(obj)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -376,7 +471,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Int(obj.size()))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -388,7 +485,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Color(obj.primary_color()))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -397,9 +496,7 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         name: "grid_height",
         input_types: vec![DagType::Grid],
         output_type: DagType::Int,
-        apply: Box::new(|args| {
-            Some(DagValue::Int(args[0].as_grid()?.len()))
-        }),
+        apply: Box::new(|args| Some(DagValue::Int(args[0].as_grid()?.len()))),
     });
     cat.push(TypedPrimitive {
         name: "grid_width",
@@ -416,17 +513,13 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         name: "mostcolor",
         input_types: vec![DagType::Grid],
         output_type: DagType::Color,
-        apply: Box::new(|args| {
-            Some(DagValue::Color(grid::mostcolor(args[0].as_grid()?)))
-        }),
+        apply: Box::new(|args| Some(DagValue::Color(grid::mostcolor(args[0].as_grid()?)))),
     });
     cat.push(TypedPrimitive {
         name: "leastcolor",
         input_types: vec![DagType::Grid],
         output_type: DagType::Color,
-        apply: Box::new(|args| {
-            Some(DagValue::Color(grid::leastcolor(args[0].as_grid()?)))
-        }),
+        apply: Box::new(|args| Some(DagValue::Color(grid::leastcolor(args[0].as_grid()?)))),
     });
 
     // Object selectors by height/width
@@ -436,8 +529,13 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         output_type: DagType::Object,
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
-                objs.iter().max_by_key(|o| object::obj_height(o)).cloned().map(DagValue::Object)
-            } else { None }
+                objs.iter()
+                    .max_by_key(|o| object::obj_height(o))
+                    .cloned()
+                    .map(DagValue::Object)
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -446,8 +544,13 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         output_type: DagType::Object,
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
-                objs.iter().min_by_key(|o| object::obj_height(o)).cloned().map(DagValue::Object)
-            } else { None }
+                objs.iter()
+                    .min_by_key(|o| object::obj_height(o))
+                    .cloned()
+                    .map(DagValue::Object)
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -456,8 +559,13 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         output_type: DagType::Object,
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
-                objs.iter().max_by_key(|o| object::obj_width(o)).cloned().map(DagValue::Object)
-            } else { None }
+                objs.iter()
+                    .max_by_key(|o| object::obj_width(o))
+                    .cloned()
+                    .map(DagValue::Object)
+            } else {
+                None
+            }
         }),
     });
 
@@ -469,7 +577,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
                 objs.first().cloned().map(DagValue::Object)
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -479,7 +589,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Objects(objs) = &args[0] {
                 objs.last().cloned().map(DagValue::Object)
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -491,7 +603,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Indices(object::delta(obj)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -501,7 +615,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Indices(object::backdrop(obj)))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
     cat.push(TypedPrimitive {
@@ -511,7 +627,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| {
             if let DagValue::Object(obj) = &args[0] {
                 Some(DagValue::Indices(obj.positions()))
-            } else { None }
+            } else {
+                None
+            }
         }),
     });
 
@@ -530,7 +648,9 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
                         result = grid::fill(&result, c, &positions);
                     }
                     Some(DagValue::Grid(result))
-                } else { None }
+                } else {
+                    None
+                }
             }),
         });
     }
@@ -538,14 +658,20 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
     // switch_colors (symmetric, c1 < c2)
     for &c1 in colors {
         for &c2 in colors {
-            if c1 >= c2 { continue; }
+            if c1 >= c2 {
+                continue;
+            }
             let name: &'static str = Box::leak(format!("switch_{c1}_{c2}").into_boxed_str());
             cat.push(TypedPrimitive {
                 name,
                 input_types: vec![DagType::Grid],
                 output_type: DagType::Grid,
                 apply: Box::new(move |args| {
-                    Some(DagValue::Grid(grid::switch_colors(args[0].as_grid()?, c1, c2)))
+                    Some(DagValue::Grid(grid::switch_colors(
+                        args[0].as_grid()?,
+                        c1,
+                        c2,
+                    )))
                 }),
             });
         }
@@ -586,10 +712,16 @@ pub struct PartialProgram {
 }
 
 pub fn compute_fitness(result: &Grid, target: &Grid) -> f64 {
-    if result.len() != target.len() || result.is_empty() { return 0.0; }
-    if result[0].len() != target[0].len() { return 0.0; }
+    if result.len() != target.len() || result.is_empty() {
+        return 0.0;
+    }
+    if result[0].len() != target[0].len() {
+        return 0.0;
+    }
     let total = result.len() * result[0].len();
-    let matching: usize = result.iter().zip(target.iter())
+    let matching: usize = result
+        .iter()
+        .zip(target.iter())
         .map(|(rr, tr)| rr.iter().zip(tr.iter()).filter(|(a, b)| a == b).count())
         .sum();
     matching as f64 / total as f64

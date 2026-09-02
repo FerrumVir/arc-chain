@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Test Inference (dead simple verification)
+# ARC Chain - Local Inference Smoke Test
 #
-# Runs inference locally, shows result, fetches on-chain attestation.
-# Proves: inference works, output is hashed, attestation is on-chain.
+# Runs inference on an explicitly loopback-only development node and displays
+# the endpoint's returned result/attestation fields. It is not payment proof.
 #
 # Usage:
 #   ./scripts/test-inference.sh                         # Test your local node
 #   ./scripts/test-inference.sh "What is 2+2?"          # Custom prompt
-#   ./scripts/test-inference.sh "Hi" 140.82.16.112:9090 # Test a remote node
+#   ./scripts/test-inference.sh "Hi" 127.0.0.1:19090   # Another local port
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 PROMPT="${1:-What is the capital of France?}"
-NODE="${2:-localhost:9944}"
+NODE="${2:-127.0.0.1:9944}"
+if ! [[ "$NODE" =~ ^127[.]0[.]0[.]1:([0-9]{1,5})$ ]]; then
+    printf 'RETIRED REMOTE PATH: test-inference.sh accepts only 127.0.0.1.\n' >&2
+    exit 78
+fi
+NODE_PORT="${BASH_REMATCH[1]}"
+if [ "$NODE_PORT" -lt 1 ] || [ "$NODE_PORT" -gt 65535 ]; then
+    printf 'test-inference.sh: invalid loopback port: %s\n' "$NODE_PORT" >&2
+    exit 2
+fi
 
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -60,12 +69,12 @@ try:
     print(f'  Speed:        {inf[\"ms_per_token\"]} ms/token')
     print(f'  Deterministic: {inf[\"deterministic\"]}')
     print('')
-    print('${GREEN}[3/3] Cryptographic proof:${NC}')
+    print('${GREEN}[3/3] Reported commitment fields:${NC}')
     print(f'  Input hash:   {inf[\"input_hash\"]}')
     print(f'  Output hash:  {inf[\"output_hash\"]}')
     print(f'  Model hash:   {inf[\"model_hash\"]}')
     print('')
-    print('${CYAN}On-chain attestation:${NC}')
+    print('${CYAN}Returned attestation record (not a payment receipt):${NC}')
     print(f'  Tx hash:      {att[\"tx_hash\"]}')
     print(f'  Bond:         {att[\"bond\"]} ARC')
     print(f'  Status:       {att[\"status\"]}')
@@ -80,4 +89,5 @@ except Exception as e:
 " || { echo -e "${YELLOW}Raw response:${NC}"; echo "$RESPONSE"; exit 1; }
 
 echo ""
-echo -e "${GREEN}${BOLD}Proof of verifiable inference. Same prompt = same output hash on any machine.${NC}"
+echo -e "${GREEN}${BOLD}Local inference response received.${NC}"
+echo "A raw 0x16 attestation is not payment; only a successful mined 0x25 reward receipt proves earnings."

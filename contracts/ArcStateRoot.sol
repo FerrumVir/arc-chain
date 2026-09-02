@@ -10,7 +10,6 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 /// @dev Designed to be consumed by bridges, light clients, and other contracts that
 ///      need to verify ARC Chain state on Ethereum.
 contract ArcStateRoot is Ownable {
-
     // -------------------------------------------------------------------------
     // Types
     // -------------------------------------------------------------------------
@@ -39,11 +38,7 @@ contract ArcStateRoot is Ownable {
     // Events
     // -------------------------------------------------------------------------
 
-    event StateRootCommitted(
-        uint256 indexed blockHeight,
-        bytes32 stateRoot,
-        bytes32 txRoot
-    );
+    event StateRootCommitted(uint256 indexed blockHeight, bytes32 stateRoot, bytes32 txRoot);
 
     event RelayerUpdated(address indexed oldRelayer, address indexed newRelayer);
 
@@ -62,10 +57,7 @@ contract ArcStateRoot is Ownable {
 
     /// @param initialOwner The admin address (can update the relayer).
     /// @param _relayer     The initial authorized relayer.
-    constructor(
-        address initialOwner,
-        address _relayer
-    ) Ownable(initialOwner) {
+    constructor(address initialOwner, address _relayer) Ownable(initialOwner) {
         require(_relayer != address(0), "ArcStateRoot: zero relayer");
         relayer = _relayer;
     }
@@ -79,22 +71,11 @@ contract ArcStateRoot is Ownable {
     /// @param blockHeight The ARC Chain block height.
     /// @param stateRoot   The state root hash at that height.
     /// @param txRoot      The transaction root hash at that height.
-    function commitStateRoot(
-        uint256 blockHeight,
-        bytes32 stateRoot,
-        bytes32 txRoot
-    ) external onlyRelayer {
+    function commitStateRoot(uint256 blockHeight, bytes32 stateRoot, bytes32 txRoot) external onlyRelayer {
         require(stateRoot != bytes32(0), "ArcStateRoot: zero state root");
-        require(
-            blockHeight > latestBlockHeight,
-            "ArcStateRoot: height must be strictly increasing"
-        );
+        require(blockHeight > latestBlockHeight, "ArcStateRoot: height must be strictly increasing");
 
-        roots[blockHeight] = RootData({
-            stateRoot: stateRoot,
-            txRoot: txRoot,
-            committedAt: block.timestamp
-        });
+        roots[blockHeight] = RootData({stateRoot: stateRoot, txRoot: txRoot, committedAt: block.timestamp});
 
         latestBlockHeight = blockHeight;
 
@@ -111,12 +92,11 @@ contract ArcStateRoot is Ownable {
     /// @param proof       The Merkle proof (array of sibling hashes from leaf to root).
     /// @param index       The leaf index in the tree (determines left/right ordering at each level).
     /// @return valid True if the proof reconstructs to the stored state root.
-    function verifyProof(
-        uint256 blockHeight,
-        bytes32 leaf,
-        bytes32[] calldata proof,
-        uint256 index
-    ) external view returns (bool valid) {
+    function verifyProof(uint256 blockHeight, bytes32 leaf, bytes32[] calldata proof, uint256 index)
+        external
+        view
+        returns (bool valid)
+    {
         bytes32 storedRoot = roots[blockHeight].stateRoot;
         require(storedRoot != bytes32(0), "ArcStateRoot: no root at height");
 
@@ -156,11 +136,7 @@ contract ArcStateRoot is Ownable {
     /// @return stateRoot The state root hash.
     /// @return txRoot    The transaction root hash.
     /// @return committedAt The timestamp when the root was committed.
-    function rootDataAt(uint256 height)
-        external
-        view
-        returns (bytes32 stateRoot, bytes32 txRoot, uint256 committedAt)
-    {
+    function rootDataAt(uint256 height) external view returns (bytes32 stateRoot, bytes32 txRoot, uint256 committedAt) {
         RootData storage data = roots[height];
         return (data.stateRoot, data.txRoot, data.committedAt);
     }

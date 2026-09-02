@@ -1,8 +1,14 @@
 # ARC Node - first run
 
-This binary is unsigned - the testnet release skips Apple / Windows code
-signing. Your operating system will warn you on first launch. The app is
-fine to run; you just need to tell the OS that once.
+> **Release status:** v0.8.0 is an unreleased recovery candidate and is not
+> deployed to the public seeds. Use these steps only after the exact v0.8.0
+> release contains the complete normalized asset set and `SHA256SUMS`.
+
+The candidate's updater payloads carry Tauri update signatures, but its macOS
+package is not Apple Developer ID signed/notarized and its Windows package is
+not Authenticode signed. Those are different trust systems. Verify the
+download against the exact release's `SHA256SUMS` before bypassing an operating
+system warning; never bypass a warning for an unverified or unexpected file.
 
 ## macOS - "ARC Node cannot be opened because the developer cannot be verified"
 
@@ -16,7 +22,8 @@ Pick one of these, top-recommended first.
 
 ### Option 2 - Terminal (one command)
 If the right-click path doesn't give you an Open button on your macOS
-version, strip the quarantine flag:
+version, first verify the downloaded DMG against `SHA256SUMS`, then strip the
+quarantine flag from the installed app:
 ```
 xattr -cr /Applications/ARC\ Node.app
 ```
@@ -28,25 +35,32 @@ xattr -cr /Applications/ARC\ Node.app
 
 ## Linux - `.AppImage` / `.deb`
 
-No signing-related prompts. If the downloaded file isn't executable:
+No Apple/Windows signing prompt applies. Use the normalized v0.8.0 filename;
+if the downloaded AppImage is not executable:
 ```
-chmod +x arc-node-desktop.AppImage
+chmod +x arc-desktop-linux-x86_64.AppImage
 ```
 
 ## What the app does on first launch
 
-1. **Downloads** the `arc-node` binary (~45 MB) from
-   [github.com/FerrumVir/arc-chain/releases](https://github.com/FerrumVir/arc-chain/releases).
+1. **Resolves** the `arc-node` binary from the exact release matching the
+   desktop version and platform, verifies its `SHA256SUMS` entry and reported
+   version, and fails closed instead of running a stale mismatched node.
 2. **Generates** a fresh BIP-39 12-word recovery phrase and derives your
    on-chain address from it. The phrase is shown on the Identity step of
    onboarding - **save it somewhere safe**.
 3. **Starts** arc-node, pointed at the 6 testnet seeds bundled with the
-   app, using your recovery phrase as the validator seed so your node's
-   address matches the one you just saw.
-4. **Registers as a community worker** (if you picked the Worker role)
-   so your compute contributes to the network.
-5. **Claims testnet faucet tokens** after your first heartbeat - you get
-   testnet ARC for trying the network out.
+   app, using an app-owned private Ed25519 keyfile derived once from your
+   recovery phrase. The keyfile preserves the address you just saw; the app
+   never places the phrase or secret key in node arguments, environment, or
+   logs and reuses the same protected keyfile across restarts.
+4. **Attempts community-worker registration** (if you picked the Worker role).
+   Registration alone does not prove that the worker is eligible, reachable,
+   receiving jobs, or earning rewards; those states must be visible in the app.
+5. **Submits** a testnet faucet request when onboarding reaches that step. A
+   submission is not a balance credit; only a successful mined receipt on the
+   selected chain confirms it. The current public fleet is divergent, and the
+   checked-in observer genesis does not produce blocks.
 
 ## What to do if onboarding fails
 
@@ -65,8 +79,22 @@ and paste the log output from the `Logs` screen.
 ## Where your data lives
 
 - macOS: `~/Library/Application Support/network.arc.desktop/store.json`
-  (identity + config) and `~/.arc/` (arc-node WAL + state)
-- Linux: `~/.local/share/network.arc.desktop/` and `~/.arc/`
-- Windows: `%APPDATA%\network.arc.desktop\` and `%USERPROFILE%\.arc\`
+  (identity + config) and `~/.arc/data-v3/` (current arc-node WAL + state)
+- Linux: `~/.local/share/network.arc.desktop/` and `~/.arc/data-v3/`
+- Windows: `%APPDATA%\network.arc.desktop\` and
+  `%USERPROFILE%\.arc\data-v3\`
 
-Delete either directory to start fresh.
+Before the first v0.8 launch, fully quit the v0.7 desktop/node and its updater;
+also stop any separately launched v0.7 `arc-node`. The v0.8
+`.arc-node.lock` is a same-generation guard, and released v0.7 binaries do not
+acquire it. A fresh path prevents WAL reuse but does not make overlapping old
+and new processes safe.
+
+When v0.8 first opens a v0.7 store that points at an unbound WAL in `~/.arc`,
+it leaves those old block/WAL bytes untouched, preserves identity and model
+selection, switches only the persisted data-directory pointer to a fresh
+`~/.arc/data-v3*` child, and shows both paths in a dismissible migration notice.
+
+Deleting the app-data directory removes the locally stored recovery phrase.
+Deleting the ARC data directory removes local chain state. Back up the phrase
+offline and stop the node before deleting either directory.

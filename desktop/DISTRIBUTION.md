@@ -1,4 +1,12 @@
-# ARC - pre-distribution checklist
+# ARC - pre-distribution checklist (archived Android planning snapshot)
+
+> **Historical planning document, not a v0.8.0 ship checklist.** Its APK scope,
+> test counts, remaining-work claims, timelines, and “current” labels were
+> written during an earlier mobile experiment. The v0.8.0 release contract is
+> desktop plus headless/server, remains unpublished and undeployed, and is
+> documented in [`../README.md`](../README.md),
+> [`README.md`](README.md), and
+> [`../docs/VALIDATOR-FLEET-ROLLOUT.md`](../docs/VALIDATOR-FLEET-ROLLOUT.md).
 
 **Target: 10,000 users. Zero silent failures.**
 
@@ -13,8 +21,10 @@ Read every line. Ship only when every **❌** becomes a **✅**.
 ## ✅ Done in this pass
 
 - Real BIP-39 + chain-compatible key derivation (`src-tauri/src/identity.rs`).
-  Seed phrase restores to the same address that `arc-node --validator-seed`
-  produces. 6 Rust unit tests enforce determinism.
+  The phrase remains in the owner-validated private native store for recovery;
+  its derived Ed25519 key is atomically materialized as an app-owned private
+  keyfile, preserving the historical node/wallet address without putting the
+  phrase or key bytes in process arguments or environment variables.
 - Android APK builds via `npx tauri android build --debug --target aarch64`.
   Output: `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`
   + `.aab` for Play Store. Includes `libarc_desktop_lib.so` for arm64-v8a.

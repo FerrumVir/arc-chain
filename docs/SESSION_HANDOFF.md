@@ -1,4 +1,13 @@
-# Session Handoff — Tier 1 On-Chain Inference
+# Session Handoff — Tier 1 On-Chain Inference (archived 2026-05-16)
+
+> **Historical implementation handoff, not current rollout state or operator
+> instructions.** The versions, endpoint plan, fleet membership, test counts,
+> and “done” labels below describe a May development branch. The public fleet
+> was later confirmed forked/version-skewed, and v0.8.0 remains an unreleased,
+> undeployed recovery candidate. Use
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
+> and [`VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) for the current
+> evidence and cutover contract.
 
 **Last session:** 2026-05-16 (Windows machine, branch `fix/inference-timeout-and-connect-ux`)
 **Next session:** continue on MacBook — clone fork, read this doc, resume.
@@ -87,41 +96,32 @@ Until Phase B coordinated upgrade lands, Tier 1 mode in the desktop will only wo
 ### Prerequisites on Mac
 
 - Xcode Command Line Tools (`xcode-select --install`)
-- Rust via rustup (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- Node.js 20+ via nvm or fnm
+- The repository-pinned Rust toolchain, preinstalled through a reviewed package
+  or toolchain process (never a network-to-shell bootstrap)
+- Node.js 24 LTS via nvm or fnm
 - Tauri prerequisites (`brew install pkg-config`)
 
 ### Setup
 
-```bash
-# 1. Clone your fork
-git clone https://github.com/arisarcmarket/arc-chain.git
-cd arc-chain
-git checkout fix/inference-timeout-and-connect-ux
+**Retired setup.** This handoff recorded a branch name but no exact source
+commit, dependency lock evidence, or release artifact checksum. Re-cloning and
+building that moving branch is therefore intentionally unsupported. Start from
+an existing reviewed local checkout at an exact commit and follow the current
+repository documentation; do not use this archived handoff as a build recipe.
+Likewise, do not acquire a model from this handoff. The reviewed Llama-2
+reference used by the current documentation is content-bound to Hugging Face
+revision `191239b3e26b2882fb562ffccdd1cf0f65402adb`, exact size 4,081,004,224
+bytes, and SHA-256
+`08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa`;
+follow [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) for the HTTPS-only download
+and verification procedure instead of reconstructing one here.
 
-# 2. Build arc-node with Tier 1 + candle
-cargo build -p arc-node --features candle
-# MSVC toolchain pin in desktop/src-tauri/rust-toolchain.toml is Windows-specific.
-# On Mac it falls back to the default toolchain (stable-aarch64-apple-darwin
-# or stable-x86_64-apple-darwin). Should compile clean.
-
-# 3. Copy binary to canonical path
-mkdir -p ~/.arc/bin ~/.arc/models
-cp target/debug/arc-node ~/.arc/bin/arc-node
-~/.arc/bin/arc-node --version   # should print: arc-node 0.7.1
-
-# 4. Download TinyLlama model
-curl -L \
-  "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" \
-  -o ~/.arc/models/tiny.gguf
-
-# 5. Install desktop deps + start Tauri dev
-cd desktop
-npm install
-npm run tauri:dev
-```
-
-Once Tauri opens, onboarding flows from step 1 (no existing state to load). Generate a fresh identity, save the seed phrase securely, complete onboarding, click Start node in Dashboard, wait for model load.
+Once Tauri opens, onboarding flows from step 1 (no existing state to load).
+Generate a fresh identity, record the recovery phrase in a protected offline
+backup, complete onboarding, click Start node in Dashboard, and wait for model
+load. The native app retains a private local recovery copy and provisions the
+node with a persistent Ed25519 keyfile; it never sends the phrase through node
+arguments or environment.
 
 ### Resume the conversation with Claude
 
@@ -136,9 +136,10 @@ If using Claude Code on MacBook:
 The script + genesis file from the prior session were wiped. To recreate:
 
 ```bash
-# Generate the local genesis (replace the seed with your actual BIP39 phrase)
-SEED="<your 12-word BIP39 phrase>"
-ADDRESS="$(echo -n "$SEED" | <derive address>)"  # see desktop/src-tauri/src/identity.rs:38-55
+# Generate a persistent local-only validator identity once.
+KEY_FILE="$HOME/.arc/identity/local-tier1-validator.json"
+test -f "$KEY_FILE" || ~/.arc/bin/arc-cli keygen --scheme ed25519 --output "$KEY_FILE"
+ADDRESS="$(~/.arc/bin/arc-cli keygen --verify-keyfile "$KEY_FILE")"
 cat > ~/.arc/genesis-local.toml <<EOF
 [chain]
 name = "arc-local-tier1"
@@ -149,7 +150,7 @@ address = "$ADDRESS"
 balance = 1_000_000_000
 
 [[validators]]
-seed = "$SEED"
+address = "$ADDRESS"
 stake = 5_000_000
 EOF
 
@@ -160,7 +161,7 @@ EOF
   --data-dir ~/.arc/data-local \
   --model ~/.arc/models/tiny.gguf \
   --genesis ~/.arc/genesis-local.toml \
-  --validator-seed "$SEED" \
+  --validator-key-file "$KEY_FILE" \
   --eth-rpc-port 0
 ```
 

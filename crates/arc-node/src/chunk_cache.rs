@@ -131,10 +131,7 @@ impl ChunkCache {
         // Evict until we have room for `bytes.len()`.
         let needed = bytes.len() as u64;
         if needed > self.cap_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "chunk larger than cap",
-            ));
+            return Err(io::Error::other("chunk larger than cap"));
         }
         while self.total_bytes()? + needed > self.cap_bytes {
             if !self.evict_one()? {
@@ -203,8 +200,7 @@ impl ChunkCache {
         let index = IndexFile {
             entries: self.last_served.clone(),
         };
-        let bytes = serde_json::to_vec(&index)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = serde_json::to_vec(&index).map_err(io::Error::other)?;
         fs::write(self.cache_dir.join("_index.json"), bytes)
     }
 
@@ -218,9 +214,7 @@ impl ChunkCache {
 }
 
 fn is_hex_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() % 2 == 0
-        && name.chars().all(|c| c.is_ascii_hexdigit())
+    !name.is_empty() && name.len().is_multiple_of(2) && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -263,7 +257,10 @@ mod tests {
         cache.put("bb", &[0u8; 10]).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         cache.put("cc", &[0u8; 10]).unwrap();
-        assert!(cache.get("aa").is_none(), "oldest chunk 'aa' should have been evicted");
+        assert!(
+            cache.get("aa").is_none(),
+            "oldest chunk 'aa' should have been evicted"
+        );
         assert!(cache.get("bb").is_some());
         assert!(cache.get("cc").is_some());
         assert!(cache.total_bytes().unwrap() <= 20);

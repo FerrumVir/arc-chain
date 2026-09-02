@@ -2,37 +2,29 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ARC Chain - Sharded Inference Demo (one command)
 #
-# This is what to run after watching the dashboard. It hits the live
-# coordinator, walks through the demo, and prints colored output proving
-# every claim:
+# This inspects one explicitly selected coordinator and labels the evidence it
+# actually returns. It does not establish that the public fleet shares one
+# canonical chain.
 #
 #   1. Discover the shard pipeline from /shards
 #   2. Run a real sharded inference and show every per-hop trace entry
 #   3. Re-run the same prompt and verify the hash is identical (determinism)
 #   4. Run a different prompt and verify the hash is different (isolation)
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
+# Usage from a reviewed checkout:
+#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
 #
 #   # Or against a different coordinator:
 #   ARC_COORDINATOR=http://your-node:9090 bash arc-demo.sh
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-# ── Pick a live coordinator by probing all seeds (override with ARC_COORDINATOR)
-# arc-pick-coordinator.sh ranks seeds by: full pipeline > healthy w/ peers > alive.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
-# When the script is curl'd into bash it won't be on disk. Fall back to
-# fetching the picker from GitHub main so the curl-pipe install still works.
-if [ ! -f "$PICK" ]; then
-    PICK=$(mktemp)
-    curl -fsSL "https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh" -o "$PICK" 2>/dev/null || true
+if [ -z "${ARC_COORDINATOR:-}" ]; then
+    printf 'ERROR: set ARC_COORDINATOR to a reviewed candidate or local test endpoint.\n' >&2
+    printf 'Automatic public-fleet discovery is disabled during production recovery.\n' >&2
+    exit 78
 fi
-if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
-    ARC_COORDINATOR=$(bash "$PICK" 2>/dev/null || echo "")
-fi
-COORDINATOR="${ARC_COORDINATOR:-http://136.244.109.1:9090}"
+COORDINATOR="$ARC_COORDINATOR"
 # 2026-04-27: the prior B prompt "The capital of France is" reliably
 # triggered a model-side collision with PROMPT_A on the testnet build -
 # both prompts produced identical output tokens for medium-length
@@ -61,8 +53,8 @@ cat <<BANNER
 ${BOLD}${MAGENTA}
   ╔════════════════════════════════════════════════════════════╗
   ║   ARC Chain - Sharded Inference Demo                       ║
-  ║   A real LLM running across 7 nodes in 7 cities            ║
-  ║   Cryptographically verifiable. Pure integer arithmetic.   ║
+  ║   Inspect one selected coordinator and its returned trace  ║
+  ║   Cache, recomputation, and commitment labels kept distinct║
   ╚════════════════════════════════════════════════════════════╝${RESET}
 BANNER
 
@@ -140,6 +132,8 @@ if [ -z "$RESP_A" ]; then
     exit 1
 fi
 
+printf "  completed in %ss\n" "$WALL_S"
+
 HASH_A=$(echo "$RESP_A" | python3 -c "import json,sys;print(json.load(sys.stdin).get('output_hash',''))" 2>/dev/null || echo "")
 
 ARC_RESP="$RESP_A" python3 <<'PYEOF'
@@ -155,31 +149,80 @@ print()
 print(f"  Per-hop trace:")
 print(f"    {'#':<3} {'node':<6} {'layers':<10} {'compute':<10} {'wall':<10} {'payload':<10} type")
 print(f"    {'-'*2:<3} {'-'*4:<6} {'-'*7:<10} {'-'*7:<10} {'-'*5:<10} {'-'*7:<10} {'-'*5}")
+any_payload = False
 for hop in d.get("shard_trace", []):
     h = hop.get("hop", 0)
     n = hop.get("node", "?")
     lay = hop.get("layers", "?")
     cm = f"{hop.get('compute_ms', 0)} ms"
     wm = f"{hop.get('wall_ms', 0)} ms"
-    pb = f"{hop.get('payload_bytes', 0) / 1024:.1f} KB"
+    raw_pb = hop.get("payload_bytes", 0) or 0
+    any_payload = any_payload or raw_pb > 0
+    pb = f"{raw_pb / 1024:.1f} KB" if raw_pb else "n/a"
     typ = "TOKEN" if hop.get("is_terminal") else "hidden"
     print(f"    {h:<3} {n:<6} {lay:<10} {cm:<10} {wm:<10} {pb:<10} {typ}")
+
+# Honesty notes about what this table does and does not cover.
+traced = sum(hop.get("wall_ms", 0) or 0 for hop in d.get("shard_trace", []))
+total = d.get("total_ms", 0) or 0
+if not any_payload:
+    print()
+    print("  note: per-hop payload reads 'n/a' because this coordinator reports")
+    print("        payload_bytes as 0 per hop. The total above is the real figure.")
+if total and traced and traced < total * 0.95:
+    pct = 100.0 * traced / total
+    print()
+    print(f"  note: the trace covers {pct:.0f}% of wall time ({traced} ms of {total} ms).")
+    print("        Hops are sampled during prefill only; the per-token decode loop")
+    print("        makes the same round trips again and is not represented here.")
 PYEOF
 
 # ── 3. Determinism check ────────────────────────────────────────────────────
 section "3. Determinism check"
 printf "  Re-running the SAME prompt - hash should be %sIDENTICAL%s\n\n" "$BOLD" "$RESET"
 
+# The coordinator caches by (model, prompt, max_tokens), so a naive re-POST is
+# answered out of that cache in microseconds and proves nothing about the
+# pipeline. Ask for a genuine recomputation. Coordinators that predate the flag
+# ignore unknown JSON fields, so this is safe to send everywhere - what we
+# actually got is read back off cache.hit, not assumed from the flag.
+build_body_forced() {
+    local prompt="$1" tokens="$2"
+    python3 -c 'import json,sys; print(json.dumps({"input": sys.argv[1], "max_tokens": int(sys.argv[2]), "force_recompute": True}))' "$prompt" "$tokens"
+}
+
 RESP_A2=$(curl -sf -m "$TIMEOUT" -X POST "${COORDINATOR}/inference/run_sharded" \
     -H 'Content-Type: application/json' \
-    -d "$(build_body "$PROMPT_A" "$MAX_TOKENS")" 2>/dev/null || echo "")
+    -d "$(build_body_forced "$PROMPT_A" "$MAX_TOKENS")" 2>/dev/null || echo "")
+if [ -z "$RESP_A2" ]; then
+    printf "  %sforce_recompute was rejected by this coordinator - retrying without it%s\n\n" "$DIM" "$RESET"
+    RESP_A2=$(curl -sf -m "$TIMEOUT" -X POST "${COORDINATOR}/inference/run_sharded" \
+        -H 'Content-Type: application/json' \
+        -d "$(build_body "$PROMPT_A" "$MAX_TOKENS")" 2>/dev/null || echo "")
+fi
 HASH_A2=$(echo "$RESP_A2" | python3 -c "import json,sys;print(json.load(sys.stdin).get('output_hash',''))" 2>/dev/null || echo "")
+CACHED_A2=$(echo "$RESP_A2" | python3 -c "
+import json,sys
+d=json.load(sys.stdin); c=d.get('cache') or {}
+print('yes' if c.get('hit') else 'no')
+" 2>/dev/null || echo "unknown")
+MS_A2=$(echo "$RESP_A2" | python3 -c "import json,sys;print(json.load(sys.stdin).get('total_ms',0))" 2>/dev/null || echo 0)
 
 printf "  Run 1 hash: %s%s%s\n" "$BLUE" "$HASH_A" "$RESET"
 printf "  Run 2 hash: %s%s%s\n" "$BLUE" "$HASH_A2" "$RESET"
+printf "  Run 2 took: %s ms   served from cache: %s\n" "${MS_A2:-0}" "$CACHED_A2"
+
 if [ "$HASH_A" = "$HASH_A2" ] && [ -n "$HASH_A" ]; then
-    printf "\n  %s%s✓ DETERMINISTIC%s - bit-identical hash on rerun.\n" "$BOLD" "$GREEN" "$RESET"
-    printf "  %sThis means the model output can be cryptographically verified.%s\n" "$DIM" "$RESET"
+    if [ "$CACHED_A2" = "no" ]; then
+        printf "\n  %s%s✓ DETERMINISTIC%s - the pipeline ran a second time and produced a\n" "$BOLD" "$GREEN" "$RESET"
+        printf "  bit-identical hash. Two independent walks, same 32 bytes.\n"
+    else
+        printf "\n  %s%s● SERVED FROM CACHE (hash match)%s\n" "$BOLD" "$YELLOW" "$RESET"
+        printf "  %sThis coordinator answered the second request out of its content-addressed\n" "$DIM"
+        printf "  cache instead of recomputing, so this is NOT a determinism result. It shows\n"
+        printf "  the cache is consistent. To get a real determinism check, run against a\n"
+        printf "  coordinator that honours force_recompute, or vary the prompt.%s\n" "$RESET"
+    fi
 else
     printf "\n  %s✗ Hashes diverged.%s\n" "$RED" "$RESET"
 fi
@@ -220,18 +263,15 @@ fi
 section "5. Summary"
 cat <<SUMMARY
 
-  You just ran a real Llama-2-7B inference across ${BOLD}7 separate machines${RESET}
-  in 7 different cities. Each machine held only ${BOLD}4 or 5 transformer layers${RESET}.
-  No single one of them has the full model in memory.
+  This run exercised ${BOLD}${COORDINATOR}${RESET} and displayed the shard trace and
+  commitments that endpoint returned. Those fields are useful evidence for
+  this response; by themselves they do not prove a canonical chain, exact
+  model bytes, independent recomputation, finality, or payment.
 
-  Every hop was BLAKE3-verified. The output is bit-identical regardless
-  of which node ran which slice. Pure i64 arithmetic - no floating point.
+  ${BOLD}Run from a reviewed checkout:${RESET}
+    ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
 
-  ${BOLD}Try it yourself:${RESET}
-    curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-
-  ${BOLD}Live dashboard:${RESET} http://140.82.16.112:3200
-  ${BOLD}5-minute walkthrough:${RESET} https://github.com/FerrumVir/arc-chain/blob/main/docs/SERO-DEMO.md
+  ${BOLD}Run-of-show:${RESET} https://github.com/FerrumVir/arc-chain/blob/main/docs/DEMO-RUNBOOK.md
   ${BOLD}Source:${RESET} https://github.com/FerrumVir/arc-chain
 
 SUMMARY

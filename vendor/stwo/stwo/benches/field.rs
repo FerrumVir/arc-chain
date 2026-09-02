@@ -145,6 +145,6 @@ pub fn simd_m31_operations_bench(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = m31_operations_bench, cm31_operations_bench, qm31_operations_bench, 
+    targets = m31_operations_bench, cm31_operations_bench, qm31_operations_bench,
         simd_m31_operations_bench);
 criterion_main!(benches);

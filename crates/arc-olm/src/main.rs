@@ -8,14 +8,20 @@
 //! and unused_imports (see `lib.rs`).
 #![allow(dead_code, unused_imports, unused_variables, clippy::never_loop)]
 
-use arc_olm::search::solver::{solve, SolverConfig};
-use std::path::Path;
+use arc_olm::search::solver::{SolverConfig, solve};
 use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Deserialize)]
-struct TaskPair { input: Vec<Vec<u8>>, output: Vec<Vec<u8>> }
+struct TaskPair {
+    input: Vec<Vec<u8>>,
+    output: Vec<Vec<u8>>,
+}
 #[derive(Deserialize)]
-struct TaskData { train: Vec<TaskPair>, test: Vec<TaskPair> }
+struct TaskData {
+    train: Vec<TaskPair>,
+    test: Vec<TaskPair>,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -34,17 +40,45 @@ fn main() {
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
-            "--max-tasks" => { max_tasks = args.get(i+1).and_then(|s| s.parse().ok()); i += 2; }
-            "--timeout-ms" => { config.timeout_ms = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(30_000); i += 2; }
-            "--beam-width" => { config.beam_width = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(200); i += 2; }
-            "--max-depth" => { config.max_depth = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(6); i += 2; }
-            "--no-aug" => { config.use_augmentation = false; i += 1; }
-            "--no-evo" => { config.use_evolution = false; i += 1; }
-            "--llm" => { config.use_llm = true; i += 1; }
-            "--verbose" | "-v" => { config.verbose = true; i += 1; }
+            "--max-tasks" => {
+                max_tasks = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+            }
+            "--timeout-ms" => {
+                config.timeout_ms = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(30_000);
+                i += 2;
+            }
+            "--beam-width" => {
+                config.beam_width = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(200);
+                i += 2;
+            }
+            "--max-depth" => {
+                config.max_depth = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);
+                i += 2;
+            }
+            "--no-aug" => {
+                config.use_augmentation = false;
+                i += 1;
+            }
+            "--no-evo" => {
+                config.use_evolution = false;
+                i += 1;
+            }
+            "--llm" => {
+                config.use_llm = true;
+                i += 1;
+            }
+            "--verbose" | "-v" => {
+                config.verbose = true;
+                i += 1;
+            }
             "--model" => {
-                if let Some(path) = args.get(i+1) {
-                    match arc_olm::search::steering::SteeringModel::load(std::path::Path::new(path)) {
+                if let Some(path) = args.get(i + 1) {
+                    match arc_olm::search::steering::SteeringModel::load(std::path::Path::new(path))
+                    {
                         Some(m) => {
                             config.steering_model = Some(std::sync::Arc::new(m));
                             eprintln!("Loaded steering model from {}", path);
@@ -54,14 +88,19 @@ fn main() {
                 }
                 i += 2;
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
 
     match command.as_str() {
         "eval" => run_eval(path, &config, max_tasks),
         "solve" => run_solve(path, &config),
-        _ => { eprintln!("Unknown command: {command}"); std::process::exit(1); }
+        _ => {
+            eprintln!("Unknown command: {command}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -70,10 +109,12 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
         .expect("Cannot read directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "json"))
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
     paths.sort();
-    if let Some(max) = max_tasks { paths.truncate(max); }
+    if let Some(max) = max_tasks {
+        paths.truncate(max);
+    }
 
     let total = paths.len();
     let mut solved = 0;
@@ -83,10 +124,12 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
     println!("ARC-OLM Multi-Engine Solver");
     println!("  Tasks: {}", total);
     println!("  Timeout: {}ms", config.timeout_ms);
-    println!("  Engines: synth + beam + aug({}) + evo({}) + llm({})",
+    println!(
+        "  Engines: synth + beam + aug({}) + evo({}) + llm({})",
         if config.use_augmentation { "on" } else { "off" },
         if config.use_evolution { "on" } else { "off" },
-        if config.use_llm { "on" } else { "off" });
+        if config.use_llm { "on" } else { "off" }
+    );
     println!();
 
     for (i, path) in paths.iter().enumerate() {
@@ -96,10 +139,17 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
             .and_then(|s| serde_json::from_str(&s).ok())
         {
             Some(d) => d,
-            None => { println!("[{:3}/{}] {}: SKIP (parse error)", i+1, total, task_id); continue; }
+            None => {
+                println!("[{:3}/{}] {}: SKIP (parse error)", i + 1, total, task_id);
+                continue;
+            }
         };
 
-        let train_pairs: Vec<_> = data.train.iter().map(|p| (p.input.clone(), p.output.clone())).collect();
+        let train_pairs: Vec<_> = data
+            .train
+            .iter()
+            .map(|p| (p.input.clone(), p.output.clone()))
+            .collect();
         let test_inputs: Vec<_> = data.test.iter().map(|p| p.input.clone()).collect();
 
         let start = std::time::Instant::now();
@@ -115,19 +165,41 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
                 if correct {
                     solved += 1;
                     *engines.entry(r.engine).or_insert(0) += 1;
-                    println!("[{:3}/{}] {}: OK  ({}, {}ms)", i+1, total, task_id, r.engine, elapsed);
+                    println!(
+                        "[{:3}/{}] {}: OK  ({}, {}ms)",
+                        i + 1,
+                        total,
+                        task_id,
+                        r.engine,
+                        elapsed
+                    );
                 } else {
-                    println!("[{:3}/{}] {}: WRONG ({}, {}ms)", i+1, total, task_id, r.engine, elapsed);
+                    println!(
+                        "[{:3}/{}] {}: WRONG ({}, {}ms)",
+                        i + 1,
+                        total,
+                        task_id,
+                        r.engine,
+                        elapsed
+                    );
                 }
             }
             None => {
-                println!("[{:3}/{}] {}: --  ({}ms)", i+1, total, task_id, elapsed);
+                println!("[{:3}/{}] {}: --  ({}ms)", i + 1, total, task_id, elapsed);
             }
         }
     }
 
-    let accuracy = if total > 0 { solved as f64 / total as f64 * 100.0 } else { 0.0 };
-    let avg_ms = if total > 0 { total_ms / total as u64 } else { 0 };
+    let accuracy = if total > 0 {
+        solved as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let avg_ms = if total > 0 {
+        total_ms / total as u64
+    } else {
+        0
+    };
 
     println!();
     println!("═══════════════════════════════════════");
@@ -141,11 +213,15 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
 }
 
 fn run_solve(path: &str, config: &SolverConfig) {
-    let data: TaskData = serde_json::from_str(
-        &std::fs::read_to_string(path).expect("Cannot read file")
-    ).expect("Cannot parse JSON");
+    let data: TaskData =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("Cannot read file"))
+            .expect("Cannot parse JSON");
 
-    let train_pairs: Vec<_> = data.train.iter().map(|p| (p.input.clone(), p.output.clone())).collect();
+    let train_pairs: Vec<_> = data
+        .train
+        .iter()
+        .map(|p| (p.input.clone(), p.output.clone()))
+        .collect();
     let test_inputs: Vec<_> = data.test.iter().map(|p| p.input.clone()).collect();
 
     match solve(&train_pairs, &test_inputs, config) {
@@ -154,7 +230,9 @@ fn run_solve(path: &str, config: &SolverConfig) {
             println!("Program: {:?}", r.program);
             for (i, output) in r.test_outputs.iter().enumerate() {
                 println!("Test output {}:", i);
-                for row in output { println!("  {:?}", row); }
+                for row in output {
+                    println!("  {:?}", row);
+                }
             }
         }
         None => println!("UNSOLVED"),

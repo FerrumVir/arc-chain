@@ -209,10 +209,7 @@ impl PriceOracle {
         // Weighted average by confidence
         let total_confidence: f64 = feeds.iter().map(|f| f.confidence).sum();
         let weighted_price = if total_confidence > 0.0 {
-            let sum: f64 = feeds
-                .iter()
-                .map(|f| f.price as f64 * f.confidence)
-                .sum();
+            let sum: f64 = feeds.iter().map(|f| f.price as f64 * f.confidence).sum();
             (sum / total_confidence) as u64
         } else {
             // Simple average as fallback
@@ -238,11 +235,7 @@ impl PriceOracle {
     /// Uses the circular buffer of historical price entries.
     /// The window_secs parameter specifies how far back from the latest
     /// entry to include.
-    pub fn get_twap(
-        &self,
-        pair: &TradingPair,
-        window_secs: u64,
-    ) -> Result<u64, OracleError> {
+    pub fn get_twap(&self, pair: &TradingPair, window_secs: u64) -> Result<u64, OracleError> {
         let key = pair.key();
         let state = self.pairs.get(&key).ok_or(OracleError::PairNotFound)?;
 
@@ -251,11 +244,7 @@ impl PriceOracle {
         }
 
         let latest_ts = state.twap_buffer.last().unwrap().timestamp;
-        let cutoff = if latest_ts >= window_secs {
-            latest_ts - window_secs
-        } else {
-            0
-        };
+        let cutoff = latest_ts.saturating_sub(window_secs);
 
         // Filter entries within the window
         let entries: Vec<&TwapEntry> = state
@@ -349,12 +338,18 @@ mod tests {
     #[test]
     fn test_update_and_get_price_single_source() {
         let mut oracle = PriceOracle::new(default_config());
+        // 5_000_000_000_000 == 50,000.00000000 at the feed's 8 decimals.
         oracle
-            .update_price(feed(btc_usd(), 50_000_0000_0000, PriceSource::Chainlink, 1000))
+            .update_price(feed(
+                btc_usd(),
+                5_000_000_000_000,
+                PriceSource::Chainlink,
+                1000,
+            ))
             .unwrap();
 
         let agg = oracle.get_price(&btc_usd()).unwrap();
-        assert_eq!(agg.price, 50_000_0000_0000);
+        assert_eq!(agg.price, 5_000_000_000_000);
         assert_eq!(agg.sources, 1);
         assert_eq!(agg.decimals, 8);
     }
@@ -454,10 +449,10 @@ mod tests {
             .update_price(feed(btc_usd(), 50_000, PriceSource::Chainlink, 1000))
             .unwrap();
 
-        assert!(!oracle.is_stale(&btc_usd(), 1100));  // 100s < 300s
-        assert!(!oracle.is_stale(&btc_usd(), 1300));  // 300s == 300s
-        assert!(oracle.is_stale(&btc_usd(), 1301));   // 301s > 300s
-        assert!(oracle.is_stale(&eth_usd(), 1000));   // not registered
+        assert!(!oracle.is_stale(&btc_usd(), 1100)); // 100s < 300s
+        assert!(!oracle.is_stale(&btc_usd(), 1300)); // 300s == 300s
+        assert!(oracle.is_stale(&btc_usd(), 1301)); // 301s > 300s
+        assert!(oracle.is_stale(&eth_usd(), 1000)); // not registered
     }
 
     #[test]
@@ -477,22 +472,30 @@ mod tests {
         let mut oracle = PriceOracle::new(default_config());
 
         // Feed prices at different timestamps
-        oracle.update_price(feed(btc_usd(), 100, PriceSource::Chainlink, 1000)).unwrap();
-        oracle.update_price(feed(btc_usd(), 200, PriceSource::Pyth, 1010)).unwrap();
-        oracle.update_price(feed(btc_usd(), 150, PriceSource::InternalDex, 1020)).unwrap();
+        oracle
+            .update_price(feed(btc_usd(), 100, PriceSource::Chainlink, 1000))
+            .unwrap();
+        oracle
+            .update_price(feed(btc_usd(), 200, PriceSource::Pyth, 1010))
+            .unwrap();
+        oracle
+            .update_price(feed(btc_usd(), 150, PriceSource::InternalDex, 1020))
+            .unwrap();
 
         let twap = oracle.get_twap(&btc_usd(), 100).unwrap();
         // Entries: (100, 1000), (200, 1010), (150, 1020)
         // Weights: 100*10=1000, 200*10=2000, 150*10=1500
         // Total weight: 30, sum: 4500 => 150
         assert!(twap > 0);
-        assert!(twap >= 100 && twap <= 200);
+        assert!((100..=200).contains(&twap));
     }
 
     #[test]
     fn test_twap_single_entry() {
         let mut oracle = PriceOracle::new(default_config());
-        oracle.update_price(feed(btc_usd(), 42_000, PriceSource::Chainlink, 1000)).unwrap();
+        oracle
+            .update_price(feed(btc_usd(), 42_000, PriceSource::Chainlink, 1000))
+            .unwrap();
 
         let twap = oracle.get_twap(&btc_usd(), 100).unwrap();
         assert_eq!(twap, 42_000);

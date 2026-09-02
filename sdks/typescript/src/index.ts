@@ -36,6 +36,7 @@ export {
 
 export type {
   // Transaction types
+  U64,
   TxType,
   TxBody,
   TransferBody,
@@ -45,6 +46,9 @@ export type {
   SettleBody,
   Ed25519Signature,
   Transaction,
+  TransferTransaction,
+  SignedTransferTransaction,
+  SignedTransferSubmitPayload,
 
   // Chain types
   Account,

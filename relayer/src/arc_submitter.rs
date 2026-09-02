@@ -9,10 +9,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use arc_types::bridge::{
-    BridgeProof, BridgeRelayMessage, BridgeTransfer, ChainId,
-    EvmAddress,
-};
+use arc_types::bridge::{BridgeProof, BridgeRelayMessage, BridgeTransfer, ChainId, EvmAddress};
 
 use crate::config::RelayerConfig;
 use crate::eth_watcher::LockEvent;
@@ -55,7 +52,9 @@ impl ArcSubmitter {
     /// Create a new ArcSubmitter from the relayer configuration.
     pub fn new(config: &RelayerConfig) -> Result<Self> {
         let key_bytes = hex::decode(
-            config.relayer_private_key.strip_prefix("0x")
+            config
+                .relayer_private_key
+                .strip_prefix("0x")
                 .unwrap_or(&config.relayer_private_key),
         )
         .context("invalid relayer_private_key hex")?;
@@ -88,6 +87,11 @@ impl ArcSubmitter {
     }
 
     /// Set the last scanned ARC Chain block height (e.g. from the database).
+    // Nothing calls this yet, for the same reason as
+    // `EthWatcher::set_last_scanned_block`: there is no persistence layer to
+    // load a saved height from. Kept so the resume path stays available once
+    // one exists; removing it would just make that fix harder to land.
+    #[allow(dead_code)]
     pub fn set_last_scanned_height(&mut self, height: u64) {
         self.last_scanned_height = height;
     }
@@ -98,8 +102,7 @@ impl ArcSubmitter {
     /// placeholder, signs the relay message, and posts it to the ARC Chain RPC.
     pub async fn submit_bridge_mint(&self, lock: &LockEvent) -> Result<[u8; 32]> {
         // Parse the ARC token address.
-        let token_bytes = hex::decode(ARC_TOKEN_ADDRESS)
-            .context("invalid ARC_TOKEN_ADDRESS")?;
+        let token_bytes = hex::decode(ARC_TOKEN_ADDRESS).context("invalid ARC_TOKEN_ADDRESS")?;
         let mut token_address: EvmAddress = [0u8; 20];
         token_address.copy_from_slice(&token_bytes);
 
@@ -141,7 +144,8 @@ impl ArcSubmitter {
             "id": 1
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(&self.arc_rpc_url)
             .json(&body)
             .send()
@@ -181,7 +185,10 @@ impl ArcSubmitter {
         let from_height = self.last_scanned_height + 1;
         let to_height = current_height;
 
-        info!(from_height, to_height, "scanning ARC Chain for BridgeLock TXs");
+        info!(
+            from_height,
+            to_height, "scanning ARC Chain for BridgeLock TXs"
+        );
 
         let events = self.get_bridge_locks(from_height, to_height).await?;
 
@@ -199,7 +206,8 @@ impl ArcSubmitter {
             "id": 1
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(&self.arc_rpc_url)
             .json(&body)
             .send()
@@ -233,7 +241,8 @@ impl ArcSubmitter {
             "id": 1
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(&self.arc_rpc_url)
             .json(&body)
             .send()
@@ -265,9 +274,7 @@ impl ArcSubmitter {
 
     /// Parse a BridgeLock transaction from the ARC Chain RPC response.
     fn parse_bridge_lock_tx(&self, tx: &serde_json::Value) -> Result<BridgeLockEvent> {
-        let sender_hex = tx["sender"]
-            .as_str()
-            .context("missing sender")?;
+        let sender_hex = tx["sender"].as_str().context("missing sender")?;
         let sender = parse_evm_address(sender_hex)?;
 
         let recipient_hex = tx["eth_recipient"]
@@ -278,14 +285,10 @@ impl ArcSubmitter {
         let amount = tx["amount"]
             .as_u64()
             .map(|v| v as u128)
-            .or_else(|| {
-                tx["amount"].as_str().and_then(|s| s.parse::<u128>().ok())
-            })
+            .or_else(|| tx["amount"].as_str().and_then(|s| s.parse::<u128>().ok()))
             .context("missing or invalid amount")?;
 
-        let nonce = tx["nonce"]
-            .as_u64()
-            .context("missing nonce")?;
+        let nonce = tx["nonce"].as_u64().context("missing nonce")?;
 
         let block_height = tx["block_height"]
             .as_u64()
@@ -294,9 +297,7 @@ impl ArcSubmitter {
         let tx_hash_hex = tx["hash"]
             .as_str()
             .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
-        let hash_bytes = hex::decode(
-            tx_hash_hex.strip_prefix("0x").unwrap_or(tx_hash_hex),
-        )?;
+        let hash_bytes = hex::decode(tx_hash_hex.strip_prefix("0x").unwrap_or(tx_hash_hex))?;
         let mut tx_hash = [0u8; 32];
         if hash_bytes.len() == 32 {
             tx_hash.copy_from_slice(&hash_bytes);
@@ -361,8 +362,7 @@ impl ArcSubmitter {
 
     /// Encode a BridgeRelayMessage into the binary payload for a BridgeMint TX.
     fn encode_bridge_mint_tx(&self, msg: &BridgeRelayMessage) -> Result<Vec<u8>> {
-        let payload = serde_json::to_vec(msg)
-            .context("failed to serialize BridgeRelayMessage")?;
+        let payload = serde_json::to_vec(msg).context("failed to serialize BridgeRelayMessage")?;
         Ok(payload)
     }
 
@@ -451,7 +451,8 @@ impl ArcSubmitter {
             "id": 1
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(eth_rpc_url)
             .json(&body)
             .send()
@@ -469,9 +470,7 @@ impl ArcSubmitter {
             .as_str()
             .context("missing tx hash in unlock response")?;
 
-        let hash_bytes = hex::decode(
-            tx_hash_hex.strip_prefix("0x").unwrap_or(tx_hash_hex),
-        )?;
+        let hash_bytes = hex::decode(tx_hash_hex.strip_prefix("0x").unwrap_or(tx_hash_hex))?;
         let mut tx_hash = [0u8; 32];
         if hash_bytes.len() == 32 {
             tx_hash.copy_from_slice(&hash_bytes);

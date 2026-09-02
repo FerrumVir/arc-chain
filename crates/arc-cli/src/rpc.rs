@@ -1,6 +1,6 @@
 //! HTTP client wrapper for the ARC Chain RPC node.
 
-use anyhow::{Result, Context, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde_json::Value;
 
@@ -22,7 +22,23 @@ impl RpcClient {
     /// `GET /info` - chain metadata (version, height, account count, mempool size).
     pub async fn get_info(&self) -> Result<Value> {
         let url = format!("{}/info", self.base_url);
-        let resp = self.client.get(&url).send().await
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to connect to {}", url))?;
+        self.handle_response(resp).await
+    }
+
+    /// `GET /health` - machine-validated node readiness status.
+    pub async fn get_health(&self) -> Result<Value> {
+        let url = format!("{}/health", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("failed to connect to {}", url))?;
         self.handle_response(resp).await
     }
@@ -30,7 +46,11 @@ impl RpcClient {
     /// `GET /account/{addr}` - account balance and nonce.
     pub async fn get_account(&self, addr: &str) -> Result<Value> {
         let url = format!("{}/account/{}", self.base_url, addr);
-        let resp = self.client.get(&url).send().await
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("failed to connect to {}", url))?;
         self.handle_response(resp).await
     }
@@ -38,7 +58,11 @@ impl RpcClient {
     /// `GET /block/{height}` - block header and transaction list.
     pub async fn get_block(&self, height: u64) -> Result<Value> {
         let url = format!("{}/block/{}", self.base_url, height);
-        let resp = self.client.get(&url).send().await
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("failed to connect to {}", url))?;
         self.handle_response(resp).await
     }
@@ -46,7 +70,11 @@ impl RpcClient {
     /// `GET /tx/{hash}/full` - full transaction with receipt.
     pub async fn get_tx(&self, hash: &str) -> Result<Value> {
         let url = format!("{}/tx/{}/full", self.base_url, hash);
-        let resp = self.client.get(&url).send().await
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .with_context(|| format!("failed to connect to {}", url))?;
         self.handle_response(resp).await
     }
@@ -54,7 +82,12 @@ impl RpcClient {
     /// `POST /tx/submit` - submit a transaction (JSON body).
     pub async fn submit_tx(&self, tx_json: Value) -> Result<Value> {
         let url = format!("{}/tx/submit", self.base_url);
-        let resp = self.client.post(&url).json(&tx_json).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&tx_json)
+            .send()
+            .await
             .with_context(|| format!("failed to connect to {}", url))?;
         self.handle_response(resp).await
     }
@@ -63,7 +96,12 @@ impl RpcClient {
     pub async fn claim_faucet(&self, faucet_url: &str, addr: &str) -> Result<Value> {
         let url = format!("{}/claim", faucet_url.trim_end_matches('/'));
         let body = serde_json::json!({ "address": addr });
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .with_context(|| format!("failed to connect to faucet at {}", url))?;
         self.handle_response(resp).await
     }
@@ -71,14 +109,17 @@ impl RpcClient {
     /// Process an HTTP response: check status, parse JSON body.
     async fn handle_response(&self, resp: reqwest::Response) -> Result<Value> {
         let status = resp.status();
-        let body = resp.text().await
-            .context("failed to read response body")?;
+        let body = resp.text().await.context("failed to read response body")?;
 
         if !status.is_success() {
             bail!("RPC error (HTTP {}): {}", status.as_u16(), body);
         }
 
-        serde_json::from_str(&body)
-            .with_context(|| format!("failed to parse JSON response: {}", &body[..body.len().min(200)]))
+        serde_json::from_str(&body).with_context(|| {
+            format!(
+                "failed to parse JSON response: {}",
+                &body[..body.len().min(200)]
+            )
+        })
     }
 }

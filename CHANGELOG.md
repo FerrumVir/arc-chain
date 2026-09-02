@@ -3,6 +3,245 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+> **Backfill note (2026-08-17).** Entries for v0.7.1 through v0.7.11 were
+> reconstructed from `git log` in a single pass; this file had stopped at
+> v0.7.0. They are terser than the hand-written entries below.
+>
+> **Release-topology caveat.** The version on the seeds, the version with a
+> git tag, and the version with a downloadable binary are three different
+> things right now:
+> - **v0.7.10 and v0.7.11** were shipped **desktop-only** via
+>   `release-desktop.yml`, so they carry Tauri bundles and **no `arc-node` CLI
+>   asset**. v0.7.7 is the newest release with a CLI binary.
+> - **v0.7.8 and v0.7.9 have no release and no tag.** The five non-NYC seeds
+>   run a binary built out-of-band from branch `fix/v078-attestation-wire-compat`,
+>   which was merged to main only on 2026-06-16 (f6bee03).
+> - **Nothing on the live network runs v0.7.11.**
+
+## v0.8.0 - Release-preparation snapshot (2026-08-31)
+
+> **Tag-stable lifecycle note:** At this review cutoff, v0.8.0 was an
+> unreleased recovery candidate and was not deployed or published. An
+> immutable v0.8.0 tag intentionally retains that historical fact. Determine
+> current publication and fleet status from the exact immutable release API
+> evidence and the signed coordinated-rollout receipts, not from this changelog
+> snapshot.
+
+- Restores one checksummed release graph for headless Linux amd64/arm64,
+  Intel/Apple-Silicon macOS, Windows CLI, and signed desktop bundles. The
+  installer resolves one exact version, works without a display, and refuses
+  downgrade or unverified replacement. Workspace, Tauri, desktop npm, and lock
+  metadata are all pinned to v0.8.0 before a matching tag can publish.
+- Splits unsigned builds, updater-payload signing, release-manifest signing,
+  draft publication, and read-only server verification across exact-ID,
+  digest-bound handoffs. Fresh protected signers run no repository program and
+  expose keys only to per-boundary absolute executable allowlists; the Node
+  signer runtime is exact-patch and byte bound. Publication never deletes a
+  release after its publish PATCH is attempted and boundedly polls GitHub's
+  eventually consistent immutable state before sealing evidence.
+- Adds the typed `arc health` command and makes the installer use it for
+  readiness, accepting only explicit JSON `ok` or `degraded` states. Install
+  and upgrade now share a complete rollback transaction across binaries,
+  configuration, identity, service definitions, and prior service state.
+- Adds a blocking release/security harness: Rust format/check/Clippy/test
+  coverage, GUI-free node boot gates for Linux x86_64 on Ubuntu
+  22.04/24.04/26.04 and ARM64 on Ubuntu 24.04/26.04, deterministic desktop E2E,
+  Tauri tests on every released desktop architecture, SDK packed-consumer
+  tests, workflow/ShellCheck contracts, and staged plus working-copy secret
+  scans.
+- Replaces same-host determinism claims with hardcoded production-engine KATs
+  covering CPU I8/I16, 1-versus-4 threads, whole-versus-three-way sharding,
+  logits/KV/hidden-state hashes, and autoregressive output across ARM and x86.
+- Makes sequential and BlockSTM execution use the same canonical ordering and
+  state semantics; consensus timestamps and DAG attachments are verified and
+  peer hints can no longer mutate authoritative state.
+- Binds every persistent database to its authenticated genesis network hash,
+  rejects unmarked legacy WAL reuse, requires production validators to exist
+  in the canonical genesis accounts, binds native RPC to loopback by default,
+  and leaves Ethereum RPC disabled unless an operator explicitly enables it.
+- Replaces the abandoned bincode 1.x implementation with a bounded internal
+  v1-wire-compatible facade, and narrowly patches Wasmer's derive crate to
+  remove `proc-macro-error2` while preserving upstream provenance and valid
+  generated code. Remaining upstream advisories stay blocking in the release
+  gate; none are ignored.
+- Introduces authenticated v3 community registration/heartbeat/claim/submit,
+  exact model-ID routing, one-job worker capacity, bounded payloads/timeouts,
+  independent 2-of-3 range verification, and five-of-six active-validator,
+  replay-protected 2.5 ARC reward transactions. Stable policy, approval, job,
+  receipt, and earnings endpoints bind evidence to the recovery epoch,
+  validator set, transaction domain, exact model/input/output, and mined
+  `0x25` receipt. Pending or rejected rewards are never reported as earned;
+  projections fail closed unless policy, receipt history, and treasury support
+  them. Stake-zero worker eligibility is explicit policy, not an installer
+  promise.
+- Separates RPC from P2P discovery and configures all six reviewed literal-IPv4
+  HTTPS origins explicitly. The locked SHA-pinned Caddy 2.11.4 gateway requests
+  publicly trusted Let's Encrypt IP certificates with the `shortlived` profile
+  over HTTP-01, removing the shared `nip.io`/`sslip.io` wildcard-DNS dependency.
+  Remote plaintext, credentials, URL paths, query strings, fragments, wildcard
+  listeners, and port zero are rejected outside the deliberate local/dev escape
+  hatch.
+- Moves wallet transfer signing into Rust so the seed never crosses IPC,
+  parses and formats ARC with exactly nine decimal base-unit precision, and
+  treats sends and 1 ARC faucet claims as pending until the chain returns a
+  successful mined receipt.
+- Authenticates P2P session transcripts with TLS-exporter-bound Ed25519
+  identities, enforces pinned certificates in strict mode, caps frames and
+  decoders, and binds claimed identities to signed payloads.
+- Hardens validator identity and rollout: validator key files are mandatory,
+  legacy exposed keys are rejected, genesis/release contracts fail closed, and
+  the six-node v3 cutover is explicitly coordinated rather than auto-deployed.
+- Adds an archive-bound recovery transaction around that cutover: a sealed
+  freeze plan, two independently captured quarantine samples at least 120
+  seconds apart, per-node stopped-writer/listener evidence, content-indexed
+  legacy bundles, and separately verified Google Drive completion roots must
+  all cross-bind before validator mutation. Every divergent legacy lineage is
+  retained with an explicit canonical, non-canonical-fork, or unclassified
+  disposition; recovery never rewrites those forks into one invented history.
+- Adds a boundary/tool/source-set-bound late-fork interlock. All six recovered
+  gateways must publish a fresh healthy status. A coherent legacy observation
+  above the sealed public-height cutoff creates a persistent incident and
+  forces the dashboard and explorer back to maintenance; it never auto-clears
+  or promotes the observation into canonical history.
+- Adds one-shot validator-vault rewrap and restore/install tooling. The
+  passphrase-encrypted source vault is metadata-validated and re-encrypted to
+  an operator-supplied CMS certificate without publishing plaintext. Restore
+  is exact-main/pre-tag/profile bound, and remote key installation is
+  create-only over pinned SSH only after authenticated offline-stop evidence
+  v2 proves the legacy writers remain fenced.
+- Makes community reward activation an authenticated genesis schedule plus an
+  independent local issuance switch. An absent activation height disables tx
+  `0x25`, and the issuance flag cannot override that absence. The checked-in,
+  checkpoint-bound recovery genesis schedules activation at block `137146`;
+  rollout readiness and the independent local switch still keep issuance
+  fail-closed until the approved coordinated cutover.
+- Reworks dashboard and explorer rendering for safe DOM insertion, honest
+  liveness/retained-history semantics, coordinator-specific compatible worker
+  capacity, visible inference/quorum/settlement evidence, actual on-chain
+  balances, and a fail-closed six-replica maintenance interlock. Production
+  dashboard CSS is compiled locally instead of executing the Tailwind
+  development CDN.
+
+At the 2026-08-31 source freeze, this candidate was not deployed or published,
+and the public fleet remained split across old v0.7.2/v0.7.9 binaries. A valid
+current deployment claim requires operators to have rotated compromised keys,
+chosen a clean-genesis or checkpoint recovery policy, and completed the signed
+rollout gate.
+
+## v0.7.11 - 2026-06-15 (desktop-only)
+
+- Removed the On-chain Tier 1 radio and the tier1 mutation, polling, and
+  status panel from the desktop UI (`Inference.tsx` -348 lines,
+  `Settings.tsx` -55). The feature was withdrawn rather than fixed: a
+  caller-signed `InferenceRequest` is accepted with HTTP 200 by
+  `/inference/onchain/submit` but never lands in a block, so escrow never
+  opens and the committee never votes. See
+  `docs/INFERENCE_TIER1_INVESTIGATION_2026-06-04.md`. (57ff20d)
+- Desktop default `max_tokens` halved 32 → 16, noted as "~3 min vs ~6 min per
+  request on the public testnet" — i.e. ~11 s/token. (d60632a)
+
+## v0.7.10 - 2026-06-11 (desktop-only)
+
+- Aligned the desktop with live chain state. Deliberately released without a
+  tag push so `release.yml` would **not** publish `arc-node` binaries from a
+  main that lacked the wire-compat fixes the seeds were running. This is the
+  change that broke `install-community-node.sh`, which resolved
+  `releases/latest` and then 404'd on a CLI asset that was no longer there.
+  (281bdd0)
+- Hid the on-chain inference submit path (tier-1 + paid escrow) in the desktop
+  and coerced persisted `"onchain"` mode back to `"coordinator"`. (306ebb7)
+- Documented the tier-1 inclusion failure. (fe1ed8d)
+- Wrote the replicated-chain (Model 1, full re-execution) implementation plan.
+  Not started as of 2026-08-17. (99cf84f)
+- Investigated and documented that the testnet seeds are **independent
+  chains**, not one network. (95a9686)
+
+## v0.7.8 / v0.7.9 - 2026-06-01 → 2026-06-04 (no tag, no release)
+
+The binary the five non-NYC seeds actually run. Built from
+`fix/v078-attestation-wire-compat`; merged to main 2026-06-16 (f6bee03).
+
+- `InferenceAttestation` made wire-compatible with v0.7.2 validators — the
+  reason NYC (still v0.7.2) can interoperate at all. Wire size pinned by a
+  unit test. (24150b3, 5279838)
+- `--community`: one-flag setup with auto-model-discovery, and auto-download
+  of a sha-pinned Llama-2-7B GGUF. (dcab105, 397698e)
+- Validator auto-shard via `/shards/join`, plus a canonical `model_id`
+  function. (ff46e53) — note this is the path that can wedge a fully-covered
+  public pipeline; see the safety rules in `CLAUDE.md`.
+- Scalable model distribution: multi-source fetch, LFS pre-check, resume.
+  (601194c)
+- Sharded inference unblocked; smart-router timeout cut. (30b3113)
+- INT16 enabled on shard-holders — `enable_i16()` now called after load so the
+  I16 dispatch path is actually taken. (0d9d6a4, 613a232)
+- `tier1_pending` restored across restarts; partial-local requests routed to
+  the sharded path. (0d9d6a4)
+- Context window doubled: RoPE 2048 → 4096, sharded output cap 256 → 1024.
+  (96b87fe)
+- `/inference/onchain/submit` accepts a caller-signed tx and reports
+  diagnostics; inference-validator retries finalize on a stuck request. Neither
+  made the transaction land in a block. (34e1fd0, 631e5b0)
+- `rolling-upgrade.sh` pauses `arc-self-heal` per node and re-arms it after the
+  health gate. (9dc7618)
+
+## v0.7.7 - 2026-05-29
+
+- Desktop Tier 1 routes to the public testnet seeds; the alpha VPS is retired.
+  (37df67b)
+- **Last release to ship `arc-node` CLI binaries** (linux-x86_64,
+  macos-arm64, macos-x86_64, windows-x86_64.exe).
+
+## v0.7.6 - 2026-05-29
+
+Ten commits of wallet-host churn, which is worth reading as one story: the
+desktop wallet was pointed at alpha, then at 5 seeds, then at LAX, then back to
+localhost, then at the live testnet. It settled on pinning a single seed —
+`docs/TESTNET_STATE_DIVERGENCE_2026-06-03.md` later explained why aggregation
+across seeds could never work. (800d828, 6226342, b05bed5, 8e151de, bf1e14c,
+4876820, f040d23, 671cf03)
+
+- "Option C": beneficiary credit for tier-1 `InferenceAttestation`. The
+  `beneficiary` wire field was subsequently marked `#[serde(skip)]` after it
+  partitioned the validator set on 2026-05-29. (9d75170)
+- arc-state: speculative `success=false` routed to unresolved — a BlockSTM fix
+  for tier 1. (4cff9ea)
+
+## v0.7.5 - 2026-05-28
+
+- arc-node posts an `InferenceAttestation` after every Tier 1 vote. (28e18dc)
+- Desktop wallet (balance / faucet / earnings) routed to alpha rather than
+  127.0.0.1. (671cf03)
+
+## v0.7.4 - 2026-05-28
+
+- Desktop actually invokes the Tauri auto-update and relaunches after install —
+  previously the update was downloaded but never applied. (b3014b9)
+- README download links bumped v0.6.0 → v0.7.3. (3218d8f)
+
+## v0.7.3 - 2026-05-26
+
+- Tier 1 on-chain inference gains load balancing and error handling. (9cbbaab)
+- Desktop tier1 pinned to the alpha solo node (v0.7.2) while the
+  multi-validator inclusion bug stayed open. (295ee6f)
+
+## v0.7.2 - 2026-05-20
+
+- **Tier 1 on-chain inference, Phase A.** (73eaee9)
+- Inference timeout raised 3 s → 120 s, and a false `503 Pipeline gap` fixed.
+  The 3-second timeout had made sharded inference unusable. (4acbcbb)
+- Connecting UX: syncing banner + onboarding progress. (0510fa4)
+- Alpha VPS hardening and UX polish. (34a393f, 9308d9d)
+- At the 2026-08-31 source freeze, this was the version **NYC still ran**.
+
+## v0.7.1 - 2026-05-12
+
+- **Validator-signed `FaucetClaim` TxType**, gated behind `FAUCET_V2_ENABLED`
+  and then defaulted on. This is why faucet credits propagate while
+  coordinator-minted attestations do not. (e0ad962, 548d3c3)
+- Signer-nonce check dropped from the `FaucetClaim` executor. (564468c)
+- `StateDB.validators` seeded from genesis at startup, and
+  `seed_genesis_validators` clears the set first. (4771d35, 40bab32)
+
 ## v0.7.0 - "Just be a node, and earn for real"
 
 The community-worker system actually works for the first time. Pre-v0.7

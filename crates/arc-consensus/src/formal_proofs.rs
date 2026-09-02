@@ -45,7 +45,7 @@ fn make_block(
     timestamp: u64,
 ) -> DagBlock {
     let mut transactions = transactions;
-    transactions.sort_by(|a, b| a.0.cmp(&b.0));
+    transactions.sort_by_key(|tx| tx.0);
     let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
     let mut block = DagBlock {
         author,
@@ -173,7 +173,7 @@ mod formal_tests {
         let byzantine = addrs[3];
 
         // Each honest validator gets its own engine (simulating separate nodes)
-        let mut engines: Vec<ConsensusEngine> = honest
+        let engines: Vec<ConsensusEngine> = honest
             .iter()
             .map(|addr| ConsensusEngine::new(vs.clone(), *addr))
             .collect();
@@ -181,12 +181,18 @@ mod formal_tests {
         // Round 0: All 4 validators propose blocks
         let mut r0_blocks = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            let block = make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64);
+            let block = make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            );
             r0_blocks.push(block);
         }
 
         // Byzantine validator also creates a CONFLICTING block for round 0
-        let byz_conflicting = make_block(
+        let _byz_conflicting = make_block(
             byzantine,
             0,
             vec![],
@@ -410,7 +416,13 @@ mod formal_tests {
         // Round 0
         let mut r0 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            let block = make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64);
+            let block = make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            );
             r0.push(block);
         }
 
@@ -588,7 +600,11 @@ mod formal_tests {
         // Continue for 3 more rounds with all 4 validators
         // Current round should be 3 (after 3 rounds: 0, 1, 2 + advances)
         let current = engine.current_round();
-        assert!(current >= 3, "Should be at round 3 or later, got {}", current);
+        assert!(
+            current >= 3,
+            "Should be at round 3 or later, got {}",
+            current
+        );
 
         // Build rounds manually for the recovered validator set
         for round_offset in 0..15 {
@@ -614,7 +630,7 @@ mod formal_tests {
         }
 
         // Try commit again -- should have more committed blocks now
-        let committed_after = engine.try_commit();
+        let _committed_after = engine.try_commit();
         let total_committed = engine.committed_blocks().len();
 
         assert!(
@@ -707,12 +723,11 @@ mod formal_tests {
         let mut effective_stake = 0u64;
         let validator_set = engine.validator_set();
         for hash in &blocks_in_r0 {
-            if let Some(block) = engine.get_block(hash) {
-                if unique_authors.insert(block.author) {
-                    if let Some(v) = validator_set.get_validator(&block.author) {
-                        effective_stake += v.stake;
-                    }
-                }
+            if let Some(block) = engine.get_block(hash)
+                && unique_authors.insert(block.author)
+                && let Some(v) = validator_set.get_validator(&block.author)
+            {
+                effective_stake += v.stake;
             }
         }
 
@@ -787,9 +802,7 @@ mod formal_tests {
         let r2_blocks: Vec<DagBlock> = honest
             .iter()
             .enumerate()
-            .map(|(i, addr)| {
-                make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64)
-            })
+            .map(|(i, addr)| make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64))
             .collect();
 
         for engine in [&engine_without_byz, &engine_with_byz] {
@@ -833,11 +846,12 @@ mod formal_tests {
 
     #[test]
     fn test_bft_one_third_threshold() {
-        // Parametric test with N=4,7,10,13 validators.
+        // Parametric test including N divisible by three, where exactly 2/3
+        // must remain below the strict supermajority threshold.
         // For each N, f = floor((N-1)/3).
         // With exactly f Byzantine -> safety holds.
         // With f+1 Byzantine -> safety may not hold (demonstrate threshold).
-        for n in [4, 7, 10, 13] {
+        for n in [4, 6, 7, 10, 13] {
             let f = (n - 1) / 3; // max tolerable faults
 
             // Test 1: With f Byzantine, system is safe and live
@@ -860,7 +874,11 @@ mod formal_tests {
                     assert!(
                         !committed.is_empty(),
                         "N={}, f={}: System should make progress with {} honest validators (stake {} >= quorum {})",
-                        n, f, honest_count, honest_stake, required_quorum
+                        n,
+                        f,
+                        honest_count,
+                        honest_stake,
+                        required_quorum
                     );
                 }
             }
@@ -923,7 +941,13 @@ mod formal_tests {
         // Round 0
         let mut r0 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            r0.push(make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64));
+            r0.push(make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            ));
         }
 
         // Forward order
@@ -942,7 +966,13 @@ mod formal_tests {
         let r0_parents: Vec<Hash256> = r0[0..3].iter().map(|b| b.hash).collect();
         let mut r1 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            r1.push(make_block(*addr, 1, r0_parents.clone(), vec![], 200 + i as u64));
+            r1.push(make_block(
+                *addr,
+                1,
+                r0_parents.clone(),
+                vec![],
+                200 + i as u64,
+            ));
         }
 
         for block in &r1 {
@@ -959,7 +989,13 @@ mod formal_tests {
         let r1_parents: Vec<Hash256> = r1[0..3].iter().map(|b| b.hash).collect();
         let mut r2 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            r2.push(make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64));
+            r2.push(make_block(
+                *addr,
+                2,
+                r1_parents.clone(),
+                vec![],
+                300 + i as u64,
+            ));
         }
 
         for block in &r2 {
@@ -999,7 +1035,13 @@ mod formal_tests {
         // Round 0: all validators propose
         let mut r0 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            let block = make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64);
+            let block = make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            );
             engine.receive_block(&block).unwrap();
             r0.push(block);
         }
@@ -1141,17 +1183,17 @@ mod formal_tests {
         // One Core (50M) validator = more weight than 5 Spark (500K) validators.
         //
         // Setup: 1 Core (50M) + 5 Spark (500K each = 2.5M)
-        // Total = 52.5M, quorum = ceil(2/3 * 52.5M) = 35_000_002
+        // Total = 52.5M, quorum = floor(2/3 * 52.5M) + 1 = 35_000_001
         // Core alone = 50M >= 35M quorum => Core alone forms quorum
         // All 5 Spark = 2.5M << 35M quorum => Sparks cannot form quorum
         //
         // Note: Spark validators can't produce blocks, so we use Core + Arc mix.
         // 1 Core (50M) + 5 Arc (5M each = 25M), total = 75M
-        // quorum = ceil(2/3 * 75M) = 50_000_002
-        // Core alone = 50M >= 50_000_002? Exactly at threshold!
+        // quorum = floor(2/3 * 75M) + 1 = 50_000_001
+        // Core alone = 50M < 50_000_001: exactly 2/3 is insufficient.
         //
         // Let's use: 1 Core (50M) + 2 Arc (5M each), total = 60M
-        // quorum = ceil(2/3 * 60M) = 40_000_002
+        // quorum = floor(2/3 * 60M) + 1 = 40_000_001
         // Core alone = 50M >= 40M quorum -> YES
         // 2 Arc alone = 10M < 40M -> NO
         let stakes = vec![
@@ -1162,7 +1204,7 @@ mod formal_tests {
         let (vs, addrs) = make_test_validators(&stakes);
 
         assert_eq!(vs.total_stake, STAKE_CORE + 2 * STAKE_ARC); // 60M
-        assert_eq!(vs.quorum, (2 * 60_000_000 + 2) / 3); // 40_000_002
+        assert_eq!(vs.quorum, strict_supermajority_threshold(60_000_000));
 
         // Core alone reaches quorum
         assert!(
@@ -1207,14 +1249,14 @@ mod formal_tests {
     fn test_minimum_quorum_stake() {
         // Calculate exact quorum threshold for given validator set, verify
         // commit only happens when met.
-        for &total_validators in &[4, 7, 10, 13] {
+        for &total_validators in &[4, 6, 7, 10, 13] {
             let stakes: Vec<(u64, u16)> = (0..total_validators)
                 .map(|i| (STAKE_ARC, i as u16 % 4))
                 .collect();
             let (vs, addrs) = make_test_validators(&stakes);
 
             let total_stake = total_validators as u64 * STAKE_ARC;
-            let expected_quorum = (2 * total_stake + 2) / 3;
+            let expected_quorum = strict_supermajority_threshold(total_stake);
             assert_eq!(
                 vs.quorum, expected_quorum,
                 "N={}: quorum mismatch",
@@ -1242,7 +1284,7 @@ mod formal_tests {
             );
 
             // Verify minimum number of equal-stake validators for quorum
-            let min_validators_for_quorum = (expected_quorum + STAKE_ARC - 1) / STAKE_ARC;
+            let min_validators_for_quorum = expected_quorum.div_ceil(STAKE_ARC);
             let max_validators_below_quorum = min_validators_for_quorum - 1;
 
             let quorum_addrs: Vec<Hash256> = addrs[..min_validators_for_quorum as usize].to_vec();
@@ -1296,12 +1338,16 @@ mod formal_tests {
                 .collect();
 
             // First: insert below-quorum blocks in R+2
-            for i in 0..max_validators_below_quorum as usize {
-                let block = make_block(addrs[i], 2, r1_parents.clone(), vec![], 300 + i as u64);
+            for (i, addr) in addrs
+                .iter()
+                .enumerate()
+                .take(max_validators_below_quorum as usize)
+            {
+                let block = make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64);
                 engine.receive_block(&block).unwrap();
             }
 
-            let committed_below = engine.try_commit();
+            let _committed_below = engine.try_commit();
             // There may or may not be commits here depending on which R1 certifier
             // the below-quorum R2 blocks happen to support. The key invariant is that
             // for a specific B->C path, below quorum R2 support is insufficient.
@@ -1309,12 +1355,11 @@ mod formal_tests {
             // Now add the quorum-reaching validator
             let idx = min_validators_for_quorum as usize - 1;
             if idx < addrs.len() && idx >= max_validators_below_quorum as usize {
-                let block =
-                    make_block(addrs[idx], 2, r1_parents.clone(), vec![], 300 + idx as u64);
+                let block = make_block(addrs[idx], 2, r1_parents.clone(), vec![], 300 + idx as u64);
                 let _ = engine.receive_block(&block);
             }
 
-            let committed_at_quorum = engine.try_commit();
+            let _committed_at_quorum = engine.try_commit();
             let total_committed = engine.committed_blocks().len();
             assert!(
                 total_committed > 0,
@@ -1399,7 +1444,7 @@ mod formal_tests {
             } else {
                 // Use first quorum-worth of blocks from previous round as parents
                 let prev = &all_blocks[(round - 1) as usize];
-                let min_quorum_count = ((2 * n + 2) / 3) as usize;
+                let min_quorum_count = strict_supermajority_threshold(n as u64) as usize;
                 let parent_count = min_quorum_count.min(prev.len());
                 prev[..parent_count].iter().map(|b| b.hash).collect()
             };
@@ -1465,7 +1510,15 @@ mod formal_tests {
         let h_blocks: Vec<DagBlock> = honest
             .iter()
             .enumerate()
-            .map(|(i, addr)| make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64))
+            .map(|(i, addr)| {
+                make_block(
+                    *addr,
+                    0,
+                    vec![],
+                    vec![hash_bytes(&[0, i as u8])],
+                    100 + i as u64,
+                )
+            })
             .collect();
 
         // Byzantine equivocation

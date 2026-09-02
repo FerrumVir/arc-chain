@@ -45,6 +45,10 @@ test.describe("Live node (port 9090) - real data", () => {
     await page.screenshot({ path: "screenshots/live-02-identity.png" });
     await page.getByTestId("btn-continue-identity").click();
 
+    await expect(page.getByTestId("step-model")).toBeVisible();
+    await page.getByTestId("tier-skip").click();
+    await page.getByTestId("btn-continue-model").click();
+
     await expect(page.getByTestId("step-launch")).toBeVisible();
     await page.screenshot({ path: "screenshots/live-03-launch.png" });
     await page.getByTestId("btn-launch").click();
@@ -94,19 +98,21 @@ test.describe("Live node (port 9090) - real data", () => {
     await page.screenshot({ path: "screenshots/live-dashboard-full.png" });
   });
 
-  test("earnings screen reads real attestation count", async ({ page }) => {
+  test("legacy earnings are unavailable rather than rendered as zero or paid rewards", async ({ page }) => {
     await seedOnboarded(page);
     await injectLive(page);
     await page.goto("/");
     await page.getByTestId("nav-earnings").click();
     await page.waitForTimeout(2_000);
 
-    // Lifetime total should be (attestations * 2.5 ARC) - non-zero
-    const lifetime = page.locator(".big-number.gradient").first();
-    await expect(lifetime).toBeVisible();
-    const lifetimeText = await lifetime.textContent();
-    const digits = (lifetimeText ?? "").replace(/[^\d]/g, "");
-    expect(Number(digits)).toBeGreaterThan(0);
+    // The browser-live fallback can see historical /inference/results, but
+    // those are not successful mined 0x25 reward receipts.
+    await expect(page.getByTestId("earnings-unavailable")).toContainText(
+      "Legacy or malformed inference-count arithmetic is not earnings",
+    );
+    await expect(page.getByTestId("earnings-empty")).toHaveCount(0);
+    await expect(page.getByTestId("weekly-chart")).toHaveCount(0);
+    await expect(page.getByText(/\+2\.50 ARC/)).toHaveCount(0);
 
     await page.screenshot({
       path: "screenshots/live-earnings.png",

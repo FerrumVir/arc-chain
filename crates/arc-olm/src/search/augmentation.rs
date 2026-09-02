@@ -34,14 +34,46 @@ fn anti_transpose(g: &Grid) -> Grid {
 /// The 8 elements of the D4 dihedral group.
 pub fn d4_transforms() -> Vec<Transform> {
     vec![
-        Transform { name: "identity",       forward: identity,       inverse: identity },
-        Transform { name: "rot90",           forward: grid::rot90,    inverse: grid::rot270 },
-        Transform { name: "rot180",          forward: grid::rot180,   inverse: grid::rot180 },
-        Transform { name: "rot270",          forward: grid::rot270,   inverse: grid::rot90 },
-        Transform { name: "flip_h",          forward: grid::hmirror,  inverse: grid::hmirror },
-        Transform { name: "flip_v",          forward: grid::vmirror,  inverse: grid::vmirror },
-        Transform { name: "transpose",       forward: grid::dmirror,  inverse: grid::dmirror },
-        Transform { name: "anti_transpose",  forward: anti_transpose, inverse: anti_transpose },
+        Transform {
+            name: "identity",
+            forward: identity,
+            inverse: identity,
+        },
+        Transform {
+            name: "rot90",
+            forward: grid::rot90,
+            inverse: grid::rot270,
+        },
+        Transform {
+            name: "rot180",
+            forward: grid::rot180,
+            inverse: grid::rot180,
+        },
+        Transform {
+            name: "rot270",
+            forward: grid::rot270,
+            inverse: grid::rot90,
+        },
+        Transform {
+            name: "flip_h",
+            forward: grid::hmirror,
+            inverse: grid::hmirror,
+        },
+        Transform {
+            name: "flip_v",
+            forward: grid::vmirror,
+            inverse: grid::vmirror,
+        },
+        Transform {
+            name: "transpose",
+            forward: grid::dmirror,
+            inverse: grid::dmirror,
+        },
+        Transform {
+            name: "anti_transpose",
+            forward: anti_transpose,
+            inverse: anti_transpose,
+        },
     ]
 }
 
@@ -105,12 +137,7 @@ fn color_perms(grid: &Grid) -> Vec<Vec<(u8, u8)>> {
 }
 
 /// Heap's algorithm for generating all permutations.
-fn heap_permutations(
-    arr: &mut Vec<u8>,
-    k: usize,
-    original: &[u8],
-    out: &mut Vec<Vec<(u8, u8)>>,
-) {
+fn heap_permutations(arr: &mut Vec<u8>, k: usize, original: &[u8], out: &mut Vec<Vec<(u8, u8)>>) {
     if k == 1 {
         let mapping: Vec<(u8, u8)> = original
             .iter()
@@ -122,7 +149,7 @@ fn heap_permutations(
     }
     for i in 0..k {
         heap_permutations(arr, k - 1, original, out);
-        if k % 2 == 0 {
+        if k.is_multiple_of(2) {
             arr.swap(i, k - 1);
         } else {
             arr.swap(0, k - 1);
@@ -210,10 +237,7 @@ where
                 .collect();
 
             // Transform test inputs.
-            let aug_tests: Vec<Grid> = test_inputs
-                .iter()
-                .map(|inp| (xf.forward)(inp))
-                .collect();
+            let aug_tests: Vec<Grid> = test_inputs.iter().map(|inp| (xf.forward)(inp)).collect();
 
             // Solve.
             let solutions = solver(&aug_train, &aug_tests);
@@ -247,18 +271,11 @@ mod tests {
     use super::*;
 
     fn sample_grid() -> Grid {
-        vec![
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-        ]
+        vec![vec![1, 2, 3], vec![4, 5, 6]]
     }
 
     fn sample_square() -> Grid {
-        vec![
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-            vec![7, 8, 9],
-        ]
+        vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]]
     }
 
     // ----------------------------------------------------------
@@ -291,10 +308,7 @@ mod tests {
 
     #[test]
     fn color_map_round_trip() {
-        let g = vec![
-            vec![0, 1, 2],
-            vec![3, 0, 1],
-        ];
+        let g = vec![vec![0, 1, 2], vec![3, 0, 1]];
         let perms = color_perms(&g);
         for mapping in &perms {
             let mapped = apply_color_map(&g, mapping);
@@ -307,10 +321,7 @@ mod tests {
     #[test]
     fn color_perms_count_small() {
         // Grid with 3 non-bg colors (bg=0 appears most).
-        let g = vec![
-            vec![0, 0, 0, 0],
-            vec![0, 1, 2, 3],
-        ];
+        let g = vec![vec![0, 0, 0, 0], vec![0, 1, 2, 3]];
         let perms = color_perms(&g);
         // 3! = 6 permutations for 3 non-bg colors.
         assert_eq!(perms.len(), 6);
@@ -348,9 +359,7 @@ mod tests {
             tests.iter().map(|t| Some(t.clone())).collect()
         };
 
-        let train = vec![
-            (vec![vec![1, 2], vec![3, 4]], vec![vec![5, 6], vec![7, 8]]),
-        ];
+        let train = vec![(vec![vec![1, 2], vec![3, 4]], vec![vec![5, 6], vec![7, 8]])];
         let test_inputs = vec![vec![vec![9, 0], vec![1, 2]]];
 
         let results = solve_with_augmentation(&train, &test_inputs, solver);
@@ -367,16 +376,10 @@ mod tests {
 
     #[test]
     fn find_bg_picks_most_common() {
-        let g = vec![
-            vec![0, 0, 0],
-            vec![1, 2, 0],
-        ];
+        let g = vec![vec![0, 0, 0], vec![1, 2, 0]];
         assert_eq!(find_bg(&g), 0);
 
-        let g2 = vec![
-            vec![3, 3, 3],
-            vec![3, 1, 3],
-        ];
+        let g2 = vec![vec![3, 3, 3], vec![3, 1, 3]];
         assert_eq!(find_bg(&g2), 3);
     }
 

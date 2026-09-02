@@ -3,9 +3,9 @@
 # Emits a 3×-replication --shard-map string for rolling-upgrade.sh.
 #
 # Every layer range is held by REPLICATION (default 3) distinct nodes, so no
-# single node failure ever leaves a range uncovered. Node load is balanced:
-# if NODES×REPLICATION is divisible by RANGE_COUNT, each node holds the same
-# number of ranges; otherwise one or two hold an extra.
+# single node failure ever leaves a range uncovered. The canonical 32-layer,
+# six-node, 3x plan is a balanced block design: every node holds exactly 16
+# layers. Custom dimensions use the deterministic round-robin fallback below.
 #
 # Usage:
 #   scripts/shard-plan-3x.sh [N_LAYERS] [RANGE_COUNT] [REPLICATION] [NODE1 NODE2 ...]
@@ -13,7 +13,7 @@
 #
 # Example:
 #   scripts/shard-plan-3x.sh 32 6 3 NYC LAX AMS LHR NRT SGP
-#   → NYC=0:6,21:26,11:16 LAX=0:6,26:32,6:11 AMS=6:11,0:6,16:21 ...
+#   → NYC=0:6,12:17,17:22 LAX=0:6,12:17,22:27 ...
 #
 # Drop SAO and JNB from the node list while their RPC is broken. Bring them
 # back later by re-running the plan with 8 nodes and redeploying.
@@ -46,13 +46,13 @@ REM=$(( N_LAYERS - BASE * RANGES ))
 STARTS=(); ENDS=()
 cursor=0
 for r in $(seq 0 $((RANGES - 1))); do
-    STARTS+=($cursor)
+    STARTS+=("$cursor")
     width=$BASE
     if [ "$r" -lt "$REM" ]; then
         width=$((width + 1))
     fi
     cursor=$((cursor + width))
-    ENDS+=($cursor)
+    ENDS+=("$cursor")
 done
 if [ "$cursor" -ne "$N_LAYERS" ]; then
     echo "ERROR: range layout mismatch ($cursor != $N_LAYERS)" >&2
@@ -75,9 +75,17 @@ node_idx_of() {
     done
     echo "-1"
 }
+CANONICAL_ROWS=("0 1 2" "3 4 5" "0 1 3" "0 2 4" "1 4 5" "2 3 5")
 for r in $(seq 0 $((RANGES - 1))); do
-    for k in $(seq 0 $((REPL - 1))); do
-        idx=$(( (r + k) % N ))
+    if [ "$N_LAYERS" -eq 32 ] && [ "$RANGES" -eq 6 ] && [ "$REPL" -eq 3 ] && [ "$N" -eq 6 ]; then
+        replica_indices="${CANONICAL_ROWS[$r]}"
+    else
+        replica_indices=""
+        for k in $(seq 0 $((REPL - 1))); do
+            replica_indices="$replica_indices $(( (r + k) % N ))"
+        done
+    fi
+    for idx in $replica_indices; do
         piece="${STARTS[$r]}:${ENDS[$r]}"
         if [ -z "${NODE_RANGES[$idx]}" ]; then
             NODE_RANGES[$idx]="$piece"

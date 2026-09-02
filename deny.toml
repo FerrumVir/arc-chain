@@ -1,0 +1,137 @@
+# cargo-deny configuration.
+#
+# Run locally with `make audit`; CI and tagged releases use the checksummed
+# `scripts/ci/run-cargo-deny.sh` wrapper against each tracked lockfile. Advisory,
+# license, source, and yanked-crate failures are release-blocking.
+
+[graph]
+all-features = false
+
+# ----------------------------------------------------------- advisories ----
+[advisories]
+version = 2
+# Yanked crates are denied rather than warned: a yanked dependency in a
+# workspace that ships signed binaries to third-party node operators via
+# `curl | bash` is a release-blocking fact, not a note.
+yanked = "deny"
+
+# POLICY FOR THIS LIST — no exceptions, including "just for now":
+#   Every entry MUST carry a comment with (a) the date it was added, (b) who
+#   accepted the risk, (c) why it is not exploitable here, and (d) the
+#   condition under which it gets removed. An entry with no expiry condition
+#   is a permanent silent vulnerability, which is strictly worse than no
+#   scanner at all. Re-review the whole list at every release.
+#
+# Format:
+#   "RUSTSEC-0000-0000", # 2026-08-17 <owner>: <why not exploitable>; remove when <condition>
+ignore = [
+    # 2026-08-27 ARC release engineering: paste is a build-time proc macro
+    # reached only through pinned Wasmer/Candle/Revm dependencies; this
+    # advisory reports maintenance status, not a vulnerability. Remove when
+    # all three upstream stacks migrate to pastey or eliminate paste, no later
+    # than the v0.9.0 dependency refresh.
+    "RUSTSEC-2024-0436",
+    # 2026-08-27 ARC release engineering: preserving verification of historic
+    # Falcon-512 transactions requires the existing wire-compatible PQClean
+    # implementation; these advisories report upstream archival and no known
+    # vulnerability. Remove all three together once the fn-dsa migration has
+    # golden vectors for legacy verification and new signing, no later than
+    # v0.9.0.
+    "RUSTSEC-2026-0162",
+    "RUSTSEC-2026-0163",
+    "RUSTSEC-2026-0165",
+    # 2026-08-27 ARC release engineering: Tauri 2.11's supported Linux
+    # WebKit/tray runtime still requires the archived gtk-rs GTK3 bindings;
+    # these advisories report maintenance status, not known vulnerabilities,
+    # and cargo-deny reports no safe upgrade. Remove each entry as soon as
+    # Tauri/Wry migrate the Linux runtime off GTK3, no later than the v0.9.0
+    # desktop dependency review.
+    "RUSTSEC-2024-0411", # gdkwayland-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0412", # gdk; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0413", # atk; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0414", # gdkx11-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0415", # gtk; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0416", # atk-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0417", # gdkx11; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0418", # gdk-sys; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0419", # gtk3-macros; remove with Tauri's GTK3 runtime
+    "RUSTSEC-2024-0420", # gtk-sys; remove with Tauri's GTK3 runtime
+    # 2026-08-27 ARC release engineering: proc-macro-error is build-time-only
+    # through the same Tauri GTK3 macro stack; this is an unmaintained notice,
+    # not a vulnerability, and has no safe upgrade. Remove with the GTK3 stack
+    # or earlier if glib-macros migrates, no later than v0.9.0.
+    "RUSTSEC-2024-0370",
+    # 2026-08-27 ARC release engineering: Tauri 2.11's urlpattern dependency
+    # retains these archived rust-unic crates. The notices contain no known
+    # vulnerability and report no safe upgrade. Remove each when Tauri updates
+    # urlpattern to ICU/unicode-ident, no later than the v0.9.0 dependency
+    # review.
+    "RUSTSEC-2025-0075", # unic-char-range; remove with Tauri urlpattern
+    "RUSTSEC-2025-0080", # unic-common; remove with Tauri urlpattern
+    "RUSTSEC-2025-0081", # unic-char-property; remove with Tauri urlpattern
+    "RUSTSEC-2025-0098", # unic-ucd-version; remove with Tauri urlpattern
+    "RUSTSEC-2025-0100", # unic-ucd-ident; remove with Tauri urlpattern
+]
+
+# ------------------------------------------------------------- licenses ----
+[licenses]
+version = 2
+# Shared allowlist for the independently locked workspace, desktop, and updater
+# verifier graphs. The release workflow audits all three.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    # Weak, file-level copyleft. Acceptable while these crates are consumed
+    # unmodified; if anyone vendors and patches an MPL crate, the modified
+    # files must be published. Flagged here so that is a decision and not an
+    # accident.
+    "MPL-2.0",
+    # Public-domain-equivalent and highly permissive licenses already present
+    # in the locked revm/wgpu/wasmer dependency graph. These are policy
+    # approvals, not advisory exceptions.
+    "CC0-1.0",
+    "0BSD",
+    # Boost Software License 1.0 (not the source-available BUSL license) is a
+    # permissive OSI-approved license used by the locked xxhash-rust crate.
+    "BSL-1.0",
+    # The workspace's own crates (Cargo.toml [workspace.package] license).
+    "BUSL-1.1",
+]
+confidence-threshold = 0.9
+
+# Per-crate exceptions go here rather than widening `allow` above, so an
+# unusual licence stays scoped to the one crate that needs it.
+# Format:
+#   { allow = ["<SPDX>"], crate = "<name>" },  # <date> <owner>: <rationale>
+exceptions = []
+
+# ----------------------------------------------------------------- bans ----
+[bans]
+# Starts at "warn", not "deny". A 16-crate workspace pulling revm, wasmer,
+# wgpu and quinn will have a substantial duplicate-version tail; denying on
+# day one would mean an immediate allowlist war and the check being disabled.
+# Ratchet: fix the duplicates that matter (anything in the crypto or wire
+# path), then consider "deny" with a curated `skip` list.
+multiple-versions = "warn"
+# Path dependencies inside the workspace use wildcards legitimately.
+wildcards = "allow"
+deny = []
+skip = []
+
+# -------------------------------------------------------------- sources ----
+[sources]
+unknown-registry = "deny"
+# Shipped graphs must resolve only from the registry or reviewed local paths.
+# Stwo is vendored; the optional ICICLE feature is not release-enabled and must
+# be vendored or registry-published before it can enter a shipped graph. A git
+# dependency therefore fails rather than relying on a mutable tag or host.
+unknown-git = "deny"
+allow-git = []

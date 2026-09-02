@@ -240,7 +240,8 @@ impl BatchProver {
         // Compute a verification tag and verify.
         let verify_start = Instant::now();
         let verify_tag = compute_verify_tag(&task.circuit_id, &task.public_inputs, &proof);
-        let verified = verify_mock_proof(&task.circuit_id, &task.public_inputs, &proof, &verify_tag);
+        let verified =
+            verify_mock_proof(&task.circuit_id, &task.public_inputs, &proof, &verify_tag);
         let verify_elapsed = verify_start.elapsed().as_millis() as u64;
 
         let status = if verified {
@@ -266,12 +267,13 @@ impl BatchProver {
             self.stats.peak_prove_time_ms = prove_elapsed;
         }
         let total_proofs = self.stats.total_proved + self.stats.total_failed;
-        if total_proofs > 0 {
-            // Rolling average.
-            self.stats.avg_prove_time_ms = ((self.stats.avg_prove_time_ms
-                * (total_proofs - 1))
-                + prove_elapsed)
-                / total_proofs;
+        // Rolling average. checked_div carries the "total_proofs > 0" guard,
+        // so the divisor cannot be zero here by construction.
+        if let Some(avg) = ((self.stats.avg_prove_time_ms * total_proofs.saturating_sub(1))
+            + prove_elapsed)
+            .checked_div(total_proofs)
+        {
+            self.stats.avg_prove_time_ms = avg;
         }
 
         // Public outputs: the first 32 bytes of the proof re-hashed.
@@ -459,7 +461,10 @@ mod tests {
 
         let proof1 = generate_mock_proof(&t1);
         let proof2 = generate_mock_proof(&t2);
-        assert_ne!(proof1, proof2, "different inputs must produce different proofs");
+        assert_ne!(
+            proof1, proof2,
+            "different inputs must produce different proofs"
+        );
     }
 
     #[test]

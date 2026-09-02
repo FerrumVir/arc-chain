@@ -16,8 +16,10 @@ fn main() {
     };
 
     let cfg = &model.config;
-    println!("Model: {}L d={} h={} kv={} ff={} v={}",
-        cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, cfg.vocab_size);
+    println!(
+        "Model: {}L d={} h={} kv={} ff={} v={}",
+        cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, cfg.vocab_size
+    );
 
     // Profile a single forward pass (one token)
     let prompt = model.encode("What is 2+2?");
@@ -38,10 +40,12 @@ fn main() {
         let layer_count = cfg.n_layers;
         for l in 0..layer_count {
             let kv_len = cfg.d_kv;
+            // KVCache holds full-precision Q16 i64 and no longer carries
+            // per-entry scales, so truncating k_data/v_data is the whole
+            // reset. The k_scales/v_scales truncations that used to sit here
+            // referenced fields that no longer exist.
             cache.k_data[l].truncate(cache.seq_len * kv_len);
-            cache.k_scales[l].truncate(cache.seq_len);
             cache.v_data[l].truncate(cache.seq_len * kv_len);
-            cache.v_scales[l].truncate(cache.seq_len);
         }
     }
 
@@ -49,7 +53,10 @@ fn main() {
     let _logits = model.forward_one_token(last_tok, &mut cache);
     let total = start.elapsed();
 
-    println!("\nTotal forward pass: {:.2} ms", total.as_secs_f64() * 1000.0);
+    println!(
+        "\nTotal forward pass: {:.2} ms",
+        total.as_secs_f64() * 1000.0
+    );
 
     // Profile individual matmul sizes
     println!("\n--- Matmul profiling (10 iterations each) ---");
@@ -61,7 +68,9 @@ fn main() {
 
     // Create test inputs
     let input_d: Vec<i64> = (0..d).map(|i| (i as i64 % 200 - 100) * ONE / 100).collect();
-    let input_ff: Vec<i64> = (0..dff).map(|i| (i as i64 % 200 - 100) * ONE / 100).collect();
+    let input_ff: Vec<i64> = (0..dff)
+        .map(|i| (i as i64 % 200 - 100) * ONE / 100)
+        .collect();
 
     let profile_matmul = |name: &str, w: &I8Weights, input: &[i64], ins: usize, outs: usize| {
         // Warmup
@@ -75,8 +84,10 @@ fn main() {
         let elapsed = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         let per_layer = elapsed;
         let all_layers = per_layer * cfg.n_layers as f64;
-        println!("  {:<12} [{:>5}×{:>5}]: {:.2} ms/call × {} layers = {:.1} ms total",
-            name, outs, ins, per_layer, cfg.n_layers, all_layers);
+        println!(
+            "  {:<12} [{:>5}×{:>5}]: {:.2} ms/call × {} layers = {:.1} ms total",
+            name, outs, ins, per_layer, cfg.n_layers, all_layers
+        );
     };
 
     let l = &model.layers[0];
@@ -95,28 +106,40 @@ fn main() {
         let _ = matmul_fast(&model.output_weight, &input_d, d, vocab);
     }
     let lm_ms = start.elapsed().as_secs_f64() * 1000.0 / 10.0;
-    println!("  {:<12} [{:>5}×{:>5}]: {:.2} ms/call × 1 = {:.1} ms total",
-        "LM_head", vocab, d, lm_ms, lm_ms);
+    println!(
+        "  {:<12} [{:>5}×{:>5}]: {:.2} ms/call × 1 = {:.1} ms total",
+        "LM_head", vocab, d, lm_ms, lm_ms
+    );
 
     // Estimate breakdown
     let q_time = {
         let _ = matmul_fast(&l.wq, &input_d, d, d);
         let s = Instant::now();
-        for _ in 0..10 { let _ = matmul_fast(&l.wq, &input_d, d, d); }
+        for _ in 0..10 {
+            let _ = matmul_fast(&l.wq, &input_d, d, d);
+        }
         s.elapsed().as_secs_f64() * 1000.0 / 10.0
     };
 
     let gate_time = {
         let _ = matmul_fast(&l.w_gate, &input_d, d, dff);
         let s = Instant::now();
-        for _ in 0..10 { let _ = matmul_fast(&l.w_gate, &input_d, d, dff); }
+        for _ in 0..10 {
+            let _ = matmul_fast(&l.w_gate, &input_d, d, dff);
+        }
         s.elapsed().as_secs_f64() * 1000.0 / 10.0
     };
 
     let total_matmul_est = (q_time * 4.0 + gate_time * 3.0) * cfg.n_layers as f64 + lm_ms;
     println!("\n--- Estimated breakdown ---");
-    println!("  Matmuls:    ~{:.0} ms ({:.0}% of {:.0} ms total)",
-        total_matmul_est, total_matmul_est / total.as_secs_f64() / 10.0, total.as_secs_f64() * 1000.0);
-    println!("  Other:      ~{:.0} ms (attention, layernorm, rope, embedding, argmax)",
-        total.as_secs_f64() * 1000.0 - total_matmul_est);
+    println!(
+        "  Matmuls:    ~{:.0} ms ({:.0}% of {:.0} ms total)",
+        total_matmul_est,
+        total_matmul_est / total.as_secs_f64() / 10.0,
+        total.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Other:      ~{:.0} ms (attention, layernorm, rope, embedding, argmax)",
+        total.as_secs_f64() * 1000.0 - total_matmul_est
+    );
 }

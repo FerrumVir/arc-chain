@@ -1,0 +1,96 @@
+{
+  "schema": "arc.frontend.network.v1",
+  "state": "recovered",
+  "updatedAt": "2026-08-27T00:00:00Z",
+  "network": {
+    "name": "ARC Local Recovery Example",
+    "chainId": "arc-local-v3"
+  },
+  "checkpoint": {
+    "height": 999,
+    "recoveryHeight": 1000,
+    "legacyPublicMaxHeight": 1120,
+    "blockHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stateRoot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "manifestHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "boundaryBlockHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "boundaryStateRoot": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "recoveryDomain": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "recoveryEpoch": 1,
+    "validatorSetId": 1,
+    "protocolVersion": "3.0.0",
+    "legacySourceId": "legacy-signed",
+    "v3SourceId": "v3-primary"
+  },
+  "sources": [
+    {
+      "id": "legacy-signed",
+      "name": "Signed legacy archive",
+      "kind": "legacy-canonical",
+      "baseUrl": "http://127.0.0.1:19090",
+      "enabled": true
+    },
+    {
+      "id": "v3-primary",
+      "name": "Protocol v3 primary",
+      "kind": "v3",
+      "baseUrl": "http://127.0.0.1:29090",
+      "replicaGroup": "v3-main",
+      "enabled": true
+    },
+    {
+      "id": "v3-replica",
+      "name": "Protocol v3 replica",
+      "kind": "v3",
+      "baseUrl": "http://127.0.0.1:39090",
+      "replicaGroup": "v3-main",
+      "enabled": true
+    },
+    {
+      "id": "legacy-fork-preserved",
+      "name": "Preserved legacy fork",
+      "kind": "legacy-fork",
+      "baseUrl": "http://127.0.0.1:49090",
+      "enabled": true,
+      "description": "Explicit historical diagnostics only; never canonical.",
+      "archive": {
+        "schema": "arc.legacy-archive.source.v1",
+        "readOnly": true,
+        "classification": "valid_noncanonical_fork",
+        "captureId": "1111111111111111111111111111111111111111111111111111111111111111",
+        "node": "nyc",
+        "rolloutManifestSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "archiveManifestSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "completeSha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "bundleSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+        "inventorySha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "bindingIndexSha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "bindingSha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "checkpointSha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "checkpointManifestHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "checkpointPayloadHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "canonicalCheckpointHeight": 999,
+        "sourceHeight": 999,
+        "sourceBlockHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "sourceStateRoot": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "provenancePath": "/provenance"
+      }
+    }
+  ],
+  "services": {
+    "maintenanceInterlock": {
+      "schema": "arc.frontend.maintenance-interlock.v1",
+      "path": "/maintenance/status",
+      "sourceSetSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "boundarySha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "toolSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "sourceMainCommit": "4444444444444444444444444444444444444444",
+      "observedCutoffHeight": 1120,
+      "requiredHealthyReplicas": 6,
+      "maxStalenessSeconds": 90
+    }
+  },
+  "notices": [
+    "Example values only. Replace every checkpoint commitment and endpoint with approved production data."
+  ]
+}

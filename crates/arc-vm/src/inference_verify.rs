@@ -391,7 +391,8 @@ mod tests {
             .unwrap();
 
         // Proof > 32 bytes: provider wins
-        mgr.respond_to_challenge(challenge_id, vec![0xAA; 64]).unwrap();
+        mgr.respond_to_challenge(challenge_id, vec![0xAA; 64])
+            .unwrap();
         let resolution = mgr.resolve_challenge(challenge_id).unwrap();
 
         assert_eq!(resolution.winner, provider_addr(1));
@@ -409,7 +410,8 @@ mod tests {
             .unwrap();
 
         // Proof <= 32 bytes: challenger wins
-        mgr.respond_to_challenge(challenge_id, vec![0xBB; 16]).unwrap();
+        mgr.respond_to_challenge(challenge_id, vec![0xBB; 16])
+            .unwrap();
         let resolution = mgr.resolve_challenge(challenge_id).unwrap();
 
         assert_eq!(resolution.winner, provider_addr(2));
@@ -443,7 +445,7 @@ mod tests {
         let provider = provider_addr(1);
 
         // New provider has perfect reputation
-        assert_eq!(mgr.get_provider_reputation(provider), 1.0);
+        assert!((mgr.get_provider_reputation(provider) - 1.0).abs() < f64::EPSILON);
 
         // Submit commitment and win a challenge
         let cid = mgr.submit_commitment(make_commitment(1, 1000));
@@ -453,7 +455,8 @@ mod tests {
         mgr.respond_to_challenge(ch, vec![0xAA; 64]).unwrap();
         mgr.resolve_challenge(ch).unwrap();
 
-        assert_eq!(mgr.get_provider_reputation(provider), 1.0); // 1 success, 0 failures
+        // 1 success, 0 failures
+        assert!((mgr.get_provider_reputation(provider) - 1.0).abs() < f64::EPSILON);
 
         // Lose a challenge
         let cid2 = mgr.submit_commitment(make_commitment(1, 1000));
@@ -463,6 +466,7 @@ mod tests {
         mgr.respond_to_challenge(ch2, vec![0xBB; 8]).unwrap();
         mgr.resolve_challenge(ch2).unwrap();
 
-        assert_eq!(mgr.get_provider_reputation(provider), 0.5); // 1 success, 1 failure
+        // 1 success, 1 failure
+        assert!((mgr.get_provider_reputation(provider) - 0.5).abs() < f64::EPSILON);
     }
 }

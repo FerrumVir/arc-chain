@@ -38,7 +38,7 @@ impl MerkleTree {
         let mut current = leaves;
 
         // Pad to even length if needed
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             current.push(*current.last().unwrap());
         }
 
@@ -58,7 +58,7 @@ impl MerkleTree {
                 .collect();
 
             let mut padded = next;
-            if padded.len() > 1 && padded.len() % 2 != 0 {
+            if padded.len() > 1 && !padded.len().is_multiple_of(2) {
                 padded.push(*padded.last().unwrap());
             }
             current = padded.clone();
@@ -92,13 +92,17 @@ impl MerkleTree {
         let mut idx = index;
 
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             let sibling = if sibling_idx < level.len() {
                 level[sibling_idx]
             } else {
                 level[idx] // duplicate for odd-length levels
             };
-            let is_left = idx % 2 != 0; // sibling is on the left if our index is odd
+            let is_left = !idx.is_multiple_of(2); // sibling is on the left if our index is odd
             siblings.push((sibling, is_left));
             idx /= 2;
         }
@@ -148,6 +152,12 @@ pub struct IncrementalMerkle {
     key_index: HashMap<[u8; 32], usize>,
 }
 
+impl Default for IncrementalMerkle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IncrementalMerkle {
     /// Create an empty tree.
     pub fn new() -> Self {
@@ -158,6 +168,38 @@ impl IncrementalMerkle {
             real_lengths: vec![1],
             key_index: HashMap::new(),
         }
+    }
+
+    /// Build a complete keyed tree in O(n log n) time without repeatedly
+    /// shifting vectors and rebuilding the key index for every insertion.
+    ///
+    /// This is the cold-start/snapshot path. `update` remains optimized for
+    /// the normal case where the tree already exists and only a few leaves
+    /// change. Duplicate keys are a caller invariant violation because one
+    /// state key cannot commit two different leaves.
+    pub fn from_keyed_leaves(mut entries: Vec<([u8; 32], Hash256)>) -> Self {
+        entries.sort_unstable_by_key(|entry| entry.0);
+        assert!(
+            entries.windows(2).all(|window| window[0].0 != window[1].0),
+            "incremental Merkle input contains duplicate keys"
+        );
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut leaves = Vec::with_capacity(entries.len());
+        let mut key_index = HashMap::with_capacity(entries.len());
+        for (index, (key, hash)) in entries.into_iter().enumerate() {
+            keys.push(key);
+            leaves.push(hash);
+            key_index.insert(key, index);
+        }
+        let mut tree = Self {
+            keys,
+            leaves,
+            levels: Vec::new(),
+            real_lengths: Vec::new(),
+            key_index,
+        };
+        tree.rebuild();
+        tree
     }
 
     /// Update an existing leaf or insert a new one.
@@ -214,7 +256,7 @@ impl IncrementalMerkle {
         let mut real_lengths = vec![current.len()];
 
         // Pad to even length (duplicate last).
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             current.push(*current.last().unwrap());
         }
 
@@ -235,7 +277,7 @@ impl IncrementalMerkle {
             real_lengths.push(next.len());
 
             let mut padded = next;
-            if padded.len() > 1 && padded.len() % 2 != 0 {
+            if padded.len() > 1 && !padded.len().is_multiple_of(2) {
                 padded.push(*padded.last().unwrap());
             }
             current = padded.clone();
@@ -305,10 +347,11 @@ impl IncrementalMerkle {
 
             // Prepare dirty set for next level.
             dirty_at_level = dirty_parents;
-            if next_real > 0 && self.levels[next_lv].len() > next_real {
-                if dirty_at_level.contains(&(next_real - 1)) {
-                    dirty_at_level.insert(next_real);
-                }
+            if next_real > 0
+                && self.levels[next_lv].len() > next_real
+                && dirty_at_level.contains(&(next_real - 1))
+            {
+                dirty_at_level.insert(next_real);
             }
         }
     }
@@ -338,10 +381,7 @@ impl IncrementalMerkle {
 
     /// Generate a Merkle inclusion proof for the leaf at `index`.
     pub fn proof(&self, index: usize) -> Option<MerkleProof> {
-        if self.levels.is_empty()
-            || self.real_lengths.is_empty()
-            || index >= self.real_lengths[0]
-        {
+        if self.levels.is_empty() || self.real_lengths.is_empty() || index >= self.real_lengths[0] {
             return None;
         }
 
@@ -350,13 +390,17 @@ impl IncrementalMerkle {
         let mut idx = index;
 
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             let sibling = if sibling_idx < level.len() {
                 level[sibling_idx]
             } else {
                 level[idx]
             };
-            let is_left = idx % 2 != 0;
+            let is_left = !idx.is_multiple_of(2);
             siblings.push((sibling, is_left));
             idx /= 2;
         }
@@ -393,9 +437,7 @@ mod tests {
 
     #[test]
     fn test_proof_verify() {
-        let leaves: Vec<Hash256> = (0..1000u32)
-            .map(|i| hash_bytes(&i.to_le_bytes()))
-            .collect();
+        let leaves: Vec<Hash256> = (0..1000u32).map(|i| hash_bytes(&i.to_le_bytes())).collect();
         let tree = MerkleTree::from_leaves(leaves);
 
         // Prove leaf 42
@@ -405,9 +447,7 @@ mod tests {
 
     #[test]
     fn test_proof_fails_with_wrong_leaf() {
-        let leaves: Vec<Hash256> = (0..100u32)
-            .map(|i| hash_bytes(&i.to_le_bytes()))
-            .collect();
+        let leaves: Vec<Hash256> = (0..100u32).map(|i| hash_bytes(&i.to_le_bytes())).collect();
         let tree = MerkleTree::from_leaves(leaves);
 
         let mut proof = tree.proof(42).unwrap();
@@ -458,6 +498,45 @@ mod tests {
 
         let full_tree = MerkleTree::from_leaves(sorted_hashes);
         assert_eq!(im.root(), full_tree.root());
+    }
+
+    #[test]
+    fn bulk_keyed_build_matches_all_sizes_and_key_order_permutations() {
+        for size in [0u32, 1, 2, 3, 31, 32, 33, 257, 1_000] {
+            let ascending: Vec<_> = (0..size)
+                .map(|index| {
+                    let mut key = [0u8; 32];
+                    key[..4].copy_from_slice(&index.to_be_bytes());
+                    (key, hash_bytes(&index.to_le_bytes()))
+                })
+                .collect();
+            let expected = IncrementalMerkle::from_keyed_leaves(ascending.clone());
+
+            let mut reversed = ascending.clone();
+            reversed.reverse();
+            let mut permuted = ascending.clone();
+            permuted.sort_unstable_by_key(|(key, _)| hash_bytes(key).0);
+            if !permuted.is_empty() {
+                let rotation = permuted.len() / 3;
+                permuted.rotate_left(rotation);
+            }
+
+            for entries in [ascending, reversed, permuted] {
+                let bulk = IncrementalMerkle::from_keyed_leaves(entries);
+                assert_eq!(bulk.root(), expected.root(), "size {size}");
+                assert_eq!(bulk.len(), size as usize);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate keys")]
+    fn bulk_keyed_build_rejects_duplicate_keys() {
+        let key = [7u8; 32];
+        IncrementalMerkle::from_keyed_leaves(vec![
+            (key, hash_bytes(b"first")),
+            (key, hash_bytes(b"second")),
+        ]);
     }
 
     #[test]
@@ -557,7 +636,10 @@ mod tests {
         // Generate and verify proofs at various positions.
         for idx in [0, 1, 50, 98, 99] {
             let proof = im.proof(idx).unwrap();
-            assert!(MerkleTree::verify_proof(&proof), "proof failed at index {idx}");
+            assert!(
+                MerkleTree::verify_proof(&proof),
+                "proof failed at index {idx}"
+            );
         }
     }
 }

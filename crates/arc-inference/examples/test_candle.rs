@@ -1,11 +1,16 @@
 //! Test candle float backend with proper tokenizer from GGUF vocab.
 
-use arc_inference::candle_backend::GgufEngine;
 use arc_inference::cached_integer_model::load_cached_model;
+use arc_inference::candle_backend::GgufEngine;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or("/tmp/llama-2-7b-chat.Q4_K_M.gguf".into());
-    let max_tok: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(32);
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or("/tmp/llama-2-7b-chat.Q4_K_M.gguf".into());
+    let max_tok: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
 
     // Load integer model just for the tokenizer
     println!("Loading tokenizer from GGUF...");
@@ -31,20 +36,40 @@ fn main() {
         let mut tokens: Vec<u32> = vec![1]; // BOS
         tokens.extend(int_model.encode(prompt));
 
-        println!("\nPrompt: {:50} ({} tokens)", &prompt[..prompt.len().min(50)], tokens.len());
+        println!(
+            "\nPrompt: {:50} ({} tokens)",
+            &prompt[..prompt.len().min(50)],
+            tokens.len()
+        );
 
         let result = engine.generate(&model_id, &tokens, max_tok).unwrap();
 
-        let output_tokens: Vec<u32> = result.output.chunks(4)
-            .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
-                c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
+        let output_tokens: Vec<u32> = result
+            .output
+            .chunks(4)
+            .map(|c| {
+                u32::from_le_bytes([
+                    c[0],
+                    c.get(1).copied().unwrap_or(0),
+                    c.get(2).copied().unwrap_or(0),
+                    c.get(3).copied().unwrap_or(0),
+                ])
+            })
             .collect();
 
         let decoded = int_model.decode(&output_tokens);
-        let ms_tok = if result.tokens_used > 0 { result.elapsed_ms / result.tokens_used as u64 } else { 0 };
+        let ms_tok = if result.tokens_used > 0 {
+            result.elapsed_ms / result.tokens_used as u64
+        } else {
+            0
+        };
 
         println!("  Output: {:?}", &decoded[..decoded.len().min(120)]);
-        println!("  {} tok, {}ms/tok, hash=0x{}", result.tokens_used, ms_tok,
-            hex::encode(&result.output_hash.0[..8]));
+        println!(
+            "  {} tok, {}ms/tok, hash=0x{}",
+            result.tokens_used,
+            ms_tok,
+            hex::encode(&result.output_hash.0[..8])
+        );
     }
 }

@@ -63,7 +63,10 @@ fn main() {
                 label, n, log_rows, ms, size, note
             ),
             Err(e) => {
-                println!("{:<14} {:>12} {:>9} {:>11}   FAILED", label, n, log_rows, ms);
+                println!(
+                    "{:<14} {:>12} {:>9} {:>11}   FAILED",
+                    label, n, log_rows, ms
+                );
                 println!("   {e}");
                 break;
             }

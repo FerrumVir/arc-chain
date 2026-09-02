@@ -11,10 +11,11 @@ use arc_types::Transaction;
 use dashmap::DashMap;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::crypto::rustls::QuicServerConfig;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -27,10 +28,21 @@ const MAX_PEERS: u32 = 256;
 
 /// Target number of outbound peers. We maintain this many active outbound
 /// connections and accept inbound connections up to MAX_PEERS.
+//
+// Kept rather than deleted: this is the documented outbound-peer target for the
+// transport, but nothing reads it yet — the dial paths (bootstrap, persisted,
+// PEX, reconnect) are only bounded by MAX_PEERS. Deleting the constant would
+// erase the record of that gap, so it is allowed to stay unused until the
+// outbound-target logic is actually wired up.
+#[allow(dead_code)]
 const TARGET_OUTBOUND: u32 = 16;
 
 /// Per-peer message rate limit (messages per second).
 const PEER_MSG_RATE_LIMIT: u32 = 500;
+/// Per-peer payload-byte budget per second. Four maximum-size block/snapshot
+/// frames fit in one window; a fifth is rejected from its header before body
+/// allocation.
+const PEER_BYTE_RATE_LIMIT: u64 = 64 * 1024 * 1024;
 /// Rate limit window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 
@@ -41,10 +53,17 @@ const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 pub enum InboundMessage {
     PeerConnected {
         address: Hash256,
+        /// Signed handshake advertisement for diagnostics only. Consensus must
+        /// resolve voting stake and membership from the fixed validator set.
         stake: u64,
+        /// Monotonic process-local generation for this peer connection.
+        connection_id: u64,
     },
     PeerDisconnected {
         address: Hash256,
+        /// Generation that closed. Consensus ignores this event if a newer
+        /// connection for `address` is already live.
+        connection_id: u64,
     },
     DagBlockWithTxs {
         block: DagBlock,
@@ -52,8 +71,11 @@ pub enum InboundMessage {
     },
     Transactions(Vec<Vec<u8>>),
     /// State diff from a proposer node (Propose-Verify protocol).
-    /// Verifiers apply the diff and confirm the root matches.
+    /// `source` is the identity authenticated by the QUIC handshake. Consensus
+    /// must bind it to the author of `block_hash`; payload fields alone are not
+    /// an authorization boundary.
     StateDiff {
+        source: Hash256,
         block_hash: Hash256,
         diff: arc_types::StateDiff,
         block_height: u64,
@@ -78,14 +100,16 @@ pub enum InboundMessage {
         source: Hash256,
         chunk: arc_state::StateSnapshot,
     },
-    /// Inference request from another node - run model and respond.
+    /// Dormant legacy inference request. The current consensus consumer logs
+    /// this event but does not execute work from it.
     InferenceRequest {
         request_id: Hash256,
         input: String,
         max_tokens: u32,
         requester: Hash256,
     },
-    /// Inference response from a community GPU node.
+    /// Dormant legacy inference response. The current consensus consumer logs
+    /// this event but does not settle or route work from it.
     InferenceResponse {
         request_id: Hash256,
         output: String,
@@ -100,7 +124,7 @@ pub enum InboundMessage {
         dag_round: u64,
         committed_round: u64,
     },
-    /// Shard activation forward (pipeline-parallel inference).
+    /// Dormant legacy shard activation forward.
     ShardForward {
         request_id: Hash256,
         model_id: Hash256,
@@ -110,14 +134,14 @@ pub enum InboundMessage {
         activations: Vec<u8>,
         activation_hash: Hash256,
     },
-    /// Shard result (final token from last shard).
+    /// Dormant legacy shard result.
     ShardResult {
         request_id: Hash256,
         token_id: u32,
         logits_hash: Hash256,
         responder: Hash256,
     },
-    /// Shard announcement (node declares its layer/expert holdings).
+    /// Dormant legacy shard announcement.
     ShardAnnounce {
         model_id: Hash256,
         start_layer: u32,
@@ -154,14 +178,14 @@ pub enum OutboundMessage {
         diff: arc_types::StateDiff,
         block_height: u64,
     },
-    /// Broadcast inference request to all peers with model capability.
+    /// Dormant legacy P2P inference request surface.
     BroadcastInferenceRequest {
         request_id: Hash256,
         input: String,
         max_tokens: u32,
         requester: Hash256,
     },
-    /// Send inference response back to the requester.
+    /// Dormant legacy P2P inference response surface.
     SendInferenceResponse {
         request_id: Hash256,
         output: String,
@@ -170,17 +194,17 @@ pub enum OutboundMessage {
         ms_per_token: u64,
         responder: Hash256,
     },
-    /// Forward activations to next shard holder in pipeline.
+    /// Dormant legacy P2P shard-forward surface.
     SendShardForward {
         target: Hash256,
         message: crate::protocol::ShardForwardMessage,
     },
-    /// Send shard result back to coordinator.
+    /// Dormant legacy P2P shard-result surface.
     SendShardResult {
         target: Hash256,
         message: crate::protocol::ShardResultMessage,
     },
-    /// Broadcast shard announcement to all peers.
+    /// Dormant legacy P2P shard-announcement surface.
     BroadcastShardAnnounce {
         message: crate::protocol::ShardAnnounceMessage,
     },
@@ -207,16 +231,229 @@ pub enum OutboundMessage {
 
 // ─── TLS Configuration ─────────────────────────────────────────────────────
 
-fn make_server_config() -> quinn::ServerConfig {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("failed to generate self-signed cert");
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+fn validator_tls_identity(
+    keypair: &KeyPair,
+) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let KeyPair::Ed25519(signing_key) = keypair else {
+        anyhow::bail!("validator QUIC identity requires an Ed25519 validator key")
+    };
 
+    // RFC 8410 Ed25519 PrivateKeyInfo: the validator seed is wrapped in the
+    // inner CurvePrivateKey OCTET STRING. The resulting certificate's SPKI is
+    // therefore the exact public key from which the ARC validator address is
+    // derived; no second TLS identity is introduced.
+    let mut pkcs8 = Vec::with_capacity(48);
+    pkcs8.extend_from_slice(&[
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ]);
+    pkcs8.extend_from_slice(&signing_key.to_bytes());
+    let private_der = PrivatePkcs8KeyDer::from(pkcs8);
+    let certificate_key =
+        rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&private_der, &rcgen::PKCS_ED25519).map_err(
+            |error| anyhow::anyhow!("failed to import validator key for QUIC TLS: {error}"),
+        )?;
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|error| anyhow::anyhow!("failed to build validator certificate: {error}"))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        format!("arc-validator-{}", keypair.address().to_hex()),
+    );
+    let certificate = params
+        .self_signed(&certificate_key)
+        .map_err(|error| anyhow::anyhow!("failed to self-sign validator certificate: {error}"))?;
+    let cert_der = CertificateDer::from(certificate.der().to_vec());
+    let key_der = PrivatePkcs8KeyDer::from(certificate_key.serialize_der()).into();
+    Ok((cert_der, key_der))
+}
+
+fn validator_address_from_certificate(
+    certificate: &CertificateDer<'_>,
+) -> Result<Hash256, rustls::Error> {
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let parsed = webpki::EndEntityCert::try_from(certificate)
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let spki = parsed.subject_public_key_info();
+    let spki = spki.as_ref();
+    if spki.len() != ED25519_SPKI_PREFIX.len() + 32 || !spki.starts_with(&ED25519_SPKI_PREFIX) {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::BadEncoding,
+        ));
+    }
+    Ok(hash_bytes(&spki[ED25519_SPKI_PREFIX.len()..]))
+}
+
+fn peer_tls_validator_address(connection: &quinn::Connection) -> anyhow::Result<Hash256> {
+    let identity = connection
+        .peer_identity()
+        .ok_or_else(|| anyhow::anyhow!("QUIC peer did not present a validator certificate"))?;
+    let certificates = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| anyhow::anyhow!("QUIC peer identity is not a rustls certificate chain"))?;
+    anyhow::ensure!(
+        certificates.len() == 1,
+        "validator QUIC peer must present exactly one leaf certificate"
+    );
+    validator_address_from_certificate(&certificates[0])
+        .map_err(|error| anyhow::anyhow!("invalid validator QUIC certificate: {error}"))
+}
+
+#[derive(Debug)]
+struct ValidatorCertificateVerifier {
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    root_hints: Vec<rustls::DistinguishedName>,
+}
+
+impl ValidatorCertificateVerifier {
+    fn new(allowed_validators: Arc<HashSet<[u8; 32]>>) -> Self {
+        Self {
+            allowed_validators,
+            root_hints: Vec::new(),
+        }
+    }
+
+    fn verify_membership(&self, certificate: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+        let address = validator_address_from_certificate(certificate)?;
+        if !self.allowed_validators.contains(&address.0) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_tls12(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("rustls provider is installed before validator TLS construction");
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("rustls provider is installed before validator TLS construction");
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &provider.signature_verification_algorithms,
+        )
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for ValidatorCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        }
+        self.verify_membership(end_entity)?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls12(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for ValidatorCertificateVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &self.root_hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        }
+        self.verify_membership(end_entity)?;
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls12(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
+fn make_server_config(
+    keypair: &KeyPair,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+) -> anyhow::Result<quinn::ServerConfig> {
+    let (cert_der, key_der) = validator_tls_identity(keypair)?;
+    let client_verifier = Arc::new(ValidatorCertificateVerifier::new(allowed_validators));
     let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .expect("failed to build rustls server config");
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|error| {
+            anyhow::anyhow!("failed to build validator rustls server config: {error}")
+        })?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_crypto).expect("failed to create QUIC server config"),
@@ -231,196 +468,121 @@ fn make_server_config() -> quinn::ServerConfig {
     transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024)); // 64 MB
     transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024)); // 256 MB
 
-    server_config
+    Ok(server_config)
 }
 
-/// Build the QUIC client TLS configuration.
-///
-/// Without the `strict-tls` feature (default), this uses [`TestnetCertVerifier`]
-/// which accepts all server certificates. Peer identity is instead verified via
-/// application-layer challenge-response (see module docs on [`TestnetCertVerifier`]).
-///
-/// With `strict-tls` enabled, this panics at startup - certificate pinning is
-/// not yet implemented. This feature flag exists to prevent accidental production
-/// deployment without TLS-layer peer verification.
-fn make_client_config() -> quinn::ClientConfig {
-    #[cfg(feature = "strict-tls")]
-    {
-        // Production mode: accept any self-signed cert but verify the peer's
-        // identity via the application-layer challenge-response. The cert
-        // provides encryption; the handshake provides authentication.
-        // Full certificate pinning (fingerprint registry) is a future enhancement.
-        info!("strict-tls: TLS encryption enabled with application-layer peer auth");
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TestnetCertVerifier))
-            .with_no_client_auth();
+fn make_client_config(
+    keypair: &KeyPair,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    let (cert_der, key_der) = validator_tls_identity(keypair)?;
+    let server_verifier = Arc::new(ValidatorCertificateVerifier::new(allowed_validators));
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(server_verifier)
+        .with_client_auth_cert(vec![cert_der], key_der)
+        .map_err(|error| {
+            anyhow::anyhow!("failed to build validator rustls client config: {error}")
+        })?;
 
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
-        ));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
+    ));
 
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60)).unwrap(),
-        ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-        client_config.transport_config(Arc::new(transport));
+    // Keep connections alive and allow large payloads (testnet)
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
+    ));
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
+    client_config.transport_config(Arc::new(transport));
 
-        return client_config;
-    }
-
-    #[cfg(not(feature = "strict-tls"))]
-    {
-        warn!(
-            "TLS certificate verification is DISABLED - using TestnetCertVerifier. \
-             Peer identity is verified via application-layer challenge-response only. \
-             Do NOT use this configuration in production without enabling the `strict-tls` feature."
-        );
-
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TestnetCertVerifier))
-            .with_no_client_auth();
-
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
-        ));
-
-        // Keep connections alive and allow large payloads (testnet)
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
-        ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-        transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-        transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
-        client_config.transport_config(Arc::new(transport));
-
-        client_config
-    }
+    Ok(client_config)
 }
 
-// Certificate pinning (fingerprint registry) is a future enhancement.
-// The current security model: TLS provides encryption, application-layer
-// challenge-response provides peer identity verification via Ed25519.
+// ─── TLS-session-bound peer authentication ─────────────────────────────────
 
-/// TLS certificate verifier that accepts all certificates without validation.
-///
-/// # Security Model
-///
-/// In ARC Chain's permissioned validator network, peer identity is NOT verified
-/// at the TLS layer. Instead, the security model is:
-///
-/// 1. **TLS provides encryption only** - all QUIC traffic is encrypted in transit,
-///    preventing passive eavesdropping.
-/// 2. **Peer identity is verified at the application layer** via challenge-response
-///    authentication (see [`verify_handshake`]). Each peer must prove ownership of
-///    their validator private key by signing a random challenge. The public key is
-///    then verified to derive to the claimed validator address.
-/// 3. **Genesis hash binding** - peers must share the same genesis hash, preventing
-///    cross-network connections.
-///
-/// This means TLS cert verification is intentionally skipped: validators use
-/// ephemeral self-signed certificates, and there is no CA or cert registry.
-/// A MITM attacker who intercepts the QUIC connection would still fail the
-/// application-layer challenge-response, since they cannot forge a valid
-/// signature for a registered validator address.
-///
-/// # Production Hardening
-///
-/// For production, consider implementing certificate pinning via a validator
-/// cert registry so that TLS itself authenticates peers (defense in depth).
-/// Enable the `strict-tls` feature flag to enforce this - it will panic at
-/// startup until cert pinning is implemented, preventing accidental deployment
-/// without TLS verification.
-#[derive(Debug)]
-struct TestnetCertVerifier;
+const PEER_AUTH_EXPORTER_LABEL: &[u8] = b"EXPORTER-ARC-peer-auth-v3";
+const PEER_AUTH_EXPORTER_CONTEXT: &[u8] = b"arc-chain-validator-identity";
 
-impl rustls::client::danger::ServerCertVerifier for TestnetCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
+/// Derive a value unique to this QUIC/TLS session. Both endpoints obtain the
+/// same bytes; a recorded application handshake from another connection does
+/// not. This is the peer-issued freshness that the old sender-chosen nonce did
+/// not provide.
+fn connection_binding(connection: &quinn::Connection) -> anyhow::Result<[u8; 32]> {
+    let mut binding = [0u8; 32];
+    connection
+        .export_keying_material(
+            &mut binding,
+            PEER_AUTH_EXPORTER_LABEL,
+            PEER_AUTH_EXPORTER_CONTEXT,
+        )
+        .map_err(|error| anyhow::anyhow!("could not derive QUIC session binding: {error:?}"))?;
+    Ok(binding)
 }
 
-// ─── Challenge-Response Authentication ──────────────────────────────────────
-
-/// Compute the challenge hash: BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)
-fn compute_challenge(nonce: &[u8; 32], genesis_hash: &Hash256) -> Hash256 {
-    let mut hasher = blake3::Hasher::new_derive_key("ARC-peer-auth-v1");
-    hasher.update(nonce);
-    hasher.update(&genesis_hash.0);
+/// Canonical transcript for one peer identity proof. Every field that affects
+/// routing, membership compatibility, or diagnostics is authenticated.
+fn compute_handshake_challenge(message: &HandshakeMessage) -> Hash256 {
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-peer-auth-v3");
+    hasher.update(&message.nonce);
+    hasher.update(message.validator_address.as_ref());
+    hasher.update(&message.stake.to_le_bytes());
+    hasher.update(&message.listen_port.to_le_bytes());
+    hasher.update(message.genesis_hash.as_ref());
+    hasher.update(&(message.public_key.len() as u64).to_le_bytes());
+    hasher.update(&message.public_key);
+    hasher.update(&message.protocol_version.to_le_bytes());
+    hasher.update(&message.min_compatible_version.to_le_bytes());
+    hasher.update(&message.dag_round.to_le_bytes());
     Hash256(*hasher.finalize().as_bytes())
 }
 
-/// Create a signed handshake message.
+/// Create a handshake whose identity proof is bound to this QUIC session.
 fn make_signed_handshake(
     local_address: Hash256,
     local_stake: u64,
     listen_port: u16,
     genesis_hash: Hash256,
     keypair: &KeyPair,
+    session_binding: [u8; 32],
 ) -> HandshakeMessage {
-    let mut nonce = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-
-    let challenge = compute_challenge(&nonce, &genesis_hash);
-    let sig = keypair.sign(&challenge).expect("signing challenge failed");
-    let sig_bytes = bincode::serialize(&sig).unwrap_or_default();
-
-    HandshakeMessage {
+    let mut message = HandshakeMessage {
         validator_address: local_address,
         stake: local_stake,
         listen_port,
         genesis_hash,
         public_key: keypair.public_key_bytes(),
-        nonce,
-        challenge_sig: sig_bytes,
+        nonce: session_binding,
+        challenge_sig: Vec::new(),
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         min_compatible_version: crate::protocol::MIN_COMPATIBLE_VERSION,
         dag_round: 0, // filled in by caller if available
-    }
+    };
+    let challenge = compute_handshake_challenge(&message);
+    let signature = keypair
+        .sign(&challenge)
+        .expect("signing session-bound handshake failed");
+    message.challenge_sig =
+        bincode::serialize(&signature).expect("peer-auth signature is serializable");
+    message
 }
 
 /// Verify a peer's handshake: pubkey derives to claimed address, signature is valid,
-/// and protocol version is compatible.
-fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
+/// the proof belongs to this TLS session, and protocol version is compatible.
+fn verify_handshake(msg: &HandshakeMessage, expected_binding: &[u8; 32]) -> anyhow::Result<()> {
+    if &msg.nonce != expected_binding {
+        anyhow::bail!("peer identity proof belongs to a different QUIC session");
+    }
+    if msg.public_key.len() != 32 {
+        anyhow::bail!("peer Ed25519 public key must be exactly 32 bytes");
+    }
+    if msg.challenge_sig.len() > 1024 {
+        anyhow::bail!("peer identity signature exceeds the protocol bound");
+    }
+
     // 1. Verify public key derives to the claimed validator address
     let derived_address = hash_bytes(&msg.public_key);
     if derived_address != msg.validator_address {
@@ -431,72 +593,130 @@ fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
         );
     }
 
-    // 2. Verify the challenge signature
-    let challenge = compute_challenge(&msg.nonce, &msg.genesis_hash);
-    let sig: CryptoSignature = bincode::deserialize(&msg.challenge_sig)
+    // 2. Verify the session-bound, full-transcript signature.
+    let challenge = compute_handshake_challenge(msg);
+    let sig: CryptoSignature = deserialize_message(&msg.challenge_sig)
         .map_err(|e| anyhow::anyhow!("failed to deserialize challenge signature: {e}"))?;
+    let CryptoSignature::Ed25519 { public_key, .. } = &sig else {
+        anyhow::bail!("peer identity proof must use Ed25519");
+    };
+    if public_key.as_slice() != msg.public_key.as_slice() {
+        anyhow::bail!("peer identity signature key does not match handshake public key");
+    }
     sig.verify(&challenge, &msg.validator_address)
         .map_err(|e| anyhow::anyhow!("challenge signature verification failed: {e}"))?;
 
     // 3. Protocol version compatibility check.
     // Treat version 0 as v1 (old nodes that don't send protocol_version).
-    let peer_version = if msg.protocol_version == 0 { 1 } else { msg.protocol_version };
-    let peer_min = if msg.min_compatible_version == 0 { 1 } else { msg.min_compatible_version };
+    let peer_version = if msg.protocol_version == 0 {
+        1
+    } else {
+        msg.protocol_version
+    };
+    let peer_min = if msg.min_compatible_version == 0 {
+        1
+    } else {
+        msg.min_compatible_version
+    };
 
-    if peer_min > crate::protocol::PROTOCOL_VERSION {
-        anyhow::bail!(
-            "peer requires protocol version >= {} but we are at {}",
-            peer_min, crate::protocol::PROTOCOL_VERSION
-        );
-    }
-    if peer_version < crate::protocol::MIN_COMPATIBLE_VERSION {
+    if !crate::protocol::protocol_ranges_overlap(
+        crate::protocol::PROTOCOL_VERSION,
+        crate::protocol::MIN_COMPATIBLE_VERSION,
+        peer_version,
+        peer_min,
+    ) {
+        if peer_min > crate::protocol::PROTOCOL_VERSION {
+            anyhow::bail!(
+                "peer requires protocol version >= {} but we are at {}",
+                peer_min,
+                crate::protocol::PROTOCOL_VERSION
+            );
+        }
         anyhow::bail!(
             "peer protocol version {} is below our minimum {}",
-            peer_version, crate::protocol::MIN_COMPATIBLE_VERSION
+            peer_version,
+            crate::protocol::MIN_COMPATIBLE_VERSION
         );
     }
 
     tracing::debug!(
         "Peer {} handshake OK: protocol v{}, dag_round={}",
-        msg.validator_address, peer_version, msg.dag_round
+        msg.validator_address,
+        peer_version,
+        msg.dag_round
     );
 
     Ok(())
 }
 
+/// Payloads may repeat a sender identity for routing, but that declaration is
+/// never an authentication boundary. Only the identity proven by the QUIC
+/// handshake is authoritative.
+fn payload_identity_is_authenticated(
+    authenticated_peer: &Hash256,
+    declared_identity: &Hash256,
+) -> bool {
+    authenticated_peer == declared_identity
+}
+
 // ─── Per-Peer Rate Limiter ───────────────────────────────────────────────────
 
-/// Per-peer rate limiting: address -> (message_count, window_start_epoch_secs)
+#[derive(Clone, Copy)]
+struct PeerRateWindow {
+    message_count: u32,
+    payload_bytes: u64,
+    window_start_epoch_secs: u64,
+}
+
+/// Per-peer rate limiting, keyed by the identity authenticated during the QUIC
+/// handshake. Both message and byte budgets are checked from the five-byte
+/// frame header before allocating the payload.
 struct PeerRateLimiter {
-    counters: DashMap<Hash256, (u32, u64)>,
+    counters: DashMap<Hash256, PeerRateWindow>,
 }
 
 impl PeerRateLimiter {
     fn new() -> Self {
-        Self { counters: DashMap::new() }
+        Self {
+            counters: DashMap::new(),
+        }
     }
 
-    /// Returns true if the message should be allowed, false if rate-limited.
-    fn allow(&self, peer: &Hash256) -> bool {
+    /// Returns true if the frame should be allowed, false if rate-limited.
+    fn allow(&self, peer: &Hash256, payload_len: u32) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        self.allow_at(peer, payload_len, now)
+    }
 
-        let mut entry = self.counters.entry(*peer).or_insert((0, now));
-        let (count, window_start) = entry.value_mut();
+    fn allow_at(&self, peer: &Hash256, payload_len: u32, now: u64) -> bool {
+        let payload_len = u64::from(payload_len);
+        let mut entry = self.counters.entry(*peer).or_insert(PeerRateWindow {
+            message_count: 0,
+            payload_bytes: 0,
+            window_start_epoch_secs: now,
+        });
+        let window = entry.value_mut();
 
-        if now - *window_start >= RATE_LIMIT_WINDOW_SECS {
-            // Reset window
-            *count = 1;
-            *window_start = now;
-            true
-        } else if *count >= PEER_MSG_RATE_LIMIT {
-            false
-        } else {
-            *count += 1;
-            true
+        if now.saturating_sub(window.window_start_epoch_secs) >= RATE_LIMIT_WINDOW_SECS {
+            *window = PeerRateWindow {
+                message_count: 0,
+                payload_bytes: 0,
+                window_start_epoch_secs: now,
+            };
         }
+
+        if window.message_count >= PEER_MSG_RATE_LIMIT
+            || payload_len > PEER_BYTE_RATE_LIMIT.saturating_sub(window.payload_bytes)
+        {
+            return false;
+        }
+
+        window.message_count += 1;
+        window.payload_bytes += payload_len;
+        true
     }
 
     fn remove_peer(&self, peer: &Hash256) {
@@ -506,8 +726,11 @@ impl PeerRateLimiter {
 
 // ─── Peer Connection Map ────────────────────────────────────────────────────
 
-/// Metadata for a connected peer (dial address + stake).
-struct PeerMeta {
+/// One live peer generation. Keeping stream and metadata in the same DashMap
+/// entry makes replacement/removal atomic for a validator address.
+struct PeerConnection<S> {
+    connection_id: u64,
+    send: S,
     /// The address to dial this peer at (IP from connection + listen_port from handshake).
     dial_addr: SocketAddr,
     /// The peer's self-reported stake.
@@ -515,22 +738,67 @@ struct PeerMeta {
 }
 
 /// Tracks active peer send streams and metadata for outbound broadcast.
-struct PeerConnections {
-    peers: DashMap<[u8; 32], quinn::SendStream>,
-    meta: DashMap<[u8; 32], PeerMeta>,
+struct PeerConnections<S = quinn::SendStream> {
+    peers: DashMap<[u8; 32], PeerConnection<S>>,
+    next_connection_id: AtomicU64,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
 }
 
-impl PeerConnections {
-    fn new() -> Self {
+impl<S> PeerConnections<S> {
+    fn new(inbound_tx: mpsc::Sender<InboundMessage>, peer_count: Arc<AtomicU32>) -> Self {
         Self {
             peers: DashMap::new(),
-            meta: DashMap::new(),
+            // Zero is reserved as "no generation" in diagnostics/tests.
+            next_connection_id: AtomicU64::new(1),
+            inbound_tx,
+            peer_count,
         }
     }
 
-    /// Store peer metadata after successful handshake.
-    fn insert_meta(&self, key: [u8; 32], dial_addr: SocketAddr, stake: u64) {
-        self.meta.insert(key, PeerMeta { dial_addr, stake });
+    /// Atomically install the newest authenticated connection generation for
+    /// one fixed validator identity.
+    ///
+    /// A clean process restart can leave the remote QUIC generation writable
+    /// in the kernel for substantially longer than the validator process is
+    /// alive. Refusing the replacement until that stale stream times out makes
+    /// a rolling restart look like a partition. The validator TLS certificate
+    /// and exporter-bound handshake are verified before this method is called,
+    /// so replacing this one identity's slot cannot admit a new member or grow
+    /// the fixed connection set. Generation-checked cleanup below prevents the
+    /// superseded reader from removing its replacement.
+    fn install_generation(
+        &self,
+        key: [u8; 32],
+        send: S,
+        dial_addr: SocketAddr,
+        stake: u64,
+    ) -> (u64, Option<u64>) {
+        use dashmap::mapref::entry::Entry;
+
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        match self.peers.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let previous_id = entry.get().connection_id;
+                entry.insert(PeerConnection {
+                    connection_id,
+                    send,
+                    dial_addr,
+                    stake,
+                });
+                (connection_id, Some(previous_id))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(PeerConnection {
+                    connection_id,
+                    send,
+                    dial_addr,
+                    stake,
+                });
+                self.peer_count.fetch_add(1, Ordering::Relaxed);
+                (connection_id, None)
+            }
+        }
     }
 
     /// Check if a peer is currently connected by validator address bytes.
@@ -538,54 +806,129 @@ impl PeerConnections {
         self.peers.contains_key(key)
     }
 
+    /// Remove only the exact connection generation that failed. If a reconnect
+    /// has already installed a newer generation, the stale cleanup is a no-op.
+    fn remove_if_current(&self, key: &[u8; 32], connection_id: u64) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        match self.peers.entry(*key) {
+            Entry::Occupied(entry) if entry.get().connection_id == connection_id => {
+                entry.remove();
+                self.peer_count.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl PeerConnections<quinn::SendStream> {
+    async fn remove_and_notify(&self, address: Hash256, connection_id: u64) -> bool {
+        if !self.remove_if_current(&address.0, connection_id) {
+            return false;
+        }
+        let _ = self
+            .inbound_tx
+            .send(InboundMessage::PeerDisconnected {
+                address,
+                connection_id,
+            })
+            .await;
+        true
+    }
+
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
+        if payload.len() > MAX_PAYLOAD_SIZE as usize {
+            error!(
+                ?msg_type,
+                payload_len = payload.len(),
+                "Refusing oversized outbound P2P broadcast"
+            );
+            return;
+        }
         // Snapshot peer keys first - do NOT hold DashMap shard locks during
         // network I/O. The old code held iter_mut() locks for the entire
         // broadcast, which blocked peer insert/remove operations for seconds.
-        let peer_keys: Vec<[u8; 32]> = self.peers.iter().map(|e| *e.key()).collect();
+        let peer_keys: Vec<([u8; 32], u64)> = self
+            .peers
+            .iter()
+            .map(|e| (*e.key(), e.connection_id))
+            .collect();
         let peer_count = peer_keys.len();
         let mut sent = 0usize;
         let mut dead_peers = Vec::new();
-        for key in &peer_keys {
+        for (key, connection_id) in &peer_keys {
             if let Some(mut entry) = self.peers.get_mut(key) {
+                if entry.connection_id != *connection_id {
+                    continue;
+                }
                 // 5-second timeout per peer prevents one slow/dead peer from
                 // blocking the entire outbound fanout task, which was the
                 // secondary cause of the P2P channel filling up.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    write_message(entry.value_mut(), msg_type, payload),
-                ).await {
-                    Ok(Ok(())) => { sent += 1; }
+                    write_message(&mut entry.send, msg_type, payload),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        sent += 1;
+                    }
                     Ok(Err(e)) => {
                         warn!("Failed to send to peer: {}", e);
-                        dead_peers.push(*key);
+                        dead_peers.push((*key, *connection_id));
                     }
                     Err(_) => {
                         warn!("Timeout writing to peer, removing dead connection");
-                        dead_peers.push(*key);
+                        dead_peers.push((*key, *connection_id));
                     }
                 }
             }
         }
-        for key in dead_peers {
-            self.peers.remove(&key);
-            self.meta.remove(&key);
+        for (key, connection_id) in dead_peers {
+            self.remove_and_notify(Hash256(key), connection_id).await;
         }
         if msg_type == MessageType::DagBlockWithTxs && peer_count > 0 {
-            debug!("Broadcast {:?}: sent to {}/{} peers ({} bytes)", msg_type, sent, peer_count, payload.len());
+            debug!(
+                "Broadcast {:?}: sent to {}/{} peers ({} bytes)",
+                msg_type,
+                sent,
+                peer_count,
+                payload.len()
+            );
         }
     }
 
     /// Send a message to a specific peer by validator address.
     async fn send_to(&self, target: &Hash256, msg_type: MessageType, payload: &[u8]) {
-        if let Some(mut entry) = self.peers.get_mut(&target.0) {
-            if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
+        if payload.len() > MAX_PAYLOAD_SIZE as usize {
+            error!(
+                ?msg_type,
+                payload_len = payload.len(),
+                target = %target,
+                "Refusing oversized outbound P2P message"
+            );
+            return;
+        }
+        let failed_generation = if let Some(mut entry) = self.peers.get_mut(&target.0) {
+            let connection_id = entry.connection_id;
+            if let Err(e) = write_message(&mut entry.send, msg_type, payload).await {
                 warn!("Failed to send {:?} to {}: {}", msg_type, target, e);
-                self.peers.remove(&target.0);
-                self.meta.remove(&target.0);
+                Some(connection_id)
+            } else {
+                None
             }
         } else {
-            debug!("send_to: peer {} not connected, cannot send {:?}", target, msg_type);
+            debug!(
+                "send_to: peer {} not connected, cannot send {:?}",
+                target, msg_type
+            );
+            None
+        };
+        // The DashMap guard above must be dropped before removal. The old code
+        // attempted `remove` while holding `get_mut`, which can deadlock.
+        if let Some(connection_id) = failed_generation {
+            self.remove_and_notify(*target, connection_id).await;
         }
     }
 }
@@ -596,18 +939,185 @@ impl PeerConnections {
 ///
 /// Binds a QUIC endpoint, dials bootstrap peers, accepts incoming connections,
 /// and bridges network I/O to/from the consensus layer via channels.
+//
+// Collapsing these into a config struct would be a breaking change to a public
+// entry point that arc-node and arc-bench both call, and those crates are out of
+// scope for this change, so the argument list stays as-is.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_transport(
     listen_addr: SocketAddr,
     bootstrap_peers: Vec<SocketAddr>,
     local_address: Hash256,
     local_stake: u64,
     genesis_hash: Hash256,
-    mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    outbound_rx: mpsc::Receiver<OutboundMessage>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
     local_keypair: KeyPair,
     data_dir: String,
 ) {
+    run_transport_inner(
+        listen_addr,
+        bootstrap_peers,
+        local_address,
+        local_stake,
+        genesis_hash,
+        allowed_validators,
+        outbound_rx,
+        inbound_tx,
+        peer_count,
+        local_keypair,
+        data_dir,
+        None,
+        None,
+    )
+    .await;
+}
+
+/// Start validator transport and report only after the authenticated QUIC
+/// endpoint is fully bound and its client configuration is installed. A
+/// production node must await this signal before starting consensus; otherwise
+/// a TLS/key/bind failure could leave a validator executing in isolation.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_transport_with_readiness(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<SocketAddr>,
+    local_address: Hash256,
+    local_stake: u64,
+    genesis_hash: Hash256,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    outbound_rx: mpsc::Receiver<OutboundMessage>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
+    startup: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
+) {
+    run_transport_inner(
+        listen_addr,
+        bootstrap_peers,
+        local_address,
+        local_stake,
+        genesis_hash,
+        allowed_validators,
+        outbound_rx,
+        inbound_tx,
+        peer_count,
+        local_keypair,
+        data_dir,
+        Some(startup),
+        None,
+    )
+    .await;
+}
+
+/// Start validator transport with the same readiness contract as
+/// [`run_transport_with_readiness`], then stop accepting/dialing peers when the
+/// node lifecycle requests shutdown. The future returns only after the QUIC
+/// endpoint is closed and the transport-owned fanout and peer-maintenance tasks
+/// have stopped.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_transport_with_readiness_and_shutdown(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<SocketAddr>,
+    local_address: Hash256,
+    local_stake: u64,
+    genesis_hash: Hash256,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    outbound_rx: mpsc::Receiver<OutboundMessage>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
+    startup: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    run_transport_inner(
+        listen_addr,
+        bootstrap_peers,
+        local_address,
+        local_stake,
+        genesis_hash,
+        allowed_validators,
+        outbound_rx,
+        inbound_tx,
+        peer_count,
+        local_keypair,
+        data_dir,
+        Some(startup),
+        Some(shutdown),
+    )
+    .await;
+}
+
+fn report_transport_startup_failure(
+    startup: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
+    message: String,
+) {
+    if let Some(sender) = startup.take() {
+        let _ = sender.send(Err(message));
+    }
+}
+
+async fn wait_for_transport_shutdown(receiver: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(receiver) = receiver.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        if receiver.changed().await.is_err() {
+            // Dropping the lifecycle owner means the transport can no longer
+            // prove it is supervised. Fail closed by stopping network input.
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_transport_inner(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<SocketAddr>,
+    local_address: Hash256,
+    local_stake: u64,
+    genesis_hash: Hash256,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
+    mut startup: Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if allowed_validators.is_empty() || !allowed_validators.contains(&local_address.0) {
+        let message = format!(
+            "P2P transport requires a non-empty fixed validator allowlist containing local identity {local_address}"
+        );
+        error!(
+            local = %local_address,
+            allowed = allowed_validators.len(),
+            %message
+        );
+        report_transport_startup_failure(&mut startup, message);
+        return;
+    }
+    if local_keypair.address() != local_address {
+        let message = format!(
+            "P2P transport local address {local_address} does not match validator key {}",
+            local_keypair.address()
+        );
+        error!(
+            declared = %local_address,
+            key_address = %local_keypair.address(),
+            %message
+        );
+        report_transport_startup_failure(&mut startup, message);
+        return;
+    }
     // ── Install rustls crypto provider (required for rustls 0.23+) ─────
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -634,23 +1144,45 @@ pub async fn run_transport(
     // (peers can't dial it on a known port). That is fine for the
     // residential consumers this fallback exists for — they're behind
     // NAT and never accept unsolicited inbound anyway.
-    let server_config = make_server_config();
+    let server_config = match make_server_config(&local_keypair, allowed_validators.clone()) {
+        Ok(config) => config,
+        Err(error) => {
+            let message =
+                format!("failed to construct validator-authenticated QUIC server: {error}");
+            error!(%message);
+            report_transport_startup_failure(&mut startup, message);
+            return;
+        }
+    };
     let configured_addr = listen_addr;
     let mut endpoint = {
         let mut bound: Option<quinn::Endpoint> = None;
         for attempt in 0..5 {
             match quinn::Endpoint::server(server_config.clone(), configured_addr) {
-                Ok(ep) => { bound = Some(ep); break; }
+                Ok(ep) => {
+                    bound = Some(ep);
+                    break;
+                }
                 Err(e) => {
                     warn!(
                         "QUIC bind on {} attempt {} failed: {} - retrying in 2s",
-                        configured_addr, attempt + 1, e
+                        configured_addr,
+                        attempt + 1,
+                        e
                     );
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
             }
         }
         if bound.is_none() {
+            if local_stake > 0 {
+                let message = format!(
+                    "staked validator cannot bind configured QUIC address {configured_addr}; refusing an unreachable ephemeral identity"
+                );
+                error!(configured = %configured_addr, %message);
+                report_transport_startup_failure(&mut startup, message);
+                return;
+            }
             let fallback = SocketAddr::new(configured_addr.ip(), 0);
             match quinn::Endpoint::server(server_config.clone(), fallback) {
                 Ok(ep) => {
@@ -660,17 +1192,17 @@ pub async fn run_transport(
                          will participate normally as a consumer/observer but cannot \
                          accept inbound dials as a public seed. Common cause on \
                          Windows: Hyper-V's dynamic UDP exclusion range covers {}.",
-                        configured_addr.port(), configured_addr.port()
+                        configured_addr.port(),
+                        configured_addr.port()
                     );
                     bound = Some(ep);
                 }
                 Err(e) => {
-                    error!(
-                        "QUIC bind failed on configured {} AND on ephemeral fallback: \
-                         {}. The OS likely does not permit this process to bind UDP \
-                         at all - check firewall/EDR policy.",
-                        configured_addr, e
+                    let message = format!(
+                        "QUIC bind failed on configured {configured_addr} and ephemeral fallback: {e}"
                     );
+                    error!(%message);
+                    report_transport_startup_failure(&mut startup, message);
                     return;
                 }
             }
@@ -678,7 +1210,17 @@ pub async fn run_transport(
         bound.unwrap()
     };
     // Set client config for outgoing connections on the same endpoint
-    endpoint.set_default_client_config(make_client_config());
+    let client_config = match make_client_config(&local_keypair, allowed_validators.clone()) {
+        Ok(config) => config,
+        Err(error) => {
+            let message =
+                format!("failed to construct validator-authenticated QUIC client: {error}");
+            error!(%message);
+            report_transport_startup_failure(&mut startup, message);
+            return;
+        }
+    };
+    endpoint.set_default_client_config(client_config);
 
     // Shadow the parameter with the actual bound address. If we fell
     // back to ephemeral, every downstream handshake/self-skip uses the
@@ -693,10 +1235,22 @@ pub async fn run_transport(
     } else {
         info!("P2P transport listening on {}", listen_addr);
     }
+    if let Some(sender) = startup.take() {
+        let _ = sender.send(Ok(listen_addr));
+    }
 
-    let connections = Arc::new(PeerConnections::new());
+    let connections = Arc::new(PeerConnections::new(inbound_tx.clone(), peer_count.clone()));
     let rate_limiter = Arc::new(PeerRateLimiter::new());
     let keypair = Arc::new(local_keypair);
+    let local_identity = LocalPeerIdentity {
+        address: local_address,
+        advertised_stake: local_stake,
+        listen_port: listen_addr.port(),
+        genesis_hash,
+    };
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(
+        allowed_validators.len().saturating_mul(2).max(8),
+    ));
 
     // ── PEX auto-dial channel ───────────────────────────────────────────
     let (pex_dial_tx, mut pex_dial_rx) = mpsc::channel::<SocketAddr>(64);
@@ -708,17 +1262,21 @@ pub async fn run_transport(
         for peer_addr in &bootstrap_peers {
             // Skip self - check loopback, listen_addr, AND local interfaces
             // (our public IP is in the seeds file but listen_addr is 0.0.0.0).
-            // ARC_ALLOW_LOOPBACK_PEERS=1 relaxes the loopback/local-iface checks
-            // so multiple arc-node processes on a single host can peer over
-            // 127.0.0.1 — used by scripts/arc-multi-start.sh for tier1 testing.
+            // Distinct loopback ports are valid peers (local clusters and the
+            // integration harness rely on this). ARC_ALLOW_LOOPBACK_PEERS=1
+            // additionally relaxes the non-loopback local-interface check so
+            // multiple nodes can use the host's LAN/public addresses.
             if peer_addr == &listen_addr {
                 continue;
             }
             if !allow_loopback_peers {
                 if peer_addr.ip().is_loopback() {
-                    continue;
-                }
-                if std::net::UdpSocket::bind(SocketAddr::new(peer_addr.ip(), 0)).is_ok() {
+                    if peer_addr.port() == listen_addr.port() {
+                        continue;
+                    }
+                    // A different 127.0.0.1 port is another local node, not
+                    // this listener. Let the authenticated handshake decide.
+                } else if std::net::UdpSocket::bind(SocketAddr::new(peer_addr.ip(), 0)).is_ok() {
                     info!("Skipping self-dial to {} (local interface)", peer_addr);
                     continue;
                 }
@@ -728,14 +1286,15 @@ pub async fn run_transport(
             info!("Dialing bootstrap peer {}", peer_addr);
             let ep = endpoint.clone();
             let addr = *peer_addr;
-            let handshake_msg = make_signed_handshake(
-                local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+            let ctx = PeerContext::new(
+                local_identity,
+                &keypair,
+                &connections,
+                &inbound_tx,
+                &pex_dial_tx,
+                &rate_limiter,
+                &allowed_validators,
             );
-            let c = connections.clone();
-            let itx = inbound_tx.clone();
-            let pc = peer_count.clone();
-            let pdt = pex_dial_tx.clone();
-            let rl = rate_limiter.clone();
             dial_handles.push(tokio::spawn(async move {
                 // Try up to 3 times with increasing timeouts. Intercontinental
                 // QUIC handshakes (e.g., US→Singapore) can need >5s on first attempt.
@@ -743,15 +1302,20 @@ pub async fn run_transport(
                     let timeout_secs = 5 * attempt as u64; // 5s, 10s, 15s
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(timeout_secs),
-                        dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
-                    ).await {
+                        dial_peer(&ep, addr, &ctx),
+                    )
+                    .await
+                    {
                         Ok(Ok(())) => {
                             info!("Connected to bootstrap peer {} (attempt {})", addr, attempt);
                             break;
                         }
                         Ok(Err(e)) => {
                             if attempt < 3 {
-                                warn!("Failed to connect to {} (attempt {}): {} - retrying", addr, attempt, e);
+                                warn!(
+                                    "Failed to connect to {} (attempt {}): {} - retrying",
+                                    addr, attempt, e
+                                );
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             } else {
                                 warn!("Failed to connect to {} after 3 attempts: {}", addr, e);
@@ -759,9 +1323,15 @@ pub async fn run_transport(
                         }
                         Err(_) => {
                             if attempt < 3 {
-                                warn!("Timeout connecting to {} ({}s, attempt {}) - retrying", addr, timeout_secs, attempt);
+                                warn!(
+                                    "Timeout connecting to {} ({}s, attempt {}) - retrying",
+                                    addr, timeout_secs, attempt
+                                );
                             } else {
-                                warn!("Timeout connecting to {} after 3 attempts ({}s each)", addr, timeout_secs);
+                                warn!(
+                                    "Timeout connecting to {} after 3 attempts ({}s each)",
+                                    addr, timeout_secs
+                                );
                             }
                         }
                     }
@@ -772,34 +1342,34 @@ pub async fn run_transport(
         for h in dial_handles {
             let _ = h.await;
         }
-        info!("Bootstrap dial phase complete, {} peers connected", peer_count.load(Ordering::Relaxed));
+        info!(
+            "Bootstrap dial phase complete, {} peers connected",
+            peer_count.load(Ordering::Relaxed)
+        );
     }
 
     // ── Dial persisted peers (from previous sessions) ───────────────────
     let persisted_peers = load_peers_from_disk(&data_dir);
     if !persisted_peers.is_empty() {
-        info!("Loading {} persisted peers from disk", persisted_peers.len());
+        info!(
+            "Loading {} persisted peers from disk",
+            persisted_peers.len()
+        );
     }
     for peer_addr in &persisted_peers {
         if bootstrap_peers.contains(peer_addr) {
             continue;
         }
-        let handshake_msg = make_signed_handshake(
-            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
-        );
-        match dial_peer(
-            &endpoint,
-            *peer_addr,
-            &handshake_msg,
-            local_address,
+        let ctx = PeerContext::new(
+            local_identity,
+            &keypair,
             &connections,
             &inbound_tx,
-            &peer_count,
             &pex_dial_tx,
             &rate_limiter,
-        )
-        .await
-        {
+            &allowed_validators,
+        );
+        match dial_peer(&endpoint, *peer_addr, &ctx).await {
             Ok(()) => info!("Connected to persisted peer {}", peer_addr),
             Err(e) => debug!("Failed to connect to persisted peer {}: {}", peer_addr, e),
         }
@@ -807,8 +1377,17 @@ pub async fn run_transport(
 
     // ── Spawn outbound fanout task ──────────────────────────────────────
     let conn_out = connections.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
+    let mut outbound_shutdown = shutdown.clone();
+    let outbound_task = tokio::spawn(async move {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = wait_for_transport_shutdown(&mut outbound_shutdown) => break,
+                message = outbound_rx.recv() => message,
+            };
+            let Some(msg) = msg else {
+                break;
+            };
             match msg {
                 OutboundMessage::BroadcastDagBlock {
                     block,
@@ -825,12 +1404,20 @@ pub async fn run_transport(
                     }
                 }
                 OutboundMessage::BroadcastTransactions(txs) => {
-                    let payload = crate::protocol::TxGossipMessage { transactions: txs };
-                    if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.broadcast(MessageType::TxGossip, &bytes).await;
+                    for batch in txs.chunks(crate::MAX_TX_PER_GOSSIP) {
+                        let payload = crate::protocol::TxGossipMessage {
+                            transactions: batch.to_vec(),
+                        };
+                        if let Ok(bytes) = bincode::serialize(&payload) {
+                            conn_out.broadcast(MessageType::TxGossip, &bytes).await;
+                        }
                     }
                 }
-                OutboundMessage::BroadcastStateDiff { block_hash, diff, block_height } => {
+                OutboundMessage::BroadcastStateDiff {
+                    block_hash,
+                    diff,
+                    block_height,
+                } => {
                     let payload = crate::protocol::StateDiffMessage {
                         block_hash,
                         diff,
@@ -840,30 +1427,58 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::StateDiff, &bytes).await;
                     }
                 }
-                OutboundMessage::BroadcastInferenceRequest { request_id, input, max_tokens, requester } => {
+                OutboundMessage::BroadcastInferenceRequest {
+                    request_id,
+                    input,
+                    max_tokens,
+                    requester,
+                } => {
                     let payload = crate::protocol::InferenceRequestMessage {
-                        request_id, input, max_tokens, requester,
+                        request_id,
+                        input,
+                        max_tokens,
+                        requester,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.broadcast(MessageType::InferenceRequest, &bytes).await;
+                        conn_out
+                            .broadcast(MessageType::InferenceRequest, &bytes)
+                            .await;
                     }
                 }
-                OutboundMessage::SendInferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
+                OutboundMessage::SendInferenceResponse {
+                    request_id,
+                    output,
+                    output_hash,
+                    model_hash,
+                    ms_per_token,
+                    responder,
+                } => {
                     let payload = crate::protocol::InferenceResponseMessage {
-                        request_id, output, output_hash, model_hash, ms_per_token, responder,
+                        request_id,
+                        output,
+                        output_hash,
+                        model_hash,
+                        ms_per_token,
+                        responder,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.broadcast(MessageType::InferenceResponse, &bytes).await;
+                        conn_out
+                            .broadcast(MessageType::InferenceResponse, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::SendShardForward { target, message } => {
                     if let Ok(bytes) = bincode::serialize(&message) {
-                        conn_out.send_to(&target, MessageType::ShardForward, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::ShardForward, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::SendShardResult { target, message } => {
                     if let Ok(bytes) = bincode::serialize(&message) {
-                        conn_out.send_to(&target, MessageType::ShardResult, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::ShardResult, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::BroadcastShardAnnounce { message } => {
@@ -871,7 +1486,10 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::ShardAnnounce, &bytes).await;
                     }
                 }
-                OutboundMessage::BroadcastHeartbeatWithRound { dag_round, committed_round } => {
+                OutboundMessage::BroadcastHeartbeatWithRound {
+                    dag_round,
+                    committed_round,
+                } => {
                     let payload = crate::protocol::HeartbeatMessage {
                         dag_round,
                         committed_round,
@@ -881,16 +1499,28 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::Heartbeat, &bytes).await;
                     }
                 }
-                OutboundMessage::SendRoundSyncRequest { target, my_round, my_committed } => {
+                OutboundMessage::SendRoundSyncRequest {
+                    target,
+                    my_round,
+                    my_committed,
+                } => {
                     let payload = crate::protocol::RoundSyncRequestMessage {
                         my_round,
                         my_committed,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.send_to(&target, MessageType::RoundSyncRequest, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::RoundSyncRequest, &bytes)
+                            .await;
                     }
                 }
-                OutboundMessage::SendRoundSyncResponse { target, current_round, last_committed_round, validator_count, total_stake } => {
+                OutboundMessage::SendRoundSyncResponse {
+                    target,
+                    current_round,
+                    last_committed_round,
+                    validator_count,
+                    total_stake,
+                } => {
                     let payload = crate::protocol::RoundSyncResponseMessage {
                         current_round,
                         last_committed_round,
@@ -898,7 +1528,9 @@ pub async fn run_transport(
                         total_stake,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.send_to(&target, MessageType::RoundSyncResponse, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::RoundSyncResponse, &bytes)
+                            .await;
                     }
                 }
             }
@@ -919,16 +1551,17 @@ pub async fn run_transport(
 
     // ── Spawn PEX + reconnect as independent task ──────────────────
     // This prevents the accept loop from starving timer-driven work.
-    {
+    let pex_task = {
         let conn_bg = connections.clone();
         let bp = bootstrap_peers.clone();
         let ep = endpoint.clone();
         let kp = keypair.clone();
         let itx = inbound_tx.clone();
-        let pc = peer_count.clone();
         let pdt = pex_dial_tx.clone();
         let rl = rate_limiter.clone();
+        let av = allowed_validators.clone();
         let dd = data_dir.clone();
+        let mut pex_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
             pex_tick.tick().await;
@@ -940,10 +1573,11 @@ pub async fn run_transport(
             recon_tick.tick().await;
             loop {
                 tokio::select! {
+                    biased;
+                    _ = wait_for_transport_shutdown(&mut pex_shutdown) => break,
                     _ = pex_tick.tick() => {
                         let mut all_peers: Vec<crate::protocol::PexPeerInfo> = conn_bg
-                            .meta.iter()
-                            .filter(|e| conn_bg.peers.contains_key(e.key()))
+                            .peers.iter()
                             .map(|entry| crate::protocol::PexPeerInfo {
                                 address: Hash256(*entry.key()),
                                 socket_addr: entry.value().dial_addr.to_string(),
@@ -973,25 +1607,34 @@ pub async fn run_transport(
                         // peer stream. Dead QUIC streams fail immediately, letting us
                         // prune stale entries that would otherwise block reconnect.
                         {
-                            let peer_keys: Vec<[u8; 32]> = conn_bg.peers.iter().map(|e| *e.key()).collect();
+                            let peer_keys: Vec<([u8; 32], u64)> = conn_bg
+                                .peers
+                                .iter()
+                                .map(|e| (*e.key(), e.connection_id))
+                                .collect();
                             let mut dead = Vec::new();
-                            for key in &peer_keys {
+                            for (key, connection_id) in &peer_keys {
                                 if let Some(mut entry) = conn_bg.peers.get_mut(key) {
+                                    if entry.connection_id != *connection_id {
+                                        continue;
+                                    }
                                     // Write a Heartbeat message (type 0, empty payload)
-                                    if write_message(entry.value_mut(), MessageType::Heartbeat, &[]).await.is_err() {
-                                        dead.push(*key);
+                                    if write_message(&mut entry.send, MessageType::Heartbeat, &[]).await.is_err() {
+                                        dead.push((*key, *connection_id));
                                     }
                                 }
                             }
-                            for key in &dead {
-                                conn_bg.peers.remove(key);
-                                conn_bg.meta.remove(key);
-                                debug!("Pruned dead peer connection");
+                            for (key, connection_id) in dead {
+                                if conn_bg
+                                    .remove_and_notify(Hash256(key), connection_id)
+                                    .await
+                                {
+                                    debug!(connection_id, "Pruned dead peer connection");
+                                }
                             }
                         }
 
-                        let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.meta.iter()
-                            .filter(|e| conn_bg.peers.contains_key(e.key()))
+                        let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.peers.iter()
                             .map(|e| e.value().dial_addr)
                             .collect();
                         let allow_lo = std::env::var("ARC_ALLOW_LOOPBACK_PEERS").is_ok();
@@ -1001,7 +1644,9 @@ pub async fn run_transport(
                                 if allow_lo {
                                     return a.port() != listen_addr.port();
                                 }
-                                if a.ip().is_loopback() { return false; }
+                                if a.ip().is_loopback() {
+                                    return a.port() != listen_addr.port();
+                                }
                                 let test_addr = SocketAddr::new(a.ip(), 0);
                                 if std::net::UdpSocket::bind(test_addr).is_ok() { return false; }
                                 true
@@ -1012,19 +1657,20 @@ pub async fn run_transport(
                             info!("Reconnect: {} peers to retry", reconnect_batch.len());
                         }
                         for addr in reconnect_batch {
-                            let handshake_msg = make_signed_handshake(
-                                local_address, local_stake, listen_addr.port(), genesis_hash, &kp,
-                            );
-                            let c = conn_bg.clone();
-                            let itx2 = itx.clone();
-                            let pc2 = pc.clone();
                             let ep2 = ep.clone();
-                            let pdt2 = pdt.clone();
-                            let rl2 = rl.clone();
+                            let ctx = PeerContext::new(
+                                local_identity,
+                                &kp,
+                                &conn_bg,
+                                &itx,
+                                &pdt,
+                                &rl,
+                                &av,
+                            );
                             tokio::spawn(async move {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    dial_peer(&ep2, addr, &handshake_msg, local_address, &c, &itx2, &pc2, &pdt2, &rl2),
+                                    dial_peer(&ep2, addr, &ctx),
                                 ).await {
                                     Ok(Ok(())) => info!("Reconnect: connected to {}", addr),
                                     Ok(Err(e)) => debug!("Reconnect to {} failed: {}", addr, e),
@@ -1032,16 +1678,21 @@ pub async fn run_transport(
                                 }
                             });
                         }
-                        let actual = conn_bg.peers.len() as u32;
-                        pc.store(actual, Ordering::Relaxed);
                     }
                 }
             }
-        });
-    }
+        })
+    };
 
+    let mut lifecycle_stop = false;
     loop {
         tokio::select! {
+            biased;
+            _ = wait_for_transport_shutdown(&mut shutdown) => {
+                info!("P2P transport lifecycle shutdown requested");
+                lifecycle_stop = true;
+                break;
+            }
             // ── Accept inbound connections ──────────────────────────────
             incoming_opt = endpoint.accept() => {
                 let incoming = match incoming_opt {
@@ -1063,39 +1714,36 @@ pub async fn run_transport(
                 let remote_addr = conn.remote_address();
                 info!("Incoming connection from {}", remote_addr);
 
-                // Enforce connection limit
-                if peer_count.load(Ordering::Relaxed) >= MAX_PEERS {
-                    warn!("Connection limit reached ({MAX_PEERS}), rejecting {}", remote_addr);
+                // Do not reject solely because every fixed validator-address
+                // slot is occupied. This connection may be the authenticated
+                // replacement for a stale pre-restart generation. Mutual TLS,
+                // the exporter-bound application handshake, and the fixed
+                // allowlist run before the address slot is installed; the map
+                // therefore remains bounded by the configured validator set.
+                let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
+                    warn!("Validator handshake concurrency limit reached, rejecting {}", remote_addr);
                     continue;
-                }
+                };
 
-                let connections_clone = connections.clone();
-                let inbound_clone = inbound_tx.clone();
-                let peer_count_clone = peer_count.clone();
-                let keypair_clone = keypair.clone();
-                let pex_dial_clone = pex_dial_tx.clone();
-                let rate_limiter_clone = rate_limiter.clone();
+                let ctx = PeerContext::new(
+                    local_identity,
+                    &keypair,
+                    &connections,
+                    &inbound_tx,
+                    &pex_dial_tx,
+                    &rate_limiter,
+                    &allowed_validators,
+                );
 
                 tokio::spawn(async move {
+                    let _handshake_permit = handshake_permit;
                     // 10-second handshake timeout - prevents attackers from
                     // holding connection slots with incomplete handshakes.
-                    let handshake_msg = make_signed_handshake(
-                        local_address, local_stake, listen_addr.port(), genesis_hash, &keypair_clone,
-                    );
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        accept_peer(
-                            conn,
-                            &handshake_msg,
-                            local_address,
-                            &connections_clone,
-                            &inbound_clone,
-                            &peer_count_clone,
-                            &pex_dial_clone,
-                            &rate_limiter_clone,
-                        )
+                        accept_peer(conn, &ctx)
                     ).await;
-                    if let Err(_) = result {
+                    if result.is_err() {
                         warn!("Handshake timeout from {}", remote_addr);
                     } else if let Ok(Err(e)) = result
                     {
@@ -1108,30 +1756,34 @@ pub async fn run_transport(
 
             // ── PEX auto-dial (from handle_peer_recv) ──────────────────
             // Spawn the entire processing into a separate task. The select body
-            // must NEVER iterate the DashMap (`conn_pex.meta.iter()`) because
+            // must NEVER iterate the peer DashMap because
             // it can deadlock with another task holding a write lock on the
             // same shard. The "already connected" check belongs inside the
             // spawned task, not the select body.
             addr = pex_dial_rx.recv() => {
                 if let Some(peer_addr) = addr {
-                    let handshake_msg = make_signed_handshake(
-                        local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
-                    );
-                    let c = connections.clone();
                     let conn_pex_clone = conn_pex.clone();
-                    let itx = inbound_tx.clone();
-                    let pc = peer_count.clone();
                     let ep = endpoint.clone();
-                    let pdt = pex_dial_tx.clone();
-                    let rl = rate_limiter.clone();
+                    let ctx = PeerContext::new(
+                        local_identity,
+                        &keypair,
+                        &connections,
+                        &inbound_tx,
+                        &pex_dial_tx,
+                        &rate_limiter,
+                        &allowed_validators,
+                    );
                     tokio::spawn(async move {
                         // Skip if already connected (moved out of select body)
-                        let already = conn_pex_clone.meta.iter().any(|e| e.value().dial_addr == peer_addr);
+                        let already = conn_pex_clone
+                            .peers
+                            .iter()
+                            .any(|e| e.value().dial_addr == peer_addr);
                         if already { return; }
                         info!("PEX: dialing discovered peer {}", peer_addr);
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
+                            dial_peer(&ep, peer_addr, &ctx),
                         ).await {
                             Ok(Ok(())) => info!("PEX: connected to {}", peer_addr),
                             Ok(Err(e)) => debug!("PEX: failed to dial {}: {}", peer_addr, e),
@@ -1144,6 +1796,79 @@ pub async fn run_transport(
             // Reconnect is handled by the background task above.
         }
     }
+
+    // Closing the endpoint wakes every peer receive loop and prevents any
+    // reconnect child that raced the lifecycle signal from establishing a new
+    // session. The two transport-owned long-lived tasks are joined before this
+    // future returns, so peer-file writes and outbound fanout cannot cross the
+    // node's final persistence barrier.
+    endpoint.close(0_u32.into(), b"node lifecycle shutdown");
+    if !lifecycle_stop {
+        outbound_task.abort();
+        pex_task.abort();
+    }
+    if let Err(error) = outbound_task.await {
+        warn!(%error, "P2P outbound task failed during shutdown");
+    }
+    if let Err(error) = pex_task.await {
+        warn!(%error, "P2P peer-maintenance task failed during shutdown");
+    }
+    endpoint.wait_idle().await;
+    connections.peers.clear();
+    peer_count.store(0, Ordering::SeqCst);
+    info!("P2P transport stopped at the lifecycle barrier");
+}
+
+// ─── Shared Connection-Setup Context ───────────────────────────────────────
+
+/// The node-wide handles that every connection-setup path needs.
+///
+/// `dial_peer` and `accept_peer` both require the same identity and runtime
+/// handles, and every
+/// call site was cloning them into individually named locals. Bundling them
+/// keeps the setup functions to a readable arity and keeps the two paths from
+/// drifting apart. All fields are cheap clones (`Arc` / mpsc `Sender`).
+#[derive(Clone, Copy)]
+struct LocalPeerIdentity {
+    address: Hash256,
+    /// Diagnostic advertisement only. Consensus resolves voting stake from
+    /// the fixed genesis validator set and never trusts this transport field.
+    advertised_stake: u64,
+    listen_port: u16,
+    genesis_hash: Hash256,
+}
+
+struct PeerContext {
+    identity: LocalPeerIdentity,
+    keypair: Arc<KeyPair>,
+    connections: Arc<PeerConnections>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    pex_dial_tx: mpsc::Sender<SocketAddr>,
+    rate_limiter: Arc<PeerRateLimiter>,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+}
+
+impl PeerContext {
+    /// Build a context from the transport's own long-lived handles.
+    fn new(
+        identity: LocalPeerIdentity,
+        keypair: &Arc<KeyPair>,
+        connections: &Arc<PeerConnections>,
+        inbound_tx: &mpsc::Sender<InboundMessage>,
+        pex_dial_tx: &mpsc::Sender<SocketAddr>,
+        rate_limiter: &Arc<PeerRateLimiter>,
+        allowed_validators: &Arc<HashSet<[u8; 32]>>,
+    ) -> Self {
+        Self {
+            identity,
+            keypair: keypair.clone(),
+            connections: connections.clone(),
+            inbound_tx: inbound_tx.clone(),
+            pex_dial_tx: pex_dial_tx.clone(),
+            rate_limiter: rate_limiter.clone(),
+            allowed_validators: allowed_validators.clone(),
+        }
+    }
 }
 
 // ─── Dial (Outbound Connection) ─────────────────────────────────────────────
@@ -1151,19 +1876,26 @@ pub async fn run_transport(
 async fn dial_peer(
     endpoint: &quinn::Endpoint,
     peer_addr: SocketAddr,
-    local_handshake: &HandshakeMessage,
-    local_address: Hash256,
-    connections: &Arc<PeerConnections>,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    peer_count: &Arc<AtomicU32>,
-    pex_dial_tx: &mpsc::Sender<SocketAddr>,
-    rate_limiter: &Arc<PeerRateLimiter>,
+    ctx: &PeerContext,
 ) -> anyhow::Result<()> {
+    let local_address = ctx.identity.address;
+    let connections = &ctx.connections;
+    let inbound_tx = &ctx.inbound_tx;
+
     let conn = endpoint.connect(peer_addr, "localhost")?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
+    let session_binding = connection_binding(&conn)?;
+    let local_handshake = make_signed_handshake(
+        ctx.identity.address,
+        ctx.identity.advertised_stake,
+        ctx.identity.listen_port,
+        ctx.identity.genesis_hash,
+        &ctx.keypair,
+        session_binding,
+    );
 
     // Send our handshake
-    let payload = bincode::serialize(local_handshake)?;
+    let payload = bincode::serialize(&local_handshake)?;
     write_message(&mut send, MessageType::Handshake, &payload).await?;
 
     // Read their handshake ack
@@ -1171,7 +1903,7 @@ async fn dial_peer(
     if msg_type != MessageType::HandshakeAck {
         anyhow::bail!("expected HandshakeAck, got {:?}", msg_type);
     }
-    let remote: HandshakeMessage = bincode::deserialize(&data)?;
+    let remote: HandshakeMessage = deserialize_message(&data)?;
 
     // Validate genesis
     if remote.genesis_hash != local_handshake.genesis_hash {
@@ -1183,7 +1915,21 @@ async fn dial_peer(
     }
 
     // Verify peer's identity: pubkey → address + valid signature
-    verify_handshake(&remote)?;
+    verify_handshake(&remote, &session_binding)?;
+    let tls_address = peer_tls_validator_address(&conn)?;
+    if tls_address != remote.validator_address {
+        anyhow::bail!(
+            "peer TLS validator {} differs from exporter-bound handshake {}",
+            tls_address,
+            remote.validator_address
+        );
+    }
+    if !ctx.allowed_validators.contains(&remote.validator_address.0) {
+        anyhow::bail!(
+            "authenticated peer {} is not in the fixed validator transport allowlist",
+            remote.validator_address
+        );
+    }
 
     // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
@@ -1191,16 +1937,8 @@ async fn dial_peer(
     // Reject self-connections. The seeds file includes our own IP,
     // and 0.0.0.0 != our public IP, so the bootstrap skip-self check misses it.
     if remote.validator_address == local_address {
-        debug!("Rejected self-connection (dial) to {}", remote.validator_address);
-        return Ok(());
-    }
-
-    // Skip if already connected - prevents the dual-dial race where both
-    // nodes dial each other and the second insert overwrites the first's
-    // SendStream. The old recv handler's cleanup then removes the new entry.
-    if connections.is_connected(&remote.validator_address.0) {
-        info!(
-            "Already connected to {} (dial), skipping duplicate",
+        debug!(
+            "Rejected self-connection (dial) to {}",
             remote.validator_address
         );
         return Ok(());
@@ -1211,16 +1949,24 @@ async fn dial_peer(
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Register peer + metadata
-    connections
-        .peers
-        .insert(remote.validator_address.0, send);
-    connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
-    peer_count.fetch_add(1, Ordering::Relaxed);
+    // Atomically install the newest authenticated generation. A delayed reader
+    // cleanup from the old generation is generation-checked below and cannot
+    // remove this replacement.
+    let (connection_id, replaced_generation) =
+        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    if let Some(replaced_generation) = replaced_generation {
+        info!(
+            peer = %remote.validator_address,
+            replaced_generation,
+            connection_id,
+            "Replaced authenticated validator connection generation (dial)"
+        );
+    }
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
             stake: remote.stake,
+            connection_id,
         })
         .await;
 
@@ -1230,23 +1976,24 @@ async fn dial_peer(
     // connection and made recv fail within microseconds, triggering a
     // connect→disconnect cascade that prevented any block gossip.
     let peer_addr_hash = remote.validator_address;
-    let inbound_clone = inbound_tx.clone();
-    let connections_ref = connections.clone();
-    let peer_count_clone = peer_count.clone();
-    let pex_dial_clone = pex_dial_tx.clone();
-    let rate_limiter_clone = rate_limiter.clone();
+    let recv_context = PeerRecvContext::from_peer_context(ctx);
+    let connections_ref = recv_context.connections.clone();
+    let rate_limiter_clone = recv_context.rate_limiter.clone();
     tokio::spawn(async move {
         let _conn = conn; // keep Quinn Connection alive until recv loop exits
-        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
-        rate_limiter_clone.remove_peer(&peer_addr_hash);
-        connections_ref.peers.remove(&peer_addr_hash.0);
-        connections_ref.meta.remove(&peer_addr_hash.0);
-        peer_count_clone.fetch_sub(1, Ordering::Relaxed);
-        let _ = inbound_clone
-            .send(InboundMessage::PeerDisconnected {
-                address: peer_addr_hash,
-            })
-            .await;
+        handle_peer_recv(recv, peer_addr_hash, recv_context).await;
+        if connections_ref
+            .remove_and_notify(peer_addr_hash, connection_id)
+            .await
+        {
+            rate_limiter_clone.remove_peer(&peer_addr_hash);
+        } else {
+            debug!(
+                peer = %peer_addr_hash,
+                connection_id,
+                "Ignored stale dial-connection cleanup"
+            );
+        }
     });
 
     Ok(())
@@ -1254,24 +2001,28 @@ async fn dial_peer(
 
 // ─── Accept (Inbound Connection) ────────────────────────────────────────────
 
-async fn accept_peer(
-    conn: quinn::Connection,
-    local_handshake: &HandshakeMessage,
-    local_address: Hash256,
-    connections: &Arc<PeerConnections>,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    peer_count: &Arc<AtomicU32>,
-    pex_dial_tx: &mpsc::Sender<SocketAddr>,
-    rate_limiter: &Arc<PeerRateLimiter>,
-) -> anyhow::Result<()> {
+async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Result<()> {
+    let local_address = ctx.identity.address;
+    let connections = &ctx.connections;
+    let inbound_tx = &ctx.inbound_tx;
+
     let (mut send, mut recv) = conn.accept_bi().await?;
+    let session_binding = connection_binding(&conn)?;
+    let local_handshake = make_signed_handshake(
+        ctx.identity.address,
+        ctx.identity.advertised_stake,
+        ctx.identity.listen_port,
+        ctx.identity.genesis_hash,
+        &ctx.keypair,
+        session_binding,
+    );
 
     // Read their handshake
     let (msg_type, data) = read_message(&mut recv).await?;
     if msg_type != MessageType::Handshake {
         anyhow::bail!("expected Handshake, got {:?}", msg_type);
     }
-    let remote: HandshakeMessage = bincode::deserialize(&data)?;
+    let remote: HandshakeMessage = deserialize_message(&data)?;
 
     // Validate genesis
     if remote.genesis_hash != local_handshake.genesis_hash {
@@ -1279,10 +2030,24 @@ async fn accept_peer(
     }
 
     // Verify peer's identity: pubkey → address + valid signature
-    verify_handshake(&remote)?;
+    verify_handshake(&remote, &session_binding)?;
+    let tls_address = peer_tls_validator_address(&conn)?;
+    if tls_address != remote.validator_address {
+        anyhow::bail!(
+            "peer TLS validator {} differs from exporter-bound handshake {}",
+            tls_address,
+            remote.validator_address
+        );
+    }
+    if !ctx.allowed_validators.contains(&remote.validator_address.0) {
+        anyhow::bail!(
+            "authenticated peer {} is not in the fixed validator transport allowlist",
+            remote.validator_address
+        );
+    }
 
     // Send our handshake ack (with our own signed challenge)
-    let payload = bincode::serialize(local_handshake)?;
+    let payload = bincode::serialize(&local_handshake)?;
     write_message(&mut send, MessageType::HandshakeAck, &payload).await?;
 
     // Compute dialable address: remote IP + their listen port
@@ -1290,14 +2055,8 @@ async fn accept_peer(
 
     // Reject self-connections
     if remote.validator_address == local_address {
-        debug!("Rejected self-connection (accept) from {}", remote.validator_address);
-        return Ok(());
-    }
-
-    // Skip if already connected (dual-dial dedup)
-    if connections.is_connected(&remote.validator_address.0) {
-        info!(
-            "Already connected to {} (accept), skipping duplicate",
+        debug!(
+            "Rejected self-connection (accept) from {}",
             remote.validator_address
         );
         return Ok(());
@@ -1308,16 +2067,24 @@ async fn accept_peer(
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Register peer + metadata
-    connections
-        .peers
-        .insert(remote.validator_address.0, send);
-    connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
-    peer_count.fetch_add(1, Ordering::Relaxed);
+    // Replace only this already-authenticated validator identity's generation.
+    // The fixed allowlist above bounds the address map; replacement keeps the
+    // peer count constant and makes a clean rolling restart immediately usable.
+    let (connection_id, replaced_generation) =
+        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    if let Some(replaced_generation) = replaced_generation {
+        info!(
+            peer = %remote.validator_address,
+            replaced_generation,
+            connection_id,
+            "Replaced authenticated validator connection generation (accept)"
+        );
+    }
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
             stake: remote.stake,
+            connection_id,
         })
         .await;
 
@@ -1325,23 +2092,24 @@ async fn accept_peer(
     // Connection stays alive for the duration of the recv loop. See
     // matching comment in connect_peer for the full explanation.
     let peer_addr_hash = remote.validator_address;
-    let inbound_clone = inbound_tx.clone();
-    let connections_ref = connections.clone();
-    let peer_count_clone = peer_count.clone();
-    let pex_dial_clone = pex_dial_tx.clone();
-    let rate_limiter_clone = rate_limiter.clone();
+    let recv_context = PeerRecvContext::from_peer_context(ctx);
+    let connections_ref = recv_context.connections.clone();
+    let rate_limiter_clone = recv_context.rate_limiter.clone();
     tokio::spawn(async move {
         let _conn = conn; // keep Quinn Connection alive until recv loop exits
-        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
-        rate_limiter_clone.remove_peer(&peer_addr_hash);
-        connections_ref.peers.remove(&peer_addr_hash.0);
-        connections_ref.meta.remove(&peer_addr_hash.0);
-        peer_count_clone.fetch_sub(1, Ordering::Relaxed);
-        let _ = inbound_clone
-            .send(InboundMessage::PeerDisconnected {
-                address: peer_addr_hash,
-            })
-            .await;
+        handle_peer_recv(recv, peer_addr_hash, recv_context).await;
+        if connections_ref
+            .remove_and_notify(peer_addr_hash, connection_id)
+            .await
+        {
+            rate_limiter_clone.remove_peer(&peer_addr_hash);
+        } else {
+            debug!(
+                peer = %peer_addr_hash,
+                connection_id,
+                "Ignored stale accepted-connection cleanup"
+            );
+        }
     });
 
     Ok(())
@@ -1349,32 +2117,80 @@ async fn accept_peer(
 
 // ─── Per-Peer Recv Loop ─────────────────────────────────────────────────────
 
+struct PeerRecvContext {
+    local_address: Hash256,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    pex_dial_tx: mpsc::Sender<SocketAddr>,
+    connections: Arc<PeerConnections>,
+    rate_limiter: Arc<PeerRateLimiter>,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+}
+
+impl PeerRecvContext {
+    fn from_peer_context(context: &PeerContext) -> Self {
+        Self {
+            local_address: context.identity.address,
+            inbound_tx: context.inbound_tx.clone(),
+            pex_dial_tx: context.pex_dial_tx.clone(),
+            connections: context.connections.clone(),
+            rate_limiter: context.rate_limiter.clone(),
+            allowed_validators: context.allowed_validators.clone(),
+        }
+    }
+}
+
 async fn handle_peer_recv(
     mut recv: quinn::RecvStream,
     peer_address: Hash256,
-    local_address: Hash256,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    pex_dial_tx: &mpsc::Sender<SocketAddr>,
-    connections: &Arc<PeerConnections>,
-    rate_limiter: &Arc<PeerRateLimiter>,
+    context: PeerRecvContext,
 ) {
+    let PeerRecvContext {
+        local_address,
+        inbound_tx,
+        pex_dial_tx,
+        connections,
+        rate_limiter,
+        allowed_validators,
+    } = context;
+    if !allowed_validators.contains(&peer_address.0) {
+        warn!(
+            peer = %peer_address,
+            "Closing receive loop for identity outside fixed validator allowlist"
+        );
+        return;
+    }
     loop {
-        let (msg_type, data) = match read_message(&mut recv).await {
-            Ok(m) => m,
+        let (msg_type, payload_len) = match read_message_header(&mut recv).await {
+            Ok(header) => header,
             Err(e) => {
                 debug!("Peer {} stream closed: {}", peer_address, e);
                 break;
             }
         };
 
-        if !rate_limiter.allow(&peer_address) {
-            warn!("Rate limiting peer {}", peer_address);
-            continue; // skip this message
+        if !rate_limiter.allow(&peer_address, payload_len) {
+            warn!(
+                peer = %peer_address,
+                payload_len,
+                "Closing peer connection after message/byte rate limit"
+            );
+            break;
         }
+
+        let data = match read_message_payload(&mut recv, payload_len).await {
+            Ok(data) => data,
+            Err(e) => {
+                debug!(
+                    "Peer {} stream closed while reading payload: {}",
+                    peer_address, e
+                );
+                break;
+            }
+        };
 
         match msg_type {
             MessageType::DagBlockWithTxs => {
-                match bincode::deserialize::<DagBlockWithTxsMessage>(&data) {
+                match deserialize_message::<DagBlockWithTxsMessage>(&data) {
                     Ok(msg) => {
                         debug!(
                             "Received DAG block from {} round={}",
@@ -1388,13 +2204,25 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize DagBlockWithTxs from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize DagBlockWithTxs from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::TxGossip => {
-                match bincode::deserialize::<crate::protocol::TxGossipMessage>(&data) {
+                match deserialize_message::<crate::protocol::TxGossipMessage>(&data) {
                     Ok(msg) => {
+                        if msg.transactions.len() > crate::MAX_TX_PER_GOSSIP {
+                            warn!(
+                                peer = %peer_address,
+                                count = msg.transactions.len(),
+                                max = crate::MAX_TX_PER_GOSSIP,
+                                "Rejected oversized transaction gossip batch"
+                            );
+                            continue;
+                        }
                         debug!(
                             "Received {} gossiped txs from {}",
                             msg.transactions.len(),
@@ -1405,20 +2233,23 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize TxGossip from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize TxGossip from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::StateDiff => {
-                match bincode::deserialize::<crate::protocol::StateDiffMessage>(&data) {
+                match deserialize_message::<crate::protocol::StateDiffMessage>(&data) {
                     Ok(msg) => {
                         debug!(
                             "Received state diff for block {} from {}",
-                            msg.block_hash,
-                            peer_address
+                            msg.block_hash, peer_address
                         );
                         let _ = inbound_tx
                             .send(InboundMessage::StateDiff {
+                                source: peer_address,
                                 block_hash: msg.block_hash,
                                 diff: msg.diff,
                                 block_height: msg.block_height,
@@ -1426,15 +2257,22 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize StateDiff from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize StateDiff from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::PeerExchange => {
-                match bincode::deserialize::<crate::protocol::PeerExchangeMessage>(&data) {
+                match deserialize_message::<crate::protocol::PeerExchangeMessage>(&data) {
                     Ok(msg) => {
                         if msg.peers.len() > 128 {
-                            warn!("PEX from {} has {} peers (>128), truncating", peer_address, msg.peers.len());
+                            warn!(
+                                "PEX from {} has {} peers (>128), truncating",
+                                peer_address,
+                                msg.peers.len()
+                            );
                         }
                         debug!(
                             "Received PEX with {} peers from {}",
@@ -1442,6 +2280,9 @@ async fn handle_peer_recv(
                             peer_address
                         );
                         for pex_peer in msg.peers.iter().take(16) {
+                            if !allowed_validators.contains(&pex_peer.address.0) {
+                                continue;
+                            }
                             // Skip self
                             if pex_peer.address == local_address {
                                 continue;
@@ -1465,18 +2306,25 @@ async fn handle_peer_recv(
                             }
                             // Queue for dialing
                             if let Ok(addr) = pex_peer.socket_addr.parse::<SocketAddr>() {
-                                debug!("PEX: queueing discovered peer {} at {}", pex_peer.address, addr);
+                                debug!(
+                                    "PEX: queueing discovered peer {} at {}",
+                                    pex_peer.address, addr
+                                );
                                 let _ = pex_dial_tx.try_send(addr);
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize PeerExchange from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize PeerExchange from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::SnapshotManifestRequest => {
-                match bincode::deserialize::<crate::protocol::SnapshotManifestRequestMessage>(&data) {
+                match deserialize_message::<crate::protocol::SnapshotManifestRequestMessage>(&data)
+                {
                     Ok(_msg) => {
                         debug!("Received snapshot manifest request from {}", peer_address);
                         let _ = inbound_tx
@@ -1486,12 +2334,16 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotManifestRequest from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotManifestRequest from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::SnapshotManifestResponse => {
-                match bincode::deserialize::<crate::protocol::SnapshotManifestResponseMessage>(&data) {
+                match deserialize_message::<crate::protocol::SnapshotManifestResponseMessage>(&data)
+                {
                     Ok(msg) => {
                         debug!(
                             "Received snapshot manifest from {} (height={}, chunks={})",
@@ -1505,12 +2357,15 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotManifestResponse from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotManifestResponse from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::SnapshotChunkRequest => {
-                match bincode::deserialize::<crate::protocol::SnapshotChunkRequestMessage>(&data) {
+                match deserialize_message::<crate::protocol::SnapshotChunkRequestMessage>(&data) {
                     Ok(msg) => {
                         debug!(
                             "Received snapshot chunk request from {} (chunk={})",
@@ -1525,12 +2380,15 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotChunkRequest from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotChunkRequest from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::SnapshotChunkResponse => {
-                match bincode::deserialize::<crate::protocol::SnapshotChunkResponseMessage>(&data) {
+                match deserialize_message::<crate::protocol::SnapshotChunkResponseMessage>(&data) {
                     Ok(msg) => {
                         debug!(
                             "Received snapshot chunk from {} (index={}/{})",
@@ -1544,14 +2402,28 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotChunkResponse from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotChunkResponse from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::InferenceRequest => {
-                match bincode::deserialize::<crate::protocol::InferenceRequestMessage>(&data) {
+                match deserialize_message::<crate::protocol::InferenceRequestMessage>(&data) {
                     Ok(msg) => {
-                        info!("Inference request from {} ({})", peer_address, msg.request_id);
+                        if !payload_identity_is_authenticated(&peer_address, &msg.requester) {
+                            warn!(
+                                peer = %peer_address,
+                                declared_requester = %msg.requester,
+                                "Rejected inference request with spoofed requester identity"
+                            );
+                            continue;
+                        }
+                        info!(
+                            "Inference request from {} ({})",
+                            peer_address, msg.request_id
+                        );
                         let _ = inbound_tx
                             .send(InboundMessage::InferenceRequest {
                                 request_id: msg.request_id,
@@ -1565,9 +2437,20 @@ async fn handle_peer_recv(
                 }
             }
             MessageType::InferenceResponse => {
-                match bincode::deserialize::<crate::protocol::InferenceResponseMessage>(&data) {
+                match deserialize_message::<crate::protocol::InferenceResponseMessage>(&data) {
                     Ok(msg) => {
-                        info!("Inference response from {} for {}", peer_address, msg.request_id);
+                        if !payload_identity_is_authenticated(&peer_address, &msg.responder) {
+                            warn!(
+                                peer = %peer_address,
+                                declared_responder = %msg.responder,
+                                "Rejected inference response with spoofed responder identity"
+                            );
+                            continue;
+                        }
+                        info!(
+                            "Inference response from {} for {}",
+                            peer_address, msg.request_id
+                        );
                         let _ = inbound_tx
                             .send(InboundMessage::InferenceResponse {
                                 request_id: msg.request_id,
@@ -1585,87 +2468,118 @@ async fn handle_peer_recv(
             MessageType::Heartbeat => {
                 // Heartbeat now carries round info for partition detection.
                 // Old heartbeats (empty payload) are still valid - just skip parse.
-                if !data.is_empty() {
-                    if let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data) {
-                        let _ = inbound_tx.send(InboundMessage::HeartbeatWithRound {
+                if !data.is_empty()
+                    && let Ok(hb) = deserialize_message::<crate::protocol::HeartbeatMessage>(&data)
+                {
+                    let _ = inbound_tx
+                        .send(InboundMessage::HeartbeatWithRound {
                             peer: peer_address,
                             dag_round: hb.dag_round,
                             committed_round: hb.committed_round,
-                        }).await;
-                    }
+                        })
+                        .await;
                 }
             }
             MessageType::ShardForward => {
-                match bincode::deserialize::<crate::protocol::ShardForwardMessage>(&data) {
+                match deserialize_message::<crate::protocol::ShardForwardMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::ShardForward {
-                            request_id: msg.request_id,
-                            model_id: msg.model_id,
-                            next_layer: msg.next_layer,
-                            total_layers: msg.total_layers,
-                            token_position: msg.token_position,
-                            activations: msg.activations,
-                            activation_hash: msg.activation_hash,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::ShardForward {
+                                request_id: msg.request_id,
+                                model_id: msg.model_id,
+                                next_layer: msg.next_layer,
+                                total_layers: msg.total_layers,
+                                token_position: msg.token_position,
+                                activations: msg.activations,
+                                activation_hash: msg.activation_hash,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad ShardForward from {}: {}", peer_address, e),
                 }
             }
             MessageType::ShardResult => {
-                match bincode::deserialize::<crate::protocol::ShardResultMessage>(&data) {
+                match deserialize_message::<crate::protocol::ShardResultMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::ShardResult {
-                            request_id: msg.request_id,
-                            token_id: msg.token_id,
-                            logits_hash: msg.logits_hash,
-                            responder: msg.responder,
-                        }).await;
+                        if !payload_identity_is_authenticated(&peer_address, &msg.responder) {
+                            warn!(
+                                peer = %peer_address,
+                                declared_responder = %msg.responder,
+                                "Rejected shard result with spoofed responder identity"
+                            );
+                            continue;
+                        }
+                        let _ = inbound_tx
+                            .send(InboundMessage::ShardResult {
+                                request_id: msg.request_id,
+                                token_id: msg.token_id,
+                                logits_hash: msg.logits_hash,
+                                responder: msg.responder,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad ShardResult from {}: {}", peer_address, e),
                 }
             }
             MessageType::ShardAnnounce => {
-                match bincode::deserialize::<crate::protocol::ShardAnnounceMessage>(&data) {
+                match deserialize_message::<crate::protocol::ShardAnnounceMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::ShardAnnounce {
-                            model_id: msg.model_id,
-                            start_layer: msg.start_layer,
-                            end_layer: msg.end_layer,
-                            expert_indices: msg.expert_indices,
-                            node_address: msg.node_address,
-                            available_memory: msg.available_memory,
-                            gpu_tier: msg.gpu_tier,
-                        }).await;
+                        if !payload_identity_is_authenticated(&peer_address, &msg.node_address) {
+                            warn!(
+                                peer = %peer_address,
+                                declared_node = %msg.node_address,
+                                "Rejected shard announcement with spoofed node identity"
+                            );
+                            continue;
+                        }
+                        let _ = inbound_tx
+                            .send(InboundMessage::ShardAnnounce {
+                                model_id: msg.model_id,
+                                start_layer: msg.start_layer,
+                                end_layer: msg.end_layer,
+                                expert_indices: msg.expert_indices,
+                                node_address: msg.node_address,
+                                available_memory: msg.available_memory,
+                                gpu_tier: msg.gpu_tier,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad ShardAnnounce from {}: {}", peer_address, e),
                 }
             }
             MessageType::RoundSyncRequest => {
-                match bincode::deserialize::<crate::protocol::RoundSyncRequestMessage>(&data) {
+                match deserialize_message::<crate::protocol::RoundSyncRequestMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::RoundSyncRequest {
-                            peer: peer_address,
-                            their_round: msg.my_round,
-                            their_committed: msg.my_committed,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::RoundSyncRequest {
+                                peer: peer_address,
+                                their_round: msg.my_round,
+                                their_committed: msg.my_committed,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad RoundSyncRequest from {}: {}", peer_address, e),
                 }
             }
             MessageType::RoundSyncResponse => {
-                match bincode::deserialize::<crate::protocol::RoundSyncResponseMessage>(&data) {
+                match deserialize_message::<crate::protocol::RoundSyncResponseMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::RoundSyncResponse {
-                            current_round: msg.current_round,
-                            last_committed_round: msg.last_committed_round,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::RoundSyncResponse {
+                                current_round: msg.current_round,
+                                last_committed_round: msg.last_committed_round,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad RoundSyncResponse from {}: {}", peer_address, e),
                 }
             }
             // Handshake messages are handled during connection setup, not here.
             MessageType::Handshake | MessageType::HandshakeAck => {
-                debug!("Unexpected handshake message from {} in data loop", peer_address);
+                debug!(
+                    "Unexpected handshake message from {} in data loop",
+                    peer_address
+                );
             }
         }
     }
@@ -1676,7 +2590,7 @@ async fn handle_peer_recv(
 /// Save known peer dial addresses to `known_peers.json` in the data directory.
 fn save_peers_to_disk(data_dir: &str, connections: &PeerConnections) {
     let peers: Vec<String> = connections
-        .meta
+        .peers
         .iter()
         .map(|entry| entry.value().dial_addr.to_string())
         .collect();
@@ -1710,5 +2624,377 @@ fn load_peers_from_disk(data_dir: &str) -> Vec<SocketAddr> {
             .filter_map(|s| s.parse().ok())
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_handshake(binding: [u8; 32]) -> HandshakeMessage {
+        let keypair = KeyPair::generate_ed25519();
+        make_signed_handshake(
+            keypair.address(),
+            500_000,
+            7_331,
+            Hash256([7_u8; 32]),
+            &keypair,
+            binding,
+        )
+    }
+
+    #[test]
+    fn handshake_identity_proof_is_bound_to_one_quic_session() {
+        let binding = [11_u8; 32];
+        let message = test_handshake(binding);
+
+        verify_handshake(&message, &binding).expect("fresh session proof should verify");
+        assert!(
+            verify_handshake(&message, &[12_u8; 32]).is_err(),
+            "a captured proof must not verify on another QUIC session"
+        );
+    }
+
+    #[test]
+    fn handshake_signature_authenticates_every_semantic_field() {
+        let binding = [19_u8; 32];
+        let original = test_handshake(binding);
+        verify_handshake(&original, &binding).unwrap();
+
+        let mut mutations: Vec<(&str, HandshakeMessage)> = Vec::new();
+
+        let mut message = original.clone();
+        message.validator_address.0[0] ^= 1;
+        mutations.push(("validator address", message));
+
+        let mut message = original.clone();
+        message.stake += 1;
+        mutations.push(("stake", message));
+
+        let mut message = original.clone();
+        message.listen_port += 1;
+        mutations.push(("listen port", message));
+
+        let mut message = original.clone();
+        message.genesis_hash.0[0] ^= 1;
+        mutations.push(("genesis hash", message));
+
+        let mut message = original.clone();
+        message.public_key[0] ^= 1;
+        mutations.push(("public key", message));
+
+        let mut message = original.clone();
+        message.nonce[0] ^= 1;
+        mutations.push(("session binding", message));
+
+        let mut message = original.clone();
+        message.challenge_sig[0] ^= 1;
+        mutations.push(("identity signature", message));
+
+        let mut message = original.clone();
+        message.protocol_version += 1;
+        mutations.push(("protocol version", message));
+
+        let mut message = original.clone();
+        message.min_compatible_version += 1;
+        mutations.push(("minimum compatible version", message));
+
+        let mut message = original.clone();
+        message.dag_round += 1;
+        mutations.push(("DAG round", message));
+
+        for (field, message) in mutations {
+            assert!(
+                verify_handshake(&message, &binding).is_err(),
+                "mutating {field} must invalidate the handshake"
+            );
+        }
+    }
+
+    #[test]
+    fn session_bound_handshake_survives_wire_round_trip() {
+        let binding = [23_u8; 32];
+        let message = test_handshake(binding);
+        let bytes = bincode::serialize(&message).unwrap();
+        let decoded: HandshakeMessage = deserialize_message(&bytes).unwrap();
+
+        verify_handshake(&decoded, &binding).expect("wire round trip should retain the proof");
+    }
+
+    #[tokio::test]
+    async fn both_quic_endpoints_derive_the_same_exporter_binding() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server_key = KeyPair::generate_ed25519();
+        let client_key = KeyPair::generate_ed25519();
+        let allowed: Arc<HashSet<[u8; 32]>> = Arc::new(
+            [server_key.address().0, client_key.address().0]
+                .into_iter()
+                .collect(),
+        );
+        let server = quinn::Endpoint::server(
+            make_server_config(&server_key, allowed.clone()).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("server endpoint is open");
+            let connection = incoming.await.expect("server QUIC handshake succeeds");
+            let peer = peer_tls_validator_address(&connection)
+                .expect("server sees the pinned client validator certificate");
+            (
+                connection_binding(&connection).expect("server exporter is available"),
+                peer,
+            )
+        });
+
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(make_client_config(&client_key, allowed.clone()).unwrap());
+        let connection = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .expect("client QUIC handshake succeeds");
+        let client_binding = connection_binding(&connection).expect("client exporter is available");
+        assert_eq!(
+            peer_tls_validator_address(&connection).unwrap(),
+            server_key.address()
+        );
+        let (server_binding, server_observed_client) = accept.await.unwrap();
+
+        assert_eq!(client_binding, server_binding);
+        assert_ne!(client_binding, [0_u8; 32]);
+        assert_eq!(server_observed_client, client_key.address());
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_fail_closed_validator_configuration() {
+        let keypair = KeyPair::generate_ed25519();
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        drop(outbound_tx);
+
+        run_transport_with_readiness(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            keypair.address(),
+            5_000_000,
+            Hash256([41_u8; 32]),
+            Arc::new(HashSet::new()),
+            outbound_rx,
+            inbound_tx,
+            Arc::new(AtomicU32::new(0)),
+            keypair,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            startup_tx,
+        )
+        .await;
+
+        let error = startup_rx
+            .await
+            .expect("transport must report its startup decision")
+            .unwrap_err();
+        assert!(error.contains("non-empty fixed validator allowlist"));
+    }
+
+    #[tokio::test]
+    async fn readiness_is_sent_only_after_authenticated_endpoint_binds() {
+        let keypair = KeyPair::generate_ed25519();
+        let address = keypair.address();
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_transport_with_readiness(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            address,
+            5_000_000,
+            Hash256([42_u8; 32]),
+            Arc::new([address.0].into_iter().collect()),
+            outbound_rx,
+            inbound_tx,
+            Arc::new(AtomicU32::new(0)),
+            keypair,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            startup_tx,
+        ));
+
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(2), startup_rx)
+            .await
+            .expect("authenticated endpoint startup timed out")
+            .expect("transport dropped its startup result")
+            .expect("authenticated endpoint must bind");
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
+
+        drop(outbound_tx);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_joins_bound_transport() {
+        let keypair = KeyPair::generate_ed25519();
+        let address = keypair.address();
+        let (_outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let peer_count = Arc::new(AtomicU32::new(0));
+        let task = tokio::spawn(run_transport_with_readiness_and_shutdown(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            address,
+            5_000_000,
+            Hash256([43_u8; 32]),
+            Arc::new([address.0].into_iter().collect()),
+            outbound_rx,
+            inbound_tx,
+            peer_count.clone(),
+            keypair,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            startup_tx,
+            shutdown_rx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), startup_rx)
+            .await
+            .expect("authenticated endpoint startup timed out")
+            .expect("transport dropped its startup result")
+            .expect("authenticated endpoint must bind");
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("transport did not join after lifecycle shutdown")
+            .expect("transport task panicked");
+        assert_eq!(peer_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn validator_certificate_is_the_arc_validator_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let keypair = KeyPair::generate_ed25519();
+        let (certificate, _) = validator_tls_identity(&keypair).unwrap();
+        let (certificate_again, _) = validator_tls_identity(&keypair).unwrap();
+        assert_eq!(
+            certificate.as_ref(),
+            certificate_again.as_ref(),
+            "a validator key must produce one stable pinned certificate"
+        );
+        assert_eq!(
+            validator_address_from_certificate(&certificate).unwrap(),
+            keypair.address()
+        );
+        assert!(validator_address_from_certificate(&CertificateDer::from(vec![1, 2, 3])).is_err());
+    }
+
+    #[test]
+    fn certificate_membership_rejects_a_valid_unknown_validator() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let allowed = KeyPair::generate_ed25519();
+        let unknown = KeyPair::generate_ed25519();
+        let (unknown_certificate, _) = validator_tls_identity(&unknown).unwrap();
+        let verifier = ValidatorCertificateVerifier::new(Arc::new(
+            [allowed.address().0].into_iter().collect(),
+        ));
+        assert!(verifier.verify_membership(&unknown_certificate).is_err());
+    }
+
+    #[test]
+    fn declared_payload_identity_must_match_authenticated_peer() {
+        let authenticated = Hash256([31_u8; 32]);
+        let spoofed = Hash256([32_u8; 32]);
+
+        assert!(payload_identity_is_authenticated(
+            &authenticated,
+            &authenticated
+        ));
+        assert!(!payload_identity_is_authenticated(&authenticated, &spoofed));
+    }
+
+    #[test]
+    fn rate_limiter_enforces_message_budget_at_frame_header() {
+        let limiter = PeerRateLimiter::new();
+        let peer = Hash256([41_u8; 32]);
+        let now = 1_000;
+
+        for _ in 0..PEER_MSG_RATE_LIMIT {
+            assert!(limiter.allow_at(&peer, 1, now));
+        }
+        assert!(!limiter.allow_at(&peer, 1, now));
+        assert!(limiter.allow_at(&peer, 1, now + RATE_LIMIT_WINDOW_SECS));
+    }
+
+    #[test]
+    fn rate_limiter_enforces_byte_budget_at_frame_header() {
+        let limiter = PeerRateLimiter::new();
+        let peer = Hash256([42_u8; 32]);
+        let now = 2_000;
+
+        for _ in 0..4 {
+            assert!(limiter.allow_at(&peer, MAX_PAYLOAD_SIZE, now));
+        }
+        assert!(!limiter.allow_at(&peer, 1, now));
+        assert!(limiter.allow_at(&peer, MAX_PAYLOAD_SIZE, now + RATE_LIMIT_WINDOW_SECS));
+    }
+
+    fn test_connections() -> (PeerConnections<()>, Arc<AtomicU32>) {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let peer_count = Arc::new(AtomicU32::new(0));
+        (
+            PeerConnections::new(inbound_tx, peer_count.clone()),
+            peer_count,
+        )
+    }
+
+    #[test]
+    fn authenticated_reconnect_replaces_only_the_same_validator_slot() {
+        let (connections, peer_count) = test_connections();
+        let peer = [3_u8; 32];
+        let dial_addr: SocketAddr = "127.0.0.1:7331".parse().unwrap();
+
+        let (first_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, None);
+        let (replacement_id, replaced) =
+            connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, Some(first_id));
+        assert!(replacement_id > first_id);
+        assert_eq!(connections.peers.len(), 1);
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            connections.peers.get(&peer).unwrap().connection_id,
+            replacement_id
+        );
+        assert!(!connections.remove_if_current(&peer, first_id));
+        assert!(connections.remove_if_current(&peer, replacement_id));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stale_disconnect_cannot_remove_replacement_generation() {
+        let (connections, peer_count) = test_connections();
+        let peer = [9_u8; 32];
+        let dial_addr: SocketAddr = "127.0.0.1:7332".parse().unwrap();
+
+        let (old_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, None);
+        assert!(connections.remove_if_current(&peer, old_id));
+        let (replacement_id, replaced) =
+            connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, None);
+        assert!(replacement_id > old_id);
+
+        // The old reader exits after the replacement has claimed the same
+        // validator address. Its delayed cleanup must be a no-op.
+        assert!(!connections.remove_if_current(&peer, old_id));
+        assert_eq!(
+            connections.peers.get(&peer).unwrap().connection_id,
+            replacement_id
+        );
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+
+        assert!(connections.remove_if_current(&peer, replacement_id));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
     }
 }

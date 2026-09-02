@@ -238,13 +238,12 @@ impl UpgradeSchedule {
             .iter()
             .rev()
             .find(|(_, u)| u.version <= self.current_version)
+            && height <= last_activated_height
         {
-            if height <= last_activated_height {
-                return Err(format!(
-                    "cannot schedule upgrade at height {} - already past activated height {}",
-                    height, last_activated_height
-                ));
-            }
+            return Err(format!(
+                "cannot schedule upgrade at height {} - already past activated height {}",
+                height, last_activated_height
+            ));
         }
 
         self.upgrades.insert(height, upgrade);
@@ -295,10 +294,10 @@ impl UpgradeSchedule {
     /// Advance `current_version` to the latest upgrade whose activation height
     /// is <= `current_height`.
     pub fn activate_upgrades(&mut self, current_height: u64) {
-        if let Some((_, upgrade)) = self.upgrades.range(..=current_height).next_back() {
-            if upgrade.version > self.current_version {
-                self.current_version = upgrade.version;
-            }
+        if let Some((_, upgrade)) = self.upgrades.range(..=current_height).next_back()
+            && upgrade.version > self.current_version
+        {
+            self.current_version = upgrade.version;
         }
     }
 }
@@ -540,14 +539,16 @@ mod tests {
         assert!(result.is_err());
 
         // Scheduling in the future should still work.
-        assert!(schedule
-            .schedule_upgrade(ProtocolUpgrade {
-                version: ProtocolVersion::new(1, 1, 0),
-                activation_height: 2000,
-                description: "future is fine".into(),
-                features: vec![],
-            })
-            .is_ok());
+        assert!(
+            schedule
+                .schedule_upgrade(ProtocolUpgrade {
+                    version: ProtocolVersion::new(1, 1, 0),
+                    activation_height: 2000,
+                    description: "future is fine".into(),
+                    features: vec![],
+                })
+                .is_ok()
+        );
     }
 
     #[test]

@@ -192,29 +192,28 @@ impl PolyOps for SimdBackend {
         // of the current index. For every 2^n aligned chunk of 2^n elements, the twiddle
         // array is the same, denoted twiddle_low. Use this to compute sums of (coeff *
         // twiddle_high) mod 2^n, then multiply by twiddle_low, and sum to get the final result.
-        let compute_chunk_sum = |coeff_chunk: &[PackedBaseField],
-                                 twiddle_mids: PackedSecureField,
-                                 offset: usize| {
-            let mut sum = PackedSecureField::zeroed();
-            let mut twiddle_high = Self::twiddle_at(&mappings, offset * N_LANES);
-            for (i, coeff_chunk) in coeff_chunk.as_chunks::<N_LANES>().0.iter().enumerate() {
-                // For every chunk of 2 ^ 4 * 2 ^ 4 = 2 ^ 8 elements, the twiddle high is the same.
-                // Multiply it by every mid twiddle factor to get the factors for the current chunk.
-                let high_twiddle_factors =
-                    (PackedSecureField::broadcast(twiddle_high) * twiddle_mids).to_array();
+        let compute_chunk_sum =
+            |coeff_chunk: &[PackedBaseField], twiddle_mids: PackedSecureField, offset: usize| {
+                let mut sum = PackedSecureField::zeroed();
+                let mut twiddle_high = Self::twiddle_at(&mappings, offset * N_LANES);
+                for (i, coeff_chunk) in coeff_chunk.as_chunks::<N_LANES>().0.iter().enumerate() {
+                    // For every chunk of 2 ^ 4 * 2 ^ 4 = 2 ^ 8 elements, the twiddle high is the same.
+                    // Multiply it by every mid twiddle factor to get the factors for the current chunk.
+                    let high_twiddle_factors =
+                        (PackedSecureField::broadcast(twiddle_high) * twiddle_mids).to_array();
 
-                // Sum the coefficients multiplied by each corrseponsing twiddle. Result is
-                // effectively an array[16] where the value at index 'i' is the sum
-                // of all coefficients at indices that are i mod 16.
-                for (&packed_coeffs, mid_twiddle) in zip(coeff_chunk, high_twiddle_factors) {
-                    sum += PackedSecureField::broadcast(mid_twiddle) * packed_coeffs;
+                    // Sum the coefficients multiplied by each corrseponsing twiddle. Result is
+                    // effectively an array[16] where the value at index 'i' is the sum
+                    // of all coefficients at indices that are i mod 16.
+                    for (&packed_coeffs, mid_twiddle) in zip(coeff_chunk, high_twiddle_factors) {
+                        sum += PackedSecureField::broadcast(mid_twiddle) * packed_coeffs;
+                    }
+
+                    // Advance twiddle high.
+                    twiddle_high = Self::advance_twiddle(twiddle_high, &twiddle_steps, offset + i);
                 }
-
-                // Advance twiddle high.
-                twiddle_high = Self::advance_twiddle(twiddle_high, &twiddle_steps, offset + i);
-            }
-            sum
-        };
+                sum
+            };
 
         #[cfg(not(feature = "parallel"))]
         let sum = compute_chunk_sum(&poly.coeffs.data, twiddle_mids, 0);

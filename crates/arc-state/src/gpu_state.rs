@@ -15,12 +15,12 @@
 //! **Security**: GPU is a hot cache, not source of truth. WAL + CPU DashMap
 //! remains authoritative. On shutdown, GPU memory is explicitly zeroed.
 
-use arc_gpu::gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel, ACCOUNT_SLOT_SIZE};
-use arc_types::Account;
 use arc_crypto::Hash256;
+use arc_gpu::gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel};
+use arc_types::Account;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -270,7 +270,10 @@ impl GpuStateCache {
                 Arc::new(buf)
             }
             Err(e) => {
-                warn!("GPU buffer allocation failed ({}), using CPU-only fallback", e);
+                warn!(
+                    "GPU buffer allocation failed ({}), using CPU-only fallback",
+                    e
+                );
                 Arc::new(GpuAccountBuffer::cpu_only(config.max_gpu_accounts))
             }
         };
@@ -432,7 +435,8 @@ impl GpuStateCache {
     /// Fast update for an account already known to be in the cache.
     /// Writes directly to cpu_mirror without contains_key check.
     pub fn update_account_fast(&self, acct: &Account) {
-        self.cpu_mirror.insert(acct.address.0, CachedAccount::from_account(acct));
+        self.cpu_mirror
+            .insert(acct.address.0, CachedAccount::from_account(acct));
     }
 
     /// Batch insert. Equivalent to calling `put` for each entry.
@@ -674,8 +678,10 @@ impl GpuStateCache {
         let buffer = Arc::try_unwrap(self.gpu_buffer);
         match buffer {
             Ok(buf) => buf.secure_shutdown(),
-            Err(arc_buf) => {
-                warn!("GPU buffer has multiple owners, cannot secure-shutdown (will be zeroed on drop)");
+            Err(_arc_buf) => {
+                warn!(
+                    "GPU buffer has multiple owners, cannot secure-shutdown (will be zeroed on drop)"
+                );
             }
         }
     }
@@ -836,7 +842,10 @@ mod tests {
         let evicted = cache.evict(1);
         assert_eq!(evicted, 1);
         assert!(cache.is_gpu_resident(&addr(0)), "account 0 should stay");
-        assert!(!cache.is_gpu_resident(&addr(1)), "account 1 should be evicted");
+        assert!(
+            !cache.is_gpu_resident(&addr(1)),
+            "account 1 should be evicted"
+        );
         assert!(cache.is_gpu_resident(&addr(2)), "account 2 should stay");
 
         // Evicted account should be in warm tier.
@@ -856,8 +865,12 @@ mod tests {
         cache.put(make_account(1));
         cache.put(make_account(2));
 
-        for _ in 0..5 { cache.get(&addr(0)); }
-        for _ in 0..3 { cache.get(&addr(2)); }
+        for _ in 0..5 {
+            cache.get(&addr(0));
+        }
+        for _ in 0..3 {
+            cache.get(&addr(2));
+        }
 
         let evicted = cache.evict(1);
         assert_eq!(evicted, 1);
@@ -909,7 +922,7 @@ mod tests {
             ..Default::default()
         };
         let cache = GpuStateCache::new(config);
-        let addrs: Vec<[u8; 32]> = (0..5).map(|i| addr(i)).collect();
+        let addrs: Vec<[u8; 32]> = (0..5).map(addr).collect();
 
         cache.prefetch(&addrs);
 
@@ -928,7 +941,7 @@ mod tests {
         let cache = GpuStateCache::new(config);
         cache.put(make_account(1));
 
-        cache.get(&addr(1));  // GPU hit
+        cache.get(&addr(1)); // GPU hit
         cache.get(&addr(99)); // miss
 
         let s = cache.stats();

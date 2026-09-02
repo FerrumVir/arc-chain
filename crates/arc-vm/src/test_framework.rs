@@ -316,8 +316,10 @@ impl TestRunner {
 
     /// Compute a summary from all collected results.
     pub fn summary(&self) -> TestSummary {
-        let mut s = TestSummary::default();
-        s.total = self.results.len();
+        let mut s = TestSummary {
+            total: self.results.len(),
+            ..Default::default()
+        };
         for r in &self.results {
             if r.passed {
                 s.passed += 1;
@@ -433,7 +435,11 @@ impl TestRunner {
                 key,
                 expected,
             } => {
-                let actual = self.state.get(&(*address, *key)).copied().unwrap_or([0u8; 32]);
+                let actual = self
+                    .state
+                    .get(&(*address, *key))
+                    .copied()
+                    .unwrap_or([0u8; 32]);
                 if actual == *expected {
                     Ok(())
                 } else {

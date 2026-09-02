@@ -1,5 +1,13 @@
 # Receipts
 
+> **Historical evidence catalog — not current production status.** Several URLs,
+> topology claims, and verification labels below predate the 2026-08-26 audit.
+> The public fleet is forked and version-skewed, community completed work was
+> zero in that read-only snapshot, and v0.8.0 is not published or deployed.
+> A matching public-v2 hash does not prove exact model bytes or payment. Use
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md)
+> for the current evidence boundary and re-run every receipt before quoting it.
+
 Every claim I make about this project, with a link you can check yourself and a
 command you can run. If something here is wrong, open an issue and I'll fix it
 in public.
@@ -65,14 +73,11 @@ always produces the exact same answer on any computer, which means anyone can
 re-run it and confirm. Then I tried to forge a fake answer four different ways
 and it caught all four.
 
-Run it yourself — this one needs nothing but the repo and an internet
-connection, and it checks a real answer against the live network:
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain
-cd arc-chain
-bash scripts/arc-verify.sh --latest
-```
+The original text suggested cloning an unpinned default branch and immediately
+running its verifier. That mutable execution path is retired and intentionally
+omitted. Reproduce historical receipts only from an existing reviewed local
+checkout at an exact commit; this archived page is not authority for the
+current public network.
 
 ### Layer 2 — five minutes, some technical background
 

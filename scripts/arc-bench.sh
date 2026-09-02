@@ -8,27 +8,21 @@
 # a file for sharing.
 #
 # Usage:
-#   bash scripts/arc-bench.sh                          # human-readable
-#   bash scripts/arc-bench.sh > BENCHMARK.md           # save report
-#   ARC_COORDINATOR=http://localhost:9944 bash arc-bench.sh
+#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-bench.sh
+#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-bench.sh > BENCHMARK.md
 #
-# Reproducible: anyone with curl + python3 can run this against the
-# live testnet and get the same output (deterministic inference + same
-# prompts → same hashes).
+# Run this only against an explicitly selected coordinator or from a reviewed
+# checkout with the local coordinator picker. Output describes that coordinator;
+# it is not proof that the public fleet shares one canonical chain.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-# ── Pick a live coordinator by probing seeds (override with ARC_COORDINATOR)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
-if [ ! -f "$PICK" ]; then
-    PICK=$(mktemp)
-    curl -fsSL "https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh" -o "$PICK" 2>/dev/null || true
+if [ -z "${ARC_COORDINATOR:-}" ]; then
+    printf 'ERROR: set ARC_COORDINATOR to a reviewed candidate or local test endpoint.\n' >&2
+    printf 'Automatic public-fleet discovery is disabled during production recovery.\n' >&2
+    exit 78
 fi
-if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
-    ARC_COORDINATOR=$(bash "$PICK" 2>/dev/null || echo "")
-fi
-COORDINATOR="${ARC_COORDINATOR:-http://136.244.109.1:9090}"
+COORDINATOR="$ARC_COORDINATOR"
 MAX_TOKENS="${ARC_MAX_TOKENS:-12}"
 
 # Each entry: prompt|expected_keyword (case-insensitive substring match)
@@ -65,10 +59,10 @@ fi
 cat <<HEADER
 # ARC Chain - Factual Benchmark Report
 
-Runs 10 factual prompts through the sharded inference pipeline and checks
-each output for the expected keyword. Reproducible: anyone with curl + python3
-can run \`scripts/arc-bench.sh\` against the live testnet and get the same
-hashes (deterministic inference).
+Runs the configured factual prompts against one explicitly selected coordinator
+and checks each response for the expected keyword. This report describes that
+endpoint and time; it does not prove that another node, model artifact, or fork
+will return the same hashes.
 
 - **Coordinator**: \`$COORDINATOR\`
 - **Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
@@ -110,7 +104,6 @@ for entry in "${PROMPTS[@]}"; do
     fi
 
     OUTPUT=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('output','').strip()[:80])" 2>/dev/null)
-    OUTPUT_HASH=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('output_hash',''))" 2>/dev/null)
     MS_PER_TOK=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ms_per_token',0))" 2>/dev/null)
     TX_HASH=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('attestation',{}).get('tx_hash',''))" 2>/dev/null)
 
@@ -140,18 +133,18 @@ cat <<FOOTER
 
 - **Pass rate**: $PASS / $TOTAL ($(( PASS * 100 / TOTAL ))%)
 - **Average ms/token**: $AVG_MS
-- **Pipeline length**: 7 shards (Llama-2-7B-Chat Q4_K_M, 32 layers split across 7 nodes in 7 cities)
-- **All output_hashes** are deterministic - re-running this benchmark on any node will produce the same hashes
+- **Pipeline topology**: not asserted by this benchmark
+- **output_hashes**: coordinator-reported commitments, not cross-node determinism proof
 
 To reproduce:
 
 \`\`\`bash
-bash scripts/arc-bench.sh
+ARC_COORDINATOR=$COORDINATOR bash scripts/arc-bench.sh
 \`\`\`
 
 To verify any individual run, take its tx_hash from the table above and run:
 
 \`\`\`bash
-bash scripts/arc-verify.sh <tx_hash>
+ARC_COORDINATOR=$COORDINATOR bash scripts/arc-verify.sh <tx_hash>
 \`\`\`
 FOOTER

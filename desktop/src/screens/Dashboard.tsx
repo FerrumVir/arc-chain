@@ -21,6 +21,7 @@ import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { NumberTicker } from "../components/NumberTicker";
 import { ObserverUpgradeBanner } from "../components/ObserverUpgradeBanner";
+import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
 import {
@@ -30,28 +31,19 @@ import {
   formatRelativeTime,
   formatUptime,
 } from "../lib/format";
+import { hostLabel } from "../lib/hosts";
 import { useAppStore } from "../lib/store";
+import { DEFAULT_NODE_CONFIG } from "../lib/types";
 
-const COORDINATOR_LABELS: Record<string, string> = {
-  "149.28.32.76": "NYC",
-  "140.82.16.112": "LAX",
-  "136.244.109.1": "AMS",
-  "104.238.171.11": "LHR",
-  "202.182.107.41": "NRT",
-  "149.28.153.31": "SGP",
-};
-
-function coordinatorLabel(url: string): string {
-  for (const [ip, label] of Object.entries(COORDINATOR_LABELS)) {
-    if (url.includes(ip)) return label;
-  }
-  return url;
-}
+// Host labels live in lib/hosts.ts so every screen names a seed identically.
+// "Which host" is load-bearing context for any chain number here, because the
+// seeds are independent chains (CLAUDE.md rule 4).
 
 export function Dashboard() {
   const queryClient = useQueryClient();
   const identity = useAppStore((s) => s.identity);
   const config = useAppStore((s) => s.config);
+  const setRoute = useAppStore((s) => s.setRoute);
 
   const { data: status } = useQuery({
     queryKey: ["status"],
@@ -73,20 +65,23 @@ export function Dashboard() {
     queryFn: api.fetchNetworkStats,
     refetchInterval: 10_000,
   });
+  // Whether the OS will bring the node back by itself. Polled rather than
+  // assumed from the config flag: the login item is registered separately, so
+  // the two can disagree and that disagreement is worth seeing.
+  const { data: loginItem } = useQuery({
+    queryKey: ["autostart"],
+    queryFn: api.getAutostart,
+    refetchInterval: 30_000,
+  });
+  const inferenceActivity = (attestations ?? []).filter((row) =>
+    row.txType == null
+    || row.txType === "Inference"
+    || row.txType === "InferenceAttestation"
+    || row.txType === "CommunityInferenceReward");
 
   const startMutation = useMutation({
     mutationFn: () =>
-      api.startNode(
-        config ?? {
-          role: "worker",
-          modelPath: null,
-          rpcPort: 9090,
-          p2pPort: 9091,
-          autoStart: true,
-          autoUpdate: true,
-          dataDir: "~/.arc",
-        },
-      ),
+      api.startNode(config ?? DEFAULT_NODE_CONFIG),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
@@ -128,6 +123,10 @@ export function Dashboard() {
 
   const running = !!status?.running;
   const isExternal = running && status?.pid == null;
+  // The node is up but not peered — the state "Reset peer state" exists to
+  // fix. Covers both "lite" (a seed is reachable over HTTP) and "syncing"
+  // (nothing is).
+  const stuckWithoutPeers = running && (status?.peers ?? 0) === 0;
   const isCrashed =
     !!status?.lastError && status.lastError.includes("exited unexpectedly");
   // Spawned but RPC not yet bound. arc-node spends most of its startup time
@@ -186,11 +185,11 @@ export function Dashboard() {
           <p className="page-subtitle">
             {running
               ? isExternal
-                ? "Your node is live - managed by the system (launchd / systemd)."
-                : "Your node is live. Earnings update every few seconds."
+                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
+                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
               : isStarting
                 ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
-                : "Your node is stopped. Start it to begin earning."}
+                : "Your node is stopped. Start it to sync and make configured compute available."}
           </p>
         </div>
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
@@ -274,9 +273,9 @@ export function Dashboard() {
           <div>
             <strong>Node is starting</strong>
             {startedAt ? ` (${startingElapsedSec}s elapsed)` : ""} — arc-node is
-            loading the GGUF model into memory before binding RPC. Debug builds
-            can take 2-5 minutes; release builds are 10-30 seconds. Switch to
-            Logs tab for live progress.
+            loading its configured model before binding RPC. Startup time
+            depends on the artifact, storage, memory, and CPU. Switch to Logs
+            for measured progress from this process.
           </div>
         </div>
       )}
@@ -324,7 +323,7 @@ export function Dashboard() {
             }}
           >
             <Loader2 size={13} className="spin" />
-            <strong>Connecting to network</strong>
+            <strong>Connecting to peers</strong>
             <span
               style={{
                 fontFamily: "var(--font-mono)",
@@ -345,17 +344,38 @@ export function Dashboard() {
         </div>
       )}
 
-      {status?.health === "lite" && status?.coordinatorUrl && (
+      {/* Recovery is gated on the actual problem — the node is up but has
+          no peers — rather than on the "lite" health level specifically.
+          "Reset peer state" is the documented fix for "stuck at 0 peers",
+          but it lived inside the lite-mode banner, which was unreachable in
+          the shipped app, so the one recovery action the docs point at could
+          never be clicked. It now also covers "syncing", which is the state
+          a genuinely stuck node sits in. */}
+      {stuckWithoutPeers && (
         <div
           className="lite-banner"
-          data-testid="lite-mode-banner"
+          data-testid={
+            status?.health === "lite" ? "lite-mode-banner" : "no-peers-banner"
+          }
           role="status"
         >
-          <strong>Client mode</strong> — your node has 0 peers, so the app is
-          using the public network through{" "}
-          {coordinatorLabel(status.coordinatorUrl)}. You can faucet, send, and
-          run inference, but{" "}
-          <strong>you won&rsquo;t earn ARC until you have at least one peer</strong>.
+          {status?.coordinatorUrl ? (
+            <>
+              <strong>Client mode</strong> — your node has 0 peers, so reads and
+              inference requests are using {hostLabel(status.coordinatorUrl)}.
+              Any balance, faucet response, or transaction is scoped to that
+              host. Use the composite explorer to audit canonical agreement and
+              preserved forks. This process cannot receive peer-routed community
+              work in its current state.
+            </>
+          ) : (
+            <>
+              <strong>No peers yet</strong> — your node is running but has not
+              completed a handshake with a configured seed. It cannot receive
+              peer-routed community work in this state. A peer connection alone
+              still does not guarantee assignment or payment.
+            </>
+          )}{" "}
           The most common cause is a stale peer cache from a prior session
           pinning to seeds that have rotated.
           <div
@@ -369,7 +389,7 @@ export function Dashboard() {
           >
             <button
               type="button"
-              className="btn-secondary"
+              className="btn btn-secondary"
               data-testid="reset-peer-state-btn"
               onClick={() => resetPeersMutation.mutate()}
               disabled={resetPeersMutation.isPending}
@@ -408,7 +428,7 @@ export function Dashboard() {
 
       <Card featured style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
-          title="Earnings"
+          title="Mined rewards"
           action={
             earnings?.rank ? (
               <span
@@ -429,12 +449,20 @@ export function Dashboard() {
           }}
         >
           <div>
-            <div
-              className="big-number gradient"
-              data-testid="earnings-total"
-            >
-              <NumberTicker value={earnings?.totalArc ?? 0} digits={2} />
-              <span className="unit">ARC total</span>
+            <div className="big-number gradient" data-testid="earnings-total">
+              {earnings?.fromChain === true ? (
+                <>
+                  <NumberTicker value={earnings.totalArc} digits={2} />
+                  <span className="unit">ARC confirmed</span>
+                </>
+              ) : (
+                <span
+                  style={{ color: "var(--text-muted)" }}
+                  title="This host did not provide the mined community-reward receipt index."
+                >
+                  — <span className="unit">not confirmed</span>
+                </span>
+              )}
             </div>
             <div
               style={{
@@ -445,15 +473,22 @@ export function Dashboard() {
                 fontSize: "var(--text-sm)",
               }}
             >
-              <div>
-                <span style={{ color: "var(--success)" }}>+</span>{" "}
-                <NumberTicker
-                  value={earnings?.todayArc ?? 0}
-                  digits={2}
-                  suffix=" today"
-                />
-              </div>
-              {!!earnings?.pendingArc && (
+              {/* Rendered only when the chain actually reports it. It used
+                  to fall back to `?? 0`, which showed a confident "+0.00
+                  today" for a number nobody knew. */}
+              {earnings?.fromChain === true && earnings.todayArc != null && (
+                <div>
+                  <span style={{ color: "var(--success)" }}>+</span>{" "}
+                  <NumberTicker
+                    value={earnings.todayArc}
+                    digits={2}
+                    suffix=" today"
+                  />
+                </div>
+              )}
+              {earnings?.fromChain === true &&
+                earnings.pendingArc != null &&
+                earnings.pendingArc > 0 && (
                 <div>
                   <NumberTicker
                     value={earnings.pendingArc}
@@ -462,17 +497,37 @@ export function Dashboard() {
                   />
                 </div>
               )}
+              {earnings && !earnings.fromChain && (
+                <div
+                  data-testid="dashboard-earnings-unavailable"
+                  title={earnings.unavailableReason
+                    ?? "Recent inference claims are not evidence of payment."}
+                >
+                  reward receipt index unavailable — no zero inferred
+                </div>
+              )}
             </div>
           </div>
           <div>
             <div className="kv">
-              <dt>Attestations</dt>
-              <dd>{formatInt(earnings?.attestations ?? 0)}</dd>
-              <dt>Last payout</dt>
+              <dt>Reward receipts</dt>
               <dd>
+                {earnings?.fromChain === true
+                  ? formatInt(earnings.attestations)
+                  : "—"}
+              </dd>
+              <dt>Last payout</dt>
+              {/* A block height is not a timestamp. Passing
+                  `last_attestation_block` (~123,462) to formatRelativeTime
+                  rendered "20770d ago" the moment the account earned
+                  anything. The two are now separate fields and rendered
+                  differently. */}
+              <dd data-testid="last-payout">
                 {earnings?.lastPayoutAt
                   ? formatRelativeTime(earnings.lastPayoutAt)
-                  : "-"}
+                  : earnings?.lastPayoutBlock
+                    ? `block #${formatInt(earnings.lastPayoutBlock)}`
+                    : "-"}
               </dd>
               <dt>Address</dt>
               <dd>
@@ -501,6 +556,12 @@ export function Dashboard() {
         </div>
       </Card>
 
+      {/* Compact projection. The full version, with the treasury ceiling and
+          the complete assumptions line, lives on the Earnings screen. */}
+      <div style={{ marginBottom: "var(--space-6)" }} data-testid="dashboard-projection">
+        <ProjectedEarnings variant="tile" />
+      </div>
+
       <div
         className="grid-stats"
         style={{ marginBottom: "var(--space-6)" }}
@@ -515,23 +576,24 @@ export function Dashboard() {
             children: (
               <p>
                 Other nodes your node has an active QUIC connection to.
-                More peers means faster sync and better fault tolerance.
-                You need at least <code>2</code> peers to serve inference.
+                Peers can improve reachability and fault tolerance, but a peer
+                count is not proof of sync, assignment, verification, or
+                reward eligibility.
               </p>
             ),
           }}
         />
         <StatTile
           icon={Users}
-          label="Network nodes"
+          label="Host validator records"
           value={formatInt(network?.totalNodes ?? 0)}
           info={{
-            title: "Network nodes",
+            title: "Host validator records",
             children: (
               <p>
-                All validators currently participating in consensus
-                network-wide. This is the total size of the ARC testnet.
-                Your node is one of them.
+                Validator records reported by the one chain host selected for
+                this session. Treat this as host-scoped unless canonical fleet
+                agreement is independently verified.
               </p>
             ),
           }}
@@ -545,13 +607,14 @@ export function Dashboard() {
             children: (
               <>
                 <p>
-                  ARC uses a DAG (directed acyclic graph) consensus instead
-                  of a single chain. Every round, validators propose blocks
-                  in parallel and reach agreement in ~1&thinsp;s.
+                  This is the selected host&rsquo;s local DAG protocol round.
+                  It can advance even while that host stops sealing blocks.
                 </p>
                 <p>
-                  This number is the current round being voted on - it
-                  ticks up continuously as long as the network is live.
+                  Round progress does not prove block finality or agreement
+                  with other sources. Check block age, hash, state root, and the
+                  composite recovery boundary before describing the chain as
+                  healthy.
                 </p>
               </>
             ),
@@ -569,9 +632,9 @@ export function Dashboard() {
             title: "Uptime",
             children: (
               <p>
-                How long this node has been connected without restart.
-                Higher uptime builds your reputation score and increases
-                your share of inference requests.
+                How long this node process has run without restart. Uptime is
+                operational evidence only; this client does not claim an
+                uptime-to-work or uptime-to-reward multiplier.
               </p>
             ),
           }}
@@ -583,32 +646,34 @@ export function Dashboard() {
           <CardHeader
             title={
               <span style={{ display: "inline-flex", alignItems: "center" }}>
-                Recent attestations
-                <InfoPopover title="How verifiable inference works">
+                Recent inference activity
+                <InfoPopover title="What this evidence proves">
                   <p>
-                    When someone sends a prompt to arc, the network <strong>executes
-                    the model end-to-end</strong> - sharded across nodes,
-                    each holding a range of transformer layers. Your
-                    node runs its slice and passes the hidden state on.
+                    On the protocol-v3 path, a worker is eligible only after it
+                    fully loads the exact model artifact requested. The
+                    coordinator independently recomputes every token through
+                    authenticated 2-of-3 agreement for each layer range.
                   </p>
                   <p>
-                    The final output is hashed (BLAKE3) with the model
-                    weights. A <strong>bonded attestation</strong> carrying{" "}
+                    An <code>InferenceAttestation</code> (<code>0x16</code>)
+                    carrying{" "}
                     <code>(input_hash, output_hash, model_hash)</code> is
-                    posted to the chain - this is what shows up here.
+                    a computation claim. A successful block receipt proves
+                    inclusion on this host; it does not itself prove payment.
                   </p>
                   <p>
-                    A VRF-selected committee of 7 validators re-runs the
-                    same input. If ≥5 agree on the hash, the attestation
-                    is final. If not, the bond is slashable and dispute
-                    resolution runs the inference on-chain via precompile
-                    0x0A.
+                    Payment is a separate <code>CommunityInferenceReward</code>
+                    transaction (<code>0x25</code>). It requires the signed
+                    worker certificate, active reward protocol and approval
+                    collection, strict greater-than-two-thirds validator
+                    identity and stake approval, and a successful mined
+                    receipt. With six equal validators, that means five.
                   </p>
                   <p style={{ color: "var(--text-muted)", fontSize: 11 }}>
-                    Inference is deterministic by construction: INT16
-                    fixed-point, pure integer math, bit-identical on any
-                    chip. On testnet, each settled attestation pays{" "}
-                    <code>2.5 ARC</code>.
+                    Raw <code>0x16</code> attestations pay nothing. Any
+                    policy-reported ARC reward applies only to a successful
+                    mined <code>0x25</code> receipt. Settlement fails closed
+                    while approval collection is unavailable.
                   </p>
                 </InfoPopover>
               </span>
@@ -623,28 +688,19 @@ export function Dashboard() {
                   color: "var(--text-muted)",
                 }}
               >
-                <span
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: 999,
-                    background: "var(--success)",
-                    boxShadow: "0 0 6px var(--success)",
-                  }}
-                />
-                Live
+                selected host
               </span>
             }
           />
           <div className="feed" data-testid="attestation-feed">
-            {!attestations || attestations.length === 0 ? (
+            {inferenceActivity.length === 0 ? (
               <EmptyState
                 icon={FileSignature}
-                title="No attestations yet"
-                description="When your node serves inference, signed receipts appear here."
+                title="No inference claims on this host"
+                description="A raw 0x16 claim appears here after submission; payment requires a separate successful mined 0x25 reward receipt."
               />
             ) : (
-              attestations.slice(0, 6).map((a) => (
+              inferenceActivity.slice(0, 6).map((a) => (
                 <div
                   key={a.txHash}
                   className="feed-item"
@@ -654,12 +710,29 @@ export function Dashboard() {
                     <Zap />
                   </div>
                   <div className="feed-item-body">
-                    <div className="feed-item-title">{a.inputPreview}</div>
+                    {/* The live seeds return flat tx records with no prompt
+                        text. Say so rather than rendering an empty title. */}
+                    <div className="feed-item-title">
+                      {a.inputPreview || (
+                        <span style={{ color: "var(--text-muted)" }}>
+                          Inference activity
+                        </span>
+                      )}
+                    </div>
                     <div className="feed-item-meta">
-                      <span>{a.tokens} tokens</span>
-                      <span>{a.latencyMs}ms</span>
+                      {/* Each of these is omitted when unknown, instead of
+                          being printed as a confident "0 tokens / 0ms". */}
+                      {a.tokens != null && <span>{a.tokens} tokens</span>}
+                      {a.latencyMs != null && <span>{a.latencyMs}ms</span>}
                       <span>{formatHash(a.txHash, 8)}</span>
-                      <span>{formatRelativeTime(a.timestamp)}</span>
+                      {a.blockHeight != null && (
+                        <span>#{formatInt(a.blockHeight)}</span>
+                      )}
+                      <span>
+                        {a.timestamp != null
+                          ? formatRelativeTime(a.timestamp)
+                          : "recent"}
+                      </span>
                     </div>
                   </div>
                   <div
@@ -667,11 +740,18 @@ export function Dashboard() {
                       textAlign: "right",
                       fontFamily: "var(--font-mono)",
                       fontSize: "var(--text-sm)",
-                      color: "var(--success)",
+                      color: a.mine ? "var(--success)" : "var(--text-muted)",
                       fontWeight: 600,
+                      whiteSpace: "nowrap",
                     }}
+                    data-testid={`activity-status-${a.txHash.slice(0, 10)}`}
+                    title={a.paid
+                      ? "Successful mined CommunityInferenceReward (0x25) receipt."
+                      : "Successful computation claim; this row is not a payment."}
                   >
-                    +{a.rewardArc.toFixed(2)}
+                    {a.paid
+                      ? "COMPUTED + PAID"
+                      : `COMPUTED · NOT PAYMENT · ${a.mine ? "yours" : "network"}`}
                   </div>
                 </div>
               ))
@@ -680,23 +760,87 @@ export function Dashboard() {
         </Card>
 
         <Card>
-          <CardHeader title="Node status" />
+          {/* Everything in this card is YOUR node, read from
+              127.0.0.1:<rpcPort>. It used to be a remote seed's numbers. */}
+          <CardHeader title="Your node" />
           <div className="kv">
             <dt>Health</dt>
             <dd>
               <StatusPill level={status?.health ?? "offline"} />
             </dd>
             <dt>Version</dt>
-            <dd>v{status?.version ?? "-"}</dd>
+            <dd>{status?.running ? `v${status.version}` : "-"}</dd>
             <dt>Block height</dt>
-            <dd>{formatInt(status?.committed ?? 0)}</dd>
+            <dd>{status?.running ? formatInt(status.committed) : "-"}</dd>
             <dt>Round</dt>
-            <dd>{formatInt(status?.round ?? 0)}</dd>
+            <dd>{status?.running ? formatInt(status.round) : "-"}</dd>
+            <dt>Cores</dt>
+            <dd data-testid="compute-width">
+              {status?.running
+                ? status.workerThreads != null
+                  ? `${status.workerThreads} of ${status.cpuCores ?? "?"}`
+                  : `all${status.cpuCores ? ` (${status.cpuCores})` : ""}`
+                : "-"}
+            </dd>
             <dt>RPC port</dt>
             <dd className="mono">:{status?.rpcPort ?? "-"}</dd>
             <dt>PID</dt>
             <dd>{status?.pid ?? "-"}</dd>
+            {/* The owner's first question: does this survive a restart on its
+                own? Answered here from the two things that decide it — the
+                config flag and the OS login item — rather than implied. */}
+            <dt>Starts with OS</dt>
+            <dd data-testid="dashboard-persistence">
+              {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart)
+                ? loginItem === true
+                  ? "yes"
+                  : loginItem === false
+                    ? "set, but no login item"
+                    : "not verified"
+                : "no"}
+            </dd>
           </div>
+          <p
+            style={{
+              marginTop: "var(--space-3)",
+              marginBottom: 0,
+              fontSize: "var(--text-xs)",
+              color: "var(--text-muted)",
+              lineHeight: 1.6,
+            }}
+            data-testid="dashboard-persistence-note"
+          >
+            {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart) &&
+            loginItem === true ? (
+              <>
+                The OS login item is registered and ARC is configured to start
+                the node when the app opens. After login it resumes as{" "}
+                {config?.modelPath ? "a worker candidate" : "an observer"}
+                {config?.modelPath
+                  ? " — it advertises compute only after the exact model artifact loads completely; assignment and payment remain separate."
+                  : " — no model is configured, so it cannot execute local model inference."}{" "}
+                Verify process and peer state after every restart.
+              </>
+            ) : (config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart) ? (
+              loginItem === false ? (
+                <>
+                  Start-on-app-launch is enabled, but no OS login item is
+                  registered. ARC will not reopen automatically after login;
+                  open it manually or repair the login item in Settings.
+                </>
+              ) : (
+                <>
+                  Start-on-app-launch is enabled, but OS registration has not
+                  been verified. Do not assume this node resumes after login.
+                </>
+              )
+            ) : (
+              <>
+                Auto-start is off, so nothing resumes after a reboot until you
+                press Start. Turn it on in Settings.
+              </>
+            )}
+          </p>
           {status?.lastError && (
             <div
               style={{
@@ -717,17 +861,66 @@ export function Dashboard() {
           <div className="divider" />
 
           <div className="section-heading">
-            <h2 style={{ fontSize: "var(--text-base)" }}>Network</h2>
+            <h2 style={{ fontSize: "var(--text-base)" }}>
+              Network
+              {status?.chainHost && (
+                <span
+                  style={{
+                    marginLeft: 8,
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-muted)",
+                    fontWeight: 400,
+                  }}
+                >
+                  via {hostLabel(status.chainHost)}
+                </span>
+              )}
+            </h2>
           </div>
           <div className="kv">
-            <dt>Total inferences</dt>
-            <dd>{formatInt(network?.totalInferences ?? 0)}</dd>
-            <dt>Average TPS</dt>
-            <dd>{formatInt(network?.avgTps ?? 0)}</dd>
-            <dt>Latest block</dt>
-            <dd>{formatInt(network?.latestBlock ?? 0)}</dd>
+            <dt>Host inference records</dt>
+            <dd>
+              {network?.totalInferences != null
+                ? formatInt(network.totalInferences)
+                : "—"}
+            </dd>
+            <dt>Host-reported TPS</dt>
+            <dd>
+              {network?.avgTps != null ? formatInt(network.avgTps) : "—"}
+            </dd>
+            <dt>Host block height</dt>
+            <dd>
+              {network?.latestBlock != null
+                ? formatInt(network.latestBlock)
+                : "—"}
+            </dd>
+            {/* Block production has been stalled on most seeds for days.
+                `/health` still reports "ok" because DAG rounds keep
+                advancing, so without this the network looks healthy. */}
+            {status?.chainBlockAgeSeconds != null && (
+              <>
+                <dt>Last block</dt>
+                <dd
+                  data-testid="chain-block-age"
+                  style={{
+                    color:
+                      status.chainBlockAgeSeconds > 3600
+                        ? "var(--warning)"
+                        : undefined,
+                  }}
+                >
+                  {formatUptime(status.chainBlockAgeSeconds)} ago
+                </dd>
+              </>
+            )}
           </div>
 
+          {/* Was `openExternal("http://140.82.16.112:3200")` labelled "Open
+              network explorer". Three things were wrong with that: the IP was
+              hardcoded to LAX rather than the seed this session actually reads,
+              :3200 is a network dashboard and not a block explorer, and the
+              deployed page carries dead tiles and stale copy. The in-app
+              Network screen reads the pinned host and can be trusted. */}
           <button
             className="btn btn-secondary"
             style={{
@@ -735,12 +928,11 @@ export function Dashboard() {
               marginTop: "var(--space-4)",
               justifyContent: "center",
             }}
-            onClick={() =>
-              api.openExternal("http://140.82.16.112:3200")
-            }
-            data-testid="btn-open-explorer"
+            onClick={() => setRoute("network")}
+            data-testid="btn-open-network"
           >
-            <ArrowUpRight size={14} /> Open network explorer
+            <ArrowUpRight size={14} /> Check the chain
+            {status?.chainHost && <> ({hostLabel(status.chainHost)})</>}
           </button>
         </Card>
       </div>

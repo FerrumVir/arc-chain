@@ -1,15 +1,101 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/brand/arc-logo-white.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="ARC Chain Block Explorer - Real-time blockchain data for the ARC L1 network" />
-    <meta name="theme-color" content="#03030A" />
-    <title>ARC Explorer</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="ARC composite block explorer for signed legacy history and the protocol-v3 continuation." />
+    <meta name="theme-color" content="#080a12" />
+    <meta name="arc-network-config" content="../shared/frontend/arc-network.json" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='29' fill='%23080a12' stroke='%23b8ff5a' stroke-width='3'/%3E%3Cpath d='M19 46 30 17h5l11 29h-7l-2-7H27l-2 7zm10-13h6l-3-9z' fill='%23b8ff5a'/%3E%3C/svg%3E" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'" />
+    <title>ARC Composite Explorer</title>
+    <link rel="stylesheet" href="./styles.css?v=3" />
+    <script src="../shared/frontend/arc-network.js?v=3" defer></script>
+    <script src="./app.js?v=3" defer></script>
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="#/" aria-label="ARC Explorer home">
+        <span class="brand-mark" aria-hidden="true"><span>A</span></span>
+        <span class="brand-copy"><strong>ARC</strong><small>COMPOSITE EXPLORER</small></span>
+      </a>
+      <div class="source-control">
+        <label for="source-select">Chain view</label>
+        <div class="select-wrap"><span id="source-dot" class="status-dot unknown" aria-hidden="true"></span><select id="source-select" aria-describedby="source-help"><option value="canonical">Canonical timeline</option></select></div>
+        <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh explorer" title="Refresh explorer"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.2 9A7 7 0 0 0 6.7 6.7L4 9m16 6-2.7 2.3A7 7 0 0 1 5.8 15" /></svg></button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="eyebrow"><span></span><b id="network-label">ARC / CONFIGURING</b></div>
+        <h1 id="hero-title">One continuous history.<br /><em>Every boundary disclosed.</em></h1>
+        <p>The canonical view routes signed legacy heights through the approved checkpoint, verifies the H+1 recovery link, and continues on protocol v3. Preserved forks are available only as explicit, non-canonical views.</p>
+        <form id="search-form" class="search" role="search">
+          <label class="sr-only" for="search-input">Search ARC Chain</label>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
+          <input id="search-input" type="search" spellcheck="false" autocomplete="off" placeholder="Block height, transaction hash, or address" />
+          <label class="sr-only" for="search-kind">Lookup type</label>
+          <select id="search-kind"><option value="auto">Auto</option><option value="block">Block</option><option value="tx">Transaction / receipt</option><option value="address">Address</option></select>
+          <button type="submit">Explore</button>
+        </form>
+        <p id="search-error" class="field-error" role="alert"></p>
+      </section>
+
+      <section id="connection-banner" class="connection-banner loading" aria-live="polite"><span class="banner-pulse" aria-hidden="true"></span><div><strong id="banner-title">Loading canonical configuration…</strong><span id="banner-detail">No chain claim has been made yet.</span></div></section>
+
+      <section class="recovery-ribbon" aria-labelledby="recovery-title">
+        <div class="recovery-heading"><span class="micro-label">Canonical continuity</span><h2 id="recovery-title">Recovery checkpoint unavailable</h2><p id="recovery-summary">The explorer is paused until approved recovery metadata is published.</p></div>
+        <ol class="continuity-track">
+          <li><span>Legacy</span><strong id="checkpoint-height">H —</strong><small id="checkpoint-hash">Signed checkpoint unavailable</small></li>
+          <li class="boundary"><span>Boundary</span><strong id="boundary-height">H+1 —</strong><small id="boundary-state">Parent link not checked</small></li>
+          <li><span>Protocol v3</span><strong id="continuation-label">Continuation —</strong><small id="manifest-hash">Manifest unavailable</small></li>
+        </ol>
+      </section>
+
+      <section class="source-ribbon" aria-label="Selected view details">
+        <div><span class="micro-label">Selected view</span><strong id="source-name">Canonical timeline</strong></div>
+        <div class="source-endpoint"><span class="micro-label">Resolved RPC</span><code id="source-endpoint">Per-height canonical resolver</code></div>
+        <div><span class="micro-label">Last refreshed</span><strong id="last-refreshed">Not yet</strong></div>
+        <p id="source-help">Canonical results are routed by height. Alternate sources are never silently merged.</p>
+      </section>
+
+      <section class="metric-grid" aria-label="Canonical source metrics">
+        <article class="metric-card accent"><span class="metric-icon" aria-hidden="true">↗</span><p>Canonical height</p><strong id="metric-height">—</strong><small id="metric-height-note">Awaiting v3 source</small></article>
+        <article class="metric-card"><span class="metric-icon" aria-hidden="true">◇</span><p>Latest block</p><strong id="metric-stored-height">—</strong><small id="metric-stored-note">No block header loaded</small></article>
+        <article class="metric-card"><span class="metric-icon" aria-hidden="true">◷</span><p>Block age</p><strong id="metric-block-age">—</strong><small id="metric-liveness-note">Liveness unknown</small></article>
+        <article class="metric-card"><span class="metric-icon" aria-hidden="true">≡</span><p>Transactions</p><strong id="metric-transactions">—</strong><small>Current source report</small></article>
+        <article class="metric-card"><span class="metric-icon" aria-hidden="true">⌁</span><p>Connected peers</p><strong id="metric-peers">—</strong><small>Current source local view</small></article>
+        <article class="metric-card"><span class="metric-icon" aria-hidden="true">✦</span><p>Validators</p><strong id="metric-validators">—</strong><small id="metric-validator-note">Availability unknown</small></article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel blocks-panel">
+          <div class="panel-heading"><div><span class="micro-label">Resolved canonical segment</span><h2>Recent protocol-v3 blocks</h2></div><span id="blocks-status" class="quiet-pill">Waiting</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Height</th><th>Segment</th><th>Age</th><th>Transactions</th><th>Block hash</th></tr></thead><tbody id="blocks-body"><tr><td colspan="5" class="empty-cell">No canonical source configured.</td></tr></tbody></table></div>
+        </article>
+        <aside class="panel facts-panel">
+          <div class="panel-heading"><div><span class="micro-label">Current source truth</span><h2>Health and commitments</h2></div></div>
+          <dl class="facts" id="source-facts"><div><dt>Source</dt><dd>Unavailable</dd></div><div><dt>Node version</dt><dd>Unavailable</dd></div><div><dt>Reachability</dt><dd>Unknown</dd></div><div><dt>Chain liveness</dt><dd>Unknown</dd></div><div><dt>Latest block hash</dt><dd>Unavailable</dd></div><div><dt>Latest state root</dt><dd>Unavailable</dd></div></dl>
+          <p class="facts-note">Reachability, liveness, canonicality, and replica agreement are separate claims. Missing values stay unavailable.</p>
+        </aside>
+      </section>
+
+      <section class="activity-grid" aria-label="Inference and reward evidence">
+        <article class="panel"><div class="panel-heading"><div><span class="micro-label">Receipt-backed only</span><h2>Inference activity</h2></div><span id="inference-status" class="quiet-pill">Waiting</span></div><div id="inference-list" class="evidence-list"><p class="empty-cell">No confirmed inference receipts loaded.</p></div></article>
+        <article class="panel"><div class="panel-heading"><div><span class="micro-label">Protocol economics</span><h2>Reward readiness</h2></div><span id="rewards-status" class="quiet-pill">Waiting</span></div><dl id="rewards-list" class="facts"><div><dt>Issuance</dt><dd>Unavailable</dd></div><div><dt>Attestation reward</dt><dd>Unavailable</dd></div><div><dt>Projected earnings</dt><dd>Unavailable without worker evidence</dd></div></dl><p class="facts-note">A configured rate is not an earning. ARC is counted as earned only after a successful mined reward receipt.</p></article>
+      </section>
+
+      <section id="inspector" class="panel inspector" aria-labelledby="inspector-title">
+        <div class="panel-heading inspector-heading"><div><span id="inspector-kicker" class="micro-label">Lookup</span><h2 id="inspector-title">Search canonical history or select an alternate source</h2></div><button id="inspector-close" class="text-button" type="button" hidden>Close</button></div>
+        <div id="inspector-content" class="inspector-content"><div class="inspector-empty"><span aria-hidden="true">⌕</span><p>Block lookup resolves by checkpoint height. Transaction and address searches retain source provenance for every result.</p></div></div>
+      </section>
+    </main>
+
+    <footer><div><span class="brand-mini">ARC</span> Verifiable continuity for deterministic intelligence.</div><p>No fork blending. No simulated throughput. No pending rewards presented as earnings.</p></footer>
+    <noscript><div class="noscript">ARC Explorer needs JavaScript to load the canonical network configuration.</div></noscript>
   </body>
 </html>

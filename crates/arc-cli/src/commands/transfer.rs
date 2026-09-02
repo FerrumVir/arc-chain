@@ -1,8 +1,8 @@
 //! `arc transfer` - send ARC tokens to another address.
 
-use anyhow::{Result, Context};
 use crate::keygen;
 use crate::rpc::RpcClient;
+use anyhow::{Context, Result};
 
 pub async fn run(rpc: &RpcClient, from_keyfile: &str, to: &str, amount: u64) -> Result<()> {
     // 0. Validate recipient address
@@ -20,7 +20,11 @@ pub async fn run(rpc: &RpcClient, from_keyfile: &str, to: &str, amount: u64) -> 
         Ok(data) => data.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0),
         Err(e) => {
             let msg = format!("{:#}", e);
-            if msg.contains("404") { 0 } else { return Err(e).context("failed to fetch sender account"); }
+            if msg.contains("404") {
+                0
+            } else {
+                return Err(e).context("failed to fetch sender account");
+            }
         }
     };
 
@@ -37,15 +41,27 @@ pub async fn run(rpc: &RpcClient, from_keyfile: &str, to: &str, amount: u64) -> 
 
     // 4. Submit
     println!("Sending {} ARC", amount);
-    println!("  From:  {}...{}", &sender_addr[..8], &sender_addr[sender_addr.len()-8..]);
-    println!("  To:    {}...{}", &to[..to.len().min(8)], &to[to.len().saturating_sub(8)..]);
+    println!(
+        "  From:  {}...{}",
+        &sender_addr[..8],
+        &sender_addr[sender_addr.len() - 8..]
+    );
+    println!(
+        "  To:    {}...{}",
+        &to[..to.len().min(8)],
+        &to[to.len().saturating_sub(8)..]
+    );
     println!("  Nonce: {}", nonce);
     println!();
 
-    let result = rpc.submit_tx(tx_json).await
+    let result = rpc
+        .submit_tx(tx_json)
+        .await
         .context("failed to submit transfer")?;
 
-    if let Some(tx_hash) = result.get("hash").and_then(|v| v.as_str())
+    if let Some(tx_hash) = result
+        .get("hash")
+        .and_then(|v| v.as_str())
         .or_else(|| result.get("tx_hash").and_then(|v| v.as_str()))
     {
         println!("Transaction submitted: {}", tx_hash);

@@ -97,10 +97,22 @@ pub struct SecurityReport {
 impl SecurityReport {
     /// Build a report from a list of findings and total check count.
     pub fn from_findings(findings: Vec<SecurityFinding>, total_checks: usize) -> Self {
-        let critical = findings.iter().filter(|f| f.severity == Severity::Critical).count();
-        let high = findings.iter().filter(|f| f.severity == Severity::High).count();
-        let medium = findings.iter().filter(|f| f.severity == Severity::Medium).count();
-        let low = findings.iter().filter(|f| f.severity == Severity::Low).count();
+        let critical = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Critical)
+            .count();
+        let high = findings
+            .iter()
+            .filter(|f| f.severity == Severity::High)
+            .count();
+        let medium = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Medium)
+            .count();
+        let low = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Low)
+            .count();
 
         // Score: 100 minus weighted deductions.
         let deduction = (critical as f64 * 25.0)
@@ -298,7 +310,9 @@ impl SecurityScanner {
                              Potential reentrancy vector.",
                             call_count
                         ),
-                        recommendation: "Use checks-effects-interactions pattern or a reentrancy guard.".to_string(),
+                        recommendation:
+                            "Use checks-effects-interactions pattern or a reentrancy guard."
+                                .to_string(),
                     })
                 } else {
                     None
@@ -313,8 +327,10 @@ impl SecurityScanner {
                         check: SecurityCheck::IntegerOverflow,
                         severity: Severity::High,
                         location: "bytecode".to_string(),
-                        description: "Arithmetic operations without overflow guards detected.".to_string(),
-                        recommendation: "Use SafeMath or Solidity >=0.8.0 checked arithmetic.".to_string(),
+                        description: "Arithmetic operations without overflow guards detected."
+                            .to_string(),
+                        recommendation: "Use SafeMath or Solidity >=0.8.0 checked arithmetic."
+                            .to_string(),
                     })
                 } else {
                     None
@@ -339,8 +355,10 @@ impl SecurityScanner {
                         check: SecurityCheck::UnprotectedSelfDestruct,
                         severity: Severity::Critical,
                         location: "bytecode".to_string(),
-                        description: "SELFDESTRUCT opcode found - may be callable by non-owners.".to_string(),
-                        recommendation: "Add access control to self-destruct functionality.".to_string(),
+                        description: "SELFDESTRUCT opcode found - may be callable by non-owners."
+                            .to_string(),
+                        recommendation: "Add access control to self-destruct functionality."
+                            .to_string(),
                     })
                 } else {
                     None
@@ -353,8 +371,10 @@ impl SecurityScanner {
                         check: SecurityCheck::UnauthorizedAccess,
                         severity: Severity::High,
                         location: "bytecode".to_string(),
-                        description: "No CALLER checks found - functions may lack access control.".to_string(),
-                        recommendation: "Add onlyOwner or role-based access control modifiers.".to_string(),
+                        description: "No CALLER checks found - functions may lack access control."
+                            .to_string(),
+                        recommendation: "Add onlyOwner or role-based access control modifiers."
+                            .to_string(),
                     })
                 } else {
                     None
@@ -369,8 +389,10 @@ impl SecurityScanner {
                         check: SecurityCheck::DenialOfService,
                         severity: Severity::Medium,
                         location: "bytecode".to_string(),
-                        description: "Multiple jump targets detected - possible unbounded loop.".to_string(),
-                        recommendation: "Bound loop iterations and use pull-over-push patterns.".to_string(),
+                        description: "Multiple jump targets detected - possible unbounded loop."
+                            .to_string(),
+                        recommendation: "Bound loop iterations and use pull-over-push patterns."
+                            .to_string(),
                     })
                 } else {
                     None
@@ -383,8 +405,11 @@ impl SecurityScanner {
                         check: SecurityCheck::FrontRunning,
                         severity: Severity::Medium,
                         location: "bytecode".to_string(),
-                        description: "GASPRICE and ORIGIN used - transaction ordering dependency.".to_string(),
-                        recommendation: "Use commit-reveal schemes or transaction ordering protection.".to_string(),
+                        description: "GASPRICE and ORIGIN used - transaction ordering dependency."
+                            .to_string(),
+                        recommendation:
+                            "Use commit-reveal schemes or transaction ordering protection."
+                                .to_string(),
                     })
                 } else {
                     None
@@ -397,8 +422,11 @@ impl SecurityScanner {
                         check: SecurityCheck::OracleManipulation,
                         severity: Severity::High,
                         location: "bytecode".to_string(),
-                        description: "External call result stored directly - possible oracle manipulation.".to_string(),
-                        recommendation: "Use TWAP oracles or multiple oracle sources with median.".to_string(),
+                        description:
+                            "External call result stored directly - possible oracle manipulation."
+                                .to_string(),
+                        recommendation: "Use TWAP oracles or multiple oracle sources with median."
+                            .to_string(),
                     })
                 } else {
                     None
@@ -411,8 +439,11 @@ impl SecurityScanner {
                         check: SecurityCheck::FlashLoan,
                         severity: Severity::Medium,
                         location: "bytecode".to_string(),
-                        description: "Value-dependent external calls detected - flash loan attack surface.".to_string(),
-                        recommendation: "Add flash-loan guards or require multi-block settlement.".to_string(),
+                        description:
+                            "Value-dependent external calls detected - flash loan attack surface."
+                                .to_string(),
+                        recommendation: "Add flash-loan guards or require multi-block settlement."
+                            .to_string(),
                     })
                 } else {
                     None
@@ -425,8 +456,11 @@ impl SecurityScanner {
                         check: SecurityCheck::PrivilegeEscalation,
                         severity: Severity::Critical,
                         location: "bytecode".to_string(),
-                        description: "DELEGATECALL found - attacker may hijack storage context.".to_string(),
-                        recommendation: "Validate delegate targets and use proxy patterns carefully.".to_string(),
+                        description: "DELEGATECALL found - attacker may hijack storage context."
+                            .to_string(),
+                        recommendation:
+                            "Validate delegate targets and use proxy patterns carefully."
+                                .to_string(),
                     })
                 } else {
                     None
@@ -481,7 +515,7 @@ mod tests {
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.critical, 0);
         assert_eq!(report.high, 0);
-        assert_eq!(report.score, 100.0);
+        assert!((report.score - 100.0).abs() < f64::EPSILON);
     }
 
     #[test]

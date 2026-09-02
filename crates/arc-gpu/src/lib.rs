@@ -1,14 +1,16 @@
-pub mod hardware_detect;
-pub mod metal_verify;
-pub mod gpu_memory;
-pub mod gpu_matmul;
-pub mod gpu_forward;
 pub mod avx512_verify;
-pub mod neon_verify;
 pub mod cuda_verify;
+pub mod gpu_forward;
+pub mod gpu_matmul;
+pub mod gpu_memory;
+pub mod hardware_detect;
 pub mod metal_icb;
+pub mod metal_verify;
+pub mod neon_verify;
 
-pub use gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel as GpuMemoryModel, ACCOUNT_SLOT_SIZE};
+pub use gpu_memory::{
+    ACCOUNT_SLOT_SIZE, GpuAccountBuffer, GpuAccountRepr, MemoryModel as GpuMemoryModel,
+};
 
 use arc_crypto::Hash256;
 use rayon::prelude::*;
@@ -206,14 +208,12 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
         "GPU BLAKE3 compute dispatch"
     );
 
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("ARC GPU Hasher"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        },
-    ))
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("ARC GPU Hasher"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
     .map_err(|e| GpuError::DeviceError(e.to_string()))?;
 
     let n = data.len() as u32;
@@ -345,16 +345,28 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
         label: Some("BLAKE3 Bind Group"),
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: lengths_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: output_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: lengths_buffer.as_entire_binding(),
+            },
         ],
     });
 
     // Dispatch compute
     let workgroup_size = 256u32;
-    let num_workgroups = (n + workgroup_size - 1) / workgroup_size;
+    let num_workgroups = n.div_ceil(workgroup_size);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("BLAKE3 Encoder"),
@@ -379,8 +391,13 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device.poll(wgpu::PollType::wait()).map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
-    receiver.recv().map_err(|e| GpuError::DeviceError(format!("Channel error: {e}")))?.map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
+    device
+        .poll(wgpu::PollType::wait())
+        .map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
+    receiver
+        .recv()
+        .map_err(|e| GpuError::DeviceError(format!("Channel error: {e}")))?
+        .map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
 
     let raw_data = buffer_slice.get_mapped_range();
     let output_u32s: &[u32] = bytemuck::cast_slice(&raw_data);
@@ -422,7 +439,7 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
     let mut current: Vec<Hash256> = leaves.to_vec();
 
     // Pad to even length with zero hash if needed
-    if current.len() % 2 != 0 {
+    if !current.len().is_multiple_of(2) {
         current.push(Hash256([0u8; 32]));
     }
 
@@ -448,7 +465,7 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
         };
 
         // Pad again if odd
-        if current.len() > 1 && current.len() % 2 != 0 {
+        if current.len() > 1 && !current.len().is_multiple_of(2) {
             current.push(Hash256([0u8; 32]));
         }
     }
@@ -555,13 +572,22 @@ mod tests {
                     if cpu != gpu {
                         mismatches += 1;
                         if mismatches <= 5 {
-                            eprintln!("Mismatch at index {i}: CPU={} GPU={}",
-                                hex::encode(cpu.0), hex::encode(gpu.0));
+                            eprintln!(
+                                "Mismatch at index {i}: CPU={} GPU={}",
+                                hex::encode(cpu.0),
+                                hex::encode(gpu.0)
+                            );
                         }
                     }
                 }
-                assert_eq!(mismatches, 0, "{mismatches} hash mismatches between CPU and GPU");
-                println!("GPU batch commit: all {0} hashes match CPU", gpu_hashes.len());
+                assert_eq!(
+                    mismatches, 0,
+                    "{mismatches} hash mismatches between CPU and GPU"
+                );
+                println!(
+                    "GPU batch commit: all {0} hashes match CPU",
+                    gpu_hashes.len()
+                );
             }
             Err(GpuError::NoAdapter) | Err(GpuError::Unavailable) => {
                 println!("GPU not available, skipping GPU verification");
@@ -657,7 +683,8 @@ mod tests {
         let refs: Vec<&[u8]> = items.iter().map(|b| b.as_slice()).collect();
 
         let cpu_results = cpu_batch_commit(&refs);
-        let gpu_results = gpu_batch_commit(&refs).expect("small batch should always succeed via CPU fallback");
+        let gpu_results =
+            gpu_batch_commit(&refs).expect("small batch should always succeed via CPU fallback");
         assert_eq!(cpu_results, gpu_results);
     }
 }

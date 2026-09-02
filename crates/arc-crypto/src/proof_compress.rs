@@ -62,10 +62,7 @@ fn rle_encode(data: &[u8]) -> Vec<u8> {
     while i < data.len() {
         let byte = data[i];
         let mut count: u8 = 1;
-        while i + (count as usize) < data.len()
-            && data[i + count as usize] == byte
-            && count < 255
-        {
+        while i + (count as usize) < data.len() && data[i + count as usize] == byte && count < 255 {
             count += 1;
         }
         out.push(count);
@@ -82,7 +79,7 @@ fn rle_decode(data: &[u8]) -> Vec<u8> {
     while i + 1 < data.len() {
         let count = data[i] as usize;
         let byte = data[i + 1];
-        out.extend(std::iter::repeat(byte).take(count));
+        out.extend(std::iter::repeat_n(byte, count));
         i += 2;
     }
     out
@@ -225,10 +222,7 @@ pub fn compress_proof(proof_bytes: &[u8]) -> CompressedProof {
         (CompressionType::Hybrid, hybrid_data),
     ];
 
-    let (best_type, best_data) = candidates
-        .into_iter()
-        .min_by_key(|(_, d)| d.len())
-        .unwrap();
+    let (best_type, best_data) = candidates.into_iter().min_by_key(|(_, d)| d.len()).unwrap();
 
     CompressedProof {
         original_size,
@@ -332,14 +326,10 @@ impl ProofAggregator {
             return [0u8; 32];
         }
 
-        let mut leaves: Vec<Hash256> = self
-            .proofs
-            .iter()
-            .map(|p| hash_bytes(p))
-            .collect();
+        let mut leaves: Vec<Hash256> = self.proofs.iter().map(|p| hash_bytes(p)).collect();
 
         // Pad to even length.
-        if leaves.len() % 2 != 0 {
+        if !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
 
@@ -355,7 +345,7 @@ impl ProofAggregator {
                 })
                 .collect();
 
-            if leaves.len() > 1 && leaves.len() % 2 != 0 {
+            if leaves.len() > 1 && !leaves.len().is_multiple_of(2) {
                 leaves.push(*leaves.last().unwrap());
             }
         }

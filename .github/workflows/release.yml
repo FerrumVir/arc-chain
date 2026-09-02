@@ -1,5 +1,10 @@
-name: Release
+name: Release ARC
 
+# One tag, one workflow, one create-only publisher. v0.7.10 and v0.7.11 were broken by
+# two sibling workflows: the desktop workflow created a release with its
+# GITHUB_TOKEN, and that event could not trigger the headless workflow. This
+# graph consumes the exact artifacts already built and exercised by the protected
+# pre-tag workflow, then invokes one create-only publisher.
 on:
   push:
     tags:
@@ -7,116 +12,1904 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release'
+        description: Existing strict tag to release (for example v0.8.0); repository rules must separately protect it from moves
         required: true
-        default: 'v0.4.0'
+        type: string
+      cutover_handoff_artifact_id:
+        description: Immutable producer artifact ID containing the three compact certificate-bound cutover assets
+        required: true
+        type: string
+      cutover_handoff_artifact_digest:
+        description: "Exact server digest for that protected handoff (sha256: followed by 64 lowercase hex characters)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+  validate:
+    name: Validate release tag and pin commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      date: ${{ steps.release.outputs.date }}
+      sha: ${{ steps.release.outputs.sha }}
+      pretag_artifacts: ${{ steps.release.outputs.pretag_artifacts }}
+      pretag_artifact_ids: ${{ steps.release.outputs.pretag_artifact_ids }}
+      pretag_run_id: ${{ steps.release.outputs.pretag_run_id }}
+      pretag_run_attempt: ${{ steps.release.outputs.pretag_run_attempt }}
+      cutover_artifact_id: ${{ steps.release.outputs.cutover_artifact_id }}
+      cutover_artifact_digest: ${{ steps.release.outputs.cutover_artifact_digest }}
+      cutover_artifact_name: ${{ steps.release.outputs.cutover_artifact_name }}
+      cutover_artifact_size: ${{ steps.release.outputs.cutover_artifact_size }}
+      cutover_run_id: ${{ steps.release.outputs.cutover_run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - id: release
+        name: Match tag, source, and application versions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+          REQUESTED_CUTOVER_ARTIFACT_ID: ${{ inputs.cutover_handoff_artifact_id }}
+          REQUESTED_CUTOVER_ARTIFACT_DIGEST: ${{ inputs.cutover_handoff_artifact_digest }}
+        run: |
+          set -Eeuo pipefail
+          TAG="$REQUESTED_TAG"
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Release tags must be strict vMAJOR.MINOR.PATCH values; got '$TAG'."
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+
+          git show-ref --verify --quiet "refs/tags/$TAG" || {
+            echo "::error::Tag '$TAG' does not exist. workflow_dispatch never creates or moves tags."
+            exit 1
+          }
+          TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "::error::Checkout $HEAD_COMMIT does not match tag $TAG ($TAG_COMMIT)."
+            exit 1
+          fi
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          MAIN_COMMIT="$(git rev-parse refs/remotes/origin/main)"
+          if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then
+            echo "::error::Tag $TAG targets $TAG_COMMIT, but current main is $MAIN_COMMIT. Release only the exact protected-main head verified by preflight."
+            exit 1
+          fi
+
+          # The recovery boundary and compact quorum certificate do not exist
+          # at source build time. Select one immutable, exact-commit Actions artifact by
+          # both server ID and digest; tag-push runs deliberately fail closed
+          # because they cannot supply this protected operational handoff.
+          if [[ ! "$REQUESTED_CUTOVER_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Release requires workflow_dispatch with a positive cutover_handoff_artifact_id."
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_CUTOVER_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Release requires the exact sha256 cutover_handoff_artifact_digest."
+            exit 1
+          fi
+          CUTOVER_ARTIFACT_JSON="$RUNNER_TEMP/cutover-handoff-artifact.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$REQUESTED_CUTOVER_ARTIFACT_ID" \
+            > "$CUTOVER_ARTIFACT_JSON"
+          CUTOVER_ARTIFACT_NAME="arc-recovery-release-handoff-$TAG_COMMIT"
+          jq -e \
+            --argjson artifact_id "$REQUESTED_CUTOVER_ARTIFACT_ID" \
+            --arg name "$CUTOVER_ARTIFACT_NAME" \
+            --arg digest "$REQUESTED_CUTOVER_ARTIFACT_DIGEST" \
+            '.id == $artifact_id and .name == $name and .digest == $digest
+             and .expired == false
+             and (.size_in_bytes | type == "number" and . > 0 and . <= 33554432)
+             and (.workflow_run.id | type == "number" and . > 0)' \
+            "$CUTOVER_ARTIFACT_JSON" >/dev/null || {
+              echo "::error::Cutover handoff artifact ID/name/digest/size/liveness differs."
+              exit 1
+            }
+          CUTOVER_RUN_ID="$(jq -er '.workflow_run.id' "$CUTOVER_ARTIFACT_JSON")"
+          CUTOVER_ARTIFACT_SIZE="$(jq -er '.size_in_bytes' "$CUTOVER_ARTIFACT_JSON")"
+          CUTOVER_RUN_JSON="$RUNNER_TEMP/cutover-handoff-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CUTOVER_RUN_ID" \
+            > "$CUTOVER_RUN_JSON"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$TAG_COMMIT" \
+            --argjson run_id "$CUTOVER_RUN_ID" \
+            '.id == $run_id and .head_repository.full_name == $repository
+             and .head_branch == "main" and .head_sha == $sha
+             and .path == ".github/workflows/recovery-release-handoff.yml"
+             and .event == "workflow_dispatch" and .status == "completed"
+             and .conclusion == "success"' \
+            "$CUTOVER_RUN_JSON" >/dev/null || {
+              echo "::error::Cutover handoff must come from a successful exact-main workflow_dispatch run."
+              exit 1
+            }
+
+          PREFLIGHT_RUN_ID="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow release-signing-preflight.yml \
+            --commit "$TAG_COMMIT" \
+            --event workflow_dispatch \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')"
+          if [ -z "$PREFLIGHT_RUN_ID" ]; then
+            echo "::error::No protected signing preflight exists for exact main commit $TAG_COMMIT."
+            exit 1
+          fi
+          PREFLIGHT_WORKFLOW_ID="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release-signing-preflight.yml" \
+            --jq '.id')"
+          PREFLIGHT_RUN_JSON="$RUNNER_TEMP/preflight-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREFLIGHT_RUN_ID" \
+            > "$PREFLIGHT_RUN_JSON"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$TAG_COMMIT" \
+            --argjson workflow_id "$PREFLIGHT_WORKFLOW_ID" \
+            --argjson run_id "$PREFLIGHT_RUN_ID" \
+            '.id == $run_id
+              and .workflow_id == $workflow_id
+              and .head_repository.full_name == $repository
+              and .head_branch == "main"
+              and .head_sha == $sha
+              and .event == "workflow_dispatch"
+              and .status == "completed"
+              and .conclusion == "success"
+              and (.run_attempt | type == "number" and . > 0)' \
+            "$PREFLIGHT_RUN_JSON" >/dev/null || {
+              echo "::error::The latest exact-commit preflight run is not a completed successful main-branch run of the protected workflow."
+              exit 1
+            }
+          PREFLIGHT_RUN_ATTEMPT="$(jq -r '.run_attempt' "$PREFLIGHT_RUN_JSON")"
+          PREFLIGHT_ARTIFACTS_JSON="$RUNNER_TEMP/preflight-artifacts.json"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$PREFLIGHT_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[]' | jq -s '{artifacts: .}' \
+            > "$PREFLIGHT_ARTIFACTS_JSON"
+          python3 scripts/release/select-pretag-artifacts.py \
+            --api-json "$PREFLIGHT_ARTIFACTS_JSON" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$TAG_COMMIT" \
+            --run-id "$PREFLIGHT_RUN_ID" \
+            --run-attempt "$PREFLIGHT_RUN_ATTEMPT" \
+            --github-output "$GITHUB_OUTPUT" >/dev/null
+          echo "::notice::Release commit $TAG_COMMIT is bound to exact artifacts from signing preflight run $PREFLIGHT_RUN_ID attempt $PREFLIGHT_RUN_ATTEMPT."
+
+          WORKSPACE_VERSION="$(awk '
+            /^\[workspace\.package\]$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && /^version[[:space:]]*=/ {
+              gsub(/[[:space:]\"]/], "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          DESKTOP_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')"
+          DESKTOP_NPM_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/package.json"))["version"])')"
+          DESKTOP_NPM_LOCK_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/package-lock.json"))["version"])')"
+          DESKTOP_NPM_LOCK_ROOT_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/package-lock.json"))["packages"][""]["version"])')"
+          DESKTOP_CARGO_VERSION="$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && /^version[[:space:]]*=/ {
+              gsub(/[[:space:]\"]/], "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' desktop/src-tauri/Cargo.toml)"
+          for pair in \
+            "workspace:$WORKSPACE_VERSION" \
+            "desktop-tauri:$DESKTOP_VERSION" \
+            "desktop-npm:$DESKTOP_NPM_VERSION" \
+            "desktop-npm-lock:$DESKTOP_NPM_LOCK_VERSION" \
+            "desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION" \
+            "desktop-cargo:$DESKTOP_CARGO_VERSION"; do
+            component="${pair%%:*}"
+            actual="${pair#*:}"
+            if [ "$actual" != "$VERSION" ]; then
+              echo "::error::$component version is $actual but tag is $TAG. Align versions before tagging."
+              exit 1
+            fi
+          done
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "sha=$TAG_COMMIT"
+            echo "cutover_artifact_id=$REQUESTED_CUTOVER_ARTIFACT_ID"
+            echo "cutover_artifact_digest=$REQUESTED_CUTOVER_ARTIFACT_DIGEST"
+            echo "cutover_artifact_name=$CUTOVER_ARTIFACT_NAME"
+            echo "cutover_artifact_size=$CUTOVER_ARTIFACT_SIZE"
+            echo "cutover_run_id=$CUTOVER_RUN_ID"
+          } >> "$GITHUB_OUTPUT"
+
+  # A tag is independently releasable only if its validated commit passes
+  # the aggregate quality harness. Do not rely on a prior branch CI run: a tag
+  # or workflow_dispatch can otherwise publish a commit whose required gates
+  # were never executed. This intentionally duplicates build work in exchange
+  # for making the publish authorization self-contained.
+  release-quality:
+    name: Full quality gate on validated release commit
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            dashboard/package-lock.json
+            desktop/package-lock.json
+            sdk/package-lock.json
+            sdk/typescript/package-lock.json
+            sdks/typescript/package-lock.json
+
+      # The workspace is pinned to nightly; the out-of-workspace Tauri crate
+      # is deliberately tested on stable by scripts/ci_check.sh.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: release-quality
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> desktop/src-tauri/target
+
+      - name: Audit every JavaScript lockfile used by release builds
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for package in dashboard desktop sdk sdk/typescript sdks/typescript; do
+            npm --prefix "$package" audit --package-lock-only --audit-level=low
+          done
+
+      - name: Install pinned Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Install Linux desktop and browser prerequisites
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2
+          cd desktop
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run every blocking local release gate
+        run: ./scripts/ci_check.sh --full
+
+  # Release publication fails closed on the reviewed Cargo.lock and deny.toml.
+  # Branch CI audits these same three Rust graphs; this gate repeats the policy
+  # on the validated tag commit so publication never relies on an earlier run.
+  release-supply-chain:
+    name: Cargo dependency policy (${{ matrix.graph }})
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            asset: arc-node-macos-arm64
-            binary: arc-node
-          # Intel Mac binary: cross-compiled from macos-14 (Apple Silicon)
-          # since macos-13 hosted pool has multi-hour queue waits.
-          - os: macos-14
-            target: x86_64-apple-darwin
-            asset: arc-node-macos-x86_64
-            binary: arc-node
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: arc-node-windows-x86_64.exe
-            binary: arc-node.exe
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            asset: arc-node-linux-x86_64
-            binary: arc-node
+          - graph: workspace
+            manifest: Cargo.toml
+          - graph: desktop
+            manifest: desktop/src-tauri/Cargo.toml
+          - graph: updater-verifier
+            manifest: tests/release/tauri-updater-verifier/Cargo.toml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Enforce advisory, license, source, and dependency policy
+        run: bash scripts/ci/run-cargo-deny.sh "${{ matrix.manifest }}"
+
+  # The release graph repeats the inference known-answer vectors on every
+  # supported CPU/OS architecture. A green Linux x86_64 quality run alone does
+  # not prove that integer promotion, threading, or shard assembly agrees on
+  # ARM, Intel macOS, or Windows.
+  cross-arch-golden-vectors:
+    name: Golden vectors (${{ matrix.platform }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+          - platform: windows-x86_64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Prove namespaced manifest verification on installer hosts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          key="$RUNNER_TEMP/arc-portability-key"
+          probe="$RUNNER_TEMP/arc-portability-probe"
+          allowed="$RUNNER_TEMP/arc-portability-allowed-signers"
+          cleanup() {
+            rm -f -- "$key" "$key.pub" "$probe" "$probe.sig" "$allowed"
+          }
+          trap cleanup EXIT HUP INT TERM
+          ssh-keygen -q -t ed25519 -N '' -f "$key"
+          printf '%s\n' 'ARC release verifier portability probe v1' > "$probe"
+          printf 'arc-release namespaces="arc-release-manifest-v1" %s\n' \
+            "$(cat "$key.pub")" > "$allowed"
+          ssh-keygen -Y sign \
+            -f "$key" \
+            -n arc-release-manifest-v1 \
+            "$probe"
+          ssh-keygen -Y verify \
+            -f "$allowed" \
+            -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s "$probe.sig" \
+            < "$probe"
+          cleanup
+          trap - EXIT HUP INT TERM
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: release-golden-${{ matrix.platform }}
+
+      - name: Run blocking inference known-answer vectors
+        run: cargo test -p arc-inference --lib --locked golden -- --nocapture
+
+  headless:
+    name: Verify exact pre-tag headless ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            extension: ''
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            extension: ''
+          - platform: macos-arm64
+            runner: macos-15
+            extension: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            extension: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            extension: .exe
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          targets: ${{ matrix.target }}
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.target }}
-          workspaces: . -> target
-
-      - name: Build arc-node release
+      - name: Revalidate the selected run, attempt, IDs, and digests
         shell: bash
-        run: cargo build --release -p arc-node --features candle --target ${{ matrix.target }}
-
-      - name: Strip binary
-        if: runner.os != 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
         run: |
-          strip target/${{ matrix.target }}/release/${{ matrix.binary }} || true
+          scripts/release/verify-pretag-run-and-artifacts.sh \
+            "$GITHUB_REPOSITORY" \
+            "${{ needs.validate.outputs.sha }}" \
+            "${{ needs.validate.outputs.pretag_run_id }}" \
+            "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            "$PRETAG_SELECTION"
 
-      - name: Rename binary
-        shell: bash
-        run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Download the immutable preflight artifact by ID
+        # At this exact v8.0.1 source pin, artifact.digest is passed as
+        # expectedHash and digest-mismatch:error throws before the step can
+        # succeed. Keeping the raw ZIP lets our materializer independently
+        # recompute that same selected digest before safe extraction.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          artifact-ids: ${{ fromJSON(needs.validate.outputs.pretag_artifacts)[matrix.platform].headless.id }}
+          path: pretag-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.validate.outputs.pretag_run_id }}
+          skip-decompress: true
+          digest-mismatch: error
 
-  release:
-    name: Publish release
-    needs: build
+      - name: Verify and materialize the exact preflight bytes
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/materialize-pretag-artifacts.py \
+            --downloads-root pretag-download \
+            --output-dir materialized \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ needs.validate.outputs.sha }}" \
+            --run-id "${{ needs.validate.outputs.pretag_run_id }}" \
+            --run-attempt "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --selection-json "$PRETAG_SELECTION" \
+            --only "headless:$PLATFORM"
+
+      - name: Re-smoke the exact binaries selected for publication
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          ROOT="materialized/headless-${{ matrix.platform }}"
+          NODE_ASSET="$ROOT/arc-node-${{ matrix.platform }}${{ matrix.extension }}"
+          CLI_ASSET="$ROOT/arc-cli-${{ matrix.platform }}${{ matrix.extension }}"
+          chmod +x "$NODE_ASSET" "$CLI_ASSET"
+          "$NODE_ASSET" --version | grep -F " $VERSION"
+          "$CLI_ASSET" --version | grep -F " $VERSION"
+
+  linux-server-compat:
+    name: Ubuntu server smoke (${{ matrix.platform }})
+    needs: [validate, headless]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            ubuntu_versions: '22.04 24.04 26.04'
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            ubuntu_versions: '24.04 26.04'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Revalidate the selected run, attempt, IDs, and digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          scripts/release/verify-pretag-run-and-artifacts.sh \
+            "$GITHUB_REPOSITORY" \
+            "${{ needs.validate.outputs.sha }}" \
+            "${{ needs.validate.outputs.pretag_run_id }}" \
+            "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            "$PRETAG_SELECTION"
+
+      - name: Download the immutable Linux preflight artifact by ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ fromJSON(needs.validate.outputs.pretag_artifacts)[matrix.platform].headless.id }}
+          path: pretag-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.validate.outputs.pretag_run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Verify and materialize the exact Linux candidate
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/materialize-pretag-artifacts.py \
+            --downloads-root pretag-download \
+            --output-dir release-smoke \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ needs.validate.outputs.sha }}" \
+            --run-id "${{ needs.validate.outputs.pretag_run_id }}" \
+            --run-attempt "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --selection-json "$PRETAG_SELECTION" \
+            --only "headless:$PLATFORM"
+
+      - name: Execute both binaries without a display on supported Ubuntu servers
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          UBUNTU_VERSIONS: ${{ matrix.ubuntu_versions }}
+        run: |
+          set -Eeuo pipefail
+          smoke_root="release-smoke/headless-${{ matrix.platform }}"
+          chmod +x "$smoke_root/arc-node-${{ matrix.platform }}" "$smoke_root/arc-cli-${{ matrix.platform }}"
+          for ubuntu in $UBUNTU_VERSIONS; do
+            docker pull "ubuntu:$ubuntu"
+            for binary in arc-node-${{ matrix.platform }} arc-cli-${{ matrix.platform }}; do
+              docker run --rm \
+                --env DISPLAY= \
+                --volume "$PWD/$smoke_root:/release:ro" \
+                "ubuntu:$ubuntu" "/release/$binary" --version \
+                | grep -F " $VERSION"
+            done
+
+            # Boot the real headless node, not just clap's `--version` path.
+            # The shipped recovered genesis is complete, but stake defaults to
+            # zero and --no-community suppresses registration. This exercises
+            # config, data-dir creation and Axum health serving without a
+            # validator key, peers, or any external network mutation. Bash
+            # `/dev/tcp` avoids installing curl in the clean server image.
+            docker run --rm \
+              --env DISPLAY= \
+              --volume "$PWD/$smoke_root:/release:ro" \
+              --volume "$PWD/$smoke_root/genesis.toml:/config/genesis.toml:ro" \
+              "ubuntu:$ubuntu" bash -ceu '
+                log=/tmp/arc-node-smoke.log
+                /release/arc-node-${{ matrix.platform }} \
+                  --rpc 127.0.0.1:19944 \
+                  --p2p-port 19945 \
+                  --eth-rpc-port 0 \
+                  --data-dir /tmp/arc-data \
+                  --genesis /config/genesis.toml \
+                  --no-community >"$log" 2>&1 &
+                node_pid=$!
+                trap '\''kill "$node_pid" 2>/dev/null || true; wait "$node_pid" 2>/dev/null || true'\'' EXIT
+                for _ in $(seq 1 40); do
+                  if ! kill -0 "$node_pid" 2>/dev/null; then
+                    cat "$log"
+                    exit 1
+                  fi
+                  if response=$(timeout 2 bash -ceu '\''
+                    exec 3<>/dev/tcp/127.0.0.1/19944
+                    printf "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
+                    cat <&3
+                  '\'' 2>/dev/null) && printf "%s" "$response" | grep -q "HTTP/1.1 200"; then
+                    # An isolated stake-zero node has no advancing chain, so
+                    # truthful health is normally `degraded`; the smoke needs
+                    # a valid liveness classification, not a false green claim.
+                    printf "%s\n" "$response" | grep -Eq '"status":"(ok|degraded)"'
+                    exit 0
+                  fi
+                  sleep 0.25
+                done
+                cat "$log"
+                exit 1
+              '
+          done
+
+  desktop:
+    name: Verify exact pre-tag desktop ${{ matrix.platform }}
+    # Signing happens once in the reviewed pre-tag environment. The tag run
+    # downloads those immutable artifact IDs only after its independent
+    # quality, dependency-policy, and known-answer gates pass.
+    needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+          - platform: windows-x86_64
+            runner: windows-latest
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Revalidate the selected run, attempt, IDs, and digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          scripts/release/verify-pretag-run-and-artifacts.sh \
+            "$GITHUB_REPOSITORY" \
+            "${{ needs.validate.outputs.sha }}" \
+            "${{ needs.validate.outputs.pretag_run_id }}" \
+            "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            "$PRETAG_SELECTION"
+
+      - name: Download the immutable signed desktop artifact by ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ fromJSON(needs.validate.outputs.pretag_artifacts)[matrix.platform].desktop.id }}
+          path: pretag-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.validate.outputs.pretag_run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Verify and materialize the exact signed desktop bytes
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/materialize-pretag-artifacts.py \
+            --downloads-root pretag-download \
+            --output-dir materialized \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ needs.validate.outputs.sha }}" \
+            --run-id "${{ needs.validate.outputs.pretag_run_id }}" \
+            --run-attempt "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --selection-json "$PRETAG_SELECTION" \
+            --only "desktop:$PLATFORM"
+          find "materialized/arc-desktop-$PLATFORM" \
+            -maxdepth 1 -type f -size +0c -print
+
+  assemble-release:
+    name: Assemble the exact unsigned release manifest
+    needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors, headless, linux-server-compat, desktop]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The isolated updater verifier is a stable-toolchain release utility.
+      RUSTUP_TOOLCHAIN: stable
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.unsigned-upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.unsigned-upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.unsigned-stage.outputs.artifact_name }}
+      metadata_sha: ${{ steps.unsigned-stage.outputs.metadata_sha }}
+      manifest_sha: ${{ steps.unsigned-stage.outputs.manifest_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Revalidate the selected run, attempt, IDs, and digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          scripts/release/verify-pretag-run-and-artifacts.sh \
+            "$GITHUB_REPOSITORY" \
+            "${{ needs.validate.outputs.sha }}" \
+            "${{ needs.validate.outputs.pretag_run_id }}" \
+            "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            "$PRETAG_SELECTION"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate.outputs.pretag_artifact_ids }}
+          path: pretag-downloads
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.validate.outputs.pretag_run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Verify and materialize every exact preflight artifact
+        shell: bash
+        env:
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/materialize-pretag-artifacts.py \
+            --downloads-root pretag-downloads \
+            --output-dir artifacts \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ needs.validate.outputs.sha }}" \
+            --run-id "${{ needs.validate.outputs.pretag_run_id }}" \
+            --run-attempt "${{ needs.validate.outputs.pretag_run_attempt }}" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --selection-json "$PRETAG_SELECTION"
+
+      - name: Download the immutable protected recovery handoff by ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.validate.outputs.cutover_artifact_id }}
+          path: cutover-handoff-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.validate.outputs.cutover_run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Materialize the exact three-file recovery handoff
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/materialize-cutover-handoff.py \
+            --downloads-root cutover-handoff-download \
+            --output-dir cutover-handoff \
+            --artifact-id "${{ needs.validate.outputs.cutover_artifact_id }}" \
+            --artifact-name "${{ needs.validate.outputs.cutover_artifact_name }}" \
+            --artifact-digest "${{ needs.validate.outputs.cutover_artifact_digest }}" \
+            --artifact-size "${{ needs.validate.outputs.cutover_artifact_size }}" \
+            --commit "${{ needs.validate.outputs.sha }}"
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Assemble assets, updater manifest, and checksums
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_DATE: ${{ needs.validate.outputs.date }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          CUTOVER_HANDOFF_DIR: cutover-handoff
+        run: ./scripts/release/assemble-release.sh
+
+      - name: Cryptographically verify every updater payload against the embedded key
+        run: |
+          tests/release/verify_tauri_updater_signatures.sh \
+            desktop/src-tauri/tauri.conf.json release-files
+
+      - name: Show final release contract
+        run: |
+          set -Eeuo pipefail
+          ls -lh release-files
+          cat release-files/SHA256SUMS
+
+      - name: Stage the exact unsigned manifest handoff
+        id: unsigned-stage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/release/release-manifest-handoff.py stage \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ needs.validate.outputs.sha }}" \
+            --tag "${{ needs.validate.outputs.tag }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-dir release-files \
+            --stage-dir unsigned-release-handoff \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload the create-only unsigned manifest handoff
+        id: unsigned-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.unsigned-stage.outputs.artifact_name }}
+          path: unsigned-release-handoff/*
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  manifest-sign:
+    name: Sign only the verified release manifest
+    needs: [validate, assemble-release]
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.sealed-upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.sealed-upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.sealed-stage.outputs.artifact_name }}
+      metadata_sha: ${{ steps.sealed-stage.outputs.metadata_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the unsigned manifest handoff by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.assemble-release.outputs.artifact_id }}
+          path: unsigned-release-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      # No repository program executes before the private-key step. This
+      # inline, exact-commit validator treats every downloaded byte as hostile.
+      - name: Validate the complete unsigned allowlist and freeze all inputs
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_ARTIFACT_NAME: ${{ needs.assemble-release.outputs.artifact_name }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.assemble-release.outputs.artifact_digest }}
+          EXPECTED_METADATA_SHA: ${{ needs.assemble-release.outputs.metadata_sha }}
+          EXPECTED_MANIFEST_SHA: ${{ needs.assemble-release.outputs.manifest_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_name="arc-release-unsigned-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
+          [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
+          /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" "$RELEASE_TAG" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_METADATA_SHA" \
+            "$EXPECTED_MANIFEST_SHA" unsigned-release-handoff <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          repository, commit, tag, run_id, attempt, metadata_sha, manifest_sha, root_raw = sys.argv[1:]
+          root = pathlib.Path(root_raw)
+          metadata_path = root / "ARC-RELEASE-HANDOFF.json"
+          release = root / "release-files"
+          if not root.is_dir() or root.is_symlink() or \
+             {path.name for path in root.iterdir()} != {metadata_path.name, release.name} or \
+             not metadata_path.is_file() or metadata_path.is_symlink() or \
+             not release.is_dir() or release.is_symlink():
+              raise SystemExit("unsigned release handoff root is unsafe")
+          raw = metadata_path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != metadata_sha:
+              raise SystemExit("unsigned release metadata hash differs")
+          metadata = json.loads(raw)
+          canonical = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          if raw != canonical or metadata.get("schema") != "arc.release-manifest-handoff.v1" or \
+             metadata.get("sealed") is not False or metadata.get("repository") != repository or \
+             metadata.get("commit") != commit or metadata.get("tag") != tag or \
+             metadata.get("workflow_run_id") != int(run_id) or \
+             metadata.get("workflow_run_attempt") != int(attempt) or \
+             metadata.get("manifest_sha256") != manifest_sha:
+              raise SystemExit("unsigned release metadata identity differs")
+          expected = {
+              "arc-node-linux-x86_64", "arc-cli-linux-x86_64", "arc-node-linux-arm64", "arc-cli-linux-arm64",
+              "arc-node-macos-arm64", "arc-cli-macos-arm64", "arc-node-macos-x86_64", "arc-cli-macos-x86_64",
+              "arc-node-windows-x86_64.exe", "arc-cli-windows-x86_64.exe",
+              "arc-desktop-macos-arm64.app.tar.gz", "arc-desktop-macos-arm64.app.tar.gz.sig", "arc-desktop-macos-arm64.dmg",
+              "arc-desktop-macos-x86_64.app.tar.gz", "arc-desktop-macos-x86_64.app.tar.gz.sig", "arc-desktop-macos-x86_64.dmg",
+              "arc-desktop-windows-x86_64-setup.exe", "arc-desktop-windows-x86_64-setup.exe.sig", "arc-desktop-windows-x86_64.msi",
+              "arc-desktop-linux-x86_64.AppImage", "arc-desktop-linux-x86_64.AppImage.sig", "arc-desktop-linux-x86_64.deb", "arc-desktop-linux-x86_64.rpm",
+              "install.sh", "testnet-seeds.txt", "genesis.toml", "latest.json",
+              "arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json",
+              "SHA256SUMS",
+          }
+          files = metadata.get("files")
+          if not isinstance(files, dict) or set(files) != expected or \
+             {path.name for path in release.iterdir()} != expected:
+              raise SystemExit("unsigned release file allowlist differs")
+          for name, expected_hash in files.items():
+              path = release / name
+              info = path.lstat()
+              maximum = 1024 * 1024 if name == "arc-recovery-checkpoint-descriptor.json" else \
+                  (4 * 1024 * 1024 if name.endswith(".sig") or name.endswith(".json") else 2 * 1024**3)
+              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or not 0 < info.st_size <= maximum or \
+                 not re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)) or sha256(path) != expected_hash:
+                  raise SystemExit(f"unsigned release file differs: {name}")
+              os.chmod(path, 0o400)
+          manifest = (release / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+          if manifest[:4] != ["# ARC release manifest v1", f"# repository={repository}", f"# tag={tag}", f"# commit={commit}"] or \
+             sha256(release / "SHA256SUMS") != manifest_sha:
+              raise SystemExit("unsigned release manifest identity differs")
+          records = {}
+          for line in manifest[4:]:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)", line)
+              if not match or match.group(2) in records:
+                  raise SystemExit("unsigned release manifest record is invalid")
+              records[match.group(2)] = match.group(1)
+          if set(records) != expected - {"SHA256SUMS"} or \
+             any(files[name] != digest for name, digest in records.items()):
+              raise SystemExit("unsigned release manifest coverage differs")
+          os.chmod(metadata_path, 0o400)
+          PY
+          [ -x /usr/bin/ssh-keygen ] && [ -f release/arc-release-allowed-signers ] \
+            && [ ! -L release/arc-release-allowed-signers ]
+
+      - name: Sign only the frozen SHA256SUMS manifest
+        shell: bash
+        env:
+          ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set +x
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH SSH_AUTH_SOCK SSH_SK_PROVIDER \
+            PYTHONHOME PYTHONPATH PERL5OPT PERL5LIB RUBYOPT RUBYLIB \
+            NODE_OPTIONS NODE_PATH GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+            GIT_CONFIG_NOSYSTEM
+          key_file="$RUNNER_TEMP/arc-release-manifest-key"
+          cleanup_key() {
+            unset ARC_RELEASE_MANIFEST_PRIVATE_KEY
+            if [ -f "$key_file" ] && [ ! -L "$key_file" ]; then
+              /usr/bin/shred -u -- "$key_file" || true
+            fi
+          }
+          trap cleanup_key EXIT HUP INT TERM
+          [ -n "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ] || {
+            echo "::error::ARC_RELEASE_MANIFEST_PRIVATE_KEY is unavailable."
+            exit 1
+          }
+          umask 077
+          /usr/bin/printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$key_file"
+          /usr/bin/chmod 600 "$key_file"
+          /usr/bin/ssh-keygen -Y sign \
+            -f "$key_file" \
+            -n arc-release-manifest-v1 \
+            unsigned-release-handoff/release-files/SHA256SUMS
+          cleanup_key
+          trap - EXIT HUP INT TERM
+
+      - name: Verify manifest signature after private-key removal
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          /usr/bin/ssh-keygen -Y verify \
+            -f release/arc-release-allowed-signers \
+            -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s unsigned-release-handoff/release-files/SHA256SUMS.sig \
+            < unsigned-release-handoff/release-files/SHA256SUMS
+
+      - name: Prove original bytes unchanged and stage the sealed handoff
+        id: sealed-stage
+        shell: bash
+        env:
+          EXPECTED_METADATA_SHA: ${{ needs.assemble-release.outputs.metadata_sha }}
+        run: |
+          set -Eeuo pipefail
+          /usr/bin/python3 -I - unsigned-release-handoff "$EXPECTED_METADATA_SHA" <<'PY'
+          import hashlib, json, pathlib, stat, sys
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          root, expected_metadata_sha = pathlib.Path(sys.argv[1]), sys.argv[2]
+          metadata_raw = (root / "ARC-RELEASE-HANDOFF.json").read_bytes()
+          if hashlib.sha256(metadata_raw).hexdigest() != expected_metadata_sha:
+              raise SystemExit("unsigned metadata changed during signing")
+          metadata = json.loads(metadata_raw)
+          release = root / "release-files"
+          expected = set(metadata["files"]) | {"SHA256SUMS.sig"}
+          if {path.name for path in release.iterdir()} != expected:
+              raise SystemExit("signer created an unexpected release file")
+          for name, expected_hash in metadata["files"].items():
+              path = release / name
+              if not path.is_file() or path.is_symlink() or sha256(path) != expected_hash:
+                  raise SystemExit(f"signer changed input bytes: {name}")
+          signature = release / "SHA256SUMS.sig"
+          if not signature.is_file() or signature.is_symlink() or not 0 < signature.stat().st_size <= 4 * 1024 * 1024:
+              raise SystemExit("signer output is not one bounded regular signature")
+          PY
+          python3 scripts/release/release-manifest-handoff.py stage \
+            --sealed \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "${{ needs.validate.outputs.sha }}" \
+            --tag "${{ needs.validate.outputs.tag }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --source-dir unsigned-release-handoff/release-files \
+            --stage-dir sealed-release-handoff \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload the create-only sealed release handoff
+        id: sealed-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.sealed-stage.outputs.artifact_name }}
+          path: sealed-release-handoff/*
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+  publish-draft:
+    name: Create and upload one isolated release draft
+    needs: [validate, manifest-sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+      evidence_id: ${{ steps.evidence.outputs.artifact-id }}
+      evidence_digest: ${{ steps.evidence.outputs.artifact-digest }}
+      evidence_name: ${{ steps.draft.outputs.evidence_name }}
+      evidence_sha: ${{ steps.draft.outputs.evidence_sha }}
+    steps:
+      # This privileged job deliberately has no checkout. The only release
+      # bytes arrive through the exact signer artifact ID and digest.
+      - name: Download the sealed release handoff by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.manifest-sign.outputs.artifact_id }}
+          path: sealed-release-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      # Workflow-inline stdlib validation is the only parser before authority
+      # is introduced. No repository program exists in this fresh workspace.
+      - name: Validate the exact sealed allowlist and owner signature
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_ARTIFACT_NAME: ${{ needs.manifest-sign.outputs.artifact_name }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.manifest-sign.outputs.artifact_digest }}
+          EXPECTED_METADATA_SHA: ${{ needs.manifest-sign.outputs.metadata_sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_name="arc-release-sealed-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
+          [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
+          /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" "$RELEASE_TAG" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$EXPECTED_METADATA_SHA" \
+            sealed-release-handoff <<'PY'
+          import hashlib, json, os, pathlib, re, stat, sys
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          repository, commit, tag, run_id, attempt, metadata_sha, root_raw = sys.argv[1:]
+          root = pathlib.Path(root_raw)
+          metadata_path = root / "ARC-RELEASE-HANDOFF.json"
+          release = root / "release-files"
+          if not root.is_dir() or root.is_symlink() or \
+             {p.name for p in root.iterdir()} != {metadata_path.name, release.name} or \
+             not metadata_path.is_file() or metadata_path.is_symlink() or \
+             not release.is_dir() or release.is_symlink():
+              raise SystemExit("sealed handoff root is unsafe")
+          raw = metadata_path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != metadata_sha or len(raw) > 4 * 1024 * 1024:
+              raise SystemExit("sealed handoff metadata hash or size differs")
+          metadata = json.loads(raw)
+          canonical = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          if raw != canonical or metadata.get("schema") != "arc.release-manifest-handoff.v1" or \
+             metadata.get("sealed") is not True or metadata.get("repository") != repository or \
+             metadata.get("commit") != commit or metadata.get("tag") != tag or \
+             metadata.get("workflow_run_id") != int(run_id) or \
+             metadata.get("workflow_run_attempt") != int(attempt):
+              raise SystemExit("sealed handoff identity differs")
+          expected = {
+              "arc-node-linux-x86_64", "arc-cli-linux-x86_64", "arc-node-linux-arm64", "arc-cli-linux-arm64",
+              "arc-node-macos-arm64", "arc-cli-macos-arm64", "arc-node-macos-x86_64", "arc-cli-macos-x86_64",
+              "arc-node-windows-x86_64.exe", "arc-cli-windows-x86_64.exe",
+              "arc-desktop-macos-arm64.app.tar.gz", "arc-desktop-macos-arm64.app.tar.gz.sig", "arc-desktop-macos-arm64.dmg",
+              "arc-desktop-macos-x86_64.app.tar.gz", "arc-desktop-macos-x86_64.app.tar.gz.sig", "arc-desktop-macos-x86_64.dmg",
+              "arc-desktop-windows-x86_64-setup.exe", "arc-desktop-windows-x86_64-setup.exe.sig", "arc-desktop-windows-x86_64.msi",
+              "arc-desktop-linux-x86_64.AppImage", "arc-desktop-linux-x86_64.AppImage.sig", "arc-desktop-linux-x86_64.deb", "arc-desktop-linux-x86_64.rpm",
+              "install.sh", "testnet-seeds.txt", "genesis.toml", "latest.json",
+              "arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json",
+              "SHA256SUMS", "SHA256SUMS.sig",
+          }
+          files, modes = metadata.get("files"), metadata.get("modes")
+          if not isinstance(files, dict) or set(files) != expected or \
+             not isinstance(modes, dict) or set(modes) != expected or \
+             {p.name for p in release.iterdir()} != expected:
+              raise SystemExit("sealed release allowlist differs")
+          total = 0
+          for name in sorted(expected):
+              path = release / name
+              info = path.lstat()
+              maximum = 1024 * 1024 if name == "arc-recovery-checkpoint-descriptor.json" else \
+                  (4 * 1024 * 1024 if name.endswith(".sig") or name.endswith(".json") else 2 * 1024**3)
+              if not stat.S_ISREG(info.st_mode) or path.is_symlink() or not 0 < info.st_size <= maximum or \
+                 not re.fullmatch(r"[0-9a-f]{64}", str(files[name])) or sha256(path) != files[name]:
+                  raise SystemExit(f"sealed release file differs: {name}")
+              total += info.st_size
+              expected_mode = 0o755 if name == "install.sh" or name.endswith(".AppImage") or \
+                  (name.startswith(("arc-node-", "arc-cli-")) and not name.endswith(".exe")) else 0o644
+              if modes[name] != expected_mode:
+                  raise SystemExit(f"sealed release mode differs: {name}")
+              os.chmod(path, expected_mode)
+          if total > 12 * 1024 * 1024 * 1024:
+              raise SystemExit("sealed release aggregate size differs")
+          lines = (release / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+          if lines[:4] != ["# ARC release manifest v1", f"# repository={repository}", f"# tag={tag}", f"# commit={commit}"] or \
+             metadata.get("manifest_sha256") != files["SHA256SUMS"]:
+              raise SystemExit("sealed release manifest identity differs")
+          records = {}
+          for line in lines[4:]:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)", line)
+              if not match or match.group(2) in records:
+                  raise SystemExit("sealed release manifest record is invalid")
+              records[match.group(2)] = match.group(1)
+          if set(records) != expected - {"SHA256SUMS", "SHA256SUMS.sig"} or \
+             any(files[name] != digest for name, digest in records.items()):
+              raise SystemExit("sealed release manifest coverage differs")
+          PY
+          allowed="$RUNNER_TEMP/arc-release-allowed-signers"
+          printf '%s\n' \
+            'arc-release namespaces="arc-release-manifest-v1" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY arc-release-manifest-v1' \
+            > "$allowed"
+          ssh-keygen -Y verify -f "$allowed" -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s sealed-release-handoff/release-files/SHA256SUMS.sig \
+            < sealed-release-handoff/release-files/SHA256SUMS
+          mv sealed-release-handoff/release-files release-files
+
+      # GH_TOKEN is scoped only to this fixed gh/jq/coreutils mutation step.
+      # No checkout, repository script, interpreter, package manager, compiler,
+      # Git hook, or command sourced from the release payload can run here.
+      - name: Create the hidden draft and upload the exact verified assets
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          SELECTED_PREFLIGHT_RUN_ID: ${{ needs.validate.outputs.pretag_run_id }}
+          SELECTED_PREFLIGHT_RUN_ATTEMPT: ${{ needs.validate.outputs.pretag_run_attempt }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+          RELEASE_NOTES: |
+            ## Headless / server node
+
+            Every supported GUI-free target has a node and CLI binary:
+
+            - Linux x86_64/amd64: `arc-node-linux-x86_64`, `arc-cli-linux-x86_64`
+            - Linux ARM64/aarch64: `arc-node-linux-arm64`, `arc-cli-linux-arm64`
+            - macOS Apple Silicon: `arc-node-macos-arm64`, `arc-cli-macos-arm64`
+            - macOS Intel: `arc-node-macos-x86_64`, `arc-cli-macos-x86_64`
+            - Windows x86_64: `arc-node-windows-x86_64.exe`, `arc-cli-windows-x86_64.exe`
+
+            Linux and macOS install without a display using the exact release:
+
+            ```bash
+            curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.validate.outputs.tag }}/install.sh
+            ARC_INSTALL_SHA256=__ARC_INSTALL_SHA256__
+            if command -v sha256sum >/dev/null 2>&1; then
+              printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
+            else
+              printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
+            fi
+            bash install.sh --version ${{ needs.validate.outputs.version }}
+            ```
+
+            Windows Server users download the two `.exe` files above manually.
+
+            ## Upgrading from v0.7.x
+
+            The first v0.7.x to v0.8.x transition is a manual, exact-tag
+            migration. Do not wait for or invoke the legacy v0.7 updater: it
+            does not verify the v0.8 release manifest and does not know the v3
+            data boundary. Download and SHA-256-check the protected-tag
+            `install.sh` shown above, then run it with the explicit
+            `--version` value.
+
+            Fully stop the v0.7 desktop/node and its old updater before v0.8
+            starts. The v0.8 `.arc-node.lock` is a same-generation guard;
+            released v0.7 binaries do not honor it. Headless community nodes
+            preserve the old `data/` tree and start from fresh `data-v0.8/`.
+            The desktop preserves the old WAL and selects fresh `data-v3*`
+            state. Validators must use the fenced, checkpoint-bound
+            coordinated cutover; v2 and v3 validators must never overlap.
+
+            This immutable v0.8 release is intentionally not GitHub's global
+            `latest` release while legacy v0.7 updaters remain in the field.
+            Use the exact tag and signed release assets above.
+
+            ## Desktop GUI
+
+            - macOS Apple Silicon: `arc-desktop-macos-arm64.dmg`
+            - macOS Intel: `arc-desktop-macos-x86_64.dmg`
+            - Windows x86_64: `arc-desktop-windows-x86_64-setup.exe`,
+              `arc-desktop-windows-x86_64.msi`
+            - Linux x86_64: `arc-desktop-linux-x86_64.AppImage`,
+              `arc-desktop-linux-x86_64.deb`, `arc-desktop-linux-x86_64.rpm`
+
+            Linux ARM64 is headless-only in this release. Tauri updater payloads
+            carry application-update signatures. Enabled background checks read
+            the signed manifest after startup and every 24 hours, but never
+            download or install without confirmation. In-place updates cover
+            macOS, Windows NSIS, and AppImage. Windows MSI, `.deb`, and `.rpm`
+            remain manual package upgrades. The macOS and Windows installers
+            are not Apple Developer ID/notarized or Windows Authenticode signed,
+            so operating-system trust approval may be required.
+
+            The checked-in genesis is the checkpoint-bound recovered testnet
+            definition with six rotated public validator identities and reward
+            activation at block 137146. For stake-zero workers, eligibility
+            exists only while the recovered fleet is live, issuance-ready, and
+            funded; only a successful mined `0x25` `CommunityInferenceReward`
+            receipt is earned. Projected earnings are null with an explicit reason
+            unless policy, receipt-rate, and treasury evidence are available.
+
+            The protected source-tag installer verifies the owner-signed
+            `SHA256SUMS.sig` before it trusts any asset checksum.
+        run: |
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB NODE_OPTIONS NODE_PATH \
+            GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM \
+            GIT_DIR GIT_WORK_TREE
+          [ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SELECTED_PREFLIGHT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SELECTED_PREFLIGHT_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+
+          installer_row="$(/usr/bin/sha256sum release-files/install.sh)"
+          installer_sha256="${installer_row%% *}"
+          [[ "$installer_sha256" =~ ^[0-9a-f]{64}$ ]]
+          placeholder_count="$(/usr/bin/grep -Fo '__ARC_INSTALL_SHA256__' <<< "$RELEASE_NOTES" | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+          [ "$placeholder_count" -eq 1 ]
+          RELEASE_NOTES="${RELEASE_NOTES/__ARC_INSTALL_SHA256__/$installer_sha256}"
+          if /usr/bin/grep -Fq '__ARC_INSTALL_SHA256__' <<< "$RELEASE_NOTES"; then
+            echo "::error::Installer-digest placeholder survived release-note materialization."
+            exit 1
+          fi
+
+          current_preflight_id="$(/usr/bin/gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow release-signing-preflight.yml \
+            --commit "$EXPECTED_SHA" --event workflow_dispatch --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          [ "$current_preflight_id" = "$SELECTED_PREFLIGHT_RUN_ID" ] || {
+            echo "::error::The selected signing preflight was superseded."
+            exit 1
+          }
+          preflight_json="$RUNNER_TEMP/current-preflight-run.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID" \
+            > "$preflight_json"
+          /usr/bin/jq -e --arg sha "$EXPECTED_SHA" \
+            --argjson attempt "$SELECTED_PREFLIGHT_RUN_ATTEMPT" \
+            '.head_sha == $sha and .head_branch == "main"
+             and .event == "workflow_dispatch" and .status == "completed"
+             and .conclusion == "success" and .run_attempt == $attempt' \
+            "$preflight_json" >/dev/null
+
+          tag_ref="$RUNNER_TEMP/tag-ref.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$tag_ref"
+          object_type="$(/usr/bin/jq -er '.object.type' "$tag_ref")"
+          object_sha="$(/usr/bin/jq -er '.object.sha' "$tag_ref")"
+          tag_depth=0
+          while [ "$object_type" = tag ]; do
+            tag_depth=$((tag_depth + 1))
+            [ "$tag_depth" -le 4 ]
+            /usr/bin/gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" > "$tag_ref"
+            object_type="$(/usr/bin/jq -er '.object.type' "$tag_ref")"
+            object_sha="$(/usr/bin/jq -er '.object.sha' "$tag_ref")"
+          done
+          [ "$object_type" = commit ] && [ "$object_sha" = "$EXPECTED_SHA" ]
+          main_sha="$(/usr/bin/gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          [ "$main_sha" = "$EXPECTED_SHA" ]
+
+          existing_tags="$RUNNER_TEMP/existing-release-tags.txt"
+          /usr/bin/gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[].tag_name' > "$existing_tags"
+          if /usr/bin/grep -Fxq "$RELEASE_TAG" "$existing_tags"; then
+            echo "::error::A GitHub release already exists for $RELEASE_TAG; releases are create-only."
+            exit 1
+          fi
+
+          request="$RUNNER_TEMP/release-draft-request.json"
+          response="$RUNNER_TEMP/release-draft.json"
+          /usr/bin/jq -n --arg tag "$RELEASE_TAG" --arg target "$EXPECTED_SHA" \
+            --arg name "ARC Chain $RELEASE_TAG" --arg body "$RELEASE_NOTES" \
+            '{tag_name:$tag,target_commitish:$target,name:$name,body:$body,
+              draft:true,prerelease:false,make_latest:"false"}' > "$request"
+          /usr/bin/gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            --input "$request" > "$response"
+          release_id="$(/usr/bin/jq -er '.id | select(type == "number" and . > 0)' "$response")"
+          cleanup_draft() {
+            status="$?"
+            trap - EXIT
+            if [ "$status" -ne 0 ] && [ -n "${release_id:-}" ]; then
+              cleanup_candidate="$RUNNER_TEMP/release-cleanup-candidate.json"
+              if /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$cleanup_candidate" \
+                && /usr/bin/jq -e --argjson id "$release_id" --arg tag "$RELEASE_TAG" \
+                  --arg sha "$EXPECTED_SHA" \
+                  '.id == $id and .tag_name == $tag and .target_commitish == $sha
+                   and .draft == true and .immutable == false' \
+                  "$cleanup_candidate" >/dev/null; then
+                echo "::notice::Deleting still-hidden unverified draft ID $release_id; the protected tag is retained."
+                /usr/bin/gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null || true
+              else
+                echo "::warning::Release ID $release_id is no longer the exact mutable draft; it is retained without a DELETE request."
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_draft EXIT
+          trap 'exit 130' HUP INT TERM
+
+          # No --clobber: a duplicate server-side asset is a hard failure.
+          /usr/bin/gh release upload "$RELEASE_TAG" release-files/* \
+            --repo "$GITHUB_REPOSITORY"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$response"
+          /usr/bin/jq -e --argjson id "$release_id" --arg tag "$RELEASE_TAG" \
+            --arg sha "$EXPECTED_SHA" \
+            '.id == $id and .tag_name == $tag and .target_commitish == $sha
+             and .draft == true and .immutable == false
+             and (.assets | length == 32)
+             and all(.assets[]; .state == "uploaded" and (.digest | startswith("sha256:")))' \
+            "$response" >/dev/null
+
+          /usr/bin/mkdir draft-evidence
+          /usr/bin/cp "$response" draft-evidence/release-draft.json
+          evidence_row="$(/usr/bin/sha256sum draft-evidence/release-draft.json)"
+          evidence_sha="${evidence_row%% *}"
+          evidence_name="arc-release-draft-evidence-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$release_id-$evidence_sha"
+          {
+            echo "release_id=$release_id"
+            echo "evidence_sha=$evidence_sha"
+            echo "evidence_name=$evidence_name"
+          } >> "$GITHUB_OUTPUT"
+          trap - EXIT HUP INT TERM
+
+      - name: Upload the exact draft API evidence
+        id: evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.draft.outputs.evidence_name }}
+          path: draft-evidence/release-draft.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Delete the draft if its evidence could not be sealed
+        if: ${{ failure() && steps.draft.outputs.release_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM GIT_DIR GIT_WORK_TREE
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          cleanup_candidate="$RUNNER_TEMP/release-cleanup-candidate.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$cleanup_candidate"
+          /usr/bin/jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" \
+            --arg sha "$EXPECTED_SHA" \
+            '.id == $id and .tag_name == $tag and .target_commitish == $sha
+             and .draft == true and .immutable == false' \
+            "$cleanup_candidate" >/dev/null
+          /usr/bin/gh api --method DELETE \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+
+  verify-draft-release:
+    name: Verify GitHub draft bytes without publication authority
+    needs: [validate, manifest-sign, publish-draft]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the exact sealed release bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.manifest-sign.outputs.artifact_id }}
+          path: sealed-release-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the exact draft API evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.publish-draft.outputs.evidence_id }}
+          path: draft-evidence
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Reconstruct and verify the complete draft contract
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_METADATA_SHA: ${{ needs.manifest-sign.outputs.metadata_sha }}
+          EXPECTED_EVIDENCE_NAME: ${{ needs.publish-draft.outputs.evidence_name }}
+          EXPECTED_EVIDENCE_DIGEST: ${{ needs.publish-draft.outputs.evidence_digest }}
+          EXPECTED_EVIDENCE_SHA: ${{ needs.publish-draft.outputs.evidence_sha }}
+          RELEASE_ID: ${{ needs.publish-draft.outputs.release_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPECTED_EVIDENCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_name="arc-release-draft-evidence-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_ID-$EXPECTED_EVIDENCE_SHA"
+          [ "$EXPECTED_EVIDENCE_NAME" = "$expected_name" ]
+          [ "$(find draft-evidence -mindepth 1 -maxdepth 1 -printf '%f\n')" = release-draft.json ]
+          [ -f draft-evidence/release-draft.json ] && [ ! -L draft-evidence/release-draft.json ]
+          [ "$(sha256sum draft-evidence/release-draft.json | awk '{print $1}')" = "$EXPECTED_EVIDENCE_SHA" ]
+          python3 scripts/release/release-manifest-handoff.py verify \
+            --sealed --repository "$GITHUB_REPOSITORY" --commit "$EXPECTED_SHA" \
+            --tag "$RELEASE_TAG" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --handoff-dir sealed-release-handoff \
+            --expected-metadata-sha "$EXPECTED_METADATA_SHA"
+          python3 scripts/release/verify-github-release.py \
+            --release-json draft-evidence/release-draft.json \
+            --asset-directory sealed-release-handoff/release-files \
+            --tag "$RELEASE_TAG" --commit "$EXPECTED_SHA" \
+            --draft true --immutable false --expected-id "$RELEASE_ID"
+
+  cleanup-rejected-draft:
+    name: Delete a draft rejected by the unprivileged verifier
+    needs: [validate, publish-draft, verify-draft-release]
+    if: ${{ always() && needs.publish-draft.result == 'success' && needs.verify-draft-release.result != 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Move binaries
+      - name: Delete only the exact rejected release ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.publish-draft.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
         run: |
-          mkdir -p release-files
-          find artifacts -type f -exec cp {} release-files/ \;
-          ls -lh release-files
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM GIT_DIR GIT_WORK_TREE
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          cleanup_candidate="$RUNNER_TEMP/release-cleanup-candidate.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$cleanup_candidate"
+          /usr/bin/jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" \
+            --arg sha "$EXPECTED_SHA" \
+            '.id == $id and .tag_name == $tag and .target_commitish == $sha
+             and .draft == true and .immutable == false' \
+            "$cleanup_candidate" >/dev/null
+          /usr/bin/gh api --method DELETE \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
 
-      - name: Determine tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create or update release
-        uses: softprops/action-gh-release@v2
+  publish:
+    name: Publish only the independently verified draft
+    needs: [validate, publish-draft, verify-draft-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      evidence_id: ${{ steps.evidence.outputs.artifact-id }}
+      evidence_digest: ${{ steps.evidence.outputs.artifact-digest }}
+      evidence_name: ${{ steps.finalize.outputs.evidence_name }}
+      evidence_sha: ${{ steps.finalize.outputs.evidence_sha }}
+    steps:
+      # The fresh mutation runner receives only previously verified API JSON.
+      # It has no source checkout and cannot execute repository programs.
+      - name: Download the exact verified draft evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          body: |
-            ARC Chain release.
+          artifact-ids: ${{ needs.publish-draft.outputs.evidence_id }}
+          path: draft-evidence
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
 
-            Features:
-            - Pipeline-parallel sharded inference (split a model across N nodes)
-            - Cross-platform integer determinism (BLAKE3 verified hidden states)
-            - Community installer with persistent service + auto-update
+      - name: Validate the exact draft evidence without repository code
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          RELEASE_ID: ${{ needs.publish-draft.outputs.release_id }}
+          EXPECTED_EVIDENCE_NAME: ${{ needs.publish-draft.outputs.evidence_name }}
+          EXPECTED_EVIDENCE_DIGEST: ${{ needs.publish-draft.outputs.evidence_digest }}
+          EXPECTED_EVIDENCE_SHA: ${{ needs.publish-draft.outputs.evidence_sha }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB NODE_OPTIONS NODE_PATH \
+            GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM \
+            GIT_DIR GIT_WORK_TREE
+          [[ "$EXPECTED_EVIDENCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_name="arc-release-draft-evidence-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_ID-$EXPECTED_EVIDENCE_SHA"
+          [ "$EXPECTED_EVIDENCE_NAME" = "$expected_name" ]
+          /usr/bin/python3 -I - draft-evidence/release-draft.json "$EXPECTED_EVIDENCE_SHA" "$RELEASE_ID" <<'PY'
+          import hashlib, json, pathlib, stat, sys
+          path, expected_hash, expected_id = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+          if {p.name for p in path.parent.iterdir()} != {path.name} or path.is_symlink() or \
+             not stat.S_ISREG(path.lstat().st_mode) or not 0 < path.stat().st_size <= 4 * 1024 * 1024:
+              raise SystemExit("draft evidence membership is unsafe")
+          raw = path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != expected_hash:
+              raise SystemExit("draft evidence hash differs")
+          value = json.loads(raw)
+          if value.get("id") != expected_id or value.get("draft") is not True or value.get("immutable") is not False:
+              raise SystemExit("draft evidence identity differs")
+          PY
 
-            Install on Mac/Linux:
-            ```
-            curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-            ```
-          files: release-files/*
-          generate_release_notes: false
-          fail_on_unmatched_files: false
+      # Only fixed gh/jq/coreutils run with contents:write authority. The
+      # independently reviewed Python verifier ran in the preceding job.
+      - name: Recheck remote identity and make the draft immutable
+        id: finalize
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          SELECTED_PREFLIGHT_RUN_ID: ${{ needs.validate.outputs.pretag_run_id }}
+          SELECTED_PREFLIGHT_RUN_ATTEMPT: ${{ needs.validate.outputs.pretag_run_attempt }}
+          RELEASE_ID: ${{ needs.publish-draft.outputs.release_id }}
+          BASH_ENV: ""
+          ENV: ""
+          PATH: /usr/bin:/bin
+        run: |
+          set -Eeuo pipefail
+          export PATH='/usr/bin:/bin'
+          unalias -a 2>/dev/null || true
+          hash -r
+          unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH \
+            DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH PYTHONHOME PYTHONPATH \
+            PERL5OPT PERL5LIB RUBYOPT RUBYLIB NODE_OPTIONS NODE_PATH \
+            GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM \
+            GIT_DIR GIT_WORK_TREE
+          [ "$GITHUB_REPOSITORY" = "FerrumVir/arc-chain" ]
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          current_preflight_id="$(/usr/bin/gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow release-signing-preflight.yml \
+            --commit "$EXPECTED_SHA" --event workflow_dispatch --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')"
+          [ "$current_preflight_id" = "$SELECTED_PREFLIGHT_RUN_ID" ]
+          preflight_json="$RUNNER_TEMP/current-preflight-run.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID" \
+            > "$preflight_json"
+          /usr/bin/jq -e --arg sha "$EXPECTED_SHA" \
+            --argjson attempt "$SELECTED_PREFLIGHT_RUN_ATTEMPT" \
+            '.head_sha == $sha and .head_branch == "main"
+             and .event == "workflow_dispatch" and .status == "completed"
+             and .conclusion == "success" and .run_attempt == $attempt' \
+            "$preflight_json" >/dev/null
+
+          tag_ref="$RUNNER_TEMP/tag-ref.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$tag_ref"
+          object_type="$(/usr/bin/jq -er '.object.type' "$tag_ref")"
+          object_sha="$(/usr/bin/jq -er '.object.sha' "$tag_ref")"
+          tag_depth=0
+          while [ "$object_type" = tag ]; do
+            tag_depth=$((tag_depth + 1))
+            [ "$tag_depth" -le 4 ]
+            /usr/bin/gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" > "$tag_ref"
+            object_type="$(/usr/bin/jq -er '.object.type' "$tag_ref")"
+            object_sha="$(/usr/bin/jq -er '.object.sha' "$tag_ref")"
+          done
+          [ "$object_type" = commit ] && [ "$object_sha" = "$EXPECTED_SHA" ]
+          main_sha="$(/usr/bin/gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          [ "$main_sha" = "$EXPECTED_SHA" ]
+
+          current="$RUNNER_TEMP/release-current.json"
+          canonical_expected="$RUNNER_TEMP/release-expected.canonical.json"
+          canonical_current="$RUNNER_TEMP/release-current.canonical.json"
+          canonical_identity_expected="$RUNNER_TEMP/release-expected.identity.json"
+          canonical_identity_current="$RUNNER_TEMP/release-current.identity.json"
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$current"
+          projection='{id,tag_name,target_commitish,name,body,draft,prerelease,immutable,
+            assets:(.assets | map({id,name,size,digest,state,uploader:.uploader.login}) | sort_by(.name))}'
+          identity_projection='{id,tag_name,target_commitish,name,body,prerelease,
+            assets:(.assets | map({id,name,size,digest,state,uploader:.uploader.login}) | sort_by(.name))}'
+          /usr/bin/jq -S "$projection" draft-evidence/release-draft.json > "$canonical_expected"
+          /usr/bin/jq -S "$projection" "$current" > "$canonical_current"
+          /usr/bin/cmp -s "$canonical_expected" "$canonical_current" || {
+            echo "::error::The server draft changed after independent verification."
+            exit 1
+          }
+          /usr/bin/jq -S "$identity_projection" draft-evidence/release-draft.json \
+            > "$canonical_identity_expected"
+
+          publication_attempted=false
+          published_immutable=false
+          cleanup_unverified() {
+            status="$?"
+            trap - EXIT
+            if [ "$status" -ne 0 ]; then
+              if [ "$publication_attempted" != true ]; then
+                cleanup_candidate="$RUNNER_TEMP/release-cleanup-candidate.json"
+                if /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$cleanup_candidate" \
+                  && /usr/bin/jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" \
+                    --arg sha "$EXPECTED_SHA" \
+                    '.id == $id and .tag_name == $tag and .target_commitish == $sha
+                     and .draft == true and .immutable == false' \
+                    "$cleanup_candidate" >/dev/null; then
+                  /usr/bin/gh api --method DELETE \
+                    "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null || \
+                    echo "::warning::Draft cleanup was rejected; inspect release ID $RELEASE_ID."
+                else
+                  echo "::warning::Release ID $RELEASE_ID is no longer the exact mutable draft; it is retained without a DELETE request."
+                fi
+              elif [ "$published_immutable" = true ]; then
+                echo "::error::Immutable release ID $RELEASE_ID is retained; cleanup is forbidden."
+              else
+                echo "::error::Publication was attempted for release ID $RELEASE_ID; state is unconfirmed and cleanup is forbidden."
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_unverified EXIT
+          trap 'exit 130' HUP INT TERM
+          patch_response="$RUNNER_TEMP/release-patch-response.json"
+          published="$RUNNER_TEMP/release-published.json"
+          publication_attempted=true
+          echo "publication_state=attempted-unconfirmed" >> "$GITHUB_OUTPUT"
+          # Public v0.7 headless updaters consume GitHub's global `latest`
+          # without the signed v3 migration contract. Keep v0.8 discoverable
+          # only by its exact immutable tag until their retirement is proven.
+          /usr/bin/gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=false > "$patch_response"
+
+          # GitHub may expose draft=false before its immutable flag converges.
+          # Poll one exact release ID for at most 60 seconds. Once PATCH is
+          # attempted, no failure path is allowed to delete the release.
+          for poll_attempt in {1..12}; do
+            /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$published"
+            /usr/bin/jq -S "$identity_projection" "$published" > "$canonical_identity_current"
+            /usr/bin/cmp -s "$canonical_identity_expected" "$canonical_identity_current" || {
+              echo "::error::Published release identity or assets changed while immutability converged."
+              exit 1
+            }
+            publication_state="$(/usr/bin/jq -er \
+              'if ((.draft | type) == "boolean" and (.immutable | type) == "boolean")
+               then [(.draft | tostring), (.immutable | tostring)] | join(" ")
+               else error("release lifecycle fields are not booleans") end' \
+              "$published")"
+            case "$publication_state" in
+              'false true')
+                published_immutable=true
+                break
+                ;;
+              'true false'|'false false')
+                ;;
+              *)
+                echo "::error::GitHub returned impossible release lifecycle state: $publication_state"
+                exit 1
+                ;;
+            esac
+            if [ "$poll_attempt" -lt 12 ]; then
+              /usr/bin/sleep 5
+            fi
+          done
+          [ "$published_immutable" = true ] || {
+            echo "::error::Release ID $RELEASE_ID was published or publication was attempted, but immutable state was not observed within 60 seconds. It is retained for manual verification and will not be deleted."
+            exit 1
+          }
+          /usr/bin/jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" \
+            --arg sha "$EXPECTED_SHA" \
+            '.id == $id and .tag_name == $tag and .target_commitish == $sha
+             and .draft == false and .immutable == true
+             and (.assets | length == 32)
+             and all(.assets[]; .state == "uploaded" and (.digest | startswith("sha256:")))' \
+            "$published" >/dev/null
+          /usr/bin/mkdir published-evidence
+          /usr/bin/cp "$published" published-evidence/release-published.json
+          evidence_row="$(/usr/bin/sha256sum published-evidence/release-published.json)"
+          evidence_sha="${evidence_row%% *}"
+          evidence_name="arc-release-published-evidence-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_ID-$evidence_sha"
+          {
+            echo "publication_state=published-immutable"
+            echo "evidence_sha=$evidence_sha"
+            echo "evidence_name=$evidence_name"
+          } >> "$GITHUB_OUTPUT"
+          trap - EXIT HUP INT TERM
+
+      - name: Upload the immutable release API evidence
+        id: evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.finalize.outputs.evidence_name }}
+          path: published-evidence/release-published.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Preserve release state if publication or evidence sealing failed
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          RELEASE_ID: ${{ needs.publish-draft.outputs.release_id }}
+          PUBLICATION_STATE: ${{ steps.finalize.outputs.publication_state }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          case "$PUBLICATION_STATE" in
+            published-immutable)
+              echo "::error::Immutable release ID $RELEASE_ID was retained because cleanup is forbidden; reseal its API evidence."
+              ;;
+            attempted-unconfirmed)
+              echo "::error::Publication state for release ID $RELEASE_ID is unconfirmed; it was retained and must be verified without deletion."
+              ;;
+            *)
+              echo "::error::Publication was not confirmed; any independently verified draft remains hidden for explicit operator review."
+              ;;
+          esac
+          exit 1
+
+  verify-published-release:
+    name: Verify the immutable GitHub release without publication authority
+    needs: [validate, manifest-sign, publish-draft, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the exact sealed release bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.manifest-sign.outputs.artifact_id }}
+          path: sealed-release-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Download the exact immutable API evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.publish.outputs.evidence_id }}
+          path: published-evidence
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Reconstruct and verify the complete immutable release contract
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_METADATA_SHA: ${{ needs.manifest-sign.outputs.metadata_sha }}
+          EXPECTED_EVIDENCE_NAME: ${{ needs.publish.outputs.evidence_name }}
+          EXPECTED_EVIDENCE_DIGEST: ${{ needs.publish.outputs.evidence_digest }}
+          EXPECTED_EVIDENCE_SHA: ${{ needs.publish.outputs.evidence_sha }}
+          RELEASE_ID: ${{ needs.publish-draft.outputs.release_id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$EXPECTED_EVIDENCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          expected_name="arc-release-published-evidence-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_ID-$EXPECTED_EVIDENCE_SHA"
+          [ "$EXPECTED_EVIDENCE_NAME" = "$expected_name" ]
+          [ "$(find published-evidence -mindepth 1 -maxdepth 1 -printf '%f\n')" = release-published.json ]
+          [ -f published-evidence/release-published.json ] && [ ! -L published-evidence/release-published.json ]
+          [ "$(sha256sum published-evidence/release-published.json | awk '{print $1}')" = "$EXPECTED_EVIDENCE_SHA" ]
+          python3 scripts/release/release-manifest-handoff.py verify \
+            --sealed --repository "$GITHUB_REPOSITORY" --commit "$EXPECTED_SHA" \
+            --tag "$RELEASE_TAG" --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --handoff-dir sealed-release-handoff \
+            --expected-metadata-sha "$EXPECTED_METADATA_SHA"
+          python3 scripts/release/verify-github-release.py \
+            --release-json published-evidence/release-published.json \
+            --asset-directory sealed-release-handoff/release-files \
+            --tag "$RELEASE_TAG" --commit "$EXPECTED_SHA" \
+            --draft false --immutable true --expected-id "$RELEASE_ID"

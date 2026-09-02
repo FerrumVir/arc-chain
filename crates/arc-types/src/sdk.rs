@@ -1,7 +1,7 @@
 // Add to lib.rs: pub mod sdk;
 
+use crate::devtools::{AbiFunction, AbiType, ContractAbi, StateMutability};
 use serde::{Deserialize, Serialize};
-use crate::devtools::{ContractAbi, AbiType, AbiFunction, StateMutability};
 
 // ─── SDK language ────────────────────────────────────────────────────────────
 
@@ -175,10 +175,14 @@ impl MethodBinding {
 
     /// Convert an ABI function to a method binding.
     pub fn from_abi_function(func: &AbiFunction) -> Self {
-        let inputs: Vec<ParamType> = func.inputs.iter()
+        let inputs: Vec<ParamType> = func
+            .inputs
+            .iter()
             .map(|p| abi_type_to_param_type(&p.param_type))
             .collect();
-        let outputs: Vec<ParamType> = func.outputs.iter()
+        let outputs: Vec<ParamType> = func
+            .outputs
+            .iter()
             .map(|p| abi_type_to_param_type(&p.param_type))
             .collect();
         let is_view = matches!(
@@ -207,9 +211,9 @@ fn abi_type_to_param_type(abi: &AbiType) -> ParamType {
         AbiType::Bytes => ParamType::Bytes,
         AbiType::BytesN(n) => ParamType::FixedBytes(*n as usize),
         AbiType::Array(inner) => ParamType::Array(Box::new(abi_type_to_param_type(inner))),
-        AbiType::Tuple(types) => ParamType::Tuple(
-            types.iter().map(|t| abi_type_to_param_type(t)).collect()
-        ),
+        AbiType::Tuple(types) => {
+            ParamType::Tuple(types.iter().map(abi_type_to_param_type).collect())
+        }
     }
 }
 
@@ -227,8 +231,10 @@ pub struct ContractBinding {
 impl ContractBinding {
     /// Create a new contract binding.
     pub fn new(contract_name: &str, address: [u8; 32], abi: ContractAbi) -> Self {
-        let methods = abi.functions.iter()
-            .map(|f| MethodBinding::from_abi_function(f))
+        let methods = abi
+            .functions
+            .iter()
+            .map(MethodBinding::from_abi_function)
             .collect();
         Self {
             contract_name: contract_name.to_string(),
@@ -407,19 +413,27 @@ impl SdkGenerator {
             lang.display_name(),
             binding.contract_name,
         ));
-        lines.push(format!("// Package: {} v{}", self.config.package_name, self.config.version));
+        lines.push(format!(
+            "// Package: {} v{}",
+            self.config.package_name, self.config.version
+        ));
         lines.push(String::new());
 
         for method in &binding.methods {
-            let inputs: Vec<String> = method.inputs.iter()
+            let inputs: Vec<String> = method
+                .inputs
+                .iter()
                 .enumerate()
                 .map(|(i, p)| format!("  param_{}: {}", i, p.to_language_type(lang)))
                 .collect();
-            let outputs: Vec<String> = method.outputs.iter()
+            let outputs: Vec<String> = method
+                .outputs
+                .iter()
                 .map(|p| p.to_language_type(lang))
                 .collect();
 
-            lines.push(format!("// {} ({}) -> ({})",
+            lines.push(format!(
+                "// {} ({}) -> ({})",
                 method.name,
                 inputs.join(", "),
                 outputs.join(", "),
@@ -487,22 +501,31 @@ mod tests {
         abi.add_function(AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
-            vec![
-                AbiParam { name: "success".to_string(), param_type: AbiType::Bool },
-            ],
+            vec![AbiParam {
+                name: "success".to_string(),
+                param_type: AbiType::Bool,
+            }],
             StateMutability::NonPayable,
         ));
         abi.add_function(AbiFunction::new(
             "balanceOf",
-            vec![
-                AbiParam { name: "owner".to_string(), param_type: AbiType::Address },
-            ],
-            vec![
-                AbiParam { name: "balance".to_string(), param_type: AbiType::Uint256 },
-            ],
+            vec![AbiParam {
+                name: "owner".to_string(),
+                param_type: AbiType::Address,
+            }],
+            vec![AbiParam {
+                name: "balance".to_string(),
+                param_type: AbiType::Uint256,
+            }],
             StateMutability::View,
         ));
         abi
@@ -543,28 +566,61 @@ mod tests {
     // 3. ParamType Rust type rendering.
     #[test]
     fn test_param_type_rust_rendering() {
-        assert_eq!(ParamType::Uint256.to_language_type(SdkLanguage::Rust), "U256");
-        assert_eq!(ParamType::Address.to_language_type(SdkLanguage::Rust), "[u8; 32]");
+        assert_eq!(
+            ParamType::Uint256.to_language_type(SdkLanguage::Rust),
+            "U256"
+        );
+        assert_eq!(
+            ParamType::Address.to_language_type(SdkLanguage::Rust),
+            "[u8; 32]"
+        );
         assert_eq!(ParamType::Bool.to_language_type(SdkLanguage::Rust), "bool");
-        assert_eq!(ParamType::String.to_language_type(SdkLanguage::Rust), "String");
-        assert_eq!(ParamType::Bytes.to_language_type(SdkLanguage::Rust), "Vec<u8>");
-        assert_eq!(ParamType::FixedBytes(32).to_language_type(SdkLanguage::Rust), "[u8; 32]");
+        assert_eq!(
+            ParamType::String.to_language_type(SdkLanguage::Rust),
+            "String"
+        );
+        assert_eq!(
+            ParamType::Bytes.to_language_type(SdkLanguage::Rust),
+            "Vec<u8>"
+        );
+        assert_eq!(
+            ParamType::FixedBytes(32).to_language_type(SdkLanguage::Rust),
+            "[u8; 32]"
+        );
 
         let arr = ParamType::Array(Box::new(ParamType::Uint256));
         assert_eq!(arr.to_language_type(SdkLanguage::Rust), "Vec<U256>");
 
         let tuple = ParamType::Tuple(vec![ParamType::Address, ParamType::Bool]);
-        assert_eq!(tuple.to_language_type(SdkLanguage::Rust), "([u8; 32], bool)");
+        assert_eq!(
+            tuple.to_language_type(SdkLanguage::Rust),
+            "([u8; 32], bool)"
+        );
     }
 
     // 4. ParamType TypeScript type rendering.
     #[test]
     fn test_param_type_typescript_rendering() {
-        assert_eq!(ParamType::Uint256.to_language_type(SdkLanguage::TypeScript), "bigint");
-        assert_eq!(ParamType::Address.to_language_type(SdkLanguage::TypeScript), "string");
-        assert_eq!(ParamType::Bool.to_language_type(SdkLanguage::TypeScript), "boolean");
-        assert_eq!(ParamType::String.to_language_type(SdkLanguage::TypeScript), "string");
-        assert_eq!(ParamType::Bytes.to_language_type(SdkLanguage::TypeScript), "Uint8Array");
+        assert_eq!(
+            ParamType::Uint256.to_language_type(SdkLanguage::TypeScript),
+            "bigint"
+        );
+        assert_eq!(
+            ParamType::Address.to_language_type(SdkLanguage::TypeScript),
+            "string"
+        );
+        assert_eq!(
+            ParamType::Bool.to_language_type(SdkLanguage::TypeScript),
+            "boolean"
+        );
+        assert_eq!(
+            ParamType::String.to_language_type(SdkLanguage::TypeScript),
+            "string"
+        );
+        assert_eq!(
+            ParamType::Bytes.to_language_type(SdkLanguage::TypeScript),
+            "Uint8Array"
+        );
 
         let arr = ParamType::Array(Box::new(ParamType::Address));
         assert_eq!(arr.to_language_type(SdkLanguage::TypeScript), "string[]");
@@ -573,10 +629,22 @@ mod tests {
     // 5. ParamType Python type rendering.
     #[test]
     fn test_param_type_python_rendering() {
-        assert_eq!(ParamType::Uint256.to_language_type(SdkLanguage::Python), "int");
-        assert_eq!(ParamType::Address.to_language_type(SdkLanguage::Python), "str");
-        assert_eq!(ParamType::Bool.to_language_type(SdkLanguage::Python), "bool");
-        assert_eq!(ParamType::Bytes.to_language_type(SdkLanguage::Python), "bytes");
+        assert_eq!(
+            ParamType::Uint256.to_language_type(SdkLanguage::Python),
+            "int"
+        );
+        assert_eq!(
+            ParamType::Address.to_language_type(SdkLanguage::Python),
+            "str"
+        );
+        assert_eq!(
+            ParamType::Bool.to_language_type(SdkLanguage::Python),
+            "bool"
+        );
+        assert_eq!(
+            ParamType::Bytes.to_language_type(SdkLanguage::Python),
+            "bytes"
+        );
 
         let arr = ParamType::Array(Box::new(ParamType::Int256));
         assert_eq!(arr.to_language_type(SdkLanguage::Python), "list[int]");
@@ -593,7 +661,11 @@ mod tests {
         assert_eq!(types.language, SdkLanguage::TypeScript);
         assert_eq!(types.file_count(), 1);
         assert!(types.files[0].path.ends_with("token.ts"));
-        assert!(types.files[0].content.contains("TypeScript types for Token"));
+        assert!(
+            types.files[0]
+                .content
+                .contains("TypeScript types for Token")
+        );
     }
 
     // 7. SdkGenerator generates full client.
@@ -624,7 +696,10 @@ mod tests {
         code.add_file(GeneratedFile::new("a.py", "print('hello')"));
         code.add_file(GeneratedFile::new("b.py", "x = 42"));
         assert_eq!(code.file_count(), 2);
-        assert_eq!(code.total_size_bytes(), "print('hello')".len() + "x = 42".len());
+        assert_eq!(
+            code.total_size_bytes(),
+            "print('hello')".len() + "x = 42".len()
+        );
     }
 
     // 9. MethodBinding from ABI function.
@@ -633,12 +708,19 @@ mod tests {
         let func = AbiFunction::new(
             "approve",
             vec![
-                AbiParam { name: "spender".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "spender".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
-            vec![
-                AbiParam { name: "success".to_string(), param_type: AbiType::Bool },
-            ],
+            vec![AbiParam {
+                name: "success".to_string(),
+                param_type: AbiType::Bool,
+            }],
             StateMutability::NonPayable,
         );
 
@@ -653,7 +735,10 @@ mod tests {
         let view_func = AbiFunction::new(
             "totalSupply",
             vec![],
-            vec![AbiParam { name: "supply".to_string(), param_type: AbiType::Uint256 }],
+            vec![AbiParam {
+                name: "supply".to_string(),
+                param_type: AbiType::Uint256,
+            }],
             StateMutability::View,
         );
         let view_method = MethodBinding::from_abi_function(&view_func);

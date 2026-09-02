@@ -1,5 +1,12 @@
 # Inference Investigation — Tier-1 On-Chain Inference Does Not Finalize on the Live Seeds
 
+> **Dated incident record.** Statements below about worker count, working
+> community routing, versions, balances, and latency are observations from June
+> 4, not current status. The 2026-08-26 read-only snapshot found a mixed
+> v0.7.2/v0.7.9 fork and community `total_work_completed: 0`; v0.8.0 remains
+> unpublished and undeployed. See
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
 **Date:** 2026-06-04
 **Tested against:** the 5 public seeds — LAX `140.82.16.112`, AMS `136.244.109.1`, LHR `104.238.171.11`, NRT `202.182.107.41`, SGP `149.28.153.31` — all on **v0.7.9** (branch `fix/v078-attestation-wire-compat`, HEAD `631e5b0`).
 **Audience:** TJ (and anyone working on the inference / consensus path).

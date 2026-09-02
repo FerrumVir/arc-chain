@@ -16,14 +16,20 @@ import clsx from "clsx";
 import { useAppStore } from "../lib/store";
 import { api, isTauri } from "../lib/tauri";
 import { LogoMark, Tagline } from "../components/Logo";
-import type {
-  Identity,
-  ModelDownloadProgress,
-  ModelTierInfo,
+import {
+  DEFAULT_NODE_CONFIG,
+  type Identity,
+  type ModelDownloadProgress,
+  type ModelTierInfo,
+  type NodeConfig,
 } from "../lib/types";
 
 const STEPS = ["welcome", "identity", "model", "launch"] as const;
 type Step = (typeof STEPS)[number];
+
+/** Twelve dummy words, shown blurred before the user asks to reveal. */
+const PLACEHOLDER_PHRASE =
+  "•••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• ••••••";
 
 const fadeSlide = {
   initial: { opacity: 0, y: 16 },
@@ -44,6 +50,11 @@ export function Onboarding() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [copied, setCopied] = useState(false);
   const [seedShown, setSeedShown] = useState(false);
+  // Held in component state only, for as long as this screen is mounted.
+  // Never written to the zustand store, and therefore never persisted to
+  // localStorage — see `scrubIdentity` in lib/store.ts for the history.
+  const [seedPhrase, setSeedPhrase] = useState<string | null>(null);
+  const [seedError, setSeedError] = useState<string | null>(null);
 
   // Model picker state — populated when entering the "model" step.
   const [tiers, setTiers] = useState<ModelTierInfo[]>([]);
@@ -77,9 +88,9 @@ export function Onboarding() {
     }
   }, [step, identity]);
 
-  // Load model tiers + the recommended-for-this-machine tier when we land
-  // on the model step. Pre-select the recommended one so the typical user
-  // can keep clicking through without thinking.
+  // Load the network-compatible model and recommend it only when local RAM is
+  // sufficient. Lower-memory machines default to observer/router mode rather
+  // than downloading an artifact that cannot run safely.
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
@@ -87,11 +98,8 @@ export function Onboarding() {
       ([loadedTiers, rec]) => {
         if (cancelled) return;
         setTiers(loadedTiers);
-        // "none" comes back when the machine isn't strong enough — pre-select
-        // tiny so the user has a sensible default to override or skip.
-        const safeRec = rec === "none" ? "tiny" : rec;
-        setRecommendedTier(safeRec);
-        setSelectedTier(safeRec);
+        setRecommendedTier(rec);
+        setSelectedTier(rec === "none" ? "skip" : rec);
       },
     );
     return () => {
@@ -131,8 +139,8 @@ export function Onboarding() {
     const wantsModel = tier !== "skip";
 
     try {
-      // 1. Download the model first if the user picked one. Big tier is
-      //    ~7.9 GB; we surface progress via the modelProgress event.
+      // 1. Download the exact production-compatible 7B artifact if selected;
+      //    progress is surfaced through the modelProgress event.
       let modelPath: string | null = null;
       if (wantsModel) {
         setLaunchStage("model");
@@ -147,18 +155,13 @@ export function Onboarding() {
       }
 
       // 2. Build the config now that we know whether we have a model. Worker
-      //    role + modelPath set ⇒ node_manager passes --community-mode and the
-      //    coordinator dispatches inference jobs. No model = observer
-      //    (validates consensus, doesn't earn — only path for users who
-      //    explicitly opt out).
-      const config = {
-        role: modelPath ? ("worker" as const) : ("observer" as const),
+      //    role + modelPath set makes the node eligible to advertise an exact,
+      //    fully loaded artifact. It does not promise assignment or payment.
+      //    No model means observer/router mode with no local model execution.
+      const config: NodeConfig = {
+        ...DEFAULT_NODE_CONFIG,
+        role: modelPath ? "worker" : "observer",
         modelPath,
-        rpcPort: 9090,
-        p2pPort: 9091,
-        autoStart: true,
-        autoUpdate: true,
-        dataDir: "~/.arc",
       };
       setStoreConfig(config);
 
@@ -247,7 +250,8 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">welcome to arc</h1>
                 <p className="onboarding-subtitle">
-                  Run a node on your machine. Serve inference. Earn ARC.
+                  Run a node on your machine. Offer compatible compute. Verify
+                  every result and reward from the selected chain host.
                 </p>
 
                 <div
@@ -261,7 +265,7 @@ export function Onboarding() {
                     {
                       icon: Sparkles,
                       title: "One click setup",
-                      desc: "Pick the model tier matching your hardware. We download it, configure your node, you start earning.",
+                      desc: "Choose the exact ARC-compatible 7B model or observer mode. We verify every downloaded byte; assignment and rewards remain visible gates.",
                     },
                     {
                       icon: ShieldCheck,
@@ -270,8 +274,8 @@ export function Onboarding() {
                     },
                     {
                       icon: Network,
-                      title: "Always on",
-                      desc: "Lives in the menu bar, starts on login, auto-updates. Inference jobs land while you sleep.",
+                      title: "Ready when you are",
+                      desc: "It can start on app launch. Automatic update checks are read-only; you confirm every download and install. Work arrives only when assigned.",
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div
@@ -412,10 +416,10 @@ export function Onboarding() {
                         </div>
                         <button
                           className="btn btn-ghost btn-sm"
+                          disabled={!seedPhrase}
                           onClick={async () => {
-                            await navigator.clipboard.writeText(
-                              identity.seedPhrase,
-                            );
+                            if (!seedPhrase) return;
+                            await navigator.clipboard.writeText(seedPhrase);
                             setCopied(true);
                             setTimeout(() => setCopied(false), 1800);
                           }}
@@ -440,7 +444,12 @@ export function Onboarding() {
                           position: "relative",
                         }}
                       >
-                        {identity.seedPhrase.split(" ").map((word, i) => (
+                        {/* Twelve blurred placeholders until the user asks
+                            to see the phrase; the real words are fetched
+                            from Rust at that moment. */}
+                        {(seedPhrase ?? PLACEHOLDER_PHRASE)
+                          .split(" ")
+                          .map((word, i) => (
                           <div
                             key={i}
                             style={{
@@ -471,7 +480,20 @@ export function Onboarding() {
                         {!seedShown && (
                           <button
                             className="btn btn-secondary btn-sm"
-                            onClick={() => setSeedShown(true)}
+                            onClick={async () => {
+                              // Fetch on demand. The phrase crosses the IPC
+                              // boundary exactly here, on an explicit user
+                              // action, and goes no further.
+                              try {
+                                setSeedError(null);
+                                setSeedPhrase(await api.revealSeedPhrase());
+                                setSeedShown(true);
+                              } catch (e) {
+                                setSeedError(
+                                  e instanceof Error ? e.message : String(e),
+                                );
+                              }
+                            }}
                             data-testid="btn-reveal-seed"
                             style={{
                               position: "absolute",
@@ -485,6 +507,18 @@ export function Onboarding() {
                           </button>
                         )}
                       </div>
+                      {seedError && (
+                        <p
+                          style={{
+                            marginTop: "var(--space-2)",
+                            fontSize: "var(--text-sm)",
+                            color: "var(--danger)",
+                          }}
+                          data-testid="seed-error"
+                        >
+                          Could not read the recovery phrase: {seedError}
+                        </p>
+                      )}
                     </div>
                   </>
                 )}
@@ -507,11 +541,24 @@ export function Onboarding() {
 
             {step === "model" && (
               <div data-testid="step-model">
-                <h1 className="onboarding-title">Pick your model</h1>
+                <h1 className="onboarding-title">Choose your compute mode</h1>
                 <p className="onboarding-subtitle">
-                  Your node serves inference for the network and earns ARC per
-                  attestation. We pre-selected the tier that fits your machine.
-                  Bigger model = more demand = more earnings.
+                  ARC production work currently uses one exact 7B artifact.
+                  Machines with at least 16 GB RAM pre-select it; smaller
+                  machines stay useful as observer/routers. A model creates
+                  eligibility, not guaranteed assignments or rewards.
+                </p>
+                <p
+                  style={{
+                    color: "var(--text-muted)",
+                    fontSize: "var(--text-sm)",
+                    lineHeight: 1.5,
+                    marginTop: "var(--space-3)",
+                  }}
+                >
+                  Exact artifact ID: <code>llama-2-7b-chat.Q4_K_M.gguf</code>.
+                  Extra copies or machines do not multiply rewards or guarantee
+                  demand.
                 </p>
 
                 <div
@@ -645,7 +692,7 @@ export function Onboarding() {
                       selectedTier === "skip" ? "underline" : "none",
                   }}
                 >
-                  Skip — run as a verifier only (no inference earnings)
+                  Skip — observer/router mode (no local model execution)
                 </button>
 
                 <div className="onboarding-actions">
@@ -694,7 +741,7 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">
                   {!launching
-                    ? "Ready to join"
+                    ? "Ready to set up"
                     : launchStage === "model"
                       ? "Downloading model"
                       : launchStage === "downloading"
@@ -702,14 +749,16 @@ export function Onboarding() {
                         : launchStage === "starting"
                           ? "Starting your node"
                           : launchStage === "connecting"
-                            ? "Joining the network"
+                            ? "Connecting to a coordinator"
                             : launchStage === "claiming"
                               ? "Claiming welcome tokens"
                               : "Finishing up"}
                 </h1>
-                <p className="onboarding-subtitle">
+                <p className="onboarding-subtitle" data-testid="launch-summary">
                   {!launching &&
-                    "We'll fetch the model, download the node binary, start it, and drop testnet ARC into your wallet."}
+                    (selectedTier === "skip"
+                      ? "We'll download the node binary, start an observer/router without local model execution, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards."
+                      : "We'll fetch the selected model, download the node binary, start the process, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards.")}
                   {launching && launchStage === "model" && modelProgress && (
                     <>
                       {formatBytes(modelProgress.downloadedBytes)} of{" "}
@@ -730,7 +779,7 @@ export function Onboarding() {
                     "Connecting to Hugging Face mirror..."}
                   {launching &&
                     launchStage === "downloading" &&
-                    "Fetching the latest arc-node for your platform. ~45 MB."}
+                    "Fetching the signed arc-node build selected by this desktop release."}
                   {launching &&
                     launchStage === "starting" &&
                     "Launching your local node."}
@@ -808,7 +857,7 @@ export function Onboarding() {
                       onClick={finish}
                       data-testid="btn-launch"
                     >
-                      {launchError ? "Retry" : "Join the network"}{" "}
+                      {launchError ? "Retry" : "Set up this node"}{" "}
                       <Sparkles size={16} />
                     </button>
                   </div>
@@ -919,8 +968,22 @@ function ConnectingStatus({
   );
 }
 
-// Poll node_status until we're "online" — either the local node has joined
-// P2P (peers ≥ 1) or a public seed coordinator's /health is reachable.
+/**
+ * Poll until the LOCAL node is genuinely online.
+ *
+ * This used to return on the first poll, every time. `node_status` resolved
+ * to a remote seed reporting 8 peers, so `s.running && s.peers >= 1` was
+ * satisfied instantly — typically before arc-node had even bound its RPC
+ * port. Onboarding then reported "Connected via p2p" and claimed the faucet
+ * regardless of whether the local node had started at all, so a user whose
+ * node failed outright still finished setup with a green checkmark. The 90s
+ * timeout, the seed-cycling animation and the coordinator-fallback branch
+ * were all unreachable.
+ *
+ * `s.running` is now genuinely local, and success additionally requires
+ * either a real peer or a reachable coordinator — the local RPC answering on
+ * its own only means the process started, not that it joined anything.
+ */
 async function waitForPeer({
   timeoutMs,
 }: {
@@ -930,8 +993,13 @@ async function waitForPeer({
   while (Date.now() - started < timeoutMs) {
     try {
       const s = await api.nodeStatus();
-      if (s.running && s.peers >= 1) return { via: "p2p" };
-      if (s.coordinatorUrl) return { via: s.coordinatorUrl };
+      if (s.running) {
+        if (s.peers >= 1) return { via: "p2p" };
+        // Local node is up but unpeered. A reachable public seed still
+        // makes the app fully usable (client mode), so that counts as
+        // joined — but only alongside a running local node.
+        if (s.coordinatorUrl) return { via: s.coordinatorUrl };
+      }
     } catch {
       /* retry */
     }

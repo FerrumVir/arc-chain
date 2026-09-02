@@ -96,10 +96,7 @@ pub enum ProposalType {
         initial_stake: u64,
     },
     /// Remove a validator from the active set.
-    RemoveValidator {
-        address: [u8; 32],
-        reason: String,
-    },
+    RemoveValidator { address: [u8; 32], reason: String },
     /// Toggle a feature flag on or off.
     FeatureFlagToggle { feature: String, enabled: bool },
     /// Arbitrary governance payload.
@@ -201,13 +198,13 @@ impl GovernanceConfig {
     pub fn default_config() -> Self {
         Self {
             min_proposal_stake: 50_000_000_000_000_000, // 50M ARC (Core tier)
-            voting_period_blocks: 1_512_000,             // ~7 days
-            execution_delay_blocks: 432_000,             // ~2 days
-            quorum_percentage_bps: 4000,                 // 40%
-            approval_threshold_bps: 6000,                // 60%
-            emergency_threshold_bps: 7500,               // 75%
+            voting_period_blocks: 1_512_000,            // ~7 days
+            execution_delay_blocks: 432_000,            // ~2 days
+            quorum_percentage_bps: 4000,                // 40%
+            approval_threshold_bps: 6000,               // 60%
+            emergency_threshold_bps: 7500,              // 75%
             max_active_proposals: 10,
-            proposal_cooldown_blocks: 216_000,           // ~1 day
+            proposal_cooldown_blocks: 216_000, // ~1 day
         }
     }
 
@@ -277,10 +274,10 @@ impl GovernanceState {
             .map(|p| p.created_at)
             .next();
 
-        if let Some(last_height) = last_proposal_height {
-            if current_height < last_height + config.proposal_cooldown_blocks {
-                return Err(GovernanceError::CooldownNotExpired);
-            }
+        if let Some(last_height) = last_proposal_height
+            && current_height < last_height + config.proposal_cooldown_blocks
+        {
+            return Err(GovernanceError::CooldownNotExpired);
         }
 
         let voting_starts = current_height;
@@ -409,8 +406,7 @@ impl GovernanceState {
         } else {
             // For / (For + Against) >= threshold / 10_000
             // Rearranged to avoid floats: For * 10_000 >= threshold * (For + Against)
-            proposal.votes_for * 10_000
-                >= proposal.approval_threshold_bps as u128 * decisive_votes
+            proposal.votes_for * 10_000 >= proposal.approval_threshold_bps as u128 * decisive_votes
         };
 
         if passes {
@@ -469,7 +465,11 @@ impl GovernanceState {
                 .iter()
                 .find(|p| p.id == proposal_id)
                 .ok_or(GovernanceError::ProposalNotFound)?;
-            (proposal.status, proposal.voting_ends, proposal.execution_delay)
+            (
+                proposal.status,
+                proposal.voting_ends,
+                proposal.execution_delay,
+            )
         };
 
         if status != ProposalStatus::Passed {
@@ -676,9 +676,7 @@ mod tests {
                 proposer,
                 "Test".to_string(),
                 "Test".to_string(),
-                ProposalType::Custom {
-                    data: vec![0x42],
-                },
+                ProposalType::Custom { data: vec![0x42] },
                 100,
                 &config,
             )
@@ -860,12 +858,7 @@ mod tests {
         // Finalize.
         let voting_ends = 100 + config.voting_period_blocks;
         state
-            .finalize_proposal(
-                0,
-                voting_ends + 1,
-                state.total_staked_supply,
-                &config,
-            )
+            .finalize_proposal(0, voting_ends + 1, state.total_staked_supply, &config)
             .unwrap();
 
         let earliest_execution = voting_ends + config.execution_delay_blocks;

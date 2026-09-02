@@ -1,0 +1,6135 @@
+//! Quorum-certified, content-addressed production recovery checkpoints.
+//!
+//! `ARCCHKPT` is deliberately separate from the legacy peer snapshot API.
+//! A peer response is not a trust root: activation requires an operator-
+//! approved manifest hash, an exact configured validator set, and a strict
+//! validator identity + stake supermajority. The complete package is verified
+//! in memory before any active-data marker is written.
+
+use crate::wal::{
+    ContractStorage, RepairableWalRead, Snapshot, quarantine_and_truncate_wal_tail,
+    read_repairable_wal_prefix, verify_wal_file_identity,
+};
+use crate::{StateDB, StateError, WalEntry, WalOp, read_wal_strict};
+use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, MerkleTree, Signature, hash_bytes};
+use arc_types::{
+    Account, Address, Block, BlockHeader, EventLog, Identity, ProtocolVersion, Transaction,
+    TxReceipt, strict_supermajority_threshold,
+};
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+
+pub const ARCCHKPT_MAGIC: [u8; 8] = *b"ARCCHKPT";
+pub const ARCCHKPT_FORMAT_VERSION: u16 = 1;
+/// Format-v1 checkpoints are decoded as one in-memory object. Bound the input
+/// before deserialization so an operator cannot accidentally hand an offline
+/// signer or validator a sparse/hostile file that exhausts the machine.
+/// A future format can raise this safely by chunking and authenticating each
+/// section independently.
+pub const ARCCHKPT_MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+/// Snapshot-assisted legacy recovery is intentionally bounded to the same
+/// in-memory envelope as an ARCCHKPT payload. The legacy LZ4 framing carries
+/// its decompressed length in the first four bytes, so reject allocation bombs
+/// before asking the decoder to reserve attacker-controlled memory.
+pub const LEGACY_SNAPSHOT_MAX_BYTES: usize = ARCCHKPT_MAX_PAYLOAD_BYTES;
+/// Protocol-v3 recovery has one fixed six-validator trust committee.
+pub const RECOVERY_VALIDATOR_SET_SIZE: usize = 6;
+/// Five identities are required in addition to strict >2/3 signed stake.
+pub const RECOVERY_SIGNATURES_REQUIRED: usize = 5;
+/// The selected canonical legacy fork retained one exact eight-validator set.
+/// Other fork-local peer registries contain zero-stake community identities
+/// and divergent dynamically admitted validators; none of those registries is
+/// a recovery trust source.
+pub const LEGACY_RECOVERY_VALIDATOR_SET_SIZE: usize = 8;
+/// Every validator in the selected source set carried exactly 5M stake.
+pub const LEGACY_RECOVERY_VALIDATOR_STAKE: u64 = 5_000_000;
+/// The canonical legacy validator-set total committed by the recovery input.
+pub const LEGACY_RECOVERY_TOTAL_STAKE: u64 = 40_000_000;
+
+fn checkpoint_destination_digest(path: &Path) -> Result<String, RecoveryError> {
+    Ok(arc_crypto::secret_file::namespace_path_digest(path)?)
+}
+
+#[cfg(windows)]
+fn checkpoint_namespace_rebarrier_path(path: &Path) -> Result<PathBuf, RecoveryError> {
+    let leaf = path.file_name().ok_or_else(|| {
+        RecoveryError::Invalid(format!(
+            "checkpoint destination has no leaf: {}",
+            path.display()
+        ))
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let canonical = parent.join(leaf);
+    Ok(parent.join(format!(
+        ".arc-recovery-package-{}.namespace-rebarrier",
+        checkpoint_destination_digest(&canonical)?
+    )))
+}
+
+struct CheckpointDestinationLock {
+    path: PathBuf,
+    staging: PathBuf,
+    #[cfg(windows)]
+    namespace_rebarrier: PathBuf,
+    _file: File,
+}
+
+impl CheckpointDestinationLock {
+    fn acquire(path: &Path) -> Result<Self, RecoveryError> {
+        let leaf = path.file_name().ok_or_else(|| {
+            RecoveryError::Invalid(format!(
+                "checkpoint destination has no leaf: {}",
+                path.display()
+            ))
+        })?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
+        let path = parent.join(leaf);
+        let digest = checkpoint_destination_digest(&path)?;
+        #[cfg(windows)]
+        let namespace_rebarrier = checkpoint_namespace_rebarrier_path(&path)?;
+        let lock_path = parent.join(format!(".arc-recovery-package-{digest}.lock"));
+        let file = match arc_crypto::secret_file::create_new_private(&lock_path) {
+            Ok(mut created) => {
+                created.write_all(b"arc.recovery.package-lock.v1\n")?;
+                created.sync_all()?;
+                drop(created);
+                arc_crypto::secret_file::open_private_read_write(&lock_path)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                arc_crypto::secret_file::open_private_read_write(&lock_path)?
+            }
+            Err(error) => return Err(RecoveryError::Io(error)),
+        };
+        file.lock()?;
+        Ok(Self {
+            path,
+            staging: parent.join(format!(".arc-recovery-package-{digest}.staging")),
+            #[cfg(windows)]
+            namespace_rebarrier,
+            _file: file,
+        })
+    }
+
+    fn restore_interrupted_namespace(&self) -> Result<(), RecoveryError> {
+        #[cfg(windows)]
+        {
+            let live = fs::symlink_metadata(&self.path);
+            let staged = fs::symlink_metadata(&self.namespace_rebarrier);
+            match (live, staged) {
+                (Ok(_), Ok(_)) => {
+                    return Err(RecoveryError::Invalid(format!(
+                        "checkpoint exists in both live and namespace-rebarrier locations: {}",
+                        self.path.display()
+                    )));
+                }
+                (Ok(metadata), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(RecoveryError::Invalid(format!(
+                            "checkpoint destination is not a regular file: {}",
+                            self.path.display()
+                        )));
+                    }
+                }
+                (Err(error), Ok(metadata)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(RecoveryError::Invalid(format!(
+                            "checkpoint namespace rebarrier is not a regular file: {}",
+                            self.namespace_rebarrier.display()
+                        )));
+                    }
+                    drop(arc_crypto::secret_file::open_private(
+                        &self.namespace_rebarrier,
+                    )?);
+                    arc_crypto::secret_file::windows_move_path_write_through(
+                        &self.namespace_rebarrier,
+                        &self.path,
+                        false,
+                    )?;
+                }
+                (Err(live), Err(staged))
+                    if live.kind() == std::io::ErrorKind::NotFound
+                        && staged.kind() == std::io::ErrorKind::NotFound => {}
+                (Err(error), _) | (_, Err(error)) => return Err(RecoveryError::Io(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn rebarrier_existing(&self) -> Result<(), RecoveryError> {
+        self.restore_interrupted_namespace()?;
+        let file = arc_crypto::secret_file::open_private_read_write(&self.path)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            arc_crypto::secret_file::windows_move_path_write_through(
+                &self.path,
+                &self.namespace_rebarrier,
+                false,
+            )?;
+            arc_crypto::secret_file::windows_move_path_write_through(
+                &self.namespace_rebarrier,
+                &self.path,
+                false,
+            )?;
+            drop(arc_crypto::secret_file::open_private(&self.path)?);
+        }
+        #[cfg(not(windows))]
+        sync_parent(&self.path)?;
+        Ok(())
+    }
+}
+
+fn restore_checkpoint_destination_if_interrupted(path: &Path) -> Result<(), RecoveryError> {
+    #[cfg(windows)]
+    {
+        let staging = checkpoint_namespace_rebarrier_path(path)?;
+        match fs::symlink_metadata(&staging) {
+            Ok(_) => {
+                let lock = CheckpointDestinationLock::acquire(path)?;
+                lock.restore_interrupted_namespace()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RecoveryError::Io(error)),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+pub const RECOVERY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
+    major: 3,
+    minor: 0,
+    patch: 0,
+};
+const ACTIVE_RECOVERY_MARKER: &str = "recovery.active";
+const ACTIVE_RECOVERY_PREFIX: &str = "recovery-";
+const ACTIVE_RECOVERY_SUFFIX: &str = ".arcchkpt";
+
+/// The third prefunded legacy system account funds the one-time conversion
+/// of synthetic legacy validator weights into real bonded account balances.
+/// The transition debits it exactly; it never mints stake.
+pub fn recovery_stake_reserve_address() -> Address {
+    hash_bytes(&[2u8])
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryValidator {
+    pub address: Address,
+    pub public_key: [u8; 32],
+    pub stake: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverySignature {
+    pub validator: Address,
+    pub public_key: [u8; 32],
+    pub signature_halves: [[u8; 32]; 2],
+}
+
+impl RecoverySignature {
+    fn from_keypair(keypair: &KeyPair, signing_hash: &Hash256) -> Result<Self, RecoveryError> {
+        let address = keypair.address();
+        let signature = keypair
+            .sign(signing_hash)
+            .map_err(|error| RecoveryError::Signature(error.to_string()))?;
+        let Signature::Ed25519 {
+            public_key,
+            signature,
+        } = signature
+        else {
+            return Err(RecoveryError::Signature(
+                "ARCCHKPT accepts Ed25519 validator signatures only".into(),
+            ));
+        };
+        let signature: [u8; 64] = signature.try_into().map_err(|_| {
+            RecoveryError::Signature("Ed25519 signature is not exactly 64 bytes".into())
+        })?;
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        first.copy_from_slice(&signature[..32]);
+        second.copy_from_slice(&signature[32..]);
+        Ok(Self {
+            validator: address,
+            public_key,
+            signature_halves: [first, second],
+        })
+    }
+
+    fn as_signature(&self) -> Signature {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&self.signature_halves[0]);
+        bytes.extend_from_slice(&self.signature_halves[1]);
+        Signature::Ed25519 {
+            public_key: self.public_key,
+            signature: bytes,
+        }
+    }
+}
+
+/// Consensus domain installed after a recovery transition. Legacy state has
+/// no domain, preserving every pre-recovery hash and state-root behavior.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryContext {
+    pub chain_id_hash: Hash256,
+    pub genesis_hash: Hash256,
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    pub protocol_version: ProtocolVersion,
+}
+
+impl RecoveryContext {
+    pub fn new(
+        chain_id: &str,
+        genesis_hash: Hash256,
+        recovery_epoch: u64,
+        validator_set_id: u64,
+    ) -> Self {
+        Self {
+            chain_id_hash: hash_bytes(chain_id.as_bytes()),
+            genesis_hash,
+            recovery_epoch,
+            validator_set_id,
+            protocol_version: RECOVERY_PROTOCOL_VERSION,
+        }
+    }
+
+    /// Domain used by consensus messages and state commitments after H+1.
+    pub fn domain_hash(&self) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-recovery-consensus-domain-v1");
+        hasher.update(self.chain_id_hash.as_ref());
+        hasher.update(self.genesis_hash.as_ref());
+        hasher.update(&self.recovery_epoch.to_be_bytes());
+        hasher.update(&self.validator_set_id.to_be_bytes());
+        hasher.update(&self.protocol_version.major.to_be_bytes());
+        hasher.update(&self.protocol_version.minor.to_be_bytes());
+        hasher.update(&self.protocol_version.patch.to_be_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+}
+
+/// Complete retained canonical state and history at source height H.
+///
+/// Maps are represented by sorted vectors. Import rejects non-canonical order
+/// and duplicates rather than sorting attacker-controlled input before hashing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryPayload {
+    pub blocks: Vec<(u64, Block)>,
+    pub accounts: Vec<(Address, Account)>,
+    pub storage: ContractStorage,
+    pub contracts: Vec<(Address, Vec<u8>)>,
+    pub receipts: Vec<(Hash256, TxReceipt)>,
+    pub full_transactions: Vec<(Hash256, Transaction)>,
+    pub tx_index: Vec<(Hash256, (u64, u32))>,
+    pub account_txs: Vec<(Address, Vec<Hash256>)>,
+    pub identities: Vec<(Address, Identity)>,
+    pub event_logs: Vec<(u64, Vec<EventLog>)>,
+    pub validators: Vec<(Address, u64)>,
+    pub staking_pool: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryManifest {
+    pub format_version: u16,
+    pub chain_id: String,
+    pub genesis_hash: Hash256,
+    pub source_height: u64,
+    pub source_block_hash: Hash256,
+    pub source_state_root: Hash256,
+    pub source_consensus_round: u64,
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    pub protocol_version: ProtocolVersion,
+    pub validators: Vec<RecoveryValidator>,
+    pub community_rewards_v1_activation_height: Option<u64>,
+    pub full_state_root: Hash256,
+    pub payload_hash: Hash256,
+    pub created_at_unix_ms: u64,
+}
+
+impl RecoveryManifest {
+    pub fn recovery_context(&self) -> RecoveryContext {
+        RecoveryContext::new(
+            &self.chain_id,
+            self.genesis_hash,
+            self.recovery_epoch,
+            self.validator_set_id,
+        )
+    }
+
+    /// Stable address of this manifest. Signatures are stored outside the
+    /// manifest so adding the fifth approval cannot change what was approved.
+    pub fn content_hash(&self) -> Hash256 {
+        let bytes = bincode::serialize(self).expect("ARCCHKPT manifest is serializable");
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-manifest-content-v1");
+        hasher.update(&ARCCHKPT_MAGIC);
+        hasher.update(&bytes);
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    pub fn signing_hash(&self) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-validator-approval-v1");
+        hasher.update(self.content_hash().as_ref());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    pub fn transition_commitment(&self) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-recovery-transition-block-v1");
+        hasher.update(self.content_hash().as_ref());
+        hasher.update(self.source_block_hash.as_ref());
+        hasher.update(self.full_state_root.as_ref());
+        hasher.update(self.recovery_context().domain_hash().as_ref());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// The only valid H+1 block for this checkpoint. It contains no ordinary
+    /// transactions; the manifest hash occupies `tx_root` and the transition
+    /// transcript occupies `proof_hash` without changing the legacy wire type.
+    pub fn transition_block(&self) -> Result<Block, RecoveryError> {
+        let height = self
+            .source_height
+            .checked_add(1)
+            .ok_or(RecoveryError::HeightOverflow)?;
+        let header = BlockHeader {
+            height,
+            timestamp: self.created_at_unix_ms,
+            parent_hash: self.source_block_hash,
+            tx_root: self.content_hash(),
+            state_root: self.full_state_root,
+            proof_hash: self.transition_commitment(),
+            tx_count: 0,
+            producer: Hash256::ZERO,
+            protocol_version: self.protocol_version,
+            state_diff: None,
+        };
+        Ok(Block::new(header, Vec::new()))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArcCheckpoint {
+    pub magic: [u8; 8],
+    pub manifest: RecoveryManifest,
+    pub payload: RecoveryPayload,
+    pub signatures: Vec<RecoverySignature>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryExportSpec {
+    pub chain_id: String,
+    pub genesis_hash: Hash256,
+    pub source_consensus_round: u64,
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    pub validators: Vec<RecoveryValidator>,
+    pub community_rewards_v1_activation_height: Option<u64>,
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryNetworkPolicy {
+    pub chain_id: String,
+    pub genesis_hash: Hash256,
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    pub validators: Vec<(Address, u64)>,
+    pub community_rewards_v1_activation_height: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryTrustRoot {
+    pub network: RecoveryNetworkPolicy,
+    pub approved_manifest_hash: Hash256,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryImport {
+    pub checkpoint_path: PathBuf,
+    pub approved_manifest_hash: Hash256,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryError {
+    #[error("ARCCHKPT I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("ARCCHKPT codec error: {0}")]
+    Codec(String),
+    #[error("invalid ARCCHKPT: {0}")]
+    Invalid(String),
+    #[error("ARCCHKPT signature error: {0}")]
+    Signature(String),
+    #[error("ARCCHKPT manifest hash {actual} is not the operator-approved hash {expected}")]
+    UnapprovedManifest { expected: Hash256, actual: Hash256 },
+    #[error("source height cannot advance to a recovery transition block")]
+    HeightOverflow,
+}
+
+impl From<RecoveryError> for StateError {
+    fn from(value: RecoveryError) -> Self {
+        StateError::PersistenceError(value.to_string())
+    }
+}
+
+impl ArcCheckpoint {
+    pub fn export_unsigned(
+        state: &StateDB,
+        mut spec: RecoveryExportSpec,
+    ) -> Result<Self, RecoveryError> {
+        canonicalize_recovery_validators(&mut spec.validators)?;
+        // Payload is the exact legacy source state. Validator replacement and
+        // missing zero-balance validator accounts are deterministic H+1
+        // transition effects, not edits to the source snapshot. Keeping both
+        // states distinct lets offline signers recompute the legacy state root
+        // as well as the post-transition v3 root.
+        let payload = state.export_recovery_payload();
+        payload.validate_canonical()?;
+
+        let Some((source_height, source_block)) = payload.blocks.last() else {
+            return Err(RecoveryError::Invalid(
+                "source state contains no canonical anchor block".into(),
+            ));
+        };
+        let replayed_source_state_root = payload.legacy_state_root();
+        let state_source_root = state.compute_state_root();
+        if replayed_source_state_root != state_source_root {
+            return Err(RecoveryError::Invalid(format!(
+                "exported source state root {} differs from replayed state root {}",
+                replayed_source_state_root, state_source_root
+            )));
+        }
+        // Legacy genesis used a zero state_root in block 0. Every later block
+        // must bind the actual replayed state root in its header.
+        if (*source_height != 0 || source_block.header.state_root != Hash256::ZERO)
+            && source_block.header.state_root != replayed_source_state_root
+        {
+            return Err(RecoveryError::Invalid(format!(
+                "source anchor state root {} differs from replayed state root {}",
+                source_block.header.state_root, replayed_source_state_root
+            )));
+        }
+        let context = RecoveryContext::new(
+            &spec.chain_id,
+            spec.genesis_hash,
+            spec.recovery_epoch,
+            spec.validator_set_id,
+        );
+        let full_state_root = payload.transition_consensus_state_root(
+            &context,
+            spec.community_rewards_v1_activation_height,
+            &spec.validators,
+        )?;
+        let payload_hash = payload.content_hash();
+        let manifest = RecoveryManifest {
+            format_version: ARCCHKPT_FORMAT_VERSION,
+            chain_id: spec.chain_id,
+            genesis_hash: spec.genesis_hash,
+            source_height: *source_height,
+            source_block_hash: source_block.hash,
+            source_state_root: replayed_source_state_root,
+            source_consensus_round: spec.source_consensus_round,
+            recovery_epoch: spec.recovery_epoch,
+            validator_set_id: spec.validator_set_id,
+            protocol_version: RECOVERY_PROTOCOL_VERSION,
+            validators: spec.validators,
+            community_rewards_v1_activation_height: spec.community_rewards_v1_activation_height,
+            full_state_root,
+            payload_hash,
+            created_at_unix_ms: spec.created_at_unix_ms,
+        };
+        Ok(Self {
+            magic: ARCCHKPT_MAGIC,
+            manifest,
+            payload,
+            signatures: Vec::new(),
+        })
+    }
+
+    pub fn manifest_hash(&self) -> Hash256 {
+        self.manifest.content_hash()
+    }
+
+    pub fn add_signature(&mut self, keypair: &KeyPair) -> Result<(), RecoveryError> {
+        // Never let the low-level signing API bless content the signer has not
+        // independently validated. CLI callers also verify against their
+        // operator trust root, but this protects direct/library use from
+        // signing a structurally forged history.
+        self.verify_content()?;
+        let address = keypair.address();
+        let validator = self
+            .manifest
+            .validators
+            .iter()
+            .find(|validator| validator.address == address)
+            .ok_or_else(|| {
+                RecoveryError::Signature(format!(
+                    "signer {address} is not in the recovery validator set"
+                ))
+            })?;
+        let public_key: [u8; 32] = keypair
+            .public_key_bytes()
+            .try_into()
+            .map_err(|_| RecoveryError::Signature("validator key is not Ed25519".into()))?;
+        if public_key != validator.public_key {
+            return Err(RecoveryError::Signature(format!(
+                "signer {address} public key differs from the manifest"
+            )));
+        }
+        let signature = RecoverySignature::from_keypair(keypair, &self.manifest.signing_hash())?;
+        if let Some(existing) = self
+            .signatures
+            .iter_mut()
+            .find(|signature| signature.validator == address)
+        {
+            *existing = signature;
+        } else {
+            self.signatures.push(signature);
+            self.signatures
+                .sort_by_key(|signature| signature.validator.0);
+        }
+        Ok(())
+    }
+
+    /// Verify every byte and internal invariant without consulting an external
+    /// trust root or requiring a completed signature quorum. This is the safe
+    /// pre-signing check used by offline validators.
+    pub fn verify_content(&self) -> Result<(), RecoveryError> {
+        if self.magic != ARCCHKPT_MAGIC {
+            return Err(RecoveryError::Invalid("bad ARCCHKPT magic".into()));
+        }
+        if self.manifest.format_version != ARCCHKPT_FORMAT_VERSION {
+            return Err(RecoveryError::Invalid(format!(
+                "unsupported format version {}",
+                self.manifest.format_version
+            )));
+        }
+        if self.manifest.protocol_version != RECOVERY_PROTOCOL_VERSION {
+            return Err(RecoveryError::Invalid(format!(
+                "recovery requires protocol {}, got {}",
+                RECOVERY_PROTOCOL_VERSION, self.manifest.protocol_version
+            )));
+        }
+        if self.manifest.recovery_epoch == 0 || self.manifest.validator_set_id == 0 {
+            return Err(RecoveryError::Invalid(
+                "recovery_epoch and validator_set_id must both be non-zero".into(),
+            ));
+        }
+        validate_recovery_validators(&self.manifest.validators)?;
+        self.payload.validate_canonical()?;
+        let Some((height, anchor)) = self.payload.blocks.last() else {
+            return Err(RecoveryError::Invalid(
+                "checkpoint has no anchor block".into(),
+            ));
+        };
+        if *height != self.manifest.source_height
+            || anchor.header.height != self.manifest.source_height
+            || anchor.hash != self.manifest.source_block_hash
+        {
+            return Err(RecoveryError::Invalid(
+                "source height/hash does not match the retained anchor block".into(),
+            ));
+        }
+        if (*height != 0 || anchor.header.state_root != Hash256::ZERO)
+            && anchor.header.state_root != self.manifest.source_state_root
+        {
+            return Err(RecoveryError::Invalid(
+                "source anchor header does not commit the replayed source state root".into(),
+            ));
+        }
+        if self.payload.staking_pool != checked_total_stake(&self.payload.validators)? {
+            return Err(RecoveryError::Invalid(
+                "source staking pool does not equal its retained validator stake".into(),
+            ));
+        }
+        if self.payload.content_hash() != self.manifest.payload_hash {
+            return Err(RecoveryError::Invalid("payload hash mismatch".into()));
+        }
+        let source_root = self.payload.legacy_state_root();
+        if source_root != self.manifest.source_state_root {
+            return Err(RecoveryError::Invalid(format!(
+                "replayed source state root mismatch: manifest {}, computed {}",
+                self.manifest.source_state_root, source_root
+            )));
+        }
+        let full_root = self.payload.transition_consensus_state_root(
+            &self.manifest.recovery_context(),
+            self.manifest.community_rewards_v1_activation_height,
+            &self.manifest.validators,
+        )?;
+        if full_root != self.manifest.full_state_root {
+            return Err(RecoveryError::Invalid(format!(
+                "full state root mismatch: manifest {}, computed {}",
+                self.manifest.full_state_root, full_root
+            )));
+        }
+        let transition = self.manifest.transition_block()?;
+        if transition.header.height != self.manifest.source_height + 1
+            || transition.header.parent_hash != self.manifest.source_block_hash
+            || transition.header.tx_count != 0
+            || !transition.tx_hashes.is_empty()
+        {
+            return Err(RecoveryError::Invalid(
+                "dedicated recovery transition block is malformed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify content, the exact operator pin, and the complete local network
+    /// policy before an offline validator signs the candidate.
+    pub fn verify_candidate(&self, trust: &RecoveryTrustRoot) -> Result<(), RecoveryError> {
+        let actual_hash = self.manifest_hash();
+        if actual_hash != trust.approved_manifest_hash {
+            return Err(RecoveryError::UnapprovedManifest {
+                expected: trust.approved_manifest_hash,
+                actual: actual_hash,
+            });
+        }
+        verify_network_policy(&self.manifest, &trust.network)?;
+        self.verify_content()
+    }
+
+    /// Verify the candidate plus both strict identity and stake
+    /// supermajorities before activation.
+    pub fn verify(&self, trust: &RecoveryTrustRoot) -> Result<(), RecoveryError> {
+        self.verify_candidate(trust)?;
+        self.verify_signature_quorum()
+    }
+
+    fn verify_signature_quorum(&self) -> Result<(), RecoveryError> {
+        let mut seen = HashSet::new();
+        let validator_map: HashMap<Address, &RecoveryValidator> = self
+            .manifest
+            .validators
+            .iter()
+            .map(|validator| (validator.address, validator))
+            .collect();
+        if self.signatures.len() > validator_map.len() {
+            return Err(RecoveryError::Signature(
+                "more signatures than configured validators".into(),
+            ));
+        }
+        let signing_hash = self.manifest.signing_hash();
+        let mut signed_stake = 0u64;
+        for approval in &self.signatures {
+            if !seen.insert(approval.validator) {
+                return Err(RecoveryError::Signature(format!(
+                    "duplicate validator signature {}",
+                    approval.validator
+                )));
+            }
+            let validator = validator_map.get(&approval.validator).ok_or_else(|| {
+                RecoveryError::Signature(format!("unknown recovery signer {}", approval.validator))
+            })?;
+            if approval.public_key != validator.public_key
+                || hash_bytes(&approval.public_key) != approval.validator
+            {
+                return Err(RecoveryError::Signature(format!(
+                    "signer {} public key does not match its configured address",
+                    approval.validator
+                )));
+            }
+            approval
+                .as_signature()
+                .verify(&signing_hash, &approval.validator)
+                .map_err(|_| {
+                    RecoveryError::Signature(format!(
+                        "invalid signature from {}",
+                        approval.validator
+                    ))
+                })?;
+            signed_stake = signed_stake.checked_add(validator.stake).ok_or_else(|| {
+                RecoveryError::Invalid("signed validator stake exceeds u64::MAX".into())
+            })?;
+        }
+        if seen.len() < RECOVERY_SIGNATURES_REQUIRED {
+            return Err(RecoveryError::Signature(format!(
+                "insufficient signer identities: have {}, require {} of {}",
+                seen.len(),
+                RECOVERY_SIGNATURES_REQUIRED,
+                validator_map.len()
+            )));
+        }
+        let total_stake = checked_total_stake(&self.payload.validators)?;
+        let required_stake = strict_supermajority_threshold(total_stake);
+        if signed_stake < required_stake {
+            return Err(RecoveryError::Signature(format!(
+                "insufficient signed stake: have {signed_stake}, require {required_stake} of {total_stake}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), RecoveryError> {
+        let payload =
+            bincode::serialize(self).map_err(|error| RecoveryError::Codec(error.to_string()))?;
+        if payload.len() > ARCCHKPT_MAX_PAYLOAD_BYTES {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint payload is {} bytes; format-v1 safety limit is {ARCCHKPT_MAX_PAYLOAD_BYTES} bytes",
+                payload.len()
+            )));
+        }
+        let mut bytes = Vec::with_capacity(ARCCHKPT_MAGIC.len() + 8 + payload.len());
+        bytes.extend_from_slice(&ARCCHKPT_MAGIC);
+        bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+        let destination_lock = CheckpointDestinationLock::acquire(path.as_ref())?;
+        destination_lock.restore_interrupted_namespace()?;
+        let path = destination_lock.path.as_path();
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(RecoveryError::Invalid(format!(
+                        "checkpoint destination is not a regular non-symlink file: {}",
+                        path.display()
+                    )));
+                }
+                let mut existing = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+                let existing_len = existing.metadata()?.len();
+                if existing_len != bytes.len() as u64 {
+                    return Err(RecoveryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "checkpoint destination already exists with different bytes: {}",
+                            path.display()
+                        ),
+                    )));
+                }
+                let mut comparison = [0u8; 64 * 1024];
+                for expected in bytes.chunks(comparison.len()) {
+                    existing.read_exact(&mut comparison[..expected.len()])?;
+                    if &comparison[..expected.len()] != expected {
+                        return Err(RecoveryError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "checkpoint destination already exists with different bytes: {}",
+                                path.display()
+                            ),
+                        )));
+                    }
+                }
+                let mut trailing = [0u8; 1];
+                if existing.read(&mut trailing)? != 0 {
+                    return Err(RecoveryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "checkpoint destination already exists with different bytes: {}",
+                            path.display()
+                        ),
+                    )));
+                }
+                // Only a byte-identical retry may migrate legacy permissions;
+                // a conflicting create-only destination is left untouched.
+                arc_crypto::secret_file::tighten_open_owned_private(&existing, path)?;
+                drop(existing);
+                // Re-prove the byte-identical name with a parent fsync on Unix
+                // or two constant-space write-through moves on Windows.
+                // Rewriting a 256 MiB checkpoint on every retry can fail
+                // exactly when recovery disk is tight.
+                destination_lock.rebarrier_existing()?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RecoveryError::Io(error)),
+        }
+        // One deterministic destination-bound staging file makes repeated
+        // crashes disk-bounded. A partial prior attempt is truncated and
+        // reused under the persistent destination lock instead of allocating
+        // another checkpoint-sized UUID file.
+        let mut file =
+            match arc_crypto::secret_file::open_private_read_write(&destination_lock.staging) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    arc_crypto::secret_file::create_new_private(&destination_lock.staging)?
+                }
+                Err(error) => return Err(RecoveryError::Io(error)),
+            };
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        arc_crypto::secret_file::durably_publish_existing_private_no_replace(
+            &destination_lock.staging,
+            path,
+        )?;
+        sync_parent(path)?;
+        Ok(())
+    }
+
+    pub fn read_from(path: impl AsRef<Path>) -> Result<Self, RecoveryError> {
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
+        let metadata_len = file.metadata()?.len();
+        if metadata_len > (ARCCHKPT_MAX_PAYLOAD_BYTES as u64).saturating_add(16) {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint file is {metadata_len} bytes; format-v1 safety limit is {} bytes",
+                ARCCHKPT_MAX_PAYLOAD_BYTES + 16
+            )));
+        }
+        let usize_len = usize::try_from(metadata_len)
+            .map_err(|_| RecoveryError::Invalid("checkpoint is too large for this host".into()))?;
+        let mut bytes = Vec::with_capacity(usize_len);
+        file.read_to_end(&mut bytes)?;
+        Self::read_from_bytes(&bytes)
+    }
+
+    /// Decode one complete ARCCHKPT byte string without reopening a path.
+    ///
+    /// Archive-query callers first open and hash an exact regular inode, then
+    /// pass those same bytes here. Keeping decoding on the already-hashed byte
+    /// string closes the path-replacement race that would exist if validation
+    /// hashed one file and `read_from` reopened another.
+    pub fn read_from_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
+        if bytes.len() > ARCCHKPT_MAX_PAYLOAD_BYTES.saturating_add(16) {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint file is {} bytes; format-v1 safety limit is {} bytes",
+                bytes.len(),
+                ARCCHKPT_MAX_PAYLOAD_BYTES + 16
+            )));
+        }
+        if bytes.len() < 16 {
+            return Err(RecoveryError::Invalid(
+                "checkpoint is shorter than the ARCCHKPT framing header".into(),
+            ));
+        }
+        let mut magic = [0u8; 8];
+        magic.copy_from_slice(&bytes[..8]);
+        if magic != ARCCHKPT_MAGIC {
+            return Err(RecoveryError::Invalid("bad ARCCHKPT file magic".into()));
+        }
+        let mut len = [0u8; 8];
+        len.copy_from_slice(&bytes[8..16]);
+        let declared = u64::from_be_bytes(len);
+        if declared > ARCCHKPT_MAX_PAYLOAD_BYTES as u64 {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint payload is {declared} bytes; format-v1 safety limit is {ARCCHKPT_MAX_PAYLOAD_BYTES} bytes"
+            )));
+        }
+        if bytes.len() as u64 != declared.saturating_add(16) {
+            return Err(RecoveryError::Invalid(format!(
+                "file length mismatch: declared {declared} payload bytes, file is {} bytes",
+                bytes.len()
+            )));
+        }
+        let usize_len = usize::try_from(declared)
+            .map_err(|_| RecoveryError::Invalid("checkpoint is too large for this host".into()))?;
+        let checkpoint: Self =
+            bincode::deserialize_limited_exact::<Self, ARCCHKPT_MAX_PAYLOAD_BYTES>(
+                &bytes[16..16 + usize_len],
+            )
+            .map_err(|error| RecoveryError::Codec(error.to_string()))?;
+        if checkpoint.magic != magic {
+            return Err(RecoveryError::Invalid(
+                "inner and outer ARCCHKPT magic differ".into(),
+            ));
+        }
+        Ok(checkpoint)
+    }
+}
+
+impl RecoveryPayload {
+    pub fn content_hash(&self) -> Hash256 {
+        let bytes = bincode::serialize(self).expect("canonical recovery payload is serializable");
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-payload-content-v1");
+        hasher.update(&bytes);
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Domain-separated commitment to the source validator metadata that is
+    /// transitively signed through `manifest.payload_hash`.
+    pub fn source_validator_set_hash(&self) -> Hash256 {
+        let bytes = bincode::serialize(&(self.validators.as_slice(), self.staking_pool))
+            .expect("canonical source validator state is serializable");
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-source-validator-set-content-v1");
+        hasher.update(&bytes);
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Recompute the legacy account-only Merkle root from the exact retained
+    /// source accounts. This is intentionally independent of StateDB caches,
+    /// dirty-key tracking, and the replacement validator set.
+    pub fn legacy_state_root(&self) -> Hash256 {
+        let mut tree = IncrementalMerkle::new();
+        for (address, account) in &self.accounts {
+            let bytes = bincode::serialize(account).expect("canonical account is serializable");
+            tree.update(address.0, hash_bytes(&bytes));
+        }
+        tree.rebuild();
+        tree.root()
+    }
+
+    fn transition_accounts(
+        &self,
+        validators: &[RecoveryValidator],
+    ) -> Result<Vec<(Address, Account)>, RecoveryError> {
+        let source_stake = checked_total_stake(&self.validators)?;
+        if self.staking_pool != source_stake {
+            return Err(RecoveryError::Invalid(
+                "source staking pool does not equal its retained validator stake".into(),
+            ));
+        }
+        let target_stake = validators.iter().try_fold(0u64, |total, validator| {
+            total
+                .checked_add(validator.stake)
+                .ok_or_else(|| RecoveryError::Invalid("validator stake exceeds u64::MAX".into()))
+        })?;
+        if target_stake != source_stake {
+            return Err(RecoveryError::Invalid(format!(
+                "recovery validator stake {target_stake} must equal conserved source stake {source_stake}"
+            )));
+        }
+
+        let mut accounts = self.accounts.clone();
+        // The selected legacy fleet recorded validator weight in the validator
+        // map, while its validator account `staked_balance` fields are expected
+        // to be zero. That account field is overloaded by legacy channel
+        // disputes and inference-provider bonds, so a non-zero value cannot be
+        // safely interpreted as validator stake without a separately signed
+        // per-address decomposition artifact. V3 deliberately has no guessing
+        // fallback: require the archived account bytes to prove zero and fund
+        // the exact source stake entirely from the explicit system reserve.
+        for (source_validator, _) in &self.validators {
+            let Ok(index) = accounts.binary_search_by_key(&source_validator.0, |entry| entry.0.0)
+            else {
+                continue;
+            };
+            if accounts[index].1.staked_balance != 0 {
+                return Err(RecoveryError::Invalid(format!(
+                    "source validator {source_validator} has ambiguous non-zero account staked_balance {}; a signed decomposition artifact is required",
+                    accounts[index].1.staked_balance
+                )));
+            }
+        }
+        let reserve_debit = target_stake;
+        let reserve_address = recovery_stake_reserve_address();
+        let reserve_index = accounts
+            .binary_search_by_key(&reserve_address.0, |entry| entry.0.0)
+            .map_err(|_| {
+                RecoveryError::Invalid(format!(
+                    "recovery stake reserve {reserve_address} is absent from source state"
+                ))
+            })?;
+        if accounts[reserve_index].1.balance < reserve_debit {
+            return Err(RecoveryError::Invalid(format!(
+                "recovery stake reserve has {}, needs {reserve_debit}",
+                accounts[reserve_index].1.balance
+            )));
+        }
+        accounts[reserve_index].1.balance -= reserve_debit;
+        for validator in validators {
+            let index = match accounts.binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+            {
+                Ok(index) => index,
+                Err(index) => {
+                    accounts.insert(
+                        index,
+                        (validator.address, Account::new(validator.address, 0)),
+                    );
+                    index
+                }
+            };
+            if self
+                .validators
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .is_err()
+                && accounts[index].1.staked_balance != 0
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "replacement validator {} collides with non-validator account metadata in staked_balance",
+                    validator.address
+                )));
+            }
+            accounts[index].1.staked_balance = validator.stake;
+        }
+        Ok(accounts)
+    }
+
+    /// Recompute the deterministic H+1 state root for an independently
+    /// supplied recovery validator set. Offline archive/audit tooling uses
+    /// this to validate fixtures without constructing a live [`StateDB`].
+    pub fn transition_consensus_state_root(
+        &self,
+        context: &RecoveryContext,
+        reward_activation_height: Option<u64>,
+        validators: &[RecoveryValidator],
+    ) -> Result<Hash256, RecoveryError> {
+        let accounts = self.transition_accounts(validators)?;
+        let target_validators: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator.address, validator.stake))
+            .collect();
+        let target_staking_pool = checked_total_stake(&target_validators)?;
+        Ok(consensus_state_root_from_sections(
+            context,
+            reward_activation_height,
+            &accounts,
+            &self.storage,
+            &self.contracts,
+            &self.identities,
+            &target_validators,
+            target_staking_pool,
+        ))
+    }
+
+    pub fn consensus_state_root(
+        &self,
+        context: &RecoveryContext,
+        reward_activation_height: Option<u64>,
+    ) -> Hash256 {
+        consensus_state_root_from_sections(
+            context,
+            reward_activation_height,
+            &self.accounts,
+            &self.storage,
+            &self.contracts,
+            &self.identities,
+            &self.validators,
+            self.staking_pool,
+        )
+    }
+
+    fn validate_canonical(&self) -> Result<(), RecoveryError> {
+        require_sorted_unique(&self.blocks, |entry| entry.0, "blocks")?;
+        require_sorted_unique(&self.accounts, |entry| entry.0.0, "accounts")?;
+        require_sorted_unique(&self.storage, |entry| entry.0.0, "storage")?;
+        for (_, entries) in &self.storage {
+            require_sorted_unique(entries, |entry| entry.0.0, "contract storage entries")?;
+        }
+        require_sorted_unique(&self.contracts, |entry| entry.0.0, "contracts")?;
+        require_sorted_unique(&self.receipts, |entry| entry.0.0, "receipts")?;
+        require_sorted_unique(
+            &self.full_transactions,
+            |entry| entry.0.0,
+            "full transactions",
+        )?;
+        require_sorted_unique(&self.tx_index, |entry| entry.0.0, "transaction index")?;
+        require_sorted_unique(&self.account_txs, |entry| entry.0.0, "account history")?;
+        require_sorted_unique(&self.identities, |entry| entry.0.0, "identities")?;
+        require_sorted_unique(&self.event_logs, |entry| entry.0, "event logs")?;
+        require_sorted_unique(&self.validators, |entry| entry.0.0, "validator state")?;
+
+        // Legacy benchmark blocks may repeat a zero transaction placeholder,
+        // so a hash is not itself a globally unique position. Preserve every
+        // exact canonical occurrence and require retained indexes/receipts to
+        // name one of them (and agree with each other when both exist).
+        let mut canonical_transaction_positions =
+            HashMap::<Hash256, Vec<(u64, u32, Hash256)>>::new();
+        for (index, (height, block)) in self.blocks.iter().enumerate() {
+            if *height != block.header.height || block.hash != Block::compute_hash(&block.header) {
+                return Err(RecoveryError::Invalid(format!(
+                    "block record {height} has invalid height or hash"
+                )));
+            }
+            if block.header.tx_count as usize != block.tx_hashes.len() {
+                return Err(RecoveryError::Invalid(format!(
+                    "block {height} transaction count mismatch"
+                )));
+            }
+            let recomputed_tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+            if recomputed_tx_root != block.header.tx_root {
+                return Err(RecoveryError::Invalid(format!(
+                    "block {height} transaction root does not match its ordered transaction hashes"
+                )));
+            }
+            for (transaction_index, transaction_hash) in block.tx_hashes.iter().enumerate() {
+                let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+                    RecoveryError::Invalid(format!(
+                        "block {height} has more transactions than its u32 index can represent"
+                    ))
+                })?;
+                canonical_transaction_positions
+                    .entry(*transaction_hash)
+                    .or_default()
+                    .push((*height, transaction_index, block.hash));
+            }
+            if index == 0 {
+                if *height != 0 || block.header.parent_hash != Hash256::ZERO {
+                    return Err(RecoveryError::Invalid(
+                        "retained canonical history must start at genesis".into(),
+                    ));
+                }
+            } else {
+                let (previous_height, previous) = &self.blocks[index - 1];
+                if *height != previous_height.saturating_add(1)
+                    || block.header.parent_hash != previous.hash
+                {
+                    return Err(RecoveryError::Invalid(format!(
+                        "canonical history breaks before block {height}"
+                    )));
+                }
+            }
+        }
+        for (address, account) in &self.accounts {
+            if account.address != *address {
+                return Err(RecoveryError::Invalid(format!(
+                    "account key {address} differs from embedded address {}",
+                    account.address
+                )));
+            }
+        }
+        let mut receipt_positions = HashMap::<Hash256, (u64, u32)>::new();
+        for (hash, receipt) in &self.receipts {
+            if receipt.tx_hash != *hash {
+                return Err(RecoveryError::Invalid(format!(
+                    "receipt key {hash} differs from embedded transaction hash {}",
+                    receipt.tx_hash
+                )));
+            }
+            let Some(positions) = canonical_transaction_positions.get(hash) else {
+                return Err(RecoveryError::Invalid(format!(
+                    "receipt {hash} does not refer to a retained canonical transaction"
+                )));
+            };
+            if !positions.iter().any(|(height, index, block_hash)| {
+                receipt.block_height == *height
+                    && receipt.index == *index
+                    && receipt.block_hash == *block_hash
+            }) {
+                return Err(RecoveryError::Invalid(format!(
+                    "receipt {hash} contradicts every retained canonical position"
+                )));
+            }
+            receipt_positions.insert(*hash, (receipt.block_height, receipt.index));
+        }
+        for (hash, transaction) in &self.full_transactions {
+            if transaction.hash != *hash || transaction.compute_hash() != *hash {
+                return Err(RecoveryError::Invalid(format!(
+                    "full transaction {hash} has invalid content hash"
+                )));
+            }
+            if !canonical_transaction_positions.contains_key(hash) {
+                return Err(RecoveryError::Invalid(format!(
+                    "full transaction {hash} is not retained in canonical history"
+                )));
+            }
+        }
+        for (hash, (height, index)) in &self.tx_index {
+            let Some(positions) = canonical_transaction_positions.get(hash) else {
+                return Err(RecoveryError::Invalid(format!(
+                    "transaction index {hash} does not refer to retained canonical history"
+                )));
+            };
+            if !positions
+                .iter()
+                .any(|(canonical_height, canonical_index, _)| {
+                    height == canonical_height && index == canonical_index
+                })
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "transaction index {hash} points to non-canonical position {height}:{index}"
+                )));
+            }
+            if receipt_positions
+                .get(hash)
+                .is_some_and(|receipt_position| receipt_position != &(*height, *index))
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "transaction index {hash} at {height}:{index} contradicts its retained receipt"
+                )));
+            }
+        }
+        for (address, transaction_hashes) in &self.account_txs {
+            for transaction_hash in transaction_hashes {
+                if !canonical_transaction_positions.contains_key(transaction_hash) {
+                    return Err(RecoveryError::Invalid(format!(
+                        "account history {address} refers to non-canonical transaction {transaction_hash}"
+                    )));
+                }
+            }
+        }
+        for (address, identity) in &self.identities {
+            if identity.address != *address {
+                return Err(RecoveryError::Invalid(format!(
+                    "identity key {address} differs from embedded address {}",
+                    identity.address
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn verify_network_policy(
+    manifest: &RecoveryManifest,
+    expected: &RecoveryNetworkPolicy,
+) -> Result<(), RecoveryError> {
+    if manifest.chain_id != expected.chain_id
+        || manifest.genesis_hash != expected.genesis_hash
+        || manifest.recovery_epoch != expected.recovery_epoch
+        || manifest.validator_set_id != expected.validator_set_id
+        || manifest.community_rewards_v1_activation_height
+            != expected.community_rewards_v1_activation_height
+    {
+        return Err(RecoveryError::Invalid(
+            "manifest network/epoch/activation fields differ from local approved policy".into(),
+        ));
+    }
+    let mut expected_validators = expected.validators.clone();
+    expected_validators.sort_by_key(|entry| entry.0.0);
+    let manifest_validators: Vec<_> = manifest
+        .validators
+        .iter()
+        .map(|validator| (validator.address, validator.stake))
+        .collect();
+    if manifest_validators != expected_validators {
+        return Err(RecoveryError::Invalid(
+            "manifest validator identities/stakes differ from configured genesis".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_recovery_validators(
+    validators: &mut [RecoveryValidator],
+) -> Result<(), RecoveryError> {
+    validators.sort_by_key(|validator| validator.address.0);
+    validate_recovery_validators(validators)
+}
+
+fn validate_recovery_validators(validators: &[RecoveryValidator]) -> Result<(), RecoveryError> {
+    if validators.len() != RECOVERY_VALIDATOR_SET_SIZE {
+        return Err(RecoveryError::Invalid(format!(
+            "protocol-v3 recovery requires exactly {RECOVERY_VALIDATOR_SET_SIZE} validators, got {}",
+            validators.len()
+        )));
+    }
+    require_sorted_unique(
+        validators,
+        |validator| validator.address.0,
+        "manifest validators",
+    )?;
+    for validator in validators {
+        if validator.stake == 0 {
+            return Err(RecoveryError::Invalid(format!(
+                "validator {} has zero stake",
+                validator.address
+            )));
+        }
+        if hash_bytes(&validator.public_key) != validator.address {
+            return Err(RecoveryError::Invalid(format!(
+                "validator {} public key does not derive to its address",
+                validator.address
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate and canonicalize the independently archived validator metadata
+/// for the selected legacy fork. This deliberately accepts only the separately
+/// sealed eight-validator, 40M-stake source shape. Runtime peer registries and
+/// divergent validator maps on other legacy forks are not authoritative.
+pub fn canonicalize_legacy_recovery_validator_set(
+    mut validators: Vec<(Address, u64)>,
+) -> Result<Vec<(Address, u64)>, RecoveryError> {
+    if validators.len() != LEGACY_RECOVERY_VALIDATOR_SET_SIZE {
+        return Err(RecoveryError::Invalid(format!(
+            "canonical legacy recovery requires exactly {LEGACY_RECOVERY_VALIDATOR_SET_SIZE} validators, got {}",
+            validators.len()
+        )));
+    }
+    validators.sort_by_key(|entry| entry.0.0);
+    require_sorted_unique(&validators, |entry| entry.0.0, "legacy recovery validators")?;
+
+    for (address, stake) in &validators {
+        if *address == Hash256::ZERO {
+            return Err(RecoveryError::Invalid(
+                "legacy recovery validator has the zero address".into(),
+            ));
+        }
+        if *stake == 0 {
+            return Err(RecoveryError::Invalid(format!(
+                "legacy recovery validator {address} has zero stake"
+            )));
+        }
+    }
+    let total = checked_total_stake(&validators).map_err(|_| {
+        RecoveryError::Invalid("legacy recovery validator stake exceeds u64::MAX".into())
+    })?;
+    for (address, stake) in &validators {
+        if *stake != LEGACY_RECOVERY_VALIDATOR_STAKE {
+            return Err(RecoveryError::Invalid(format!(
+                "legacy recovery validator {address} has stake {stake}, expected {LEGACY_RECOVERY_VALIDATOR_STAKE}"
+            )));
+        }
+    }
+    if total != LEGACY_RECOVERY_TOTAL_STAKE {
+        return Err(RecoveryError::Invalid(format!(
+            "legacy recovery validator stake is {total}, expected {LEGACY_RECOVERY_TOTAL_STAKE}"
+        )));
+    }
+    Ok(validators)
+}
+
+fn checked_total_stake(validators: &[(Address, u64)]) -> Result<u64, RecoveryError> {
+    validators.iter().try_fold(0u64, |total, (_, stake)| {
+        total
+            .checked_add(*stake)
+            .ok_or_else(|| RecoveryError::Invalid("validator stake exceeds u64::MAX".into()))
+    })
+}
+
+fn require_sorted_unique<T, K: Ord + Copy>(
+    entries: &[T],
+    key: impl Fn(&T) -> K,
+    label: &str,
+) -> Result<(), RecoveryError> {
+    if entries
+        .windows(2)
+        .any(|window| key(&window[0]) >= key(&window[1]))
+    {
+        return Err(RecoveryError::Invalid(format!(
+            "{label} are not strictly sorted and unique"
+        )));
+    }
+    Ok(())
+}
+
+fn commit_section(hasher: &mut blake3::Hasher, label: &[u8], hash: &Hash256) {
+    hasher.update(&(label.len() as u64).to_be_bytes());
+    hasher.update(label);
+    hasher.update(hash.as_ref());
+}
+
+fn commit_serialized<T: Serialize>(hasher: &mut blake3::Hasher, label: &[u8], value: &T) {
+    let bytes = bincode::serialize(value).expect("consensus state section is serializable");
+    let mut section = blake3::Hasher::new_derive_key("ARC-full-state-section-v1");
+    section.update(&(label.len() as u64).to_be_bytes());
+    section.update(label);
+    section.update(&(bytes.len() as u64).to_be_bytes());
+    section.update(&bytes);
+    commit_section(hasher, label, &Hash256(*section.finalize().as_bytes()));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consensus_state_root_from_sections(
+    context: &RecoveryContext,
+    reward_activation_height: Option<u64>,
+    accounts: &[(Address, Account)],
+    storage: &ContractStorage,
+    contracts: &[(Address, Vec<u8>)],
+    identities: &[(Address, Identity)],
+    validators: &[(Address, u64)],
+    staking_pool: u64,
+) -> Hash256 {
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-full-consensus-state-v1");
+    commit_section(&mut hasher, b"domain", &context.domain_hash());
+    commit_serialized(&mut hasher, b"accounts", &accounts);
+    commit_serialized(&mut hasher, b"storage", &storage);
+    commit_serialized(&mut hasher, b"contracts", &contracts);
+    commit_serialized(&mut hasher, b"identities", &identities);
+    commit_serialized(&mut hasher, b"validators", &validators);
+    commit_serialized(&mut hasher, b"staking_pool", &staking_pool);
+    commit_serialized(
+        &mut hasher,
+        b"community_rewards_v1_activation_height",
+        &reward_activation_height,
+    );
+    Hash256(*hasher.finalize().as_bytes())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LegacyBoundary {
+    height: u64,
+    state_root: Hash256,
+    checkpoint_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LegacyWalRejectedTail {
+    TruncatedFrameLength,
+    InvalidFrameLength(u32),
+    TruncatedFramePayload,
+    InvalidEntryEncoding,
+    ChecksumMismatch(u64),
+    SequenceGap { expected: u64, actual: u64 },
+}
+
+impl LegacyWalRejectedTail {
+    fn stable_reason(&self) -> String {
+        match self {
+            Self::TruncatedFrameLength => "truncated_wal_frame_length".to_string(),
+            Self::InvalidFrameLength(length) => {
+                format!("invalid_wal_frame_length:{length}")
+            }
+            Self::TruncatedFramePayload => "truncated_wal_frame_payload".to_string(),
+            Self::InvalidEntryEncoding => "invalid_wal_entry_encoding".to_string(),
+            Self::ChecksumMismatch(sequence) => {
+                format!("wal_checksum_mismatch_at_sequence:{sequence}")
+            }
+            Self::SequenceGap { expected, actual } => {
+                format!("wal_sequence_gap:expected={expected},actual={actual}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LegacyWalPrefixRead {
+    entries: Vec<WalEntry>,
+    frame_end_offsets: Vec<u64>,
+    original_bytes: u64,
+    rejected_tail: Option<LegacyWalRejectedTail>,
+}
+
+/// Exact physical source-WAL boundary selected for snapshot-assisted recovery.
+///
+/// Operators can copy the first `source_wal_accepted_prefix_bytes` bytes as the
+/// canonical block-boundary evidence and quarantine the remaining bytes. The
+/// lengths always add back to `source_wal_original_bytes`; the loader never
+/// rewrites the source file.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LegacyWalBoundaryReport {
+    pub source_wal_original_bytes: u64,
+    pub source_wal_accepted_prefix_bytes: u64,
+    pub source_wal_quarantined_tail_bytes: u64,
+    pub source_wal_tail_reason: String,
+}
+
+fn legacy_wal_boundary_report(
+    read: &LegacyWalPrefixRead,
+    boundary: &LegacyBoundary,
+) -> Result<LegacyWalBoundaryReport, StateError> {
+    let accepted_prefix = *read
+        .frame_end_offsets
+        .get(boundary.checkpoint_index)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "selected legacy checkpoint has no physical WAL frame offset".into(),
+            )
+        })?;
+    let quarantined_tail = read
+        .original_bytes
+        .checked_sub(accepted_prefix)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "selected legacy checkpoint offset exceeds source WAL size".into(),
+            )
+        })?;
+    let valid_tail_entries = read
+        .entries
+        .len()
+        .checked_sub(boundary.checkpoint_index + 1)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "selected legacy checkpoint index exceeds parsed WAL entries".into(),
+            )
+        })?;
+    let source_wal_tail_reason = match (valid_tail_entries, &read.rejected_tail) {
+        (0, None) => "none".to_string(),
+        (count, None) => {
+            format!("valid_entries_after_selected_snapshot_boundary:{count}")
+        }
+        (0, Some(reason)) => reason.stable_reason(),
+        (count, Some(reason)) => format!(
+            "valid_entries_after_selected_snapshot_boundary:{count};{}",
+            reason.stable_reason()
+        ),
+    };
+    if (quarantined_tail == 0) != (source_wal_tail_reason == "none") {
+        return Err(StateError::PersistenceError(
+            "legacy WAL physical tail accounting contradicts its classification".into(),
+        ));
+    }
+    Ok(LegacyWalBoundaryReport {
+        source_wal_original_bytes: read.original_bytes,
+        source_wal_accepted_prefix_bytes: accepted_prefix,
+        source_wal_quarantined_tail_bytes: quarantined_tail,
+        source_wal_tail_reason,
+    })
+}
+
+/// Read the longest checksum- and sequence-valid WAL prefix while retaining a
+/// precise reason for any rejected tail. This is used only with an exact-height
+/// snapshot: the caller must prove the selected block boundary matches the
+/// independently captured snapshot before it may ignore `tail_error`.
+fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError> {
+    let file = File::open(path).map_err(|error| {
+        StateError::PersistenceError(format!("failed to open legacy WAL {path:?}: {error}"))
+    })?;
+    let original_bytes = file
+        .metadata()
+        .map_err(|error| {
+            StateError::PersistenceError(format!("failed to inspect legacy WAL {path:?}: {error}"))
+        })?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut frame_end_offsets = Vec::new();
+    let mut expected_sequence = 0u64;
+    let mut offset = 0u64;
+
+    loop {
+        let mut length_bytes = [0u8; 4];
+        let first = reader.read(&mut length_bytes[..1]).map_err(|error| {
+            StateError::PersistenceError(format!("failed to read legacy WAL {path:?}: {error}"))
+        })?;
+        if first == 0 {
+            let final_bytes = reader
+                .get_ref()
+                .metadata()
+                .map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "failed to re-inspect legacy WAL {path:?}: {error}"
+                    ))
+                })?
+                .len();
+            if final_bytes != original_bytes || offset != original_bytes {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy WAL changed size while being read: before={original_bytes}, parsed={offset}, after={final_bytes}"
+                )));
+            }
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: None,
+            });
+        }
+        if let Err(error) = reader.read_exact(&mut length_bytes[1..]) {
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(StateError::PersistenceError(format!(
+                    "failed to read legacy WAL frame length from {path:?}: {error}"
+                )));
+            }
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::TruncatedFrameLength),
+            });
+        }
+        let length_u32 = u32::from_le_bytes(length_bytes);
+        let length = length_u32 as usize;
+        if length == 0 || length > ARCCHKPT_MAX_PAYLOAD_BYTES {
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::InvalidFrameLength(length_u32)),
+            });
+        }
+        let mut encoded = vec![0u8; length];
+        if let Err(error) = reader.read_exact(&mut encoded) {
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(StateError::PersistenceError(format!(
+                    "failed to read legacy WAL frame payload from {path:?}: {error}"
+                )));
+            }
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::TruncatedFramePayload),
+            });
+        }
+        let entry: WalEntry = match bincode::deserialize(&encoded) {
+            Ok(entry) => entry,
+            Err(_) => {
+                return Ok(LegacyWalPrefixRead {
+                    entries,
+                    frame_end_offsets,
+                    original_bytes,
+                    rejected_tail: Some(LegacyWalRejectedTail::InvalidEntryEncoding),
+                });
+            }
+        };
+        let checksum_payload =
+            bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op)).map_err(
+                |error| {
+                    StateError::PersistenceError(format!(
+                        "failed to recompute legacy WAL checksum: {error}"
+                    ))
+                },
+            )?;
+        if entry.checksum != crc32fast::hash(&checksum_payload) {
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::ChecksumMismatch(entry.sequence)),
+            });
+        }
+        if entry.sequence != expected_sequence {
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::SequenceGap {
+                    expected: expected_sequence,
+                    actual: entry.sequence,
+                }),
+            });
+        }
+        offset = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(length as u64))
+            .ok_or_else(|| {
+                StateError::PersistenceError("legacy WAL byte offset overflows u64".into())
+            })?;
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("legacy WAL sequence overflows u64".into())
+        })?;
+        entries.push(entry);
+        frame_end_offsets.push(offset);
+    }
+}
+
+fn legacy_post_root_state_mutation(op: &WalOp) -> bool {
+    matches!(
+        op,
+        WalOp::SetAccount(..)
+            | WalOp::SetStorage(..)
+            | WalOp::DeleteStorage(..)
+            | WalOp::SetContract(..)
+            | WalOp::SetIdentity(..)
+    )
+}
+
+/// Locate the latest structurally complete block boundary without trusting a
+/// final WAL record merely because it calls itself a checkpoint. A later torn
+/// suffix has no matching SetBlock+root and is deliberately not selected.
+fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundary, StateError> {
+    let mut blocks = HashMap::<u64, usize>::new();
+    let mut latest = None;
+    for (index, entry) in entries.iter().enumerate() {
+        match &entry.op {
+            WalOp::SetBlock(height, block)
+                if *height == block.header.height
+                    && block.hash == Block::compute_hash(&block.header) =>
+            {
+                blocks.insert(*height, index);
+            }
+            WalOp::Checkpoint(root) => {
+                let height = entry.block_height;
+                let Some(&block_index) = blocks.get(&height) else {
+                    continue;
+                };
+                let WalOp::SetBlock(_, block) = &entries[block_index].op else {
+                    unreachable!("legacy block index is created only from SetBlock")
+                };
+                if (height != 0 || block.header.state_root != Hash256::ZERO)
+                    && block.header.state_root != *root
+                    || entries[block_index + 1..index]
+                        .iter()
+                        .any(|candidate| legacy_post_root_state_mutation(&candidate.op))
+                {
+                    continue;
+                }
+                latest = Some(LegacyBoundary {
+                    height,
+                    state_root: *root,
+                    checkpoint_index: index,
+                });
+            }
+            _ => {}
+        }
+    }
+    latest.ok_or_else(|| {
+        StateError::PersistenceError(
+            "legacy source has no complete SetBlock + Checkpoint boundary".into(),
+        )
+    })
+}
+
+/// Locate the complete WAL boundary committed by an independently captured
+/// snapshot.  A live writer may append one or more later complete blocks after
+/// `/sync/snapshot` has serialized its state and before the WAL is read.  Those
+/// later frames are a suffix of the capture, not evidence that the snapshot is
+/// stale or unsafe.  Selection is therefore by the snapshot's exact
+/// height/root tuple rather than by the newest complete WAL checkpoint.
+fn exact_complete_legacy_boundary(
+    entries: &[WalEntry],
+    snapshot_height: u64,
+    snapshot_root: Hash256,
+) -> Result<LegacyBoundary, StateError> {
+    let mut blocks = HashMap::<u64, usize>::new();
+    let mut selected = None;
+    for (index, entry) in entries.iter().enumerate() {
+        match &entry.op {
+            WalOp::SetBlock(height, block)
+                if *height == block.header.height
+                    && block.hash == Block::compute_hash(&block.header) =>
+            {
+                blocks.insert(*height, index);
+            }
+            WalOp::Checkpoint(root)
+                if entry.block_height == snapshot_height && *root == snapshot_root =>
+            {
+                let Some(&block_index) = blocks.get(&snapshot_height) else {
+                    continue;
+                };
+                let WalOp::SetBlock(_, block) = &entries[block_index].op else {
+                    unreachable!("legacy block index is created only from SetBlock")
+                };
+                if (snapshot_height != 0 || block.header.state_root != Hash256::ZERO)
+                    && block.header.state_root != snapshot_root
+                    || entries[block_index + 1..index]
+                        .iter()
+                        .any(|candidate| legacy_post_root_state_mutation(&candidate.op))
+                {
+                    continue;
+                }
+                if selected.is_some() {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy WAL contains more than one complete boundary for snapshot height/root {snapshot_height}/{snapshot_root}"
+                    )));
+                }
+                selected = Some(LegacyBoundary {
+                    height: snapshot_height,
+                    state_root: snapshot_root,
+                    checkpoint_index: index,
+                });
+            }
+            _ => {}
+        }
+    }
+    selected.ok_or_else(|| {
+        StateError::PersistenceError(format!(
+            "legacy snapshot height/root {snapshot_height}/{snapshot_root} has no exact complete SetBlock + Checkpoint WAL boundary"
+        ))
+    })
+}
+
+fn validate_legacy_boundary(
+    entries: &[WalEntry],
+    boundary: &LegacyBoundary,
+) -> Result<(), StateError> {
+    let committed = &entries[..=boundary.checkpoint_index];
+    let mut blocks = BTreeMap::<u64, (usize, &Block)>::new();
+    let mut checkpoints = BTreeMap::<u64, (usize, Hash256)>::new();
+
+    for (index, entry) in committed.iter().enumerate() {
+        match &entry.op {
+            WalOp::SetBlock(height, block) => {
+                if *height != entry.block_height || *height != block.header.height {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy SetBlock at WAL sequence {} has inconsistent heights: tag={}, key={}, header={}",
+                        entry.sequence, entry.block_height, height, block.header.height
+                    )));
+                }
+                if block.hash != Block::compute_hash(&block.header) {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy block {} has an invalid header hash at WAL sequence {}",
+                        height, entry.sequence
+                    )));
+                }
+                if blocks.insert(*height, (index, block)).is_some() {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy WAL rewrites canonical block height {height}"
+                    )));
+                }
+            }
+            WalOp::Checkpoint(root) => match checkpoints.entry(entry.block_height) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((index, *root));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy WAL has duplicate checkpoints at height {}",
+                        entry.block_height
+                    )));
+                }
+            },
+            _ => {}
+        }
+    }
+
+    let expected_block_count = boundary
+        .height
+        .checked_add(1)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| StateError::PersistenceError("legacy height exceeds usize".into()))?;
+    if blocks.len() != expected_block_count {
+        return Err(StateError::PersistenceError(format!(
+            "legacy WAL is missing canonical blocks through height {}: expected {}, got {}",
+            boundary.height,
+            expected_block_count,
+            blocks.len()
+        )));
+    }
+
+    let mut previous = None;
+    for height in 0..=boundary.height {
+        let Some(&(block_index, block)) = blocks.get(&height) else {
+            return Err(StateError::PersistenceError(format!(
+                "legacy WAL is missing canonical block {height}"
+            )));
+        };
+        if let Some(parent) = previous
+            && block.header.parent_hash != parent
+        {
+            return Err(StateError::PersistenceError(format!(
+                "legacy canonical block parent mismatch at height {height}"
+            )));
+        }
+        previous = Some(block.hash);
+
+        let Some(&(checkpoint_index, checkpoint_root)) = checkpoints.get(&height) else {
+            if height == 0 {
+                continue;
+            }
+            return Err(StateError::PersistenceError(format!(
+                "legacy canonical block {height} has no durable checkpoint"
+            )));
+        };
+        if checkpoint_index <= block_index
+            || (height != 0 || block.header.state_root != Hash256::ZERO)
+                && checkpoint_root != block.header.state_root
+        {
+            return Err(StateError::PersistenceError(format!(
+                "legacy block/checkpoint mismatch at height {height}"
+            )));
+        }
+        if committed[block_index + 1..checkpoint_index]
+            .iter()
+            .any(|entry| legacy_post_root_state_mutation(&entry.op))
+        {
+            return Err(StateError::PersistenceError(format!(
+                "legacy WAL mutates root-covered state after SetBlock and before Checkpoint at height {height}"
+            )));
+        }
+    }
+
+    let Some(&(final_index, final_root)) = checkpoints.get(&boundary.height) else {
+        return Err(StateError::PersistenceError(
+            "selected legacy boundary lost its checkpoint".into(),
+        ));
+    };
+    if final_index != boundary.checkpoint_index || final_root != boundary.state_root {
+        return Err(StateError::PersistenceError(
+            "selected legacy boundary differs from validated checkpoint chain".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_legacy_recovery_snapshot(path: &Path) -> Result<Snapshot, StateError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect legacy recovery snapshot {path:?}: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot must be a regular non-symlink file: {path:?}"
+        )));
+    }
+    let compressed_len: usize = metadata
+        .len()
+        .try_into()
+        .map_err(|_| StateError::PersistenceError("snapshot file size exceeds usize".into()))?;
+    if !(4..=LEGACY_SNAPSHOT_MAX_BYTES).contains(&compressed_len) {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot compressed size {compressed_len} is outside 4..={LEGACY_SNAPSHOT_MAX_BYTES} bytes"
+        )));
+    }
+    let mut file = File::open(path).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to open legacy recovery snapshot {path:?}: {error}"
+        ))
+    })?;
+    let mut compressed = Vec::with_capacity(compressed_len);
+    file.read_to_end(&mut compressed).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to read legacy recovery snapshot {path:?}: {error}"
+        ))
+    })?;
+    if compressed.len() != compressed_len {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot changed size while being read: expected {compressed_len}, got {}",
+            compressed.len()
+        )));
+    }
+    let decoded_len =
+        u32::from_le_bytes(compressed[..4].try_into().expect("four bytes checked")) as usize;
+    if decoded_len > LEGACY_SNAPSHOT_MAX_BYTES {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot requests {decoded_len} decompressed bytes, limit is {LEGACY_SNAPSHOT_MAX_BYTES}"
+        )));
+    }
+    let decoded = lz4_flex::decompress_size_prepended(&compressed).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "invalid legacy recovery snapshot compression at {path:?}: {error}"
+        ))
+    })?;
+    let snapshot: Snapshot = bincode::deserialize(&decoded).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "invalid legacy recovery snapshot payload at {path:?}: {error}"
+        ))
+    })?;
+    validate_legacy_snapshot_shape(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_legacy_snapshot_shape(snapshot: &Snapshot) -> Result<(), StateError> {
+    let mut accounts = HashSet::with_capacity(snapshot.accounts.len());
+    for (address, account) in &snapshot.accounts {
+        if *address != account.address {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot account key {address} differs from embedded address {}",
+                account.address
+            )));
+        }
+        if !accounts.insert(address.0) {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot duplicates account {address}"
+            )));
+        }
+    }
+
+    let mut storage_addresses = HashSet::with_capacity(snapshot.storage.len());
+    for (address, entries) in &snapshot.storage {
+        if !storage_addresses.insert(address.0) {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot duplicates storage address {address}"
+            )));
+        }
+        let mut keys = HashSet::with_capacity(entries.len());
+        for (key, _) in entries {
+            if !keys.insert(key.0) {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy snapshot duplicates storage key {key} for {address}"
+                )));
+            }
+        }
+    }
+
+    let mut contracts = HashSet::with_capacity(snapshot.contracts.len());
+    for (address, bytecode) in &snapshot.contracts {
+        if !contracts.insert(address.0) {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot duplicates contract {address}"
+            )));
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find_map(|(candidate, account)| (candidate == address).then_some(account))
+            .ok_or_else(|| {
+                StateError::PersistenceError(format!(
+                    "legacy snapshot contract {address} has no account"
+                ))
+            })?;
+        let code_hash = hash_bytes(bytecode);
+        if account.code_hash != code_hash {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot contract {address} bytecode hash {code_hash} differs from account commitment {}",
+                account.code_hash
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_storage(mut storage: ContractStorage) -> ContractStorage {
+    for (_, entries) in &mut storage {
+        entries.sort_by_key(|entry| entry.0.0);
+    }
+    storage.sort_by_key(|entry| entry.0.0);
+    storage
+}
+
+fn validate_snapshot_sections_against_wal(
+    snapshot: &Snapshot,
+    state: &StateDB,
+) -> Result<(), StateError> {
+    let wal_storage = canonical_storage(
+        state
+            .storage
+            .iter()
+            .map(|entry| {
+                (
+                    Hash256(*entry.key()),
+                    entry
+                        .value()
+                        .iter()
+                        .map(|value| (*value.key(), value.value().clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+    let snapshot_storage = canonical_storage(snapshot.storage.clone());
+    if bincode::serialize(&wal_storage).ok() != bincode::serialize(&snapshot_storage).ok() {
+        return Err(StateError::PersistenceError(
+            "legacy snapshot contract storage differs from canonical WAL replay".into(),
+        ));
+    }
+
+    let mut wal_contracts: Vec<_> = state
+        .contracts
+        .iter()
+        .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+        .collect();
+    wal_contracts.sort_by_key(|entry| entry.0.0);
+    let mut snapshot_contracts = snapshot.contracts.clone();
+    snapshot_contracts.sort_by_key(|entry| entry.0.0);
+    if wal_contracts != snapshot_contracts {
+        return Err(StateError::PersistenceError(
+            "legacy snapshot contract bytecode differs from canonical WAL replay".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact physical repair performed on a post-recovery state WAL before replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryWalRepairReport {
+    pub recovery_wal_original_bytes: u64,
+    pub recovery_wal_accepted_prefix_bytes: u64,
+    pub recovery_wal_quarantined_tail_bytes: u64,
+    pub recovery_wal_tail_reason: String,
+    pub recovery_wal_quarantine_path: Option<PathBuf>,
+}
+
+struct PostRecoveryWalPlan {
+    entries: Vec<WalEntry>,
+    report: RecoveryWalRepairReport,
+    original_hash: blake3::Hash,
+}
+
+fn plan_post_recovery_wal(
+    mut read: RepairableWalRead,
+    transition_height: u64,
+) -> Result<PostRecoveryWalPlan, StateError> {
+    if read.entries.is_empty() {
+        if read.original_bytes != 0 {
+            let reason = read.torn_tail.map_or_else(
+                || "uncommitted_bytes_before_first_checkpoint".to_string(),
+                |tail| tail.stable_reason().to_string(),
+            );
+            return Ok(PostRecoveryWalPlan {
+                entries: Vec::new(),
+                report: RecoveryWalRepairReport {
+                    recovery_wal_original_bytes: read.original_bytes,
+                    recovery_wal_accepted_prefix_bytes: 0,
+                    recovery_wal_quarantined_tail_bytes: read.original_bytes,
+                    recovery_wal_tail_reason: reason,
+                    recovery_wal_quarantine_path: None,
+                },
+                original_hash: read.original_hash,
+            });
+        }
+        return Ok(PostRecoveryWalPlan {
+            entries: Vec::new(),
+            report: RecoveryWalRepairReport {
+                recovery_wal_original_bytes: 0,
+                recovery_wal_accepted_prefix_bytes: 0,
+                recovery_wal_quarantined_tail_bytes: 0,
+                recovery_wal_tail_reason: "none".into(),
+                recovery_wal_quarantine_path: None,
+            },
+            original_hash: read.original_hash,
+        });
+    }
+
+    let mut blocks = HashMap::<u64, (usize, Hash256)>::new();
+    let mut checkpoint_heights = HashSet::new();
+    let mut latest_boundary = None;
+    let mut previous_entry_height = transition_height;
+    for (index, entry) in read.entries.iter().enumerate() {
+        if entry.block_height <= transition_height {
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL entry {} targets height {} at/before transition {}",
+                entry.sequence, entry.block_height, transition_height
+            )));
+        }
+        if entry.block_height < previous_entry_height {
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL height regresses at sequence {}: previous={}, actual={}",
+                entry.sequence, previous_entry_height, entry.block_height
+            )));
+        }
+        previous_entry_height = entry.block_height;
+
+        match &entry.op {
+            WalOp::SetBlock(height, block) => {
+                if *height != entry.block_height || block.header.height != *height {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery SetBlock at sequence {} has inconsistent heights: tag={}, key={}, header={}",
+                        entry.sequence, entry.block_height, height, block.header.height
+                    )));
+                }
+                if block.hash != Block::compute_hash(&block.header) {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery SetBlock at height {height} has an invalid header hash"
+                    )));
+                }
+                if blocks
+                    .insert(*height, (index, block.header.state_root))
+                    .is_some()
+                {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery WAL rewrites canonical block height {height}"
+                    )));
+                }
+            }
+            WalOp::Checkpoint(root) => {
+                if !checkpoint_heights.insert(entry.block_height) {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery WAL has duplicate checkpoints at height {}",
+                        entry.block_height
+                    )));
+                }
+                let Some(&(block_index, block_root)) = blocks.get(&entry.block_height) else {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery checkpoint at height {} has no preceding SetBlock",
+                        entry.block_height
+                    )));
+                };
+                if block_index >= index || block_root != *root {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery block/checkpoint mismatch at height {}",
+                        entry.block_height
+                    )));
+                }
+                latest_boundary = Some((index, entry.block_height));
+            }
+            _ => {}
+        }
+    }
+
+    let Some((checkpoint_index, checkpoint_height)) = latest_boundary else {
+        // The signed recovery package plus canonical transition block is an
+        // independently authenticated byte-zero boundary. A crash during the
+        // first post-recovery block may therefore discard every physically
+        // valid/torn WAL byte after semantic validation above. Complete frame
+        // corruption and invalid heights/hashes still fail before this point.
+        let valid_entries = read.entries.len();
+        let reason = match read.torn_tail {
+            None => format!("uncommitted_valid_entries_before_first_checkpoint:{valid_entries}"),
+            Some(tail) => format!(
+                "uncommitted_valid_entries_before_first_checkpoint:{valid_entries};{}",
+                tail.stable_reason()
+            ),
+        };
+        return Ok(PostRecoveryWalPlan {
+            entries: Vec::new(),
+            report: RecoveryWalRepairReport {
+                recovery_wal_original_bytes: read.original_bytes,
+                recovery_wal_accepted_prefix_bytes: 0,
+                recovery_wal_quarantined_tail_bytes: read.original_bytes,
+                recovery_wal_tail_reason: reason,
+                recovery_wal_quarantine_path: None,
+            },
+            original_hash: read.original_hash,
+        });
+    };
+    let mut expected_height = transition_height.checked_add(1).ok_or_else(|| {
+        StateError::PersistenceError("recovery transition height overflows u64".into())
+    })?;
+    let mut committed_blocks: Vec<_> = blocks
+        .iter()
+        .filter_map(|(height, (index, _))| (*index <= checkpoint_index).then_some(*height))
+        .collect();
+    committed_blocks.sort_unstable();
+    for height in committed_blocks {
+        if height != expected_height || !checkpoint_heights.contains(&height) {
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL lacks a contiguous SetBlock + Checkpoint boundary at height {expected_height}"
+            )));
+        }
+        expected_height = expected_height.checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("post-recovery block height overflows u64".into())
+        })?;
+    }
+    if expected_height
+        != checkpoint_height.checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("post-recovery checkpoint height overflows u64".into())
+        })?
+    {
+        return Err(StateError::PersistenceError(format!(
+            "post-recovery WAL is missing a complete block checkpoint through height {checkpoint_height}"
+        )));
+    }
+    let accepted_prefix_bytes = *read
+        .frame_end_offsets
+        .get(checkpoint_index)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "post-recovery checkpoint has no physical WAL frame offset".into(),
+            )
+        })?;
+    let quarantined_tail_bytes = read
+        .original_bytes
+        .checked_sub(accepted_prefix_bytes)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "post-recovery checkpoint offset exceeds WAL file size".into(),
+            )
+        })?;
+    let valid_tail_entries = read
+        .entries
+        .len()
+        .checked_sub(checkpoint_index + 1)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "post-recovery checkpoint index exceeds parsed entries".into(),
+            )
+        })?;
+    let recovery_wal_tail_reason = match (valid_tail_entries, read.torn_tail) {
+        (0, None) => "none".to_string(),
+        (count, None) => format!("uncommitted_valid_entries_after_checkpoint:{count}"),
+        (0, Some(tail)) => tail.stable_reason().to_string(),
+        (count, Some(tail)) => format!(
+            "uncommitted_valid_entries_after_checkpoint:{count};{}",
+            tail.stable_reason()
+        ),
+    };
+    if (quarantined_tail_bytes == 0) != (recovery_wal_tail_reason == "none") {
+        return Err(StateError::PersistenceError(
+            "post-recovery WAL physical tail accounting contradicts its classification".into(),
+        ));
+    }
+
+    read.entries.truncate(checkpoint_index + 1);
+    Ok(PostRecoveryWalPlan {
+        entries: read.entries,
+        report: RecoveryWalRepairReport {
+            recovery_wal_original_bytes: read.original_bytes,
+            recovery_wal_accepted_prefix_bytes: accepted_prefix_bytes,
+            recovery_wal_quarantined_tail_bytes: quarantined_tail_bytes,
+            recovery_wal_tail_reason,
+            recovery_wal_quarantine_path: None,
+        },
+        original_hash: read.original_hash,
+    })
+}
+
+impl StateDB {
+    fn export_recovery_payload(&self) -> RecoveryPayload {
+        let mut blocks: Vec<_> = self
+            .blocks
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        blocks.sort_by_key(|entry| entry.0);
+        let mut accounts: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        accounts.sort_by_key(|entry| entry.0.0);
+        let mut storage: Vec<_> = self
+            .storage
+            .iter()
+            .map(|entry| {
+                let mut values: Vec<_> = entry
+                    .value()
+                    .iter()
+                    .map(|value| (*value.key(), value.value().clone()))
+                    .collect();
+                values.sort_by_key(|value| value.0.0);
+                (Hash256(*entry.key()), values)
+            })
+            .collect();
+        storage.sort_by_key(|entry| entry.0.0);
+        let mut contracts: Vec<_> = self
+            .contracts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        contracts.sort_by_key(|entry| entry.0.0);
+        let mut receipts: Vec<_> = self
+            .receipts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        receipts.sort_by_key(|entry| entry.0.0);
+        let mut full_transactions: Vec<_> = self
+            .full_transactions
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        full_transactions.sort_by_key(|entry| entry.0.0);
+        let mut tx_index: Vec<_> = self
+            .tx_index
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        tx_index.sort_by_key(|entry| entry.0.0);
+        let mut account_txs: Vec<_> = self
+            .account_txs
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        account_txs.sort_by_key(|entry| entry.0.0);
+        let mut identities: Vec<_> = self
+            .identities
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        identities.sort_by_key(|entry| entry.0.0);
+        let mut event_logs: Vec<_> = self
+            .event_logs
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect();
+        event_logs.sort_by_key(|entry| entry.0);
+        let mut validators: Vec<_> = self
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        validators.sort_by_key(|entry| entry.0.0);
+        RecoveryPayload {
+            blocks,
+            accounts,
+            storage,
+            contracts,
+            receipts,
+            full_transactions,
+            tx_index,
+            account_txs,
+            identities,
+            event_logs,
+            validators,
+            staking_pool: self.staking_pool.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn recovery_context(&self) -> Option<RecoveryContext> {
+        self.recovery_context.read().clone()
+    }
+
+    pub fn recovery_manifest_hash(&self) -> Option<Hash256> {
+        *self.recovery_manifest_hash.read()
+    }
+
+    pub fn active_protocol_version(&self) -> ProtocolVersion {
+        self.recovery_context()
+            .map(|context| context.protocol_version)
+            .unwrap_or(ProtocolVersion::GENESIS)
+    }
+
+    pub fn transaction_domain_hash(&self) -> Option<Hash256> {
+        self.recovery_context().map(|context| context.domain_hash())
+    }
+
+    pub fn verify_transaction_signature(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<(), arc_crypto::SignatureError> {
+        match self.transaction_domain_hash() {
+            Some(domain) => transaction.verify_signature_in_domain(&domain),
+            None => transaction.verify_signature(),
+        }
+    }
+
+    pub fn sign_transaction(
+        &self,
+        transaction: &mut Transaction,
+        keypair: &KeyPair,
+    ) -> Result<(), arc_crypto::SignatureError> {
+        match self.transaction_domain_hash() {
+            Some(domain) => transaction.sign_in_domain(keypair, &domain),
+            None => transaction.sign(keypair),
+        }
+    }
+
+    pub(crate) fn compute_recovery_state_root(&self, context: &RecoveryContext) -> Hash256 {
+        // Do not materialize retained blocks, receipts, transaction bodies, or
+        // logs here. They are content-addressed in ARCCHKPT, but are historical
+        // data rather than live consensus state. Re-hashing history on every
+        // block would make production O(chain length).
+        let mut accounts: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        accounts.sort_by_key(|entry| entry.0.0);
+        let mut storage: Vec<_> = self
+            .storage
+            .iter()
+            .map(|entry| {
+                let mut values: Vec<_> = entry
+                    .value()
+                    .iter()
+                    .map(|value| (*value.key(), value.value().clone()))
+                    .collect();
+                values.sort_by_key(|value| value.0.0);
+                (Hash256(*entry.key()), values)
+            })
+            .collect();
+        storage.sort_by_key(|entry| entry.0.0);
+        let mut contracts: Vec<_> = self
+            .contracts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        contracts.sort_by_key(|entry| entry.0.0);
+        let mut identities: Vec<_> = self
+            .identities
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        identities.sort_by_key(|entry| entry.0.0);
+        let mut validators: Vec<_> = self
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        validators.sort_by_key(|entry| entry.0.0);
+        consensus_state_root_from_sections(
+            context,
+            self.community_rewards_v1_activation_height(),
+            &accounts,
+            &storage,
+            &contracts,
+            &identities,
+            &validators,
+            self.staking_pool.load(Ordering::Acquire),
+        )
+    }
+
+    /// Strict, read-only loader for the legacy WAL used to build an unsigned
+    /// recovery candidate. It never creates a binding, marker, WAL, or
+    /// checkpoint file and requires a complete block-boundary checkpoint.
+    pub fn load_legacy_recovery_source(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+    ) -> Result<Self, StateError> {
+        Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            None,
+        )
+        .map(|(state, _)| state)
+    }
+
+    /// Load a legacy recovery source and bind its canonical block boundary to
+    /// a same-height live state snapshot.
+    ///
+    /// Old ARC nodes did not persist every in-memory state section in every
+    /// execution path. A WAL remains authoritative for block/history ordering,
+    /// while the snapshot supplies exactly accounts/storage/contracts. The
+    /// snapshot is never trusted by metadata: its account root is recomputed
+    /// and must equal both the final complete WAL checkpoint and block header.
+    pub fn load_legacy_recovery_source_with_snapshot(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+    ) -> Result<Self, StateError> {
+        Self::load_legacy_recovery_source_with_snapshot_report(
+            wal_dir,
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            snapshot_path,
+        )
+        .map(|(state, _)| state)
+    }
+
+    /// Snapshot-assisted loader variant that also reports the exact physical
+    /// WAL prefix accepted through the selected checkpoint frame. The source
+    /// WAL remains read-only; operators may use the returned byte boundary to
+    /// archive the accepted prefix and quarantine the suffix byte-for-byte.
+    pub fn load_legacy_recovery_source_with_snapshot_report(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+    ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
+        let (state, report) = Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            Some(snapshot_path.as_ref()),
+        )?;
+        let report = report.ok_or_else(|| {
+            StateError::PersistenceError(
+                "snapshot-assisted loader did not produce a physical WAL boundary report".into(),
+            )
+        })?;
+        Ok((state, report))
+    }
+
+    /// Load the canonical legacy block/account boundary and bind the explicit
+    /// operator-archived source validator metadata used by ARCCHKPT export.
+    ///
+    /// Legacy snapshots do not carry validator state, and the selected WAL did
+    /// not persist the genesis validator map. The account root is therefore
+    /// verified first. Only then may this inject the independently supplied
+    /// eight-validator/40M consensus metadata; no account, block, receipt,
+    /// storage, or contract data is changed.
+    pub fn load_legacy_recovery_export_source(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+        legacy_validators: &[(Address, u64)],
+    ) -> Result<Self, StateError> {
+        Self::load_legacy_recovery_export_source_with_report(
+            wal_dir,
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            snapshot_path,
+            legacy_validators,
+        )
+        .map(|(state, _)| state)
+    }
+
+    /// Export loader variant that returns the exact physical source-WAL
+    /// boundary selected by the signed snapshot height/root.
+    pub fn load_legacy_recovery_export_source_with_report(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+        legacy_validators: &[(Address, u64)],
+    ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
+        // Validate before the potentially expensive production WAL replay.
+        let legacy_validators =
+            canonicalize_legacy_recovery_validator_set(legacy_validators.to_vec())?;
+        let (state, report) = Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            Some(snapshot_path.as_ref()),
+        )?;
+        state.bind_legacy_recovery_validator_set(&legacy_validators)?;
+        let report = report.ok_or_else(|| {
+            StateError::PersistenceError(
+                "snapshot-assisted export did not produce a physical WAL boundary report".into(),
+            )
+        })?;
+        Ok((state, report))
+    }
+
+    fn bind_legacy_recovery_validator_set(
+        &self,
+        expected: &[(Address, u64)],
+    ) -> Result<(), StateError> {
+        let expected = canonicalize_legacy_recovery_validator_set(expected.to_vec())?;
+        let source_height = self.height();
+        let source_root = self.compute_state_root();
+        let source_anchor = self.get_block(source_height).ok_or_else(|| {
+            StateError::PersistenceError(format!(
+                "legacy validator binding has no source block at height {source_height}"
+            ))
+        })?;
+        if (source_height != 0 || source_anchor.header.state_root != Hash256::ZERO)
+            && source_anchor.header.state_root != source_root
+        {
+            return Err(StateError::PersistenceError(format!(
+                "refusing legacy validator binding because source block commits {}, replayed account root is {}",
+                source_anchor.header.state_root, source_root
+            )));
+        }
+
+        let mut persisted: Vec<_> = self
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        persisted.sort_by_key(|entry| entry.0.0);
+        let persisted_pool = self.staking_pool.load(Ordering::Acquire);
+        if persisted.is_empty() && persisted_pool == 0 {
+            for (address, stake) in &expected {
+                self.validators.insert(address.0, *stake);
+            }
+            self.staking_pool
+                .store(LEGACY_RECOVERY_TOTAL_STAKE, Ordering::Release);
+        } else if persisted != expected || persisted_pool != LEGACY_RECOVERY_TOTAL_STAKE {
+            return Err(StateError::PersistenceError(format!(
+                "persisted legacy validator state differs from the explicit canonical source set: persisted count/stake {}/{}, expected {}/{}",
+                persisted.len(),
+                persisted_pool,
+                expected.len(),
+                LEGACY_RECOVERY_TOTAL_STAKE
+            )));
+        }
+
+        let rebound_root = self.compute_state_root();
+        if self.height() != source_height
+            || self.get_state_root() != source_root
+            || rebound_root != source_root
+        {
+            return Err(StateError::PersistenceError(
+                "legacy validator binding changed the verified block/account boundary".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_legacy_recovery_source_inner(
+        wal_dir: &Path,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: Option<&Path>,
+    ) -> Result<(Self, Option<LegacyWalBoundaryReport>), StateError> {
+        if wal_dir.join(ACTIVE_RECOVERY_MARKER).exists() {
+            return Err(StateError::PersistenceError(
+                "source data directory already has an active recovery; chained recovery export is not supported by this format revision"
+                    .into(),
+            ));
+        }
+        let requested_wal_path = wal_dir.join("state.wal");
+        let wal_path = crate::wal::select_read_only_wal_path(&requested_wal_path).map_err(
+            |error| {
+                StateError::PersistenceError(format!(
+                    "failed to select the read-only legacy source WAL {requested_wal_path:?}: {error}"
+                ))
+            },
+        )?;
+
+        let binding_path = wal_dir.join("genesis.network-hash");
+        match fs::read_to_string(&binding_path) {
+            Ok(value) => {
+                let actual = Hash256::from_hex(value.trim()).map_err(|_| {
+                    StateError::PersistenceError(format!(
+                        "invalid genesis binding in {binding_path:?}"
+                    ))
+                })?;
+                if actual != expected_genesis_hash {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy source is bound to genesis {actual}, expected {expected_genesis_hash}"
+                    )));
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && allow_unbound_legacy_wal => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy source has no authenticated genesis binding at {binding_path:?}; rerun only after independent chain-tip verification with --allow-unbound-legacy-wal"
+                )));
+            }
+            Err(error) => {
+                return Err(StateError::PersistenceError(format!(
+                    "failed to read genesis binding {binding_path:?}: {error}"
+                )));
+            }
+        }
+
+        let snapshot = snapshot_path
+            .map(read_legacy_recovery_snapshot)
+            .transpose()?;
+        let prefix_read = snapshot
+            .as_ref()
+            .map(|_| read_legacy_wal_prefix(&wal_path))
+            .transpose()?;
+        let strict_entries = if prefix_read.is_none() {
+            Some(read_wal_strict(&wal_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "legacy recovery source WAL is incomplete or corrupt: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+        let entries = prefix_read
+            .as_ref()
+            .map(|read| read.entries.as_slice())
+            .or(strict_entries.as_deref())
+            .ok_or_else(|| {
+                StateError::PersistenceError("legacy recovery source produced no WAL reader".into())
+            })?;
+        if entries.is_empty() {
+            return Err(StateError::PersistenceError(
+                "legacy recovery source WAL is empty".into(),
+            ));
+        }
+
+        let boundary = if let Some(snapshot) = snapshot.as_ref() {
+            exact_complete_legacy_boundary(entries, snapshot.block_height, snapshot.state_root)?
+        } else {
+            latest_complete_legacy_boundary(entries)?
+        };
+        let wal_report = prefix_read
+            .as_ref()
+            .map(|read| legacy_wal_boundary_report(read, &boundary))
+            .transpose()?;
+        validate_legacy_boundary(entries, &boundary)?;
+        let committed_entries = &entries[..=boundary.checkpoint_index];
+        let state = StateDB::new();
+        for entry in committed_entries {
+            state.apply_wal_op(&entry.op);
+        }
+        state.rebuild_transaction_indexes();
+        if state.get_block(0).is_none() {
+            return Err(StateError::PersistenceError(
+                "legacy source does not retain genesis block 0".into(),
+            ));
+        }
+
+        if let Some(snapshot) = snapshot.as_ref() {
+            validate_snapshot_sections_against_wal(snapshot, &state)?;
+            state.import_snapshot(snapshot, boundary.state_root)?;
+            // import_snapshot changes only the three snapshot-covered state
+            // sections and height. WAL-derived blocks/history/receipts remain.
+            state.rebuild_transaction_indexes();
+        } else {
+            let actual_root = state.compute_state_root();
+            if actual_root != boundary.state_root {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy source checkpoint root mismatch: WAL {}, replayed {}; provide an exact-height --snapshot capture so missing legacy state can be root-verified without weakening the checkpoint",
+                    boundary.state_root, actual_root
+                )));
+            }
+        }
+
+        if state.height() != boundary.height || state.get_state_root() != boundary.state_root {
+            return Err(StateError::PersistenceError(format!(
+                "legacy canonical boundary changed after replay: expected height/root {}/{}, got {}/{}",
+                boundary.height,
+                boundary.state_root,
+                state.height(),
+                state.get_state_root()
+            )));
+        }
+        if boundary.checkpoint_index + 1 < entries.len() {
+            tracing::warn!(
+                ignored_entries = entries.len() - boundary.checkpoint_index - 1,
+                first_ignored_sequence = entries[boundary.checkpoint_index + 1].sequence,
+                committed_height = boundary.height,
+                "Ignored WAL suffix after the latest fully committed legacy block boundary"
+            );
+        }
+        if let Some(report) = wal_report.as_ref()
+            && report.source_wal_quarantined_tail_bytes != 0
+        {
+            tracing::warn!(
+                committed_height = boundary.height,
+                accepted_prefix_bytes = report.source_wal_accepted_prefix_bytes,
+                quarantined_tail_bytes = report.source_wal_quarantined_tail_bytes,
+                tail_reason = %report.source_wal_tail_reason,
+                "Quarantined WAL tail after snapshot-bound legacy block boundary"
+            );
+        }
+        Ok((state, wal_report))
+    }
+
+    fn install_verified_checkpoint(&self, checkpoint: &ArcCheckpoint) -> Result<(), RecoveryError> {
+        let payload = &checkpoint.payload;
+        let transitioned_accounts = payload.transition_accounts(&checkpoint.manifest.validators)?;
+        let transitioned_staking_pool =
+            checkpoint
+                .manifest
+                .validators
+                .iter()
+                .try_fold(0u64, |total, validator| {
+                    total.checked_add(validator.stake).ok_or_else(|| {
+                        RecoveryError::Invalid("validator stake exceeds u64::MAX".into())
+                    })
+                })?;
+        self.accounts.clear();
+        self.storage.clear();
+        self.blocks.clear();
+        self.receipts.clear();
+        self.tx_index.clear();
+        self.account_txs.clear();
+        self.contracts.clear();
+        self.identities.clear();
+        self.full_transactions.clear();
+        self.event_logs.clear();
+        self.validators.clear();
+
+        for (address, account) in &transitioned_accounts {
+            self.accounts.insert(address.0, account.clone());
+            self.dirty_accounts.insert(address.0);
+        }
+        for (address, entries) in &payload.storage {
+            let values = DashMap::new();
+            for (key, value) in entries {
+                values.insert(*key, value.clone());
+            }
+            self.storage.insert(address.0, values);
+        }
+        for (address, bytes) in &payload.contracts {
+            self.contracts.insert(address.0, bytes.clone());
+        }
+        for (hash, receipt) in &payload.receipts {
+            self.receipts.insert(hash.0, receipt.clone());
+        }
+        for (hash, transaction) in &payload.full_transactions {
+            self.full_transactions.insert(hash.0, transaction.clone());
+        }
+        for (hash, location) in &payload.tx_index {
+            self.tx_index.insert(hash.0, *location);
+        }
+        for (address, transactions) in &payload.account_txs {
+            self.account_txs.insert(address.0, transactions.clone());
+        }
+        for (address, identity) in &payload.identities {
+            self.identities.insert(address.0, identity.clone());
+        }
+        for (height, logs) in &payload.event_logs {
+            self.event_logs.insert(*height, logs.clone());
+        }
+        for validator in &checkpoint.manifest.validators {
+            self.validators.insert(validator.address.0, validator.stake);
+        }
+        self.staking_pool
+            .store(transitioned_staking_pool, Ordering::Release);
+        self.community_rewards_v1_activation_height.store(
+            checkpoint
+                .manifest
+                .community_rewards_v1_activation_height
+                .unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        *self.recovery_context.write() = Some(checkpoint.manifest.recovery_context());
+        *self.recovery_manifest_hash.write() = Some(checkpoint.manifest_hash());
+
+        for (height, block) in &payload.blocks {
+            self.blocks.insert(*height, block.clone());
+        }
+        let transition = checkpoint.manifest.transition_block()?;
+        self.blocks
+            .insert(transition.header.height, transition.clone());
+        *self.height.write() = transition.header.height;
+
+        let computed = self.compute_recovery_state_root(&checkpoint.manifest.recovery_context());
+        if computed != checkpoint.manifest.full_state_root {
+            return Err(RecoveryError::Invalid(format!(
+                "staged state root changed during import: expected {}, got {}",
+                checkpoint.manifest.full_state_root, computed
+            )));
+        }
+        Ok(())
+    }
+
+    /// Open normal state or activate/reopen an approved ARCCHKPT base.
+    /// Existing legacy WAL data is never overwritten by an import.
+    pub fn with_genesis_persistent_recovery(
+        prefunded: &[(Address, u64)],
+        wal_dir: impl AsRef<Path>,
+        network: RecoveryNetworkPolicy,
+        import: Option<RecoveryImport>,
+    ) -> Result<Self, StateError> {
+        let namespace_lock = crate::prepare_persistent_state_directory(wal_dir.as_ref())?;
+        Self::with_genesis_persistent_recovery_in_prepared_directory(
+            prefunded,
+            &namespace_lock,
+            network,
+            import,
+        )
+    }
+
+    /// Open normal state or activate/reopen an approved ARCCHKPT base beneath
+    /// an already-proven directory namespace. The opaque capability can only
+    /// be minted by a successful direct rebarrier or by the desktop's exact
+    /// private lifecycle proof while the stable sibling lock remains held.
+    pub fn with_genesis_persistent_recovery_in_prepared_directory(
+        prefunded: &[(Address, u64)],
+        namespace_lock: &arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock,
+        network: RecoveryNetworkPolicy,
+        import: Option<RecoveryImport>,
+    ) -> Result<Self, StateError> {
+        let wal_dir = namespace_lock.target();
+        crate::cleanup_state_staging_files(wal_dir)?;
+        cleanup_recovery_staging_files(wal_dir)?;
+        restore_interrupted_stored_checkpoint_names(wal_dir)?;
+        let marker_path = wal_dir.join(ACTIVE_RECOVERY_MARKER);
+        let existing_marker = read_active_marker(&marker_path)?;
+
+        let approved_hash = match (existing_marker, import.as_ref()) {
+            (Some(active), Some(requested)) if active != requested.approved_manifest_hash => {
+                return Err(StateError::PersistenceError(format!(
+                    "data directory is already bound to recovery manifest {active}; refusing requested {}",
+                    requested.approved_manifest_hash
+                )));
+            }
+            (Some(active), _) => Some(active),
+            (None, Some(requested)) => Some(requested.approved_manifest_hash),
+            (None, None) => None,
+        };
+
+        let Some(approved_hash) = approved_hash else {
+            reject_interrupted_checkpoint_staging_without_import(wal_dir)?;
+            reject_orphaned_recovery_files(wal_dir)?;
+            return Self::with_genesis_persistent_in_prepared_dir(
+                prefunded,
+                wal_dir,
+                network.genesis_hash,
+            );
+        };
+
+        let checkpoint_path = if let Some(requested) = import.as_ref() {
+            requested.checkpoint_path.clone()
+        } else {
+            checkpoint_store_path(wal_dir, approved_hash)
+        };
+        restore_checkpoint_destination_if_interrupted(&checkpoint_path).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "failed to restore interrupted checkpoint namespace {checkpoint_path:?}: {error}"
+            ))
+        })?;
+        let checkpoint = ArcCheckpoint::read_from(&checkpoint_path)?;
+        let trust = RecoveryTrustRoot {
+            network: network.clone(),
+            approved_manifest_hash: approved_hash,
+        };
+        checkpoint.verify(&trust)?;
+
+        // Verify the complete logical import in an isolated, non-persistent
+        // StateDB before creating a marker or WAL in the active directory.
+        let staged = StateDB::new();
+        staged.install_verified_checkpoint(&checkpoint)?;
+        if staged.height() != checkpoint.manifest.source_height + 1 {
+            return Err(StateError::PersistenceError(
+                "staged checkpoint did not activate exactly at H+1".into(),
+            ));
+        }
+
+        let wal_path = wal_dir.join("state.wal");
+        let stored_path = checkpoint_store_path(wal_dir, approved_hash);
+        if existing_marker.is_none() && wal_path.exists() {
+            return Err(StateError::PersistenceError(format!(
+                "refusing ARCCHKPT activation over existing WAL {wal_path:?}; archive it and use a fresh data directory"
+            )));
+        }
+        let stored_was_present = stored_path.exists();
+        if !stored_was_present {
+            write_checkpoint_atomically(&checkpoint, &stored_path)?;
+        }
+        let stored_metadata = fs::symlink_metadata(&stored_path).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "failed to inspect stored recovery checkpoint {stored_path:?}: {error}"
+            ))
+        })?;
+        if stored_metadata.file_type().is_symlink() || !stored_metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "stored recovery checkpoint is not a regular non-symlink file: {stored_path:?}"
+            )));
+        }
+        let stored_checkpoint = ArcCheckpoint::read_from(&stored_path)?;
+        stored_checkpoint.verify(&trust)?;
+        if existing_marker.is_none() && stored_was_present {
+            // A previous write-through publication may have made the final
+            // name visible while reporting a late flush failure. Before a
+            // marker can make that name a permanent trust dependency, give
+            // the exact verified package a fresh namespace barrier. This is
+            // activation/retry-only, never a 256 MiB healthy-restart rewrite.
+            stored_checkpoint.write_to(&stored_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to rebarrier stored recovery checkpoint {stored_path:?}: {error}"
+                ))
+            })?;
+        } else {
+            // Healthy restarts avoid rewriting the bounded-but-large package.
+            // The marker could only have been published after the package's
+            // namespace barrier; repeat the file-data barrier and Unix parent
+            // fsync to detect media/permission failures before replay.
+            let stored_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&stored_path)
+                .map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "failed to open stored recovery checkpoint {stored_path:?}: {error}"
+                    ))
+                })?;
+            if !stored_file
+                .metadata()
+                .map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "failed to inspect stored recovery checkpoint {stored_path:?}: {error}"
+                    ))
+                })?
+                .is_file()
+            {
+                return Err(StateError::PersistenceError(format!(
+                    "stored recovery checkpoint is not a regular file: {stored_path:?}"
+                )));
+            }
+            stored_file.sync_all().map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to flush stored recovery checkpoint {stored_path:?}: {error}"
+                ))
+            })?;
+            drop(stored_file);
+            sync_parent(&stored_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to rebarrier stored recovery checkpoint {stored_path:?}: {error}"
+                ))
+            })?;
+        }
+        if existing_marker.is_none() {
+            write_marker_atomically(&marker_path, approved_hash)?;
+        }
+        let marker_bytes = format!("{}\n", approved_hash.to_hex());
+        arc_crypto::secret_file::durably_replace_private(&marker_path, marker_bytes.as_bytes())
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to rebarrier recovery marker {marker_path:?}: {error}"
+                ))
+            })?;
+        Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), network.genesis_hash)?;
+
+        let transition_height = checkpoint.manifest.source_height + 1;
+        let wal_existed = wal_path.exists();
+        let mut wal_plan = if wal_existed {
+            let read = read_repairable_wal_prefix(&wal_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "recovery WAL contains non-repairable corruption; refusing replay: {error}"
+                ))
+            })?;
+            plan_post_recovery_wal(read, transition_height)?
+        } else {
+            PostRecoveryWalPlan {
+                entries: Vec::new(),
+                report: RecoveryWalRepairReport {
+                    recovery_wal_original_bytes: 0,
+                    recovery_wal_accepted_prefix_bytes: 0,
+                    recovery_wal_quarantined_tail_bytes: 0,
+                    recovery_wal_tail_reason: "none".into(),
+                    recovery_wal_quarantine_path: None,
+                },
+                original_hash: blake3::hash(&[]),
+            }
+        };
+
+        // Prove the selected physical prefix against the signed checkpoint and
+        // its canonical state root before preserving or truncating any byte.
+        staged.apply_verified_recovery_wal(&wal_plan.entries)?;
+        staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
+        staged.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
+
+        if wal_plan.report.recovery_wal_quarantined_tail_bytes != 0 {
+            let quarantine_path = quarantine_and_truncate_wal_tail(
+                &wal_path,
+                wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                wal_plan.report.recovery_wal_original_bytes,
+                wal_plan.original_hash,
+            )
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to durably quarantine post-recovery WAL tail: {error}"
+                ))
+            })?;
+            wal_plan.report.recovery_wal_quarantine_path = Some(quarantine_path.clone());
+            tracing::warn!(
+                recovery_wal_original_bytes = wal_plan.report.recovery_wal_original_bytes,
+                recovery_wal_accepted_prefix_bytes =
+                    wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                recovery_wal_quarantined_tail_bytes =
+                    wal_plan.report.recovery_wal_quarantined_tail_bytes,
+                recovery_wal_tail_reason = %wal_plan.report.recovery_wal_tail_reason,
+                recovery_wal_quarantine_path = ?quarantine_path,
+                "quarantined post-recovery state WAL suffix before replay"
+            );
+        } else if wal_existed {
+            verify_wal_file_identity(
+                &wal_path,
+                wal_plan.report.recovery_wal_original_bytes,
+                wal_plan.original_hash,
+            )
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "recovery WAL changed after checkpoint validation; refusing replay: {error}"
+                ))
+            })?;
+            tracing::info!(
+                recovery_wal_original_bytes = wal_plan.report.recovery_wal_original_bytes,
+                recovery_wal_accepted_prefix_bytes =
+                    wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                recovery_wal_quarantined_tail_bytes = 0u64,
+                recovery_wal_tail_reason = "none",
+                "post-recovery state WAL ends at a verified block checkpoint"
+            );
+        }
+
+        let state = StateDB::with_persistence(&wal_path)?;
+        state.install_verified_checkpoint(&checkpoint)?;
+        state.apply_verified_recovery_wal(&wal_plan.entries)?;
+        state.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
+        state.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
+        Ok(state)
+    }
+
+    fn rebuild_transaction_indexes(&self) {
+        self.tx_index.clear();
+        self.account_txs.clear();
+        let mut receipts: Vec<_> = self
+            .receipts
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+            .collect();
+        receipts.sort_by_key(|(hash, receipt)| (receipt.block_height, receipt.index, hash.0));
+        for (hash, receipt) in receipts {
+            self.tx_index
+                .insert(hash.0, (receipt.block_height, receipt.index));
+        }
+        let mut transactions: Vec<_> = self
+            .full_transactions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        transactions.sort_by_key(|transaction| {
+            self.receipts
+                .get(&transaction.hash.0)
+                .map(|receipt| (receipt.block_height, receipt.index))
+                .unwrap_or((u64::MAX, u32::MAX))
+        });
+        for transaction in transactions {
+            self.index_account_tx(&transaction);
+        }
+    }
+
+    /// Rebuild every index derivable from replayed receipts/transaction bodies,
+    /// then merge the signed retained indexes from ARCCHKPT. Legacy sources may
+    /// have pruned a body and/or receipt while still retaining its block hash
+    /// occurrence and account-history index; those signed entries are evidence,
+    /// not disposable caches. A replayed receipt for the same hash must name the
+    /// same canonical position or startup fails closed.
+    fn rebuild_recovery_transaction_indexes(
+        &self,
+        payload: &RecoveryPayload,
+    ) -> Result<(), RecoveryError> {
+        self.rebuild_transaction_indexes();
+
+        for (hash, signed_location) in &payload.tx_index {
+            if let Some(replayed_location) = self.tx_index.get(&hash.0).map(|entry| *entry)
+                && replayed_location != *signed_location
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "replayed transaction index {hash} at {}:{} conflicts with signed retained location {}:{}",
+                    replayed_location.0, replayed_location.1, signed_location.0, signed_location.1,
+                )));
+            }
+            self.tx_index.insert(hash.0, *signed_location);
+        }
+
+        for (address, signed_hashes) in &payload.account_txs {
+            let derived_hashes = self
+                .account_txs
+                .remove(&address.0)
+                .map(|(_, hashes)| hashes)
+                .unwrap_or_default();
+            let mut merged = signed_hashes.clone();
+            for hash in derived_hashes {
+                if !merged.contains(&hash) {
+                    merged.push(hash);
+                }
+            }
+            self.account_txs.insert(address.0, merged);
+        }
+        Ok(())
+    }
+
+    fn apply_verified_recovery_wal(&self, entries: &[crate::WalEntry]) -> Result<(), StateError> {
+        for entry in entries {
+            self.apply_wal_op(&entry.op);
+            let WalOp::Checkpoint(expected_root) = &entry.op else {
+                continue;
+            };
+            let block = self.get_block(entry.block_height).ok_or_else(|| {
+                StateError::PersistenceError(format!(
+                    "post-recovery checkpoint at height {} has no replayed block",
+                    entry.block_height
+                ))
+            })?;
+            if block.header.state_root != *expected_root {
+                return Err(StateError::PersistenceError(format!(
+                    "post-recovery block/checkpoint root mismatch at height {}: block {}, checkpoint {}",
+                    entry.block_height, block.header.state_root, expected_root
+                )));
+            }
+            let actual_root = self.compute_state_root();
+            if actual_root != *expected_root {
+                return Err(StateError::PersistenceError(format!(
+                    "post-recovery WAL state root mismatch at checkpoint height {}: checkpoint {}, replayed {}",
+                    entry.block_height, expected_root, actual_root
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_recovery_restart(
+        &self,
+        entries: &[crate::WalEntry],
+        checkpoint: &ArcCheckpoint,
+    ) -> Result<(), StateError> {
+        let transition_height = checkpoint.manifest.source_height + 1;
+        let mut last_checkpoint = None;
+        let mut last_block_height = transition_height;
+        for entry in entries {
+            match &entry.op {
+                WalOp::Checkpoint(root) => last_checkpoint = Some((entry.block_height, *root)),
+                WalOp::SetBlock(height, _) => last_block_height = last_block_height.max(*height),
+                _ => {}
+            }
+        }
+        if !entries.is_empty() {
+            let Some((checkpoint_height, expected_root)) = last_checkpoint else {
+                return Err(StateError::PersistenceError(
+                    "post-recovery WAL has no complete block checkpoint".into(),
+                ));
+            };
+            if checkpoint_height != last_block_height || self.height() != last_block_height {
+                return Err(StateError::PersistenceError(format!(
+                    "post-recovery WAL is not block-atomic: checkpoint={checkpoint_height}, block={last_block_height}, state={}",
+                    self.height()
+                )));
+            }
+            let actual = self.compute_state_root();
+            if actual != expected_root {
+                return Err(StateError::PersistenceError(format!(
+                    "post-recovery WAL state root mismatch: checkpoint {expected_root}, replayed {actual}"
+                )));
+            }
+        }
+        let mut previous = self
+            .get_block(transition_height)
+            .ok_or_else(|| StateError::PersistenceError("transition block missing".into()))?;
+        for height in (transition_height + 1)..=self.height() {
+            let block = self.get_block(height).ok_or_else(|| {
+                StateError::PersistenceError(format!(
+                    "canonical block {height} missing after replay"
+                ))
+            })?;
+            if block.header.parent_hash != previous.hash
+                || block.hash != Block::compute_hash(&block.header)
+            {
+                return Err(StateError::PersistenceError(format!(
+                    "canonical block linkage/hash invalid at height {height}"
+                )));
+            }
+            if block.header.protocol_version.major == 3 && block.header.proof_hash == Hash256::ZERO
+            {
+                return Err(StateError::PersistenceError(format!(
+                    "protocol-v3 canonical block {height} is not bound to a DAG decision"
+                )));
+            }
+            previous = block;
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_store_path(wal_dir: &Path, hash: Hash256) -> PathBuf {
+    wal_dir.join(format!(
+        "{ACTIVE_RECOVERY_PREFIX}{}{ACTIVE_RECOVERY_SUFFIX}",
+        hash.to_hex()
+    ))
+}
+
+fn restore_interrupted_stored_checkpoint_names(wal_dir: &Path) -> Result<(), StateError> {
+    #[cfg(windows)]
+    {
+        for entry in fs::read_dir(wal_dir).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "failed to inspect interrupted checkpoint namespaces in {wal_dir:?}: {error}"
+            ))
+        })? {
+            let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(digest) = name
+                .strip_prefix(".arc-recovery-package-")
+                .and_then(|value| value.strip_suffix(".namespace-rebarrier"))
+            else {
+                continue;
+            };
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                continue;
+            }
+            let staging = entry.path();
+            let metadata = fs::symlink_metadata(&staging)
+                .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StateError::PersistenceError(format!(
+                    "checkpoint namespace rebarrier is not a regular file: {staging:?}"
+                )));
+            }
+            drop(
+                arc_crypto::secret_file::open_private(&staging).map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "checkpoint namespace rebarrier is not private {staging:?}: {error}"
+                    ))
+                })?,
+            );
+            let checkpoint = ArcCheckpoint::read_from(&staging)?;
+            let destination = checkpoint_store_path(wal_dir, checkpoint.manifest_hash());
+            let expected = checkpoint_destination_digest(&destination).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to bind interrupted checkpoint namespace {staging:?}: {error}"
+                ))
+            })?;
+            if digest != expected {
+                // A standalone operator export may share this directory. Its
+                // destination-bound staging is unrelated to the active store.
+                continue;
+            }
+            restore_checkpoint_destination_if_interrupted(&destination).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to restore stored checkpoint {destination:?}: {error}"
+                ))
+            })?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = wal_dir;
+    Ok(())
+}
+
+fn read_active_marker(path: &Path) -> Result<Option<Hash256>, StateError> {
+    match fs::read_to_string(path) {
+        Ok(value) => Hash256::from_hex(value.trim())
+            .map(Some)
+            .map_err(|_| StateError::PersistenceError(format!("invalid recovery marker {path:?}"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StateError::PersistenceError(format!(
+            "failed to read recovery marker {path:?}: {error}"
+        ))),
+    }
+}
+
+fn reject_orphaned_recovery_files(wal_dir: &Path) -> Result<(), StateError> {
+    let has_orphan = fs::read_dir(wal_dir)
+        .map_err(|error| StateError::PersistenceError(error.to_string()))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|name| {
+            name.starts_with(ACTIVE_RECOVERY_PREFIX) && name.ends_with(ACTIVE_RECOVERY_SUFFIX)
+        });
+    if has_orphan {
+        return Err(StateError::PersistenceError(
+            "ARCCHKPT file exists without recovery.active; refusing ambiguous startup".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn deterministic_checkpoint_staging_digest(name: &str) -> Option<&str> {
+    let digest = name
+        .strip_prefix(".arc-recovery-package-")?
+        .strip_suffix(".staging")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(digest)
+}
+
+fn reject_interrupted_checkpoint_staging_without_import(wal_dir: &Path) -> Result<(), StateError> {
+    for entry in fs::read_dir(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect interrupted checkpoint staging in {wal_dir:?}: {error}"
+        ))
+    })? {
+        let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if deterministic_checkpoint_staging_digest(&name).is_none() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "interrupted ARCCHKPT staging artifact is not a regular non-symlink file: {path:?}"
+            )));
+        }
+        drop(
+            arc_crypto::secret_file::open_private(&path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "interrupted ARCCHKPT staging artifact is not private {path:?}: {error}"
+                ))
+            })?,
+        );
+        // This can be either a fully fsynced package awaiting create-only
+        // publication or a partial package that `ArcCheckpoint::write_to`
+        // will safely truncate and reuse. Without an approved import there is
+        // no trust root with which to activate it, but silently initializing a
+        // normal genesis WAL would make the interrupted recovery impossible
+        // to resume in this directory.
+        return Err(StateError::PersistenceError(format!(
+            "interrupted ARCCHKPT package staging exists without recovery.active or an approved import: {path:?}; refusing normal genesis startup"
+        )));
+    }
+    Ok(())
+}
+
+fn write_checkpoint_atomically(
+    checkpoint: &ArcCheckpoint,
+    destination: &Path,
+) -> Result<(), RecoveryError> {
+    // `ArcCheckpoint::write_to` already stages, fsyncs, publishes create-only,
+    // and rebarriers an identical retry. A second 256 MiB staging layer only
+    // doubles peak disk use and creates another orphan class.
+    checkpoint.write_to(destination)
+}
+
+fn write_marker_atomically(path: &Path, hash: Hash256) -> Result<(), RecoveryError> {
+    let temporary = durable_staging_path(path, "marker");
+    let write_result = (|| -> Result<(), RecoveryError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        writeln!(file, "{}", hash.to_hex())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = rename_for_durable_publish(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    sync_parent(path)?;
+    Ok(())
+}
+
+fn durable_staging_path(destination: &Path, label: &str) -> PathBuf {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        ".arc-recovery-{label}-{}.tmp",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn cleanup_recovery_staging_files(wal_dir: &Path) -> Result<(), StateError> {
+    for entry in fs::read_dir(wal_dir).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect recovery staging directory {wal_dir:?}: {error}"
+        ))
+    })? {
+        let entry = entry.map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let recognized = ["package", "checkpoint", "marker"].iter().any(|label| {
+            crate::uuid_staging_name(&name, &format!(".arc-recovery-{label}-"), ".tmp")
+        });
+        if !recognized {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| StateError::PersistenceError(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(StateError::PersistenceError(format!(
+                "recovery staging artifact is not a regular file: {path:?}"
+            )));
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?path, %error, "deferring cleanup of incomplete recovery staging file");
+            }
+            continue;
+        }
+        if let Err(error) = sync_parent(&path) {
+            tracing::warn!(path = ?path, %error, "recovery staging cleanup barrier will be retried");
+        }
+    }
+    Ok(())
+}
+
+fn rename_for_durable_publish(source: &Path, destination: &Path) -> Result<(), RecoveryError> {
+    #[cfg(windows)]
+    {
+        // Windows has no documented parent-directory fsync. Publish the
+        // already-synced file through the supported write-through move so its
+        // live name is durable before activation can continue.
+        arc_crypto::secret_file::windows_move_path_write_through(source, destination, false)?;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        // A hard-link publication preserves create-new semantics under races;
+        // the caller fsyncs the shared parent after the staging name is gone.
+        fs::hard_link(source, destination)?;
+        fs::remove_file(source)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::rename(source, destination)?;
+        Ok(())
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<(), RecoveryError> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows publication is flushed by rename_for_durable_publish.
+        let _ = path;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let serial = NEXT_DIR.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "arc-recovery-{label}-{}-{serial}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn durable_recovery_publish_moves_a_synced_file() {
+        let directory = temp_dir("durable-publish");
+        let staging = directory.join("staging");
+        let destination = directory.join("published");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .unwrap();
+        file.write_all(b"checkpoint").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        rename_for_durable_publish(&staging, &destination).unwrap();
+        sync_parent(&destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"checkpoint");
+
+        let blocked = directory.join("blocked");
+        fs::write(&blocked, b"blocked").unwrap();
+        assert!(rename_for_durable_publish(&blocked, &destination).is_err());
+        assert!(blocked.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"checkpoint");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_write_retry_rebarriers_identical_bytes_and_rejects_difference() {
+        let directory = temp_dir("checkpoint-write-retry");
+        let path = directory.join("candidate.arcchkpt");
+        let (checkpoint, _, _) = checkpoint();
+        checkpoint.write_to(&path).unwrap();
+        let first = fs::read(&path).unwrap();
+        checkpoint
+            .write_to(&path)
+            .expect("byte-identical retry must rebarrier and succeed");
+        assert_eq!(fs::read(&path).unwrap(), first);
+
+        let mut different = checkpoint;
+        different.payload.accounts[0].1.balance += 1;
+        assert!(different.write_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), first);
+
+        let oversized = directory.join("preexisting-oversized.arcchkpt");
+        let file = File::create(&oversized).unwrap();
+        file.set_len((ARCCHKPT_MAX_PAYLOAD_BYTES as u64) + 17)
+            .unwrap();
+        drop(file);
+        #[cfg(unix)]
+        let original_mode = {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+            fs::set_permissions(&oversized, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::metadata(&oversized).unwrap().mode() & 0o777
+        };
+        assert!(different.write_to(&oversized).is_err());
+        assert_eq!(
+            fs::metadata(&oversized).unwrap().len(),
+            (ARCCHKPT_MAX_PAYLOAD_BYTES as u64) + 17
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                fs::metadata(&oversized).unwrap().mode() & 0o777
+            },
+            original_mode,
+            "a conflicting create-only destination must not be permission-migrated"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_write_reuses_one_destination_bound_partial_staging_file() {
+        let directory = temp_dir("checkpoint-deterministic-staging");
+        let path = directory.join("candidate.arcchkpt");
+        let (checkpoint, _, _) = checkpoint();
+        let destination_lock = CheckpointDestinationLock::acquire(&path).unwrap();
+        let staging = destination_lock.staging.clone();
+        let mut partial = arc_crypto::secret_file::create_new_private(&staging).unwrap();
+        partial.write_all(b"partial checkpoint bytes").unwrap();
+        partial.sync_all().unwrap();
+        drop(partial);
+        drop(destination_lock);
+
+        checkpoint.write_to(&path).unwrap();
+        assert!(path.is_file());
+        assert!(
+            !staging.exists(),
+            "successful publication must consume deterministic staging"
+        );
+        let decoded = ArcCheckpoint::read_from(&path).unwrap();
+        assert_eq!(
+            bincode::serialize(&decoded).unwrap(),
+            bincode::serialize(&checkpoint).unwrap()
+        );
+        assert!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|name| !name.starts_with(".arc-recovery-package-") || name.ends_with(".lock")),
+            "checkpoint retries may leave only the one bounded lock sidecar"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_startup_cleanup_reclaims_only_exact_internal_staging_files() {
+        let directory = temp_dir("recovery-staging-cleanup");
+        let stale: Vec<_> = ["package", "checkpoint", "marker"]
+            .into_iter()
+            .map(|label| {
+                directory.join(format!(
+                    ".arc-recovery-{label}-{}.tmp",
+                    uuid::Uuid::new_v4()
+                ))
+            })
+            .collect();
+        for path in &stale {
+            fs::write(path, b"incomplete internal staging").unwrap();
+        }
+        let unrelated = directory.join(".arc-recovery-package-not-a-uuid.tmp");
+        fs::write(&unrelated, b"operator file").unwrap();
+
+        cleanup_recovery_staging_files(&directory).unwrap();
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert!(unrelated.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn deterministic_checkpoint_staging_grammar_is_exact() {
+        let digest = "a".repeat(64);
+        let exact = format!(".arc-recovery-package-{digest}.staging");
+        assert_eq!(
+            deterministic_checkpoint_staging_digest(&exact),
+            Some(digest.as_str())
+        );
+        for unrelated in [
+            format!("arc-recovery-package-{digest}.staging"),
+            format!(".arc-recovery-package-{}.staging", "a".repeat(63)),
+            format!(".arc-recovery-package-{}.staging", "A".repeat(64)),
+            format!(".arc-recovery-package-{digest}.staging.extra"),
+        ] {
+            assert!(deterministic_checkpoint_staging_digest(&unrelated).is_none());
+        }
+    }
+
+    fn validators() -> (Vec<KeyPair>, Vec<RecoveryValidator>) {
+        let keys: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let validators = keys
+            .iter()
+            .map(|key| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 5_000_000,
+            })
+            .collect();
+        (keys, validators)
+    }
+
+    fn legacy_validator_set() -> Vec<(Address, u64)> {
+        (0..LEGACY_RECOVERY_VALIDATOR_SET_SIZE)
+            .map(|index| {
+                (
+                    hash_bytes(format!("legacy-validator-{index}").as_bytes()),
+                    LEGACY_RECOVERY_VALIDATOR_STAKE,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn selected_nyc_legacy_validator_set_matches_recovery_commitment() {
+        let addresses = [
+            "030eab8217c91526ee96c263fa40541fdee2be5b3bb808fb6bd5775175a9df2d",
+            "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+            "16e1afc6f6323be62e37a823f36568c9427baca08a7ed12ab289e08dffddb97d",
+            "4f6f87d3fc2aac2b76778fa5d95cc72ff7b1f33c6c47abd3f277aeccc6833545",
+            "868dddb80041cdaa7aaa0b2992f4dfc49628a26f2c7424c985310ed0bead7aba",
+            "8bed4ea91365a9c92c67f2bb660ab8d39cb130d973eb6fb93cdb1dfdc4a9f3d3",
+            "bc27a1a9a0a8f7fcadb8d60641170e58083b990fe92614041a044b5de724bd62",
+            "c7a6141ddfe8ce668c3683b0097969cbab2d686494e1bae15bc464baa42264fd",
+        ];
+        let validators = canonicalize_legacy_recovery_validator_set(
+            addresses
+                .into_iter()
+                .map(|address| {
+                    (
+                        Hash256::from_hex(address).unwrap(),
+                        LEGACY_RECOVERY_VALIDATOR_STAKE,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let bytes =
+            bincode::serialize(&(validators.as_slice(), LEGACY_RECOVERY_TOTAL_STAKE)).unwrap();
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-source-validator-set-content-v1");
+        hasher.update(&bytes);
+        assert_eq!(
+            Hash256(*hasher.finalize().as_bytes()).to_hex(),
+            "80d7c2d229fea4171732fd04451372d849fab7baefed143a2a445ae72f472ecd"
+        );
+    }
+
+    fn target_validators_40m() -> (Vec<KeyPair>, Vec<RecoveryValidator>) {
+        let keys: Vec<_> = (0..RECOVERY_VALIDATOR_SET_SIZE)
+            .map(|_| KeyPair::generate_ed25519())
+            .collect();
+        let quotient = LEGACY_RECOVERY_TOTAL_STAKE / RECOVERY_VALIDATOR_SET_SIZE as u64;
+        let remainder = LEGACY_RECOVERY_TOTAL_STAKE % RECOVERY_VALIDATOR_SET_SIZE as u64;
+        let validators = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: quotient + u64::from((index as u64) < remainder),
+            })
+            .collect();
+        (keys, validators)
+    }
+
+    fn seed_source_validator_metadata(state: &StateDB, validators: &[RecoveryValidator]) {
+        let mut total = 0u64;
+        for validator in validators {
+            state
+                .validators
+                .insert(validator.address.0, validator.stake);
+            total = total.checked_add(validator.stake).unwrap();
+        }
+        state.staking_pool.store(total, Ordering::Release);
+        let reserve = recovery_stake_reserve_address();
+        state
+            .accounts
+            .insert(reserve.0, Account::new(reserve, total.saturating_mul(2)));
+        state.dirty_accounts.insert(reserve.0);
+    }
+
+    fn checkpoint() -> (ArcCheckpoint, Vec<KeyPair>, RecoveryNetworkPolicy) {
+        let (keys, validators) = validators();
+        let state =
+            StateDB::with_genesis(&[(hash_bytes(b"alice"), 10_000), (hash_bytes(b"bob"), 20_000)]);
+        seed_source_validator_metadata(&state, &validators);
+        let genesis_hash = hash_bytes(b"approved-v3-genesis");
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash,
+                source_consensus_round: 9_000_000,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: Some(100),
+                created_at_unix_ms: 1_787_777_000_000,
+            },
+        )
+        .unwrap();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "0x415243".into(),
+            genesis_hash,
+            recovery_epoch: 1,
+            validator_set_id: 1,
+            validators: validators
+                .iter()
+                .map(|validator| (validator.address, validator.stake))
+                .collect(),
+            community_rewards_v1_activation_height: Some(100),
+        };
+        (checkpoint, keys, policy)
+    }
+
+    fn persistent_recovery_fixture(
+        label: &str,
+    ) -> (
+        StateDB,
+        ArcCheckpoint,
+        Vec<KeyPair>,
+        RecoveryNetworkPolicy,
+        PathBuf,
+        PathBuf,
+    ) {
+        let (checkpoint, keys, policy) = checkpoint();
+        let source_dir = temp_dir(&format!("{label}-source"));
+        let active_dir = temp_dir(&format!("{label}-active"));
+        let package = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&package).unwrap();
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: package,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        )
+        .unwrap();
+        (state, checkpoint, keys, policy, source_dir, active_dir)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_constructor_restores_a_staged_full_root_before_startup_decisions() {
+        let (state, _checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("staged-full-root");
+        let block = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"staged-full-root-block",
+        );
+        let expected_root = state.get_state_root();
+        drop(state);
+
+        let digest = arc_crypto::secret_file::namespace_path_digest(&active_dir).unwrap();
+        let staged = active_dir.parent().unwrap().join(format!(
+            ".arc-private-directory-namespace-{digest}.rebarrier"
+        ));
+        arc_crypto::secret_file::windows_move_path_write_through(&active_dir, &staged, false)
+            .unwrap();
+        assert!(!active_dir.exists());
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), block.header.height);
+        assert_eq!(
+            restarted.get_block(block.header.height).unwrap().hash,
+            block.hash
+        );
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(!staged.exists());
+        drop(restarted);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    fn commit_empty_recovery_block(
+        state: &StateDB,
+        producer: Address,
+        timestamp: u64,
+        decision_label: &[u8],
+    ) -> Block {
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                producer,
+                timestamp,
+                hash_bytes(decision_label),
+            )
+            .unwrap()
+            .0
+    }
+
+    fn recovery_wal_quarantines(active_dir: &Path) -> Vec<PathBuf> {
+        let mut quarantines: Vec<_> = fs::read_dir(active_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("state.wal.quarantine-") && name.ends_with(".bin")
+                    })
+            })
+            .collect();
+        quarantines.sort();
+        quarantines
+    }
+
+    #[test]
+    fn recovery_bound_persistence_rejects_standalone_diff_and_event_boundaries() {
+        let (state, _checkpoint, _keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("standalone-boundary-rejection");
+        let wal_path = active_dir.join("state.wal");
+        let before_wal = fs::read(&wal_path).unwrap();
+        let before_root = state.get_state_root();
+        let diff = arc_types::StateDiff {
+            changes: Vec::new(),
+            new_root: before_root,
+        };
+        let error = state.apply_state_diff(&diff).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("standalone state-diff persistence is unavailable"),
+            "{error}"
+        );
+        state.store_event_logs(
+            state.height(),
+            vec![EventLog {
+                address: hash_bytes(b"recovery-event-address"),
+                topics: vec![hash_bytes(b"recovery-event-topic")],
+                data: b"must-not-be-persisted".to_vec(),
+                block_height: state.height(),
+                tx_hash: hash_bytes(b"recovery-event-transaction"),
+                log_index: 0,
+            }],
+        );
+        assert!(state.event_logs.is_empty());
+        state.try_sync_wal().unwrap();
+        assert_eq!(fs::read(&wal_path).unwrap(), before_wal);
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.get_state_root(), before_root);
+        assert!(restarted.event_logs.is_empty());
+        drop(restarted);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    fn payload_with_one_canonical_transaction() -> RecoveryPayload {
+        let (checkpoint, _, _) = checkpoint();
+        let mut payload = checkpoint.payload;
+        let transaction_hash = hash_bytes(b"canonical-history-transaction");
+        let (_, block) = &mut payload.blocks[0];
+        block.tx_hashes = vec![transaction_hash];
+        block.header.tx_count = 1;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        payload.receipts = vec![(
+            transaction_hash,
+            TxReceipt {
+                tx_hash: transaction_hash,
+                block_height: 0,
+                block_hash: block.hash,
+                index: 0,
+                success: true,
+                gas_used: 1,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        )];
+        payload.tx_index = vec![(transaction_hash, (0, 0))];
+        payload.validate_canonical().unwrap();
+        payload
+    }
+
+    fn checkpoint_with_pruned_and_retained_history() -> (
+        ArcCheckpoint,
+        Vec<KeyPair>,
+        RecoveryNetworkPolicy,
+        Hash256,
+        Transaction,
+        Address,
+        Address,
+    ) {
+        let (mut checkpoint, keys, policy) = checkpoint();
+        checkpoint.signatures.clear();
+        let indexed_account = checkpoint.payload.accounts[0].0;
+        let recipient = checkpoint.payload.accounts[1].0;
+        let pruned_hash = hash_bytes(b"signed-pruned-history-transaction");
+        let retained = Transaction::new_transfer(indexed_account, recipient, 7, 0);
+        let (_, block) = &mut checkpoint.payload.blocks[0];
+        block.tx_hashes = vec![pruned_hash, retained.hash];
+        block.header.tx_count = 2;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        let source_block_hash = block.hash;
+        checkpoint.payload.receipts = vec![(
+            retained.hash,
+            TxReceipt {
+                tx_hash: retained.hash,
+                block_height: 0,
+                block_hash: source_block_hash,
+                index: 1,
+                success: true,
+                gas_used: 1,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        )];
+        checkpoint.payload.full_transactions = vec![(retained.hash, retained.clone())];
+        // The stopped source retained this block occurrence/account index but
+        // pruned both the transaction body and receipt. The signed checkpoint
+        // must remain sufficient to query and prove its block inclusion.
+        checkpoint.payload.tx_index = vec![(pruned_hash, (0, 0))];
+        checkpoint.payload.account_txs = vec![(indexed_account, vec![pruned_hash])];
+        checkpoint.payload.validate_canonical().unwrap();
+        checkpoint.manifest.source_block_hash = source_block_hash;
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy.clone(),
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            })
+            .unwrap();
+        (
+            checkpoint,
+            keys,
+            policy,
+            pruned_hash,
+            retained,
+            indexed_account,
+            recipient,
+        )
+    }
+
+    #[test]
+    fn manifest_is_content_addressed_and_five_of_six_signed() {
+        let (checkpoint, _, policy) = checkpoint();
+        let hash = checkpoint.manifest_hash();
+        checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy,
+                approved_manifest_hash: hash,
+            })
+            .unwrap();
+        assert_eq!(checkpoint.manifest_hash(), hash);
+        assert_eq!(checkpoint.signatures.len(), 5);
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&checkpoint.manifest.validators)
+            .unwrap();
+        for validator in &checkpoint.manifest.validators {
+            let account = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .expect("every replacement validator has an explicit account");
+            assert_eq!(transitioned[account].1.staked_balance, validator.stake);
+        }
+    }
+
+    #[test]
+    fn validator_rotation_bonds_reserved_stake_without_minting_supply() {
+        let (_, source_validators) = validators();
+        let (_, target_validators) = validators();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
+        seed_source_validator_metadata(&state, &source_validators);
+        let source_supply: u128 = state
+            .export_recovery_payload()
+            .accounts
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"rotation-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&target_validators)
+            .unwrap();
+        let target_supply: u128 = transitioned
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        assert_eq!(source_supply, target_supply);
+        for validator in &source_validators {
+            if let Ok(index) =
+                transitioned.binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+            {
+                assert_eq!(transitioned[index].1.staked_balance, 0);
+            }
+        }
+        for validator in &target_validators {
+            let index = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .unwrap();
+            assert_eq!(transitioned[index].1.staked_balance, validator.stake);
+        }
+    }
+
+    #[test]
+    fn validator_rotation_rejects_ambiguous_source_validator_staked_metadata() {
+        let (_, source_validators) = validators();
+        let (_, target_validators) = validators();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
+        seed_source_validator_metadata(&state, &source_validators);
+
+        let ambiguous_address = source_validators[0].address;
+        let mut ambiguous = Account::new(ambiguous_address, 17);
+        ambiguous.nonce = 9;
+        ambiguous.staked_balance = 23_714;
+        ambiguous.code_hash = hash_bytes(b"legacy-provider-or-dispute-owner");
+        ambiguous.storage_root = hash_bytes(b"legacy-provider-or-dispute-metadata");
+        state
+            .accounts
+            .insert(ambiguous_address.0, ambiguous.clone());
+        state.dirty_accounts.insert(ambiguous_address.0);
+
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"ambiguous-source-validator-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .expect_err("ambiguous overloaded source stake metadata must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous non-zero account staked_balance"),
+            "{error}"
+        );
+        assert_eq!(
+            bincode::serialize(&state.get_account(&ambiguous_address).unwrap()).unwrap(),
+            bincode::serialize(&ambiguous).unwrap(),
+            "failed export must not rewrite source account metadata"
+        );
+    }
+
+    #[test]
+    fn synthetic_legacy_validator_weights_are_bonded_from_system_reserve() {
+        let (_, source_validators) = validators();
+        let (_, target_validators) = validators();
+        let total: u64 = source_validators
+            .iter()
+            .map(|validator| validator.stake)
+            .sum();
+        let reserve = recovery_stake_reserve_address();
+        let state = StateDB::with_genesis(&[(reserve, total * 2), (hash_bytes(b"holder"), 42)]);
+        for validator in &source_validators {
+            state
+                .validators
+                .insert(validator.address.0, validator.stake);
+        }
+        state.staking_pool.store(total, Ordering::Release);
+        let source_supply: u128 = state
+            .export_recovery_payload()
+            .accounts
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"synthetic-stake-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&target_validators)
+            .unwrap();
+        let target_supply: u128 = transitioned
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        assert_eq!(source_supply, target_supply);
+        let reserve_index = transitioned
+            .binary_search_by_key(&reserve.0, |entry| entry.0.0)
+            .unwrap();
+        assert_eq!(transitioned[reserve_index].1.balance, total);
+        for validator in &target_validators {
+            let index = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .unwrap();
+            assert_eq!(transitioned[index].1.staked_balance, validator.stake);
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_active_dispute_and_inference_provider_staked_metadata() {
+        let legacy_validators =
+            canonicalize_legacy_recovery_validator_set(legacy_validator_set()).unwrap();
+        let (_, target_validators) = target_validators_40m();
+        let reserve = recovery_stake_reserve_address();
+        let dispute_address = hash_bytes(b"active-channel-dispute-escrow");
+        let provider_address = hash_bytes(b"bonded-inference-provider");
+        let state = StateDB::with_genesis(&[(reserve, 1_000_000_000_000)]);
+        for (address, stake) in &legacy_validators {
+            state.validators.insert(address.0, *stake);
+        }
+        state
+            .staking_pool
+            .store(LEGACY_RECOVERY_TOTAL_STAKE, Ordering::Release);
+
+        // Exact legacy ChannelDispute encoding: nonce is the accepted state
+        // nonce and staked_balance is the still-active expiry height.
+        let mut dispute = Account::new(dispute_address, 75_000);
+        dispute.nonce = 9;
+        dispute.staked_balance = 237_145;
+        dispute.code_hash = hash_bytes(b"channel-opener");
+        dispute.storage_root = hash_bytes(b"channel-counterparty");
+        state.accounts.insert(dispute_address.0, dispute.clone());
+        state.dirty_accounts.insert(dispute_address.0);
+
+        // Exact legacy InferenceRegister shape: balance was debited and the
+        // provider bond remains locked in staked_balance.
+        let mut provider = Account::new(provider_address, 75_000);
+        provider.nonce = 1;
+        provider.staked_balance = 25_000;
+        state.accounts.insert(provider_address.0, provider.clone());
+        state.dirty_accounts.insert(provider_address.0);
+
+        let source_supply: u128 = state
+            .export_recovery_payload()
+            .accounts
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"metadata-preservation-genesis"),
+                source_consensus_round: 9_774_808,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1_787_857_623_000,
+            },
+        )
+        .unwrap();
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&target_validators)
+            .unwrap();
+        let transitioned_dispute = &transitioned[transitioned
+            .binary_search_by_key(&dispute_address.0, |entry| entry.0.0)
+            .unwrap()]
+        .1;
+        let transitioned_provider = &transitioned[transitioned
+            .binary_search_by_key(&provider_address.0, |entry| entry.0.0)
+            .unwrap()]
+        .1;
+        assert_eq!(
+            bincode::serialize(transitioned_dispute).unwrap(),
+            bincode::serialize(&dispute).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(transitioned_provider).unwrap(),
+            bincode::serialize(&provider).unwrap()
+        );
+
+        let transitioned_supply: u128 = transitioned
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        assert_eq!(transitioned_supply, source_supply);
+
+        let mut colliding_target = target_validators;
+        colliding_target[0].address = provider_address;
+        colliding_target.sort_by_key(|validator| validator.address.0);
+        let error = checkpoint
+            .payload
+            .transition_accounts(&colliding_target)
+            .expect_err("replacement validator must not overwrite provider bond metadata");
+        assert!(error.to_string().contains("collides with non-validator"));
+    }
+
+    #[test]
+    fn validator_rotation_rejects_any_change_to_total_bonded_stake() {
+        let (_, source_validators) = validators();
+        let (_, mut target_validators) = validators();
+        target_validators[0].stake += 1;
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
+        seed_source_validator_metadata(&state, &source_validators);
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"rotation-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must equal conserved source stake")
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_payload_whose_legacy_root_differs_from_source() {
+        let (mut checkpoint, _, _) = checkpoint();
+        checkpoint.payload.accounts[0].1.balance += 1;
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        let error = checkpoint.verify_content().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replayed source state root mismatch")
+        );
+    }
+
+    #[test]
+    fn oversized_checkpoint_is_rejected_before_payload_allocation() {
+        let dir = temp_dir("oversized");
+        let path = dir.join("oversized.arcchkpt");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&ARCCHKPT_MAGIC).unwrap();
+        file.write_all(&(ARCCHKPT_MAX_PAYLOAD_BYTES as u64 + 1).to_be_bytes())
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let error = ArcCheckpoint::read_from(&path).unwrap_err();
+        assert!(error.to_string().contains("format-v1 safety limit"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exporter_rejects_anchor_root_that_differs_from_replayed_state() {
+        let state = StateDB::with_genesis(&[(hash_bytes(b"source-account"), 100)]);
+        let mut anchor = state.get_block(0).unwrap();
+        anchor.header.state_root = hash_bytes(b"forged-source-root");
+        anchor.hash = Block::compute_hash(&anchor.header);
+        state.blocks.insert(0, anchor);
+        let (_, validators) = validators();
+        seed_source_validator_metadata(&state, &validators);
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"approved-v3-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from replayed state root")
+        );
+    }
+
+    #[test]
+    fn four_of_six_is_exactly_two_thirds_and_rejected() {
+        let (mut checkpoint, _, policy) = checkpoint();
+        checkpoint.signatures.pop();
+        let error = checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("insufficient signer identities"));
+    }
+
+    #[test]
+    fn recovery_rejects_any_validator_set_other_than_six() {
+        let (_, mut recovery_validators) = validators();
+        recovery_validators.pop();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42)]);
+        seed_source_validator_metadata(&state, &recovery_validators);
+
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"wrong-validator-count-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: recovery_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("requires exactly 6 validators"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_payload_byte_is_bound_before_activation() {
+        let (mut checkpoint, _, policy) = checkpoint();
+        checkpoint.payload.accounts[0].1.balance += 1;
+        let error = checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("payload hash mismatch"));
+    }
+
+    #[test]
+    fn checkpoint_history_recomputes_transaction_roots_and_positions() {
+        let payload = payload_with_one_canonical_transaction();
+
+        let mut repeated_legacy_placeholder = payload.clone();
+        let block = &mut repeated_legacy_placeholder.blocks[0].1;
+        block.tx_hashes = vec![Hash256::ZERO, Hash256::ZERO];
+        block.header.tx_count = 2;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        repeated_legacy_placeholder.receipts.clear();
+        repeated_legacy_placeholder.tx_index.clear();
+        repeated_legacy_placeholder
+            .validate_canonical()
+            .expect("repeated legacy zero placeholders are valid when not falsely indexed");
+
+        let mut changed_hash = payload.clone();
+        changed_hash.blocks[0].1.tx_hashes[0] = hash_bytes(b"swapped-history-transaction");
+        let error = changed_hash.validate_canonical().unwrap_err();
+        assert!(error.to_string().contains("transaction root"), "{error}");
+
+        let mut changed_receipt_hash = payload.clone();
+        changed_receipt_hash.receipts[0].1.block_hash = hash_bytes(b"wrong-receipt-block");
+        let error = changed_receipt_hash.validate_canonical().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts every retained canonical position"),
+            "{error}"
+        );
+
+        let mut changed_receipt_index = payload.clone();
+        changed_receipt_index.receipts[0].1.index = 1;
+        let error = changed_receipt_index.validate_canonical().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts every retained canonical position"),
+            "{error}"
+        );
+
+        let mut changed_index = payload;
+        changed_index.tx_index[0].1 = (0, 1);
+        let error = changed_index.validate_canonical().unwrap_err();
+        assert!(
+            error.to_string().contains("non-canonical position 0:1"),
+            "{error}"
+        );
+
+        let mut contradictory_duplicate = payload_with_one_canonical_transaction();
+        let transaction_hash = contradictory_duplicate.blocks[0].1.tx_hashes[0];
+        let block = &mut contradictory_duplicate.blocks[0].1;
+        block.tx_hashes.push(transaction_hash);
+        block.header.tx_count = 2;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        contradictory_duplicate.receipts[0].1.block_hash = block.hash;
+        contradictory_duplicate.tx_index[0].1 = (0, 1);
+        let error = contradictory_duplicate.validate_canonical().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its retained receipt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tampered_transaction_history_cannot_be_signed_verified_or_imported() {
+        let (mut checkpoint, keys, policy) = checkpoint();
+        checkpoint.signatures.clear();
+        let transaction_hash = hash_bytes(b"history-before-tamper");
+        let (_, anchor) = &mut checkpoint.payload.blocks[0];
+        anchor.tx_hashes = vec![transaction_hash];
+        anchor.header.tx_count = 1;
+        anchor.header.tx_root = MerkleTree::from_leaves(anchor.tx_hashes.clone()).root();
+        anchor.hash = Block::compute_hash(&anchor.header);
+        checkpoint.manifest.source_block_hash = anchor.hash;
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        checkpoint.verify_content().unwrap();
+
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy.clone(),
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            })
+            .unwrap();
+
+        checkpoint.payload.blocks[0].1.tx_hashes[0] = hash_bytes(b"history-after-tamper");
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        let malicious_manifest_hash = checkpoint.manifest_hash();
+        let content_error = checkpoint.verify_content().unwrap_err();
+        assert!(
+            content_error.to_string().contains("transaction root"),
+            "{content_error}"
+        );
+        let signing_error = checkpoint.add_signature(&keys[0]).unwrap_err();
+        assert!(
+            signing_error.to_string().contains("transaction root"),
+            "{signing_error}"
+        );
+
+        let checkpoint_dir = temp_dir("history-import-checkpoint");
+        let active_dir = temp_dir("history-import-active");
+        let checkpoint_path = checkpoint_dir.join("tampered.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let import_error = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path,
+                approved_manifest_hash: malicious_manifest_hash,
+            }),
+        )
+        .err()
+        .expect("tampered transaction history must not activate");
+        assert!(
+            import_error.to_string().contains("transaction root"),
+            "{import_error}"
+        );
+        assert!(!active_dir.join(ACTIVE_RECOVERY_MARKER).exists());
+
+        fs::remove_dir_all(checkpoint_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn full_state_root_commits_every_consensus_section_and_domain() {
+        let (checkpoint, _, _) = checkpoint();
+        let context = checkpoint.manifest.recovery_context();
+        let activation = checkpoint.manifest.community_rewards_v1_activation_height;
+        let baseline = checkpoint
+            .payload
+            .consensus_state_root(&context, activation);
+
+        let mut account = checkpoint.payload.clone();
+        account.accounts[0].1.balance += 1;
+        let mut storage = checkpoint.payload.clone();
+        storage
+            .storage
+            .push((hash_bytes(b"contract-storage"), Vec::new()));
+        storage.storage.sort_by_key(|entry| entry.0.0);
+        let mut contracts = checkpoint.payload.clone();
+        contracts
+            .contracts
+            .push((hash_bytes(b"contract-code"), vec![1, 2, 3]));
+        contracts.contracts.sort_by_key(|entry| entry.0.0);
+        let mut identities = checkpoint.payload.clone();
+        let identity_address = hash_bytes(b"identity");
+        identities.identities.push((
+            identity_address,
+            Identity {
+                address: identity_address,
+                level: arc_types::IdentityLevel::Verified,
+                attestor: hash_bytes(b"attestor"),
+                proof_hash: hash_bytes(b"proof"),
+                country_code: *b"US",
+                attested_at: 1,
+                expires_at: 0,
+            },
+        ));
+        identities.identities.sort_by_key(|entry| entry.0.0);
+        let mut validators = checkpoint.payload.clone();
+        validators.validators[0].1 += 1;
+        let mut staking_pool = checkpoint.payload.clone();
+        staking_pool.staking_pool += 1;
+
+        for changed in [
+            account,
+            storage,
+            contracts,
+            identities,
+            validators,
+            staking_pool,
+        ] {
+            assert_ne!(changed.consensus_state_root(&context, activation), baseline);
+        }
+        assert_ne!(
+            checkpoint
+                .payload
+                .consensus_state_root(&context, activation.map(|height| height + 1)),
+            baseline
+        );
+        let different_domain = RecoveryContext::new(
+            &checkpoint.manifest.chain_id,
+            checkpoint.manifest.genesis_hash,
+            context.recovery_epoch + 1,
+            context.validator_set_id + 1,
+        );
+        assert_ne!(
+            checkpoint
+                .payload
+                .consensus_state_root(&different_domain, activation),
+            baseline
+        );
+    }
+
+    #[test]
+    fn transition_is_dedicated_h_plus_one_block() {
+        let (checkpoint, _, _) = checkpoint();
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        assert_eq!(
+            transition.header.height,
+            checkpoint.manifest.source_height + 1
+        );
+        assert_eq!(
+            transition.header.parent_hash,
+            checkpoint.manifest.source_block_hash
+        );
+        assert_eq!(transition.header.tx_count, 0);
+        assert!(transition.tx_hashes.is_empty());
+        assert_eq!(transition.header.tx_root, checkpoint.manifest_hash());
+        assert_eq!(
+            transition.header.proof_hash,
+            checkpoint.manifest.transition_commitment()
+        );
+        assert_eq!(
+            transition.header.protocol_version,
+            RECOVERY_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn import_is_verified_then_restart_reverifies_same_checkpoint() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("source");
+        let active_dir = temp_dir("active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.height(), checkpoint.manifest.source_height + 1);
+        assert_eq!(state.recovery_manifest_hash(), Some(approved));
+        assert_eq!(state.get_state_root(), checkpoint.manifest.full_state_root);
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.recovery_manifest_hash(), Some(approved));
+        assert_eq!(
+            restarted
+                .get_block(checkpoint.manifest.source_height + 1)
+                .unwrap()
+                .header
+                .parent_hash,
+            checkpoint.manifest.source_block_hash
+        );
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn activation_and_restart_preserve_signed_pruned_indexes_and_rebuild_retained_bodies() {
+        let (checkpoint, _, policy, pruned_hash, retained, indexed_account, recipient) =
+            checkpoint_with_pruned_and_retained_history();
+        let source_dir = temp_dir("indexed-history-source");
+        let active_dir = temp_dir("indexed-history-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        assert_eq!(state.get_tx_location(&pruned_hash.0), Some((0, 0)));
+        assert_eq!(state.get_tx_location(&retained.hash.0), Some((0, 1)));
+        assert_eq!(
+            state.get_account_txs(&indexed_account.0),
+            vec![pruned_hash, retained.hash]
+        );
+        assert_eq!(state.get_account_txs(&recipient.0), vec![retained.hash]);
+        state.generate_tx_inclusion_proof(&pruned_hash).unwrap();
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.get_tx_location(&pruned_hash.0), Some((0, 0)));
+        assert_eq!(restarted.get_tx_location(&retained.hash.0), Some((0, 1)));
+        assert_eq!(
+            restarted.get_account_txs(&indexed_account.0),
+            vec![pruned_hash, retained.hash]
+        );
+        assert_eq!(restarted.get_account_txs(&recipient.0), vec![retained.hash]);
+        restarted.generate_tx_inclusion_proof(&pruned_hash).unwrap();
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn replayed_receipt_cannot_override_a_signed_retained_location() {
+        let (checkpoint, _, _, pruned_hash, _, _, _) =
+            checkpoint_with_pruned_and_retained_history();
+        let state = StateDB::new();
+        state.install_verified_checkpoint(&checkpoint).unwrap();
+        let source_block_hash = checkpoint.payload.blocks[0].1.hash;
+        state.receipts.insert(
+            pruned_hash.0,
+            TxReceipt {
+                tx_hash: pruned_hash,
+                block_height: 0,
+                block_hash: source_block_hash,
+                index: 1,
+                success: true,
+                gas_used: 1,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        );
+        let error = state
+            .rebuild_recovery_transaction_indexes(&checkpoint.payload)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with signed retained location 0:0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn restart_quarantines_torn_post_recovery_wal_at_prior_checkpoint() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("torn");
+        let block = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"torn-tail-prior-checkpoint",
+        );
+        let expected_height = block.header.height;
+        let expected_root = block.header.state_root;
+        drop(state);
+        let wal_path = active_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"torn-final-payload").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let original = fs::read(&wal_path).unwrap();
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            checkpoint.manifest.source_height + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            planned.report.recovery_wal_original_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            (original.len() - accepted_prefix.len()) as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "truncated_wal_frame_payload"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        drop(restarted);
+        assert_eq!(fs::read(&wal_path).unwrap(), accepted_prefix);
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(
+            fs::read(&quarantines[0]).unwrap(),
+            original[accepted_prefix.len()..]
+        );
+
+        let restarted_again =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted_again.height(), expected_height);
+        assert_eq!(restarted_again.get_state_root(), expected_root);
+        drop(restarted_again);
+        assert_eq!(recovery_wal_quarantines(&active_dir), quarantines);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_quarantines_complete_uncheckpointed_next_block() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("complete-uncheckpointed");
+        let committed = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"complete-tail-prior-checkpoint",
+        );
+        let expected_height = committed.header.height;
+        let expected_root = committed.header.state_root;
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
+        let next_height = expected_height + 1;
+        let next_block = Block::new(
+            BlockHeader {
+                height: next_height,
+                timestamp: 1_787_777_002_000,
+                parent_hash: committed.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                state_root: expected_root,
+                proof_hash: hash_bytes(b"complete-but-uncheckpointed-decision"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetBlock(next_height, next_block), next_height);
+        writer.sync().unwrap();
+        drop(writer);
+        let original = fs::read(&wal_path).unwrap();
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            checkpoint.manifest.source_height + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            planned.report.recovery_wal_original_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            (original.len() - accepted_prefix.len()) as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "uncommitted_valid_entries_after_checkpoint:1"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(restarted.get_block(next_height).is_none());
+        drop(restarted);
+        assert_eq!(fs::read(&wal_path).unwrap(), accepted_prefix);
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(
+            fs::read(&quarantines[0]).unwrap(),
+            original[accepted_prefix.len()..]
+        );
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_quarantines_complete_first_block_without_a_checkpoint_to_empty_base() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("no-checkpoint");
+        drop(state);
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let expected_height = transition.header.height;
+        let expected_root = transition.header.state_root;
+        let next_height = transition.header.height + 1;
+        let uncommitted = Block::new(
+            BlockHeader {
+                height: next_height,
+                timestamp: 1_787_777_001_000,
+                parent_hash: transition.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                state_root: transition.header.state_root,
+                proof_hash: hash_bytes(b"no-checkpoint-decision"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        let wal_path = active_dir.join("state.wal");
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetBlock(next_height, uncommitted), next_height);
+        writer.sync().unwrap();
+        drop(writer);
+        let original = fs::read(&wal_path).unwrap();
+
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            transition.header.height,
+        )
+        .unwrap();
+        assert_eq!(planned.report.recovery_wal_accepted_prefix_bytes, 0);
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "uncommitted_valid_entries_before_first_checkpoint:1"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(restarted.get_block(next_height).is_none());
+        drop(restarted);
+        assert!(fs::read(&wal_path).unwrap().is_empty());
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read(&quarantines[0]).unwrap(), original);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_quarantines_a_torn_first_post_recovery_frame_to_empty_base() {
+        let (state, checkpoint, _, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("torn-first-frame");
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let expected_height = transition.header.height;
+        let expected_root = transition.header.state_root;
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"torn-first-frame").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let original = fs::read(&wal_path).unwrap();
+
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            transition.header.height,
+        )
+        .unwrap();
+        assert_eq!(planned.report.recovery_wal_accepted_prefix_bytes, 0);
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "truncated_wal_frame_payload"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        drop(restarted);
+        assert!(fs::read(&wal_path).unwrap().is_empty());
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read(&quarantines[0]).unwrap(), original);
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_rejects_bad_intermediate_checkpoint_even_if_final_root_matches() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("bad-intermediate-root");
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let target = checkpoint.payload.accounts[0].0;
+        let original = state.get_account(&target).unwrap();
+        let final_root = state.get_state_root();
+        let mut changed = original.clone();
+        changed.balance = changed.balance.checked_add(1).unwrap();
+
+        let scratch = StateDB::new();
+        scratch.install_verified_checkpoint(&checkpoint).unwrap();
+        scratch.apply_wal_op(&WalOp::SetAccount(target, changed.clone()));
+        assert_ne!(
+            scratch.get_state_root(),
+            final_root,
+            "fixture mutation must change the recovery state root"
+        );
+
+        let first_height = transition.header.height + 1;
+        let first = Block::new(
+            BlockHeader {
+                height: first_height,
+                timestamp: 1_787_777_001_000,
+                parent_hash: transition.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                // Deliberately commit the pre-mutation root. The second block
+                // restores the account, so final-only replay validation would
+                // accept this invalid intermediate history.
+                state_root: final_root,
+                proof_hash: hash_bytes(b"bad-intermediate-root-first"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        let second_height = first_height + 1;
+        let second = Block::new(
+            BlockHeader {
+                height: second_height,
+                timestamp: 1_787_777_002_000,
+                parent_hash: first.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                state_root: final_root,
+                proof_hash: hash_bytes(b"bad-intermediate-root-second"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetAccount(target, changed), first_height);
+        writer.append(WalOp::SetBlock(first_height, first), first_height);
+        writer.append(WalOp::Checkpoint(final_root), first_height);
+        writer.append(WalOp::SetAccount(target, original), second_height);
+        writer.append(WalOp::SetBlock(second_height, second), second_height);
+        writer.append(WalOp::Checkpoint(final_root), second_height);
+        writer.sync().unwrap();
+        drop(writer);
+        let original_wal = fs::read(&wal_path).unwrap();
+
+        let error = StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None)
+            .err()
+            .expect("an invalid intermediate recovery checkpoint must fail closed");
+        assert!(
+            error.to_string().contains(&format!(
+                "state root mismatch at checkpoint height {first_height}"
+            )),
+            "{error}"
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), original_wal);
+        assert!(recovery_wal_quarantines(&active_dir).is_empty());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn checksum_corruption_in_committed_wal_middle_stays_fatal() {
+        let (state, _, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("corrupt-middle");
+        let first = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"corrupt-middle-first",
+        );
+        let _second = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_002_000,
+            b"corrupt-middle-second",
+        );
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let inspection = read_repairable_wal_prefix(&wal_path).unwrap();
+        let checkpoint_index = inspection
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.block_height == first.header.height
+                    && matches!(entry.op, WalOp::Checkpoint(_))
+            })
+            .unwrap();
+        assert!(checkpoint_index + 1 < inspection.entries.len());
+        let checksum_byte_offset = inspection.frame_end_offsets[checkpoint_index] - 1;
+        let mut wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        wal.seek(SeekFrom::Start(checksum_byte_offset)).unwrap();
+        let mut checksum_byte = [0u8; 1];
+        wal.read_exact(&mut checksum_byte).unwrap();
+        checksum_byte[0] ^= 0x80;
+        wal.seek(SeekFrom::Start(checksum_byte_offset)).unwrap();
+        wal.write_all(&checksum_byte).unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let corrupted = fs::read(&wal_path).unwrap();
+
+        let error = StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None)
+            .err()
+            .expect("checksum corruption before later committed frames must remain fatal");
+        assert!(
+            error.to_string().contains("WAL checksum mismatch"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), corrupted);
+        assert!(recovery_wal_quarantines(&active_dir).is_empty());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn adaptive_h_plus_two_block_has_correct_wal_height_and_survives_restart() {
+        let sender = KeyPair::generate_ed25519();
+        let recipient = hash_bytes(b"post-recovery-recipient");
+        let source = StateDB::with_genesis(&[(sender.address(), 10_000), (recipient, 0)]);
+        let (validator_keys, validators) = validators();
+        seed_source_validator_metadata(&source, &validators);
+        let genesis_hash = hash_bytes(b"post-recovery-genesis");
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash,
+                source_consensus_round: 100,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1_787_777_000_000,
+            },
+        )
+        .unwrap();
+        for key in validator_keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "0x415243".into(),
+            genesis_hash,
+            recovery_epoch: 1,
+            validator_set_id: 1,
+            validators: validators
+                .iter()
+                .map(|validator| (validator.address, validator.stake))
+                .collect(),
+            community_rewards_v1_activation_height: None,
+        };
+        let source_dir = temp_dir("post-block-source");
+        let active_dir = temp_dir("post-block-active");
+        let package = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&package).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: package,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        let mut transaction = Transaction::new_transfer(sender.address(), recipient, 250, 0);
+        transaction.fee = crate::V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut transaction, &sender).unwrap();
+        let transaction_hash = transaction.hash;
+        let dag_decision = hash_bytes(b"test recovery DAG decision at H+2");
+        let (block, receipts) = state
+            .execute_block_adaptive_at_with_proof(
+                &[transaction],
+                validator_keys[0].address(),
+                1_787_777_001_000,
+                dag_decision,
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(
+            block.header.height,
+            checkpoint.manifest.source_height + 2,
+            "the first ordinary transaction block must be H+2 after the dedicated H+1 transition"
+        );
+        assert_eq!(block.header.protocol_version, RECOVERY_PROTOCOL_VERSION);
+        assert_eq!(block.header.proof_hash, dag_decision);
+        let root = block.header.state_root;
+        let height = block.header.height;
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), height);
+        assert_eq!(restarted.get_state_root(), root);
+        assert!(restarted.get_transaction(&transaction_hash.0).is_some());
+        let receipt = restarted.get_receipt(&transaction_hash.0).unwrap();
+        assert!(receipt.success);
+        assert_eq!(receipt.block_height, height);
+        assert_eq!(restarted.get_account(&sender.address()).unwrap().nonce, 1);
+        assert_eq!(restarted.get_account(&recipient).unwrap().balance, 250);
+        assert_eq!(
+            restarted
+                .get_account(&crate::v3_fee_treasury_address())
+                .unwrap()
+                .balance,
+            crate::V3_MIN_TRANSFER_FEE
+        );
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    fn legacy_snapshot_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Snapshot, Address, Address, Hash256) {
+        let data_dir = temp_dir(label);
+        let snapshot_path = data_dir.with_extension("snapshot.lz4");
+        let sender = hash_bytes(format!("{label}-sender").as_bytes());
+        let recipient = hash_bytes(format!("{label}-recipient").as_bytes());
+        let reference = StateDB::with_genesis(&[
+            (sender, 1_000),
+            (recipient, 0),
+            (recovery_stake_reserve_address(), 1_000_000_000_000),
+        ]);
+        let transaction = Transaction::new_transfer(sender, recipient, 125, 0);
+        let (block, receipts) = reference.execute_block(&[transaction], sender).unwrap();
+        assert!(receipts[0].success);
+        let snapshot = reference.export_snapshot();
+        assert_eq!(snapshot.block_height, 1);
+        assert_eq!(snapshot.state_root, block.header.state_root);
+        snapshot.write_to(&snapshot_path).unwrap();
+
+        // Recreate the complete block/history boundary but deliberately omit
+        // the recipient account from the WAL. This models the real legacy
+        // failure mode: the block root is canonical, while WAL-only replay is
+        // missing live state that the exact-height snapshot still commits.
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        writer.append(WalOp::SetAccount(sender, Account::new(sender, 1_000)), 0);
+        writer.append(WalOp::SetBlock(0, Block::genesis()), 0);
+        writer.append(
+            WalOp::SetAccount(sender, reference.get_account(&sender).unwrap()),
+            1,
+        );
+        writer.append(WalOp::SetBlock(1, block), 1);
+        writer.append(WalOp::Checkpoint(snapshot.state_root), 1);
+        writer.sync().unwrap();
+        drop(writer);
+
+        (
+            data_dir,
+            snapshot_path,
+            snapshot.clone(),
+            sender,
+            recipient,
+            snapshot.state_root,
+        )
+    }
+
+    #[test]
+    fn snapshot_assisted_legacy_loader_recovers_only_root_bound_live_sections() {
+        let (data_dir, snapshot_path, _, sender, recipient, root) =
+            legacy_snapshot_fixture("snapshot-assisted");
+        let error = StateDB::load_legacy_recovery_source(&data_dir, Hash256::ZERO, true)
+            .err()
+            .expect("WAL-only replay with missing state must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("provide an exact-height --snapshot")
+        );
+
+        let loaded = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert_eq!(loaded.get_account(&sender).unwrap().balance, 875);
+        assert_eq!(loaded.get_account(&recipient).unwrap().balance, 125);
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn live_capture_snapshot_loads_when_the_source_and_its_sibling_have_no_snapshot() {
+        let (data_dir, generated_snapshot, _, _, _, root) =
+            legacy_snapshot_fixture("live-capture-no-existing-snapshot");
+        let capture_attempt = temp_dir("live-capture-external-attempt");
+        let captured_snapshot = capture_attempt.join("live.snapshot.lz4");
+        fs::rename(&generated_snapshot, &captured_snapshot).unwrap();
+
+        assert!(!data_dir.join("state.snapshot.lz4").exists());
+        assert!(
+            !data_dir.with_extension("snapshot.lz4").exists(),
+            "the fixture must model production data directories with no sibling snapshot"
+        );
+        assert!(captured_snapshot.is_file());
+
+        let (loaded, report) = StateDB::load_legacy_recovery_export_source_with_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &captured_snapshot,
+            &legacy_validator_set(),
+        )
+        .expect("an external live /sync/snapshot capture must be a complete loader input");
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(report.source_wal_accepted_prefix_bytes > 0);
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes + report.source_wal_quarantined_tail_bytes,
+            report.source_wal_original_bytes
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_dir_all(capture_attempt).unwrap();
+    }
+
+    #[test]
+    fn canonical_legacy_validator_input_rejects_wrong_shape_and_arithmetic() {
+        let canonical = legacy_validator_set();
+        let mut reversed = canonical.clone();
+        reversed.reverse();
+        let normalized = canonicalize_legacy_recovery_validator_set(reversed).unwrap();
+        assert_eq!(normalized, {
+            let mut expected = canonical.clone();
+            expected.sort_by_key(|entry| entry.0.0);
+            expected
+        });
+
+        let mut duplicate = canonical.clone();
+        duplicate[1].0 = duplicate[0].0;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("unique")
+        );
+
+        let mut zero = canonical.clone();
+        zero[0].1 = 0;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(zero)
+                .unwrap_err()
+                .to_string()
+                .contains("zero stake")
+        );
+
+        let mut overflow = canonical.clone();
+        overflow[0].1 = u64::MAX;
+        overflow[1].1 = u64::MAX;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("u64::MAX")
+        );
+
+        let mut wrong_stake = canonical.clone();
+        wrong_stake[0].1 -= 1;
+        wrong_stake[1].1 += 1;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(wrong_stake)
+                .unwrap_err()
+                .to_string()
+                .contains("expected 5000000")
+        );
+
+        let mut polluted_peer_registry = canonical;
+        polluted_peer_registry.extend((0..10).map(|index| {
+            (
+                hash_bytes(format!("zero-stake-community-peer-{index}").as_bytes()),
+                0,
+            )
+        }));
+        assert!(
+            canonicalize_legacy_recovery_validator_set(polluted_peer_registry)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly 8 validators")
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_validator_binding_preserves_root_and_enables_40m_transition() {
+        let (data_dir, snapshot_path, _, _, _, root) =
+            legacy_snapshot_fixture("legacy-validator-binding");
+        let legacy_validators = legacy_validator_set();
+
+        let unbound = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .unwrap();
+        let (_, target_validators) = target_validators_40m();
+        let missing = ArcCheckpoint::export_unsigned(
+            &unbound,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"legacy-validator-binding-genesis"),
+                source_consensus_round: 7,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("conserved source stake 0"));
+
+        let bound = StateDB::load_legacy_recovery_export_source(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+            &legacy_validators,
+        )
+        .unwrap();
+        assert_eq!(bound.height(), 1);
+        assert_eq!(bound.get_state_root(), root);
+        assert_eq!(bound.total_staked(), LEGACY_RECOVERY_TOTAL_STAKE);
+        assert_eq!(bound.active_validators().len(), 8);
+
+        let (_, wrong_target) = validators();
+        let mismatch = ArcCheckpoint::export_unsigned(
+            &bound,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"legacy-validator-binding-genesis"),
+                source_consensus_round: 7,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: wrong_target,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("conserved source stake 40000000")
+        );
+
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &bound,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"legacy-validator-binding-genesis"),
+                source_consensus_round: 7,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        checkpoint.verify_content().unwrap();
+        assert_eq!(checkpoint.manifest.source_state_root, root);
+        assert_eq!(checkpoint.payload.validators.len(), 8);
+        assert_eq!(checkpoint.payload.staking_pool, LEGACY_RECOVERY_TOTAL_STAKE);
+        assert_ne!(
+            checkpoint.payload.source_validator_set_hash(),
+            Hash256::ZERO
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn divergent_persisted_validator_sets_never_override_operator_input() {
+        for (label, retained, phantom) in [
+            ("lower", 7usize, 0usize),
+            ("higher", 8usize, 1usize),
+            ("polluted", 8usize, 10usize),
+        ] {
+            let (data_dir, snapshot_path, _, _, _, _) =
+                legacy_snapshot_fixture(&format!("legacy-validator-{label}"));
+            let state = StateDB::load_legacy_recovery_source_with_snapshot(
+                &data_dir,
+                Hash256::ZERO,
+                true,
+                &snapshot_path,
+            )
+            .unwrap();
+            let expected =
+                canonicalize_legacy_recovery_validator_set(legacy_validator_set()).unwrap();
+            for (address, stake) in expected.iter().take(retained) {
+                state.validators.insert(address.0, *stake);
+            }
+            for index in 0..phantom {
+                state.validators.insert(
+                    hash_bytes(format!("{label}-phantom-{index}").as_bytes()).0,
+                    if label == "higher" { 5_000_000 } else { 0 },
+                );
+            }
+            let persisted_total = state
+                .validators
+                .iter()
+                .try_fold(0u64, |total, entry| total.checked_add(*entry.value()))
+                .unwrap();
+            state.staking_pool.store(persisted_total, Ordering::Release);
+            let persisted_count = state.validators.len();
+
+            let error = state
+                .bind_legacy_recovery_validator_set(&expected)
+                .expect_err("divergent persisted validator metadata must fail closed");
+            assert!(error.to_string().contains("differs from the explicit"));
+            assert_eq!(state.validators.len(), persisted_count);
+            assert_eq!(state.total_staked(), persisted_total);
+
+            fs::remove_dir_all(data_dir).unwrap();
+            fs::remove_file(snapshot_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_discards_validly_framed_and_torn_uncommitted_suffix() {
+        let (data_dir, snapshot_path, _, _, _, root) = legacy_snapshot_fixture("snapshot-trailing");
+        let wal_path = data_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
+        let attacker = hash_bytes(b"snapshot-trailing-attacker");
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(
+            WalOp::SetAccount(attacker, Account::new(attacker, u64::MAX)),
+            2,
+        );
+        writer.sync().unwrap();
+        drop(writer);
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"physically-torn-tail").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let original = fs::read(&wal_path).unwrap();
+
+        let (loaded, report) = StateDB::load_legacy_recovery_source_with_snapshot_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(loaded.get_account(&attacker).is_none());
+        assert_eq!(report.source_wal_original_bytes, original.len() as u64);
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert_eq!(
+            report.source_wal_quarantined_tail_bytes,
+            (original.len() - accepted_prefix.len()) as u64
+        );
+        assert_eq!(
+            report.source_wal_tail_reason,
+            "valid_entries_after_selected_snapshot_boundary:1;truncated_wal_frame_payload"
+        );
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes + report.source_wal_quarantined_tail_bytes,
+            report.source_wal_original_bytes
+        );
+        let split = report.source_wal_accepted_prefix_bytes as usize;
+        assert_eq!(&original[..split], accepted_prefix.as_slice());
+        let mut reconstructed = original[..split].to_vec();
+        reconstructed.extend_from_slice(&original[split..]);
+        assert_eq!(reconstructed, original);
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_keeps_exact_snapshot_boundary_before_later_complete_suffix() {
+        let (data_dir, snapshot_path, snapshot, _, _, _) =
+            legacy_snapshot_fixture("snapshot-forged");
+        let accepted_prefix = fs::read(data_dir.join("state.wal")).unwrap();
+        let header = BlockHeader {
+            height: 2,
+            timestamp: 2,
+            parent_hash: hash_bytes(b"forged-parent"),
+            tx_root: Hash256::ZERO,
+            state_root: snapshot.state_root,
+            proof_hash: Hash256::ZERO,
+            tx_count: 0,
+            producer: hash_bytes(b"forged-producer"),
+            protocol_version: ProtocolVersion::new(0, 1, 0),
+            state_diff: None,
+        };
+        let forged = Block::new(header, Vec::new());
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        writer.append(WalOp::SetBlock(2, forged), 2);
+        writer.append(WalOp::Checkpoint(snapshot.state_root), 2);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let (loaded, report) = StateDB::load_legacy_recovery_source_with_snapshot_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .expect("a later complete suffix must not roll the snapshot boundary forward");
+        assert_eq!(loaded.height(), snapshot.block_height);
+        assert_eq!(loaded.get_state_root(), snapshot.state_root);
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert!(report.source_wal_quarantined_tail_bytes > 0);
+        assert!(
+            report
+                .source_wal_tail_reason
+                .starts_with("valid_entries_after_selected_snapshot_boundary:")
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_rejects_snapshot_without_exact_wal_boundary() {
+        let (data_dir, snapshot_path, mut snapshot, _, _, _) =
+            legacy_snapshot_fixture("snapshot-no-exact-boundary");
+        snapshot.block_height += 1;
+        snapshot.write_to(&snapshot_path).unwrap();
+
+        let error = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .err()
+        .expect("a snapshot without its exact WAL boundary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("has no exact complete SetBlock + Checkpoint WAL boundary"),
+            "{error}"
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_rejects_uncommitted_storage_and_allocation_bombs() {
+        let (data_dir, snapshot_path, mut snapshot, _, _, _) =
+            legacy_snapshot_fixture("snapshot-storage");
+        snapshot.storage.push((
+            hash_bytes(b"uncommitted-contract"),
+            vec![(hash_bytes(b"key"), b"value".to_vec())],
+        ));
+        snapshot.write_to(&snapshot_path).unwrap();
+        let error = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .err()
+        .expect("snapshot-only storage is not committed by the WAL");
+        assert!(error.to_string().contains("storage differs"));
+
+        let bomb = data_dir.with_extension("snapshot-bomb.lz4");
+        let requested = (LEGACY_SNAPSHOT_MAX_BYTES as u32).saturating_add(1);
+        fs::write(&bomb, requested.to_le_bytes()).unwrap();
+        let error = read_legacy_recovery_snapshot(&bomb).unwrap_err();
+        assert!(error.to_string().contains("decompressed bytes"));
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+        fs::remove_file(bomb).unwrap();
+    }
+
+    #[test]
+    fn legacy_export_loader_is_read_only_and_requires_explicit_unbound_override() {
+        let source_dir = temp_dir("legacy-export-source");
+        let genesis_hash = hash_bytes(b"legacy-export-genesis");
+        let state = StateDB::with_genesis_persistent(
+            &[(hash_bytes(b"legacy-account"), 123)],
+            &source_dir,
+            genesis_hash,
+        )
+        .unwrap();
+        let (block, _) = state
+            .execute_block_verified_at(&[], hash_bytes(b"legacy-producer"), 1)
+            .unwrap();
+        let root = block.header.state_root;
+        drop(state);
+
+        let loaded =
+            StateDB::load_legacy_recovery_source(&source_dir, genesis_hash, false).unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(!source_dir.join(ACTIVE_RECOVERY_MARKER).exists());
+
+        fs::remove_file(source_dir.join("genesis.network-hash")).unwrap();
+        let error = StateDB::load_legacy_recovery_source(&source_dir, genesis_hash, false)
+            .err()
+            .expect("unbound legacy source must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("no authenticated genesis binding")
+        );
+        StateDB::load_legacy_recovery_source(&source_dir, genesis_hash, true).unwrap();
+
+        fs::remove_dir_all(source_dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_loader_reads_staged_only_wal_without_repairing_its_namespace() {
+        let source_dir = temp_dir("legacy-staged-only-source");
+        let genesis_hash = hash_bytes(b"legacy-staged-only-genesis");
+        let state = StateDB::with_genesis_persistent(
+            &[(hash_bytes(b"legacy-staged-account"), 123)],
+            &source_dir,
+            genesis_hash,
+        )
+        .unwrap();
+        let (block, _) = state
+            .execute_block_verified_at(&[], hash_bytes(b"legacy-staged-producer"), 1)
+            .unwrap();
+        let root = block.header.state_root;
+        drop(state);
+
+        let live = source_dir.join("state.wal");
+        let staged = source_dir.join(".state.wal.namespace-rebarrier");
+        fs::rename(&live, &staged).unwrap();
+
+        let loaded =
+            StateDB::load_legacy_recovery_source(&source_dir, genesis_hash, false).unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(
+            !live.exists(),
+            "read-only capture must not restore the live name"
+        );
+        assert!(
+            staged.is_file(),
+            "read-only capture must retain staged evidence"
+        );
+
+        fs::remove_dir_all(source_dir).unwrap();
+    }
+
+    #[test]
+    fn existing_legacy_wal_blocks_checkpoint_activation() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("legacy-source");
+        let active_dir = temp_dir("legacy-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        fs::write(active_dir.join("state.wal"), []).unwrap();
+        let result = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        );
+        let error = match result {
+            Ok(_) => panic!("legacy WAL activation unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("refusing ARCCHKPT activation over existing WAL")
+        );
+        assert!(!active_dir.join(ACTIVE_RECOVERY_MARKER).exists());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn pre_marker_retry_rebarriers_an_existing_verified_checkpoint() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("pre-marker-retry-source");
+        let active_dir = temp_dir("pre-marker-retry-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        checkpoint.write_to(&stored).unwrap();
+        let expected = fs::read(&stored).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&stored, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert_eq!(fs::read(&stored).unwrap(), expected);
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(&stored).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    fn write_private_checkpoint_stage(destination: &Path, bytes: &[u8]) -> PathBuf {
+        let destination_lock = CheckpointDestinationLock::acquire(destination).unwrap();
+        let staging = destination_lock.staging.clone();
+        let mut file = arc_crypto::secret_file::create_new_private(&staging).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        drop(destination_lock);
+        staging
+    }
+
+    #[test]
+    fn complete_checkpoint_stage_fences_normal_startup_and_resumes_approved_import() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("complete-package-stage-source");
+        let active_dir = temp_dir("complete-package-stage-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        let staging = write_private_checkpoint_stage(&stored, &fs::read(&source).unwrap());
+        let staging_name = staging.file_name().unwrap().to_str().unwrap();
+        assert!(deterministic_checkpoint_staging_digest(staging_name).is_some());
+        assert!(fs::symlink_metadata(&staging).unwrap().is_file());
+        drop(arc_crypto::secret_file::open_private(&staging).unwrap());
+
+        let error =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .err()
+                .expect("an interrupted complete package must fence normal startup");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted ARCCHKPT package staging")
+        );
+        assert!(staging.is_file());
+        assert!(!stored.exists());
+        assert!(!active_dir.join("state.wal").exists());
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert!(!staging.exists());
+        assert!(stored.is_file());
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+        assert!(active_dir.join("state.wal").is_file());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn partial_checkpoint_stage_fences_normal_startup_and_resumes_approved_import() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("partial-package-stage-source");
+        let active_dir = temp_dir("partial-package-stage-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        let staging = write_private_checkpoint_stage(&stored, b"ARCCHKPT\0partial");
+        assert!(
+            deterministic_checkpoint_staging_digest(staging.file_name().unwrap().to_str().unwrap())
+                .is_some()
+        );
+        assert!(fs::symlink_metadata(&staging).unwrap().is_file());
+        drop(arc_crypto::secret_file::open_private(&staging).unwrap());
+
+        let error =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .err()
+                .expect("an interrupted partial package must fence normal startup");
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted ARCCHKPT package staging")
+        );
+        assert_eq!(fs::read(&staging).unwrap(), b"ARCCHKPT\0partial");
+        assert!(!stored.exists());
+        assert!(!active_dir.join("state.wal").exists());
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert!(!staging.exists());
+        assert!(stored.is_file());
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+        assert!(active_dir.join("state.wal").is_file());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_only_stored_checkpoint_is_restored_before_orphan_decisions() {
+        let (checkpoint, _, policy) = checkpoint();
+        let source_dir = temp_dir("staged-stored-checkpoint-source");
+        let active_dir = temp_dir("staged-stored-checkpoint-active");
+        let source = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&source).unwrap();
+        let approved = checkpoint.manifest_hash();
+        let stored = checkpoint_store_path(&active_dir, approved);
+        checkpoint.write_to(&stored).unwrap();
+        let staged = checkpoint_namespace_rebarrier_path(&stored).unwrap();
+        arc_crypto::secret_file::windows_move_path_write_through(&stored, &staged, false).unwrap();
+
+        let error =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .err()
+                .expect("an unapproved restored package must remain fail-closed");
+        assert!(error.to_string().contains("without recovery.active"));
+        assert!(stored.is_file());
+        assert!(!staged.exists());
+        assert!(!active_dir.join("state.wal").exists());
+
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path: source,
+                approved_manifest_hash: approved,
+            }),
+        )
+        .unwrap();
+        drop(state);
+        assert!(active_dir.join(ACTIVE_RECOVERY_MARKER).is_file());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+}

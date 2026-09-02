@@ -1,6 +1,17 @@
-# ARC Chain - Sharded AI Inference Across the Network
+# ARC Chain - Sharded AI Inference Across the Network (archived draft)
 
-A real Llama-2-7B model running across **7 separate VPS in 7 cities**. Each holds ~1 GB of weights. No single one of them has the full model. Together they answer prompts in real time, with **bit-identical output on every chip on earth**.
+> **DO NOT PUBLISH OR USE AS CURRENT INSTALL INSTRUCTIONS.** This is an April
+> 2026 promotional snapshot. Its “live,” one-command join, daily auto-update,
+> universal model-ID, quality, and availability claims do not describe the
+> public network audited on 2026-08-26. v0.8.0 is an unreleased recovery
+> candidate; public v0.7.11 is desktop-only and the seeds remain on older,
+> divergent/stalled binaries. Use [`../README.md`](../README.md) for current
+> status, [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) for the gated server
+> path, and
+> [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) only after
+> the validator cutover is complete.
+
+A real Llama-2-7B model running across **6 separate VPS in 6 cities**. The 32 transformer layers are split into 6 contiguous ranges, each replicated on 3 of the 6 machines, so every node holds 15–17 layers (~3 GB) and no single one has the full model. Together they answer prompts, with **bit-identical output on every chip on earth**.
 
 **Live demo (open in any browser):**
 http://140.82.16.112:3200
@@ -11,13 +22,9 @@ Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the acti
 
 ## Try it from your terminal in 5 seconds
 
-```bash
-# Auto-picks the first healthy coordinator from the 6 testnet seeds
-COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
-curl -X POST "$COORDINATOR/inference/run_sharded" \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"The largest planet is","max_tokens":15}'
-```
+The original terminal snippet executed a mutable default-branch coordinator
+picker and is intentionally omitted. This archived draft is not an operator
+runbook; use a reviewed local checkout and the current documentation.
 
 Returns the answer (`Jupiter, which is more than 1,31...`) plus the full per-hop trace showing every node that contributed compute.
 
@@ -25,9 +32,8 @@ Returns the answer (`Jupiter, which is more than 1,31...`) plus the full per-hop
 
 ## Run the full demo (one command, prints everything)
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
-```
+The original mutable network-to-shell demo command is retired and
+intentionally omitted.
 
 This single command:
 1. Discovers the live shard pipeline (6 seeds × 3× replication, 32 layers, NYC · LAX · AMS · LHR · NRT · SGP)
@@ -42,10 +48,9 @@ This single command:
 
 Anyone with an attestation `tx_hash` can independently audit it:
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
-  | bash -s -- <tx_hash>
-```
+The original mutable network-to-shell verifier command is retired and
+intentionally omitted. Run a verifier only from a reviewed local checkout at
+an exact source revision.
 
 Prints `✓ VERIFIED` if the re-derivation matches the on-chain claim. The model and the network are auditable by anyone, on any machine, at any time after the fact.
 
@@ -53,13 +58,20 @@ Prints `✓ VERIFIED` if the re-derivation matches the on-chain claim. The model
 
 ## Join the network in one command
 
-Anyone can run a node and contribute compute. Persistent service, daily auto-update, ~3 minutes from curl to running:
+The historical one-command installer is retired and intentionally omitted.
+The only supported replacement is the version-pinned, checksum-verifying flow
+in [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md), after the named release exists.
 
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-```
-
-The installer auto-detects your platform (macOS arm64/x86, Linux x86_64/aarch64), pulls the latest pre-built binary from GitHub releases, downloads Llama-2-7B-Chat Q4_K_M, generates a unique validator seed, and installs as a launchd / systemd service that auto-starts and auto-restarts. A daily timer at 04:17 local checks for new releases and seamlessly upgrades the binary.
+The v0.8 installer auto-detects macOS arm64/x86_64 and Linux
+x86_64/aarch64, resolves one explicitly selected immutable `vX.Y.Z` release,
+and verifies its signed manifest, checksum, exact asset set, and binary version.
+It generates a persistent mode-0600 Ed25519 validator keyfile without placing
+seed or phrase material in argv, environment, or logs, then installs a launchd
+or systemd service that auto-starts and auto-restarts. It joins with
+`--stake 0 --community-mode`, which takes no consensus role. The daily updater
+accepts only immutable signed/checksummed releases. **No model download is
+required to join** — pass a reviewed local `--model /path/to.gguf` to serve
+inference. Linux arm64/aarch64 uses the normalized `arc-node-linux-arm64` v0.8 asset.
 
 After install your node is running, joined to the testnet, and visible at the live dashboard above.
 
@@ -84,7 +96,8 @@ Each layer range is held by 3 replicas (e.g. range [0,6) lives on AMS · LAX · 
 
 For the deep dive: [`docs/HOW-SHARDING-WORKS.md`](HOW-SHARDING-WORKS.md)
 
-For the 5-minute walkthrough: [`docs/SERO-DEMO.md`](SERO-DEMO.md)
+For the current 2–3 minute, receipt-gated walkthrough after the recovered
+validator cutover: [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md)
 
 For the source: https://github.com/FerrumVir/arc-chain
 
@@ -115,7 +128,7 @@ A 10-concurrent stress test (10 different prompts sent in parallel through the 6
 
 - **6 layer ranges × 3 replicas** of Llama-2-7B (4 GB total, ~1.1 GB per range-replica)
 - **6 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP
-- **32 transformer layers** split contiguously across the 7 shard nodes
+- **32 transformer layers** split contiguously into 6 ranges across the 6 shard nodes (18 replica entries)
 - **~150 KB** transferred per token across the network (i64 hidden states + JSON envelope + BLAKE3 hashes)
 - **Bit-identical output** across every replay, every machine, every CPU architecture
 

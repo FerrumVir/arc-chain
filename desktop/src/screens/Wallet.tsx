@@ -4,34 +4,106 @@ import {
   ClipboardCheck,
   Copy,
   Droplet,
-  Info,
   QrCode,
+  Send,
   Wallet as WalletIcon,
 } from "lucide-react";
-import { useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
-import { NumberTicker } from "../components/NumberTicker";
 import { api } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
-import { formatInt } from "../lib/format";
+import { formatArcExact, formatInt } from "../lib/format";
+import type { TxLookup, WalletTxResult } from "../lib/types";
+
+function receiptView(result: WalletTxResult, lookup?: TxLookup) {
+  const mined = lookup ? lookup.status === "mined" : result.mined;
+  const success = lookup
+    ? lookup.status === "mined"
+      ? lookup.success
+      : null
+    : result.success;
+  const blockHeight = lookup?.blockHeight ?? result.blockHeight;
+  if (mined && success === true) {
+    return {
+      tone: "var(--success)",
+      text: `Confirmed ${formatArcExact(result.amountArc)} ARC${blockHeight != null ? ` in block #${formatInt(blockHeight)}` : ""}`,
+    };
+  }
+  if (mined && success === false) {
+    return {
+      tone: "var(--danger)",
+      text: `Mined but failed${blockHeight != null ? ` in block #${formatInt(blockHeight)}` : ""} — no credit is claimed`,
+    };
+  }
+  if (lookup?.status === "error" || lookup?.status === "invalid_hash") {
+    return {
+      tone: "var(--warning)",
+      text: "Submitted; receipt status is currently unavailable",
+    };
+  }
+  if (!lookup && result.receiptStatus === "receipt_unavailable") {
+    return {
+      tone: "var(--warning)",
+      text: "Submitted; receipt status is currently unavailable",
+    };
+  }
+  if (!lookup && result.mined && result.success === null) {
+    return {
+      tone: "var(--warning)",
+      text: "Mined, but the receipt did not report execution success",
+    };
+  }
+  return {
+    tone: "var(--warning)",
+    text: `Submitted ${formatArcExact(result.amountArc)} ARC · waiting for a mined receipt`,
+  };
+}
 
 export function Wallet() {
   const queryClient = useQueryClient();
   const identity = useAppStore((s) => s.identity);
 
-  const { data: balance } = useQuery({
+  const {
+    data: balance,
+    isError: balanceIsError,
+    error: balanceError,
+  } = useQuery({
     queryKey: ["balance"],
     queryFn: api.fetchBalance,
     refetchInterval: 4000,
   });
 
+  const [recipient, setRecipient] = useState("");
+  const [amountArc, setAmountArc] = useState("");
+  const [trackedTx, setTrackedTx] = useState<WalletTxResult | null>(null);
+
   const faucet = useMutation({
     mutationFn: () => api.faucetClaim(),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["balance"] });
+    onSuccess: setTrackedTx,
+  });
+
+  const send = useMutation({
+    mutationFn: () => api.sendArc(recipient.trim(), amountArc.trim()),
+    onSuccess: (result) => {
+      setTrackedTx(result);
+      setAmountArc("");
     },
   });
+
+  const { data: trackedReceipt } = useQuery({
+    queryKey: ["wallet-receipt", trackedTx?.txHash],
+    queryFn: () => api.lookupTx(trackedTx!.txHash),
+    enabled: Boolean(trackedTx?.txHash),
+    refetchInterval: (query) =>
+      query.state.data?.status === "mined" ? false : 2000,
+  });
+
+  useEffect(() => {
+    if (trackedReceipt?.status === "mined") {
+      queryClient.invalidateQueries({ queryKey: ["balance"] });
+    }
+  }, [queryClient, trackedReceipt?.status]);
 
   const [copied, setCopied] = useState(false);
 
@@ -41,6 +113,14 @@ export function Wallet() {
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
+
+  const submitTransfer = (event: FormEvent) => {
+    event.preventDefault();
+    send.mutate();
+  };
+
+  const receiptFor = (result: WalletTxResult | undefined) =>
+    result?.txHash === trackedTx?.txHash ? trackedReceipt : undefined;
 
   return (
     <div className="main-inner" data-testid="wallet-screen">
@@ -63,8 +143,10 @@ export function Wallet() {
                 <p>
                   Your balance is fetched from the chain via{" "}
                   <code>GET /account/&lt;address&gt;</code>. It reflects every
-                  confirmed transaction: faucet drops, earnings from verified
-                  inference, and transfers in or out.
+                  successful transaction retained by this selected host:
+                  faucet credits, transfers, and mined community-reward
+                  transactions (<code>0x25</code>). A raw inference attestation
+                  (<code>0x16</code>) is not payment.
                 </p>
                 <p style={{ color: "var(--text-muted)", fontSize: 11 }}>
                   Updates every 4 seconds.
@@ -78,7 +160,7 @@ export function Wallet() {
               data-testid="wallet-nonce"
               title="Transaction counter - increments with every tx you send"
             >
-              Nonce {formatInt(balance?.nonce ?? 0)}
+              Nonce {balance ? formatInt(balance.nonce) : "—"}
             </span>
           }
         />
@@ -96,10 +178,22 @@ export function Wallet() {
               data-testid="wallet-balance"
               style={{ fontSize: "var(--text-4xl)" }}
             >
-              <NumberTicker value={balance?.balance ?? 0} digits={0} />
+              {balance ? formatArcExact(balance.balanceArc) : "—"}
               <span className="unit">ARC</span>
             </div>
-            {balance && balance.stakedBalance > 0 && (
+            {balanceIsError && (
+              <div
+                data-testid="wallet-balance-error"
+                style={{
+                  marginTop: "var(--space-2)",
+                  color: "var(--warning)",
+                  fontSize: "var(--text-xs)",
+                }}
+              >
+                Balance unavailable: {(balanceError as Error).message}
+              </div>
+            )}
+            {balance && balance.stakedBalanceBase !== "0" && (
               <div
                 style={{
                   marginTop: "var(--space-3)",
@@ -107,7 +201,7 @@ export function Wallet() {
                   fontSize: "var(--text-sm)",
                 }}
               >
-                {formatInt(balance.stakedBalance)} ARC staked
+                {formatArcExact(balance.stakedBalanceArc)} ARC staked
               </div>
             )}
           </div>
@@ -119,21 +213,24 @@ export function Wallet() {
               data-testid="btn-faucet"
             >
               <Droplet size={16} />{" "}
-              {faucet.isPending ? "Claiming…" : "Claim 10,000 ARC"}
+              {faucet.isPending ? "Submitting…" : "Claim 1 ARC"}
             </button>
             {faucet.isSuccess && (
               <div
                 style={{
                   marginTop: "var(--space-2)",
                   fontSize: "var(--text-xs)",
-                  color: "var(--success)",
+                  color: receiptView(
+                    faucet.data,
+                    receiptFor(faucet.data),
+                  ).tone,
                   textAlign: "right",
                   fontFamily: "var(--font-mono)",
                 }}
                 data-testid="faucet-success"
               >
-                +{formatInt(faucet.data?.amount ?? 0)} ARC · tx{" "}
-                {faucet.data?.txHash.slice(0, 10)}…
+                {receiptView(faucet.data, receiptFor(faucet.data)).text}
+                <br />tx {faucet.data.txHash.slice(0, 10)}…
               </div>
             )}
             {faucet.isError && (
@@ -221,52 +318,89 @@ export function Wallet() {
                 Send
                 <InfoPopover title="Send ARC">
                   <p>
-                    On testnet, transactions are unsigned-OK so you can send
-                    without a hardware wallet.
+                    Every transfer is signed in the native Rust process with
+                    this wallet&apos;s ed25519 key. The recovery phrase is never
+                    sent to the WebView or included in an IPC command.
                   </p>
                   <p>
-                    On <strong>mainnet</strong>, transactions must be ed25519-
-                    signed. This app will move signing into the OS keychain
-                    before mainnet ships.
+                    ARC uses exactly nine decimal places. Extra digits are
+                    rejected rather than rounded, and the app reports a
+                    transfer as confirmed only after a successful mined
+                    receipt exists.
                   </p>
                 </InfoPopover>
               </span>
             }
           />
-          <div
-            style={{
-              color: "var(--text-muted)",
-              fontSize: "var(--text-sm)",
-              marginBottom: "var(--space-4)",
-            }}
-          >
-            Coming in v0.2 - secure ed25519 signing is a prerequisite and
-            lands with keychain integration.
-          </div>
-          <div
-            style={{
-              padding: "var(--space-3) var(--space-4)",
-              background: "var(--warning-bg)",
-              border: "1px solid rgba(245, 181, 81, 0.2)",
-              borderRadius: "var(--radius-sm)",
-              display: "flex",
-              gap: "var(--space-3)",
-              alignItems: "flex-start",
-              fontSize: "var(--text-sm)",
-            }}
-          >
-            <Info
-              size={14}
-              style={{ color: "var(--warning)", flexShrink: 0, marginTop: 2 }}
+          <form onSubmit={submitTransfer} data-testid="send-arc-form">
+            <label className="field-label" htmlFor="send-recipient">
+              Recipient (64 hex characters)
+            </label>
+            <input
+              id="send-recipient"
+              className="input input-mono"
+              value={recipient}
+              onChange={(event) => setRecipient(event.target.value)}
+              placeholder="0x…"
+              autoComplete="off"
+              spellCheck={false}
+              data-testid="send-recipient"
+              style={{ marginBottom: "var(--space-3)" }}
             />
-            <div>
-              For now, send from the CLI wallet:
-              <br />
-              <code style={{ color: "var(--arc-ink)" }}>
-                arc-cli send &lt;to&gt; &lt;amount&gt;
-              </code>
+            <label className="field-label" htmlFor="send-amount">
+              Amount (ARC)
+            </label>
+            <input
+              id="send-amount"
+              className="input input-mono"
+              value={amountArc}
+              onChange={(event) => setAmountArc(event.target.value)}
+              placeholder="0.000000001"
+              inputMode="decimal"
+              autoComplete="off"
+              data-testid="send-amount"
+              style={{ marginBottom: "var(--space-3)" }}
+            />
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={
+                send.isPending || recipient.trim() === "" || amountArc.trim() === ""
+              }
+              data-testid="btn-send-arc"
+              style={{ width: "100%", justifyContent: "center" }}
+            >
+              <Send size={14} /> {send.isPending ? "Signing and submitting…" : "Send ARC"}
+            </button>
+          </form>
+          {send.isSuccess && (
+            <div
+              data-testid="send-status"
+              style={{
+                marginTop: "var(--space-3)",
+                color: receiptView(send.data, receiptFor(send.data)).tone,
+                fontFamily: "var(--font-mono)",
+                fontSize: "var(--text-xs)",
+                lineHeight: 1.6,
+              }}
+            >
+              {receiptView(send.data, receiptFor(send.data)).text}
+              <br />tx {send.data.txHash.slice(0, 12)}…
             </div>
-          </div>
+          )}
+          {send.isError && (
+            <div
+              data-testid="send-error"
+              style={{
+                marginTop: "var(--space-3)",
+                color: "var(--danger)",
+                fontSize: "var(--text-xs)",
+                lineHeight: 1.5,
+              }}
+            >
+              {(send.error as Error).message}
+            </div>
+          )}
         </Card>
       </div>
 

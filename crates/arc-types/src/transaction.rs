@@ -1,8 +1,66 @@
 use arc_crypto::Hash256;
-use arc_crypto::signature::{Signature, KeyPair, SignatureError};
+use arc_crypto::signature::{KeyPair, Signature, SignatureError};
 use serde::{Deserialize, Serialize};
 
 use crate::account::Address;
+
+/// Protocol-v3 state-machine-owned dynamic accounts share this 120-bit
+/// prefix; byte 15 identifies the exact account family.  The remaining 128
+/// bits are a transcript hash.  Every externally writable v3 transaction
+/// family must reject all addresses in this namespace before it mutates
+/// state, so a normal account can neither pre-dust nor overwrite a future
+/// replay/budget marker.
+pub const V3_SYSTEM_ACCOUNT_PREFIX: [u8; 15] = *b"ARC-V3-REWARD:\0";
+
+/// Exhaustive protocol-v3 dynamic system-account families.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum V3SystemAccountKind {
+    CommunityRewardJob = 1,
+    CommunityRewardCertificate = 2,
+    RecoveryRewardProbe = 3,
+    CommunityRewardBlockBudget = 4,
+    CommunityRewardEpochBudget = 5,
+    CommunityRewardWorkerBudget = 6,
+    CommunityRewardCoordinatorBudget = 7,
+    FaucetClaimMarker = 8,
+}
+
+/// Embed a full transcript digest in a type-specific 128-bit reserved
+/// namespace.  Truncating only the digest suffix retains 128-bit collision
+/// resistance while making ownership recognizable without enumerating
+/// unbounded content-derived addresses.
+pub fn v3_system_account_address(kind: V3SystemAccountKind, digest: &Hash256) -> Address {
+    let mut bytes = [0u8; 32];
+    bytes[..V3_SYSTEM_ACCOUNT_PREFIX.len()].copy_from_slice(&V3_SYSTEM_ACCOUNT_PREFIX);
+    bytes[V3_SYSTEM_ACCOUNT_PREFIX.len()] = kind as u8;
+    bytes[16..].copy_from_slice(&digest.as_ref()[..16]);
+    Hash256(bytes)
+}
+
+/// Whether an address belongs to one of the explicitly allocated v3 dynamic
+/// system-account namespaces.
+pub fn is_v3_system_account(address: &Address) -> bool {
+    address.as_ref()[..V3_SYSTEM_ACCOUNT_PREFIX.len()] == V3_SYSTEM_ACCOUNT_PREFIX
+        && matches!(address.as_ref()[V3_SYSTEM_ACCOUNT_PREFIX.len()], 1..=8)
+}
+
+fn serialize_unverified<S>(_: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_bool(false)
+}
+
+fn deserialize_unverified<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Consume the legacy wire field to preserve the bincode layout, but never
+    // trust a process-local verification-cache bit received from JSON/P2P.
+    let _ = bool::deserialize(deserializer)?;
+    Ok(false)
+}
 
 // ---------------------------------------------------------------------------
 // Gas constants & metering
@@ -68,6 +126,8 @@ pub mod gas_costs {
     pub const SHARD_PROOF: u64 = 60_000;
     /// Gas for submitting an optimistic inference attestation (Tier 2).
     pub const INFERENCE_ATTESTATION: u64 = 50_000;
+    /// Gas for a validator-authorized community inference reward.
+    pub const COMMUNITY_INFERENCE_REWARD: u64 = 50_000;
     /// Gas for challenging an inference attestation (Tier 2).
     pub const INFERENCE_CHALLENGE: u64 = 100_000;
     /// Gas for opening a per-request inference escrow (Milestone B).
@@ -287,6 +347,9 @@ pub enum TxType {
     /// elapsed. Distributes payout (or refunds), zeroes the escrow, and
     /// commits the final `output_hash` to the receipt log.
     InferenceFinalize = 0x24,
+    /// Validator-authorized payment for one coordinator-issued community
+    /// inference job. Appended to preserve every existing wire discriminant.
+    CommunityInferenceReward = 0x25,
 }
 
 /// A transaction on the ARC chain.
@@ -316,7 +379,11 @@ pub struct Transaction {
     pub signature: Signature,
     /// Whether the signature has already been verified (e.g. at mempool insertion).
     /// When true, block execution can skip re-verification for a ~2x speedup.
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "serialize_unverified",
+        deserialize_with = "deserialize_unverified"
+    )]
     pub sig_verified: bool,
 }
 
@@ -386,6 +453,57 @@ pub enum TxBody {
     InferenceVote(InferenceVoteBody),
     /// Tier 1 system-deterministic finalize (payout or refund, zeroes escrow).
     InferenceFinalize(InferenceFinalizeBody),
+    /// Validator-authorized, replay-protected community inference payment.
+    CommunityInferenceReward(CommunityInferenceRewardBody),
+}
+
+impl TxBody {
+    /// Canonical envelope discriminant for this body variant.
+    ///
+    /// Consensus and ingress must reject a transaction whose public `tx_type`
+    /// disagrees with this value; otherwise a restricted body can masquerade
+    /// as a harmless transfer while state executes the body variant.
+    pub const fn tx_type(&self) -> TxType {
+        match self {
+            Self::Transfer(_) => TxType::Transfer,
+            Self::Settle(_) => TxType::Settle,
+            Self::Swap(_) => TxType::Swap,
+            Self::Escrow(_) => TxType::Escrow,
+            Self::Stake(_) => TxType::Stake,
+            Self::WasmCall(_) => TxType::WasmCall,
+            Self::MultiSig(_) => TxType::MultiSig,
+            Self::DeployContract(_) => TxType::DeployContract,
+            Self::RegisterAgent(_) => TxType::RegisterAgent,
+            Self::JoinValidator(_) => TxType::JoinValidator,
+            Self::LeaveValidator => TxType::LeaveValidator,
+            Self::ClaimRewards => TxType::ClaimRewards,
+            Self::UpdateStake(_) => TxType::UpdateStake,
+            Self::Governance(_) => TxType::Governance,
+            Self::BridgeLock(_) => TxType::BridgeLock,
+            Self::BridgeMint(_) => TxType::BridgeMint,
+            Self::BatchSettle(_) => TxType::BatchSettle,
+            Self::ChannelOpen(_) => TxType::ChannelOpen,
+            Self::ChannelClose(_) => TxType::ChannelClose,
+            Self::ChannelDispute(_) => TxType::ChannelDispute,
+            Self::ShardProof(_) => TxType::ShardProof,
+            Self::InferenceAttestation(_) => TxType::InferenceAttestation,
+            Self::InferenceChallenge(_) => TxType::InferenceChallenge,
+            Self::InferenceRegister(_) => TxType::InferenceRegister,
+            Self::InferenceEscrowOpen(_) => TxType::InferenceEscrowOpen,
+            Self::InferenceEscrowRelease(_) => TxType::InferenceEscrowRelease,
+            Self::InferenceEscrowRefund(_) => TxType::InferenceEscrowRefund,
+            Self::ModelRegistration(_) => TxType::ModelRegistration,
+            Self::ModelRequest(_) => TxType::ModelRequest,
+            Self::ShardCoverageClaim(_) => TxType::ShardCoverageClaim,
+            Self::CapacityAdvertisement(_) => TxType::CapacityAdvertisement,
+            Self::ShardAssignmentProposal(_) => TxType::ShardAssignmentProposal,
+            Self::FaucetClaim(_) => TxType::FaucetClaim,
+            Self::InferenceRequest(_) => TxType::InferenceRequest,
+            Self::InferenceVote(_) => TxType::InferenceVote,
+            Self::InferenceFinalize(_) => TxType::InferenceFinalize,
+            Self::CommunityInferenceReward(_) => TxType::CommunityInferenceReward,
+        }
+    }
 }
 
 /// Simple value transfer.
@@ -668,12 +786,309 @@ pub struct InferenceAttestationBody {
     /// Marking the field `skip` makes the serialized form (and the tx hash)
     /// byte-identical to v0.7.2, restoring rolling-upgrade compatibility.
     ///
-    /// The "credit the original requester, not the working validator"
-    /// behavior (Option C) is reconstructed at query time in
-    /// `worker_earnings` by matching this attestation's `input_hash` to the
-    /// sender of the original InferenceRequest — no wire field required.
+    /// This deprecated local hint is not used for payment. Community income
+    /// is attributed explicitly by `CommunityInferenceRewardBody::worker`.
     #[serde(skip)]
     pub beneficiary: Option<Address>,
+}
+
+/// Validator-authorized payment for one completed community inference job.
+///
+/// The worker's signed `InferenceAttestation` proves the result to independent
+/// validators. A bounded Ed25519 approval quorum authorizes this compact
+/// on-chain receipt; its outer signature only authenticates the aggregator.
+/// Consensus derives one-shot markers from both `job_id` and the worker
+/// certificate so neither can be paid twice under a different transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommunityInferenceRewardBody {
+    /// Domain separator for ARC chain `0x415243` reward-v1 signatures.
+    pub chain_domain: Hash256,
+    /// Coordinator-generated, globally unique job commitment.
+    pub job_id: Hash256,
+    /// Active validator that created the assignment. Validators authenticate
+    /// this coordinator before independently recomputing and approving work.
+    pub coordinator: Address,
+    /// Cryptographically random coordinator boot/session epoch for ordinary
+    /// jobs, or a namespaced rollout/ordinal identity for recovery probes.
+    /// Binding it in every approval prevents semantic reuse; recovery probes
+    /// additionally receive a consensus replay marker across coordinators.
+    pub assignment_epoch: Hash256,
+    /// Monotonic nonce within `assignment_epoch`.
+    pub job_nonce: u64,
+    /// Protocol-v3 recovery context active when validators approved this job.
+    /// All three fields are zero on legacy/dev state without a recovery
+    /// context and must exactly match state at execution.
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+    pub transaction_domain: Hash256,
+    /// Stake-zero or staked worker that completed the assigned job.
+    pub worker: Address,
+    /// Model and I/O commitments copied from the verified worker attestation.
+    pub model_id: Hash256,
+    pub input_hash: Hash256,
+    pub output_hash: Hash256,
+    /// Token ceiling authorized by the coordinator for this job.
+    pub max_tokens: u32,
+    /// Last block height at which this reward authorization is valid.
+    pub expires_at_height: u64,
+    /// Flat worker-signed certificate. A full `Transaction` here made the
+    /// wire type recursively nestable because a reward transaction could
+    /// contain another reward transaction indefinitely. Validators rebuild
+    /// the one permitted InferenceAttestation shape from these bounded fields.
+    pub worker_certificate: WorkerInferenceCertificate,
+    /// Independent active-validator approvals over
+    /// [`Self::validator_approval_commitment`]. The outer transaction
+    /// signature authenticates the aggregator only; consensus does not treat
+    /// it as proof that the off-chain result was independently verified.
+    /// State caps this list at [`MAX_COMMUNITY_REWARD_APPROVALS`].
+    pub validator_approvals: Vec<CommunityRewardValidatorApproval>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerInferenceCertificate {
+    /// Hash assigned by `Transaction::sign` to the original worker
+    /// InferenceAttestation.
+    pub attestation_hash: Hash256,
+    pub nonce: u64,
+    pub challenge_period: u64,
+    pub signature: Signature,
+}
+
+/// Hard wire bound for reward-v1 quorum evidence.
+///
+/// V1 deliberately fails closed when the active validator set exceeds this
+/// bound. Each entry is exactly an address, Ed25519 public key, and 64-byte
+/// signature, so a reward cannot recursively embed transactions or unbounded
+/// post-quantum signature payloads.
+pub const MAX_COMMUNITY_REWARD_APPROVALS: usize = 64;
+
+/// Reward-v1 is intentionally fixed to the six-validator ARC approval
+/// committee. Issuance fails closed if the active set has any other size.
+pub const COMMUNITY_REWARD_VALIDATOR_SET_SIZE: usize = 6;
+/// Five independently recomputing validators must approve one receipt.
+pub const COMMUNITY_REWARD_APPROVALS_REQUIRED: usize = 5;
+/// Community compute is stake-zero eligible. This explicit consensus
+/// constant is the single code-level policy switch; raising it requires a
+/// coordinated protocol release rather than an unsafe per-node flag.
+pub const COMMUNITY_REWARD_MIN_WORKER_STAKE: u64 = 0;
+
+/// Wire-compatible namespace for rollout recovery probes.  Recovery probes
+/// reuse the existing `assignment_epoch` commitment so old blocks retain the
+/// exact same bincode layout, while consensus can recognize the small subset
+/// that also needs a rollout/ordinal-wide replay marker across coordinators.
+pub const RECOVERY_REWARD_PROBE_PREFIX: [u8; 16] = *b"ARC-RCV-PROBE1\0\0";
+
+/// One validator's approval of a community reward's complete semantic
+/// commitment. The split 64-byte signature keeps the wire representation
+/// fixed-size while using serde's portable 32-byte array support.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityRewardValidatorApproval {
+    pub validator: Address,
+    pub public_key: [u8; 32],
+    pub signature_halves: [[u8; 32]; 2],
+}
+
+impl CommunityRewardValidatorApproval {
+    /// Convert only a canonical 64-byte Ed25519 signature. Other ARC
+    /// signature schemes are intentionally not representable in reward-v1
+    /// quorum evidence.
+    pub fn from_ed25519_signature(validator: Address, signature: Signature) -> Option<Self> {
+        let Signature::Ed25519 {
+            public_key,
+            signature,
+        } = signature
+        else {
+            return None;
+        };
+        let bytes: [u8; 64] = signature.try_into().ok()?;
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        first.copy_from_slice(&bytes[..32]);
+        second.copy_from_slice(&bytes[32..]);
+        Some(Self {
+            validator,
+            public_key,
+            signature_halves: [first, second],
+        })
+    }
+
+    /// Reconstruct the ARC signature enum only for cryptographic verification.
+    pub fn as_signature(&self) -> Signature {
+        let mut signature = Vec::with_capacity(64);
+        signature.extend_from_slice(&self.signature_halves[0]);
+        signature.extend_from_slice(&self.signature_halves[1]);
+        Signature::Ed25519 {
+            public_key: self.public_key,
+            signature,
+        }
+    }
+}
+
+impl CommunityInferenceRewardBody {
+    pub fn expected_chain_domain() -> Hash256 {
+        arc_crypto::hash_bytes(b"arc-chain:0x415243:community-inference-reward:v1")
+    }
+
+    /// Derive the only valid job identifier for an exact assignment.
+    pub fn derive_job_id(
+        coordinator: &Address,
+        assignment_epoch: &Hash256,
+        job_nonce: u64,
+        model_id: &Hash256,
+        input_hash: &Hash256,
+        max_tokens: u32,
+    ) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-community-job-v4");
+        hasher.update(coordinator.as_ref());
+        hasher.update(assignment_epoch.as_ref());
+        hasher.update(&job_nonce.to_le_bytes());
+        hasher.update(model_id.as_ref());
+        hasher.update(input_hash.as_ref());
+        hasher.update(&max_tokens.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Zero-balance state marker used for consensus-level replay protection.
+    pub fn marker_address(chain_domain: &Hash256, job_id: &Hash256) -> Address {
+        let mut bytes = Vec::with_capacity(23 + 64);
+        bytes.extend_from_slice(b"arc-community-reward-v1");
+        bytes.extend_from_slice(chain_domain.as_ref());
+        bytes.extend_from_slice(job_id.as_ref());
+        arc_crypto::hash_bytes(&bytes)
+    }
+
+    /// Protocol-v3 replay marker. The legacy full-hash derivation above must
+    /// remain stable for historical state; v3 writes the same transcript into
+    /// a transfer-inaccessible namespace so predictable jobs cannot be
+    /// pre-dusted by an ordinary account.
+    pub fn v3_marker_address(chain_domain: &Hash256, job_id: &Hash256) -> Address {
+        v3_system_account_address(
+            V3SystemAccountKind::CommunityRewardJob,
+            &Self::marker_address(chain_domain, job_id),
+        )
+    }
+
+    /// Independent one-shot marker for the worker-signed certificate. A
+    /// validator must not be able to wrap one valid certificate in fresh job
+    /// IDs and collect the flat treasury reward repeatedly.
+    pub fn certificate_marker_address(
+        chain_domain: &Hash256,
+        worker: &Address,
+        attestation_hash: &Hash256,
+    ) -> Address {
+        let mut bytes = Vec::with_capacity(34 + 96);
+        bytes.extend_from_slice(b"arc-community-certificate-v1");
+        bytes.extend_from_slice(chain_domain.as_ref());
+        bytes.extend_from_slice(worker.as_ref());
+        bytes.extend_from_slice(attestation_hash.as_ref());
+        arc_crypto::hash_bytes(&bytes)
+    }
+
+    /// Protocol-v3 namespaced certificate replay marker.
+    pub fn v3_certificate_marker_address(
+        chain_domain: &Hash256,
+        worker: &Address,
+        attestation_hash: &Hash256,
+    ) -> Address {
+        v3_system_account_address(
+            V3SystemAccountKind::CommunityRewardCertificate,
+            &Self::certificate_marker_address(chain_domain, worker, attestation_hash),
+        )
+    }
+
+    /// Whether this assignment carries the explicit recovery-probe namespace.
+    pub fn is_recovery_probe_assignment(assignment_epoch: &Hash256) -> bool {
+        assignment_epoch.as_ref()[..RECOVERY_REWARD_PROBE_PREFIX.len()]
+            == RECOVERY_REWARD_PROBE_PREFIX
+    }
+
+    /// Cross-coordinator one-shot marker for a rollout-bound recovery probe.
+    ///
+    /// Normal community jobs deliberately share a random boot epoch and must
+    /// not receive this marker.  The fixed 128-bit namespace makes accidental
+    /// classification of a normal random epoch cryptographically negligible
+    /// without adding a field that would break historical bincode decoding.
+    pub fn recovery_probe_marker_address(
+        chain_domain: &Hash256,
+        assignment_epoch: &Hash256,
+    ) -> Option<Address> {
+        if !Self::is_recovery_probe_assignment(assignment_epoch) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(31 + 64);
+        bytes.extend_from_slice(b"arc-recovery-reward-probe-marker-v1");
+        bytes.extend_from_slice(chain_domain.as_ref());
+        bytes.extend_from_slice(assignment_epoch.as_ref());
+        Some(arc_crypto::hash_bytes(&bytes))
+    }
+
+    /// Protocol-v3 namespaced rollout-probe replay marker.
+    pub fn v3_recovery_probe_marker_address(
+        chain_domain: &Hash256,
+        assignment_epoch: &Hash256,
+    ) -> Option<Address> {
+        Self::recovery_probe_marker_address(chain_domain, assignment_epoch).map(|legacy| {
+            v3_system_account_address(V3SystemAccountKind::RecoveryRewardProbe, &legacy)
+        })
+    }
+
+    /// Common transcript independently signed by every reward approver.
+    ///
+    /// This binds all payout semantics, the exact worker-signed certificate,
+    /// and the reward-v1 amount. It intentionally excludes
+    /// `validator_approvals` and the outer transaction envelope so validators
+    /// can sign the same bounded message before an aggregator packages it.
+    pub fn validator_approval_commitment(&self) -> Hash256 {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("ARC-community-inference-reward-validator-approval-v1");
+        hasher.update(self.chain_domain.as_ref());
+        hasher.update(self.job_id.as_ref());
+        hasher.update(self.coordinator.as_ref());
+        hasher.update(self.assignment_epoch.as_ref());
+        hasher.update(&self.job_nonce.to_le_bytes());
+        hasher.update(&self.recovery_epoch.to_be_bytes());
+        hasher.update(&self.validator_set_id.to_be_bytes());
+        hasher.update(self.transaction_domain.as_ref());
+        hasher.update(self.worker.as_ref());
+        hasher.update(self.model_id.as_ref());
+        hasher.update(self.input_hash.as_ref());
+        hasher.update(self.output_hash.as_ref());
+        hasher.update(&self.max_tokens.to_le_bytes());
+        hasher.update(&self.expires_at_height.to_le_bytes());
+        hasher.update(self.worker_certificate.attestation_hash.as_ref());
+        hasher.update(&self.worker_certificate.nonce.to_le_bytes());
+        hasher.update(&self.worker_certificate.challenge_period.to_le_bytes());
+        let certificate_signature = bincode::serialize(&self.worker_certificate.signature)
+            .expect("worker certificate signature is serializable");
+        hasher.update(&(certificate_signature.len() as u64).to_le_bytes());
+        hasher.update(&certificate_signature);
+        hasher.update(&crate::economics::INFERENCE_ATTESTATION_REWARD.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Rebuild the only worker transaction shape accepted by a community
+    /// reward. Fixed fee/gas/bond values keep the certificate compact and
+    /// remove all recursive deserialization paths.
+    pub fn reconstruct_worker_attestation(&self) -> Transaction {
+        Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: self.worker,
+            nonce: self.worker_certificate.nonce,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: self.model_id,
+                input_hash: self.input_hash,
+                output_hash: self.output_hash,
+                challenge_period: self.worker_certificate.challenge_period,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: self.worker_certificate.attestation_hash,
+            signature: self.worker_certificate.signature.clone(),
+            sig_verified: false,
+        }
+    }
 }
 
 /// Challenge an inference attestation (Tier 2 fraud proof).
@@ -1061,15 +1476,43 @@ pub struct FaucetClaimBody {
     pub amount: u64,
 }
 
-/// Per-claim cap enforced by the executor (anti-drain). Matches the
-/// RPC-layer `FAUCET_CLAIM_AMOUNT` default so a routine /faucet/claim
-/// hits the cap exactly; raising one without the other will reject txs.
-pub const FAUCET_CLAIM_MAX: u64 = 10_000;
+impl FaucetClaimBody {
+    /// Exactly-once marker shared by every validator for one recipient. This
+    /// closes the cross-node replay path where six validators could each sign
+    /// a different transaction hash for the same faucet address.
+    pub fn marker_address(recipient: &Address) -> Address {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-faucet-recipient-marker-v1");
+        hasher.update(recipient.as_ref());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Protocol-v3 exactly-once marker protected from arbitrary transfer
+    /// writes. The original derivation remains the legacy/v2 state key.
+    pub fn v3_marker_address(recipient: &Address) -> Address {
+        v3_system_account_address(
+            V3SystemAccountKind::FaucetClaimMarker,
+            &Self::marker_address(recipient),
+        )
+    }
+}
+
+/// Per-claim cap enforced by the executor (anti-drain): exactly 1 ARC in
+/// nine-decimal base units. Matches the RPC-layer default; raising one without
+/// the other will reject transactions.
+pub const FAUCET_CLAIM_MAX: u64 = crate::economics::ARC_BASE_UNITS;
 
 /// System faucet pool address. Same on every seed because it's derived
 /// from `blake3::hash(&[0u8])` and prefunded in genesis.toml.
 pub fn faucet_pool_address() -> Address {
     arc_crypto::hash_bytes(&[0u8])
+}
+
+/// Dedicated finite treasury for validator-approved community inference
+/// rewards. It is the second prefunded system account (`blake3(&[1u8])`) and
+/// is deliberately distinct from the public faucet, so onboarding claims can
+/// neither consume worker rewards nor inflate their projected runway.
+pub fn inference_reward_treasury_address() -> Address {
+    arc_crypto::hash_bytes(&[1u8])
 }
 
 /// Milestone B helpers - shared between arc-state and arc-node so both
@@ -1169,7 +1612,13 @@ impl CompactTransfer {
         hasher.update(to.as_ref());
         hasher.update(&amount.to_le_bytes());
         let hash = Hash256(*hasher.finalize().as_bytes());
-        Self { from, to, amount, nonce, hash }
+        Self {
+            from,
+            to,
+            amount,
+            nonce,
+            hash,
+        }
     }
 
     /// Serialize into a fixed-size 250-byte buffer.
@@ -1188,11 +1637,38 @@ impl CompactTransfer {
 }
 
 impl Transaction {
+    /// Construct a validator-authorized payment for a completed community
+    /// inference job. The caller must sign with an active validator key.
+    pub fn new_community_inference_reward(
+        validator: Address,
+        nonce: u64,
+        body: CommunityInferenceRewardBody,
+    ) -> Self {
+        let mut tx = Self {
+            tx_type: TxType::CommunityInferenceReward,
+            from: validator,
+            nonce,
+            body: TxBody::CommunityInferenceReward(body),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
     /// Construct a validator-authorized faucet claim (unsigned — caller
     /// must `tx.sign(&validator_keypair)` before submitting). The executor
     /// will reject the tx unless `validator` is an active validator at
     /// commit time.
-    pub fn new_faucet_claim(validator: Address, recipient: Address, amount: u64, nonce: u64) -> Self {
+    pub fn new_faucet_claim(
+        validator: Address,
+        recipient: Address,
+        amount: u64,
+        nonce: u64,
+    ) -> Self {
         let body = TxBody::FaucetClaim(FaucetClaimBody { recipient, amount });
         let mut tx = Self {
             tx_type: TxType::FaucetClaim,
@@ -1325,6 +1801,11 @@ impl Transaction {
     }
 
     /// Create a new agent registration transaction (unsigned).
+    // These eight parameters are the five wire fields of `RegisterBody` plus the
+    // three envelope fields (from/fee/nonce) every `new_*` constructor here takes.
+    // Bundling them into a params struct would change a public API of the shared
+    // type crate that every downstream SDK builds against, for no behaviour gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_register_agent(
         from: Address,
         agent_name: String,
@@ -1373,6 +1854,22 @@ impl Transaction {
         Hash256(*hasher.finalize().as_bytes())
     }
 
+    /// Compute the protocol-v3 transaction hash for an exact recovery domain.
+    /// The same transaction fields signed for another chain, recovery epoch,
+    /// or validator-set ID produce a different hash and cannot be replayed.
+    pub fn compute_hash_in_domain(&self, recovery_domain: &Hash256) -> Hash256 {
+        let body_bytes = bincode::serialize(&self.body).expect("serializable");
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-chain-tx-v3");
+        hasher.update(recovery_domain.as_ref());
+        hasher.update(&[self.tx_type as u8]);
+        hasher.update(self.from.as_ref());
+        hasher.update(&self.nonce.to_le_bytes());
+        hasher.update(&body_bytes);
+        hasher.update(&self.fee.to_le_bytes());
+        hasher.update(&self.gas_limit.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
     /// Sign this transaction in place.
     ///
     /// 1. Recomputes the hash from the current fields.
@@ -1384,6 +1881,19 @@ impl Transaction {
         Ok(())
     }
 
+    /// Sign for one protocol-v3 recovery domain. This must be used by clients
+    /// after the H+1 transition; legacy [`Self::sign`] remains unchanged.
+    pub fn sign_in_domain(
+        &mut self,
+        keypair: &KeyPair,
+        recovery_domain: &Hash256,
+    ) -> Result<(), SignatureError> {
+        self.hash = self.compute_hash_in_domain(recovery_domain);
+        self.signature = keypair.sign(&self.hash)?;
+        self.sig_verified = false;
+        Ok(())
+    }
+
     /// Verify this transaction's signature.
     ///
     /// 1. Recomputes the expected hash from fields.
@@ -1392,12 +1902,30 @@ impl Transaction {
     ///
     /// Null signatures (benchmark mode) always fail verification.
     pub fn verify_signature(&self) -> Result<(), SignatureError> {
+        if self.tx_type != self.body.tx_type() {
+            return Err(SignatureError::HashMismatch);
+        }
         // Integrity: recompute hash and compare
         let expected = self.compute_hash();
         if expected != self.hash {
             return Err(SignatureError::HashMismatch);
         }
         // Authorization: verify signature matches `from`
+        self.signature.verify(&self.hash, &self.from)
+    }
+
+    /// Verify content, signer, and signature in one exact recovery domain.
+    pub fn verify_signature_in_domain(
+        &self,
+        recovery_domain: &Hash256,
+    ) -> Result<(), SignatureError> {
+        if self.tx_type != self.body.tx_type() {
+            return Err(SignatureError::HashMismatch);
+        }
+        let expected = self.compute_hash_in_domain(recovery_domain);
+        if self.hash != expected {
+            return Err(SignatureError::HashMismatch);
+        }
         self.signature.verify(&self.hash, &self.from)
     }
 
@@ -1429,6 +1957,22 @@ mod tests {
         assert_eq!(tx.tx_type, TxType::Transfer);
         assert_ne!(tx.hash, Hash256::ZERO);
         assert!(tx.is_unsigned());
+    }
+
+    #[test]
+    fn unsigned_transfer_wire_format_stays_bincode_v1_compatible() {
+        const LEGACY_WIRE_HEX: &str = "0000000048fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b000000000000000000000000ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0e80300000000000000000000000000000000000000000000003296b0b8498403c1255885e25dbc016407ad8b83498b8233bd006c59a4ba892e00000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let tx = Transaction::new_transfer(test_addr(1), test_addr(2), 1000, 0);
+        assert_eq!(
+            hex::encode(bincode::serialize(&tx).unwrap()),
+            LEGACY_WIRE_HEX
+        );
+
+        let historical = hex::decode(LEGACY_WIRE_HEX).unwrap();
+        let decoded: Transaction = bincode::deserialize(&historical).unwrap();
+        assert_eq!(bincode::serialize(&decoded).unwrap(), historical);
+        assert_eq!(decoded.hash, tx.hash);
+        assert_eq!(decoded.tx_type, tx.tx_type);
     }
 
     #[test]
@@ -1507,6 +2051,20 @@ mod tests {
     }
 
     #[test]
+    fn recovery_domain_prevents_cross_epoch_transaction_replay() {
+        let keypair = KeyPair::generate_ed25519();
+        let domain_a = hash_bytes(b"chain-A/recovery-1/set-1");
+        let domain_b = hash_bytes(b"chain-A/recovery-2/set-2");
+        let mut transaction = Transaction::new_transfer(keypair.address(), test_addr(2), 1_000, 0);
+
+        transaction.sign_in_domain(&keypair, &domain_a).unwrap();
+
+        transaction.verify_signature_in_domain(&domain_a).unwrap();
+        assert!(transaction.verify_signature_in_domain(&domain_b).is_err());
+        assert!(transaction.verify_signature().is_err());
+    }
+
+    #[test]
     fn test_secp256k1_sign_verify_transfer() {
         let kp = KeyPair::generate_secp256k1();
         let address = kp.address();
@@ -1532,6 +2090,36 @@ mod tests {
         });
 
         // Verification must fail (hash mismatch)
+        assert!(tx.verify_signature().is_err());
+    }
+
+    #[test]
+    fn sig_verified_wire_field_is_always_reset_to_false() {
+        let kp = KeyPair::generate_ed25519();
+        let mut tx = Transaction::new_transfer(kp.address(), test_addr(2), 1, 0);
+        tx.sign(&kp).unwrap();
+        tx.sig_verified = true;
+
+        let json = serde_json::to_value(&tx).unwrap();
+        assert_eq!(json["sig_verified"], false);
+        let mut malicious_json = json;
+        malicious_json["sig_verified"] = serde_json::Value::Bool(true);
+        let decoded_json: Transaction = serde_json::from_value(malicious_json).unwrap();
+        assert!(!decoded_json.sig_verified);
+
+        let wire = bincode::serialize(&tx).unwrap();
+        let decoded_wire: Transaction = bincode::deserialize(&wire).unwrap();
+        assert!(!decoded_wire.sig_verified);
+        decoded_wire.verify_signature().unwrap();
+    }
+
+    #[test]
+    fn signed_type_body_mismatch_is_rejected() {
+        let kp = KeyPair::generate_ed25519();
+        let mut tx = Transaction::new_transfer(kp.address(), test_addr(2), 1, 0);
+        tx.tx_type = TxType::InferenceAttestation;
+        tx.sign(&kp).unwrap();
+        assert_ne!(tx.tx_type, tx.body.tx_type());
         assert!(tx.verify_signature().is_err());
     }
 
@@ -1566,7 +2154,10 @@ mod tests {
         b.fee = 20;
         let hash_b = b.compute_hash();
 
-        assert_ne!(hash_a, hash_b, "different fees must produce different hashes");
+        assert_ne!(
+            hash_a, hash_b,
+            "different fees must produce different hashes"
+        );
     }
 
     // ── Gas metering ──
@@ -1610,8 +2201,8 @@ mod tests {
     #[test]
     fn test_gas_costs_constants() {
         assert_eq!(gas_costs::TX_BASE, 21_000);
-        assert!(gas_costs::DEPLOY_CONTRACT > gas_costs::TRANSFER);
-        assert!(gas_costs::BLOCK_GAS_LIMIT >= 30_000_000);
+        const { assert!(gas_costs::DEPLOY_CONTRACT > gas_costs::TRANSFER) };
+        const { assert!(gas_costs::BLOCK_GAS_LIMIT >= 30_000_000) };
     }
 
     // ── Tier 1 on-chain inference tx round-trip ──
@@ -1691,12 +2282,315 @@ mod tests {
         assert_eq!(TxType::InferenceRequest as u8, 0x22);
         assert_eq!(TxType::InferenceVote as u8, 0x23);
         assert_eq!(TxType::InferenceFinalize as u8, 0x24);
+        assert_eq!(TxType::CommunityInferenceReward as u8, 0x25);
+    }
+
+    #[test]
+    fn community_inference_reward_roundtrip_and_marker_are_stable() {
+        let job_id = hash_bytes(b"job-1");
+        let worker_key = KeyPair::generate_ed25519();
+        let validator_key = KeyPair::generate_ed25519();
+        let mut worker_attestation = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: worker_key.address(),
+            nonce: 0,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: hash_bytes(b"model"),
+                input_hash: hash_bytes(b"input"),
+                output_hash: hash_bytes(b"output"),
+                challenge_period: 100,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        worker_attestation.sign(&worker_key).unwrap();
+        let chain_domain = CommunityInferenceRewardBody::expected_chain_domain();
+        let mut body = CommunityInferenceRewardBody {
+            chain_domain,
+            job_id,
+            coordinator: validator_key.address(),
+            assignment_epoch: hash_bytes(b"assignment-epoch"),
+            job_nonce: 7,
+            recovery_epoch: 3,
+            validator_set_id: 11,
+            transaction_domain: hash_bytes(b"recovery-domain"),
+            worker: worker_key.address(),
+            model_id: hash_bytes(b"model"),
+            input_hash: hash_bytes(b"input"),
+            output_hash: hash_bytes(b"output"),
+            max_tokens: 32,
+            expires_at_height: 123,
+            worker_certificate: WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: 100,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let approval_commitment = body.validator_approval_commitment();
+        body.validator_approvals.push(
+            CommunityRewardValidatorApproval::from_ed25519_signature(
+                validator_key.address(),
+                validator_key.sign(&approval_commitment).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            approval_commitment,
+            body.validator_approval_commitment(),
+            "approval evidence itself is excluded from the common transcript"
+        );
+        let marker = CommunityInferenceRewardBody::marker_address(&chain_domain, &job_id);
+        assert_eq!(
+            marker,
+            CommunityInferenceRewardBody::marker_address(&chain_domain, &job_id)
+        );
+
+        let encoded = bincode::serialize(&TxBody::CommunityInferenceReward(body.clone()))
+            .expect("serialize reward");
+        assert!(
+            encoded.len() < 1024,
+            "flat reward certificate must remain bounded; got {} bytes",
+            encoded.len()
+        );
+        let decoded: TxBody = bincode::deserialize(&encoded).expect("deserialize reward");
+        match decoded {
+            TxBody::CommunityInferenceReward(got) => {
+                assert_eq!(got.job_id, body.job_id);
+                assert_eq!(got.worker, body.worker);
+                assert_eq!(got.output_hash, body.output_hash);
+                assert_eq!(got.max_tokens, 32);
+                assert_eq!(got.expires_at_height, 123);
+                assert_eq!(got.validator_approvals.len(), 1);
+                got.validator_approvals[0]
+                    .as_signature()
+                    .verify(
+                        &got.validator_approval_commitment(),
+                        &validator_key.address(),
+                    )
+                    .unwrap();
+                let rebuilt = got.reconstruct_worker_attestation();
+                assert_eq!(rebuilt.hash, got.worker_certificate.attestation_hash);
+                rebuilt.verify_signature().unwrap();
+            }
+            other => panic!("wrong variant after roundtrip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recovery_probe_marker_is_namespace_bound_and_cross_coordinator() {
+        let chain_domain = CommunityInferenceRewardBody::expected_chain_domain();
+        let mut encoded = [0u8; 32];
+        encoded[..RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&RECOVERY_REWARD_PROBE_PREFIX);
+        encoded[RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(7);
+        let probe_id = Hash256(encoded);
+        assert!(CommunityInferenceRewardBody::is_recovery_probe_assignment(
+            &probe_id
+        ));
+        let marker =
+            CommunityInferenceRewardBody::recovery_probe_marker_address(&chain_domain, &probe_id)
+                .expect("recovery namespace receives a marker");
+        assert_eq!(
+            Some(marker),
+            CommunityInferenceRewardBody::recovery_probe_marker_address(&chain_domain, &probe_id,)
+        );
+        assert!(
+            CommunityInferenceRewardBody::recovery_probe_marker_address(
+                &chain_domain,
+                &hash_bytes(b"ordinary-random-boot-epoch"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn v3_dynamic_system_accounts_have_distinct_reserved_128_bit_namespaces() {
+        let digest = hash_bytes(b"same transcript for every namespace");
+        let kinds = [
+            V3SystemAccountKind::CommunityRewardJob,
+            V3SystemAccountKind::CommunityRewardCertificate,
+            V3SystemAccountKind::RecoveryRewardProbe,
+            V3SystemAccountKind::CommunityRewardBlockBudget,
+            V3SystemAccountKind::CommunityRewardEpochBudget,
+            V3SystemAccountKind::CommunityRewardWorkerBudget,
+            V3SystemAccountKind::CommunityRewardCoordinatorBudget,
+            V3SystemAccountKind::FaucetClaimMarker,
+        ];
+        let addresses: Vec<_> = kinds
+            .iter()
+            .map(|kind| v3_system_account_address(*kind, &digest))
+            .collect();
+        let unique: std::collections::HashSet<_> =
+            addresses.iter().map(|address| address.0).collect();
+        assert_eq!(unique.len(), kinds.len());
+        for (address, kind) in addresses.iter().zip(kinds) {
+            assert!(is_v3_system_account(address));
+            assert_eq!(
+                &address.as_ref()[..V3_SYSTEM_ACCOUNT_PREFIX.len()],
+                &V3_SYSTEM_ACCOUNT_PREFIX
+            );
+            assert_eq!(address.as_ref()[V3_SYSTEM_ACCOUNT_PREFIX.len()], kind as u8);
+            assert_eq!(&address.as_ref()[16..], &digest.as_ref()[..16]);
+        }
+        assert!(!is_v3_system_account(&digest));
+
+        let chain_domain = CommunityInferenceRewardBody::expected_chain_domain();
+        let job = hash_bytes(b"job");
+        assert_ne!(
+            CommunityInferenceRewardBody::marker_address(&chain_domain, &job),
+            CommunityInferenceRewardBody::v3_marker_address(&chain_domain, &job),
+            "legacy full-hash state keys remain distinct and unchanged"
+        );
+        assert!(is_v3_system_account(
+            &CommunityInferenceRewardBody::v3_marker_address(&chain_domain, &job)
+        ));
+        assert!(is_v3_system_account(&FaucetClaimBody::v3_marker_address(
+            &hash_bytes(b"recipient")
+        )));
+    }
+
+    #[test]
+    fn community_reward_approval_commitment_binds_every_semantic_and_certificate_field() {
+        let worker_key = KeyPair::generate_ed25519();
+        let mut worker_attestation = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: worker_key.address(),
+            nonce: 4,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: hash_bytes(b"model"),
+                input_hash: hash_bytes(b"input"),
+                output_hash: hash_bytes(b"output"),
+                challenge_period: 100,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        worker_attestation.sign(&worker_key).unwrap();
+        let body = CommunityInferenceRewardBody {
+            chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id: hash_bytes(b"job"),
+            coordinator: hash_bytes(b"coordinator"),
+            assignment_epoch: hash_bytes(b"assignment-epoch"),
+            job_nonce: 9,
+            recovery_epoch: 3,
+            validator_set_id: 11,
+            transaction_domain: hash_bytes(b"recovery-domain"),
+            worker: worker_key.address(),
+            model_id: hash_bytes(b"model"),
+            input_hash: hash_bytes(b"input"),
+            output_hash: hash_bytes(b"output"),
+            max_tokens: 32,
+            expires_at_height: 123,
+            worker_certificate: WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: 100,
+                signature: worker_attestation.signature,
+            },
+            validator_approvals: Vec::new(),
+        };
+        let expected = body.validator_approval_commitment();
+
+        macro_rules! assert_mutation_bound {
+            ($label:literal, $mutation:expr) => {{
+                let mut changed = body.clone();
+                $mutation(&mut changed);
+                assert_ne!(
+                    changed.validator_approval_commitment(),
+                    expected,
+                    "{} was not bound by approval commitment",
+                    $label
+                );
+            }};
+        }
+        assert_mutation_bound!("chain_domain", |b: &mut CommunityInferenceRewardBody| {
+            b.chain_domain = hash_bytes(b"other-domain")
+        });
+        assert_mutation_bound!("job_id", |b: &mut CommunityInferenceRewardBody| {
+            b.job_id = hash_bytes(b"other-job")
+        });
+        assert_mutation_bound!("coordinator", |b: &mut CommunityInferenceRewardBody| {
+            b.coordinator = hash_bytes(b"other-coordinator")
+        });
+        assert_mutation_bound!(
+            "assignment_epoch",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.assignment_epoch = hash_bytes(b"other-epoch")
+            }
+        );
+        assert_mutation_bound!("job_nonce", |b: &mut CommunityInferenceRewardBody| {
+            b.job_nonce += 1
+        });
+        assert_mutation_bound!("recovery_epoch", |b: &mut CommunityInferenceRewardBody| {
+            b.recovery_epoch += 1
+        });
+        assert_mutation_bound!(
+            "validator_set_id",
+            |b: &mut CommunityInferenceRewardBody| { b.validator_set_id += 1 }
+        );
+        assert_mutation_bound!(
+            "transaction_domain",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.transaction_domain = hash_bytes(b"other-recovery-domain")
+            }
+        );
+        assert_mutation_bound!("worker", |b: &mut CommunityInferenceRewardBody| {
+            b.worker = hash_bytes(b"other-worker")
+        });
+        assert_mutation_bound!("model_id", |b: &mut CommunityInferenceRewardBody| {
+            b.model_id = hash_bytes(b"other-model")
+        });
+        assert_mutation_bound!("input_hash", |b: &mut CommunityInferenceRewardBody| {
+            b.input_hash = hash_bytes(b"other-input")
+        });
+        assert_mutation_bound!("output_hash", |b: &mut CommunityInferenceRewardBody| {
+            b.output_hash = hash_bytes(b"other-output")
+        });
+        assert_mutation_bound!("max_tokens", |b: &mut CommunityInferenceRewardBody| {
+            b.max_tokens += 1
+        });
+        assert_mutation_bound!(
+            "expires_at_height",
+            |b: &mut CommunityInferenceRewardBody| { b.expires_at_height += 1 }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.attestation_hash",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.worker_certificate.attestation_hash = hash_bytes(b"other-attestation")
+            }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.nonce",
+            |b: &mut CommunityInferenceRewardBody| { b.worker_certificate.nonce += 1 }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.challenge_period",
+            |b: &mut CommunityInferenceRewardBody| { b.worker_certificate.challenge_period += 1 }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.signature",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.worker_certificate.signature = Signature::null()
+            }
+        );
     }
 
     #[test]
     fn tier1_constants_sane() {
-        assert!(TIER1_INPUT_BLOB_MAX > 0 && TIER1_INPUT_BLOB_MAX <= 1024 * 1024);
-        assert!(TIER1_OUTPUT_BLOB_MAX > 0);
+        const { assert!(TIER1_INPUT_BLOB_MAX > 0 && TIER1_INPUT_BLOB_MAX <= 1024 * 1024) };
+        const { assert!(TIER1_OUTPUT_BLOB_MAX > 0) };
         // Output blob ceiling should comfortably hold the max-token output:
         // TIER1_MAX_TOKENS × ~8 bytes/token UTF-8 worst case = 16 KB.
         assert!(TIER1_OUTPUT_BLOB_MAX as u32 >= TIER1_MAX_TOKENS * 8);
@@ -1714,9 +2608,9 @@ mod tests {
         // Must be a real range, and min must leave validators time to
         // observe + run inference + submit a vote tx (single block is
         // not enough even on the fastest hardware).
-        assert!(TIER1_MIN_DEADLINE_BLOCKS >= 5);
-        assert!(TIER1_MAX_DEADLINE_BLOCKS > TIER1_MIN_DEADLINE_BLOCKS);
-        assert!(TIER1_MAX_DEADLINE_BLOCKS <= 100_000);
+        const { assert!(TIER1_MIN_DEADLINE_BLOCKS >= 5) };
+        const { assert!(TIER1_MAX_DEADLINE_BLOCKS > TIER1_MIN_DEADLINE_BLOCKS) };
+        const { assert!(TIER1_MAX_DEADLINE_BLOCKS <= 100_000) };
     }
 
     #[test]
@@ -1724,8 +2618,8 @@ mod tests {
         // A single request must not be allowed to consume hours of
         // validator compute. 2048 caps each request at ~5-15 minutes
         // of CPU inference, manageable as a worst case.
-        assert!(TIER1_MAX_TOKENS > 0);
-        assert!(TIER1_MAX_TOKENS <= 8192);
+        const { assert!(TIER1_MAX_TOKENS > 0) };
+        const { assert!(TIER1_MAX_TOKENS <= 8192) };
     }
 
     /// Pin the wire size of InferenceAttestationBody to the v0.7.2 layout.

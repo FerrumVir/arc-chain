@@ -28,7 +28,7 @@
 //! - **Verifiability**: Anyone with the public key can verify that the output
 //!   was correctly derived.
 
-use crate::hash::{hash_bytes, Hash256};
+use crate::hash::{Hash256, hash_bytes};
 use crate::signature::{KeyPair, Signature, SignatureError};
 use serde::{Deserialize, Serialize};
 
@@ -67,10 +67,7 @@ pub struct VrfOutput(pub Hash256);
 /// # Returns
 ///
 /// `(VrfProof, VrfOutput)` on success, or `SignatureError` if signing fails.
-pub fn vrf_prove(
-    keypair: &KeyPair,
-    alpha: &[u8],
-) -> Result<(VrfProof, VrfOutput), SignatureError> {
+pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput), SignatureError> {
     // Step 1: Derive a gamma input deterministically from (pk, alpha).
     let gamma_input = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-gamma-v1");
@@ -200,7 +197,10 @@ mod tests {
         let (proof, output) = vrf_prove(&kp, alpha).expect("prove ok");
         let verified = vrf_verify(&address, alpha, &proof).expect("verify ok");
 
-        assert_eq!(output, verified, "prove and verify must yield the same output");
+        assert_eq!(
+            output, verified,
+            "prove and verify must yield the same output"
+        );
     }
 
     #[test]

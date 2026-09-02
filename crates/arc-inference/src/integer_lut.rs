@@ -22,7 +22,7 @@ pub const ONE: i64 = 1 << FRAC_BITS; // 65536
 pub const EXP_LUT_SIZE: usize = 4096;
 pub const EXP_LUT_RANGE: i64 = 16 * ONE; // covers [-16*ONE, 0]
 
-pub const EXP_LUT: [i64; 4097] = {
+pub static EXP_LUT: [i64; 4097] = {
     let mut table = [0i64; 4097];
     table[4096] = ONE;
     // exp(-1/256) = 0.99610544... × 65536 = 65280.76..., rounded to 65281.
@@ -32,7 +32,9 @@ pub const EXP_LUT: [i64; 4097] = {
     let mut i: usize = 4095;
     loop {
         table[i] = (table[i + 1] * decay) >> FRAC_BITS;
-        if i == 0 { break; }
+        if i == 0 {
+            break;
+        }
         i -= 1;
     }
 
@@ -43,8 +45,12 @@ pub const EXP_LUT: [i64; 4097] = {
 /// Returns round(exp(x_real) * ONE) where x_real = x / ONE.
 /// Uses lookup table with linear interpolation. Deterministic on all platforms.
 pub fn integer_exp(x: i64) -> i64 {
-    if x >= 0 { return ONE; }
-    if x <= -(EXP_LUT_RANGE) { return 0; }
+    if x >= 0 {
+        return ONE;
+    }
+    if x <= -(EXP_LUT_RANGE) {
+        return 0;
+    }
 
     // Map x from [-16*ONE, 0] to index [0, 4096].
     // step = 16*ONE / 4096 = ONE/256 = 256.
@@ -53,7 +59,9 @@ pub fn integer_exp(x: i64) -> i64 {
     let idx = (offset / step) as usize;
     let frac = offset % step;
 
-    if idx >= 4096 { return ONE; }
+    if idx >= 4096 {
+        return ONE;
+    }
 
     let lo = EXP_LUT[idx];
     let hi = EXP_LUT[idx + 1];
@@ -63,16 +71,18 @@ pub fn integer_exp(x: i64) -> i64 {
 /// Integer softmax: input is slice of Q16 values, output is Q16 values summing to ~ONE.
 /// Deterministic on all platforms (no float operations).
 pub fn softmax_i64(input: &[i64]) -> Vec<i64> {
-    if input.is_empty() { return vec![]; }
-    if input.len() == 1 { return vec![ONE]; }
+    if input.is_empty() {
+        return vec![];
+    }
+    if input.len() == 1 {
+        return vec![ONE];
+    }
 
     // Find max for numerical stability
     let max_val = *input.iter().max().unwrap();
 
     // Compute exp(x - max) for each element
-    let exps: Vec<i64> = input.iter()
-        .map(|&x| integer_exp(x - max_val))
-        .collect();
+    let exps: Vec<i64> = input.iter().map(|&x| integer_exp(x - max_val)).collect();
 
     // Sum of exps
     let sum: i64 = exps.iter().sum();
@@ -108,7 +118,9 @@ pub fn relu_i64(x: i64) -> i64 {
 /// Uses Newton-Raphson iteration starting from a rough estimate.
 /// Deterministic across all platforms (integer-only).
 pub fn integer_isqrt(x: i64) -> i64 {
-    if x <= 0 { return ONE * 100; } // avoid division by zero, return large value
+    if x <= 0 {
+        return ONE * 100;
+    } // avoid division by zero, return large value
 
     // Initial estimate: find leading bit position, compute rough 1/sqrt
     // For Q16 input x, real value is x/ONE. We want ONE/sqrt(x/ONE) = ONE*sqrt(ONE/x) = ONE * sqrt(ONE) / sqrt(x)
@@ -119,7 +131,9 @@ pub fn integer_isqrt(x: i64) -> i64 {
     // sqrt(x) ≈ 2^(bits/2), so 1/sqrt(x) ≈ 2^(-bits/2)
     // In Q16: ONE * 2^(-bits/2) = 65536 >> (bits/2)
     let mut y = ONE * 256 / (1i64 << ((bits + 1) / 2)); // rough estimate
-    if y <= 0 { y = 1; }
+    if y <= 0 {
+        y = 1;
+    }
 
     // Newton-Raphson converges quadratically; 5 iterations bring the
     // relative error from ~0.1% (3 iters) down to ~1e-6, which matters for
@@ -130,7 +144,9 @@ pub fn integer_isqrt(x: i64) -> i64 {
         let xy2 = (x * y2) >> FRAC_BITS;
         let three_minus = 3 * ONE - xy2;
         y = (y * three_minus) / (2 * ONE);
-        if y <= 0 { y = 1; }
+        if y <= 0 {
+            y = 1;
+        }
     }
 
     y
@@ -150,7 +166,11 @@ mod tests {
         // With the expanded [-16, 0] range, exp(-20) is well past the cap.
         assert_eq!(integer_exp(-20 * ONE), 0);
         // exp(-5) ≈ 6.7e-3; in Q16 that's ~442, well above 0.
-        assert!(integer_exp(-5 * ONE) > 100, "exp(-5) = {}", integer_exp(-5 * ONE));
+        assert!(
+            integer_exp(-5 * ONE) > 100,
+            "exp(-5) = {}",
+            integer_exp(-5 * ONE)
+        );
         // Exp is strictly increasing from -16 to 0 (no Q16 underflow below -13ish).
         assert!(integer_exp(-3 * ONE) > integer_exp(-5 * ONE));
     }
@@ -158,9 +178,15 @@ mod tests {
     #[test]
     fn test_exp_monotonic() {
         let mut prev = 0i64;
-        for i in (-16 * ONE as i64)..=0 {
+        for i in (-16 * ONE)..=0 {
             let val = integer_exp(i);
-            assert!(val >= prev, "exp not monotonic at {}: {} < {}", i, val, prev);
+            assert!(
+                val >= prev,
+                "exp not monotonic at {}: {} < {}",
+                i,
+                val,
+                prev
+            );
             prev = val;
         }
     }
@@ -171,7 +197,12 @@ mod tests {
         let output = softmax_i64(&input);
         let sum: i64 = output.iter().sum();
         // Should be within 1% of ONE
-        assert!((sum - ONE).abs() < ONE / 100, "softmax sum {} not close to {}", sum, ONE);
+        assert!(
+            (sum - ONE).abs() < ONE / 100,
+            "softmax sum {} not close to {}",
+            sum,
+            ONE
+        );
     }
 
     #[test]
@@ -193,7 +224,12 @@ mod tests {
         // isqrt(ONE) should be ONE (1/sqrt(1) = 1)
         let result = integer_isqrt(ONE);
         let error = (result - ONE).abs();
-        assert!(error < ONE / 50, "isqrt(ONE) = {} (error {})", result, error);
+        assert!(
+            error < ONE / 50,
+            "isqrt(ONE) = {} (error {})",
+            result,
+            error
+        );
     }
 
     #[test]
@@ -202,7 +238,13 @@ mod tests {
         let result = integer_isqrt(4 * ONE);
         let expected = ONE / 2;
         let error = (result - expected).abs();
-        assert!(error < ONE / 50, "isqrt(4*ONE) = {} (expected {}, error {})", result, expected, error);
+        assert!(
+            error < ONE / 50,
+            "isqrt(4*ONE) = {} (expected {}, error {})",
+            result,
+            expected,
+            error
+        );
     }
 
     #[test]

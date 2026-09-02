@@ -4,16 +4,24 @@
 //! using deterministic Ed25519 keypairs. The consensus loop drains signed txs
 //! from a bounded channel and feeds them to `execute_block_signed_benchmark()`.
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
+#[cfg(feature = "benchmark-tools")]
 use arc_crypto::Hash256;
+#[cfg(feature = "benchmark-tools")]
+use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_types::Transaction;
+#[cfg(feature = "benchmark-tools")]
 use crossbeam::channel::{self, Receiver};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "benchmark-tools")]
 use std::sync::Arc;
+#[cfg(feature = "benchmark-tools")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "benchmark-tools")]
 use std::thread::JoinHandle;
+#[cfg(feature = "benchmark-tools")]
 use tracing::info;
 
 /// Pre-signing pool that feeds signed transactions to the consensus loop.
+#[cfg(feature = "benchmark-tools")]
 pub struct BenchmarkPool {
     rx: Receiver<Vec<Transaction>>,
     stop: Arc<AtomicBool>,
@@ -21,6 +29,12 @@ pub struct BenchmarkPool {
     handles: Vec<JoinHandle<()>>,
 }
 
+#[cfg(not(feature = "benchmark-tools"))]
+pub struct BenchmarkPool {
+    _private: (),
+}
+
+#[cfg(feature = "benchmark-tools")]
 impl BenchmarkPool {
     /// Start the pre-signing pool.
     ///
@@ -44,12 +58,10 @@ impl BenchmarkPool {
         let stop = Arc::new(AtomicBool::new(false));
 
         // Pre-compute receiver addresses (senders 50..100 map to receivers)
-        let receivers: Vec<Hash256> = (50u8..100u8)
-            .map(benchmark_address)
-            .collect();
+        let receivers: Vec<Hash256> = (50u8..100u8).map(benchmark_address).collect();
 
         // Partition senders across threads
-        let senders_per_thread = (sender_count as usize + num_threads - 1) / num_threads;
+        let senders_per_thread = (sender_count as usize).div_ceil(num_threads);
 
         let mut handles = Vec::with_capacity(num_threads);
         for thread_id in 0..num_threads {
@@ -57,7 +69,8 @@ impl BenchmarkPool {
             let stop = stop.clone();
             let receivers = receivers.clone();
             let start_idx = sender_start as usize + thread_id * senders_per_thread;
-            let end_idx = (start_idx + senders_per_thread).min((sender_start + sender_count) as usize);
+            let end_idx =
+                (start_idx + senders_per_thread).min((sender_start + sender_count) as usize);
 
             if start_idx >= end_idx {
                 continue;
@@ -83,19 +96,16 @@ impl BenchmarkPool {
 
                         // Round-robin across this thread's senders
                         for _ in 0..batch_size {
-                            for (kp_idx, (sk, sender, sender_global_idx)) in keypairs.iter().enumerate() {
+                            for (kp_idx, (sk, sender, sender_global_idx)) in
+                                keypairs.iter().enumerate()
+                            {
                                 if batch.len() >= batch_size {
                                     break;
                                 }
                                 let receiver = receivers[*sender_global_idx % receivers.len()];
                                 let nonce = nonces[kp_idx];
 
-                                let mut tx = Transaction::new_transfer(
-                                    *sender,
-                                    receiver,
-                                    1,
-                                    nonce,
-                                );
+                                let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
                                 // Sign with ed25519 keypair
                                 use ed25519_dalek::Signer;
@@ -114,10 +124,8 @@ impl BenchmarkPool {
                             }
                         }
 
-                        if !batch.is_empty() {
-                            if tx.send(batch).is_err() {
-                                break; // Channel closed
-                            }
+                        if !batch.is_empty() && tx.send(batch).is_err() {
+                            break; // Channel closed
                         }
                     }
                 })
@@ -162,6 +170,16 @@ impl BenchmarkPool {
     }
 }
 
+#[cfg(not(feature = "benchmark-tools"))]
+impl BenchmarkPool {
+    /// Default/release builds retain only an inert consensus API shape; they
+    /// cannot construct a signing pool or generate benchmark transactions.
+    pub fn drain(&self, _max: usize) -> Vec<Transaction> {
+        Vec::new()
+    }
+}
+
+#[cfg(feature = "benchmark-tools")]
 impl Drop for BenchmarkPool {
     fn drop(&mut self) {
         self.stop();

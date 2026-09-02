@@ -1,6 +1,6 @@
 import { ExternalLink, Moon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { api, isTauri } from "../lib/tauri";
+import { api, isSyntheticPreview } from "../lib/tauri";
 import { StatusPill } from "./StatusPill";
 import { ArcDevice } from "./Logo";
 
@@ -26,7 +26,7 @@ export function Titlebar() {
 
       <div className="titlebar-right">
         <StatusPill level={level} />
-        {isTauri || (
+        {isSyntheticPreview && (
           <span
             style={{
               fontSize: 10,
@@ -37,7 +37,7 @@ export function Titlebar() {
             }}
             data-testid="preview-mode"
           >
-            <Moon size={10} /> Preview mode
+            <Moon size={10} /> Synthetic preview · not live
           </span>
         )}
         <button

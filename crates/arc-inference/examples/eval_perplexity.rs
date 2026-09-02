@@ -60,9 +60,14 @@ fn main() {
     let load_start = Instant::now();
     let model = load_cached_model(model_path).expect("Failed to load model");
     println!("Model loaded in {:.2}s", load_start.elapsed().as_secs_f64());
-    println!("Config: {} layers, d_model={}, vocab={}",
-        model.config.n_layers, model.config.d_model, model.config.vocab_size);
-    println!("Weight hash: 0x{}", hex::encode(&model.weight_hash().0[..8]));
+    println!(
+        "Config: {} layers, d_model={}, vocab={}",
+        model.config.n_layers, model.config.d_model, model.config.vocab_size
+    );
+    println!(
+        "Weight hash: 0x{}",
+        hex::encode(&model.weight_hash().0[..8])
+    );
     println!();
 
     // Read tokens: either pre-tokenized JSON ([1, 2, 3, ...]) or raw text
@@ -75,7 +80,11 @@ fn main() {
     } else {
         // Raw text: use model's built-in tokenizer (greedy longest-match)
         let toks = model.encode(&raw);
-        println!("Text: {} chars -> {} tokens (model tokenizer)", raw.len(), toks.len());
+        println!(
+            "Text: {} chars -> {} tokens (model tokenizer)",
+            raw.len(),
+            toks.len()
+        );
         toks
     };
     let n_tokens = if max_tokens > 0 && max_tokens < tokens.len() {
@@ -126,8 +135,13 @@ fn main() {
             let elapsed = eval_start.elapsed().as_secs_f64();
             let running_ppl = (neg_log_likelihood_sum / n_evaluated as f64).exp();
             let tok_per_sec = (i + 1) as f64 / elapsed;
-            print!("\r[{}/{}] PPL: {:.2}  ({:.1} tok/s)     ",
-                i + 1, n_tokens - 1, running_ppl, tok_per_sec);
+            print!(
+                "\r[{}/{}] PPL: {:.2}  ({:.1} tok/s)     ",
+                i + 1,
+                n_tokens - 1,
+                running_ppl,
+                tok_per_sec
+            );
             use std::io::Write;
             std::io::stdout().flush().ok();
         }
@@ -144,12 +158,17 @@ fn main() {
     println!("Avg NLL:           {:.4}", avg_nll);
     println!("Perplexity:        {:.2}", perplexity);
     println!("Bits per byte:     {:.2}", avg_nll / (2.0_f64).ln());
-    println!("Time:              {:.1}s ({:.1} tok/s)",
+    println!(
+        "Time:              {:.1}s ({:.1} tok/s)",
         total_time.as_secs_f64(),
-        n_evaluated as f64 / total_time.as_secs_f64());
+        n_evaluated as f64 / total_time.as_secs_f64()
+    );
     println!();
     println!("Model:         {} (INT8 integer engine)", model_path);
-    println!("Weight hash:   0x{}", hex::encode(&model.weight_hash().0[..8]));
+    println!(
+        "Weight hash:   0x{}",
+        hex::encode(&model.weight_hash().0[..8])
+    );
     println!("Deterministic: all forward pass computations use pure integer arithmetic");
     println!("Measurement:   log-softmax computed in f64 from Q16 logits (standard practice)");
 
@@ -162,13 +181,17 @@ fn main() {
         let logits1 = {
             let mut c = arc_inference::cached_integer_model::KVCache::new(model.config.n_layers);
             let _ = model.forward_one_token(1, &mut c);
-            for &t in &tokens[..i] { let _ = model.forward_one_token(t, &mut c); }
+            for &t in &tokens[..i] {
+                let _ = model.forward_one_token(t, &mut c);
+            }
             model.forward_one_token(tokens[i], &mut c)
         };
         let logits2 = {
             let mut c = arc_inference::cached_integer_model::KVCache::new(model.config.n_layers);
             let _ = model.forward_one_token(1, &mut c);
-            for &t in &tokens[..i] { let _ = model.forward_one_token(t, &mut c); }
+            for &t in &tokens[..i] {
+                let _ = model.forward_one_token(t, &mut c);
+            }
             model.forward_one_token(tokens[i], &mut c)
         };
         if logits1 != logits2 {
@@ -177,6 +200,9 @@ fn main() {
         }
     }
     if all_match {
-        println!("PASS: Logits are bitwise identical across runs (verified {} tokens)", verify_count);
+        println!(
+            "PASS: Logits are bitwise identical across runs (verified {} tokens)",
+            verify_count
+        );
     }
 }

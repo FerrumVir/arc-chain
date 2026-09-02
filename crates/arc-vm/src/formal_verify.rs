@@ -56,6 +56,9 @@ pub struct StateTransition {
     pub action: String,
 }
 
+/// Comparison applied to a `uint` state variable and a parsed literal.
+type UintCmp = dyn Fn(u64, u64) -> bool;
+
 /// A snapshot of the model's state.
 #[derive(Debug, Clone)]
 pub struct ModelState {
@@ -87,7 +90,7 @@ impl ModelState {
         }
 
         // Try relational operators (longest first to avoid partial match).
-        let operators: &[(&str, &dyn Fn(u64, u64) -> bool)] = &[
+        let operators: &[(&str, &UintCmp)] = &[
             (">=", &|a: u64, b: u64| a >= b),
             ("==", &|a: u64, b: u64| a == b),
             (">", &|a: u64, b: u64| a > b),
@@ -108,22 +111,22 @@ impl ModelState {
                         }
                     }
                     // Uint comparison.
-                    if let StateValue::Uint(v) = val {
-                        if let Ok(lit) = literal.parse::<u64>() {
-                            return Some(cmp_fn(*v, lit));
-                        }
+                    if let StateValue::Uint(v) = val
+                        && let Ok(lit) = literal.parse::<u64>()
+                    {
+                        return Some(cmp_fn(*v, lit));
                     }
                     // Int comparison.
-                    if let StateValue::Int(v) = val {
-                        if let Ok(lit) = literal.parse::<i64>() {
-                            return Some(match op {
-                                ">=" => *v >= lit,
-                                "==" => *v == lit,
-                                ">" => *v > lit,
-                                "<" => *v < lit,
-                                _ => return None,
-                            });
-                        }
+                    if let StateValue::Int(v) = val
+                        && let Ok(lit) = literal.parse::<i64>()
+                    {
+                        return Some(match op {
+                            ">=" => *v >= lit,
+                            "==" => *v == lit,
+                            ">" => *v > lit,
+                            "<" => *v < lit,
+                            _ => return None,
+                        });
                     }
                 }
             }
@@ -242,7 +245,10 @@ impl ModelChecker {
                     Some(CounterExample {
                         states: vec![state.clone()],
                         transitions: vec![],
-                        description: format!("Invariant '{}' violated: {}", inv.name, inv.expression),
+                        description: format!(
+                            "Invariant '{}' violated: {}",
+                            inv.name, inv.expression
+                        ),
                     })
                 },
             });
@@ -348,11 +354,7 @@ impl ModelChecker {
 
         // Also check all invariants hold in the new state.
         let inv_results = self.check_state(to);
-        results.extend(
-            inv_results
-                .into_iter()
-                .filter(|r| !r.satisfied)
-        );
+        results.extend(inv_results.into_iter().filter(|r| !r.satisfied));
 
         results
     }
@@ -361,17 +363,17 @@ impl ModelChecker {
     pub fn generate_counterexample(&self, property: &str) -> Option<CounterExample> {
         // Search invariants.
         for inv in &self.invariants {
-            if inv.name == property {
-                if let Some(false) = inv.holds {
-                    return Some(CounterExample {
-                        states: vec![],
-                        transitions: vec![],
-                        description: format!(
-                            "Invariant '{}' was violated. Expression: {}",
-                            inv.name, inv.expression
-                        ),
-                    });
-                }
+            if inv.name == property
+                && let Some(false) = inv.holds
+            {
+                return Some(CounterExample {
+                    states: vec![],
+                    transitions: vec![],
+                    description: format!(
+                        "Invariant '{}' was violated. Expression: {}",
+                        inv.name, inv.expression
+                    ),
+                });
             }
         }
 
@@ -439,7 +441,7 @@ impl ConsensusModel {
 
         checker.add_invariant(Invariant {
             name: "bft_fault_tolerance".to_string(),
-            expression: format!("faulty < {}", (validators + 2) / 3),
+            expression: format!("faulty < {}", validators.div_ceil(3)),
             holds: Some(3 * faulty < validators),
             checked_at: Some(0),
         });
@@ -451,7 +453,7 @@ impl ConsensusModel {
                 "No two honest validators commit conflicting blocks (n={}, f={})",
                 validators, faulty
             ),
-            formula: format!("conflicting_commits == 0"),
+            formula: "conflicting_commits == 0".to_string(),
             status: if 3 * faulty < validators {
                 VerificationStatus::Verified
             } else {
@@ -467,7 +469,7 @@ impl ConsensusModel {
                 "Chain makes progress when > 2/3 validators are honest (honest={}, n={})",
                 honest, validators
             ),
-            formula: format!("committed_blocks > 0"),
+            formula: "committed_blocks > 0".to_string(),
             status: if 3 * honest > 2 * validators {
                 VerificationStatus::Verified
             } else {
@@ -696,10 +698,7 @@ mod tests {
 
     #[test]
     fn test_state_value_array() {
-        let arr = StateValue::Array(vec![
-            StateValue::Uint(1),
-            StateValue::Bool(true),
-        ]);
+        let arr = StateValue::Array(vec![StateValue::Uint(1), StateValue::Bool(true)]);
         if let StateValue::Array(items) = arr {
             assert_eq!(items.len(), 2);
         } else {

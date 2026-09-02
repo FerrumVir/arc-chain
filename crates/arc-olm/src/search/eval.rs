@@ -1,10 +1,10 @@
 //! ARC-AGI task loading and evaluation.
 
 use crate::Grid;
-use crate::search::beam::{beam_search, BeamConfig, SearchResult};
-use crate::search::solver::{self, SolverConfig, SolveResult};
-use std::path::Path;
+use crate::search::beam::{BeamConfig, SearchResult, beam_search};
+use crate::search::solver::{self, SolveResult, SolverConfig};
 use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Deserialize)]
 struct TaskPair {
@@ -28,7 +28,8 @@ pub struct EvalResult {
 
 /// Load and solve a single ARC-AGI task.
 pub fn solve_task(path: &Path, config: &BeamConfig) -> EvalResult {
-    let task_id = path.file_stem()
+    let task_id = path
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
@@ -38,24 +39,34 @@ pub fn solve_task(path: &Path, config: &BeamConfig) -> EvalResult {
     let data: TaskData = match std::fs::read_to_string(path) {
         Ok(s) => match serde_json::from_str(&s) {
             Ok(d) => d,
-            Err(_) => return EvalResult {
-                task_id, solved: false, program: vec![], depth: 0,
+            Err(_) => {
+                return EvalResult {
+                    task_id,
+                    solved: false,
+                    program: vec![],
+                    depth: 0,
+                    time_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        },
+        Err(_) => {
+            return EvalResult {
+                task_id,
+                solved: false,
+                program: vec![],
+                depth: 0,
                 time_ms: start.elapsed().as_millis() as u64,
-            },
-        },
-        Err(_) => return EvalResult {
-            task_id, solved: false, program: vec![], depth: 0,
-            time_ms: start.elapsed().as_millis() as u64,
-        },
+            };
+        }
     };
 
-    let train_pairs: Vec<(Grid, Grid)> = data.train.iter()
+    let train_pairs: Vec<(Grid, Grid)> = data
+        .train
+        .iter()
         .map(|p| (p.input.clone(), p.output.clone()))
         .collect();
 
-    let test_inputs: Vec<Grid> = data.test.iter()
-        .map(|p| p.input.clone())
-        .collect();
+    let test_inputs: Vec<Grid> = data.test.iter().map(|p| p.input.clone()).collect();
 
     let result = beam_search(&train_pairs, &test_inputs, config);
 
@@ -79,18 +90,26 @@ pub fn solve_task(path: &Path, config: &BeamConfig) -> EvalResult {
             }
         }
         None => EvalResult {
-            task_id, solved: false, program: vec![], depth: 0, time_ms,
+            task_id,
+            solved: false,
+            program: vec![],
+            depth: 0,
+            time_ms,
         },
     }
 }
 
 /// Evaluate on a directory of ARC-AGI tasks.
-pub fn evaluate_directory(dir: &Path, config: &BeamConfig, max_tasks: Option<usize>) -> Vec<EvalResult> {
+pub fn evaluate_directory(
+    dir: &Path,
+    config: &BeamConfig,
+    max_tasks: Option<usize>,
+) -> Vec<EvalResult> {
     let mut paths: Vec<_> = std::fs::read_dir(dir)
         .expect("Cannot read directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "json"))
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
 
     paths.sort();
@@ -107,17 +126,35 @@ pub fn evaluate_directory(dir: &Path, config: &BeamConfig, max_tasks: Option<usi
         let result = solve_task(path, config);
         if result.solved {
             solved += 1;
-            println!("[{:3}/{}] {}: OK (depth={}, {}ms)",
-                i + 1, total, result.task_id, result.depth, result.time_ms);
+            println!(
+                "[{:3}/{}] {}: OK (depth={}, {}ms)",
+                i + 1,
+                total,
+                result.task_id,
+                result.depth,
+                result.time_ms
+            );
         } else {
-            println!("[{:3}/{}] {}: --  ({}ms)",
-                i + 1, total, result.task_id, result.time_ms);
+            println!(
+                "[{:3}/{}] {}: --  ({}ms)",
+                i + 1,
+                total,
+                result.task_id,
+                result.time_ms
+            );
         }
         results.push(result);
     }
 
-    let accuracy = if total > 0 { solved as f64 / total as f64 * 100.0 } else { 0.0 };
-    println!("\n===== RESULT: {}/{} ({:.1}%) =====", solved, total, accuracy);
+    let accuracy = if total > 0 {
+        solved as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "\n===== RESULT: {}/{} ({:.1}%) =====",
+        solved, total, accuracy
+    );
 
     results
 }

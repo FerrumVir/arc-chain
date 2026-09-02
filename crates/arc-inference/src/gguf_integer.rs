@@ -7,24 +7,33 @@
 //! Works for ANY model size - 1B, 8B, 70B - as long as the GGUF fits in RAM.
 
 #[cfg(feature = "candle")]
-use candle_core::{Device, Tensor};
-#[cfg(feature = "candle")]
 use candle_core::quantized::gguf_file;
+#[cfg(feature = "candle")]
+use candle_core::{Device, Tensor};
 
-use crate::integer_lut::*;
-use crate::integer_engine::*;
-use crate::cached_integer_model::{silu_i64, compute_rope_tables, apply_rope};
+// Everything these bring in is used only by the `candle`-gated GGUF loader
+// and forward pass below, so the imports are gated the same way.
 use crate::InferenceError;
+#[cfg(feature = "candle")]
+use crate::cached_integer_model::{apply_rope, compute_rope_tables, silu_i64};
+#[cfg(feature = "candle")]
+use crate::integer_engine::*;
+#[cfg(feature = "candle")]
+use crate::integer_lut::*;
 
 /// Convert an f32 tensor to i64 Q16 fixed-point.
 /// Deterministic: IEEE-754 round-to-nearest for values in typical weight range.
 #[cfg(feature = "candle")]
 fn tensor_to_i64(tensor: &Tensor) -> Result<Vec<i64>, InferenceError> {
-    let flat = tensor.flatten_all()
+    let flat = tensor
+        .flatten_all()
         .map_err(|e| InferenceError::Runtime(format!("Flatten: {e}")))?
         .to_vec1::<f32>()
         .map_err(|e| InferenceError::Runtime(format!("ToVec: {e}")))?;
-    Ok(flat.iter().map(|&x| (x * ONE as f32).round() as i64).collect())
+    Ok(flat
+        .iter()
+        .map(|&x| (x * ONE as f32).round() as i64)
+        .collect())
 }
 
 /// Extract a quantized tensor from GGUF, dequantize to f32, convert to i64 Q16.
@@ -35,9 +44,11 @@ fn extract_tensor(
     device: &Device,
     name: &str,
 ) -> Result<Vec<i64>, InferenceError> {
-    let qtensor = content.tensor(reader, name, device)
+    let qtensor = content
+        .tensor(reader, name, device)
         .map_err(|e| InferenceError::Runtime(format!("Tensor '{name}': {e}")))?;
-    let dequant = qtensor.dequantize(device)
+    let dequant = qtensor
+        .dequantize(device)
         .map_err(|e| InferenceError::Runtime(format!("Dequant '{name}': {e}")))?;
     tensor_to_i64(&dequant)
 }
@@ -61,7 +72,9 @@ fn get_meta_u32(content: &gguf_file::Content, key: &str) -> Result<u32, Inferenc
         Some(gguf_file::Value::U32(v)) => Ok(*v),
         Some(gguf_file::Value::U64(v)) => Ok(*v as u32),
         Some(gguf_file::Value::I32(v)) => Ok(*v as u32),
-        _ => Err(InferenceError::Runtime(format!("Missing GGUF metadata: {key}"))),
+        _ => Err(InferenceError::Runtime(format!(
+            "Missing GGUF metadata: {key}"
+        ))),
     }
 }
 
@@ -85,8 +98,8 @@ pub fn generate_integer_from_gguf(
     let device = Device::Cpu;
 
     // Parse GGUF
-    let mut reader = std::fs::File::open(path)
-        .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
+    let mut reader =
+        std::fs::File::open(path).map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
     let content = gguf_file::Content::read(&mut reader)
         .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
 
@@ -100,10 +113,13 @@ pub fn generate_integer_from_gguf(
     let n_layers = get_meta_u32(&content, &format!("{arch}.block_count"))? as usize;
     let d_model = get_meta_u32(&content, &format!("{arch}.embedding_length"))? as usize;
     let n_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count"))? as usize;
-    let n_kv_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count_kv")).unwrap_or(n_heads as u32) as usize;
+    let n_kv_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count_kv"))
+        .unwrap_or(n_heads as u32) as usize;
     let d_ff = get_meta_u32(&content, &format!("{arch}.feed_forward_length"))? as usize;
-    let vocab_size = content.tensor_infos.get("token_embd.weight")
-        .map(|t| t.shape.dims()[0] as usize)
+    let vocab_size = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .map(|t| t.shape.dims()[0])
         .unwrap_or(32000);
 
     // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
@@ -121,7 +137,13 @@ pub fn generate_integer_from_gguf(
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, _rope_base);
 
     tracing::info!(
-        n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, d_head,
+        n_layers,
+        d_model,
+        n_heads,
+        n_kv_heads,
+        d_ff,
+        vocab_size,
+        d_head,
         "GGUF integer engine: model config loaded"
     );
 
@@ -130,12 +152,18 @@ pub fn generate_integer_from_gguf(
     tracing::info!("Embeddings loaded: {} values", embedding.len());
 
     // Load output head + final norm
-    let output_weight = extract_tensor(&content, &mut reader, &device, "output.weight")
-        .or_else(|_| {
+    let output_weight =
+        extract_tensor(&content, &mut reader, &device, "output.weight").or_else(|_| {
             // Some models tie embeddings to output
             Ok(embedding.clone())
         })?;
-    let final_norm = extract_tensor_or_ones(&content, &mut reader, &device, "output_norm.weight", d_model);
+    let final_norm = extract_tensor_or_ones(
+        &content,
+        &mut reader,
+        &device,
+        "output_norm.weight",
+        d_model,
+    );
     let final_norm_beta = vec![0i64; d_model];
 
     // Attention scale: round(ONE / sqrt(d_head))
@@ -163,15 +191,62 @@ pub fn generate_integer_from_gguf(
             let prefix = format!("blk.{layer}");
 
             // Load layer weights as i64 (dequantized from Q4)
-            let wq = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.attn_q.weight"))?;
-            let wk = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.attn_k.weight"))?;
-            let wv = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.attn_v.weight"))?;
-            let wo = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.attn_output.weight"))?;
-            let w_gate = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.ffn_gate.weight"))?;
-            let w_up = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.ffn_up.weight"))?;
-            let w_down = extract_tensor(&content, &mut reader, &device, &format!("{prefix}.ffn_down.weight"))?;
-            let attn_norm = extract_tensor_or_ones(&content, &mut reader, &device, &format!("{prefix}.attn_norm.weight"), d_model);
-            let ffn_norm = extract_tensor_or_ones(&content, &mut reader, &device, &format!("{prefix}.ffn_norm.weight"), d_model);
+            let wq = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.attn_q.weight"),
+            )?;
+            let wk = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.attn_k.weight"),
+            )?;
+            let wv = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.attn_v.weight"),
+            )?;
+            let wo = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.attn_output.weight"),
+            )?;
+            let w_gate = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.ffn_gate.weight"),
+            )?;
+            let w_up = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.ffn_up.weight"),
+            )?;
+            let w_down = extract_tensor(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.ffn_down.weight"),
+            )?;
+            let attn_norm = extract_tensor_or_ones(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.attn_norm.weight"),
+                d_model,
+            );
+            let ffn_norm = extract_tensor_or_ones(
+                &content,
+                &mut reader,
+                &device,
+                &format!("{prefix}.ffn_norm.weight"),
+                d_model,
+            );
             let zero_beta = vec![0i64; d_model];
 
             // === Attention block ===
@@ -180,7 +255,8 @@ pub fn generate_integer_from_gguf(
             for pos in 0..seq_len {
                 normed.extend(layernorm_i64(
                     &hidden[pos * d_model..(pos + 1) * d_model],
-                    &attn_norm, &zero_beta,
+                    &attn_norm,
+                    &zero_beta,
                 ));
             }
 
@@ -199,13 +275,23 @@ pub fn generate_integer_from_gguf(
             for pos in 0..seq_len {
                 for h in 0..n_heads {
                     let q_start = pos * d_model + h * d_head;
-                    apply_rope(&mut all_q[q_start..q_start + d_head],
-                        pos, d_head, &rope_cos, &rope_sin);
+                    apply_rope(
+                        &mut all_q[q_start..q_start + d_head],
+                        pos,
+                        d_head,
+                        &rope_cos,
+                        &rope_sin,
+                    );
                 }
                 for h in 0..n_kv_heads {
                     let k_start = pos * d_kv + h * d_head;
-                    apply_rope(&mut all_k[k_start..k_start + d_head],
-                        pos, d_head, &rope_cos, &rope_sin);
+                    apply_rope(
+                        &mut all_k[k_start..k_start + d_head],
+                        pos,
+                        d_head,
+                        &rope_cos,
+                        &rope_sin,
+                    );
                 }
             }
 
@@ -237,7 +323,13 @@ pub fn generate_integer_from_gguf(
             // Output projection + residual
             let mut after_attn = Vec::with_capacity(seq_len * d_model);
             for pos in 0..seq_len {
-                let projected = matmul_i64(&wo, &[], &attn_out[pos * d_model..(pos + 1) * d_model], d_model, d_model);
+                let projected = matmul_i64(
+                    &wo,
+                    &[],
+                    &attn_out[pos * d_model..(pos + 1) * d_model],
+                    d_model,
+                    d_model,
+                );
                 for d in 0..d_model {
                     after_attn.push(hidden[pos * d_model + d] + projected[d]);
                 }
@@ -270,7 +362,12 @@ pub fn generate_integer_from_gguf(
             // Layer weights dropped here - memory freed
 
             if layer % 4 == 0 {
-                tracing::debug!("Layer {}/{} complete (step {})", layer + 1, n_layers, token_step);
+                tracing::debug!(
+                    "Layer {}/{} complete (step {})",
+                    layer + 1,
+                    n_layers,
+                    token_step
+                );
             }
         }
 
@@ -286,16 +383,23 @@ pub fn generate_integer_from_gguf(
         generated.push(next_token);
         all_tokens.push(next_token);
 
-        tracing::info!("Token {}: {} (step {}ms)", token_step, next_token, start.elapsed().as_millis());
+        tracing::info!(
+            "Token {}: {} (step {}ms)",
+            token_step,
+            next_token,
+            start.elapsed().as_millis()
+        );
 
-        if eos_tokens.contains(&next_token) { break; }
-        if start.elapsed().as_millis() as u64 > timeout_ms { break; }
+        if eos_tokens.contains(&next_token) {
+            break;
+        }
+        if start.elapsed().as_millis() as u64 > timeout_ms {
+            break;
+        }
     }
 
     // Compute output hash
-    let output_bytes: Vec<u8> = generated.iter()
-        .flat_map(|t| t.to_le_bytes())
-        .collect();
+    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
     let hash = arc_crypto::hash_bytes(&output_bytes);
 
     Ok((generated, hash))

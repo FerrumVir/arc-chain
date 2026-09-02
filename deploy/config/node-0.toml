@@ -1,21 +1,18 @@
-# ARC Chain Node Configuration - Validator 0 (Boot Node)
-# -----------------------------------------------------------------
-# Deployed to /etc/arc/config.toml on arc-node-0.
-# Peer addresses are populated by setup-testnet.sh after provisioning.
+# RETIRED V2 VALIDATOR TEMPLATE — NOT A DEPLOYABLE VALIDATOR CONFIGURATION.
+# An approved v3 manifest must supply a generated validator identity, artifact
+# checksum, canonical genesis hash, peer set, and explicit activation plan.
 
 [rpc]
-listen = "0.0.0.0:9944"
-eth_port = 8545
+listen = "127.0.0.1:0"
+eth_port = 0
 
 [p2p]
-port = 9945
-# Peers injected by setup-testnet.sh - node-0 is the boot node
-peers = ["__NODE_1_IP__:9945", "__NODE_2_IP__:9945", "__NODE_3_IP__:9945"]
+port = 0
+peers = []
 
 [validator]
-seed = "arc-validator-0"
-stake = 5_000_000
-min_stake = 500_000
+stake = 0
+min_stake = 0
 
 [storage]
-data_dir = "/var/lib/arc/data"
+data_dir = "/tmp/arc-retired-node-0"

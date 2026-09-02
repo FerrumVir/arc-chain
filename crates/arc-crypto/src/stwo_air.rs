@@ -40,14 +40,14 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::bit_reverse_coset_to_circle_domain_order;
-use stwo::core::verifier::verify;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::verifier::verify;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
+use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::{self as stwo_prover_mod, CommitmentSchemeProver};
 use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator, ORIGINAL_TRACE_IDX,
+    EvalAtRow, FrameworkComponent, FrameworkEval, ORIGINAL_TRACE_IDX, TraceLocationAllocator,
 };
 
 use num_traits::Zero;
@@ -146,7 +146,8 @@ pub fn u64_to_m31_limbs(value: u64) -> Result<(M31, M31), String> {
     if hi >= (1u32 << 31) - 1 {
         return Err(format!(
             "u64_to_m31_limbs: value {value} too large (hi={hi} >= M31 modulus). \
-             Max safe value: {}", (1u64 << 47) - (1u64 << 16) - 1
+             Max safe value: {}",
+            (1u64 << 47) - (1u64 << 16) - 1
         ));
     }
     Ok((M31::from(lo), M31::from(hi)))
@@ -287,18 +288,14 @@ impl FrameworkEval for ArcBlockWitnessEval {
         // ---------------------------------------------------------------
         // Constraint 2: has_transfer is boolean - has_transfer² - has_transfer = 0
         // ---------------------------------------------------------------
-        eval.add_constraint(
-            has_transfer.clone() * has_transfer.clone() - has_transfer.clone(),
-        );
+        eval.add_constraint(has_transfer.clone() * has_transfer.clone() - has_transfer.clone());
 
         // ---------------------------------------------------------------
         // Constraint 3: has_transfer implies active
         //   has_transfer · (1 - active) = 0
         //   i.e. if has_transfer=1 then active must be 1
         // ---------------------------------------------------------------
-        eval.add_constraint(
-            has_transfer.clone() - active.clone() * has_transfer.clone(),
-        );
+        eval.add_constraint(has_transfer.clone() - active.clone() * has_transfer.clone());
 
         // ---------------------------------------------------------------
         // Constraint 4 (x16): padding rows have zero hash limbs
@@ -315,9 +312,7 @@ impl FrameworkEval for ArcBlockWitnessEval {
         // ---------------------------------------------------------------
         eval.add_constraint(
             has_transfer.clone()
-                * (sender_after.clone() - sender_before.clone()
-                    + amount.clone()
-                    + fee.clone()),
+                * (sender_after.clone() - sender_before.clone() + amount.clone() + fee.clone()),
         );
 
         // ---------------------------------------------------------------
@@ -326,8 +321,7 @@ impl FrameworkEval for ArcBlockWitnessEval {
         //   i.e. recv_after = recv_before + amount
         // ---------------------------------------------------------------
         eval.add_constraint(
-            has_transfer.clone()
-                * (recv_after.clone() - recv_before.clone() - amount.clone()),
+            has_transfer.clone() * (recv_after.clone() - recv_before.clone() - amount.clone()),
         );
 
         // ---------------------------------------------------------------
@@ -335,8 +329,7 @@ impl FrameworkEval for ArcBlockWitnessEval {
         //   has_transfer · (nonce_after - nonce_before - 1) = 0
         // ---------------------------------------------------------------
         eval.add_constraint(
-            has_transfer.clone()
-                * (nonce_after.clone() - nonce_before.clone() - E::F::from(one)),
+            has_transfer.clone() * (nonce_after.clone() - nonce_before.clone() - E::F::from(one)),
         );
 
         // ---------------------------------------------------------------
@@ -347,22 +340,30 @@ impl FrameworkEval for ArcBlockWitnessEval {
         //   and the trace generator rejects underflow (u64 arithmetic),
         //   this witness proves sender had sufficient balance.
         // ---------------------------------------------------------------
-        eval.add_constraint(
-            has_transfer.clone() * (suf_bal_aux.clone() - sender_after.clone()),
-        );
+        eval.add_constraint(has_transfer.clone() * (suf_bal_aux.clone() - sender_after.clone()));
 
         // ---------------------------------------------------------------
         // Constraints 9–22 (x14): transfer columns zero when has_transfer=0
         //   col · (1 - has_transfer) = col - has_transfer · col = 0
         // ---------------------------------------------------------------
         let transfer_data_cols = [
-            sbb_lo, sbb_hi, sba_lo, sba_hi, rbb_lo, rbb_hi, rba_lo, rba_hi,
-            amt_lo, amt_hi, nonce_before, nonce_after, fee, suf_bal_aux,
+            sbb_lo,
+            sbb_hi,
+            sba_lo,
+            sba_hi,
+            rbb_lo,
+            rbb_hi,
+            rba_lo,
+            rba_hi,
+            amt_lo,
+            amt_hi,
+            nonce_before,
+            nonce_after,
+            fee,
+            suf_bal_aux,
         ];
         for col in &transfer_data_cols {
-            eval.add_constraint(
-                col.clone() - has_transfer.clone() * col.clone(),
-            );
+            eval.add_constraint(col.clone() - has_transfer.clone() * col.clone());
         }
 
         eval
@@ -447,7 +448,9 @@ fn dense_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PrePro
     use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
     ["dense_is_active", "dense_is_start", "dense_is_last"]
         .iter()
-        .map(|id| PreProcessedColumnId { id: (*id).to_string() })
+        .map(|id| PreProcessedColumnId {
+            id: (*id).to_string(),
+        })
         .collect()
 }
 
@@ -685,7 +688,9 @@ fn packed_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PrePr
     use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
     ["pk_is_active", "pk_is_start", "pk_is_last"]
         .iter()
-        .map(|id| PreProcessedColumnId { id: (*id).to_string() })
+        .map(|id| PreProcessedColumnId {
+            id: (*id).to_string(),
+        })
         .collect()
 }
 
@@ -731,7 +736,7 @@ impl FrameworkEval for PackedDenseEval {
         // running sum of this row's products
         let mut row_sum = p[0].clone();
         for item in p.iter().take(PACK_K).skip(1) {
-            row_sum = row_sum + item.clone();
+            row_sum += item.clone();
         }
 
         // 2. accumulation chain with per-neuron reset
@@ -837,7 +842,7 @@ pub fn generate_packed_trace(
                 cols[k][row] = w;
                 cols[PACK_K + k][row] = xv;
                 cols[2 * PACK_K + k][row] = prod;
-                row_sum = row_sum + prod;
+                row_sum += prod;
             }
             acc = if r == 0 { row_sum } else { acc + row_sum };
             cols[3 * PACK_K][row] = acc;
@@ -993,7 +998,10 @@ pub fn try_prove_dense_stark(
         ));
     }
     if input.len() < in_size {
-        return Err(format!("input too short: got {}, need {in_size}", input.len()));
+        return Err(format!(
+            "input too short: got {}, need {in_size}",
+            input.len()
+        ));
     }
     if output.len() < out_size {
         return Err(format!(
@@ -1002,7 +1010,10 @@ pub fn try_prove_dense_stark(
         ));
     }
     if !bias.is_empty() && bias.len() < out_size {
-        return Err(format!("bias too short: got {}, need {out_size}", bias.len()));
+        return Err(format!(
+            "bias too short: got {}, need {out_size}",
+            bias.len()
+        ));
     }
 
     let n_ops = out_size * in_size;
@@ -1088,13 +1099,17 @@ pub fn try_prove_dense_stark(
         for root in &commitment_roots {
             h.update(root);
         }
-        h.update(&(log_size as u32).to_le_bytes());
+        h.update(&log_size.to_le_bytes());
         h.update(&(out_size as u32).to_le_bytes());
         h.update(&(in_size as u32).to_le_bytes());
         h.update(&hash_i64(&weights[..in_size * out_size]));
         h.update(&hash_i64(&input[..in_size]));
         h.update(&hash_i64(&output[..out_size]));
-        h.update(&hash_i64(if bias.is_empty() { &[] } else { &bias[..out_size] }));
+        h.update(&hash_i64(if bias.is_empty() {
+            &[]
+        } else {
+            &bias[..out_size]
+        }));
         *h.finalize().as_bytes()
     };
 
@@ -1202,24 +1217,19 @@ pub fn generate_block_witness_trace(
         // Mark has_transfer
         transfer_cols[0][i] = M31::from(1u32);
 
-        let (sbb_lo, sbb_hi) = u64_to_m31_limbs(tw.sender_bal_before)
-            .expect("sender_bal_before overflow");
-        let (sba_lo, sba_hi) = u64_to_m31_limbs(tw.sender_bal_after)
-            .expect("sender_bal_after overflow");
-        let (rbb_lo, rbb_hi) = u64_to_m31_limbs(tw.receiver_bal_before)
-            .expect("receiver_bal_before overflow");
-        let (rba_lo, rba_hi) = u64_to_m31_limbs(tw.receiver_bal_after)
-            .expect("receiver_bal_after overflow");
-        let (amt_lo, amt_hi) = u64_to_m31_limbs(tw.amount)
-            .expect("amount overflow");
+        let (sbb_lo, sbb_hi) =
+            u64_to_m31_limbs(tw.sender_bal_before).expect("sender_bal_before overflow");
+        let (sba_lo, sba_hi) =
+            u64_to_m31_limbs(tw.sender_bal_after).expect("sender_bal_after overflow");
+        let (rbb_lo, rbb_hi) =
+            u64_to_m31_limbs(tw.receiver_bal_before).expect("receiver_bal_before overflow");
+        let (rba_lo, rba_hi) =
+            u64_to_m31_limbs(tw.receiver_bal_after).expect("receiver_bal_after overflow");
+        let (amt_lo, amt_hi) = u64_to_m31_limbs(tw.amount).expect("amount overflow");
         let nonce_before = M31::from(tw.sender_nonce_before);
         let nonce_after = M31::from(tw.sender_nonce_after);
         let fee_val = {
-            assert!(
-                tw.fee < (1u64 << 31),
-                "fee {} exceeds M31 max",
-                tw.fee
-            );
+            assert!(tw.fee < (1u64 << 31), "fee {} exceeds M31 max", tw.fee);
             M31::from(tw.fee as u32)
         };
 
@@ -1505,7 +1515,6 @@ pub fn verify_block_proof(input: &BlockProofInput, proof_data: &[u8]) -> bool {
     receipt.binding_hash == expected_binding
 }
 
-
 // ---------------------------------------------------------------------------
 // Recursive Verifier AIR - inner-circuit STARK recursion
 // ---------------------------------------------------------------------------
@@ -1584,9 +1593,10 @@ pub struct RecursiveVerifierInput {
 ///     `chain_valid_next * (end_state_limbs[j]_curr - start_state_limbs[j]_next) = 0`
 ///  6. (x16) Merkle structural consistency:
 ///     `active * (merkle_computed[j] - child_hash[j] - merkle_sibling[j]) = 0`
-///     (The computed Merkle node must be the "sum" of child hash and sibling in M31,
-///      representing the commitment to the hash preimage. The actual BLAKE3 is
-///      verified in the trace generator.)
+///
+///     The computed Merkle node must be the "sum" of child hash and sibling in M31,
+///     representing the commitment to the hash preimage. The actual BLAKE3 is
+///     verified in the trace generator.
 #[derive(Clone)]
 pub struct ArcRecursiveVerifierEval {
     pub log_size: u32,
@@ -1654,17 +1664,13 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
         // ---------------------------------------------------------------
         // Constraint 2: chain_valid is boolean - chain_valid^2 - chain_valid = 0
         // ---------------------------------------------------------------
-        eval.add_constraint(
-            chain_valid.clone() * chain_valid.clone() - chain_valid.clone(),
-        );
+        eval.add_constraint(chain_valid.clone() * chain_valid.clone() - chain_valid.clone());
 
         // ---------------------------------------------------------------
         // Constraint 3: chain_valid implies active
         //   chain_valid * (1 - active) = 0
         // ---------------------------------------------------------------
-        eval.add_constraint(
-            chain_valid.clone() - active.clone() * chain_valid.clone(),
-        );
+        eval.add_constraint(chain_valid.clone() - active.clone() * chain_valid.clone());
 
         // ---------------------------------------------------------------
         // Constraint 4 (x64): padding - all limb columns zero when active=0
@@ -2195,21 +2201,52 @@ mod tests {
         fn make_bench_input(n_diffs: usize) -> BlockProofInput {
             let h = 1u64;
             let h_bytes = h.to_le_bytes();
-            let block_hash = *blake3::Hasher::new_derive_key("b").update(&h_bytes).finalize().as_bytes();
-            let prev = *blake3::Hasher::new_derive_key("p").update(&h_bytes).finalize().as_bytes();
-            let post = *blake3::Hasher::new_derive_key("q").update(&h_bytes).finalize().as_bytes();
+            let block_hash = *blake3::Hasher::new_derive_key("b")
+                .update(&h_bytes)
+                .finalize()
+                .as_bytes();
+            let prev = *blake3::Hasher::new_derive_key("p")
+                .update(&h_bytes)
+                .finalize()
+                .as_bytes();
+            let post = *blake3::Hasher::new_derive_key("q")
+                .update(&h_bytes)
+                .finalize()
+                .as_bytes();
             let tx_hashes: Vec<[u8; 32]> = (0..n_diffs.max(1) as u32)
-                .map(|i| *blake3::Hasher::new().update(&i.to_le_bytes()).finalize().as_bytes())
+                .map(|i| {
+                    *blake3::Hasher::new()
+                        .update(&i.to_le_bytes())
+                        .finalize()
+                        .as_bytes()
+                })
                 .collect();
             let state_diffs: Vec<([u8; 32], [u8; 32], [u8; 32])> = (0..n_diffs as u32)
                 .map(|i| {
-                    let a = *blake3::Hasher::new_derive_key("a").update(&i.to_le_bytes()).finalize().as_bytes();
-                    let o = *blake3::Hasher::new_derive_key("o").update(&i.to_le_bytes()).finalize().as_bytes();
-                    let n = *blake3::Hasher::new_derive_key("n").update(&i.to_le_bytes()).finalize().as_bytes();
+                    let a = *blake3::Hasher::new_derive_key("a")
+                        .update(&i.to_le_bytes())
+                        .finalize()
+                        .as_bytes();
+                    let o = *blake3::Hasher::new_derive_key("o")
+                        .update(&i.to_le_bytes())
+                        .finalize()
+                        .as_bytes();
+                    let n = *blake3::Hasher::new_derive_key("n")
+                        .update(&i.to_le_bytes())
+                        .finalize()
+                        .as_bytes();
                     (a, o, n)
                 })
                 .collect();
-            BlockProofInput { height: h, block_hash, prev_state_root: prev, post_state_root: post, tx_hashes, state_diffs, transfers: vec![] }
+            BlockProofInput {
+                height: h,
+                block_hash,
+                prev_state_root: prev,
+                post_state_root: post,
+                tx_hashes,
+                state_diffs,
+                transfers: vec![],
+            }
         }
 
         let sizes = [1, 5, 10, 50, 100, 500, 1000];
@@ -2218,7 +2255,10 @@ mod tests {
         eprintln!("  ARC Chain STARK Benchmark: BLAKE3 Mock vs Stwo Circle STARK");
         eprintln!("  M4 Mac, release mode, Mersenne-31 field");
         eprintln!("======================================================================\n");
-        eprintln!("{:<14} {:>12} {:>12} {:>12} {:>10}", "State Diffs", "Mock (µs)", "Stwo (µs)", "Ratio", "Proof (B)");
+        eprintln!(
+            "{:<14} {:>12} {:>12} {:>12} {:>10}",
+            "State Diffs", "Mock (µs)", "Stwo (µs)", "Ratio", "Proof (B)"
+        );
         eprintln!("{}", "-".repeat(64));
 
         for &n in &sizes {
@@ -2242,8 +2282,15 @@ mod tests {
             }
             let stwo_us = t1.elapsed().as_micros() / stwo_iters as u128;
 
-            let ratio = if mock_us > 0 { format!("{:.0}x", stwo_us as f64 / mock_us as f64) } else { "N/A".into() };
-            eprintln!("{:<14} {:>12} {:>12} {:>12} {:>10}", n, mock_us, stwo_us, ratio, proof_size);
+            let ratio = if mock_us > 0 {
+                format!("{:.0}x", stwo_us as f64 / mock_us as f64)
+            } else {
+                "N/A".into()
+            };
+            eprintln!(
+                "{:<14} {:>12} {:>12} {:>12} {:>10}",
+                n, mock_us, stwo_us, ratio, proof_size
+            );
         }
 
         eprintln!("\nMock = BLAKE3 hash (no cryptographic proof of computation)");
@@ -2317,7 +2364,10 @@ mod tests {
         assert_eq!(proof_data.len(), proof_size);
 
         let valid = verify_block_proof(&input, &proof_data);
-        assert!(valid, "proof receipt should verify with stwo-icicle feature");
+        assert!(
+            valid,
+            "proof receipt should verify with stwo-icicle feature"
+        );
 
         // Tampered input should fail
         let mut bad_input = input.clone();
@@ -2365,11 +2415,11 @@ mod tests {
         let values: Vec<u64> = vec![
             0,
             1,
-            65535,          // max lo limb (lo = 0xFFFF)
-            65536,          // lo=0, hi=1
+            65535, // max lo limb (lo = 0xFFFF)
+            65536, // lo=0, hi=1
             1_000_000,
             1_000_000_000,
-            max_safe - 1,   // just below max safe
+            max_safe - 1, // just below max safe
         ];
         for &v in &values {
             let (lo, hi) = u64_to_m31_limbs(v).expect("test value overflow");
@@ -2482,7 +2532,10 @@ mod tests {
 
         // Verify transfer witness consistency before proving
         for tw in &input.transfers {
-            assert_eq!(tw.sender_bal_after, tw.sender_bal_before - tw.amount - tw.fee);
+            assert_eq!(
+                tw.sender_bal_after,
+                tw.sender_bal_before - tw.amount - tw.fee
+            );
             assert_eq!(tw.receiver_bal_after, tw.receiver_bal_before + tw.amount);
             assert_eq!(tw.sender_nonce_after, tw.sender_nonce_before + 1);
         }
@@ -2531,9 +2584,9 @@ mod tests {
         // Alice sends 500 tokens to Bob, paying 5 fee
         let transfer = TransferWitness {
             sender_bal_before: 10_000,
-            sender_bal_after: 9_495,   // 10_000 - 500 - 5
+            sender_bal_after: 9_495, // 10_000 - 500 - 5
             receiver_bal_before: 2_000,
-            receiver_bal_after: 2_500,  // 2_000 + 500
+            receiver_bal_after: 2_500, // 2_000 + 500
             amount: 500,
             sender_nonce_before: 7,
             sender_nonce_after: 8,
@@ -2768,7 +2821,8 @@ mod tests {
         // Verify state chain is valid
         for i in 0..input.child_end_states.len() - 1 {
             assert_eq!(
-                input.child_end_states[i], input.child_start_states[i + 1],
+                input.child_end_states[i],
+                input.child_start_states[i + 1],
                 "state chain should be continuous at index {}",
                 i
             );
@@ -2837,8 +2891,7 @@ mod tests {
         }
 
         // Step 3: Generate recursive STARK proof of the verification
-        let (recursive_proof_data, proof_size, proving_time_ms) =
-            prove_recursive(&recursive_input);
+        let (recursive_proof_data, proof_size, proving_time_ms) = prove_recursive(&recursive_input);
 
         assert!(proof_size > 0);
 
@@ -2863,5 +2916,4 @@ mod tests {
             proving_time_ms
         );
     }
-
 }

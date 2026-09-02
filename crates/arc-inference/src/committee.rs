@@ -7,7 +7,7 @@
 //! Security: With 10% malicious validators, P(corruption) = 0.018%.
 //!           With 20% malicious validators, P(corruption) = 0.47%.
 
-use arc_crypto::{hash_bytes, Hash256};
+use arc_crypto::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 
 /// Default committee size for Tier 2+ inference.
@@ -87,7 +87,7 @@ pub fn select_committee(
         .collect();
 
     // Sort by score (deterministic ordering)
-    candidates.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+    candidates.sort_by_key(|a| a.1.0);
 
     // Take top k
     let members: Vec<Hash256> = candidates.iter().take(k).map(|(addr, _)| *addr).collect();
@@ -131,12 +131,14 @@ pub fn aggregate_votes(
         std::collections::HashMap::new();
 
     for (_, output_hash) in &valid_votes {
-        let entry = vote_counts.entry(output_hash.0).or_insert((*output_hash, 0));
+        let entry = vote_counts
+            .entry(output_hash.0)
+            .or_insert((*output_hash, 0));
         entry.1 += 1;
     }
 
     // Check if any output_hash has sufficient agreement
-    for (_, (output_hash, count)) in &vote_counts {
+    for (output_hash, count) in vote_counts.values() {
         if *count >= committee.min_agreement {
             return CommitteeResult::Consensus {
                 output_hash: *output_hash,
@@ -239,11 +241,7 @@ mod tests {
         let committee = select_committee(&seed, &validators, 2, 7);
 
         let output = hash_bytes(b"correct-output");
-        let votes: Vec<_> = committee
-            .members
-            .iter()
-            .map(|m| (*m, output))
-            .collect();
+        let votes: Vec<_> = committee.members.iter().map(|m| (*m, output)).collect();
 
         match aggregate_votes(&committee, &votes) {
             CommitteeResult::Consensus { agreeing, .. } => {
