@@ -102,7 +102,7 @@ PRE_SECRET_COMMANDS = {
 REVIEWED_PRIVILEGED_PYTHON_SHA256 = {
     "7f2abec0d11ea6f177af1b7aa84a2982743f57bad66eda07d42d9c64357dc282",
     "dc5630726239b434b993c503a2463bab77c590ba24da1b906a77ea2f45dbdb9a",
-    "42463909bfd7ddd058150a548e37f4693841b67cabeeaf9e369196e8388dd9f3",
+    "4ba0f3b84e3e758e8757b4cf53c8c8a3f68843057425f8bb88cff90bd11028a8",
 }
 
 SECRET_COMMANDS = {
@@ -708,9 +708,9 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
             "            --batch --yes --no-symkey-cache --pinentry-mode loopback \\",
         )
         self.assert_secret_mutation_rejected(
-            "vault", "          /usr/bin/python3 -I - \"$plain_tar\" <<'PY'",
+            "vault", "          /usr/bin/python3 -I - \"$plain_tar\" \"$canonical_tar\" <<'PY'",
             "          python3 scripts/release/validate-validator-vault.py \"$plain_tar\"\n"
-            "          /usr/bin/python3 -I - \"$plain_tar\" <<'PY'",
+            "          /usr/bin/python3 -I - \"$plain_tar\" \"$canonical_tar\" <<'PY'",
         )
 
     def test_rejects_repository_code_in_token_step(self) -> None:
@@ -825,8 +825,8 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
     def test_rejects_expanding_or_changed_privileged_python_heredocs(self) -> None:
         self.assert_secret_mutation_rejected(
             "vault",
-            "/usr/bin/python3 -I - \"$plain_tar\" <<'PY'",
-            '/usr/bin/python3 -I - "$plain_tar" <<PY',
+            "/usr/bin/python3 -I - \"$plain_tar\" \"$canonical_tar\" <<'PY'",
+            '/usr/bin/python3 -I - "$plain_tar" "$canonical_tar" <<PY',
         )
         self.assert_secret_mutation_rejected(
             "vault",

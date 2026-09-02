@@ -120,7 +120,7 @@ jobs:
           }
 
       - id: rewrap
-        name: Inline-decrypt, metadata-validate, and public-key rewrap
+        name: Inline-decrypt, canonicalize, and public-key rewrap
         shell: bash
         env:
           EXPECTED_MAIN_SHA: ${{ needs.authorize.outputs.sha }}
@@ -166,6 +166,7 @@ jobs:
           restore_cert="$input_dir/operator-restore.cert.pem"
           cms_output="$output_dir/arc-validator-keys-v0.8.0.tar.cms"
           plain_tar="$work_dir/validator-vault.tar"
+          canonical_tar="$work_dir/validator-vault.canonical.tar"
           candidate_cms="$work_dir/validator-vault.tar.cms"
           keep_output=false
           clear_secret_material() {
@@ -253,57 +254,222 @@ jobs:
           unset passphrase
           /usr/bin/chmod 600 "$plain_tar"
 
-          # Isolated stdlib code validates metadata only. There is no checkout,
-          # import path, extraction, member read, or source-generated executable.
-          /usr/bin/python3 -I - "$plain_tar" <<'PY'
+          # Isolated stdlib code rewrites only verified, bounded in-memory
+          # payload slices. There is no checkout, import path, filesystem
+          # extraction, member-name output, or source-generated executable.
+          /usr/bin/python3 -I - "$plain_tar" "$canonical_tar" <<'PY'
           import pathlib, stat, sys, tarfile
+          import io, os, re, struct
           from pathlib import PurePosixPath
-          path = pathlib.Path(sys.argv[1])
-          info = path.lstat()
-          if path.is_symlink() or not stat.S_ISREG(info.st_mode) or \
-             not 0 < info.st_size <= 1024 * 1024 or info.st_size % 512:
-              raise SystemExit("decrypted archive is outside the bounded plain-tar contract")
-          names, folded = set(), set()
-          count = total = 0
-          try:
-              with tarfile.open(path, mode="r:") as archive:
+
+          MAX_SOURCE_BYTES = 1024 * 1024
+          MAX_MEMBERS = 64
+          MAX_INPUT_MEMBER_BYTES = 128 * 1024
+          MAX_INPUT_FILE_BYTES = 512 * 1024
+          MAX_KEY_BYTES = 16 * 1024
+          MAX_KEY_FILE_BYTES = 96 * 1024
+          MAX_PATH_BYTES = 192
+          MAX_PATH_DEPTH = 4
+          ALLOWED_TIMES = {"mtime", "atime", "ctime", "LIBARCHIVE.creationtime"}
+          FORBIDDEN_PAX = {"path", "linkpath", "size"}
+
+          def read_source(path):
+              flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(path, flags)
+              try:
+                  before = os.fstat(descriptor)
+                  if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or \
+                     before.st_mode & 0o7777 != 0o600 or \
+                     not 0 < before.st_size <= MAX_SOURCE_BYTES or before.st_size % 512:
+                      raise ValueError("source contract")
+                  chunks, remaining = [], before.st_size
+                  while remaining:
+                      chunk = os.read(descriptor, min(64 * 1024, remaining))
+                      if not chunk:
+                          raise ValueError("short source read")
+                      chunks.append(chunk)
+                      remaining -= len(chunk)
+                  if os.read(descriptor, 1):
+                      raise ValueError("source grew")
+                  after = os.fstat(descriptor)
+                  identity = lambda value: (
+                      value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+                      value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+                  )
+                  if identity(before) != identity(after):
+                      raise ValueError("source changed")
+                  return b"".join(chunks)
+              finally:
+                  os.close(descriptor)
+
+          def safe_path(name):
+              encoded = name.encode("utf-8", "strict")
+              pure = PurePosixPath(name)
+              if not encoded or len(encoded) > MAX_PATH_BYTES or \
+                 any(byte < 32 or byte == 127 for byte in encoded) or \
+                 pure.is_absolute() or "\\" in name or ":" in name or \
+                 any(part in ("", ".", "..") for part in pure.parts) or \
+                 len(pure.parts) > MAX_PATH_DEPTH:
+                  raise ValueError("unsafe member path")
+              return pure.as_posix(), pure.parts
+
+          def safe_pax(headers):
+              for key, value in headers.items():
+                  if key in FORBIDDEN_PAX or key.startswith("GNU.sparse."):
+                      raise ValueError("semantic PAX metadata")
+                  if key in ALLOWED_TIMES:
+                      if not isinstance(value, str) or len(value) > 32 or \
+                         re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?", value) is None:
+                          raise ValueError("invalid PAX timestamp")
+                      continue
+                  if key.startswith(("LIBARCHIVE.xattr.", "SCHILY.xattr.")):
+                      if len(key.encode("utf-8", "strict")) > 512 or \
+                         not isinstance(value, str) or \
+                         len(value.encode("utf-8", "surrogateescape")) > 16 * 1024:
+                          raise ValueError("invalid PAX xattr")
+                      continue
+                  raise ValueError("unsupported PAX metadata")
+
+          def is_appledouble(payload):
+              if len(payload) < 26:
+                  return False
+              magic, version = struct.unpack(">II", payload[:8])
+              count = struct.unpack(">H", payload[24:26])[0]
+              table_end = 26 + count * 12
+              if magic != 0x00051607 or version != 0x00020000 or \
+                 not 0 < count <= 32 or table_end > len(payload):
+                  return False
+              identifiers, spans = set(), []
+              for index in range(count):
+                  entry_id, offset, length = struct.unpack(
+                      ">III", payload[26 + index * 12:38 + index * 12]
+                  )
+                  if entry_id == 0 or entry_id in identifiers or \
+                     offset < table_end or offset > len(payload) or \
+                     length > len(payload) - offset:
+                      return False
+                  identifiers.add(entry_id)
+                  if length:
+                      spans.append((offset, offset + length))
+              spans.sort()
+              return all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+
+          def canonicalize(source, target):
+              if target == source or target.parent != source.parent:
+                  raise ValueError("output contract")
+              raw = read_source(source)
+              names, folded, records = set(), set(), {}
+              total_input = 0
+              with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+                  if archive.pax_headers:
+                      raise ValueError("global PAX metadata")
                   members = archive.getmembers()
-                  if not 0 < len(members) <= 64:
+                  if not 0 < len(members) <= MAX_MEMBERS:
                       raise ValueError("member count")
                   for member in members:
-                      name = member.name
-                      pure = PurePosixPath(name)
-                      if not name or len(name.encode("utf-8", "strict")) > 192 or \
-                         any(ord(c) < 32 or ord(c) == 127 for c in name) or \
-                         pure.is_absolute() or "\\" in name or ":" in name or \
-                         any(part in ("", ".", "..") for part in pure.parts) or len(pure.parts) > 4:
-                          raise ValueError("unsafe member path")
-                      normalized = pure.as_posix()
+                      normalized, parts = safe_path(member.name)
                       if normalized in names or normalized.casefold() in folded:
                           raise ValueError("duplicate member path")
-                      names.add(normalized); folded.add(normalized.casefold())
-                      if {"path", "linkpath", "size", "GNU.sparse.map", "GNU.sparse.name", "GNU.sparse.realsize"}.intersection(member.pax_headers):
-                          raise ValueError("path/size-changing PAX metadata")
+                      names.add(normalized)
+                      folded.add(normalized.casefold())
+                      safe_pax(member.pax_headers)
                       if member.isdir():
-                          if member.mode & 0o7777 not in (0o500, 0o700):
+                          if member.type != tarfile.DIRTYPE or \
+                             member.mode & 0o7777 not in (0o500, 0o700):
                               raise ValueError("non-private directory")
+                          records[normalized] = ("directory", parts, b"")
                           continue
-                      if not member.isfile() or member.issym() or member.islnk() or member.issparse():
+                      if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or \
+                         not member.isfile() or member.issym() or member.islnk() or member.issparse():
                           raise ValueError("non-regular vault member")
-                      if not 0 < member.size <= 128 * 1024 or member.mode & 0o7777 not in (0o400, 0o600):
+                      apple_metadata_candidate = parts[-1].startswith("._")
+                      private_modes = (0o400, 0o500, 0o600, 0o700) \
+                          if apple_metadata_candidate else (0o400, 0o600)
+                      if not 0 < member.size <= MAX_INPUT_MEMBER_BYTES or \
+                         member.mode & 0o7777 not in private_modes:
                           raise ValueError("unbounded or non-private vault member")
-                      count += 1; total += member.size
-                      if total > 512 * 1024:
-                          raise ValueError("aggregate size")
-          except (OSError, UnicodeError, tarfile.TarError, ValueError) as error:
-              raise SystemExit(f"validator vault metadata validation failed: {type(error).__name__}")
-          if count < 6:
-              raise SystemExit("validator vault contains fewer than six private files")
+                      start, end = member.offset_data, member.offset_data + member.size
+                      if not 0 <= start <= end <= len(raw):
+                          raise ValueError("member payload bounds")
+                      payload = raw[start:end]
+                      if len(payload) != member.size:
+                          raise ValueError("member payload size")
+                      total_input += len(payload)
+                      if total_input > MAX_INPUT_FILE_BYTES:
+                          raise ValueError("aggregate input size")
+                      records[normalized] = ("file", parts, payload)
+
+              regular_names = {name for name, row in records.items() if row[0] == "file"}
+              for name, (_, parts, _) in records.items():
+                  if any("/".join(parts[:depth]) in regular_names for depth in range(1, len(parts))):
+                      raise ValueError("file-directory hierarchy collision")
+
+              keys = []
+              for name, (kind, parts, payload) in records.items():
+                  if kind != "file":
+                      continue
+                  basename = parts[-1]
+                  if basename.startswith("._"):
+                      base_name = "/".join((*parts[:-1], basename[2:]))
+                      base = records.get(base_name)
+                      if not basename[2:] or base is None or \
+                         base[0] not in ("file", "directory") or \
+                         base[1][-1].startswith("._") or not is_appledouble(payload):
+                          raise ValueError("invalid AppleDouble metadata")
+                      continue
+                  if len(payload) > MAX_KEY_BYTES:
+                      raise ValueError("key size")
+                  keys.append((name, payload))
+
+              if len(keys) != 6 or sum(len(payload) for _, payload in keys) > MAX_KEY_FILE_BYTES:
+                  raise ValueError("key count or aggregate size")
+              output = io.BytesIO()
+              with tarfile.open(fileobj=output, mode="w:", format=tarfile.USTAR_FORMAT) as archive:
+                  for name, payload in sorted(keys, key=lambda row: row[0].encode("utf-8")):
+                      member = tarfile.TarInfo(name)
+                      member.type = tarfile.REGTYPE
+                      member.mode = 0o600
+                      member.uid = member.gid = 0
+                      member.uname = member.gname = ""
+                      member.mtime = 0
+                      member.size = len(payload)
+                      member.linkname = ""
+                      member.devmajor = member.devminor = 0
+                      member.pax_headers = {}
+                      archive.addfile(member, io.BytesIO(payload))
+              canonical = output.getvalue()
+              if not 0 < len(canonical) <= MAX_SOURCE_BYTES or len(canonical) % 512:
+                  raise ValueError("canonical tar bounds")
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | \
+                      getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+              descriptor = os.open(target, flags, 0o600)
+              try:
+                  os.fchmod(descriptor, 0o600)
+                  view = memoryview(canonical)
+                  while view:
+                      written = os.write(descriptor, view)
+                      if written <= 0:
+                          raise ValueError("canonical write")
+                      view = view[written:]
+                  os.fsync(descriptor)
+                  final = os.fstat(descriptor)
+                  if not stat.S_ISREG(final.st_mode) or final.st_nlink != 1 or \
+                     final.st_mode & 0o7777 != 0o600 or final.st_size != len(canonical):
+                      raise ValueError("canonical output contract")
+              finally:
+                  os.close(descriptor)
+
+          try:
+              if len(sys.argv) != 3:
+                  raise ValueError("argument contract")
+              canonicalize(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]))
+          except Exception as error:
+              raise SystemExit(f"validator vault canonicalization failed: {type(error).__name__}")
           PY
 
           /usr/bin/openssl cms -encrypt -binary -outform DER -aes-256-gcm \
             -recip "$restore_cert" -keyopt rsa_padding_mode:oaep \
-            -keyopt rsa_oaep_md:sha256 -in "$plain_tar" -out "$candidate_cms" 2>/dev/null
+            -keyopt rsa_oaep_md:sha256 -in "$canonical_tar" -out "$candidate_cms" 2>/dev/null
           [ -s "$candidate_cms" ] && [ ! -L "$candidate_cms" ]
           /usr/bin/chmod 600 "$candidate_cms"
           /usr/bin/ln -- "$candidate_cms" "$cms_output"

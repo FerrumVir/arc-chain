@@ -304,7 +304,8 @@ installer_and_updater_verify_checksums() {
 }
 
 release_manifest_has_owner_signature_and_preflight() {
-    local file
+    local allowed_signer file
+    allowed_signer="$(cat "$RELEASE_ALLOWED_SIGNERS")"
     for file in "$RELEASE_WORKFLOW" "$RELEASE_PREFLIGHT_WORKFLOW"; do
         [ -f "$file" ] || {
             printf 'release signing workflow is missing: %s\n' "$file"
@@ -323,6 +324,10 @@ release_manifest_has_owner_signature_and_preflight() {
                 return 1
             }
         done
+        [ "$(grep -Fc -- "$allowed_signer" "$file")" -eq 1 ] || {
+            printf 'release signing workflow %s differs from the checked-in manifest trust root\n' "$file"
+            return 1
+        }
     done
     for required in \
         'RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}' \
@@ -2030,6 +2035,7 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         'ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}' \
         'TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}' \
         'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}' \
+        '/usr/bin/printf '\''%s\n'\'' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"' \
         '/usr/bin/gpg' \
         '/usr/bin/ssh-keygen' \
         '/usr/bin/shred -u' \
@@ -2059,6 +2065,7 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         'decrypted archive membership differs from the four-file contract' \
         'shasum -a 256 -c KEY-SHA256SUMS' \
         'release/arc-release-allowed-signers' \
+        'awk '\''{print $3 " " $4}'\'' "$REPO_ROOT/release/arc-release-allowed-signers"' \
         'EXPECTED_CIPHERTEXT_SHA256' \
         'git -C "$REPO_ROOT" diff --quiet "$EXPECTED_MAIN_SHA"' \
         'ssh-keygen -Y sign' \
