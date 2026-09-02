@@ -34,7 +34,7 @@ esac
 [ -n "$PASSPHRASE" ] && [ "${#PASSPHRASE}" -ge 32 ] \
     || die 'ARC_SIGNING_BACKUP_PASSPHRASE must contain at least 32 characters'
 
-for command_name in cargo cmp git gpg npm python3 shasum ssh-keygen tar; do
+for command_name in awk cargo cmp git gpg npm python3 shasum ssh-keygen tar; do
     command -v "$command_name" >/dev/null 2>&1 \
         || die "required command is unavailable: $command_name"
 done
@@ -134,7 +134,7 @@ ssh-keygen -y -f "$WORK_DIR/restored/release-manifest-ed25519" \
     > "$WORK_DIR/derived-manifest.pub"
 cmp -s "$WORK_DIR/derived-manifest.pub" "$WORK_DIR/restored/release-manifest-ed25519.pub" \
     || die 'restored manifest private and public keys disagree'
-cut -d ' ' -f 3- "$REPO_ROOT/release/arc-release-allowed-signers" \
+awk '{print $3 " " $4}' "$REPO_ROOT/release/arc-release-allowed-signers" \
     > "$WORK_DIR/allowed-manifest.pub"
 cmp -s "$WORK_DIR/derived-manifest.pub" "$WORK_DIR/allowed-manifest.pub" \
     || die 'restored manifest key does not match the committed release trust root'

@@ -37,8 +37,19 @@ one_shot_workflow_is_exact_main_protected_and_create_only() {
         'ARC_VALIDATOR_VAULT_PASSPHRASE' \
         'ARC_VALIDATOR_VAULT_RESTORE_CERT_B64' \
         'This protected job never checks out repository content' \
-        'Inline-decrypt, metadata-validate, and public-key rewrap' \
-        '/usr/bin/python3 -I - "$plain_tar"' \
+        'Inline-decrypt, canonicalize, and public-key rewrap' \
+        '/usr/bin/python3 -I - "$plain_tar" "$canonical_tar"' \
+        'canonical_tar="$work_dir/validator-vault.canonical.tar"' \
+        '-in "$canonical_tar"' \
+        'tarfile.USTAR_FORMAT' \
+        'is_appledouble(payload)' \
+        'basename == "PUBLIC-INVENTORY.json"' \
+        'basename.endswith(".key")' \
+        'public inventory parent mismatch' \
+        'unexpected non-key vault member' \
+        'archive.pax_headers' \
+        'member.offset_data' \
+        'os.O_EXCL' \
         'clear_secret_material' \
         'Reconfirm protected main after every secret and plaintext is gone' \
         'trap cleanup EXIT' \
@@ -93,7 +104,7 @@ one_shot_workflow_is_exact_main_protected_and_create_only() {
     fi
 }
 
-rewrap_uses_the_recovered_profile_and_metadata_only_validation() {
+rewrap_uses_the_recovered_profile_and_safe_canonicalization() {
     for required in \
         'set +x' \
         'ulimit -c 0' \
@@ -126,6 +137,10 @@ rewrap_uses_the_recovered_profile_and_metadata_only_validation() {
     if grep -Eq 'tar[[:space:]]+(-t|--list|-x|--extract)|cat[[:space:]]+.*PLAIN|echo[^\n]*[$][{]?ARC_VALIDATOR_VAULT_PASSPHRASE' \
         "$REWRAP" "$WORKFLOW"; then
         printf 'validator-vault workflow can list/extract members or print secret material\n'
+        return 1
+    fi
+    if grep -Fq 'archive.extractfile' "$WORKFLOW"; then
+        printf 'protected validator-vault workflow reads members through tar extraction\n'
         return 1
     fi
     for required in \
@@ -219,8 +234,8 @@ python_archive_tests_pass() {
 
 run_test 'one-shot vault rewrap is exact-main, protected, least-privilege, and create-only' \
     one_shot_workflow_is_exact_main_protected_and_create_only
-run_test 'vault rewrap uses the recovered KDF and metadata-only tar validation' \
-    rewrap_uses_the_recovered_profile_and_metadata_only_validation
+run_test 'vault rewrap uses the recovered KDF and canonical safe-tar boundary' \
+    rewrap_uses_the_recovered_profile_and_safe_canonicalization
 run_test 'validator-vault safe-tar adversarial tests pass without member disclosure' \
     python_archive_tests_pass
 run_test 'fixture vault round-trips only through the operator CMS key and fails closed' \

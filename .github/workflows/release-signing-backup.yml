@@ -111,7 +111,9 @@ jobs:
           trap cleanup_keys EXIT HUP INT TERM
 
           /usr/bin/printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$tauri_key"
-          /usr/bin/printf '%s' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"
+          # GitHub secrets do not preserve a terminal newline reliably. OpenSSH
+          # private keys require one; without it ssh-keygen fails in libcrypto.
+          /usr/bin/printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"
           /usr/bin/chmod 600 "$tauri_key" "$manifest_key"
 
           unset TAURI_SIGNING_PRIVATE_KEY ARC_RELEASE_MANIFEST_PRIVATE_KEY

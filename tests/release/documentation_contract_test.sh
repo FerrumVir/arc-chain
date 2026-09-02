@@ -10,6 +10,7 @@ README="$REPO_ROOT/README.md"
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 HEADLESS="$REPO_ROOT/docs/HEADLESS_INSTALL.md"
 WALKTHROUGH="$REPO_ROOT/docs/COMMUNITY-NODE-WALKTHROUGH.md"
+SCRIPTS_README="$REPO_ROOT/scripts/README.md"
 ROLLOUT="$REPO_ROOT/docs/VALIDATOR-FLEET-ROLLOUT.md"
 RECOVERY_README="$REPO_ROOT/scripts/recovery/README.md"
 ARCHIVE_TOOL="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
@@ -117,7 +118,7 @@ candidate_install_commands_are_exact_and_honest() {
     else
         installer_sha="$(shasum -a 256 "$REPO_ROOT/install.sh" | awk '{print $1}')"
     fi
-    for file in "$README" "$HEADLESS" "$WALKTHROUGH"; do
+    for file in "$README" "$HEADLESS" "$WALKTHROUGH" "$SCRIPTS_README"; do
         require_literal "$file" "$exact_url" \
             'candidate install guide does not download the exact installer tag' || return 1
         require_literal "$file" "--version $CANDIDATE_VERSION" \

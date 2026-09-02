@@ -84,7 +84,7 @@ commands below are release-shape examples, not a claim that GitHub's current
 ```bash
 # Example only after the v0.8.0 release is explicitly approved and published:
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=903c97d309ecd2ae22cfe87fa88e9a4dcb8ec8331aa0b7c8503148071de35ee4
+ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -182,7 +182,7 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 ```bash
 # Only after v0.8.0 is explicitly approved and published:
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=903c97d309ecd2ae22cfe87fa88e9a4dcb8ec8331aa0b7c8503148071de35ee4
+ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
