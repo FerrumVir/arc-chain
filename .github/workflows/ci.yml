@@ -57,7 +57,7 @@ jobs:
         run: bash tests/release/run.sh
       - name: ShellCheck release/install scripts
         run: |
-          shellcheck \
+          shellcheck -S warning \
             install.sh \
             scripts/install-community-node.sh \
             scripts/install-node.sh \
@@ -66,9 +66,9 @@ jobs:
             scripts/release/assemble-release.sh
           # Contract tests intentionally single-quote literal shell/GitHub
           # expressions and source fixture-selected helpers. Keep production
-          # scripts on ShellCheck's full policy while suppressing only those
-          # two inapplicable diagnostics in the test harness.
-          shellcheck --exclude=SC1090,SC2016 \
+          # scripts on the blocking warning/error policy while suppressing only
+          # those two inapplicable diagnostics in the test harness.
+          shellcheck -S warning --exclude=SC1090,SC2016 \
             tests/release/*.sh \
             tests/release/helpers/*.sh \
             tests/integration/*.sh

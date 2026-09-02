@@ -1076,6 +1076,52 @@ nondefault_release_features_have_distinct_blocking_statuses() {
     fi
 }
 
+shellcheck_gates_share_the_blocking_warning_policy() {
+    local release_contract_block shellcheck_block
+    local release_command_count release_warning_count
+    local shellcheck_command_count shellcheck_warning_count
+    release_contract_block="$(awk '
+        /^  release-contract:/ { capture=1 }
+        capture { print }
+        capture && /^  secret-scan:/ { exit }
+    ' "$CI_WORKFLOW")"
+    shellcheck_block="$(awk '
+        /^  shellcheck:/ { capture=1 }
+        capture { print }
+        capture && /^  forge:/ { exit }
+    ' "$CI_WORKFLOW")"
+
+    release_command_count="$(printf '%s\n' "$release_contract_block" \
+        | grep -Ec '^[[:space:]]*shellcheck[[:space:]]' || true)"
+    release_warning_count="$(printf '%s\n' "$release_contract_block" \
+        | grep -Ec '^[[:space:]]*shellcheck -S warning([[:space:]]|$)' || true)"
+    if [ "$release_command_count" -ne 2 ] || [ "$release_warning_count" -ne 2 ]; then
+        printf 'release contract must run exactly two warning/error ShellCheck commands (commands=%s warning-policy=%s)\n' \
+            "$release_command_count" "$release_warning_count"
+        return 1
+    fi
+
+    shellcheck_command_count="$(printf '%s\n' "$shellcheck_block" \
+        | grep -Ec '^[[:space:]]*shellcheck[[:space:]]' || true)"
+    shellcheck_warning_count="$(printf '%s\n' "$shellcheck_block" \
+        | grep -Ec '^[[:space:]]*shellcheck -S warning([[:space:]]|$)' || true)"
+    if [ "$shellcheck_command_count" -ne 2 ] || [ "$shellcheck_warning_count" -ne 1 ]; then
+        printf 'protected ShellCheck job must version-check once and run one warning/error lint command (commands=%s warning-policy=%s)\n' \
+            "$shellcheck_command_count" "$shellcheck_warning_count"
+        return 1
+    fi
+
+    grep -Fq 'shellcheck -S warning "${files[@]}"' "$QUALITY_HARNESS" || {
+        printf 'local quality harness does not mirror the blocking warning/error ShellCheck policy\n'
+        return 1
+    }
+    if printf '%s\n%s\n' "$release_contract_block" "$shellcheck_block" \
+        | grep -Eq 'continue-on-error:[[:space:]]*true'; then
+        printf 'a blocking ShellCheck gate is advisory\n'
+        return 1
+    fi
+}
+
 updater_signatures_are_verified_against_the_embedded_key() {
     local fixture_bin target_dir valid_key wrong_key
     for required in \
@@ -2207,6 +2253,7 @@ run_test 'release golden vectors cover Linux x86/ARM, both Macs, and Windows' cr
 run_test 'branch golden vectors prove manifest verification on every installer OS' branch_golden_vectors_prove_manifest_verification_on_every_os
 run_test 'workspace compile and library tests block on Linux, Mac, and Windows' cross_os_workspace_tests_are_blocking
 run_test 'Candle and benchmark-tools have distinct protected statuses mirrored locally' nondefault_release_features_have_distinct_blocking_statuses
+run_test 'all ShellCheck gates share the blocking warning/error policy' shellcheck_gates_share_the_blocking_warning_policy
 run_test 'updater signatures verify against the embedded key and reject rotation' updater_signatures_are_verified_against_the_embedded_key
 run_test 'signing and publishing require the owner-protected release environment' release_secret_jobs_require_the_owner_environment
 run_test 'publisher pins one validated commit, rechecks the tag, and refuses release replacement' publish_is_pinned_to_one_validated_commit_and_create_only
