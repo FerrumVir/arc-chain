@@ -2371,8 +2371,10 @@ epoch, set, domain, validator-set commitment, and amount agreement.
   rollout/ordinal-derived `--recovery-probe-id`, proves receipt 1 mined, then
   invokes ordinal 2. It never submits both at once.
 
-For the production GO gate, use the repository probe rather than policy-only
-mode. It first requires an issuance-ready validator that sees an eligible
+For the production GO gate, the manifest validator requires the staged,
+SHA-pinned repository probe with the exact one-token argv; policy-only mode,
+fixed receipts, a foreign probe path/hash, or a different token count is
+rejected before plan/GO. The probe first requires an issuance-ready validator that sees an eligible
 full-model worker, submits one real one-token `/inference/run`, and refuses to
 emit evidence unless the response proves community routing, the canonical
 per-row INT8 execution profile, authenticated 2-of-3 verification for every

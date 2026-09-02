@@ -54,6 +54,19 @@
               "source_snapshot", "source_wal", "caddy"
             ]
           },
+          "checks": {
+            "properties": {
+              "reward": {
+                "required": ["probe_argv", "probe_sha256", "expected_reward_base"],
+                "properties": {
+                  "mode": { "const": "receipt" },
+                  "expect_protocol_active": { "const": true },
+                  "expect_issuance_ready": { "const": true }
+                },
+                "not": { "required": ["receipts"] }
+              }
+            }
+          },
           "validators": {
             "items": {
               "required": [

@@ -502,6 +502,25 @@ pub fn create_private_directory_tree(path: &Path) -> io::Result<()> {
                     ),
                 ));
             }
+            // On Windows, `Path::components` deliberately preserves dot
+            // segments following a verbatim (`\\?\`) prefix as `Normal`
+            // components.  Canonicalized temporary and operator paths use
+            // that prefix, so checking only `ParentDir` would let a lexical
+            // `..` reach the namespace walk and mutate a sibling before the
+            // caller is rejected.  Dot names are filesystem syntax rather
+            // than valid leaf names on every supported platform; reject both
+            // representations before inspecting or creating anything.
+            std::path::Component::Normal(value)
+                if value == std::ffi::OsStr::new(".") || value == std::ffi::OsStr::new("..") =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "private directory path must not contain dot segments: {}",
+                        path.display()
+                    ),
+                ));
+            }
             _ => normalized.push(component.as_os_str()),
         }
     }
@@ -1899,7 +1918,9 @@ mod tests {
         let requested = root.0.join("missing").join("..").join("target");
         #[cfg(unix)]
         let before = std::fs::metadata(&root.0).unwrap().permissions();
-        assert!(create_private_directory_tree(&requested).is_err());
+        let error = create_private_directory_tree(&requested)
+            .expect_err("parent traversal must fail before filesystem mutation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!root.0.join("missing").exists());
         assert!(!root.0.join("target").exists());
         #[cfg(unix)]

@@ -156,6 +156,19 @@ class ManifestFixture:
                 ],
                 "expected_reward_base": 2_500_000_000,
             }
+        elif production:
+            reward = {
+                "mode": "receipt",
+                "expect_protocol_active": True,
+                "expect_issuance_ready": True,
+                "probe_argv": [
+                    artifacts["reward_probe"]["path"],
+                    "--max-tokens",
+                    "1",
+                ],
+                "probe_sha256": artifacts["reward_probe"]["sha256"],
+                "expected_reward_base": 2_500_000_000,
+            }
         gateway = {"mode": "none"}
         if production:
             gateway = {
@@ -535,6 +548,19 @@ class RecoveryRolloutTests(unittest.TestCase):
             "reward_base": 2_500_000_000,
             "reward_arc": 2.5,
         }
+
+    @staticmethod
+    def two_receipt_evidence() -> list[rollout.ReceiptEvidence]:
+        return [
+            rollout.ReceiptEvidence.from_value(
+                {
+                    "tx_hash": "0x" + tx * 64,
+                    "job_id": "0x" + job * 64,
+                    "worker": "0x" + "c" * 64,
+                }
+            )
+            for tx, job in (("a", "b"), ("d", "e"))
+        ]
 
     @staticmethod
     def reward_earnings(worker, rows, **overrides):
@@ -2415,6 +2441,41 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, r"exactly source_height \+ 1"):
             rollout.validate_manifest(wrong_boundary)
 
+    def test_production_manifest_requires_sealed_real_inference_reward_probe(self) -> None:
+        valid = self.fixture(production=True)
+        self.assertIs(rollout.validate_manifest(valid), valid)
+
+        policy_only = copy.deepcopy(valid)
+        policy_only["checks"]["reward"] = {
+            "mode": "policy",
+            "expect_protocol_active": False,
+            "expect_issuance_ready": False,
+        }
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "production requires receipt reward mode"
+        ):
+            rollout.validate_manifest(policy_only)
+
+        fixed_receipts = self.fixture(production=True, reward_receipt=True)
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "production requires the sealed real-inference probe"
+        ):
+            rollout.validate_manifest(fixed_receipts)
+
+        multi_token = copy.deepcopy(valid)
+        multi_token["checks"]["reward"]["probe_argv"][-1] = "2"
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "exactly bind the staged probe and one-token canary"
+        ):
+            rollout.validate_manifest(multi_token)
+
+        foreign_probe = copy.deepcopy(valid)
+        foreign_probe["checks"]["reward"]["probe_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "must equal the staged reward-probe artifact"
+        ):
+            rollout.validate_manifest(foreign_probe)
+
     def test_manifest_seals_a_legacy_public_height_not_below_source(self) -> None:
         valid = self.fixture()
         self.assertEqual(valid["chain"]["legacy_public_max_height"], 110)
@@ -4087,6 +4148,7 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
     def test_frontend_config_binds_source_boundary_domain_and_all_six_v3_replicas(self) -> None:
         value = self.fixture(production=True)
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        reward_evidence = self.two_receipt_evidence()
         config = harness.frontend_config()
         checkpoint = config["checkpoint"]
         self.assertEqual(checkpoint["height"], value["chain"]["source_height"])
@@ -4268,23 +4330,28 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
         blocked = self.root / "frontend.blocked.json"
         harness.verify_live = mock.Mock(side_effect=rollout.RolloutError("height gate pending"))
         with self.assertRaisesRegex(rollout.RolloutError, "height gate pending"):
-            rollout.write_frontend_config(harness, blocked)
+            rollout.write_frontend_config(
+                harness, blocked, reward_evidence=reward_evidence
+            )
         self.assertFalse(blocked.exists())
         self.assertFalse(Path(str(blocked) + ".sha256").exists())
 
         output = self.root / "frontend.lock.json"
         harness.verify_live = mock.Mock()
-        digest_value = rollout.write_frontend_config(harness, output)
-        harness.verify_live.assert_called_once_with(None)
+        digest_value = rollout.write_frontend_config(
+            harness, output, reward_evidence=reward_evidence
+        )
+        harness.verify_live.assert_called_once_with(reward_evidence)
         self.assertEqual(digest_value, digest(output))
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
         self.assertEqual(stat.S_IMODE(Path(str(output) + ".sha256").stat().st_mode), 0o444)
         with self.assertRaisesRegex(rollout.RolloutError, "refusing replacement"):
             rollout.write_frontend_config(harness, output)
-        harness.verify_live.assert_called_once_with(None)
+        harness.verify_live.assert_called_once_with(reward_evidence)
 
     def test_finalized_archive_files_derive_safe_path_fork_sources(self) -> None:
         value = self.fixture(production=True)
+        reward_evidence = self.two_receipt_evidence()
         value["archive"]["prearchive_rollout_sha256"] = "c" * 64
         rows = [
             {
@@ -4434,6 +4501,7 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
             output,
             archive_manifest_path=archive_path,
             archive_complete_path=complete_path,
+            reward_evidence=reward_evidence,
         )
         config = json.loads(output.read_text())
         fork = [source for source in config["sources"] if source["kind"] == "legacy-fork"]
@@ -4721,6 +4789,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
 
     def test_frontend_config_can_fully_verify_and_fetch_archive_metadata(self) -> None:
         value = self.fixture(production=True)
+        reward_evidence = self.two_receipt_evidence()
         value["archive"].update(
             {
                 "complete_sha256": "1" * 64,
@@ -4745,7 +4814,9 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             side_effect=lambda evidence: events.append("live-verified")
         )
         output = self.root / "auto-fetched-frontend.json"
-        rollout.write_frontend_config(harness, output)
+        rollout.write_frontend_config(
+            harness, output, reward_evidence=reward_evidence
+        )
         self.assertEqual(
             events, ["archive-verified", "metadata-loaded", "live-verified"]
         )
@@ -4756,12 +4827,15 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                 harness,
                 self.root / "one-sided-archive-input.json",
                 archive_manifest_path=self.root / "only-manifest.json",
+                reward_evidence=reward_evidence,
             )
 
         bad_root_output = self.root / "bad-archive-root-frontend.json"
         harness.verify_production_archive = mock.Mock(return_value="9" * 64)
         with self.assertRaisesRegex(rollout.RolloutError, "different finalized root"):
-            rollout.write_frontend_config(harness, bad_root_output)
+            rollout.write_frontend_config(
+                harness, bad_root_output, reward_evidence=reward_evidence
+            )
         self.assertFalse(bad_root_output.exists())
 
     def test_archive_metadata_reads_are_binary_and_bounded_before_parsing(self) -> None:
@@ -5285,13 +5359,18 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
     def test_success_terminal_is_strict_and_mutually_exclusive(self) -> None:
         value = self.fixture(production=True)
         rollback_root = self.root / "success-terminal"
+        reward_output = self.root / "success-reward-evidence.json"
         baseline = {
             f"{service}_{state}": False
             for service in ("validator", "gateway", "filter", "interlock", "archive", "nginx")
             for state in ("active", "enabled")
         }
         harness = rollout.RecoveryRollout(
-            value, "d" * 64, output=io.StringIO(), rollback_journal=rollback_root
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
         )
         harness.production_service_baseline = {
             node["name"]: dict(baseline) for node in value["validators"]
@@ -5300,6 +5379,12 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             node["name"]: {"80": 0, "443": 0} for node in value["validators"]
         }
         harness.reserve_rollback_journal()
+        evidence = self.two_receipt_evidence()
+        harness.reserve_reward_evidence_output()
+        self.persist_reward_baseline(harness, evidence[0].worker)
+        harness.persist_reward_evidence_progress(evidence[:1])
+        harness.persist_reward_evidence_progress(evidence)
+        reward_sha256 = harness.persist_reward_evidence(evidence)
         gate_payload = rollout.canonical_bytes(
             {
                 "schema": "arc.recovery.public-gate-open-receipt.v1",
@@ -5345,15 +5430,20 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             tls_receipt.chmod(0o400)
         harness._write_production_success_receipt()
         resumed = rollout.RecoveryRollout(
-            value, "d" * 64, output=io.StringIO(), rollback_journal=rollback_root
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
         )
         self.assertEqual(resumed.reserve_rollback_journal(), "success")
         success = json.loads(
             (rollback_root / "SUCCESS-RECEIPT.json").read_text(encoding="utf-8")
         )
         self.assertEqual(
-            success["schema"], "arc.recovery.production-rollout-success.v2"
+            success["schema"], "arc.recovery.production-rollout-success.v3"
         )
+        self.assertEqual(success["reward_evidence_sha256"], reward_sha256)
         self.assertEqual(
             success["public_tls_preflight_evidence_sha256"],
             digest(rollback_root / "PUBLIC-TLS-PREFLIGHT-EVIDENCE.json"),
@@ -5363,11 +5453,79 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             digest(rollback_root / "PUBLIC-TLS-POST-ROLLOUT-EVIDENCE.json"),
         )
 
+        reward_payload = reward_output.read_bytes()
+        reward_sidecar = reward_output.with_name(reward_output.name + ".sha256")
+        sidecar_payload = reward_sidecar.read_bytes()
+
+        reward_output.unlink()
+        missing = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "cannot open production reward evidence"
+        ):
+            missing.reserve_rollback_journal()
+        reward_output.write_bytes(reward_payload)
+        reward_output.chmod(0o444)
+
+        reward_output.chmod(0o600)
+        reward_output.write_bytes(reward_payload + b" ")
+        reward_output.chmod(0o444)
+        tampered = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "production reward evidence differs"
+        ):
+            tampered.reserve_rollback_journal()
+        reward_output.chmod(0o600)
+        reward_output.write_bytes(reward_payload)
+        reward_output.chmod(0o444)
+
+        reward_sidecar.chmod(0o600)
+        reward_sidecar.write_bytes(b"0" * len(sidecar_payload))
+        reward_sidecar.chmod(0o444)
+        wrong_sidecar = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "production reward evidence sidecar differs"
+        ):
+            wrong_sidecar.reserve_rollback_journal()
+        reward_sidecar.chmod(0o600)
+        reward_sidecar.write_bytes(sidecar_payload)
+        reward_sidecar.chmod(0o444)
+
+        exact_again = rollout.RecoveryRollout(
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
+        )
+        self.assertEqual(exact_again.reserve_rollback_journal(), "success")
+
         contradictory = rollback_root / "ROLLBACK-RECEIPT.json"
         contradictory.write_bytes(rollout.canonical_bytes({"complete": True}))
         contradictory.chmod(0o400)
         ambiguous = rollout.RecoveryRollout(
-            value, "d" * 64, output=io.StringIO(), rollback_journal=rollback_root
+            value,
+            "d" * 64,
+            output=io.StringIO(),
+            rollback_journal=rollback_root,
+            reward_evidence_output=reward_output,
         )
         with self.assertRaisesRegex(rollout.RolloutError, "mutually exclusive"):
             ambiguous.reserve_rollback_journal()

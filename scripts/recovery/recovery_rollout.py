@@ -1438,6 +1438,25 @@ def validate_manifest(
         forbidden = set(reward) & {"probe_argv", "probe_sha256", "receipts", "expected_reward_base"}
         if forbidden:
             fail(f"policy reward mode cannot contain: {', '.join(sorted(forbidden))}")
+    if mode == "production":
+        expected_probe = artifacts["reward_probe"]
+        expected_probe_argv = [expected_probe["path"], "--max-tokens", "1"]
+        if reward["mode"] != "receipt":
+            fail(
+                "production requires receipt reward mode with the sealed real-inference probe"
+            )
+        if "probe_argv" not in reward or "receipts" in reward:
+            fail(
+                "production requires the sealed real-inference probe, not fixed reward receipts"
+            )
+        if reward["probe_argv"] != expected_probe_argv:
+            fail(
+                "production reward probe argv must exactly bind the staged probe and one-token canary"
+            )
+        if reward["probe_sha256"] != expected_probe["sha256"]:
+            fail(
+                "production reward probe sha256 must equal the staged reward-probe artifact"
+            )
 
     gateway = require_keys(
         manifest["gateway"],
@@ -4939,6 +4958,7 @@ class RecoveryRollout:
         self.reward_evidence_reservation: tuple[int, int] | None = None
         self.existing_reward_evidence: list[ReceiptEvidence] | None = None
         self.reward_evidence_progress: list[ReceiptEvidence] = []
+        self.final_reward_evidence_sha256: str | None = None
         self.reward_earnings_baselines: dict[str, RewardEarningsBaseline] = {}
         self.reward_earnings_baseline: RewardEarningsBaseline | None = None
         self.rollback_journal = rollback_journal
@@ -5210,6 +5230,57 @@ class RecoveryRollout:
             return payload
         finally:
             os.close(fd)
+
+    def _validate_finalized_reward_evidence(
+        self, expected_sha256: str
+    ) -> str:
+        """Re-prove the immutable receipt bundle and its exact sidecar read-only."""
+
+        if self.checks["reward"]["mode"] != "receipt":
+            fail("finalized reward-evidence validation is receipt-mode only")
+        if self.reward_evidence_output is None:
+            fail("production success requires --reward-evidence-output")
+        output = self.reward_evidence_output
+        if output.suffix != ".json":
+            fail("reward evidence output must end in .json")
+        digest = bare_hash(expected_sha256, "production reward evidence sha256")
+        payload = self._validate_operator_file(
+            output,
+            digest,
+            "production reward evidence",
+            modes={0o444},
+            owners={os.geteuid()},
+            nlink=1,
+            maximum=REWARD_EVIDENCE_MAX_BYTES,
+        )
+        sidecar = output.with_name(output.name + ".sha256")
+        expected_sidecar = f"{digest}  {output.name}\n".encode("ascii")
+        sidecar_payload = self._validate_operator_file(
+            sidecar,
+            sha256_bytes(expected_sidecar),
+            "production reward evidence sidecar",
+            modes={0o444},
+            owners={os.geteuid()},
+            nlink=1,
+            maximum=1024,
+        )
+        if sidecar_payload != expected_sidecar:
+            fail("production reward evidence sidecar does not bind the exact JSON")
+        bundle = parse_reward_evidence_payload(payload, self.digest)
+        evidence = list(bundle.receipts)
+        if (
+            self.existing_reward_evidence is not None
+            and self.existing_reward_evidence != evidence
+        ):
+            fail("production reward evidence differs from the in-process receipts")
+        self.existing_reward_evidence = evidence
+        self.reward_evidence_progress = list(evidence)
+        self.reward_earnings_baseline = bundle.earnings_baseline
+        self.reward_earnings_baselines = {
+            bundle.earnings_baseline.worker: bundle.earnings_baseline
+        }
+        self.final_reward_evidence_sha256 = digest
+        return digest
 
     def configure_production_transport(self) -> None:
         """Freeze every production transport input into one non-inheriting contract."""
@@ -5729,7 +5800,8 @@ class RecoveryRollout:
                 "quarantine_retirement_receipt_sha256",
                 "gateway_security_receipt_sha256",
                 "public_tls_preflight_evidence_sha256",
-                "public_tls_post_rollout_evidence_sha256", "validators",
+                "public_tls_post_rollout_evidence_sha256",
+                "reward_evidence_sha256", "validators",
             ),
         )
         if self.rollback_journal is None:
@@ -5743,7 +5815,7 @@ class RecoveryRollout:
             for node in self.validators
         ]
         if (
-            receipt["schema"] != "arc.recovery.production-rollout-success.v2"
+            receipt["schema"] != "arc.recovery.production-rollout-success.v3"
             or receipt["rollout_manifest_sha256"] != self.digest
             or receipt["archive_manifest_sha256"]
             != self.manifest["archive"]["archive_manifest_sha256"]
@@ -5754,6 +5826,9 @@ class RecoveryRollout:
             or receipt["preservation_policy"]
             != "data-history-artifacts-configs-logs-preserved-no-deletion"
             or receipt["validators"] != expected_rows
+            or not LOWER_HEX_32_RE.fullmatch(
+                str(receipt["reward_evidence_sha256"])
+            )
             or sha256_bytes((self.rollback_journal / "HEADER.json").read_bytes())
             != receipt["header_sha256"]
             or not (self.rollback_journal / "PUBLIC-GATE-OPEN-RECEIPT.json").is_file()
@@ -5798,6 +5873,13 @@ class RecoveryRollout:
             != receipt["public_tls_post_rollout_evidence_sha256"]
         ):
             fail("existing production success receipt differs")
+        if (
+            self._validate_finalized_reward_evidence(
+                receipt["reward_evidence_sha256"]
+            )
+            != receipt["reward_evidence_sha256"]
+        ):
+            fail("existing production success reward-evidence root differs")
 
     def reserve_rollback_journal(self) -> str:
         """Create and fsync the immutable rollback transaction before mutation."""
@@ -8398,6 +8480,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         if self.existing_reward_evidence is not None:
             if list(evidence) != self.existing_reward_evidence:
                 fail("finalized reward evidence differs from the supplied receipts")
+            self._validate_finalized_reward_evidence(digest)
             self.say(
                 f"PASS existing rollout-bound reward evidence {output} sha256={digest}"
             )
@@ -8425,6 +8508,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         os.close(sidecar_fd)
         self.reward_evidence_reservation = None
         self.existing_reward_evidence = list(evidence)
+        self._validate_finalized_reward_evidence(digest)
         self.say(f"PASS create-only rollout-bound reward evidence {output} sha256={digest}")
         return digest
 
@@ -8802,6 +8886,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             self._fsync_directory(output.parent)
             self.existing_reward_evidence = evidence
             self.reward_evidence_progress = list(evidence)
+            self._validate_finalized_reward_evidence(digest)
             self.say(
                 f"PASS resumed finalized rollout-bound reward evidence "
                 f"{output} sha256={digest}"
@@ -13464,6 +13549,11 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
     def _write_production_success_receipt(self) -> None:
         if self.rollback_journal is None:
             fail("production success receipt requires the reserved rollback journal")
+        if self.final_reward_evidence_sha256 is None:
+            fail("production success requires finalized rollout-bound reward evidence")
+        reward_evidence_sha256 = self._validate_finalized_reward_evidence(
+            self.final_reward_evidence_sha256
+        )
         header_sha256 = sha256_bytes(
             (self.rollback_journal / "HEADER.json").read_bytes()
         )
@@ -13491,7 +13581,7 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
                     f"{label} TLS evidence"
                 )
         receipt = {
-            "schema": "arc.recovery.production-rollout-success.v2",
+            "schema": "arc.recovery.production-rollout-success.v3",
             "rollout_manifest_sha256": self.digest,
             "archive_manifest_sha256": self.manifest["archive"]["archive_manifest_sha256"],
             "freeze_plan_sha256": self.manifest["archive"]["freeze_plan_sha256"],
@@ -13512,6 +13602,7 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
             "public_tls_post_rollout_evidence_sha256": sha256_bytes(
                 tls_post_rollout_path.read_bytes()
             ),
+            "reward_evidence_sha256": reward_evidence_sha256,
             "validators": [
                 {
                     "node": node["name"],
