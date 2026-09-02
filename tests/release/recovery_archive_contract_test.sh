@@ -532,7 +532,8 @@ content_capture_fixture_detects_source_tamper() (
     generation="$(printf 'c%.0s' {1..64})"; generation_sha="$(printf 'd%.0s' {1..64})"; drive_sha="$(printf 'e%.0s' {1..64})"
     LIVE_OBSERVATION_BASE="$f/live"; live="$LIVE_OBSERVATION_BASE/$id/$generation/$n"
     mkdir -p "$c" "$d" "${live%/*}"; printf sealed-wal > "$d/state.wal"; printf state > "$d/state.bin"
-    capture_live_observation_receipt_at "$f/.live.partial" "$live" "$id" "$generation" \
+    capture_live_observation_receipt_at "${live%/*}/.${n}.live-observations.partial" \
+        "$live" "$id" "$generation" \
         "$generation_sha" "$drive_sha" "$n" "$freeze" http://127.0.0.1:1 || return 1
     write_regular_tree_inventory "$d" "$c/source-data.files.sha256" || return 1
     python3 - "$d" "$c/capture-source.json" <<'PY' || return 1
@@ -597,7 +598,7 @@ port_file.write_text(str(server.server_port), encoding="ascii")
 server.serve_forever()
 PY
     : > "$f/requests.log"
-    python3 "$f/server.py" "$f/requests.log" "$f/port" & server=$!
+    "$ARC_RECOVERY_PYTHON_PATH" -I "$f/server.py" "$f/requests.log" "$f/port" & server=$!
     for _ in $(seq 1 100); do [ -s "$f/port" ] && break; sleep 0.02; done
     [ -s "$f/port" ] || return 1
     port="$(cat "$f/port")"; id="$(printf 'a%.0s' {1..64})"; freeze="$(printf 'b%.0s' {1..64})"
@@ -605,7 +606,8 @@ PY
     LIVE_OBSERVATION_BASE="$f/live"; first="$LIVE_OBSERVATION_BASE/$id/$generation/nyc"
     mkdir -p -- "${first%/*}"
 
-    capture_live_observation_receipt_at "$f/.first.partial" "$first" "$id" "$generation" \
+    capture_live_observation_receipt_at "${first%/*}/.nyc.live-observations.partial" \
+        "$first" "$id" "$generation" \
         "$generation_sha" "$drive_sha" nyc "$freeze" \
         "http://127.0.0.1:$port" || return 1
     verify_live_observation_receipt "$first" "$id" "$generation" "$generation_sha" \
