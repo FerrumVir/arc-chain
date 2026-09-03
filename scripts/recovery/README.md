@@ -144,8 +144,11 @@ and creates a mode-`0444` `.sha256` sidecar. It never replaces either file.
 `run` rechecks the seal and all artifact hashes, executes offline ARCCHKPT
 `inspect` plus quorum `verify`, checks six fresh-or-exact-resume
 data/key/host prerequisites,
-and prints `PLAN ONLY`. It changes no local/remote directory, process, service,
-package, proxy, certificate, or data.
+and prints `PLAN ONLY`. It makes no persistent recovery-managed change to a
+local or remote directory, file, process/service state, package, proxy,
+certificate, or chain data. Production probes stream directly over the pinned
+SSH channel and do not install a remote rollout helper before the exact GO
+authorization. Normal SSH and service audit logs may record that read access.
 
 If any artifact, endpoint, node, key path, stake, activation rule, timeout, or
 probe changes, create and approve a new sealed manifest. Do not chmod/edit an
@@ -192,8 +195,8 @@ Use a roots-only finalized, sealed `mode: "production"` manifest only after the
 exact capture-scoped archive has a fully verified `COMPLETE.json` and all six
 controlled legacy writers remain persistently fenced. This is not a claim that
 all dynamically observed external legacy forks are globally halted. Run the
-read-only plan to obtain the verified archive-manifest hash and exact extended
-phrase:
+recovery-state read-only plan to obtain the verified archive-manifest hash and
+exact extended phrase:
 
 ```bash
 python3 scripts/recovery/recovery_rollout.py run \

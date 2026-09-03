@@ -11764,7 +11764,12 @@ PY
     cat "$temporary/manifest-sha"
 )
 
-verify_complete_phase() {
+verify_complete_phase() (
+    # ``verify-complete`` is also the production rollout's pre-GO archive
+    # preflight.  Keep every pinned transport/config copy and metadata scratch
+    # inside this function's subprocess, and remove it on both success and any
+    # fail-closed exit.
+    trap cleanup_temporary_root EXIT
     local destination="" expected_complete_sha="" expected_manifest_sha="" expected_sums_sha="" expected_prearchive_sha=""
     local verify_live_captures=false
     local new_node_paths=()
@@ -11797,6 +11802,7 @@ verify_complete_phase() {
     if [ "${#new_node_paths[@]}" -gt 0 ] || [ "$verify_live_captures" = true ]; then
         local temporary freeze_plan freeze_sha capture_id
         temporary="$(mktemp -d)"
+        ARCHIVE_FLEET_TEMP_ROOT="$temporary"
         freeze_plan="$temporary/freeze-plan.json"
         rclone cat "$destination/freeze-plan.json" > "$freeze_plan"
         rclone cat "$destination/freeze-plan.json.sha256" > "${freeze_plan}.sha256"
@@ -11846,7 +11852,7 @@ PY
     fi
     printf 'archive fleet: VERIFIED COMPLETE destination=%s archive_manifest=%s\n' \
         "$destination" "$archive_manifest_sha"
-}
+)
 
 verify_reference_pair() (
     local binary="$1" genesis="$2" validators="$3" legacy_validators="$4"

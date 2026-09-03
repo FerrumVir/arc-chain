@@ -6646,14 +6646,88 @@ class RecoveryRollout:
                 fail(f"{node['name']} data dir already exists; recovery import requires a fresh path")
         self.say("PASS all six local keyfiles are mode 0600 and all six data dirs are absent")
 
-    def ssh(self, node: Mapping[str, Any], script: str, args: Sequence[str] = (), *, timeout: int = 180) -> str:
-        for value in args:
-            if not SAFE_REMOTE_RE.fullmatch(value):
-                fail(f"unsafe remote argument for {node['name']}: {value!r}")
+    def _run_ssh_script(
+        self,
+        node: Mapping[str, Any],
+        remote_command: str,
+        script: str,
+        *,
+        timeout: int,
+    ) -> str:
         self._assert_production_ssh_transport()
         assert self.production_ssh_path is not None
         assert self.production_known_hosts is not None
         assert self.production_ssh_identity is not None
+        command = [
+            os.fspath(self.production_ssh_path),
+            "-F", "/dev/null",
+            "-i", os.fspath(self.production_ssh_identity),
+            "-o", f"UserKnownHostsFile={self.production_known_hosts}",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "HostKeyAlgorithms=ssh-ed25519",
+            "-o", "PubkeyAcceptedAlgorithms=ssh-ed25519",
+            "-o", "UpdateHostKeys=no",
+            "-o", "CanonicalizeHostname=no",
+            "-o", "CheckHostIP=yes",
+            "-o", "IdentityAgent=none",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ProxyCommand=none",
+            "-o", "ProxyJump=none",
+            "-o", "PasswordAuthentication=no",
+            "-o", "PreferredAuthentications=publickey",
+            "-o", "NumberOfPasswordPrompts=0",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "ChallengeResponseAuthentication=no",
+            "-o", "GSSAPIAuthentication=no",
+            "-o", "ForwardAgent=no",
+            "-o", "ForwardX11=no",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "PermitLocalCommand=no",
+            "-o", "RequestTTY=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=yes",
+            f"{node['ssh_user']}@{node['host']}",
+            remote_command,
+        ]
+        result = run_checked(
+            command,
+            stdin=script,
+            timeout=timeout,
+            env=self.production_transport_env,
+        ).stdout
+        self._assert_production_ssh_transport()
+        return result
+
+    def ssh_read_only(
+        self,
+        node: Mapping[str, Any],
+        script: str,
+        args: Sequence[str] = (),
+        *,
+        timeout: int = 180,
+    ) -> str:
+        """Stream an observational probe without creating a remote helper file."""
+        for value in args:
+            if not SAFE_REMOTE_RE.fullmatch(value):
+                fail(f"unsafe remote argument for {node['name']}: {value!r}")
+        remote_command = shlex.join(
+            [
+                "/usr/bin/env", "-i",
+                "HOME=/root",
+                "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                "LANG=C", "LC_ALL=C",
+                "/bin/sh", "-s", "--", *args,
+            ]
+        )
+        return self._run_ssh_script(
+            node, remote_command, script, timeout=timeout
+        )
+
+    def ssh(self, node: Mapping[str, Any], script: str, args: Sequence[str] = (), *, timeout: int = 180) -> str:
+        for value in args:
+            if not SAFE_REMOTE_RE.fullmatch(value):
+                fail(f"unsafe remote argument for {node['name']}: {value!r}")
         script_sha256 = sha256_bytes(script.encode("utf-8"))
         remote_wrapper = r'''set -eu
 expected=$1
@@ -6699,46 +6773,9 @@ exec /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C LC_ALL
                 script_sha256, *args,
             ]
         )
-        command = [
-            os.fspath(self.production_ssh_path),
-            "-F", "/dev/null",
-            "-i", os.fspath(self.production_ssh_identity),
-            "-o", f"UserKnownHostsFile={self.production_known_hosts}",
-            "-o", "GlobalKnownHostsFile=/dev/null",
-            "-o", "HostKeyAlgorithms=ssh-ed25519",
-            "-o", "PubkeyAcceptedAlgorithms=ssh-ed25519",
-            "-o", "UpdateHostKeys=no",
-            "-o", "CanonicalizeHostname=no",
-            "-o", "CheckHostIP=yes",
-            "-o", "IdentityAgent=none",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "ProxyCommand=none",
-            "-o", "ProxyJump=none",
-            "-o", "PasswordAuthentication=no",
-            "-o", "PreferredAuthentications=publickey",
-            "-o", "NumberOfPasswordPrompts=0",
-            "-o", "KbdInteractiveAuthentication=no",
-            "-o", "ChallengeResponseAuthentication=no",
-            "-o", "GSSAPIAuthentication=no",
-            "-o", "ForwardAgent=no",
-            "-o", "ForwardX11=no",
-            "-o", "ClearAllForwardings=yes",
-            "-o", "PermitLocalCommand=no",
-            "-o", "RequestTTY=no",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "StrictHostKeyChecking=yes",
-            f"{node['ssh_user']}@{node['host']}",
-            remote_command,
-        ]
-        result = run_checked(
-            command,
-            stdin=script,
-            timeout=timeout,
-            env=self.production_transport_env,
-        ).stdout
-        self._assert_production_ssh_transport()
-        return result
+        return self._run_ssh_script(
+            node, remote_command, script, timeout=timeout
+        )
 
     def scp(self, node: Mapping[str, Any], local: str, remote: str) -> None:
         if not SAFE_REMOTE_RE.fullmatch(remote):
@@ -7128,7 +7165,7 @@ done
         identity_stage = self.manifest["archive"]["prearchive_rollout_sha256"]
         for node in self.validators:
             receipt_row = receipt_rows[node["name"]]
-            self.ssh(
+            self.ssh_read_only(
                 node,
                 script,
                 (
@@ -7235,7 +7272,7 @@ done
                 if self.legacy_archive_for(node) is not None
                 else "none"
             )
-            baseline_output = self.ssh(
+            baseline_output = self.ssh_read_only(
                 node,
                 r'''set -eu
 archive_service=$4 interlock_service=$5
@@ -7293,7 +7330,7 @@ printf 'public_443_count=%s\n' "$(printf '%s\n' "$public_rows" | awk '$4 ~ /:443
                 fail(f"{node['name']} public-listener baseline omitted an exact count")
             self.production_service_baseline[node["name"]] = baseline
             self.production_public_listener_baseline[node["name"]] = public_listener_counts
-            self.ssh(
+            self.ssh_read_only(
                 node,
                 r'''set -eu
 expected_version=$1 expected_sha=$2
@@ -13885,7 +13922,7 @@ def build_parser() -> argparse.ArgumentParser:
     seal = subparsers.add_parser("seal", help="canonicalize and create a read-only manifest plus SHA256 sidecar")
     seal.add_argument("--draft", required=True, type=Path)
     seal.add_argument("--output", required=True, type=Path)
-    run = subparsers.add_parser("run", help="read-only plan/preflight by default; execute only behind the exact GO hash")
+    run = subparsers.add_parser("run", help="recovery-state read-only plan/preflight by default; execute only behind the exact GO hash")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--execute", action="store_true")
     run.add_argument("--go-hash")
@@ -13935,7 +13972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest, _ = load_sealed_manifest(args.output)
             print(f"SEALED {args.output} sha256={digest}")
             if manifest["mode"] == "production":
-                print("Execution remains locked until the bound remote archive is complete and fully verified; run the read-only plan next.")
+                print("Execution remains locked until the bound remote archive is complete and fully verified; run the recovery-state read-only plan next.")
             else:
                 authorization = execution_authorization(manifest, digest)
                 print(f"Execution authorization: ARC_RECOVERY_GO='{authorization}' --go-hash {digest}")
@@ -14038,7 +14075,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         archive_manifest_sha256 = rollout.preflight()
         if not args.execute:
             authorization = execution_authorization(manifest, digest, archive_manifest_sha256)
-            print("PLAN ONLY: no directory, process, service, package, proxy, certificate, or remote file was changed")
+            print(
+                "PLAN ONLY: made no persistent recovery-managed change to any "
+                "directory, file, process/service state, package, proxy, certificate, "
+                "or chain data; normal SSH and service audit logs may record access"
+            )
             archive_arg = (
                 f" --archive-manifest-sha256 {archive_manifest_sha256}"
                 if archive_manifest_sha256 is not None
@@ -14064,7 +14105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             archive_manifest_sha256,
         )
         # Execute-only: reserve and fsync both create-only evidence outputs
-        # before the first local or remote mutation. Plan-only remains read-only.
+        # before the first local or remote mutation. Plan-only remains
+        # recovery-state read-only.
         rollout.reserve_reward_evidence_output()
         rollout.execute()
         return 0

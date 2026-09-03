@@ -141,11 +141,13 @@ it is not an incomplete observer placeholder. Operators must prove each
 separately delivered keyfile matches its assigned public address, configure the
 six explicit HTTPS community RPC origins, execute one coordinated cutover, and
 verify common-height block hash plus state root agreement. The content-addressed
-`scripts/recovery/recovery_rollout.py` plan defaults to read-only, requires an
-exact archive-bound GO phrase before mutation, imports only into fresh or exact
-same-manifest resumable data directories, checks H/H+1 continuity and restart
-convergence, and can require a successful reward receipt plus receipt-only
-earnings on every validator.
+`scripts/recovery/recovery_rollout.py` plan defaults to recovery-state read-only,
+streams production probes over pinned SSH without installing a remote rollout
+helper, requires an exact archive-bound GO phrase before any persistent
+recovery-managed mutation, imports only into fresh or exact same-manifest
+resumable data directories, checks H/H+1 continuity and restart convergence,
+and can require a successful reward receipt plus receipt-only earnings on every
+validator. Normal SSH and service audit logs may record plan access.
 
 The legacy archive has a separate, earlier freeze authorization because the
 final checkpoint and archive roots cannot truthfully exist before the forked

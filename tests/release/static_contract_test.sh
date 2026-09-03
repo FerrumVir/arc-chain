@@ -42,6 +42,7 @@ VALIDATOR_VAULT_RESTORE="$REPO_ROOT/scripts/release/restore-validator-vault.py"
 PRODUCTION_MANIFEST_BUILDER="$REPO_ROOT/scripts/recovery/build-production-manifest.py"
 PRODUCTION_MANIFEST_TEST="$TEST_DIR/production_manifest_builder_test.sh"
 RECOVERY_RUNBOOK="$REPO_ROOT/scripts/recovery/README.md"
+RECOVERY_ROLLOUT="$REPO_ROOT/scripts/recovery/recovery_rollout.py"
 RELEASE_TEST_RUNNER="$TEST_DIR/run.sh"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
@@ -2245,6 +2246,73 @@ validator_vault_restore_and_install_are_fail_closed() {
     fi
 }
 
+recovery_plan_remote_transport_is_read_only() {
+    python3 - "$RECOVERY_ROLLOUT" <<'PY'
+import ast
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+tree = ast.parse(source)
+rollout_class = next(
+    node
+    for node in tree.body
+    if isinstance(node, ast.ClassDef) and node.name == "RecoveryRollout"
+)
+methods = {
+    node.name: node
+    for node in rollout_class.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+required_methods = {
+    "_preflight_production", "ssh_read_only", "ssh", "_run_ssh_script"
+}
+if not required_methods.issubset(methods):
+    raise SystemExit("recovery rollout omits the explicit read-only SSH boundary")
+
+preflight_calls = []
+for call in ast.walk(methods["_preflight_production"]):
+    if (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "self"
+        and call.func.attr in {"ssh_read_only", "ssh", "scp", "_run_ssh_script"}
+    ):
+        preflight_calls.append(call.func.attr)
+if preflight_calls.count("ssh_read_only") != 3 or any(
+    name != "ssh_read_only" for name in preflight_calls
+):
+    raise SystemExit(
+        "production preflight must contain exactly three streamed read-only SSH call sites"
+    )
+
+read_only = ast.get_source_segment(source, methods["ssh_read_only"]) or ""
+for required in (
+    '"/usr/bin/env", "-i"',
+    '"HOME=/root"',
+    '"PATH=/usr/bin:/bin:/usr/sbin:/sbin"',
+    '"LANG=C", "LC_ALL=C"',
+    '"/bin/sh", "-s", "--"',
+    "self._run_ssh_script(",
+):
+    if required not in read_only:
+        raise SystemExit(f"read-only SSH transport omits exact streamed boundary: {required}")
+for forbidden in (
+    ".arc-recovery-rollout-helpers", "mkdir", "mktemp", "/bin/ln", "/bin/chmod"
+):
+    if forbidden in read_only:
+        raise SystemExit(f"read-only SSH transport can persist remote state: {forbidden}")
+
+mutating = ast.get_source_segment(source, methods["ssh"]) or ""
+if "/root/.arc-recovery-rollout-helpers" not in mutating:
+    raise SystemExit("execute transport lost its content-addressed helper contract")
+if "no persistent recovery-managed change" not in source:
+    raise SystemExit("plan output does not state the scoped recovery-state boundary")
+PY
+}
+
 macos_pretag_community_canary_is_exact_private_and_fail_closed() {
     local required origin
     for required in \
@@ -2391,6 +2459,7 @@ run_test 'Windows desktop shutdown is private, authenticated, and uses the full 
 run_test 'signing-key backups are encrypted, create-only, and restore-tested' signing_key_backup_is_encrypted_create_only_and_restore_tested
 run_test 'validator-vault restore/install is profile-bound, offline-proof gated, and create-only' validator_vault_restore_and_install_are_fail_closed
 run_test 'production manifest builder is hermetic, sealed, documented, and release-gated' production_manifest_builder_is_release_gated
+run_test 'production recovery plan streams probes without persistent remote helpers' recovery_plan_remote_transport_is_read_only
 run_test 'macOS pre-tag community canary is exact, private, SIGTERM-only, and preservation-safe' macos_pretag_community_canary_is_exact_private_and_fail_closed
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 

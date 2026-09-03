@@ -1653,6 +1653,36 @@ PY
     fi
 }
 
+recovery_plan_read_only_scope_is_truthful() {
+    local literal
+    for literal in \
+        'makes no persistent recovery-managed change' \
+        'Production probes stream directly over the pinned' \
+        'do not install a remote rollout helper before the exact GO' \
+        'Normal SSH and service audit logs may record that read access.'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits the scoped non-mutating plan contract' \
+            || return 1
+    done
+    for literal in \
+        'defaults to recovery-state read-only' \
+        'streams production probes over pinned SSH without installing a remote rollout' \
+        'before any persistent' \
+        'Normal SSH and service audit logs may record plan access.'
+    do
+        require_literal "$PRODUCTION_RECOVERY_AUDIT" "$literal" \
+            'production recovery audit omits the scoped non-mutating plan contract' \
+            || return 1
+    done
+    if grep -Fq -- \
+        'It changes no local/remote directory, process, service,' \
+        "$RECOVERY_README"; then
+        printf 'recovery README retains the impossible absolute no-host-change claim\n'
+        return 1
+    fi
+}
+
 run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
 run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
@@ -1667,5 +1697,6 @@ run_test 'candidate facts remain source-bound and dated without unsupported floo
 run_test 'hardened canary and vault runbooks match their current command parsers' hardened_canary_and_vault_commands_match_current_parsers
 run_test 'recovery archive commands pin tools, external intent, and exact rollout journals' recovery_archive_commands_are_exact_and_resumable
 run_test 'operator recovery commands are Ubuntu-pinned, create-only, and ordered' operator_recovery_commands_are_linux_pinned_and_ordered
+run_test 'recovery plan documents a scoped persistent-state read-only boundary' recovery_plan_read_only_scope_is_truthful
 
 finish_tests

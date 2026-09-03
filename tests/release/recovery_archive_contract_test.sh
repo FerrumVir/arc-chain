@@ -2098,6 +2098,92 @@ SH
     return 0
 )
 
+verify_complete_plan_cleans_transport_state_and_never_uses_ssh() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture digest destination
+    fixture="$(mktemp -d "$REPO_ROOT/.verify-complete-plan-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    mkdir -m 700 "$fixture/success-tmp" "$fixture/failure-tmp"
+    digest="$(printf 'a%.0s' {1..64})"
+    DRIVE_REMOTE=arc-test
+    destination="$DRIVE_REMOTE/captures/$digest"
+
+    # Exercise the phase boundary rather than Drive/GitHub parsing, which has
+    # separate fixtures above.  These mocks materialize the same sensitive
+    # pinned roots as configure_operator_transport so cleanup is observable.
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    configure_operator_transport() {
+        ARCHIVE_FLEET_PINNED_PYTHON_ROOT="$(mktemp -d)"
+        ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT="$(mktemp -d)"
+        printf 'operator-python-home\n' > "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT/state"
+        printf 'ssh-identity-and-rclone-config\n' > "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/private"
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    configure_github_anchor_transport() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    require_commands() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    validate_drive_remote() { return 0; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    verify_remote_complete() {
+        printf '%s\n' "$digest"
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    rclone() {
+        [ "${ARC_TEST_FAIL_RCLONE:-0}" != 1 ] || die "injected metadata download failure"
+        [ "$1" = cat ] || return 74
+        case "$2" in
+            */freeze-plan.json)
+                printf '%s\n' '{"nodes":[{"name":"nyc","data_dir":"/var/lib/arc-old-nyc"},{"name":"lax","data_dir":"/var/lib/arc-old-lax"},{"name":"ams","data_dir":"/var/lib/arc-old-ams"},{"name":"lhr","data_dir":"/var/lib/arc-old-lhr"},{"name":"nrt","data_dir":"/var/lib/arc-old-nrt"},{"name":"sgp","data_dir":"/var/lib/arc-old-sgp"}]}'
+                ;;
+            */freeze-plan.json.sha256)
+                printf '%s  freeze-plan.json\n' "$digest"
+                ;;
+            *) return 75 ;;
+        esac
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    capture_id_for_freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # Plan archive verification must not reach either SSH entry point unless
+    # execute explicitly requests --verify-live-captures.
+    # shellcheck disable=SC2329 # tripwire invoked only on a regression
+    ssh() { : > "$fixture/ssh-called"; return 91; }
+    # shellcheck disable=SC2329 # tripwire invoked only on a regression
+    ssh_remote_exact() { : > "$fixture/ssh-called"; return 92; }
+
+    TMPDIR="$fixture/success-tmp" verify_complete_phase \
+        --destination "$destination" \
+        --new-node-paths nyc /opt/arc-v3-nyc /var/lib/arc-v3-nyc \
+        --new-node-paths lax /opt/arc-v3-lax /var/lib/arc-v3-lax \
+        --new-node-paths ams /opt/arc-v3-ams /var/lib/arc-v3-ams \
+        --new-node-paths lhr /opt/arc-v3-lhr /var/lib/arc-v3-lhr \
+        --new-node-paths nrt /opt/arc-v3-nrt /var/lib/arc-v3-nrt \
+        --new-node-paths sgp /opt/arc-v3-sgp /var/lib/arc-v3-sgp \
+        > "$fixture/success.out" || return 1
+    grep -Fq -- "archive_manifest=$digest" "$fixture/success.out" || return 1
+    [ ! -e "$fixture/ssh-called" ] || return 1
+    [ -z "$(find "$fixture/success-tmp" -mindepth 1 -print -quit)" ] || return 1
+
+    if ARC_TEST_FAIL_RCLONE=1 TMPDIR="$fixture/failure-tmp" \
+        verify_complete_phase --destination "$destination" \
+        --new-node-paths nyc /opt/arc-v3-nyc /var/lib/arc-v3-nyc \
+        --new-node-paths lax /opt/arc-v3-lax /var/lib/arc-v3-lax \
+        --new-node-paths ams /opt/arc-v3-ams /var/lib/arc-v3-ams \
+        --new-node-paths lhr /opt/arc-v3-lhr /var/lib/arc-v3-lhr \
+        --new-node-paths nrt /opt/arc-v3-nrt /var/lib/arc-v3-nrt \
+        --new-node-paths sgp /opt/arc-v3-sgp /var/lib/arc-v3-sgp \
+        > "$fixture/failure.out" 2>&1; then
+        printf 'verify-complete accepted a failed archive verifier\n' >&2
+        return 1
+    fi
+    [ ! -e "$fixture/ssh-called" ] || return 1
+    [ -z "$(find "$fixture/failure-tmp" -mindepth 1 -print -quit)" ] || return 1
+)
+
 complete_is_last_and_fully_verified() {
     python3 - "$ORCHESTRATOR" <<'PY' || return 1
 import pathlib,sys
@@ -2712,6 +2798,7 @@ run_test 'remote zero-progress heals only reviewed publish orphans' remote_zero_
 run_test 'capture lock and monotonic lease are portable and bound' capture_lock_and_monotonic_lease_are_portable_and_bound
 run_test 'canonical reference is independently required' reference_pair_is_independent_of_final_capture_classes
 run_test 'remote COMPLETE rejects object attacks' remote_complete_rejects_missing_tampered_extra
+run_test 'verify-complete plan cleanup is total and SSH-free' verify_complete_plan_cleans_transport_state_and_never_uses_ssh
 run_test 'COMPLETE is last and fully verified' complete_is_last_and_fully_verified
 run_test 'immutable Gist revision recovers a lost local intent after latest edit' gist_revision_recovers_lost_local_intent_after_latest_edit
 run_test 'new v3 paths preserve frozen source' new_v3_paths_and_post_cutover_source_are_verified
