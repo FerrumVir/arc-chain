@@ -353,7 +353,19 @@ class CurlApiClient:
             character in endpoint for character in ("\r", "\n", "\0", "#")
         ):
             fail("GitHub REST endpoint escaped the fixed repository boundary")
+        if re.search(r"(?:[?&])_arc_proof=", endpoint) is not None:
+            fail("GitHub REST endpoint supplied the reserved proof nonce")
         self.counter += 1
+        # GitHub's anonymous REST edge may return a fresh request ID with an
+        # Age of zero while reusing the cached response Date for up to its
+        # advertised s-maxage.  A unique URL per GET prevents that stale Date
+        # from making the strict initial/final proof ordering nondeterministic.
+        separator = "&" if "?" in endpoint else "?"
+        try:
+            proof_nonce = os.urandom(32).hex()
+        except OSError:
+            fail("GitHub REST proof nonce entropy is unavailable")
+        request_endpoint = f"{endpoint}{separator}_arc_proof={proof_nonce}"
         header = self.transaction_root / f"api-{self.counter}.headers"
         body = self.transaction_root / f"api-{self.counter}.json"
         self._reprove_tools()
@@ -391,7 +403,7 @@ class CurlApiClient:
             "--header",
             "Authorization:",
             "--header",
-            "Cache-Control: no-cache",
+            "Cache-Control: no-cache, no-store, max-age=0",
             "--header",
             "Pragma: no-cache",
             "--user-agent",
@@ -400,7 +412,7 @@ class CurlApiClient:
             str(header),
             "--output",
             str(body),
-            f"{API_ORIGIN}{endpoint}",
+            f"{API_ORIGIN}{request_endpoint}",
         ]
         environment = {
             "HOME": str(self.transaction_root),

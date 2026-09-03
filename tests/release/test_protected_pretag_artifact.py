@@ -9,6 +9,7 @@ import io
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -386,11 +387,24 @@ class ProtectedArtifactTests(unittest.TestCase):
         client = provenance.CurlApiClient(
             curl, curl_sha, ca, ca_sha, root, now=NOW
         )
-        with mock.patch.object(provenance.subprocess, "run", side_effect=fake_run):
-            document = client.get_json(
-                f"/repos/{provenance.REPOSITORY}/actions/workflows/release-signing-preflight.yml",
-                label="fixture",
-            )
+        endpoint = (
+            f"/repos/{provenance.REPOSITORY}/actions/workflows/"
+            "release-signing-preflight.yml"
+        )
+        commands: list[list[str]] = []
+
+        def capture_run(command: list[str], **kwargs):
+            result = fake_run(command, **kwargs)
+            commands.append(command)
+            return result
+
+        with mock.patch.object(
+            provenance.os,
+            "urandom",
+            side_effect=(b"a" * 32, b"b" * 32),
+        ), mock.patch.object(provenance.subprocess, "run", side_effect=capture_run):
+            document = client.get_json(endpoint, label="fixture")
+            client.get_json(endpoint, label="fixture")
         self.assertEqual({"id": 1}, document.value)
         command = captured["command"]
         assert isinstance(command, list)
@@ -400,14 +414,65 @@ class ProtectedArtifactTests(unittest.TestCase):
         self.assertNotIn("--location", command)
         self.assertNotIn("-L", command)
         self.assertIn("Authorization:", command)
-        self.assertIn("Cache-Control: no-cache", command)
+        self.assertIn("Cache-Control: no-cache, no-store, max-age=0", command)
         self.assertIn("Pragma: no-cache", command)
         self.assertFalse(any("token " in value.lower() for value in command))
+        urls = [item[-1] for item in commands]
+        self.assertEqual(2, len(set(urls)))
+        for url in urls:
+            self.assertRegex(
+                url,
+                rf"^{re.escape(provenance.API_ORIGIN + endpoint)}\?_arc_proof=[0-9a-f]{{64}}$",
+            )
         kwargs = captured["kwargs"]
         assert isinstance(kwargs, dict)
         environment = kwargs["env"]
         self.assertEqual({"HOME", "PATH", "LANG", "LC_ALL"}, set(environment))
         self.assertNotIn("HTTP_PROXY", environment)
+
+    def test_curl_client_preserves_existing_query_and_reserves_proof_nonce(self) -> None:
+        curl, curl_sha, ca, ca_sha = protected_runtime()
+        root = self.fixture.root / "api-query-root"
+        root.mkdir(mode=0o700)
+        captured_url: list[str] = []
+
+        def fake_run(command: list[str], **_kwargs):
+            captured_url.append(command[-1])
+            header = Path(command[command.index("--dump-header") + 1])
+            body = Path(command[command.index("--output") + 1])
+            response_date = email.utils.formatdate(NOW, usegmt=True)
+            header.write_bytes(
+                f"HTTP/2 200\r\ndate: {response_date}\r\n"
+                "cache-control: public, max-age=60, s-maxage=60\r\nage: 0\r\n"
+                "x-github-request-id: ABCD:1234:5678:9ABC\r\n\r\n".encode()
+            )
+            body.write_bytes(b'{"total_count":0,"artifacts":[]}\n')
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        client = provenance.CurlApiClient(
+            curl, curl_sha, ca, ca_sha, root, now=NOW
+        )
+        endpoint = f"/repos/{provenance.REPOSITORY}/actions/runs/1/artifacts?per_page=100"
+        with mock.patch.object(
+            provenance.os, "urandom", return_value=b"c" * 32
+        ), mock.patch.object(provenance.subprocess, "run", side_effect=fake_run):
+            client.get_json(endpoint, label="fixture")
+        self.assertRegex(
+            captured_url[0],
+            rf"^{re.escape(provenance.API_ORIGIN + endpoint)}&_arc_proof=[0-9a-f]{{64}}$",
+        )
+        with self.assertRaisesRegex(provenance.ProvenanceError, "reserved proof nonce"):
+            client.get_json(
+                f"/repos/{provenance.REPOSITORY}/branches/main?_arc_proof={'a' * 64}",
+                label="fixture",
+            )
+        with mock.patch.object(
+            provenance.os, "urandom", side_effect=OSError("entropy unavailable")
+        ), self.assertRaisesRegex(provenance.ProvenanceError, "entropy is unavailable"):
+            client.get_json(
+                f"/repos/{provenance.REPOSITORY}/branches/main",
+                label="fixture",
+            )
 
     def test_curl_client_rejects_stale_or_multiple_http_responses(self) -> None:
         stale = (
