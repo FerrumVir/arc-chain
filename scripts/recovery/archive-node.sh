@@ -2083,6 +2083,216 @@ if not entries or sorted(entries)[-1] != "zzzz-arc-recovery-freeze.conf":
 PY
 }
 
+materialize_absent_legacy_updater_anchor() {
+    local unit="$1" load_state fragment_path anchor
+    case "$unit" in
+        arc-node-update.service|arc-node-update.timer) ;;
+        *) die "refusing an unreviewed legacy updater anchor: $unit" ;;
+    esac
+    anchor="/etc/systemd/system/$unit"
+    load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null || true)"
+    fragment_path="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null || true)"
+    case "$load_state" in
+        loaded)
+            [ -n "$fragment_path" ] || die "loaded legacy updater has no fragment path: $unit"
+            return 0
+            ;;
+        not-found)
+            [ -z "$fragment_path" ] || die "absent legacy updater unexpectedly has a fragment path: $unit"
+            ;;
+        *)
+            die "legacy updater has an unsupported load state before anchor staging: $unit state=${load_state:-unknown}"
+            ;;
+    esac
+
+    # systemd intentionally ignores a drop-in when no base unit exists.  The
+    # old fleet predates the updater units, so materialize a create-only,
+    # permanently non-startable base before relying on the persistent recovery
+    # drop-ins.  Every later source-manifest proof sees and hashes this exact
+    # regular file just like a pre-existing unit fragment.
+    python3 - "$unit" "$anchor" <<'PY'
+import ctypes
+import errno
+import os
+import pathlib
+import stat
+import sys
+
+unit, path_raw = sys.argv[1:]
+path = pathlib.Path(path_raw)
+service = (
+    b"[Unit]\n"
+    b"Description=ARC recovery inert anchor for absent legacy updater service\n"
+    b"DefaultDependencies=no\n"
+    b"RefuseManualStart=yes\n"
+    b"ConditionPathExists=!/dev/null\n"
+    b"\n"
+    b"[Service]\n"
+    b"Type=oneshot\n"
+    b"ExecStart=/usr/bin/false\n"
+)
+timer = (
+    b"[Unit]\n"
+    b"Description=ARC recovery inert anchor for absent legacy updater timer\n"
+    b"DefaultDependencies=no\n"
+    b"RefuseManualStart=yes\n"
+    b"ConditionPathExists=!/dev/null\n"
+    b"\n"
+    b"[Timer]\n"
+    b"OnActiveSec=3153600000s\n"
+    b"Unit=arc-node-update.service\n"
+)
+payloads = {
+    "arc-node-update.service": service,
+    "arc-node-update.timer": timer,
+}
+if unit not in payloads or path.name != unit:
+    raise SystemExit("legacy updater anchor target is not exact")
+payload = payloads[unit]
+parent = path.parent
+parent_details = parent.lstat()
+if (parent.is_symlink() or not stat.S_ISDIR(parent_details.st_mode)
+        or parent_details.st_uid != os.geteuid()
+        or parent_details.st_gid != os.getegid()
+        or parent_details.st_mode & 0o022):
+    raise SystemExit("legacy updater anchor parent is unsafe")
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+directory = os.open(parent, flags)
+try:
+    temporary = f".{unit}.arc-recovery-anchor.partial"
+
+    # Reconcile only the deterministic partial owned by this exact unit.  A
+    # crash can leave an empty/prefix mode-0600 write or a complete mode-0444
+    # write, but never makes that partial authoritative.  Any other inode,
+    # bytes, link count, or mode fails closed.
+    try:
+        partial_details = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        partial_details = None
+    if partial_details is not None:
+        partial_mode = stat.S_IMODE(partial_details.st_mode)
+        if (not stat.S_ISREG(partial_details.st_mode)
+                or partial_details.st_uid != os.geteuid()
+                or partial_details.st_gid != os.getegid()
+                or partial_details.st_nlink != 1
+                or partial_mode not in {0o600, 0o444}
+                or partial_details.st_size > len(payload)
+                or (partial_mode == 0o444 and partial_details.st_size != len(payload))):
+            raise SystemExit("legacy updater anchor partial inode is unsafe")
+        descriptor = os.open(
+            temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory
+        )
+        try:
+            partial = os.read(descriptor, len(payload) + 1)
+        finally:
+            os.close(descriptor)
+        if not payload.startswith(partial):
+            raise SystemExit("legacy updater anchor partial bytes are not an exact prefix")
+        os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
+
+    try:
+        details = os.stat(unit, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise SystemExit("short legacy updater anchor write")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o444)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        source = parent / temporary
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = (
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                -100, os.fsencode(source), -100, os.fsencode(path), 1
+            )
+        else:
+            # Validator hosts are Linux.  Darwin's exclusive equivalent keeps
+            # local contract tests on the same no-replace publication model.
+            renamex = getattr(libc, "renamex_np", None)
+            if renamex is None:
+                raise SystemExit("exclusive legacy updater anchor publication is unavailable")
+            renamex.argtypes = (
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint,
+            )
+            renamex.restype = ctypes.c_int
+            result = renamex(os.fsencode(source), os.fsencode(path), 4)
+        if result != 0:
+            error = ctypes.get_errno()
+            if error != errno.EEXIST:
+                raise SystemExit(
+                    f"exclusive legacy updater anchor publication failed: errno={error}"
+                )
+            # A same-lock retry can observe a target only after an external
+            # race.  Preserve no ambiguous partial and validate that target
+            # below as the exact immutable anchor.
+            os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
+        details = os.stat(unit, dir_fd=directory, follow_symlinks=False)
+    if (not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.geteuid() or details.st_gid != os.getegid()
+            or stat.S_IMODE(details.st_mode) != 0o444 or details.st_nlink != 1):
+        raise SystemExit("legacy updater anchor inode is unsafe")
+    descriptor = os.open(unit, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory)
+    try:
+        if os.read(descriptor, len(payload) + 1) != payload:
+            raise SystemExit("legacy updater anchor bytes differ")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+}
+
+materialize_absent_legacy_updater_anchors() {
+    local unit
+    # Refresh PID1's view first so a stale not-found result can never shadow a
+    # real vendor or administrator unit fragment.
+    systemctl daemon-reload
+    for unit in arc-node-update.service arc-node-update.timer; do
+        materialize_absent_legacy_updater_anchor "$unit"
+    done
+    sync
+    systemctl daemon-reload
+    for unit in arc-node-update.service arc-node-update.timer; do
+        [ "$(systemctl show "$unit" --property=LoadState --value)" = loaded ] || \
+            die "legacy updater anchor did not produce a loaded unit: $unit"
+        [ -n "$(systemctl show "$unit" --property=FragmentPath --value)" ] || \
+            die "legacy updater anchor has no effective fragment: $unit"
+        case "$(systemctl show "$unit" --property=Job --value)" in ''|0) ;;
+            *) die "legacy updater gained a job during anchor staging: $unit" ;;
+        esac
+        case "$(systemctl show "$unit" --property=ActiveState --value)" in inactive|failed) ;;
+            *) die "legacy updater became active during anchor staging: $unit" ;;
+        esac
+        if [ "${unit##*.}" = service ]; then
+            [ "$(systemctl show "$unit" --property=MainPID --value)" = 0 ] || \
+                die "legacy updater service gained a MainPID during anchor staging"
+        fi
+    done
+}
+
 persist_legacy_restart_fence_files() {
     local unit last_dropin
     if [ "$#" -eq 0 ]; then
@@ -2285,6 +2495,11 @@ PY
         die "alternative node service has a MainPID before fence staging"
     [ "$(systemctl show arc-node-update.service --property=MainPID --value 2>/dev/null || printf 0)" = 0 ] || \
         die "updater service has a MainPID before fence staging"
+    materialize_absent_legacy_updater_anchors
+    [ "$(systemctl show "$selected_unit" --property=MainPID --value)" = "$selected_pid" ] || \
+        die "selected supervisor changed while staging legacy updater anchors"
+    [ "$(systemctl show "$selected_unit" --property=ActiveState --value)" = active ] || \
+        die "selected supervisor stopped while staging legacy updater anchors"
     disable_and_verify_unit "$other_unit"
     disable_and_verify_unit arc-node-update.service
     disable_and_verify_unit arc-node-update.timer
