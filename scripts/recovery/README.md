@@ -1192,6 +1192,22 @@ printf '%s  %s\n' "$ssh_identity_sha256" "$ssh_identity" \
   --receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json
 ```
 
+Every archive command that initializes Python, SSH, or Drive runs in an
+invocation-scoped subshell and installs its cleanup handler before argument
+parsing or configuration. It creates a private mode-0700 Python HOME and
+transport root, copies `known_hosts` and `id_ed25519` at mode 0400, and, for a
+Drive command, copies the reviewed rclone executable at mode 0500 plus a
+disposable mode-0600 rclone config copy. All `ssh`, `scp`, and `rclone` calls
+then use only those copies in a clean environment. A token refresh can change
+the disposable config copy, but the source SSH identity and rclone config
+remain byte-for-byte unchanged. The invocation removes all of these roots on
+a normal success, plan return, or fail-closed error, including an error partway
+through configuration. Nested `prepare-writers` -> `audit-writers` execution
+owns separate roots, so the nested cleanup cannot remove its parent's active
+transport. `SIGKILL` or loss of the operator host cannot run an EXIT handler;
+any resulting orphan remains inside its private mode-0700 `TMPDIR` root and
+must be securely removed before retrying.
+
 After all six exact writers are stopped, `capture` re-runs the hash-pinned
 remote `stopped-status` command with every frozen writer argument and seals a
 canonical mode-0400 `arc.validator-vault.offline-stop-evidence.v2` receipt plus

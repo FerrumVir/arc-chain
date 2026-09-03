@@ -95,6 +95,22 @@ cleanup_temporary_root() {
     fi
 }
 
+begin_temporary_scope() {
+    # Command functions run in subshells.  Never inherit ownership of a
+    # caller's temporary roots or initialized wrappers: each invocation must
+    # allocate and clean only its own private runtime state.
+    ARCHIVE_FLEET_TEMP_ROOT=""
+    ARCHIVE_FLEET_PINNED_ROOT=""
+    ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT=""
+    ARCHIVE_FLEET_PINNED_PYTHON_ROOT=""
+    ARC_OPERATOR_TRANSPORT_READY=false
+    ARC_OPERATOR_TRANSPORT_RCLONE=false
+    ARC_OPERATOR_PYTHON_READY=false
+    ARC_OPERATOR_GH_READY=false
+    ARC_OPERATOR_GH_TOKEN=""
+    trap cleanup_temporary_root EXIT
+}
+
 die() {
     printf 'archive fleet: %s\n' "$*" >&2
     exit 1
@@ -1302,7 +1318,11 @@ print(hashlib.sha256(b"ARC recovery capture v2\0" + bytes.fromhex(sys.argv[1])).
 PY
 }
 
-audit_writers() {
+audit_writers() (
+    # This command pins the SSH identity into a private temporary transport
+    # root.  Install cleanup before argument validation or transport setup so
+    # both successful plans and every fail-closed exit remove that copy.
+    begin_temporary_scope
     local legacy_validators="" output=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -1321,7 +1341,6 @@ audit_writers() {
     legacy_sha="$(hash_file "$legacy_validators")"
     temporary="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$temporary"
-    trap cleanup_temporary_root EXIT
     for node in nyc lax ams lhr nrt sgp; do
         host="$(host_for "$node")"
         ssh_remote_exact "$host" /usr/bin/env -i HOME=/root \
@@ -2174,9 +2193,12 @@ PY
     digest="$(hash_file "$output")"
     printf 'archive fleet: sealed exact live writer contracts %s\n' "$output"
     printf 'archive fleet: writer contracts sha256 %s\n' "$digest"
-}
+)
 
-seal_freeze_plan() {
+seal_freeze_plan() (
+    # Python receives a private HOME even for this local-only command.  Keep
+    # that runtime root invocation-scoped on success and failure.
+    begin_temporary_scope
     local window="" output="" legacy_validators="" writer_contracts=""
     local drive_remote_root="$DRIVE_REMOTE" drive_client_sha="" drive_account_sha=""
     local drive_daily_budget="" dedicated_drive_uploader=false
@@ -2361,7 +2383,7 @@ PY
     printf 'archive fleet: capture id %s\n' "$capture_id"
     printf "archive fleet: execution authorization ARC_RECOVERY_FREEZE_GO='FREEZE %s CAPTURE %s'\n" \
         "$digest" "$capture_id"
-}
+)
 
 freeze_plan_hash() {
     local plan="$1"
@@ -2639,7 +2661,10 @@ PY' \
     done
 }
 
-prepare_writers() {
+prepare_writers() (
+    # Plan mode still authenticates the transport contract.  Its private SSH
+    # identity copy must disappear before the plan command returns.
+    begin_temporary_scope
     local legacy_validators="" output="" execute=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -2663,7 +2688,7 @@ prepare_writers() {
     printf 'archive fleet: PREPARE-WRITERS authorization=%s\n' "$expected_go"
     printf 'archive fleet: preparation stages only fail-open persistent start barriers, stops/disables process-free alternatives, and seals either a systemd-owned writer or an exact detached root-session writer relationship; the shared allow marker remains present and no writer is stopped\n'
     if [ "$execute" != true ]; then
-        printf 'archive fleet: PLAN ONLY; no host file, unit, cgroup, or local audit was changed\n'
+        printf 'archive fleet: PLAN ONLY; no persistent host file, unit, cgroup, or local audit was changed\n'
         return 0
     fi
     [ "${ARC_RECOVERY_PREPARE_GO:-}" = "$expected_go" ] || \
@@ -2673,7 +2698,6 @@ prepare_writers() {
     local pids=() names=()
     log_root="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
-    trap cleanup_temporary_root EXIT
     for node in nyc lax ams lhr nrt sgp; do
         run_remote "$node" stage-recovery-barrier "$node" > "$log_root/$node.log" 2>&1 &
         pids+=("$!"); names+=("$node")
@@ -2690,7 +2714,7 @@ prepare_writers() {
     [ "$failed" -eq 0 ] || \
         die "preparation is safely resumable while each present allow marker keeps its staged start barrier fail-open"
     audit_writers --legacy-validator-set "$legacy_validators" --output "$output"
-}
+)
 
 run_remote() {
     local node="$1"
@@ -3300,6 +3324,9 @@ PY
 }
 
 verify_offline_stop_phase() (
+    # The challenged verifier allocates a private Python HOME before its
+    # evidence scratch directory.  Own both from the first instruction.
+    begin_temporary_scope
     local freeze_plan="" evidence="" evidence_sha="" known_hosts="" known_sha=""
     local identity="" challenge="" python_path="" python_sha="" ssh_sha=""
     while [ "$#" -gt 0 ]; do
@@ -3340,7 +3367,7 @@ verify_offline_stop_phase() (
     local transition_kind transition_sha
     local pids=() names=()
     temporary="$(/usr/bin/mktemp -d)"
-    trap 'chmod -R u+w "$temporary" 2>/dev/null || true; rm -rf -- "$temporary"' EXIT
+    ARCHIVE_FLEET_TEMP_ROOT="$temporary"
     read -r started started_at < <(python3 - <<'PY'
 import datetime, time
 print(time.monotonic_ns(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -8546,7 +8573,11 @@ for (node,host),origin in zip(fleet,origins):
 PY
 }
 
-capture_phase() {
+capture_phase() (
+    # Plan mode initializes both SSH and Drive transports.  Register cleanup
+    # before parsing or validating anything so OAuth/identity copies never
+    # survive a successful plan or a fail-closed exit.
+    begin_temporary_scope
     local freeze_plan="" offline_stop_output="" legacy_height_receipt=""
     local legacy_height_receipt_sha="" legacy_height_sample_output=""
     local inspector_binary="" inspector_binary_sha=""
@@ -8628,7 +8659,6 @@ capture_phase() {
     [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
         die "cannot create private freeze-plan snapshot root"
     chmod 700 -- "$ARCHIVE_FLEET_PINNED_ROOT"
-    trap cleanup_temporary_root EXIT
     freeze_plan="$(pin_freeze_plan "$OPERATOR_FREEZE_PLAN" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
@@ -8665,7 +8695,7 @@ capture_phase() {
     REMOTE_HELPER_PATH="/root/.arc-recovery-helpers/$REMOTE_HELPER_SHA/archive-node.sh"
     run_drive_prefreeze_gate preflight "$freeze_plan" "$freeze_sha" "$capture_id"
     if [ "$execute" != true ]; then
-        printf 'archive fleet: PLAN ONLY; no service or remote/local file was changed\n'
+        printf 'archive fleet: PLAN ONLY; no persistent service or recovery-managed remote/local file was changed\n'
         return 0
     fi
     local expected_go="FREEZE $freeze_sha CAPTURE $capture_id"
@@ -8697,6 +8727,7 @@ capture_phase() {
     install_freeze_plan "$freeze_plan" "$freeze_sha"
     local inspector_stage_root
     inspector_stage_root="$(mktemp -d)"
+    ARCHIVE_FLEET_TEMP_ROOT="$inspector_stage_root"
     local inspector_stage_pids=() inspector_stage_nodes=() inspector_stage_failed=0
     local inspector_stage_index inspector_stage_node
     for inspector_stage_node in nyc lax ams lhr nrt sgp; do
@@ -8720,6 +8751,7 @@ capture_phase() {
     [ "$inspector_stage_failed" -eq 0 ] || \
         die "exact capture recovery-export inputs were not staged on all six writers"
     find "$inspector_stage_root" -depth -delete
+    ARCHIVE_FLEET_TEMP_ROOT=""
     printf 'archive fleet: staged exact hash-bound v0.8 recovery exporter inputs on all six writers\n'
     printf 'archive fleet: running exact ARC Drive identity/capacity/write-read-delete gate\n'
     local drive_execute_output drive_prefreeze_receipt
@@ -8730,7 +8762,6 @@ capture_phase() {
     local log_root
     log_root="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
-    trap cleanup_temporary_root EXIT
     local maintenance_input_root
     maintenance_input_root="$(prepare_protected_maintenance_directory \
         "${offline_stop_output}.maintenance-inputs")"
@@ -9322,7 +9353,7 @@ PY
         "$offline_stop_output" "$offline_stop_sha"
     printf 'archive fleet: OFFLINE CAPTURE COMPLETE capture=%s; all six legacy nodes remain fenced/stopped\n' "$capture_id"
     printf 'archive fleet: next create/sign/seal the recovery checkpoint from an accepted capture; do not restart legacy nodes\n'
-}
+)
 
 manifest_field() {
     local manifest="$1" path="$2"
@@ -9565,7 +9596,10 @@ print(raw)
 PY
 }
 
-verify_installed_keys_phase() {
+verify_installed_keys_phase() (
+    # The identity verifier pins Python and SSH state before its proof scratch
+    # root; keep every copy inside one invocation-scoped cleanup boundary.
+    begin_temporary_scope
     local freeze_plan="" manifest="" cli="" cli_sha="" validators="" validators_sha=""
     local install_receipt="" install_sha="" restore_receipt="" restore_sha=""
     local challenge="" output=""
@@ -9611,7 +9645,6 @@ verify_installed_keys_phase() {
     ARCHIVE_FLEET_PINNED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-key-proof.XXXXXX")"
     [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
         die "cannot allocate the private validator identity proof root"
-    trap cleanup_temporary_root EXIT
     freeze_plan="$(pin_freeze_plan "$freeze_plan" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id manifest_sha verification_output
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
@@ -9779,7 +9812,7 @@ finally: os.close(directory)
 PY
     fi
     cat "$proof_path"
-}
+)
 
 upload_immutable() {
     local source="$1" destination="$2"
@@ -11769,7 +11802,7 @@ verify_complete_phase() (
     # preflight.  Keep every pinned transport/config copy and metadata scratch
     # inside this function's subprocess, and remove it on both success and any
     # fail-closed exit.
-    trap cleanup_temporary_root EXIT
+    begin_temporary_scope
     local destination="" expected_complete_sha="" expected_manifest_sha="" expected_sums_sha="" expected_prearchive_sha=""
     local verify_live_captures=false
     local new_node_paths=()
@@ -11974,7 +12007,11 @@ print(required)
 PY
 }
 
-seal_phase() {
+seal_phase() (
+    # Seal plans authenticate SSH and Drive before any GO check.  Install the
+    # invocation cleanup boundary first so all private transport copies are
+    # removed on plan, success, and every ordinary error path.
+    begin_temporary_scope
     local freeze_plan="" manifest="" validators="" finalization_intent="" work_root=""
     local validator_install_receipt="" vault_restore_receipt=""
     local execute=false allow_unbound=false
@@ -12012,7 +12049,6 @@ seal_phase() {
     ARCHIVE_FLEET_PINNED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-seal-freeze-plan.XXXXXX")"
     [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
         die "cannot allocate the private seal freeze-plan snapshot"
-    trap cleanup_temporary_root EXIT
     freeze_plan="$(pin_freeze_plan "$freeze_plan" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id verification_output manifest_sha
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
@@ -12201,7 +12237,7 @@ PY
     done
     rclone lsd "$DRIVE_REMOTE" >/dev/null
     if [ "$execute" != true ]; then
-        printf 'archive fleet: PLAN ONLY; no remote or Drive file was changed\n'
+        printf 'archive fleet: PLAN ONLY; no persistent remote, Drive, or source credential/config file was changed\n'
         return 0
     fi
     local expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"
@@ -12217,7 +12253,6 @@ PY
     local log_root github_gist_canary_receipt
     log_root="$(mktemp -d "$work_root/arc-archive-seal.XXXXXX")"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
-    trap cleanup_temporary_root EXIT
     github_gist_canary_receipt="$log_root/github-gist-write-canary.json"
     run_github_gist_anchor_canary "$freeze_sha" "$capture_id" \
         "$github_gist_canary_receipt" >/dev/null
@@ -12602,7 +12637,7 @@ PY
     printf 'archive fleet: FINAL-ROLLOUT-ROOTS destination=%s complete_sha256=%s archive_manifest_sha256=%s sha256sums_sha256=%s prearchive_rollout_sha256=%s\n' \
         "$destination" "$(hash_file "$complete_root/COMPLETE.json")" "$archive_manifest_sha" \
         "$(hash_file "$metadata_root/SHA256SUMS")" "$manifest_sha"
-}
+)
 
 COMMAND="${1:-}"
 if [ -n "$COMMAND" ]; then

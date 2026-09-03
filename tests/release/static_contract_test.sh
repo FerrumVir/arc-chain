@@ -43,6 +43,7 @@ PRODUCTION_MANIFEST_BUILDER="$REPO_ROOT/scripts/recovery/build-production-manife
 PRODUCTION_MANIFEST_TEST="$TEST_DIR/production_manifest_builder_test.sh"
 RECOVERY_RUNBOOK="$REPO_ROOT/scripts/recovery/README.md"
 RECOVERY_ROLLOUT="$REPO_ROOT/scripts/recovery/recovery_rollout.py"
+RECOVERY_ARCHIVE="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
 RELEASE_TEST_RUNNER="$TEST_DIR/run.sh"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
@@ -2265,6 +2266,7 @@ methods = {
     for node in rollout_class.body
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 }
+
 required_methods = {
     "_preflight_production", "ssh_read_only", "ssh", "_run_ssh_script",
     "_rclone_cat_pinned_archive_object",
@@ -2329,6 +2331,102 @@ if "os.fspath(self.production_rclone_config)" in rclone_read:
     raise SystemExit("pre-GO rclone metadata read passes the operator config directly")
 if "no persistent recovery-managed change" not in source:
     raise SystemExit("plan output does not state the scoped recovery-state boundary")
+PY
+}
+
+archive_transport_configuration_is_invocation_scoped() {
+    python3 - "$RECOVERY_ARCHIVE" <<'PY' || return 1
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+boundaries = {
+    "audit_writers": "seal_freeze_plan() (",
+    "seal_freeze_plan": "freeze_plan_hash() {",
+    "prepare_writers": "run_remote() {",
+    "verify_offline_stop_phase": "create_offline_stop_evidence() {",
+    "capture_phase": "manifest_field() {",
+    "verify_installed_keys_phase": "upload_immutable() {",
+    "verify_complete_phase": "verify_reference_pair() (",
+    "seal_phase": 'COMMAND="${1:-}"',
+}
+bodies = {}
+for name, next_declaration in boundaries.items():
+    declaration = f"{name}() ("
+    start = text.index(declaration)
+    end = text.index(next_declaration, start + len(declaration))
+    body = text[start:end]
+    bodies[name] = body
+    meaningful = [
+        line.strip()
+        for line in body.splitlines()[1:]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not meaningful or meaningful[0] != "begin_temporary_scope":
+        raise SystemExit(f"{name} does not enter its temporary scope before parsing/configuration")
+    if re.search(r"(?m)^\s*trap\s+.*\sEXIT\s*$", body):
+        raise SystemExit(f"{name} overrides its invocation EXIT cleanup")
+
+transport_owners = {
+    name for name, body in bodies.items()
+    if re.search(r"(?m)^\s*configure_operator_transport\s+(?:true|false)\s*$", body)
+}
+python_owners = {
+    name for name, body in bodies.items()
+    if re.search(r"(?m)^\s*configure_operator_python\s*$", body)
+}
+if transport_owners != {
+    "audit_writers", "prepare_writers", "capture_phase",
+    "verify_installed_keys_phase", "verify_complete_phase", "seal_phase",
+}:
+    raise SystemExit(f"unexpected transport configuration owners: {sorted(transport_owners)}")
+if python_owners != {"seal_freeze_plan", "verify_offline_stop_phase"}:
+    raise SystemExit(f"unexpected direct Python configuration owners: {sorted(python_owners)}")
+
+all_transport_calls = re.findall(
+    r"(?m)^\s*configure_operator_transport\s+(?:true|false)\s*$", text
+)
+all_python_calls = re.findall(r"(?m)^\s*configure_operator_python\s*$", text)
+if len(all_transport_calls) != 6 or len(all_python_calls) != 3:
+    # The third Python call is the transport helper's internal dependency.
+    raise SystemExit("a configure call was added outside the enumerated command scopes")
+
+cleanup_start = text.index("cleanup_temporary_root() {")
+cleanup_end = text.index("begin_temporary_scope() {", cleanup_start)
+cleanup = text[cleanup_start:cleanup_end]
+scope_start = cleanup_end
+scope_end = text.index("die() {", scope_start)
+scope = text[scope_start:scope_end]
+roots = (
+    "ARCHIVE_FLEET_TEMP_ROOT", "ARCHIVE_FLEET_PINNED_ROOT",
+    "ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT", "ARCHIVE_FLEET_PINNED_PYTHON_ROOT",
+)
+for root in roots:
+    if f'rm -rf -- "${root}"' not in cleanup:
+        raise SystemExit(f"cleanup omits {root}")
+    if f'{root}=""' not in scope:
+        raise SystemExit(f"new command scope can inherit {root}")
+if scope.count("trap cleanup_temporary_root EXIT") != 1:
+    raise SystemExit("temporary scope does not install exactly one EXIT cleanup")
+if 'audit_writers --legacy-validator-set "$legacy_validators" --output "$output"' not in bodies["prepare_writers"]:
+    raise SystemExit("prepare-writers no longer exercises the nested audit scope")
+for required in (
+    'create("known_hosts", known_payload, 0o400)',
+    'create("id_ed25519", identity_payload, 0o400)',
+    'create("rclone.conf", config_payload, 0o600)',
+    'ARC_OPERATOR_RCLONE_CONFIG="$runtime/rclone.conf"',
+    'HOME="$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"',
+    '"$ARC_OPERATOR_RCLONE_BIN" --config "$ARC_OPERATOR_RCLONE_CONFIG"',
+):
+    if required not in text:
+        raise SystemExit(f"private transport copy/wrapper contract omits: {required}")
+capture = bodies["capture_phase"]
+if not re.search(
+    r'inspector_stage_root="\$\(mktemp -d\)"\s*\n'
+    r'\s*ARCHIVE_FLEET_TEMP_ROOT="\$inspector_stage_root"', capture
+):
+    raise SystemExit("capture inspector scratch is not cleanup-owned immediately after allocation")
 PY
 }
 
@@ -2479,6 +2577,7 @@ run_test 'signing-key backups are encrypted, create-only, and restore-tested' si
 run_test 'validator-vault restore/install is profile-bound, offline-proof gated, and create-only' validator_vault_restore_and_install_are_fail_closed
 run_test 'production manifest builder is hermetic, sealed, documented, and release-gated' production_manifest_builder_is_release_gated
 run_test 'production recovery plan streams probes without persistent remote helpers' recovery_plan_remote_transport_is_read_only
+run_test 'archive transport credentials and temp roots are invocation-scoped' archive_transport_configuration_is_invocation_scoped
 run_test 'macOS pre-tag community canary is exact, private, SIGTERM-only, and preservation-safe' macos_pretag_community_canary_is_exact_private_and_fail_closed
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 

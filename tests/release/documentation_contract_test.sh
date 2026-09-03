@@ -1687,6 +1687,39 @@ recovery_plan_read_only_scope_is_truthful() {
         printf 'recovery README retains the impossible absolute no-host-change claim\n'
         return 1
     fi
+
+    for literal in \
+        'invocation-scoped subshell' \
+        'disposable mode-0600 rclone config copy' \
+        'source SSH identity and rclone config' \
+        'remain byte-for-byte unchanged' \
+        'normal success, plan return, or fail-closed error' \
+        'Nested `prepare-writers` -> `audit-writers` execution' \
+        '`SIGKILL` or loss of the operator host cannot run an EXIT handler'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits the invocation-scoped credential cleanup contract' \
+            || return 1
+    done
+    for literal in \
+        '`preflight` makes no Drive object mutation' \
+        'may refresh OAuth state only in the caller-selected RCLONE_CONFIG' \
+        'orchestrator supplies a disposable mode-0600 copy' \
+        'standalone caller must provide the same isolation'
+    do
+        require_literal "$DRIVE_PREFREEZE_GATE" "$literal" \
+            'Drive prefreeze help obscures its local OAuth refresh boundary' \
+            || return 1
+    done
+    for literal in \
+        'PLAN ONLY; no persistent host file, unit, cgroup, or local audit was changed' \
+        'PLAN ONLY; no persistent service or recovery-managed remote/local file was changed' \
+        'PLAN ONLY; no persistent remote, Drive, or source credential/config file was changed'
+    do
+        require_literal "$ARCHIVE_TOOL" "$literal" \
+            'archive plan output omits its persistent-state scope' \
+            || return 1
+    done
 }
 
 run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent

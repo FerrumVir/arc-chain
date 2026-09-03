@@ -2184,6 +2184,200 @@ verify_complete_plan_cleans_transport_state_and_never_uses_ssh() (
     [ -z "$(find "$fixture/failure-tmp" -mindepth 1 -print -quit)" ] || return 1
 )
 
+archive_command_scopes_clean_plan_failure_and_nested_success() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture runtime roots_log digest artifact_digest original_identity_sha original_config_sha
+    fixture="$(mktemp -d "$REPO_ROOT/.archive-command-scope-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    runtime="$fixture/runtime"
+    roots_log="$fixture/roots.tsv"
+    mkdir -m 700 "$runtime"
+    : > "$roots_log"
+    printf 'sealed-test-identity\n' > "$fixture/id_ed25519"
+    printf 'sealed-test-oauth-config\n' > "$fixture/rclone.conf"
+    chmod 400 "$fixture/id_ed25519"
+    chmod 600 "$fixture/rclone.conf"
+    original_identity_sha="$(hash_file "$fixture/id_ed25519")"
+    original_config_sha="$(hash_file "$fixture/rclone.conf")"
+    digest="$(printf '9%.0s' {1..64})"
+    printf '{}\n' > "$fixture/legacy-validators.json"
+    printf 'capture-plan-input\n' > "$fixture/capture-input"
+    artifact_digest="$(hash_file "$fixture/capture-input")"
+    for name in freeze.json height.json inspector genesis.toml validators.json capture-legacy.json; do
+        cp "$fixture/capture-input" "$fixture/$name"
+    done
+
+    mode_of() {
+        python3 - "$1" <<'PY'
+import pathlib, stat, sys
+print(f"{stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode):03o}")
+PY
+    }
+    assert_logged_roots_absent() {
+        local kind path drive
+        while IFS=$'\t' read -r kind path drive; do
+            [ -n "$kind" ] && [ -n "$path" ] || return 1
+            [ ! -e "$path" ] && [ ! -L "$path" ] || {
+                printf 'temporary %s root (Drive=%s) survived command exit: %s\n' \
+                    "$kind" "$drive" "$path" >&2
+                return 1
+            }
+        done < "$roots_log"
+    }
+    assert_original_credentials_unchanged() {
+        [ "$(hash_file "$fixture/id_ed25519")" = "$original_identity_sha" ] &&
+            [ "$(hash_file "$fixture/rclone.conf")" = "$original_config_sha" ] &&
+            [ "$(mode_of "$fixture/id_ed25519")" = 400 ] &&
+            [ "$(mode_of "$fixture/rclone.conf")" = 600 ]
+    }
+
+    # These test doubles materialize the same three private classes as the
+    # real configuration helpers: nonsecret Python HOME, SSH identity, and
+    # OAuth-bearing rclone config. The command boundary, not parsing/network
+    # behavior (covered elsewhere), is under test here.
+    # shellcheck disable=SC2329 # invoked through each command function
+    configure_operator_python() {
+        ARCHIVE_FLEET_PINNED_PYTHON_ROOT="$(mktemp -d "$runtime/python-home.XXXXXX")"
+        chmod 700 "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
+        printf 'isolated-python-home\n' > "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT/state"
+        [ "$(mode_of "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT")" = 700 ] || return 1
+        printf 'python\t%s\tfalse\n' "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT" >> "$roots_log"
+    }
+    # shellcheck disable=SC2329 # invoked through each command function
+    configure_operator_transport() {
+        local require_drive="${1:-false}"
+        configure_operator_python
+        ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT="$(mktemp -d "$runtime/transport.XXXXXX")"
+        chmod 700 "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
+        cp "$fixture/id_ed25519" "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/id_ed25519"
+        chmod 400 "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/id_ed25519"
+        if [ "$require_drive" = true ]; then
+            cp "$fixture/rclone.conf" "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf"
+            chmod 600 "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf"
+            printf 'simulated-token-refresh\n' >> "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf"
+            [ "$(mode_of "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf")" = 600 ] || return 1
+        fi
+        [ "$(mode_of "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT")" = 700 ] || return 1
+        [ "$(mode_of "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/id_ed25519")" = 400 ] || return 1
+        printf 'transport\t%s\t%s\n' "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT" "$require_drive" >> "$roots_log"
+        [ "${ARC_TEST_CONFIGURE_FAIL:-0}" != 1 ] || die "injected transport configuration failure"
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by command functions
+    require_commands() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    tracked_source_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    install_helpers() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    run_remote() { :; }
+
+    TMPDIR="$runtime" prepare_writers \
+        --legacy-validator-set "$fixture/legacy-validators.json" \
+        --output "$fixture/writers-plan.json" --plan > "$fixture/plan.out" || return 1
+    grep -Fq -- 'archive fleet: PLAN ONLY;' "$fixture/plan.out" || return 1
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+
+    # A real capture plan asks for Drive transport, so this success path
+    # exercises simultaneous Python-HOME, SSH-identity, and OAuth-config copies.
+    # Its heavyweight evidence validators are independently covered above.
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    pin_freeze_plan() { printf '%s\n' "$1"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    capture_id_for_freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    manifest_field() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    run_drive_prefreeze_gate() { :; }
+    TMPDIR="$runtime" capture_phase \
+        --freeze-plan "$fixture/freeze.json" \
+        --legacy-public-height-receipt "$fixture/height.json" \
+        --legacy-public-height-receipt-sha256 "$artifact_digest" \
+        --inspector-binary "$fixture/inspector" \
+        --inspector-binary-sha256 "$artifact_digest" \
+        --genesis "$fixture/genesis.toml" \
+        --genesis-sha256 "$artifact_digest" \
+        --validator-public-keys "$fixture/validators.json" \
+        --validator-public-keys-sha256 "$artifact_digest" \
+        --legacy-validator-set "$fixture/capture-legacy.json" \
+        --legacy-validator-set-sha256 "$artifact_digest" \
+        --offline-stop-evidence-output "$fixture/offline-stop.json" \
+        --plan > "$fixture/capture-plan.out" || return 1
+    grep -Fq -- \
+        'PLAN ONLY; no persistent service or recovery-managed remote/local file was changed' \
+        "$fixture/capture-plan.out" || return 1
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+
+    # Help is an early successful return. It must retain its output/status and
+    # allocate no runtime state after begin_temporary_scope installs cleanup.
+    local roots_before_help
+    roots_before_help="$(wc -l < "$roots_log" | tr -d ' ')"
+    TMPDIR="$runtime" prepare_writers --help > "$fixture/help.out" || return 1
+    grep -Fq -- 'Usage:' "$fixture/help.out" || return 1
+    [ "$(wc -l < "$roots_log" | tr -d ' ')" = "$roots_before_help" ] || return 1
+
+    # Exercise the successful prepare -> nested audit shape. The nested scope
+    # first forgets inherited ownership, then proves its own cleanup removed
+    # only its roots while all three parent roots still exist.
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    audit_writers() (
+        local parent_temp="$ARCHIVE_FLEET_TEMP_ROOT"
+        local parent_transport="$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
+        local parent_python="$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
+        begin_temporary_scope
+        configure_operator_transport false
+        local nested_transport="$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
+        local nested_python="$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
+        nested_cleanup_check() {
+            cleanup_temporary_root
+            if [ -d "$parent_temp" ] && [ -d "$parent_transport" ] && [ -d "$parent_python" ] &&
+                [ ! -e "$nested_transport" ] && [ ! -e "$nested_python" ]; then
+                printf 'PASS\n' > "$fixture/nested-scope.out"
+            else
+                printf 'FAIL\n' > "$fixture/nested-scope.out"
+                return 1
+            fi
+        }
+        trap nested_cleanup_check EXIT
+    )
+    ARC_RECOVERY_PREPARE_GO="STAGE-BARRIERS $digest HELPER $digest" \
+        TMPDIR="$runtime" prepare_writers \
+        --legacy-validator-set "$fixture/legacy-validators.json" \
+        --output "$fixture/writers-execute.json" --execute > "$fixture/execute.out" || return 1
+    [ "$(cat "$fixture/nested-scope.out")" = PASS ] || return 1
+    assert_logged_roots_absent || return 1
+    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || return 1
+
+    # Fail inside transport configuration, after all three private classes
+    # exist but before the helper returns. The command's already-installed
+    # EXIT handler must still remove every copy, including the OAuth config.
+    # shellcheck disable=SC2329 # invoked indirectly by verify-complete
+    validate_drive_remote() { return 0; }
+    if ARC_TEST_CONFIGURE_FAIL=1 TMPDIR="$runtime" \
+        verify_complete_phase --destination "arc-test:captures/$digest" \
+        > "$fixture/configure-failure.out" 2>&1; then
+        printf 'verify-complete accepted injected transport setup failure\n' >&2
+        return 1
+    fi
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+
+    # The local freeze-plan command configures only its private Python HOME.
+    # A validation error after configuration must clean that nonsecret root.
+    if TMPDIR="$runtime" seal_freeze_plan > "$fixture/python-failure.out" 2>&1; then
+        printf 'seal-freeze-plan accepted empty required arguments\n' >&2
+        return 1
+    fi
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || return 1
+)
+
 complete_is_last_and_fully_verified() {
     python3 - "$ORCHESTRATOR" <<'PY' || return 1
 import pathlib,sys
@@ -2799,6 +2993,7 @@ run_test 'capture lock and monotonic lease are portable and bound' capture_lock_
 run_test 'canonical reference is independently required' reference_pair_is_independent_of_final_capture_classes
 run_test 'remote COMPLETE rejects object attacks' remote_complete_rejects_missing_tampered_extra
 run_test 'verify-complete plan cleanup is total and SSH-free' verify_complete_plan_cleans_transport_state_and_never_uses_ssh
+run_test 'archive command scopes clean plan, failure, and nested success state' archive_command_scopes_clean_plan_failure_and_nested_success
 run_test 'COMPLETE is last and fully verified' complete_is_last_and_fully_verified
 run_test 'immutable Gist revision recovers a lost local intent after latest edit' gist_revision_recovers_lost_local_intent_after_latest_edit
 run_test 'new v3 paths preserve frozen source' new_v3_paths_and_post_cutover_source_are_verified
