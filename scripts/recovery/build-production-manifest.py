@@ -108,10 +108,10 @@ APPROVED_ACME_EMAIL = "tj@arc.ai"
 MAX_OFFLINE_STOP_VERIFICATION_AGE_SECONDS = 300
 MAX_OFFLINE_STOP_VERIFICATION_DURATION_MS = 120_000
 # The live capture path enforces this wall-clock bound immediately before the
-# first quarantine.  The post-stop builder must instead re-prove the same
-# bound from the immutable receipt/cross-proof/maintenance-boundary timeline;
-# the six official HTTP origins no longer exist to resample at that point.
-MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS = 300
+# authenticated all-writer cross-proof. The post-stop builder re-proves the
+# same bound from the immutable receipt/cross-proof timeline; the six official
+# HTTP origins no longer exist to resample at that point.
+MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS = 300
 ZERO_HASH = "0" * 64
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024
@@ -4587,11 +4587,12 @@ def load_intrinsic_legacy_public_height_receipt(
 ) -> tuple[dict[str, Any], int, str, bytes]:
     """Load a historical stopped-fleet receipt without using the current clock.
 
-    ``archive-fleet-to-drive.sh capture`` retains the live <=300-second check
-    before it may create the first quarantine boundary.  After that boundary,
-    resampling would require restarting the retired writers, so this builder
-    validates intrinsic receipt semantics and later proves freshness from the
-    exact sealed capture timeline instead of comparing against ``now()``.
+    ``archive-fleet-to-drive.sh capture`` performs the live <=300-second check
+    immediately before it seals the authenticated all-writer cross-proof.
+    Actual writer mutations are separately authorized by fresh, bounded
+    per-round target receipts.  After the writers retire, this builder validates
+    intrinsic receipt semantics and the exact sealed capture timeline instead
+    of comparing historical evidence against ``now()``.
     """
 
     payload, _details = read_secure(
@@ -4612,7 +4613,7 @@ def load_intrinsic_legacy_public_height_receipt(
             source_main=args.source_main_sha,
             freeze_sha=freeze_sha,
             now=completed,
-            max_age_seconds=MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS,
+            max_age_seconds=MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS,
         )
     except legacy_height.HeightReceiptError as error:
         fail(f"legacy public-height receipt failed intrinsic validation: {error}")
@@ -4713,7 +4714,7 @@ def validate_sealed_legacy_height_capture_timeline(
                 != ledger_wrapper.get("sha256")):
         fail("sealed quarantine generation ledger roots differ")
 
-    _parse_utc_seconds(
+    height_completed = _parse_utc_seconds(
         height_receipt.get("completed_at"), "sealed legacy public-height completed_at"
     )
     fleet_started = _parse_utc_seconds(
@@ -4757,8 +4758,11 @@ def validate_sealed_legacy_height_capture_timeline(
     boundary_created = _parse_utc_seconds(
         boundary.get("created_at"), "sealed maintenance-boundary created_at"
     )
-    if fleet_started > fleet_completed:
+    if not height_completed <= fleet_started <= fleet_completed:
         fail("sealed authenticated-height fleet receipt timeline regressed")
+    if (fleet_started - height_completed).total_seconds() \
+            > MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS:
+        fail("sealed legacy public-height receipt exceeded the 300-second authenticated cross-proof boundary")
     # Remote transition/stop UTC values and operator UTC are audit-only.  The
     # exact selection -> authorization -> readiness -> dispatch -> transition
     # -> ledger roots (plus each node's BOOTTIME lease) establish causality.

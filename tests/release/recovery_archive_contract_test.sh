@@ -92,6 +92,7 @@ all_six_exact_writers_stop_before_content_capture() {
 import pathlib,sys
 t=pathlib.Path(sys.argv[1]).read_text(); b=t[t.index("capture_phase()"):t.index("manifest_field()")]
 assert b.index('run_drive_prefreeze_gate execute') < b.index('capture_all_live_observations')
+late_sample=b.index('legacy_height_receipt_sha="$(sample_legacy_public_height_late')
 height_cross=b.index('capture_authenticated_legacy_height_cross_proof "$freeze_plan"')
 rounds=b.index('run_quarantine_generation_rounds')
 first_boundary=b.index('build-first-boundary')
@@ -100,7 +101,7 @@ capture=b.index('ensure_offline_capture "$capture_id" "$node"')
 persisted=b.index('run_persisted_head_exact "$freeze_plan"')
 boundary=b.index('create_legacy_maintenance_boundary')
 offline=b.index('create_offline_stop_evidence')
-assert b.index('capture_all_live_observations') < height_cross < rounds < first_boundary
+assert b.index('capture_all_live_observations') < late_sample < height_cross < rounds < first_boundary
 assert first_boundary < stop < capture < persisted < boundary < offline
 assert 'ALL SIX CONTROLLED WRITERS HALTED' in b and 'no global halt is claimed' in b
 for required in ('sample-targets', 'quarantine-round-authorize',
@@ -114,73 +115,174 @@ PY
     ! grep -Eq 'pkill[[:space:]]|killall[[:space:]]|kill[[:space:]]+-9' "$NODE_HELPER"
 }
 
-first_quarantine_boundary_is_temporally_authorized_before_write() (
+late_public_height_sampling_is_plan_safe_and_create_only() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
-    local fixture freeze capture receipt_sha
-    fixture="$(mktemp -d "$REPO_ROOT/.first-boundary-test.XXXXXX")"
+    local fixture output first_sha first_raw pinned status
+    fixture="$(mktemp -d "$REPO_ROOT/.late-height-test.XXXXXX")"
     trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
-    freeze="$(printf 'a%.0s' {1..64})"
-    capture="$(printf 'b%.0s' {1..64})"
-    python3 - "$fixture" "$freeze" "$capture" <<'PY' || return 1
-import datetime, hashlib, json, pathlib, sys
-root=pathlib.Path(sys.argv[1]);freeze,capture=sys.argv[2:]
-canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
-now=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
-stamp=lambda value:value.strftime("%Y-%m-%dT%H:%M:%SZ")
-def write_case(name,public_completed,fleet_started,fleet_completed):
-    public={"schema":"arc.recovery.legacy-public-height.v1","source_main_commit":"c"*40,
-        "freeze_plan_sha256":freeze,"capture_id":capture,"started_at":stamp(public_completed),
-        "completed_at":stamp(public_completed),"duration_ms":1,"request_policy":{},
-        "origins":[],"legacy_public_max_height":1}
-    public_raw=canonical(public);public_sha=hashlib.sha256(public_raw).hexdigest()
-    cross={"schema":"arc.recovery.authenticated-legacy-height-fleet.v1",
-        "source_main_commit":"c"*40,"freeze_plan_sha256":freeze,"capture_id":capture,
-        "legacy_public_height_receipt_sha256":public_sha,"challenge":"d"*64,
-        "started_at":stamp(fleet_started),"completed_at":stamp(fleet_completed),
-        "conservative_height_floor":1,"nodes":[]}
-    (root/f"{name}-public.json").write_bytes(public_raw)
-    (root/f"{name}-cross.json").write_bytes(canonical(cross))
-    for path in (root/f"{name}-public.json",root/f"{name}-cross.json"):path.chmod(0o400)
-    (root/f"{name}-sha.txt").write_text(public_sha+"\n",encoding="ascii")
-write_case("valid",now-datetime.timedelta(seconds=2),now-datetime.timedelta(seconds=1),now)
-write_case("stale",now-datetime.timedelta(seconds=301),now-datetime.timedelta(seconds=300),now)
-write_case("reordered",now,now+datetime.timedelta(seconds=1),now+datetime.timedelta(seconds=2))
+    chmod 700 "$fixture"
+    mkdir "$fixture/source"
+    python3 - "$fixture/source/legacy-public-height.py" <<'PY' || return 1
+import pathlib,sys
+path=pathlib.Path(sys.argv[1])
+path.write_text('''#!/usr/bin/env python3
+import hashlib,json,os,pathlib,sys
+output=pathlib.Path(sys.argv[sys.argv.index("--output")+1])
+payload=b'{"sampled_after_prerequisites":true}\\n'
+fd=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o400)
+with os.fdopen(fd,"wb") as handle:
+    handle.write(payload);handle.flush();os.fsync(handle.fileno())
+print(json.dumps({"legacy_public_max_height":425,"receipt_sha256":hashlib.sha256(payload).hexdigest()},sort_keys=True,separators=(",",":")))
+''',encoding="utf-8")
+(path.parent/"recovery_freeze.py").write_text("# pinned dependency\\n",encoding="utf-8")
+(path.parent/"quarantine_rounds.py").write_text("# pinned dependency\\n",encoding="utf-8")
 PY
-    receipt_sha="$(cat "$fixture/valid-sha.txt")"
-    reserve_stop_boundary_timestamp "$fixture/valid-evidence.json" \
-        first-quarantine-started "$freeze" "$capture" \
-        "$fixture/valid-public.json" "$receipt_sha" "$fixture/valid-cross.json" \
-        >/dev/null || return 1
-    [ -f "$fixture/valid-evidence.json.first-quarantine-started.json" ] || return 1
-    python3 - "$fixture/valid-evidence.json.first-quarantine-started.json" <<'PY' || return 1
+    LEGACY_HEIGHT_TOOL="$fixture/source/legacy-public-height.py"
+    RECOVERY_FREEZE_MODULE="$fixture/source/recovery_freeze.py"
+    QUARANTINE_ROUND_MODULE="$fixture/source/quarantine_rounds.py"
+    [ -f "$LEGACY_HEIGHT_TOOL" ] || return 1
+    [ -f "$RECOVERY_FREEZE_MODULE" ] || return 1
+    [ -f "$QUARANTINE_ROUND_MODULE" ] || return 1
+    tracked_source_hash() { hash_file "$1"; }
+    manifest_field() { printf '%s\n' "$(printf '1%.0s' {1..40})"; }
+    pinned="$(pin_legacy_public_height_toolchain "$fixture/pinned")" || return 1
+    [ "$pinned" = "$fixture/pinned/legacy-public-height.py" ] || return 1
+    python3 - "$fixture/pinned" <<'PY' || return 1
 import pathlib,stat,sys
-assert stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode)==0o400
+root=pathlib.Path(sys.argv[1])
+assert stat.S_IMODE(root.stat().st_mode)==0o700
+for name in ("legacy-public-height.py","recovery_freeze.py","quarantine_rounds.py"):
+    assert stat.S_IMODE((root/name).stat().st_mode)==0o400
 PY
+    [ ! -e "$fixture/pinned/__pycache__" ] || return 1
+    LEGACY_HEIGHT_TOOL="$pinned"
+    [ "$LEGACY_HEIGHT_TOOL" = "$pinned" ] || return 1
+    output="$fixture/late-height.json"
+    [ "$(validate_legacy_public_height_sample_output "$output")" = absent ] || return 1
+    [ ! -e "$output" ] || return 1
+    first_sha="$(sample_legacy_public_height_late \
+        "$fixture/freeze.json" "$(printf '2%.0s' {1..64})" "$output")" || return 1
+    [ "$first_sha" = "$(hash_file "$output")" ] || return 1
+    [ "$(validate_legacy_public_height_sample_output "$output")" = sealed ] || return 1
+    first_raw="$(base64 < "$output")"
+    if ( trap - EXIT; sample_legacy_public_height_late \
+            "$fixture/freeze.json" "$(printf '2%.0s' {1..64})" "$output" \
+            >/dev/null 2>&1 ); then
+        return 1
+    else
+        status=$?
+    fi
+    [ "$status" -ne 0 ] || return 1
+    [ "$(base64 < "$output")" = "$first_raw" ] || return 1
 
-    receipt_sha="$(cat "$fixture/stale-sha.txt")"
-    set +e
-    reserve_stop_boundary_timestamp "$fixture/stale-evidence.json" \
-        first-quarantine-started "$freeze" "$capture" \
-        "$fixture/stale-public.json" "$receipt_sha" "$fixture/stale-cross.json" \
-        >/dev/null 2>&1
-    local stale_status=$?
-    set -e
-    [ "$stale_status" -ne 0 ] || return 1
-    [ ! -e "$fixture/stale-evidence.json.first-quarantine-started.json" ] || return 1
-    [ ! -e "$fixture/stale-evidence.json.first-quarantine-started.json.partial" ] || return 1
+    chmod 600 "$output"
+    if ( trap - EXIT; validate_legacy_public_height_sample_output "$output" \
+            >/dev/null 2>&1 ); then return 1; fi
+    chmod 400 "$output"
+    ln "$output" "$fixture/hardlink.json"
+    if ( trap - EXIT; validate_legacy_public_height_sample_output "$output" \
+            >/dev/null 2>&1 ); then return 1; fi
+    rm "$fixture/hardlink.json"
+    ln -s "$output" "$fixture/symlink.json"
+    if ( trap - EXIT; validate_legacy_public_height_sample_output \
+            "$fixture/symlink.json" >/dev/null 2>&1 ); then return 1; fi
+    mkdir -m 777 "$fixture/writable"
+    if ( trap - EXIT; validate_legacy_public_height_sample_output \
+            "$fixture/writable/new.json" >/dev/null 2>&1 ); then return 1; fi
 
-    receipt_sha="$(cat "$fixture/reordered-sha.txt")"
-    set +e
-    reserve_stop_boundary_timestamp "$fixture/reordered-evidence.json" \
-        first-quarantine-started "$freeze" "$capture" \
-        "$fixture/reordered-public.json" "$receipt_sha" "$fixture/reordered-cross.json" \
-        >/dev/null 2>&1
-    local reordered_status=$?
-    set -e
-    [ "$reordered_status" -ne 0 ] || return 1
-    [ ! -e "$fixture/reordered-evidence.json.first-quarantine-started.json" ] || return 1
-    [ ! -e "$fixture/reordered-evidence.json.first-quarantine-started.json.partial" ] || return 1
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+capture=text[text.index("capture_phase()"):text.index("manifest_field()")]
+plan_return=capture.index("if [ \"$execute\" != true ]")
+late_sample=capture.index('legacy_height_receipt_sha="$(sample_legacy_public_height_late')
+live=capture.index("capture_all_live_observations")
+cross=capture.index('capture_authenticated_legacy_height_cross_proof "$freeze_plan"')
+assert plan_return < live < late_sample < cross
+assert "--sample-legacy-public-height-output" in capture
+assert "mutually exclusive with an existing receipt/hash" in capture
+assert "unselected late legacy public-height receipt exists" in capture
+assert "collides with the offline-stop evidence namespace" in capture
+assert "capture-scoped with a unique 32-hex nonce" in capture
+PY
+)
+
+freeze_plan_install_reuse_is_root_safe_and_crash_resumable() (
+    local fixture target sidecar payload_sha
+    fixture="$(mktemp -d "$REPO_ROOT/.freeze-plan-reuse-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    target="$fixture/freeze.lock.json"
+    sidecar="$target.sha256"
+    printf '%s\n' '{"sealed":true}' > "$target"
+    payload_sha="$(python3 - "$target" <<'PY'
+import hashlib,pathlib,sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+    printf '%s  %s\n' "$payload_sha" "${target##*/}" > "$sidecar"
+    chmod 400 "$target" "$sidecar"
+    # Model an interrupted hard-link publication: the immutable inode is
+    # correct, but cleanup did not yet remove the uploader-side link.
+    ln "$target" "$fixture/retained-upload"
+    ln "$sidecar" "$fixture/retained-sidecar-partial"
+    python3 - "$ORCHESTRATOR" "$target" "$sidecar" "$payload_sha" <<'PY' || return 1
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+target = pathlib.Path(sys.argv[2])
+sidecar = pathlib.Path(sys.argv[3])
+expected = sys.argv[4]
+install = source[source.index("install_freeze_plan()") : source.index("prepare_writers()")]
+
+assert 'test ! -w "$target"' not in install
+assert 'test ! -w "$sidecar"' not in install
+assert '$(/usr/bin/stat -c %u:%g:%a -- "$target")" = 0:0:400' in install
+assert '$(/usr/bin/stat -c %u:%g:%a -- "$sidecar")" = 0:0:400' in install
+assert "%h" not in install
+
+def identity(path):
+    details = path.lstat()
+    return {
+        "regular": stat.S_ISREG(details.st_mode),
+        "symlink": stat.S_ISLNK(details.st_mode),
+        # The remote command is authenticated as root; normalize this local
+        # fixture to the exact remote numeric identity contract.
+        "uid": 0,
+        "gid": 0,
+        "mode": stat.S_IMODE(details.st_mode),
+        "nlink": details.st_nlink,
+    }
+
+def accepted(details):
+    return (
+        details["regular"]
+        and not details["symlink"]
+        and (details["uid"], details["gid"], details["mode"]) == (0, 0, 0o400)
+    )
+
+target_identity = identity(target)
+sidecar_identity = identity(sidecar)
+assert target_identity["nlink"] == 2 and sidecar_identity["nlink"] == 2
+assert accepted(target_identity) and accepted(sidecar_identity)
+assert hashlib.sha256(target.read_bytes()).hexdigest() == expected
+assert sidecar.read_bytes() == f"{expected}  {target.name}\n".encode("ascii")
+for field, bad in (("uid", 1), ("gid", 1), ("mode", 0o600),
+                   ("regular", False), ("symlink", True)):
+    altered = dict(target_identity); altered[field] = bad
+    assert not accepted(altered), field
+# Link count is deliberately outside the reuse predicate: both the ordinary
+# nlink=1 state and an interrupted nlink=2 publication are recoverable.
+ordinary = dict(target_identity); ordinary["nlink"] = 1
+assert accepted(ordinary) and accepted(target_identity)
+assert hashlib.sha256(target.read_bytes() + b"tamper").hexdigest() != expected
+assert sidecar.read_bytes() + b"tamper" != f"{expected}  {target.name}\n".encode("ascii")
+PY
 )
 
 offline_stop_roots_are_remote_derived_and_archive_bound() {
@@ -2580,7 +2682,8 @@ run_test 'capture id and destination fail closed' capture_id_and_destination_fai
 run_test 'timer units normalize an empty MainPID to zero' timer_units_with_empty_mainpid_normalize_to_zero
 run_test 'sealed stake proof never claims global halt' sealed_stake_quorum_never_claims_global_halt
 run_test 'all six exact writers stop before capture' all_six_exact_writers_stop_before_content_capture
-run_test 'first quarantine boundary is temporally authorized before write' first_quarantine_boundary_is_temporally_authorized_before_write
+run_test 'late public height sampling is plan-safe and create-only' late_public_height_sampling_is_plan_safe_and_create_only
+run_test 'freeze-plan reuse is root-safe and crash-resumable' freeze_plan_install_reuse_is_root_safe_and_crash_resumable
 run_test 'offline-stop roots are remote-derived and archive-bound' offline_stop_roots_are_remote_derived_and_archive_bound
 run_test 'offline-stop receipt is canonical, private, and adversarial' offline_stop_receipt_is_canonical_private_and_adversarial
 run_test 'ordinary and challenged stopped-status execute' ordinary_and_challenged_stopped_status_execute

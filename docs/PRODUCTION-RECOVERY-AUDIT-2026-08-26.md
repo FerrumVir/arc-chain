@@ -4,6 +4,16 @@ This is a read-only evidence snapshot plus the contract of the unreleased
 v0.8.0/v3 recovery candidate. It is not a deployment announcement. No seed was
 restarted, upgraded, rekeyed, or otherwise mutated during this audit.
 
+> **Protocol supersession — 2026-09-03:** The observations and actions recorded
+> in this dated audit remain historical evidence. The current capture contract
+> samples the create-only legacy public-height receipt after the slow staging,
+> Drive, and live-observation prerequisites, and requires its completion to be
+> no more than 300 seconds before the authenticated all-writer cross-proof
+> starts. Receipt age is no longer used as the mutation lease. Every quarantine
+> round separately re-samples its still-live targets and requires exact
+> target-specific public/cross proofs plus a same-boot monotonic authorization
+> lease of at most 300 seconds before any writer transition.
+
 ## What community reports correctly identified
 
 - Public v0.7.10 and v0.7.11 were desktop-only releases. The desktop and CLI
@@ -248,25 +258,26 @@ second local copy.
 The supported seal path is `build-production-manifest.py prearchive`, never a
 hand-edited production manifest. It consumes the exact
 protected-main Linux x86_64 pre-tag artifacts and build run, sealed freeze and
-legacy public-height receipt proven fresh at the sealed pre-quarantine
-boundary, canonical six-root
+legacy public-height receipt proven fresh at the authenticated all-writer
+cross-proof boundary, canonical six-root
 `arc.validator-vault.offline-stop-evidence.v2` receipt, source artifacts,
 signed checkpoint, exact Caddy 2.11.4 binary, and reward probe. Capture derives
 that offline-stop receipt from fresh hash-pinned remote stopped-status calls;
 each fixed node/host row binds the real offline-stop.v4 `stop.complete` and
 index roots plus the exact status argv/output hashes.
 
-The live capture path retains the receipt's 300-second wall-clock gate and,
-before writing the first quarantine boundary or mutating a host, atomically
-requires `receipt.completed_at <= authenticated fleet started_at <=
-authenticated fleet completed_at <= first_quarantine_started_at` with a total
-receipt-to-boundary interval of `0..=300` seconds. Once the fleet is stopped,
-the builder deliberately uses no current-time freshness check: resampling the
-six retired origins would be impossible without violating the stop fence. It
-authenticates the exact receipt/freeze/capture/hash bindings and the complete
-sealed chain through all-controlled-stopped and maintenance-boundary creation,
-then repeats the same semantic check after an exact byte-and-SHA re-read just
-before create-only prearchive publication.
+This 2026-08-26 audit recorded the intended receipt timing contract as a
+300-second wall-clock gate through the first quarantine boundary, requiring
+`receipt.completed_at <= authenticated fleet started_at <= authenticated fleet
+completed_at <= first_quarantine_started_at` with a total receipt-to-boundary
+interval of `0..=300` seconds. That timing rule is superseded by the 2026-09-03
+contract above. Once the fleet is stopped, the builder deliberately uses no
+current-time freshness check: resampling the six retired origins would be
+impossible without violating the stop fence. It authenticates the exact
+receipt/freeze/capture/hash bindings and the complete sealed chain through
+all-controlled-stopped and maintenance-boundary creation, then repeats the
+same intrinsic and sealed-timeline checks after an exact byte-and-SHA re-read
+just before create-only prearchive publication.
 
 A committed local first-boundary timestamp is not, by itself, proof that a
 remote quarantine began. On resume, capture challenges all six exact hosts for

@@ -3712,6 +3712,51 @@ class ProductionManifestBuilderTests(unittest.TestCase):
                 offline_stop=offline,
             )
 
+    def test_capture_timeline_rejects_cross_proof_started_301_seconds_after_receipt(self) -> None:
+        public_completed = (
+            dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            - dt.timedelta(hours=2)
+        )
+        self.fixture.write_height(completed_at=public_completed)
+        self.fixture.write_offline_stop(
+            fleet_started_at=public_completed + dt.timedelta(seconds=1),
+            fleet_completed_at=public_completed + dt.timedelta(seconds=2),
+            first_quarantine_at=public_completed + dt.timedelta(seconds=3),
+            all_stopped_at=public_completed + dt.timedelta(seconds=4),
+            boundary_created_at=public_completed + dt.timedelta(seconds=5),
+        )
+        height = json.loads(self.fixture.height.read_text())
+        bundle = json.loads(self.fixture.bundle.read_text())
+        boundary = json.loads(self.fixture.boundary.read_text())
+        offline = json.loads(self.fixture.offline_stop.read_text())
+        cross = copy.deepcopy(offline["legacy_height_cross_proof"])
+        cross["started_at"] = (
+            public_completed + dt.timedelta(seconds=301)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cross["completed_at"] = (
+            public_completed + dt.timedelta(seconds=302)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cross_sha = sha(canonical(cross))
+        offline["legacy_height_cross_proof"] = copy.deepcopy(cross)
+        bundle["authenticated_prefence_height_cross_proof"] = {
+            "value": copy.deepcopy(cross),
+            "sha256": cross_sha,
+        }
+        boundary["authenticated_prefence_height_cross_proof_sha256"] = cross_sha
+
+        with self.assertRaisesRegex(
+            builder.BuilderError, "300-second authenticated cross-proof boundary"
+        ):
+            builder.validate_sealed_legacy_height_capture_timeline(
+                args=self.fixture.args(),
+                freeze_sha=self.fixture.freeze_sha,
+                height_receipt=height,
+                height_receipt_sha=sha(self.fixture.height.read_bytes()),
+                evidence_bundle=bundle,
+                boundary=boundary,
+                offline_stop=offline,
+            )
+
     def test_final_height_recheck_rejects_same_maximum_byte_substitution(self) -> None:
         original_side_effect = builder.execute_installed_key_verifier.side_effect
 
