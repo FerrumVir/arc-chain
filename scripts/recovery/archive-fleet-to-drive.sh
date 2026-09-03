@@ -1388,6 +1388,14 @@ for prepare_unit in prepare_units:
     activation_closure[prepare_unit] = {
         name: prepare_prop(name) for name in closure_properties
     }
+    # MainPID is not defined for timer units.  systemd may render that
+    # service-only property as either an empty string or "0", depending on
+    # whether the timer came from a full vendor unit or the inert recovery
+    # anchor.  Seal one canonical quiescent representation so the state row
+    # and activation-closure row cannot disagree semantically.
+    if (prepare_unit.endswith(".timer")
+            and not activation_closure[prepare_unit]["MainPID"]):
+        activation_closure[prepare_unit]["MainPID"] = "0"
     if (activation_closure[prepare_unit]["Names"] != prepare_unit
             or activation_closure[prepare_unit]["Id"] != prepare_unit
             or activation_closure[prepare_unit]["Following"]):

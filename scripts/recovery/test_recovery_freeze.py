@@ -654,6 +654,22 @@ class FreezePlanTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(rf.FreezeValidationError):
                 rf.validate_pinned_freeze_plan(raw, hashlib.sha256(raw).hexdigest())
 
+    def test_inert_timer_empty_main_pid_is_canonical_quiescent_zero(self) -> None:
+        timer_blank = plan_value()
+        timer_blank["nodes"][0]["prepare_barrier"]["activation_closure"][
+            "arc-node-update.timer"
+        ]["MainPID"] = ""
+        raw = rf.canonical_json_bytes(timer_blank)
+        rf.validate_pinned_freeze_plan(raw, hashlib.sha256(raw).hexdigest())
+
+        service_blank = plan_value()
+        service_blank["nodes"][0]["prepare_barrier"]["activation_closure"][
+            "arc-self-heal.service"
+        ]["MainPID"] = ""
+        raw = rf.canonical_json_bytes(service_blank)
+        with self.assertRaises(rf.FreezeValidationError):
+            rf.validate_pinned_freeze_plan(raw, hashlib.sha256(raw).hexdigest())
+
 
 class PrepareAndBarrierTests(unittest.TestCase):
     def test_prepare_receipt_is_exact_and_bound_to_plan_node_and_cgroups(self) -> None:
