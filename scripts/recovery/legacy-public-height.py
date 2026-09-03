@@ -3,8 +3,9 @@
 
 The sampler is intentionally independent of the rollout RPC client.  It talks
 only to the fixed, reviewed legacy HTTP origins and writes a private,
-create-only canonical receipt.  The production-manifest builder must reject a
-receipt more than five minutes old.
+create-only canonical receipt.  The live capture orchestrator must verify the
+receipt within five minutes before it seals the authenticated cross-proof;
+post-stop builders validate that immutable historical decision intrinsically.
 """
 
 from __future__ import annotations

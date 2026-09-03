@@ -1941,7 +1941,7 @@ production_manifest_builder_is_release_gated() {
         'ssh_known_hosts' \
         'MAX_OFFLINE_STOP_VERIFICATION_AGE_SECONDS = 300' \
         'MAX_OFFLINE_STOP_VERIFICATION_DURATION_MS = 120_000' \
-        'MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS = 300' \
+        'MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS = 300' \
         'load_intrinsic_legacy_public_height_receipt' \
         'validate_sealed_legacy_height_capture_timeline' \
         'quarantine_generation_ledger_sha256' \
@@ -1981,8 +1981,8 @@ production_manifest_builder_is_release_gated() {
         '--ssh-sha256' \
         'reviewed Python path differs from /usr/bin/python3 resolution' \
         'arc.recovery.offline-stop-remote-verification.v1' \
-        'first-quarantine public-height authorization timeline is not ordered' \
-        'first-quarantine public-height receipt exceeded the 300-second live boundary' \
+        'sample_legacy_public_height_late' \
+        'validate_durable_legacy_height_cross_proof' \
         'ssh-known-hosts'
     do
         grep -Fq -- "$required" "$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh" \
@@ -1991,7 +1991,8 @@ production_manifest_builder_is_release_gated() {
             return 1
         }
     done
-    python3 - "$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh" <<'PY' || return 1
+    python3 - "$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh" \
+        "$PRODUCTION_MANIFEST_BUILDER" <<'PY' || return 1
 import pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 phase = text[text.index("verify_offline_stop_phase()") : text.index("create_offline_stop_evidence()")]
@@ -2000,6 +2001,32 @@ assert "/usr/bin/readlink -f" not in phase
 assert 'python3() {' in text
 assert '"$ARC_OPERATOR_PYTHON_BIN" -I "$@"' in text
 assert "python3 -" in phase
+
+capture = text[text.index("capture_phase()") : text.index("manifest_field()")]
+capture_order = (
+    capture.index('if [ "$execute" != true ]'),
+    capture.index("capture_all_live_observations"),
+    capture.index('legacy_height_receipt_sha="$(sample_legacy_public_height_late'),
+    capture.index('capture_authenticated_legacy_height_cross_proof "$freeze_plan"'),
+    capture.index("run_quarantine_generation_rounds"),
+)
+assert capture_order == tuple(sorted(capture_order))
+
+builder = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+timeline = builder[
+    builder.index("def validate_sealed_legacy_height_capture_timeline(") :
+    builder.index("def validate_remote_stop_verification(")
+]
+timeline_order = (
+    timeline.index("height_completed = _parse_utc_seconds("),
+    timeline.index("fleet_started = _parse_utc_seconds("),
+    timeline.index("if not height_completed <= fleet_started <= fleet_completed:"),
+    timeline.index("if (fleet_started - height_completed).total_seconds()"),
+    timeline.index("> MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS:"),
+    timeline.index("sealed legacy public-height receipt exceeded the 300-second authenticated cross-proof boundary"),
+)
+assert timeline_order == tuple(sorted(timeline_order))
+assert "MAX_LEGACY_HEIGHT_TO_FIRST_QUARANTINE_SECONDS" not in builder
 PY
 }
 

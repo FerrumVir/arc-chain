@@ -292,6 +292,28 @@ class LegacyPublicHeightTests(unittest.TestCase):
                 now=completed + dt.timedelta(seconds=301),
             )
 
+    def test_late_sampling_survives_425_second_prerequisite_latency(self) -> None:
+        capture_started = dt.datetime(2026, 9, 3, 9, 20, tzinfo=dt.timezone.utc)
+        cross_proof_started = capture_started + dt.timedelta(seconds=425)
+
+        early_receipt = self.receipt(capture_started)
+        with self.assertRaisesRegex(height.HeightReceiptError, r"stale \(425s old"):
+            height.validate_receipt(
+                early_receipt,
+                source_main="1" * 40,
+                freeze_sha="2" * 64,
+                now=cross_proof_started,
+            )
+
+        late_receipt = self.receipt(cross_proof_started)
+        maximum = height.validate_receipt(
+            late_receipt,
+            source_main="1" * 40,
+            freeze_sha="2" * 64,
+            now=cross_proof_started,
+        )
+        self.assertEqual(maximum, 105)
+
     def test_receipt_output_symlink_is_never_followed(self) -> None:
         target = self.root / "target.json"
         target.write_text("untouched", encoding="utf-8")

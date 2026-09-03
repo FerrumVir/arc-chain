@@ -12,6 +12,7 @@ ROLLOUT_TOOL="$SCRIPT_DIR/recovery_rollout.py"
 ROLLOUT_SCHEMA="$SCRIPT_DIR/recovery-manifest.schema.json"
 DRIVE_PREFREEZE_GATE="$SCRIPT_DIR/verify-drive-prefreeze.sh"
 LEGACY_HEIGHT_TOOL="$SCRIPT_DIR/legacy-public-height.py"
+RECOVERY_FREEZE_MODULE="$SCRIPT_DIR/recovery_freeze.py"
 QUARANTINE_ROUND_DRIVER="$SCRIPT_DIR/quarantine_round_driver.py"
 QUARANTINE_ROUND_MODULE="$SCRIPT_DIR/quarantine_rounds.py"
 LATE_FORK_INTERLOCK_TOOL="$SCRIPT_DIR/legacy-late-fork-interlock.py"
@@ -687,8 +688,7 @@ Usage:
     --output /absolute/freeze.lock.json
 
   archive-fleet-to-drive.sh capture --freeze-plan /absolute/freeze.lock.json \
-    --legacy-public-height-receipt /absolute/legacy-public-height.json \
-    --legacy-public-height-receipt-sha256 HASH \
+    --sample-legacy-public-height-output /absolute/unique-legacy-public-height.json \
     --inspector-binary /absolute/pretag-linux-x86_64/arc-node \
     --inspector-binary-sha256 HASH --genesis /absolute/genesis.toml \
     --genesis-sha256 HASH --validator-public-keys /absolute/validator-public-keys.json \
@@ -698,8 +698,7 @@ Usage:
     [--offline-stop-evidence-output /absolute/offline-stop-evidence.json] [--plan]
   ARC_RECOVERY_FREEZE_GO='FREEZE PLAN_SHA256 CAPTURE CAPTURE_SHA256' archive-fleet-to-drive.sh capture \
     --freeze-plan /absolute/freeze.lock.json \
-    --legacy-public-height-receipt /absolute/legacy-public-height.json \
-    --legacy-public-height-receipt-sha256 HASH \
+    --sample-legacy-public-height-output /absolute/unique-legacy-public-height.json \
     --inspector-binary /absolute/pretag-linux-x86_64/arc-node \
     --inspector-binary-sha256 HASH --genesis /absolute/genesis.toml \
     --genesis-sha256 HASH --validator-public-keys /absolute/validator-public-keys.json \
@@ -945,6 +944,351 @@ tracked_source_hash() {
     blob_sha="$(git -C "$REPO_ROOT" show "HEAD:$relative" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
     [ "$disk_sha" = "$blob_sha" ] || die "tracked recovery source blob differs from HEAD: $relative"
     printf '%s\n' "$disk_sha"
+}
+
+validate_legacy_public_height_sample_output() {
+    local output="$1"
+    python3 - "$output" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if (
+    not path.is_absolute()
+    or path.suffix != ".json"
+    or os.path.normpath(os.fspath(path)) != os.fspath(path)
+    or path.name in {"", ".", ".."}
+    or any(part in {".", ".."} for part in path.parts[1:])
+):
+    raise SystemExit("late legacy public-height output path is unsafe")
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+directory = os.open("/", flags)
+try:
+    root_details = os.fstat(directory)
+    if (
+        not stat.S_ISDIR(root_details.st_mode)
+        or root_details.st_uid != 0
+        or root_details.st_mode & 0o022
+    ):
+        raise SystemExit("late legacy public-height filesystem root is unsafe")
+    for component in path.parent.parts[1:]:
+        next_directory = os.open(component, flags, dir_fd=directory)
+        os.close(directory)
+        directory = next_directory
+        details = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or details.st_uid not in {0, os.geteuid()}
+            or details.st_mode & 0o022
+        ):
+            raise SystemExit("late legacy public-height output ancestry is unsafe")
+    try:
+        details = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        print("absent")
+        raise SystemExit(0)
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or details.st_nlink != 1
+        or stat.S_IMODE(details.st_mode) != 0o400
+        or not 0 < details.st_size <= 16 * 1024 * 1024
+    ):
+        raise SystemExit("late legacy public-height output identity is unsafe")
+    print("sealed")
+finally:
+    os.close(directory)
+PY
+}
+
+sealed_legacy_public_height_receipt_sha() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    before = os.fstat(descriptor)
+    stable = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o400
+        or not 0 < before.st_size <= 16 * 1024 * 1024
+    ):
+        raise SystemExit("sealed legacy public-height receipt identity is unsafe")
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    payload = b"".join(chunks)
+    if len(payload) != before.st_size or stable(os.fstat(descriptor)) != stable(before):
+        raise SystemExit("sealed legacy public-height receipt changed while read")
+finally:
+    os.close(descriptor)
+value = json.loads(payload)
+canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if payload != canonical:
+    raise SystemExit("sealed legacy public-height receipt is noncanonical")
+print(hashlib.sha256(payload).hexdigest())
+PY
+}
+
+validate_intrinsic_legacy_public_height_receipt() {
+    local receipt="$1" receipt_sha="$2" freeze_plan="$3" freeze_sha="$4"
+    local source_main
+    source_main="$(manifest_field "$freeze_plan" source_commit)"
+    python3 -B -I - "$LEGACY_HEIGHT_TOOL" "$receipt" "$receipt_sha" \
+        "$source_main" "$freeze_sha" <<'PY'
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import stat
+import sys
+
+tool = pathlib.Path(sys.argv[1])
+receipt = pathlib.Path(sys.argv[2])
+expected, source_main, freeze_sha = sys.argv[3:]
+spec = importlib.util.spec_from_file_location("arc_pinned_legacy_public_height", tool)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load pinned legacy public-height validator")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+descriptor = os.open(receipt, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    before = os.fstat(descriptor)
+    stable = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o400
+        or not 0 < before.st_size <= 16 * 1024 * 1024
+    ):
+        raise SystemExit("legacy public-height intrinsic receipt identity is unsafe")
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    payload = b"".join(chunks)
+    if len(payload) != before.st_size or stable(os.fstat(descriptor)) != stable(before):
+        raise SystemExit("legacy public-height intrinsic receipt changed while read")
+finally:
+    os.close(descriptor)
+if hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("legacy public-height intrinsic receipt hash differs")
+value = json.loads(payload)
+if payload != module.canonical_bytes(value):
+    raise SystemExit("legacy public-height intrinsic receipt is noncanonical")
+completed = module.parse_utc(value.get("completed_at"), "completed_at")
+module.validate_receipt(
+    value,
+    source_main=source_main,
+    freeze_sha=freeze_sha,
+    now=completed,
+    max_age_seconds=module.MAX_RECEIPT_AGE_SECONDS,
+)
+PY
+}
+
+pin_legacy_public_height_toolchain() {
+    local destination="$1" tool_sha freeze_sha rounds_sha
+    tool_sha="$(tracked_source_hash "$LEGACY_HEIGHT_TOOL")"
+    freeze_sha="$(tracked_source_hash "$RECOVERY_FREEZE_MODULE")"
+    rounds_sha="$(tracked_source_hash "$QUARANTINE_ROUND_MODULE")"
+    python3 - "$destination" \
+        "$LEGACY_HEIGHT_TOOL" "$tool_sha" \
+        "$RECOVERY_FREEZE_MODULE" "$freeze_sha" \
+        "$QUARANTINE_ROUND_MODULE" "$rounds_sha" <<'PY'
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+pairs = [(pathlib.Path(sys.argv[index]), sys.argv[index + 1]) for index in range(2, 8, 2)]
+output_names = (
+    "legacy-public-height.py",
+    "recovery_freeze.py",
+    "quarantine_rounds.py",
+)
+parent = root.parent
+parent_details = parent.lstat()
+if (
+    not root.is_absolute()
+    or root.name in {"", ".", ".."}
+    or parent.is_symlink()
+    or not stat.S_ISDIR(parent_details.st_mode)
+    or parent_details.st_uid != os.geteuid()
+    or stat.S_IMODE(parent_details.st_mode) != 0o700
+):
+    raise SystemExit("legacy public-height pin root parent is unsafe")
+parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.mkdir(root.name, 0o700, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+try:
+    for index, (source, expected) in enumerate(pairs):
+        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(descriptor)
+            stable = lambda value: (
+                value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+            )
+            if (
+                source.is_symlink()
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_uid not in {0, os.geteuid()}
+                or before.st_nlink < 1
+                or before.st_mode & 0o022
+                or not 0 < before.st_size <= 16 * 1024 * 1024
+            ):
+                raise SystemExit(f"legacy public-height source identity is unsafe: {source}")
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+            if len(payload) != before.st_size or stable(os.fstat(descriptor)) != stable(before):
+                raise SystemExit(f"legacy public-height source changed while read: {source}")
+        finally:
+            os.close(descriptor)
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise SystemExit(f"legacy public-height source hash differs: {source}")
+        output = os.open(
+            output_names[index],
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+            dir_fd=root_fd,
+        )
+        with os.fdopen(output, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o400)
+    os.fsync(root_fd)
+finally:
+    os.close(root_fd)
+os.chmod(root, 0o700, follow_symlinks=False)
+print(root / "legacy-public-height.py")
+PY
+}
+
+validate_durable_legacy_height_cross_proof() {
+    local path="$1" freeze_sha="$2" capture_id="$3" receipt_sha="$4"
+    require_absolute_file "$path" "durable authenticated legacy-height cross-proof"
+    require_hash "$receipt_sha" "legacy public-height receipt hash"
+    python3 - "$path" "$freeze_sha" "$capture_id" "$receipt_sha" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    before = os.fstat(descriptor)
+    stable = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o400
+        or not 0 < before.st_size <= 16 * 1024 * 1024
+    ):
+        raise SystemExit("durable authenticated legacy-height cross-proof is unsafe")
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    payload = b"".join(chunks)
+    if len(payload) != before.st_size or stable(os.fstat(descriptor)) != stable(before):
+        raise SystemExit("durable authenticated legacy-height cross-proof changed while read")
+finally:
+    os.close(descriptor)
+value = json.loads(payload)
+canonical = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if (
+    payload != canonical
+    or value.get("schema") != "arc.recovery.authenticated-legacy-height-fleet.v1"
+    or value.get("freeze_plan_sha256") != sys.argv[2]
+    or value.get("capture_id") != sys.argv[3]
+    or value.get("legacy_public_height_receipt_sha256") != sys.argv[4]
+):
+    raise SystemExit("durable authenticated legacy-height cross-proof differs")
+PY
+}
+
+sample_legacy_public_height_late() {
+    local freeze_plan="$1" freeze_sha="$2" output="$3"
+    local source_main result receipt_sha state
+    state="$(validate_legacy_public_height_sample_output "$output")"
+    [ "$state" = absent ] || die \
+        "late legacy public-height output already exists; preserve it and choose a new unique output"
+    source_main="$(manifest_field "$freeze_plan" source_commit)"
+    result="$(python3 -B -I "$LEGACY_HEIGHT_TOOL" sample \
+        --source-main "$source_main" --freeze-plan "$freeze_plan" \
+        --freeze-plan-sha256 "$freeze_sha" --output "$output" \
+        --timeout-seconds 10)"
+    receipt_sha="$(python3 - "$result" <<'PY'
+import json
+import re
+import sys
+
+value = json.loads(sys.argv[1])
+if (
+    not isinstance(value, dict)
+    or set(value) != {"legacy_public_max_height", "receipt_sha256"}
+    or isinstance(value.get("legacy_public_max_height"), bool)
+    or not isinstance(value.get("legacy_public_max_height"), int)
+    or value["legacy_public_max_height"] < 0
+    or re.fullmatch(r"[0-9a-f]{64}", str(value.get("receipt_sha256"))) is None
+):
+    raise SystemExit("late legacy public-height sampler output differs")
+print(value["receipt_sha256"])
+PY
+)"
+    require_hash "$receipt_sha" "late legacy public-height receipt hash"
+    state="$(validate_legacy_public_height_sample_output "$output")"
+    [ "$state" = sealed ] || die "late legacy public-height receipt was not sealed"
+    [ "$(sealed_legacy_public_height_receipt_sha "$output")" = "$receipt_sha" ] || \
+        die "late legacy public-height receipt differs from sampler output"
+    printf '%s\n' "$receipt_sha"
 }
 
 capture_id_for_freeze_plan_hash() {
@@ -2277,7 +2621,7 @@ install_freeze_plan() {
         case "$remote_temporary" in /root/.arc-recovery-plan-uploads/upload.*) ;; *) die "unsafe remote freeze-plan temporary path" ;; esac
         scp -q "${SSH_OPTIONS[@]}" "$plan" "$SSH_USER@$host:$remote_temporary"
         ssh_remote_exact "$host" /bin/sh -c \
-            'set -eu; temporary=$1 target=$2 expected=$3; trap '\''rm -f -- "$temporary"'\'' EXIT; test -f "$temporary" && test ! -L "$temporary"; test "$(sha256sum "$temporary" | cut -d" " -f1)" = "$expected"; parent=${target%/*}; grand=${parent%/*}; top=${grand%/*}; for directory in "$top" "$grand" "$parent"; do if test -e "$directory"; then test -d "$directory" && test ! -L "$directory"; else mkdir -m 700 -- "$directory"; fi; done; chmod 400 -- "$temporary"; if ln -- "$temporary" "$target" 2>/dev/null; then :; else test -f "$target" && test ! -L "$target" && test "$(sha256sum "$target" | cut -d" " -f1)" = "$expected" && test ! -w "$target"; fi; sidecar="$target.sha256"; expected_line="$expected  ${target##*/}"; if test -e "$sidecar"; then test -f "$sidecar" && test ! -L "$sidecar" && test "$(cat "$sidecar")" = "$expected_line" && test ! -w "$sidecar"; else side_tmp="$sidecar.partial.$$"; (umask 077; printf "%s\n" "$expected_line" > "$side_tmp"); chmod 400 "$side_tmp"; ln "$side_tmp" "$sidecar"; rm -f "$side_tmp"; fi; python3 - "$target" "$sidecar" <<'\''PY'\''
+            'set -eu; temporary=$1 target=$2 expected=$3; trap '\''rm -f -- "$temporary"'\'' EXIT; test -f "$temporary" && test ! -L "$temporary"; test "$(sha256sum "$temporary" | cut -d" " -f1)" = "$expected"; parent=${target%/*}; grand=${parent%/*}; top=${grand%/*}; for directory in "$top" "$grand" "$parent"; do if test -e "$directory"; then test -d "$directory" && test ! -L "$directory"; else mkdir -m 700 -- "$directory"; fi; done; chmod 400 -- "$temporary"; if ln -- "$temporary" "$target" 2>/dev/null; then :; else test -f "$target" && test ! -L "$target" && test "$(sha256sum "$target" | cut -d" " -f1)" = "$expected" && test "$(/usr/bin/stat -c %u:%g:%a -- "$target")" = 0:0:400; fi; sidecar="$target.sha256"; expected_line="$expected  ${target##*/}"; if test -e "$sidecar"; then test -f "$sidecar" && test ! -L "$sidecar" && test "$(cat "$sidecar")" = "$expected_line" && test "$(/usr/bin/stat -c %u:%g:%a -- "$sidecar")" = 0:0:400; else side_tmp="$sidecar.partial.$$"; (umask 077; printf "%s\n" "$expected_line" > "$side_tmp"); chmod 400 "$side_tmp"; ln "$side_tmp" "$sidecar"; rm -f "$side_tmp"; fi; python3 - "$target" "$sidecar" <<'\''PY'\''
 import os, pathlib, stat, sys
 for raw in sys.argv[1:]:
     path = pathlib.Path(raw); details = path.lstat()
@@ -6606,11 +6950,11 @@ capture_authenticated_legacy_height_cross_proof() {
     local receipt_sha="$5" output="$6" proof_root="$7"
     require_absolute_file "$receipt" "legacy public-height receipt"
     require_hash "$receipt_sha" "legacy public-height receipt hash"
-    [ "$(hash_file "$receipt")" = "$receipt_sha" ] || \
+    [ "$(sealed_legacy_public_height_receipt_sha "$receipt")" = "$receipt_sha" ] || \
         die "legacy public-height receipt differs from its explicit hash"
     local source_main challenge verify_result
     source_main="$(manifest_field "$freeze_plan" source_commit)"
-    verify_result="$(python3 -I "$LEGACY_HEIGHT_TOOL" verify \
+    verify_result="$(python3 -B -I "$LEGACY_HEIGHT_TOOL" verify \
         --source-main "$source_main" --freeze-plan "$freeze_plan" \
         --freeze-plan-sha256 "$freeze_sha" --receipt "$receipt" --max-age-seconds 300)"
     python3 - "$verify_result" "$receipt_sha" <<'PY'
@@ -6673,8 +7017,10 @@ import sys
 
 output = pathlib.Path(sys.argv[1])
 boundary, freeze_sha, capture_id, public_raw, public_sha, authenticated_raw = sys.argv[2:]
-if boundary not in {"first-quarantine-started", "all-controlled-stopped"}:
+if boundary != "all-controlled-stopped":
     raise SystemExit("unsupported stop boundary")
+if any((public_raw, public_sha, authenticated_raw)):
+    raise SystemExit("unexpected public-height inputs for terminal stop boundary")
 if (not output.is_absolute() or output.suffix != ".json"
         or os.fspath(output) != os.path.normpath(os.fspath(output))):
     raise SystemExit("stop boundary output is unsafe")
@@ -6692,99 +7038,6 @@ expected = {
     "freeze_plan_sha256": freeze_sha,
     "capture_id": capture_id,
 }
-
-def locked_json(raw_path, label):
-    candidate = pathlib.Path(raw_path)
-    if not candidate.is_absolute():
-        raise SystemExit(f"first-quarantine {label} path is not absolute")
-    descriptor = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        before = os.fstat(descriptor)
-        stable = lambda item: (
-            item.st_dev, item.st_ino, item.st_mode, item.st_uid, item.st_gid,
-            item.st_nlink, item.st_size, item.st_mtime_ns, item.st_ctime_ns,
-        )
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid not in {0, os.geteuid()}
-                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o400
-                or before.st_size <= 0 or before.st_size > 16 * 1024 * 1024):
-            raise SystemExit(f"first-quarantine {label} identity is unsafe")
-        chunks = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        payload = b"".join(chunks)
-        if len(payload) != before.st_size or stable(os.fstat(descriptor)) != stable(before):
-            raise SystemExit(f"first-quarantine {label} changed while read")
-    finally:
-        os.close(descriptor)
-    try:
-        decoded = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SystemExit(f"first-quarantine {label} is invalid JSON") from error
-    if payload != canonical(decoded):
-        raise SystemExit(f"first-quarantine {label} is noncanonical")
-    return decoded, payload
-
-def validate_first_quarantine_authorization(value):
-    if boundary != "first-quarantine-started":
-        if any((public_raw, public_sha, authenticated_raw)):
-            raise SystemExit("unexpected public-height inputs for terminal stop boundary")
-        return
-    if not all((public_raw, public_sha, authenticated_raw)):
-        raise SystemExit("first quarantine requires sealed public-height authorization inputs")
-    if re.fullmatch(r"[0-9a-f]{64}", public_sha) is None:
-        raise SystemExit("first-quarantine public-height hash is malformed")
-    public, public_payload = locked_json(public_raw, "public-height receipt")
-    authenticated, _authenticated_payload = locked_json(
-        authenticated_raw, "authenticated-height fleet proof"
-    )
-    public_fields = {
-        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
-        "started_at", "completed_at", "duration_ms", "request_policy", "origins",
-        "legacy_public_max_height",
-    }
-    authenticated_fields = {
-        "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
-        "legacy_public_height_receipt_sha256", "challenge", "started_at",
-        "completed_at", "conservative_height_floor", "nodes",
-    }
-    if (not isinstance(public, dict) or set(public) != public_fields
-            or hashlib.sha256(public_payload).hexdigest() != public_sha
-            or public.get("schema") != "arc.recovery.legacy-public-height.v1"
-            or (public.get("freeze_plan_sha256"), public.get("capture_id"))
-                != (freeze_sha, capture_id)):
-        raise SystemExit("first-quarantine public-height receipt binding differs")
-    if (not isinstance(authenticated, dict) or set(authenticated) != authenticated_fields
-            or authenticated.get("schema")
-                != "arc.recovery.authenticated-legacy-height-fleet.v1"
-            or (authenticated.get("source_main_commit"),
-                authenticated.get("freeze_plan_sha256"), authenticated.get("capture_id"),
-                authenticated.get("legacy_public_height_receipt_sha256"))
-                != (public.get("source_main_commit"), freeze_sha, capture_id, public_sha)):
-        raise SystemExit("first-quarantine authenticated-height binding differs")
-
-    def utc(raw, label):
-        if not isinstance(raw, str) or re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", raw
-        ) is None:
-            raise SystemExit(f"first-quarantine {label} is not canonical UTC")
-        try:
-            return datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
-        except ValueError as error:
-            raise SystemExit(f"first-quarantine {label} is invalid") from error
-
-    public_completed = utc(public.get("completed_at"), "public completion")
-    fleet_started = utc(authenticated.get("started_at"), "fleet start")
-    fleet_completed = utc(authenticated.get("completed_at"), "fleet completion")
-    first = utc(value.get("timestamp"), "boundary timestamp")
-    if not public_completed <= fleet_started <= fleet_completed <= first:
-        raise SystemExit("first-quarantine public-height authorization timeline is not ordered")
-    if (first - public_completed).total_seconds() > 300:
-        raise SystemExit(
-            "first-quarantine public-height receipt exceeded the 300-second live boundary"
-        )
 
 def locked_bytes(name, *, modes, links={1}, allow_empty=False):
     fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
@@ -6835,7 +7088,6 @@ try:
             raise SystemExit("existing stop boundary timestamp is noncanonical")
         if any(value.get(key) != wanted for key, wanted in expected.items()):
             raise SystemExit("existing stop boundary timestamp belongs to another capture")
-        validate_first_quarantine_authorization(value)
         if partial.exists() or partial.is_symlink():
             fragment = locked_bytes(
                 partial.name, modes={0o400, 0o600}, links={1, 2}, allow_empty=True
@@ -6868,7 +7120,6 @@ try:
                     and all(candidate.get(key) == wanted for key, wanted in expected.items())
                     and isinstance(candidate.get("timestamp"), str)
                     and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", candidate["timestamp"])):
-                validate_first_quarantine_authorization(candidate)
                 os.chmod(partial.name, 0o400, dir_fd=dfd, follow_symlinks=False)
                 descriptor = os.open(
                     partial.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd
@@ -6894,10 +7145,6 @@ try:
                 **expected,
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
-            # Validate and write in one process so no quarantine command can
-            # interleave between the live <=300-second decision and this
-            # create-only authorization boundary.
-            validate_first_quarantine_authorization(value)
             payload = canonical(value)
             descriptor = os.open(
                 partial.name,
@@ -8042,7 +8289,7 @@ run_quarantine_generation_rounds() {
         attempt_root="$(mktemp -d "$round_dir/attempt.XXXXXX")"
         chmod 700 -- "$attempt_root"
         public_receipt="$attempt_root/target-public-height.json"
-        python3 -I "$LEGACY_HEIGHT_TOOL" sample-targets \
+        python3 -B -I "$LEGACY_HEIGHT_TOOL" sample-targets \
             --source-main "$source_main" --freeze-plan "$freeze_plan" \
             --freeze-plan-sha256 "$freeze_sha" --targets "$targets" \
             --output "$public_receipt" --timeout-seconds 10 >/dev/null
@@ -8301,7 +8548,8 @@ PY
 
 capture_phase() {
     local freeze_plan="" offline_stop_output="" legacy_height_receipt=""
-    local legacy_height_receipt_sha="" inspector_binary="" inspector_binary_sha=""
+    local legacy_height_receipt_sha="" legacy_height_sample_output=""
+    local inspector_binary="" inspector_binary_sha=""
     local inspector_genesis="" inspector_genesis_sha="" inspector_validators=""
     local inspector_validators_sha="" inspector_legacy_validators=""
     local inspector_legacy_validators_sha="" execute=false
@@ -8312,6 +8560,7 @@ capture_phase() {
             --offline-stop-evidence-output) [ "$#" -ge 2 ] || die "--offline-stop-evidence-output needs a value"; offline_stop_output="$2"; shift 2 ;;
             --legacy-public-height-receipt) [ "$#" -ge 2 ] || die "--legacy-public-height-receipt needs a value"; legacy_height_receipt="$2"; shift 2 ;;
             --legacy-public-height-receipt-sha256) [ "$#" -ge 2 ] || die "--legacy-public-height-receipt-sha256 needs a value"; legacy_height_receipt_sha="$2"; shift 2 ;;
+            --sample-legacy-public-height-output) [ "$#" -ge 2 ] || die "--sample-legacy-public-height-output needs a value"; legacy_height_sample_output="$2"; shift 2 ;;
             --inspector-binary) [ "$#" -ge 2 ] || die "--inspector-binary needs a value"; inspector_binary="$2"; shift 2 ;;
             --inspector-binary-sha256) [ "$#" -ge 2 ] || die "--inspector-binary-sha256 needs a value"; inspector_binary_sha="$2"; shift 2 ;;
             --genesis) [ "$#" -ge 2 ] || die "--genesis needs a value"; inspector_genesis="$2"; shift 2 ;;
@@ -8328,9 +8577,16 @@ capture_phase() {
         esac
     done
     [ -n "$freeze_plan" ] || die "--freeze-plan is required"
-    [ -n "$legacy_height_receipt" ] || die "--legacy-public-height-receipt is required"
-    require_hash "$legacy_height_receipt_sha" "legacy public-height receipt hash"
-    require_absolute_file "$legacy_height_receipt" "legacy public-height receipt"
+    if [ -n "$legacy_height_sample_output" ]; then
+        [ -z "$legacy_height_receipt" ] && [ -z "$legacy_height_receipt_sha" ] || die \
+            "--sample-legacy-public-height-output is mutually exclusive with an existing receipt/hash"
+        legacy_height_receipt="$legacy_height_sample_output"
+    else
+        [ -n "$legacy_height_receipt" ] || die \
+            "capture requires --sample-legacy-public-height-output or --legacy-public-height-receipt"
+        require_hash "$legacy_height_receipt_sha" "legacy public-height receipt hash"
+        require_absolute_file "$legacy_height_receipt" "legacy public-height receipt"
+    fi
     local inspector_path inspector_expected
     for inspector_path in "$inspector_binary" "$inspector_genesis" \
         "$inspector_validators" "$inspector_legacy_validators"; do
@@ -8352,7 +8608,18 @@ capture_phase() {
         die "capture inspector legacy-validator-set differs from its explicit hash"
     [ -n "$offline_stop_output" ] || offline_stop_output="${freeze_plan}.offline-stop-evidence.json"
     case "$offline_stop_output" in /*.json) ;; *) die "offline-stop evidence output must be an absolute .json path" ;; esac
+    if [ -n "$legacy_height_sample_output" ]; then
+        case "$legacy_height_receipt" in
+            "$offline_stop_output"|"$offline_stop_output".*) die \
+                "late legacy public-height output collides with the offline-stop evidence namespace" ;;
+        esac
+    fi
+    local legacy_height_cross_proof="${offline_stop_output}.authenticated-height-cross-proof.json"
+    local legacy_height_cross_partial="${legacy_height_cross_proof}.partial"
     configure_operator_transport true
+    if [ -n "$legacy_height_sample_output" ]; then
+        validate_legacy_public_height_sample_output "$legacy_height_receipt" >/dev/null
+    fi
     require_commands python3 ssh scp grep git mktemp
     [ -x "$REMOTE_HELPER" ] || die "remote helper is missing or not executable"
     [ -x "$DRIVE_PREFREEZE_GATE" ] || die "Drive prefreeze gate is missing or not executable"
@@ -8366,6 +8633,28 @@ capture_phase() {
     local freeze_sha capture_id
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
     capture_id="$(capture_id_for_freeze_plan_hash "$freeze_sha")"
+    if [ -n "$legacy_height_sample_output" ]; then
+        local late_height_output_state
+        printf '%s\n' "${legacy_height_receipt##*/}" | grep -Eq \
+            "^legacy-public-height\\.${capture_id}\\.[0-9a-f]{32}\\.json$" || die \
+            "late legacy public-height output must be capture-scoped with a unique 32-hex nonce"
+        late_height_output_state="$(validate_legacy_public_height_sample_output \
+            "$legacy_height_receipt")"
+        if [ -e "$legacy_height_cross_proof" ] || [ -L "$legacy_height_cross_proof" ]; then
+            [ "$late_height_output_state" = sealed ] || die \
+                "authenticated legacy-height cross-proof exists without its selected receipt"
+            legacy_height_receipt_sha="$(sealed_legacy_public_height_receipt_sha \
+                "$legacy_height_receipt")"
+            validate_durable_legacy_height_cross_proof "$legacy_height_cross_proof" \
+                "$freeze_sha" "$capture_id" "$legacy_height_receipt_sha"
+        else
+            [ "$late_height_output_state" = absent ] || die \
+                "unselected late legacy public-height receipt exists; preserve it and choose a new unique output"
+            [ ! -e "$legacy_height_cross_partial" ] && \
+                [ ! -L "$legacy_height_cross_partial" ] || die \
+                "partial authenticated legacy-height proof exists; preserve this namespace and choose a new offline-stop output"
+        fi
+    fi
     printf 'ARC staged legacy freeze plan\n'
     printf '  freeze:   %s\n' "$freeze_sha"
     printf '  capture:  %s\n' "$capture_id"
@@ -8385,6 +8674,24 @@ capture_phase() {
 
     [ "$(freeze_plan_hash "$freeze_plan")" = "$freeze_sha" ] || \
         die "freeze plan or source bindings changed before execution"
+    # Pin the sampler and its local imports into this invocation's private
+    # root. Both sampling and verification execute these immutable bytes with
+    # bytecode generation disabled.
+    LEGACY_HEIGHT_TOOL="$(pin_legacy_public_height_toolchain \
+        "$ARCHIVE_FLEET_PINNED_ROOT/legacy-height-toolchain")"
+    if [ -f "$legacy_height_receipt" ] && [ ! -L "$legacy_height_receipt" ]; then
+        local actual_legacy_height_receipt_sha
+        actual_legacy_height_receipt_sha="$(sealed_legacy_public_height_receipt_sha \
+            "$legacy_height_receipt")"
+        if [ -n "$legacy_height_sample_output" ]; then
+            legacy_height_receipt_sha="$actual_legacy_height_receipt_sha"
+        else
+            [ "$actual_legacy_height_receipt_sha" = "$legacy_height_receipt_sha" ] || die \
+                "legacy public-height receipt differs from its explicit hash"
+        fi
+        validate_intrinsic_legacy_public_height_receipt "$legacy_height_receipt" \
+            "$legacy_height_receipt_sha" "$freeze_plan" "$freeze_sha"
+    fi
     install_helpers "$(manifest_field "$freeze_plan" remote_helper_sha256)"
     assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
     install_freeze_plan "$freeze_plan" "$freeze_sha"
@@ -8526,29 +8833,31 @@ PY
         "$observation_generation_receipt_sha" \
         "$drive_prefreeze_receipt_sha" "$log_root" "$live_observation_statuses"
     assert_pinned_freeze_bytes "$freeze_plan" "$freeze_sha"
-    local legacy_height_cross_proof="${offline_stop_output}.authenticated-height-cross-proof.json"
     local first_quarantine_started_at all_controlled_stopped_at
     local first_boundary_path="${offline_stop_output}.first-quarantine-started.json"
     if [ -e "$legacy_height_cross_proof" ] || [ -L "$legacy_height_cross_proof" ]; then
-        [ -f "$legacy_height_cross_proof" ] && [ ! -L "$legacy_height_cross_proof" ] || \
-            die "durable authenticated legacy-height cross-proof is unsafe"
-        python3 - "$legacy_height_cross_proof" "$freeze_sha" "$capture_id" \
-            "$legacy_height_receipt_sha" <<'PY'
-import json,pathlib,stat,sys
-path=pathlib.Path(sys.argv[1]);value=json.loads(path.read_text(encoding="utf-8"))
-raw=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
-details=path.lstat()
-if (path.read_bytes()!=raw or stat.S_IMODE(details.st_mode)!=0o400 or details.st_nlink!=1
-        or value.get("schema")!="arc.recovery.authenticated-legacy-height-fleet.v1"
-        or value.get("freeze_plan_sha256")!=sys.argv[2]
-        or value.get("capture_id")!=sys.argv[3]
-        or value.get("legacy_public_height_receipt_sha256")!=sys.argv[4]):
-    raise SystemExit("durable authenticated legacy-height cross-proof differs")
-PY
+        if [ -n "$legacy_height_sample_output" ]; then
+            [ "$(validate_legacy_public_height_sample_output "$legacy_height_receipt")" = sealed ] || \
+                die "selected late legacy public-height receipt is missing or unsafe"
+            legacy_height_receipt_sha="$(sealed_legacy_public_height_receipt_sha \
+                "$legacy_height_receipt")"
+        fi
+        validate_durable_legacy_height_cross_proof "$legacy_height_cross_proof" \
+            "$freeze_sha" "$capture_id" "$legacy_height_receipt_sha"
         printf 'archive fleet: reusing the durable authenticated pre-quarantine height proof\n'
     else
         [ ! -e "$first_boundary_path" ] && [ ! -L "$first_boundary_path" ] || die \
             "first quarantine boundary exists without its durable authenticated height proof"
+        [ ! -e "$legacy_height_cross_partial" ] && \
+            [ ! -L "$legacy_height_cross_partial" ] || die \
+            "partial authenticated legacy-height proof must remain in an abandoned offline-output namespace"
+        if [ -n "$legacy_height_sample_output" ]; then
+            printf 'archive fleet: sampling all six public heights after expensive pre-freeze staging\n'
+            legacy_height_receipt_sha="$(sample_legacy_public_height_late \
+                "$freeze_plan" "$freeze_sha" "$legacy_height_receipt")"
+            printf 'archive fleet: sealed late public-height receipt path=%s sha256=%s\n' \
+                "$legacy_height_receipt" "$legacy_height_receipt_sha"
+        fi
         printf 'archive fleet: cross-proving public height samples against every exact SSH-authenticated loopback writer\n'
         capture_authenticated_legacy_height_cross_proof "$freeze_plan" "$freeze_sha" \
             "$capture_id" "$legacy_height_receipt" "$legacy_height_receipt_sha" \

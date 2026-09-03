@@ -1068,34 +1068,25 @@ scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
   --attest-dedicated-drive-uploader \
   --output /secure/operator/arc-freeze.lock.json
 
-# Copy these exact values from the successful seal-freeze-plan output. Sample
-# while all six legacy HTTPS origins are still live and immediately before the
-# capture plan/execute pair; the receipt is create-only and cannot be refreshed
-# in place.
+# Copy these exact values from the successful seal-freeze-plan output. Give this
+# attempt a unique create-only receipt path, but do not sample it here. The
+# execute phase samples only after the slow inspector, Drive, and live-
+# observation prerequisites, immediately before the authenticated cross-proof.
 freeze_sha256='<freeze-plan hash printed by seal-freeze-plan>'
 capture_id='<capture id printed by seal-freeze-plan>'
 [[ "$freeze_sha256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$capture_id" =~ ^[0-9a-f]{64}$ ]]
-legacy_height_result="$(
-  "$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/legacy-public-height.py sample \
-    --source-main "$protected_main_sha" \
-    --freeze-plan /secure/operator/arc-freeze.lock.json \
-    --freeze-plan-sha256 "$freeze_sha256" \
-    --output /secure/operator/legacy-public-height.json \
-    --timeout-seconds 10
+legacy_height_attempt_nonce="$(
+  "$ARC_RECOVERY_PYTHON_PATH" -I -c 'import secrets; print(secrets.token_hex(16))'
 )"
-legacy_public_height_sha256="$(
-  printf '%s' "$legacy_height_result" \
-    | "$ARC_RECOVERY_PYTHON_PATH" -I -c 'import json,sys; print(json.load(sys.stdin)["receipt_sha256"])'
-)"
-[[ "$legacy_public_height_sha256" =~ ^[0-9a-f]{64}$ ]]
-printf 'legacy public-height receipt sha256=%s capture=%s\n' \
-  "$legacy_public_height_sha256" "$capture_id"
+[[ "$legacy_height_attempt_nonce" =~ ^[0-9a-f]{32}$ ]]
+legacy_public_height_receipt="/secure/operator/legacy-public-height.${capture_id}.${legacy_height_attempt_nonce}.json"
+offline_stop_output=/secure/operator/arc-offline-stop-evidence.json
+test ! -e "$legacy_public_height_receipt" && test ! -L "$legacy_public_height_receipt"
 
 scripts/recovery/archive-fleet-to-drive.sh capture \
   --freeze-plan /secure/operator/arc-freeze.lock.json \
-  --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
-  --legacy-public-height-receipt-sha256 "$legacy_public_height_sha256" \
+  --sample-legacy-public-height-output "$legacy_public_height_receipt" \
   --inspector-binary "$arc_node_linux" \
   --inspector-binary-sha256 "$arc_node_linux_sha256" \
   --genesis "$operator_genesis" \
@@ -1104,13 +1095,12 @@ scripts/recovery/archive-fleet-to-drive.sh capture \
   --validator-public-keys-sha256 "$validator_public_keys_sha256" \
   --legacy-validator-set "$legacy_validator_set" \
   --legacy-validator-set-sha256 "$legacy_validator_set_sha256" \
-  --offline-stop-evidence-output /secure/operator/arc-offline-stop-evidence.json
+  --offline-stop-evidence-output "$offline_stop_output"
 
 ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
   scripts/recovery/archive-fleet-to-drive.sh capture \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
-    --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
-    --legacy-public-height-receipt-sha256 "$legacy_public_height_sha256" \
+    --sample-legacy-public-height-output "$legacy_public_height_receipt" \
     --inspector-binary "$arc_node_linux" \
     --inspector-binary-sha256 "$arc_node_linux_sha256" \
     --genesis "$operator_genesis" \
@@ -1119,9 +1109,23 @@ ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
     --validator-public-keys-sha256 "$validator_public_keys_sha256" \
     --legacy-validator-set "$legacy_validator_set" \
     --legacy-validator-set-sha256 "$legacy_validator_set_sha256" \
-    --offline-stop-evidence-output /secure/operator/arc-offline-stop-evidence.json \
+    --offline-stop-evidence-output "$offline_stop_output" \
     --execute
+
+legacy_public_height_sha256="$(arc_sha256 "$legacy_public_height_receipt")"
+[[ "$legacy_public_height_sha256" =~ ^[0-9a-f]{64}$ ]]
+printf 'legacy public-height receipt path=%s sha256=%s capture=%s\n' \
+  "$legacy_public_height_receipt" "$legacy_public_height_sha256" "$capture_id"
 ```
+
+If execution exits after creating the late receipt but before sealing the
+authenticated cross-proof, leave every byte in place. After proving there is
+no selection, mutation dispatch, quarantine ledger, or first boundary and all
+six exact writers remain live and unfenced, choose a new receipt nonce. Keep
+the existing offline-stop namespace only when no authenticated-cross `.partial`
+exists; if that create-only partial exists, preserve it and choose a new
+offline-stop namespace too. A completed cross-proof must instead resume with
+its exact original receipt path and hash; it must never be resampled.
 
 Install the restored keys only after that successful capture. All three
 maintenance artifacts and sidecars are required by the current parser; their
@@ -1129,13 +1133,13 @@ digests are derived from the just-created bytes, not copied from an earlier
 attempt.
 
 ```bash
-legacy_maintenance_evidence_bundle=/secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-evidence-bundle.json
+legacy_maintenance_evidence_bundle="$offline_stop_output.legacy-maintenance-evidence-bundle.json"
 legacy_maintenance_evidence_bundle_sidecar="$legacy_maintenance_evidence_bundle.sha256"
 legacy_maintenance_evidence_bundle_sha256="$(/usr/bin/sha256sum "$legacy_maintenance_evidence_bundle" | /usr/bin/awk '{print $1}')"
-legacy_maintenance_boundary=/secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-boundary.json
+legacy_maintenance_boundary="$offline_stop_output.legacy-maintenance-boundary.json"
 legacy_maintenance_boundary_sidecar="$legacy_maintenance_boundary.sha256"
 legacy_maintenance_boundary_sha256="$(/usr/bin/sha256sum "$legacy_maintenance_boundary" | /usr/bin/awk '{print $1}')"
-offline_stop_evidence=/secure/operator/arc-offline-stop-evidence.json
+offline_stop_evidence="$offline_stop_output"
 offline_stop_evidence_sidecar="$offline_stop_evidence.sha256"
 offline_stop_evidence_sha256="$(/usr/bin/sha256sum "$offline_stop_evidence" | /usr/bin/awk '{print $1}')"
 known_hosts="$ARC_RECOVERY_SSH_KNOWN_HOSTS"
@@ -1788,11 +1792,11 @@ if [ "$prearchive_existing" = 0 ]; then
       --ca-bundle-sha256 "$system_ca_bundle_sha256" \
       --freeze-plan /secure/operator/arc-freeze.lock.json \
       --freeze-plan-sha256 "$freeze_sha256" \
-      --legacy-public-height-receipt /secure/operator/legacy-public-height.json \
-      --legacy-maintenance-evidence-bundle /secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-evidence-bundle.json \
-      --legacy-maintenance-boundary /secure/operator/arc-offline-stop-evidence.json.legacy-maintenance-boundary.json \
-      --legacy-late-fork-source-set /secure/operator/arc-offline-stop-evidence.json.legacy-late-fork-source-set.json \
-      --offline-stop-evidence /secure/operator/arc-offline-stop-evidence.json \
+      --legacy-public-height-receipt "$legacy_public_height_receipt" \
+      --legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle" \
+      --legacy-maintenance-boundary "$legacy_maintenance_boundary" \
+      --legacy-late-fork-source-set "$offline_stop_output.legacy-late-fork-source-set.json" \
+      --offline-stop-evidence "$offline_stop_evidence" \
       --ssh-known-hosts "$known_hosts" \
       --ssh-identity "$ssh_identity" \
       --validator-vault-restore-receipt /secure/operator/arc-v0.8-validator-restore/RESTORE-RECEIPT.json \

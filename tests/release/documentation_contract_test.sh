@@ -767,8 +767,7 @@ recovery_archive_commands_are_exact_and_resumable() {
     done
 
     for literal in \
-        'scripts/recovery/legacy-public-height.py sample' \
-        '--timeout-seconds 10' \
+        '--sample-legacy-public-height-output "$legacy_public_height_receipt"' \
         'scripts/release/select-pretag-artifacts.py' \
         'scripts/release/verify-pretag-run-and-artifacts.sh' \
         'scripts/release/materialize-pretag-artifacts.py' \
@@ -786,6 +785,43 @@ recovery_archive_commands_are_exact_and_resumable() {
             'recovery README omits an exact protected materialization/finalization command' \
             || return 1
     done
+    python3 - "$RECOVERY_README" <<'PY' || return 1
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index("scripts/recovery/archive-fleet-to-drive.sh prepare-writers")
+end = text.index("Install the restored keys only after that successful capture.", start)
+capture = text[start:end]
+calls = [
+    match.start()
+    for match in re.finditer(
+        re.escape("scripts/recovery/archive-fleet-to-drive.sh capture \\"), capture
+    )
+]
+if len(calls) != 2:
+    raise SystemExit("recovery README must contain exactly one capture plan and one capture execute call")
+nonce = capture.index('legacy_height_attempt_nonce="$(')
+receipt = capture.index('legacy_public_height_receipt="/secure/operator/legacy-public-height.')
+authorization = capture.index('ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id"')
+execute = capture.index("    --execute", calls[1])
+sealed_hash = capture.index('legacy_public_height_sha256="$(arc_sha256 "$legacy_public_height_receipt")"')
+if not nonce < receipt < calls[0] < authorization < calls[1] < execute < sealed_hash:
+    raise SystemExit("late public-height receipt plan/execute/hash order differs")
+flag = '--sample-legacy-public-height-output "$legacy_public_height_receipt"'
+if capture.count(flag) != 2 or flag not in capture[calls[0]:authorization] or flag not in capture[calls[1]:execute]:
+    raise SystemExit("capture plan and execute must share the exact late-sample output path")
+if "scripts/recovery/legacy-public-height.py sample" in capture:
+    raise SystemExit("recovery README samples public height before capture prerequisites")
+for statement in (
+    "do not sample it here",
+    "execute phase samples only after the slow inspector, Drive, and live-",
+    "observation prerequisites, immediately before the authenticated cross-proof",
+):
+    if statement not in capture:
+        raise SystemExit(f"recovery README omits late-sampling timing contract: {statement}")
+PY
     for literal in \
         '/secure/operator/arc-offline-stop-evidence.json' \
         '/secure/operator/arc-validator-maintenance-ed25519' \
