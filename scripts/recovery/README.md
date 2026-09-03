@@ -148,7 +148,11 @@ and prints `PLAN ONLY`. It makes no persistent recovery-managed change to a
 local or remote directory, file, process/service state, package, proxy,
 certificate, or chain data. Production probes stream directly over the pinned
 SSH channel and do not install a remote rollout helper before the exact GO
-authorization. Normal SSH and service audit logs may record that read access.
+authorization. Each post-archive, root-pinned metadata fetch uses an exact
+private mode-`0600` rclone-config copy and an isolated disposable `HOME`.
+OAuth refresh and cache writes remain inside that root, which is removed on
+success or failure, and the original operator config is re-proved afterward.
+Normal SSH and service audit logs may record that read access.
 
 If any artifact, endpoint, node, key path, stake, activation rule, timeout, or
 probe changes, create and approve a new sealed manifest. Do not chmod/edit an

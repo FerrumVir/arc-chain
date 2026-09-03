@@ -1659,6 +1659,9 @@ recovery_plan_read_only_scope_is_truthful() {
         'makes no persistent recovery-managed change' \
         'Production probes stream directly over the pinned' \
         'do not install a remote rollout helper before the exact GO' \
+        'private mode-`0600` rclone-config copy and an isolated disposable `HOME`.' \
+        'OAuth refresh and cache writes remain inside that root' \
+        'original operator config is re-proved afterward.' \
         'Normal SSH and service audit logs may record that read access.'
     do
         require_literal "$RECOVERY_README" "$literal" \
@@ -1668,6 +1671,9 @@ recovery_plan_read_only_scope_is_truthful() {
     for literal in \
         'defaults to recovery-state read-only' \
         'streams production probes over pinned SSH without installing a remote rollout' \
+        'Root-pinned archive metadata fetches use an exact private mode-`0600`' \
+        'writes are removed with that root on success or failure' \
+        'operator config is re-proved afterward.' \
         'before any persistent' \
         'Normal SSH and service audit logs may record plan access.'
     do

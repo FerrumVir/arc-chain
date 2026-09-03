@@ -5012,7 +5012,12 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         harness.configure_production_transport = mock.Mock()
         harness._assert_production_rclone_transport = mock.Mock()
         harness.production_rclone_path = Path("/reviewed/rclone")
-        harness.production_rclone_config = Path("/secure/rclone.conf")
+        harness.production_rclone_config = self.root / "rclone.conf"
+        harness.production_rclone_config.write_bytes(b"reviewed-rclone-config\n")
+        harness.production_rclone_config.chmod(0o600)
+        harness.production_transport_pins = {
+            "rclone_config": digest(harness.production_rclone_config)
+        }
         harness.production_transport_env = {"PATH": "/usr/bin:/bin"}
         with self.assertRaisesRegex(rollout.RolloutError, "same-process"):
             harness.load_production_archive_metadata()
@@ -5029,6 +5034,141 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         invalid.chmod(0o444)
         with self.assertRaisesRegex(rollout.RolloutError, "cannot read archive metadata"):
             rollout._read_canonical_read_only_json(invalid, "archive metadata")
+
+    def test_archive_metadata_rclone_is_private_disposable_and_fail_closed(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        original = self.root / "operator-rclone.conf"
+        original_payload = b"[arc]\ntype = drive\ntoken = stale\n"
+        original.write_bytes(original_payload)
+        original.chmod(0o600)
+        original_identity = original.lstat()
+        harness.configure_production_transport = mock.Mock()
+        harness._assert_production_rclone_transport = mock.Mock()
+        harness.production_rclone_path = Path("/reviewed/rclone")
+        harness.production_rclone_config = original
+        harness.production_transport_pins = {
+            "rclone_config": hashlib.sha256(original_payload).hexdigest()
+        }
+        harness.production_transport_env = {
+            "HOME": "/persistent-home-must-not-be-used",
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TZ": "UTC",
+        }
+        temporary_roots: list[Path] = []
+
+        def assert_original_unchanged() -> None:
+            current = original.lstat()
+            self.assertEqual(original.read_bytes(), original_payload)
+            self.assertEqual(
+                (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mode,
+                    current.st_uid,
+                    current.st_gid,
+                    current.st_nlink,
+                    current.st_size,
+                    current.st_mtime_ns,
+                    current.st_ctime_ns,
+                ),
+                (
+                    original_identity.st_dev,
+                    original_identity.st_ino,
+                    original_identity.st_mode,
+                    original_identity.st_uid,
+                    original_identity.st_gid,
+                    original_identity.st_nlink,
+                    original_identity.st_size,
+                    original_identity.st_mtime_ns,
+                    original_identity.st_ctime_ns,
+                ),
+            )
+
+        def mutate_private_state(command, environment) -> Path:
+            self.assertEqual(command[0], "/reviewed/rclone")
+            self.assertEqual(command[1], "--config")
+            private_config = Path(command[2])
+            temporary_root = private_config.parent
+            temporary_roots.append(temporary_root)
+            self.assertNotEqual(private_config, original)
+            self.assertNotIn(os.fspath(original), command)
+            self.assertEqual(private_config.read_bytes(), original_payload)
+            self.assertEqual(stat.S_IMODE(private_config.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(temporary_root.stat().st_mode), 0o700)
+            self.assertEqual(environment["HOME"], os.fspath(temporary_root))
+            self.assertNotEqual(environment["HOME"], harness.production_transport_env["HOME"])
+            refreshed = temporary_root / "rclone.conf.refreshed"
+            refreshed.write_bytes(b"refreshed-oauth-token\n")
+            refreshed.chmod(0o600)
+            os.replace(refreshed, private_config)
+            cache = temporary_root / ".cache" / "rclone"
+            cache.mkdir(parents=True)
+            (cache / "state").write_text("private-cache\n", encoding="utf-8")
+            assert_original_unchanged()
+            return temporary_root
+
+        wanted = b'{"schema":"arc.test"}\n'
+        wanted_sha = hashlib.sha256(wanted).hexdigest()
+
+        def successful_run(command, **kwargs):
+            mutate_private_state(command, kwargs["env"])
+            return SimpleNamespace(stdout=wanted)
+
+        with mock.patch.object(
+            rollout, "run_checked_bytes", side_effect=successful_run
+        ):
+            self.assertEqual(
+                harness._rclone_cat_pinned_archive_object(
+                    "ARCHIVE-MANIFEST.json", wanted_sha, max_bytes=len(wanted)
+                ),
+                wanted,
+            )
+        self.assertTrue(temporary_roots)
+        self.assertTrue(all(not path.exists() for path in temporary_roots))
+        self.assertEqual(harness._assert_production_rclone_transport.call_count, 2)
+        assert_original_unchanged()
+
+        harness._assert_production_rclone_transport.reset_mock()
+        temporary_roots.clear()
+
+        def failed_run(command, **kwargs):
+            mutate_private_state(command, kwargs["env"])
+            raise rollout.RolloutError("injected rclone failure")
+
+        with mock.patch.object(rollout, "run_checked_bytes", side_effect=failed_run):
+            with self.assertRaisesRegex(rollout.RolloutError, "injected rclone failure"):
+                harness._rclone_cat_pinned_archive_object(
+                    "COMPLETE.json", wanted_sha, max_bytes=len(wanted)
+                )
+        self.assertTrue(temporary_roots)
+        self.assertTrue(all(not path.exists() for path in temporary_roots))
+        self.assertEqual(harness._assert_production_rclone_transport.call_count, 2)
+        assert_original_unchanged()
+
+        harness._assert_production_rclone_transport.reset_mock()
+        temporary_roots.clear()
+
+        def bad_payload_run(command, **kwargs):
+            mutate_private_state(command, kwargs["env"])
+            return SimpleNamespace(stdout=b"wrong-but-bounded\n")
+
+        with mock.patch.object(
+            rollout, "run_checked_bytes", side_effect=bad_payload_run
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError,
+                "changed after complete-archive verification",
+            ):
+                harness._rclone_cat_pinned_archive_object(
+                    "legacy-nyc.inventory", wanted_sha, max_bytes=64
+                )
+        self.assertTrue(temporary_roots)
+        self.assertTrue(all(not path.exists() for path in temporary_roots))
+        self.assertEqual(harness._assert_production_rclone_transport.call_count, 2)
+        assert_original_unchanged()
 
     def test_production_execute_reverifies_live_captures_before_first_mutation(self) -> None:
         value = self.fixture(production=True)

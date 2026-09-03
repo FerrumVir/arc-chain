@@ -2266,7 +2266,8 @@ methods = {
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
 }
 required_methods = {
-    "_preflight_production", "ssh_read_only", "ssh", "_run_ssh_script"
+    "_preflight_production", "ssh_read_only", "ssh", "_run_ssh_script",
+    "_rclone_cat_pinned_archive_object",
 }
 if not required_methods.issubset(methods):
     raise SystemExit("recovery rollout omits the explicit read-only SSH boundary")
@@ -2308,6 +2309,24 @@ for forbidden in (
 mutating = ast.get_source_segment(source, methods["ssh"]) or ""
 if "/root/.arc-recovery-rollout-helpers" not in mutating:
     raise SystemExit("execute transport lost its content-addressed helper contract")
+
+rclone_read = ast.get_source_segment(
+    source, methods["_rclone_cat_pinned_archive_object"]
+) or ""
+for required in (
+    "tempfile.TemporaryDirectory(",
+    'private_config = temporary_root / "rclone.conf"',
+    "_exclusive_write(private_config, config_payload, 0o600)",
+    '"HOME": os.fspath(temporary_root)',
+    "finally:",
+    "self._assert_production_rclone_transport()",
+):
+    if required not in rclone_read:
+        raise SystemExit(
+            f"pre-GO rclone metadata read omits private transport boundary: {required}"
+        )
+if "os.fspath(self.production_rclone_config)" in rclone_read:
+    raise SystemExit("pre-GO rclone metadata read passes the operator config directly")
 if "no persistent recovery-managed change" not in source:
     raise SystemExit("plan output does not state the scoped recovery-state boundary")
 PY

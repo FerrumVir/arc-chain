@@ -6533,20 +6533,64 @@ class RecoveryRollout:
         self._assert_production_rclone_transport()
         assert self.production_rclone_path is not None
         assert self.production_rclone_config is not None
-        output = run_checked_bytes(
-            [
-                os.fspath(self.production_rclone_path),
-                "--config",
-                os.fspath(self.production_rclone_config),
-                "cat",
-                f"{self.manifest['archive']['destination']}/{name}",
-                "--count",
-                str(max_bytes + 1),
-            ],
-            timeout=600,
-            env=self.production_transport_env,
-        ).stdout
-        self._assert_production_rclone_transport()
+        operator_uid = os.geteuid()
+        config_payload = self._validate_operator_file(
+            self.production_rclone_config,
+            self.production_transport_pins["rclone_config"],
+            "production rclone config",
+            modes={0o600},
+            owners={operator_uid},
+            nlink=1,
+            maximum=1024 * 1024,
+        )
+        try:
+            # Rclone persists a refreshed OAuth token to its config.  Keep that
+            # expected write, plus any HOME-relative cache, inside one private
+            # disposable root so a plan never changes operator credentials.
+            with tempfile.TemporaryDirectory(
+                prefix="arc-recovery-rclone-read-"
+            ) as temporary:
+                temporary_root = Path(temporary)
+                details = temporary_root.lstat()
+                if (
+                    stat.S_ISLNK(details.st_mode)
+                    or not stat.S_ISDIR(details.st_mode)
+                    or details.st_uid != operator_uid
+                    or stat.S_IMODE(details.st_mode) != 0o700
+                ):
+                    fail("private rclone read root has an unsafe identity")
+                private_config = temporary_root / "rclone.conf"
+                _exclusive_write(private_config, config_payload, 0o600)
+                self._validate_operator_file(
+                    private_config,
+                    self.production_transport_pins["rclone_config"],
+                    "private production rclone config copy",
+                    modes={0o600},
+                    owners={operator_uid},
+                    nlink=1,
+                    maximum=1024 * 1024,
+                )
+                rclone_environment = {
+                    **self.production_transport_env,
+                    "HOME": os.fspath(temporary_root),
+                }
+                output = run_checked_bytes(
+                    [
+                        os.fspath(self.production_rclone_path),
+                        "--config",
+                        os.fspath(private_config),
+                        "cat",
+                        f"{self.manifest['archive']['destination']}/{name}",
+                        "--count",
+                        str(max_bytes + 1),
+                    ],
+                    timeout=600,
+                    env=rclone_environment,
+                ).stdout
+        finally:
+            # Re-prove the immutable operator inputs even when rclone or
+            # temporary-root cleanup fails closed.
+            self._assert_production_rclone_transport()
         payload = output
         if len(payload) > max_bytes:
             fail(f"archive object {name} exceeds its {max_bytes}-byte safety limit")
