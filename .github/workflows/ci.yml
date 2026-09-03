@@ -495,7 +495,7 @@ jobs:
           trap - EXIT HUP INT TERM
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - name: Build desktop frontend required by Tauri context
@@ -503,6 +503,42 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Native Windows protected signer runtime boundary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Match the protected preflight install mode exactly; that workflow
+          # never executes package lifecycle scripts before freezing the
+          # signer runtime and file identity.
+          npm ci --prefix desktop --ignore-scripts
+          node_bin="$(command -v node.exe)"
+          case "$node_bin" in
+            /*) ;;
+            *)
+              echo "::error::Node did not resolve to an absolute Windows executable."
+              exit 1
+              ;;
+          esac
+          tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"
+          case "$tauri_cli" in
+            /*) ;;
+            *)
+              echo "::error::Tauri CLI did not resolve inside the absolute checkout."
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$node_bin" ] || [ -L "$node_bin" ] || [ ! -x "$node_bin" ]; then
+            echo "::error::Node is missing, linked, or non-executable."
+            exit 1
+          fi
+          if [ ! -f "$tauri_cli" ] || [ -L "$tauri_cli" ]; then
+            echo "::error::Tauri CLI is missing or linked."
+            exit 1
+          fi
+          [ "$("$node_bin" --version)" = "v24.20.0" ]
+          tauri_cli_sha256="$(/usr/bin/sha256sum "$tauri_cli" | /usr/bin/awk '{print $1}')"
+          [ "$tauri_cli_sha256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |

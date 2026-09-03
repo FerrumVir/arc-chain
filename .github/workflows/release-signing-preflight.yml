@@ -562,10 +562,31 @@ jobs:
               exit 1
               ;;
           esac
-          tauri_cli="$GITHUB_WORKSPACE/desktop/node_modules/@tauri-apps/cli/tauri.js"
-          [ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ] \
-            && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
-          [ "$("$node_bin" --version)" = "v24.20.0" ]
+          # GITHUB_WORKSPACE is a native drive-letter path on Windows runners.
+          # Git Bash builtins do not give that spelling the same POSIX file
+          # identity used by the later isolated signer. PWD is the absolute
+          # MSYS path for the exact checkout and remains valid after PATH is
+          # reduced to /usr/bin:/bin in the secret-bearing step.
+          tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"
+          case "$tauri_cli" in
+            /*) ;;
+            *)
+              echo "::error::The locked Tauri CLI did not resolve inside the absolute checkout."
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$node_bin" ] || [ -L "$node_bin" ] || [ ! -x "$node_bin" ]; then
+            echo "::error::The locked Node runtime is missing, linked, or non-executable."
+            exit 1
+          fi
+          if [ ! -f "$tauri_cli" ] || [ -L "$tauri_cli" ]; then
+            echo "::error::The locked Tauri CLI is missing or linked."
+            exit 1
+          fi
+          if [ "$("$node_bin" --version)" != "v24.20.0" ]; then
+            echo "::error::The locked Node runtime version changed."
+            exit 1
+          fi
           case "$RUNNER_OS" in
             macOS)
               node_sha256="$(/usr/bin/shasum -a 256 "$node_bin" | /usr/bin/awk '{print $1}')"
@@ -576,7 +597,10 @@ jobs:
               tauri_cli_sha256="$(/usr/bin/sha256sum "$tauri_cli" | /usr/bin/awk '{print $1}')"
               ;;
           esac
-          [ "$tauri_cli_sha256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          if [ "$tauri_cli_sha256" != "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]; then
+            echo "::error::The locked Tauri CLI bytes changed."
+            exit 1
+          fi
           {
             echo "node_bin=$node_bin"
             echo "node_sha256=$node_sha256"
@@ -1529,9 +1553,25 @@ jobs:
               ;;
           esac
           tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"
-          [ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ] \
-            && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
-          [ "$("$node_bin" --version)" = "v24.20.0" ]
+          case "$tauri_cli" in
+            /*) ;;
+            *)
+              echo "::error::The locked Tauri CLI did not resolve inside the absolute checkout."
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$node_bin" ] || [ -L "$node_bin" ] || [ ! -x "$node_bin" ]; then
+            echo "::error::The locked Node runtime is missing, linked, or non-executable."
+            exit 1
+          fi
+          if [ ! -f "$tauri_cli" ] || [ -L "$tauri_cli" ]; then
+            echo "::error::The locked Tauri CLI is missing or linked."
+            exit 1
+          fi
+          if [ "$("$node_bin" --version)" != "v24.20.0" ]; then
+            echo "::error::The locked Node runtime version changed."
+            exit 1
+          fi
           case "$RUNNER_OS" in
             macOS)
               node_sha256="$(/usr/bin/shasum -a 256 "$node_bin" | /usr/bin/awk '{print $1}')"
@@ -1542,7 +1582,10 @@ jobs:
               tauri_cli_sha256="$(/usr/bin/sha256sum "$tauri_cli" | /usr/bin/awk '{print $1}')"
               ;;
           esac
-          [ "$tauri_cli_sha256" = "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]
+          if [ "$tauri_cli_sha256" != "0dd6ec63c7c63a993fde20955e291d833c03f3760e63e0ee21e83482f6c0b43a" ]; then
+            echo "::error::The locked Tauri CLI bytes changed."
+            exit 1
+          fi
           native_count="$(find desktop/node_modules/@tauri-apps -maxdepth 2 \
             -type f -name 'cli.*.node' | wc -l | tr -d ' ')"
           [ "$native_count" -eq 1 ]
