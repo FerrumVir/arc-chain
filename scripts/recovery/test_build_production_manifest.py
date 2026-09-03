@@ -306,7 +306,7 @@ print(json.dumps(value,sort_keys=True))
                 "genesis.toml": sha(self.genesis.read_bytes()),
             },
         }
-        write(self.build_metadata, json.dumps(metadata, sort_keys=True, indent=2).encode() + b"\n", 0o444)
+        write(self.build_metadata, canonical(metadata), 0o444)
         self.raw_actions_zips: dict[tuple[str, str], pathlib.Path] = {}
         self.artifact_ids: dict[tuple[str, str], int] = {}
         input_rows = []
@@ -3734,7 +3734,7 @@ class ProductionManifestBuilderTests(unittest.TestCase):
     def test_prearchive_rejects_tampered_duplicate_symlink_and_wrong_commit(self) -> None:
         metadata = json.loads(self.fixture.build_metadata.read_text())
         metadata["commit"] = "7" * 40
-        write(self.fixture.build_metadata, json.dumps(metadata, sort_keys=True, indent=2).encode() + b"\n", 0o444)
+        write(self.fixture.build_metadata, canonical(metadata), 0o444)
         with self.assertRaisesRegex(builder.BuilderError, "metadata commit differs"):
             builder.prearchive(self.fixture.args())
 
