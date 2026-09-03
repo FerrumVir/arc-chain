@@ -66,3 +66,9 @@ windows-sys = { version = "0.61", features = [
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# Tauri 2.11's Linux GTK3 stack is constrained to glib 0.18. Keep the
+# dependency version honest while applying the exact upstream fix for
+# RUSTSEC-2024-0429 until Tauri ships a supported newer GTK stack.
+[patch.crates-io]
+glib = { path = "../../vendor/third_party/glib-0.18.5" }

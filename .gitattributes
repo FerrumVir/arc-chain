@@ -1,1 +1,5 @@
 *.pdf binary
+# Preserve the byte-exact crates.io payload on every checkout. The canonical
+# MIT text intentionally contains its published blank line at EOF.
+vendor/third_party/glib-0.18.5/** text eol=lf
+vendor/third_party/glib-0.18.5/LICENSE whitespace=-blank-at-eof

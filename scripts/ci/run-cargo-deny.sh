@@ -57,3 +57,51 @@ CARGO_DENY="$WORK_DIR/cargo-deny-$VERSION-$TARGET/cargo-deny"
     --manifest-path "$MANIFEST_PATH" \
     --locked \
     check advisories bans sources licenses
+
+# cargo-deny intentionally omits local-path packages from advisory matching.
+# For the desktop graph, shadow only the reviewed glib backport with its exact
+# canonical registry identity, then require the live database to report exactly
+# the one advisory whose upstream fix is carried in the vendored source.
+MANIFEST_DIR="$(CDPATH='' cd -- "$(dirname -- "$MANIFEST_PATH")" && pwd -P)"
+MANIFEST_ABS="$MANIFEST_DIR/$(basename -- "$MANIFEST_PATH")"
+DESKTOP_MANIFEST="$REPO_ROOT/desktop/src-tauri/Cargo.toml"
+if [ "$MANIFEST_ABS" = "$DESKTOP_MANIFEST" ]; then
+    ACTUAL_METADATA="$WORK_DIR/desktop-metadata.json"
+    SHADOW_METADATA="$WORK_DIR/desktop-registry-shadow-metadata.json"
+    SHADOW_REPORT="$WORK_DIR/desktop-registry-shadow-advisories.jsonl"
+    SHADOW_DIAGNOSTICS="$WORK_DIR/desktop-registry-shadow-diagnostics.jsonl"
+    SHADOW_HELPER="$SCRIPT_DIR/vendored-glib-advisory-shadow.py"
+    VENDORED_GLIB_MANIFEST="$REPO_ROOT/vendor/third_party/glib-0.18.5/Cargo.toml"
+
+    cargo metadata \
+        --manifest-path "$MANIFEST_ABS" \
+        --format-version 1 \
+        --locked \
+        --offline >"$ACTUAL_METADATA"
+    python3 "$SHADOW_HELPER" rewrite-metadata \
+        "$ACTUAL_METADATA" \
+        "$SHADOW_METADATA" \
+        "$VENDORED_GLIB_MANIFEST"
+
+    set +e
+    "$CARGO_DENY" \
+        --config "$REPO_ROOT/deny.toml" \
+        --manifest-path "$MANIFEST_ABS" \
+        --metadata-path "$SHADOW_METADATA" \
+        --format json \
+        --color never \
+        --offline \
+        check --audit-compatible-output advisories \
+        >"$SHADOW_REPORT" 2>"$SHADOW_DIAGNOSTICS"
+    SHADOW_STATUS=$?
+    set -e
+
+    if ! python3 "$SHADOW_HELPER" verify-report \
+        "$SHADOW_REPORT" \
+        "$SHADOW_DIAGNOSTICS" \
+        "$REPO_ROOT/deny.toml" \
+        "$SHADOW_STATUS"; then
+        sed -n '1,160p' "$SHADOW_DIAGNOSTICS" >&2
+        exit 1
+    fi
+fi
