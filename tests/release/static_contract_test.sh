@@ -2382,7 +2382,12 @@ boundaries = {
     "capture_phase": "manifest_field() {",
     "verify_installed_keys_phase": "upload_immutable() {",
     "verify_complete_phase": "verify_reference_pair() (",
-    "seal_phase": 'COMMAND="${1:-}"',
+    # seal_phase ends at the next top-level declaration. The previous anchor
+    # COMMAND="${1:-}" now sits ~1,600 lines further down, past the whole
+    # dispatcher, so the slice swallowed its `trap - EXIT` and aborted this
+    # gate with "seal_phase overrides its invocation EXIT cleanup" before a
+    # single dispatcher assertion could run.
+    "seal_phase": 'archive_write_current_process_id() {',
 }
 bodies = {}
 for name, next_declaration in boundaries.items():

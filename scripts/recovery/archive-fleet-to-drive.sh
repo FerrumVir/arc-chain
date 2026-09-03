@@ -12759,7 +12759,11 @@ archive_stop_and_kill_group_members_except() {
         done
         [ "$skip" = true ] || targets+=("$process_pid")
     done <<< "$snapshot"
-    for process_pid in "${targets[@]}"; do
+    # Bash 3.2 treats "${targets[@]}" on an empty array as an unbound-variable
+    # fatal under set -u, which no caller-side "|| true" can suppress. Dying
+    # here leaves the entire group SIGSTOPped by the kill above with the CONT
+    # below never reached. The ${x[@]+...} guard keeps the expansion legal.
+    for process_pid in ${targets[@]+"${targets[@]}"}; do
         builtin kill -s KILL -- "$process_pid" 2>/dev/null || true
     done
     builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
@@ -12961,8 +12965,19 @@ archive_dispatch_sentinel() {
                         guardian_finalized=true
                 fi
                 watchdog_pid=""; watchdog_pgid=""
-                if [ "$guardian_finalized" = true ] && \
-                    ! archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
+                # Gate the sweep on the guardian receipt ALONE. The sentinel
+                # runs inside phase_pgid (set +m before the fork; asserted at
+                # sentinel start), so its own /bin/ps command-substitution
+                # children are members of the group being counted and are not
+                # in the exclusion list -- the predicate is structurally always
+                # true here, which made this sweep unreachable and stranded the
+                # 0700 gate (the phase TMPDIR holding id_ed25519, known_hosts
+                # and rclone.conf) on every guardian-kill path.
+                # It is also redundant: the guardian leads its own PGID
+                # (watchdog_pid == watchdog_pgid, :13329), so its identical
+                # calls are sound, and it writes guardian.finalized only after
+                # its anchor-validated drain loop has emptied the group.
+                if [ "$guardian_finalized" = true ]; then
                     (umask 077; printf '%s\t%s\t%s\n' "$sentinel_pid" "$stop_token" \
                         "$guardian_failed" > "$gate/sentinel.complete.partial") && \
                         /bin/mv -f "$gate/sentinel.complete.partial" "$gate/sentinel.complete"
