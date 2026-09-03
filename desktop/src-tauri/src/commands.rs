@@ -974,19 +974,48 @@ async fn cached_chain_choice(state: &AppState) -> Option<ChainHostChoice> {
         .map(|(c, _)| c.clone())
 }
 
+/// A conservative upper bound for the number of tokens produced by ARC's
+/// raw-input tokenizer.
+///
+/// `CachedIntegerModel::encode` prepends one three-byte SentencePiece marker,
+/// replaces every ASCII space with that same three-byte marker, and then emits
+/// at most one token per transformed UTF-8 byte. Keeping the bound here in
+/// bytes means the desktop does not need the model vocabulary merely to avoid
+/// cancelling a valid coordinator request too early.
+fn inference_prompt_token_upper_bound(prompt: &str) -> u64 {
+    const SENTENCEPIECE_MARKER_BYTES: u64 = 3;
+
+    prompt
+        .as_bytes()
+        .iter()
+        .fold(SENTENCEPIECE_MARKER_BYTES, |transformed_bytes, byte| {
+            transformed_bytes.saturating_add(if *byte == b' ' {
+                SENTENCEPIECE_MARKER_BYTES
+            } else {
+                1
+            })
+        })
+}
+
 /// Mirror the coordinator's protocol budget: worker inference, independent
 /// validator recomputation, and remote reward approvals can span three model
-/// passes. Add 60 seconds beyond the server's capped deadline so a valid
+/// passes. The server budgets the complete generation context -- one internal
+/// BOS position, the tokenized prompt, and requested output -- rather than
+/// output tokens alone. Add 60 seconds beyond its capped deadline so a valid
 /// settled response is never cancelled by the desktop first.
-fn inference_timeout(max_tokens: u32) -> std::time::Duration {
+fn inference_timeout(prompt: &str, max_tokens: u32) -> std::time::Duration {
     const MIN_SERVER_SECS: u64 = 45;
     const MAX_SERVER_SECS: u64 = 3_900;
     const CLAIM_WINDOW_SECS: u64 = 30;
     const CLIENT_HEADROOM_SECS: u64 = 60;
+    const INTERNAL_BOS_POSITIONS: u64 = 1;
     // One generation is budgeted at 3.3s/token. Dispatch can include the
     // worker pass, coordinator verification, and validator approval pass,
-    // each with 50% headroom: ceil(14.85s * tokens) + claim window.
-    let estimated_ms = (max_tokens as u64).saturating_mul(14_850);
+    // each with 50% headroom: ceil(14.85s * positions) + claim window.
+    let required_positions = INTERNAL_BOS_POSITIONS
+        .saturating_add(inference_prompt_token_upper_bound(prompt))
+        .saturating_add(u64::from(max_tokens));
+    let estimated_ms = required_positions.saturating_mul(14_850);
     let estimated_secs = estimated_ms.saturating_add(999) / 1_000;
     let server_secs = estimated_secs
         .saturating_add(CLAIM_WINDOW_SECS)
@@ -997,9 +1026,9 @@ fn inference_timeout(max_tokens: u32) -> std::time::Duration {
 /// How long a coordinator gets to answer `/health` before we skip it.
 const COORDINATOR_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-fn inference_client(max_tokens: u32) -> Result<reqwest::Client, String> {
+fn inference_client(prompt: &str, max_tokens: u32) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(inference_timeout(max_tokens))
+        .timeout(inference_timeout(prompt, max_tokens))
         .build()
         .map_err(map_err)
 }
@@ -1156,7 +1185,7 @@ pub async fn run_inference(
     let port = state.node.lock().await.rpc_port;
     let host = paths::local_host(port);
     let max_tokens = max_tokens.unwrap_or(32);
-    let client = inference_client(max_tokens)?;
+    let client = inference_client(&prompt, max_tokens)?;
     let mut result = rpc_client::run_inference(
         &client,
         &host,
@@ -1191,7 +1220,7 @@ pub async fn run_inference_via_coordinator(
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
     let max_tokens = max_tokens.unwrap_or(32);
-    let client = inference_client(max_tokens)?;
+    let client = inference_client(&prompt, max_tokens)?;
     let k = k.unwrap_or(3);
     let chat_template = chat_template.unwrap_or(true);
 
@@ -1300,7 +1329,7 @@ pub async fn run_inference_via_coordinator_direct(
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
     let max_tokens = max_tokens.unwrap_or(32);
-    let client = inference_client(max_tokens)?;
+    let client = inference_client(&prompt, max_tokens)?;
     let chat_template = chat_template.unwrap_or(true);
 
     let candidates = coordinator_candidates(&state).await;
@@ -3270,9 +3299,47 @@ mod release_binary_tests {
 
     #[test]
     fn desktop_inference_deadline_outlives_the_server_protocol_budget() {
-        assert_eq!(inference_timeout(0).as_secs(), 105);
-        assert_eq!(inference_timeout(32).as_secs(), 566);
-        assert_eq!(inference_timeout(u32::MAX).as_secs(), 3_960);
+        fn admitted_coordinator_budget(required_positions: u64) -> Option<u64> {
+            let estimated = required_positions
+                .saturating_mul(14_850)
+                .div_ceil(1_000)
+                .saturating_add(30);
+            (estimated <= 3_900).then_some(estimated.max(45))
+        }
+
+        // The UTF-8 byte bound accounts for the tokenizer's leading marker
+        // and its expansion of an ASCII space into a three-byte marker.
+        let short_prompt = "ARC node";
+        assert_eq!(inference_prompt_token_upper_bound(short_prompt), 13);
+        assert_eq!(inference_prompt_token_upper_bound("🧪 "), 10);
+        let short_positions = 1 + 13 + 16;
+        let short_timeout = inference_timeout(short_prompt, 16).as_secs();
+        assert_eq!(short_timeout, 536);
+        assert_eq!(
+            short_timeout,
+            admitted_coordinator_budget(short_positions).unwrap() + 60
+        );
+        assert!(short_timeout < 10 * 60, "short prompts stay bounded");
+
+        // At one output token, a long prompt alone can consume almost the
+        // complete coordinator budget. The old output-only calculation gave
+        // this request 105 seconds and cancelled it thousands of seconds too
+        // early. The conservative prompt bound now covers that budget plus
+        // client headroom.
+        let long_prompt = "x".repeat(255);
+        let long_positions = 1 + inference_prompt_token_upper_bound(&long_prompt) + 1;
+        assert_eq!(long_positions, 260);
+        assert_eq!(inference_timeout(&long_prompt, 1).as_secs(), 3_951);
+        assert_eq!(
+            inference_timeout(&long_prompt, 1).as_secs(),
+            admitted_coordinator_budget(long_positions).unwrap() + 60
+        );
+
+        // One more raw byte crosses the coordinator's admitted deadline. The
+        // desktop saturates at the full 3,900s server cap plus 60s headroom,
+        // including for arithmetic-overflow-scale output requests.
+        assert_eq!(inference_timeout(&"x".repeat(256), 1).as_secs(), 3_960);
+        assert_eq!(inference_timeout("", u32::MAX).as_secs(), 3_960);
     }
 
     #[test]

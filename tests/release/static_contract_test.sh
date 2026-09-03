@@ -26,6 +26,7 @@ UPDATER_VERIFIER_MANIFEST="$TEST_DIR/tauri-updater-verifier/Cargo.toml"
 UPDATER_FIXTURE_DIR="$TEST_DIR/fixtures/tauri-updater"
 RELEASE_ALLOWED_SIGNERS="$REPO_ROOT/release/arc-release-allowed-signers"
 RELEASE_PREFLIGHT_WORKFLOW="$REPO_ROOT/.github/workflows/release-signing-preflight.yml"
+RECOVERY_RELEASE_HANDOFF_WORKFLOW="$REPO_ROOT/.github/workflows/recovery-release-handoff.yml"
 SIGNING_BACKUP_WORKFLOW="$REPO_ROOT/.github/workflows/release-signing-backup.yml"
 SIGNING_BACKUP_VERIFY="$REPO_ROOT/scripts/release/verify-signing-key-backup.sh"
 PRETAG_SELECTOR="$REPO_ROOT/scripts/release/select-pretag-artifacts.py"
@@ -533,6 +534,69 @@ pretag_exact_byte_handoff_is_fail_closed() {
     do
         grep -Fq -- "$required" "$PRETAG_SELECTOR" || {
             printf 'pre-tag selector omits fail-closed check: %s\n' "$required"
+            return 1
+        }
+    done
+}
+
+upload_artifact_digests_are_canonicalized_at_job_boundaries() {
+    # The exact pinned actions/upload-artifact implementation exposes its
+    # artifact-digest output as 64 bare lowercase hex characters. GitHub's
+    # artifact REST objects expose the same value as sha256:<hex>. Keep the
+    # repository-facing job-output contract in the REST form, exactly once at
+    # each producer boundary, so downstream validators never receive a bare or
+    # double-prefixed digest.
+    local upload_pin evidence_boundary evidence_boundary_count
+    upload_pin='actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+    evidence_boundary="evidence_digest: \${{ format('sha256:{0}', steps.evidence.outputs.artifact-digest) }}"
+    for workflow in \
+        "$RECOVERY_RELEASE_HANDOFF_WORKFLOW" \
+        "$RELEASE_PREFLIGHT_WORKFLOW" \
+        "$RELEASE_WORKFLOW"
+    do
+        grep -Fq "$upload_pin" "$workflow" || {
+            printf 'digest contract is not tied to the reviewed upload-artifact implementation: %s\n' \
+                "$workflow"
+            return 1
+        }
+    done
+
+    grep -Fq \
+        "artifact-digest: \${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}" \
+        "$RECOVERY_RELEASE_HANDOFF_WORKFLOW" || {
+        printf 'recovery handoff does not canonicalize its job digest output\n'
+        return 1
+    }
+    for required in \
+        "artifact_digest: \${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}" \
+        '[[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]'
+    do
+        grep -Fq -- "$required" "$RELEASE_PREFLIGHT_WORKFLOW" || {
+            printf 'desktop signer handoff digest boundary omits: %s\n' "$required"
+            return 1
+        }
+    done
+    for required in \
+        "artifact_digest: \${{ format('sha256:{0}', steps.unsigned-upload.outputs.artifact-digest) }}" \
+        "artifact_digest: \${{ format('sha256:{0}', steps.sealed-upload.outputs.artifact-digest) }}" \
+        "evidence_digest: \${{ format('sha256:{0}', steps.evidence.outputs.artifact-digest) }}"
+    do
+        grep -Fq -- "$required" "$RELEASE_WORKFLOW" || {
+            printf 'release handoff digest boundary omits: %s\n' "$required"
+            return 1
+        }
+    done
+    evidence_boundary_count="$(grep -Fc "$evidence_boundary" "$RELEASE_WORKFLOW")"
+    [ "$evidence_boundary_count" -eq 2 ] || {
+        printf 'both draft and published evidence outputs must canonicalize exactly once\n'
+        return 1
+    }
+    for required in \
+        '[[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]' \
+        '--arg digest "sha256:$ARTIFACT_DIGEST"'
+    do
+        grep -Fq -- "$required" "$RECOVERY_RELEASE_HANDOFF_WORKFLOW" || {
+            printf 'same-step recovery artifact/API digest comparison omits: %s\n' "$required"
             return 1
         }
     done
@@ -1407,6 +1471,15 @@ release_secret_jobs_require_the_owner_environment() {
         'Select and download the exact-main ciphertext before secret access' \
         'npm ci --prefix desktop --ignore-scripts' \
         'Restore only the four bounded members and exercise both keys' \
+        'canonicalize_manifest_public_key' \
+        'NR != 1 { exit 1 }' \
+        'if (NF != 2 && NF != 3) exit 1' \
+        'if ($1 != "ssh-ed25519") exit 1' \
+        'if ($2 !~ /^[A-Za-z0-9+\/]+={0,2}$/) exit 1' \
+        'if (NF == 3 && $3 != "arc-release-manifest-v1") exit 1' \
+        '"$expected_manifest" "$expected_manifest_canonical"' \
+        '"$derived_manifest_canonical" "$expected_manifest_canonical"' \
+        '"$restored_manifest_canonical" "$expected_manifest_canonical"' \
         'cleanup_plaintext' \
         'Verify the updater canary only after all recovered secrets are gone' \
         'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}'
@@ -1675,14 +1748,22 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
     for required in \
         'repos/FerrumVir/arc-chain/immutable-releases' \
         'Run that command from the existing owner/admin `gh` session immediately before' \
-        'immediately deletes that exact release ID without' \
-        'deleting the protected tag'
+        'Before publication, a failed upload or independent verification may delete' \
+        'Once the publication PATCH has been attempted, every failure path retains' \
+        'stops for manual verification' \
+        'do not rerun the' \
+        'tag or release workflow'
     do
         grep -Fq -- "$required" "$REPO_ROOT/docs/VALIDATOR-FLEET-ROLLOUT.md" || {
             printf 'operator pre-tag immutable-settings runbook omits: %s\n' "$required"
             return 1
         }
     done
+    if grep -Fq -- 'immediately deletes that exact release ID without' \
+        "$REPO_ROOT/docs/VALIDATOR-FLEET-ROLLOUT.md"; then
+        printf 'operator runbook still claims a post-publication release is deleted\n'
+        return 1
+    fi
     for required in \
         'needs: [validate, manifest-sign]' \
         'This privileged job deliberately has no checkout' \
@@ -2258,6 +2339,7 @@ run_test 'release publishes and gates a SHA256SUMS manifest' checksum_manifest_i
 run_test 'installer and update-only path verify SHA-256 before replacement' installer_and_updater_verify_checksums
 run_test 'headless manifest is owner-signed and both protected keys have a pre-tag canary' release_manifest_has_owner_signature_and_preflight
 run_test 'pre-tag artifacts are complete, immutable-ID bound, digest-verified, and never rebuilt after tagging' pretag_exact_byte_handoff_is_fail_closed
+run_test 'upload-artifact digests are canonicalized exactly once at every job boundary' upload_artifact_digests_are_canonicalized_at_job_boundaries
 run_test 'raw node consumers use exact versioned release URLs' raw_node_downloads_are_version_pinned
 run_test 'update-only path refuses equal and older semantic versions' updater_has_semver_downgrade_guard
 run_test 'installer normalizes service identity and protects its seed' installer_normalizes_service_identity_and_secret_permissions

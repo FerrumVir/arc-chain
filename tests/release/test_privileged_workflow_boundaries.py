@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 import textwrap
 import unittest
 from dataclasses import dataclass
@@ -87,7 +88,7 @@ SHELL_BUILTINS = {
 }
 
 PRE_SECRET_COMMANDS = {
-    "$node_bin", "/usr/bin/awk", "/usr/bin/cmp", "/usr/bin/find",
+    "$node_bin", "$python_bin", "$python_candidate", "/usr/bin/awk", "/usr/bin/cmp", "/usr/bin/find",
     "/usr/bin/gh", "/usr/bin/jq", "/usr/bin/python3", "/usr/bin/sha256sum",
     "/usr/bin/shasum", "/usr/bin/sort", "/usr/bin/tr", "/usr/bin/wc",
     "awk", "command", "cmp", "find", "gh", "git", "install", "jq", "mv", "npm",
@@ -398,11 +399,14 @@ def require_exact_command_heads(run: str, allowed: set[str], *, label: str) -> N
         raise BoundaryError(f"{label} contains legacy command substitution")
     if re.search(r"(?m)(?:^|[;&|])[ \t]*[\"']?\$\((?!\()", run):
         raise BoundaryError(f"{label} executes the output of a command substitution")
-    python_heads = len(re.findall(r"(?<![A-Za-z0-9_./-])/usr/bin/python3(?:\s|$)", run))
+    isolated_python = r'(?:/usr/bin/python3|"\$python_bin")'
+    python_heads = len(
+        re.findall(rf"(?m)^\s*{isolated_python}(?:\s|$)", run)
+    )
     python_bodies = [
         textwrap.dedent(match.group("body"))
         for match in re.finditer(
-            r"/usr/bin/python3\s+-I\s+-(?:[^\n]*\\\n)*[^\n]*<<'PY'\n"
+            rf"{isolated_python}\s+-I\s+-(?:[^\n]*\\\n)*[^\n]*<<'PY'\n"
             r"(?P<body>.*?)^\s*PY\s*$",
             run,
             re.MULTILINE | re.DOTALL,
@@ -479,6 +483,110 @@ def require_privileged_shell_isolation(step: Step, *, label: str) -> None:
             raise BoundaryError(f"{label} lacks in-shell isolation: {literal}")
 
 
+def require_platform_node_resolution(job: Job, *, label: str) -> None:
+    step_names = {
+        "updater-key": "Install the locked Tauri signer",
+        "desktop-bundle": "Freeze the exact locked file-signing surface without executing it",
+    }
+    expected_name = step_names[job.name]
+    matching = [step for step in job.steps if step.name == expected_name]
+    if len(matching) != 1:
+        raise BoundaryError(f"{label} lacks its unique locked Node resolution step")
+    run = matching[0].run
+    resolution = textwrap.dedent(
+        '''\
+        case "$RUNNER_OS" in
+          Windows)
+            node_bin="$(command -v node.exe)"
+            ;;
+          Linux|macOS)
+            node_bin="$(command -v node)"
+            ;;
+          *)
+            echo "::error::Unsupported runner OS for the locked Node runtime: $RUNNER_OS"
+            exit 1
+            ;;
+        esac
+        case "$node_bin" in
+          /*) ;;
+          *)
+            echo "::error::The locked Node runtime did not resolve to an absolute executable."
+            exit 1
+            ;;
+        esac
+        '''
+    ).strip()
+    if resolution not in textwrap.dedent(run):
+        raise BoundaryError(f"{label} does not resolve the locked Node executable per OS")
+    if '[ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ]' not in run:
+        raise BoundaryError(f"{label} does not reject a missing, linked, or non-executable Node path")
+
+
+def require_platform_python_resolution(job: Job, *, label: str) -> None:
+    matching = [
+        step
+        for step in job.steps
+        if step.name == "Validate the sealed handoff and make payloads non-executable"
+    ]
+    if len(matching) != 1:
+        raise BoundaryError(f"{label} lacks its unique sealed-handoff validator")
+    run = textwrap.dedent(matching[0].run)
+    resolution = textwrap.dedent(
+        '''\
+        case "$RUNNER_OS" in
+          Windows)
+            python_candidate="$(command -v python.exe)"
+            python_bin="$python_candidate"
+            ;;
+          Linux|macOS)
+            python_candidate="$(command -v python3)"
+            case "$python_candidate" in
+              /*) ;;
+              *)
+                echo "::error::Python did not resolve to an absolute executable."
+                exit 1
+                ;;
+            esac
+            python_bin="$("$python_candidate" -I -c \\
+              'import os, sys; print(os.path.realpath(sys.executable))')"
+            ;;
+          *)
+            echo "::error::Unsupported runner OS for the isolated Python runtime: $RUNNER_OS"
+            exit 1
+            ;;
+        esac
+        '''
+    ).strip()
+    normalized_run = "\n".join(line.strip() for line in run.splitlines())
+    normalized_resolution = "\n".join(
+        line.strip() for line in resolution.splitlines()
+    )
+    if normalized_resolution not in normalized_run:
+        raise BoundaryError(f"{label} does not resolve the isolated Python executable per OS")
+    for literal in (
+        'case "$python_bin" in',
+        '[ -f "$python_bin" ] && [ ! -L "$python_bin" ] && [ -x "$python_bin" ]',
+        'python_sha256="$(/usr/bin/shasum -a 256 "$python_bin"',
+        'python_sha256="$(/usr/bin/sha256sum "$python_bin"',
+        'current_python_sha256="$(/usr/bin/shasum -a 256 "$python_bin"',
+        'current_python_sha256="$(/usr/bin/sha256sum "$python_bin"',
+        '[ "$current_python_sha256" = "$python_sha256" ]',
+        '"$python_bin" -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA"',
+    ):
+        if literal not in run:
+            raise BoundaryError(f"{label} omits frozen Python boundary: {literal}")
+
+
+def require_platform_verifier_suffix(job: Job, *, label: str) -> None:
+    suffix_name = "exe-suffix" if job.name == "updater-key" else "binary-suffix"
+    invocation = (
+        '"$verifier_target/debug/tauri-updater-verifier'
+        f'${{{{ matrix.{suffix_name} }}}}"'
+    )
+    if invocation not in job.text:
+        raise BoundaryError(f"{label} omits the native verifier executable suffix")
+
+
 def reject_repo_execution(text: str, *, label: str, allow_inline_python: bool = True) -> None:
     forbidden = {
         "repository script path": r"scripts/",
@@ -494,6 +602,25 @@ def reject_repo_execution(text: str, *, label: str, allow_inline_python: bool = 
             raise BoundaryError(f"{label} contains {description}")
 
 
+def backup_manifest_public_key_awk(text: str) -> str:
+    """Return the exact inline canonicalizer exercised by backup readiness."""
+    start = text.find("          canonicalize_manifest_public_key() {")
+    if start < 0:
+        raise BoundaryError("backup readiness lacks the manifest public-key canonicalizer")
+    end = text.find("\n          }", start)
+    if end < 0:
+        raise BoundaryError("backup readiness manifest public-key canonicalizer is unterminated")
+    function = text[start:end]
+    match = re.search(
+        r"/usr/bin/awk '\n(?P<body>.*?)\n            ' \"\$input_path\" > \"\$output_path\"",
+        function,
+        re.DOTALL,
+    )
+    if match is None:
+        raise BoundaryError("backup readiness manifest public-key canonicalizer is not the reviewed awk form")
+    return textwrap.dedent(match.group("body"))
+
+
 def validate_secret_workflows(texts: dict[str, str]) -> None:
     allowed_jobs = {
         ("preflight", "backup-readiness"),
@@ -507,6 +634,17 @@ def validate_secret_workflows(texts: dict[str, str]) -> None:
     secret_steps = 0
     for workflow_name, text in texts.items():
         for job_name, job in parse_jobs(text).items():
+            if workflow_name == "preflight" and job_name in {"updater-key", "desktop-bundle"}:
+                require_platform_node_resolution(
+                    job, label=f"locked Node surface {workflow_name}/{job_name}"
+                )
+                require_platform_verifier_suffix(
+                    job, label=f"updater verifier surface {workflow_name}/{job_name}"
+                )
+            if workflow_name == "preflight" and job_name == "desktop-bundle":
+                require_platform_python_resolution(
+                    job, label=f"isolated Python surface {workflow_name}/{job_name}"
+                )
             matching = [index for index, step in enumerate(job.steps) if "${{ secrets." in step.text]
             if not matching:
                 continue
@@ -571,6 +709,16 @@ def validate_secret_workflows(texts: dict[str, str]) -> None:
                     reject_repo_execution(step.run, label="backup readiness secret step", allow_inline_python=False)
                     for required in (
                         "/usr/bin/gpg", "signer sign", "cleanup_plaintext",
+                        "canonicalize_manifest_public_key",
+                        "NR != 1 { exit 1 }",
+                        "if (NF != 2 && NF != 3) exit 1",
+                        'if ($1 != "ssh-ed25519") exit 1',
+                        'if ($2 !~ /^[A-Za-z0-9+\\/]+={0,2}$/) exit 1',
+                        'if (NF == 3 && $3 != "arc-release-manifest-v1") exit 1',
+                        'print $1 " " $2',
+                        '"$derived_manifest_canonical" "$expected_manifest_canonical"',
+                        '"$restored_manifest_canonical" "$expected_manifest_canonical"',
+                        '"$expected_manifest" "$expected_manifest_canonical"',
                         "ARC_NODE_SHA256:", "ARC_TAURI_CLI_SHA256:",
                         "node-version: 24.20.0",
                     ):
@@ -679,6 +827,59 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
     def test_current_secret_and_publication_boundaries(self) -> None:
         validate_secret_workflows(self.texts)
         validate_publish_authority(self.texts["release"])
+
+    def test_backup_manifest_public_key_canonicalizer(self) -> None:
+        text = self.texts["preflight"]
+        self.assertIn(
+            'canonicalize_manifest_public_key \\\n'
+            '            "$expected_manifest" "$expected_manifest_canonical"',
+            text,
+        )
+        self.assertNotIn(
+            '> "$expected_manifest_canonical"',
+            text,
+        )
+        expected_match = re.search(
+            r"^          ARC_EXPECTED_MANIFEST_PUBLIC_KEY: (ssh-ed25519 [A-Za-z0-9+/=]+)$",
+            text,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(expected_match)
+        expected = expected_match.group(1)
+        algorithm, key = expected.split(" ")
+        program = backup_manifest_public_key_awk(text)
+
+        def accepted(value: str) -> bool:
+            completed = subprocess.run(
+                ["/usr/bin/awk", program],
+                input=value,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return completed.returncode == 0 and completed.stdout == expected + "\n"
+
+        for value in (
+            expected + "\n",
+            expected + " arc-release-manifest-v1\n",
+            f"  {algorithm}\t{key}   arc-release-manifest-v1  \n",
+        ):
+            with self.subTest(valid=value):
+                self.assertTrue(accepted(value))
+
+        for value in (
+            "",
+            f"ssh-rsa {key}\n",
+            f"{algorithm} {key} unreviewed-comment\n",
+            f"{algorithm} {key} arc-release-manifest-v1 extra\n",
+            f"{algorithm} {key[:-1]}*\n",
+            f"{algorithm} AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+            expected + "\r\n",
+            expected + "\n\n",
+            expected + "\n" + expected + "\n",
+        ):
+            with self.subTest(invalid=value):
+                self.assertFalse(accepted(value))
 
     def assert_secret_mutation_rejected(self, workflow: str, old: str, new: str) -> None:
         mutated = dict(self.texts)
@@ -844,6 +1045,57 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(old=old):
                 self.assert_secret_mutation_rejected("preflight", old, new)
+
+    def test_rejects_extensionless_or_linkable_windows_node_runtime(self) -> None:
+        original = self.texts["preflight"]
+        attacks = (
+            ('node_bin="$(command -v node.exe)"', 'node_bin="$(command -v node)"'),
+            (
+                '[ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ]',
+                '[ -x "$node_bin" ]',
+            ),
+        )
+        for old, new in attacks:
+            positions = [match.start() for match in re.finditer(re.escape(old), original)]
+            self.assertEqual(len(positions), 2)
+            for occurrence, position in enumerate(positions):
+                with self.subTest(old=old, occurrence=occurrence):
+                    mutated_text = original[:position] + new + original[position + len(old):]
+                    mutated = dict(self.texts)
+                    mutated["preflight"] = mutated_text
+                    with self.assertRaises(BoundaryError):
+                        validate_secret_workflows(mutated)
+
+    def test_rejects_unfrozen_or_nonisolated_windows_python_runtime(self) -> None:
+        attacks = (
+            ('python_candidate="$(command -v python.exe)"',
+             'python_candidate="$(command -v python3)"'),
+            (
+                '[ -f "$python_bin" ] && [ ! -L "$python_bin" ] && [ -x "$python_bin" ]',
+                '[ -x "$python_bin" ]',
+            ),
+            ('[ "$current_python_sha256" = "$python_sha256" ]', 'true'),
+            (
+                '"$python_bin" -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA"',
+                '"$python_bin" - "$GITHUB_REPOSITORY" "$EXPECTED_SHA"',
+            ),
+        )
+        for old, new in attacks:
+            with self.subTest(old=old):
+                self.assert_secret_mutation_rejected("preflight", old, new)
+
+    def test_rejects_extensionless_windows_updater_verifier(self) -> None:
+        for suffix_name in ("exe-suffix", "binary-suffix"):
+            old = (
+                '"$verifier_target/debug/tauri-updater-verifier'
+                f'${{{{ matrix.{suffix_name} }}}}"'
+            )
+            with self.subTest(suffix=suffix_name):
+                self.assert_secret_mutation_rejected(
+                    "preflight",
+                    old,
+                    '"$verifier_target/debug/tauri-updater-verifier"',
+                )
 
     def test_rejects_post_patch_delete_or_unbounded_immutability_wait(self) -> None:
         for old, new in (

@@ -130,6 +130,123 @@ def require_regular(path: Path, *, label: str, maximum: int) -> os.stat_result:
     return metadata
 
 
+def signer_input_permissions_are_read_only(
+    metadata: os.stat_result, *, windows: bool
+) -> bool:
+    """Return whether a signer input has the host's strict read-only state.
+
+    POSIX preserves the materializer's exact ``0400`` mode. Native Windows
+    deliberately maps ``chmod(..., 0400)`` to the read-only file attribute and
+    reports the resulting permission bits as ``0444``. Prove both Windows
+    representations and reject reparse points instead of weakening the POSIX
+    contract to a cross-platform numeric mode comparison.
+    """
+
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not windows:
+        return mode == 0o400
+
+    readonly_flag = getattr(stat, "FILE_ATTRIBUTE_READONLY", None)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", None)
+    file_attributes = getattr(metadata, "st_file_attributes", None)
+    if (
+        not isinstance(readonly_flag, int)
+        or not isinstance(reparse_flag, int)
+        or not isinstance(file_attributes, int)
+    ):
+        return False
+    return (
+        file_attributes & readonly_flag != 0
+        and file_attributes & reparse_flag == 0
+        and mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) == 0
+    )
+
+
+def same_regular_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare an open descriptor and pathname without trusting mode text."""
+
+    return (
+        stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_nlink == 1
+        and right.st_nlink == 1
+    )
+
+
+def windows_permissions_match_mode(metadata: os.stat_result, mode: int) -> bool:
+    """Prove the Windows read-only attribute implied by a portable mode."""
+
+    readonly_flag = getattr(stat, "FILE_ATTRIBUTE_READONLY", None)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", None)
+    file_attributes = getattr(metadata, "st_file_attributes", None)
+    if (
+        not isinstance(readonly_flag, int)
+        or not isinstance(reparse_flag, int)
+        or not isinstance(file_attributes, int)
+        or file_attributes & reparse_flag != 0
+    ):
+        return False
+    expects_writable = mode & stat.S_IWUSR != 0
+    is_readonly = file_attributes & readonly_flag != 0
+    has_write_mode = metadata.st_mode & (
+        stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    ) != 0
+    return (
+        (expects_writable and not is_readonly and has_write_mode)
+        or (not expects_writable and is_readonly and not has_write_mode)
+    )
+
+
+def set_open_file_mode(path: Path, descriptor: int, mode: int) -> None:
+    """Set a mode while proving that path still names the open regular file.
+
+    Python gained ``os.fchmod`` on Windows only in 3.13, while the hosted
+    Windows runner currently exposes Python 3.12. On that runtime, use the
+    pathname API only while retaining the descriptor, and bind the pathname to
+    the descriptor both before and after the mutation. A replacement, link, or
+    reparse-point race therefore fails closed rather than being accepted as
+    the staged handoff object.
+    """
+
+    before_descriptor = os.fstat(descriptor)
+    before_path = path.lstat()
+    if path.is_symlink() or not same_regular_file_identity(
+        before_descriptor, before_path
+    ):
+        fail(f"open file identity differs before chmod for {path.name}")
+
+    descriptor_chmod = getattr(os, "fchmod", None)
+    if callable(descriptor_chmod):
+        descriptor_chmod(descriptor, mode)
+    elif os.name == "nt":
+        os.chmod(path, mode)
+    else:
+        fail(f"descriptor chmod is unavailable for {path.name}")
+
+    after_descriptor = os.fstat(descriptor)
+    after_path = path.lstat()
+    if (
+        path.is_symlink()
+        or not same_regular_file_identity(before_descriptor, after_descriptor)
+        or not same_regular_file_identity(after_descriptor, after_path)
+    ):
+        fail(f"open file identity changed during chmod for {path.name}")
+    if os.name == "nt":
+        if not windows_permissions_match_mode(after_descriptor, mode) or not \
+           windows_permissions_match_mode(after_path, mode):
+            fail(f"Windows file permissions differ after chmod for {path.name}")
+    elif stat.S_IMODE(after_descriptor.st_mode) != mode or \
+         stat.S_IMODE(after_path.st_mode) != mode:
+        fail(f"POSIX file permissions differ after chmod for {path.name}")
+
+
+def require_signer_input_read_only(metadata: os.stat_result) -> None:
+    if not signer_input_permissions_are_read_only(metadata, windows=os.name == "nt"):
+        fail("a signer input regained permissions before verification")
+
+
 def payload_files(platform: str, root: Path) -> list[tuple[str, Path, int]]:
     if not root.is_dir() or root.is_symlink():
         fail("unsigned payload must be a non-symlink directory")
@@ -193,7 +310,7 @@ def write_exclusive(path: Path, payload: bytes, mode: int) -> None:
             if written <= 0:
                 fail(f"write made no progress for {path.name}")
             offset += written
-        os.fchmod(descriptor, mode)
+        set_open_file_mode(path, descriptor, mode)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -525,7 +642,7 @@ def copy_stream(source: BinaryIO, target: Path, mode: int) -> None:
             shutil.copyfileobj(source, output)
             output.flush()
             os.fsync(output.fileno())
-        os.fchmod(descriptor, mode)
+        set_open_file_mode(target, descriptor, mode)
     finally:
         os.close(descriptor)
 
@@ -732,8 +849,7 @@ def verify_signed(args: argparse.Namespace) -> None:
         metadata = require_regular(
             path, label="signed-workspace input", maximum=MAX_PAYLOAD_FILE_BYTES
         )
-        if metadata.st_mode & 0o777 != 0o400:
-            fail("a signer input regained permissions before verification")
+        require_signer_input_read_only(metadata)
         expected_hash = hashes[name]
         if re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)) is None:
             fail("handoff receipt has an invalid payload hash")

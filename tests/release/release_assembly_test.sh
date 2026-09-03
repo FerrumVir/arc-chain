@@ -7,6 +7,7 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 . "$TEST_DIR/helpers/testlib.sh"
 
 ASSEMBLER="$REPO_ROOT/scripts/release/assemble-release.sh"
+RELEASE_HANDOFF="$REPO_ROOT/scripts/release/release-manifest-handoff.py"
 CUTOVER_FIXTURE_BUILDER="$TEST_DIR/make_cutover_release_fixture.py"
 CUTOVER_ASSET_DERIVER="$REPO_ROOT/scripts/release/assemble-cutover-assets.py"
 CANONICAL_HEADLESS_ASSETS='
@@ -228,6 +229,7 @@ assert set(descriptor) == {
     "recovery_manifest_sha256", "release_commit", "release_tag", "repository",
     "schema_version", "verified_quorum",
 }
+
 assert descriptor["schema_version"] == "arc-recovery-checkpoint-descriptor/v1"
 assert descriptor["repository"] == "FerrumVir/arc-chain"
 assert descriptor["release_tag"] == "v0.8.0"
@@ -340,6 +342,69 @@ assert [(row["address"], row["stake"]) for row in policy["legacy_validators"]] =
 ]
 assert policy["checkpoint_quorum"] == descriptor["verified_quorum"]
 PY
+}
+
+complete_cutover_release_stages_through_signing_handoff() {
+    local sandbox stage_dir github_output metadata_sha
+    new_assembly_fixture
+    sandbox="$NEW_ASSEMBLY_SANDBOX"
+    stage_dir="$sandbox/unsigned-release-handoff"
+    github_output="$sandbox/handoff-output"
+
+    if ! run_assembler "$sandbox" >"$sandbox/assemble-for-handoff.out" 2>&1; then
+        sed -n '1,160p' "$sandbox/assemble-for-handoff.out"
+        return 1
+    fi
+    if ! python3 "$RELEASE_HANDOFF" stage \
+        --repository FerrumVir/arc-chain \
+        --commit 9999999999999999999999999999999999999999 \
+        --tag v0.8.0 \
+        --run-id 2468 \
+        --run-attempt 1 \
+        --source-dir "$sandbox/output" \
+        --stage-dir "$stage_dir" \
+        --github-output "$github_output" \
+        >"$sandbox/stage-handoff.out" 2>&1; then
+        sed -n '1,160p' "$sandbox/stage-handoff.out"
+        return 1
+    fi
+
+    metadata_sha="$(awk -F= '$1 == "metadata_sha" { print $2 }' "$github_output")"
+    case "$metadata_sha" in
+        ''|*[!0-9a-f]*)
+            printf 'release handoff did not emit a metadata SHA-256\n'
+            return 1
+            ;;
+    esac
+    [ "${#metadata_sha}" -eq 64 ] || {
+        printf 'release handoff emitted a malformed metadata SHA-256\n'
+        return 1
+    }
+    python3 "$RELEASE_HANDOFF" verify \
+        --repository FerrumVir/arc-chain \
+        --commit 9999999999999999999999999999999999999999 \
+        --tag v0.8.0 \
+        --run-id 2468 \
+        --run-attempt 1 \
+        --handoff-dir "$stage_dir" \
+        --expected-metadata-sha "$metadata_sha" \
+        >"$sandbox/verify-handoff.out" 2>&1 || {
+            sed -n '1,160p' "$sandbox/verify-handoff.out"
+            return 1
+        }
+
+    assert_equals 31 \
+        "$(find "$stage_dir/release-files" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+        'signing handoff must retain the complete 31-file cutover release' || return 1
+    for asset in \
+        arc-legacy-maintenance-boundary.json \
+        arc-recovery-checkpoint-descriptor.json \
+        arc-cutover-policy.json; do
+        [ -s "$stage_dir/release-files/$asset" ] || {
+            printf 'signing handoff dropped required cutover asset: %s\n' "$asset"
+            return 1
+        }
+    done
 }
 
 complete_scheduled_genesis_is_preserved() {
@@ -543,6 +608,7 @@ assembler_preserves_unowned_and_last_good_outputs() {
 }
 
 run_test 'complete fixture produces exact-tag manifest and verified SHA256SUMS' complete_fixture_produces_verifiable_contract
+run_test 'complete assembled cutover release crosses the signing handoff intact' complete_cutover_release_stages_through_signing_handoff
 run_test 'complete production genesis preserves its explicit activation schedule' complete_scheduled_genesis_is_preserved
 run_test 'unsafe production genesis is rejected before a publishable manifest exists' unsafe_production_genesis_is_rejected_before_manifest
 run_test 'each of the ten canonical headless assets is independently required' every_headless_asset_is_individually_required

@@ -2317,12 +2317,1327 @@ frontend_config=/secure/operator/arc-network.recovered.json
   /usr/bin/sha256sum --check --strict arc-network.recovered.json.sha256)
 ```
 
-<!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->
+## Create the compact release handoff and publish
+
+Do this only after the finalized manifest, maintenance boundary, quorum-signed
+checkpoint, six-validator restart proof, and recovered frontend proof above are
+complete. Remain in the same clean, detached, exact-`$protected_main_sha`
+checkout. The private handoff directory must contain exactly the four files
+shown below, on protected local operator storage, with no write bits. Neither
+the multi-gigabyte checkpoint nor the private finalized rollout manifest is
+committed or uploaded. The helper derives three bounded public JSON files,
+creates a commit whose sole parent is the exact protected-main commit, and
+publishes its content-addressed
+`refs/arc-recovery-handoffs/<protected-main-sha>` ref. The helper runs both
+derivation/verification programs under isolated `python -I` with a five-variable
+non-secret environment. Only its hardened Git publisher receives the bounded
+token through a create-only askpass file, and the credential-free `origin` URL
+must exactly identify this repository. A retry freshly re-derives the commit,
+accepts only the identical local or remote ref, and never moves a mismatch.
+After any push error it re-probes the remote: the exact ref is success, proven
+absence is safely retryable, and an unavailable or different result stops with
+the local ref preserved. Never put a token in the remote URL.
+
+```bash
+set -Eeuo pipefail
+test "$PWD" = "$operator_checkout"
+unset GH_TOKEN GITHUB_TOKEN
+test "$(arc_git -C "$operator_checkout" rev-parse HEAD)" = "$protected_main_sha"
+arc_git -C "$operator_checkout" diff-index --quiet HEAD --
+test -z "$(arc_git -C "$operator_checkout" status --porcelain=v1 --untracked-files=all)"
+test "$(arc_git -C "$operator_checkout" remote get-url --all origin)" = \
+  https://github.com/FerrumVir/arc-chain.git
+test "$(arc_git -C "$operator_checkout" remote get-url --push --all origin)" = \
+  https://github.com/FerrumVir/arc-chain.git
+
+full_handoff_dir="$(
+  /usr/bin/mktemp -d /secure/operator/release-handoff-v0.8.0.XXXXXXXX
+)"
+release_control_root="$(
+  /usr/bin/mktemp -d /secure/operator/release-control-v0.8.0.XXXXXXXX
+)"
+test "$(/usr/bin/stat --format='%a:%h' "$full_handoff_dir")" = 700:1
+test "$(/usr/bin/stat --format='%a:%h' "$release_control_root")" = 700:1
+write_once_or_compare() {
+  local destination="$1" candidate
+  case "$destination" in "$release_control_root"/*) ;; *) return 1 ;; esac
+  candidate="$(/usr/bin/mktemp "$release_control_root/.receipt.XXXXXXXX")"
+  /usr/bin/cat > "$candidate"
+  /usr/bin/chmod 0400 "$candidate"
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    test -f "$destination" && test ! -L "$destination"
+    test "$(/usr/bin/stat --format='%a:%h' "$destination")" = 400:1
+    /usr/bin/cmp -s "$candidate" "$destination"
+  else
+    /usr/bin/ln -- "$candidate" "$destination"
+    /usr/bin/sync -f "$destination"
+    /usr/bin/sync -f "$release_control_root"
+  fi
+  /usr/bin/rm -f -- "$candidate"
+}
+/usr/bin/install -m 0400 "$final_manifest" \
+  "$full_handoff_dir/arc-recovery-final.lock.json"
+/usr/bin/install -m 0400 "$final_manifest_sidecar" \
+  "$full_handoff_dir/arc-recovery-final.lock.json.sha256"
+/usr/bin/install -m 0400 "$legacy_maintenance_boundary" \
+  "$full_handoff_dir/legacy-maintenance-boundary.json"
+/usr/bin/install -m 0400 "$recovery_checkpoint" \
+  "$full_handoff_dir/recovery.arcchkpt"
+
+GH_TOKEN="$(
+  "$ARC_RECOVERY_GH_PATH" auth token --hostname github.com \
+    --user "$ARC_RECOVERY_GITHUB_LOGIN"
+)"
+test -n "$GH_TOKEN"
+test "$(GH_TOKEN="$GH_TOKEN" "$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/branches/main --jq .commit.sha)" = "$protected_main_sha"
+handoff_receipt="$(
+  GH_TOKEN="$GH_TOKEN" "$ARC_RECOVERY_PYTHON_PATH" -I \
+    scripts/release/create-cutover-handoff-commit.py \
+    --repository-root "$operator_checkout" \
+    --full-handoff-dir "$full_handoff_dir" \
+    --verifier-binary "$arc_node_linux" \
+    --inspector-binary "$arc_node_linux" \
+    --genesis "$operator_genesis" \
+    --main-commit "$protected_main_sha" \
+    --tag v0.8.0 \
+    --repository FerrumVir/arc-chain \
+    --push-remote origin
+)"
+handoff_commit_sha="$(printf '%s' "$handoff_receipt" | /usr/bin/jq -er '.handoff_commit_sha')"
+handoff_ref="refs/arc-recovery-handoffs/$protected_main_sha"
+[[ "$handoff_commit_sha" =~ ^[0-9a-f]{40}$ ]]
+printf '%s' "$handoff_receipt" | /usr/bin/jq -e \
+  --arg commit "$handoff_commit_sha" --arg ref "$handoff_ref" \
+  '.handoff_commit_sha == $commit and .handoff_ref == $ref
+   and (.local_ref_state == "created" or .local_ref_state == "reused")
+   and .pushed_remote == "origin"
+   and (.remote_ref_state == "created" or .remote_ref_state == "reused")' >/dev/null
+test "$(arc_git -C "$operator_checkout" rev-list --parents -n 1 \
+  "$handoff_commit_sha")" = "$handoff_commit_sha $protected_main_sha"
+test -z "$(arc_git -C "$operator_checkout" status --porcelain=v1 --untracked-files=all)"
+
+handoff_workflow_id="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/actions/workflows/recovery-release-handoff.yml --jq .id)"
+[[ "$handoff_workflow_id" =~ ^[1-9][0-9]*$ ]]
+handoff_run_candidates() {
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/actions/workflows/recovery-release-handoff.yml/runs?event=workflow_dispatch&branch=main&per_page=100' \
+    --jq '.workflow_runs[]' \
+  | /usr/bin/jq -cs --arg sha "$protected_main_sha" \
+      --argjson workflow_id "$handoff_workflow_id" '
+      [.[] | select(.workflow_id == $workflow_id and .head_sha == $sha
+        and .head_branch == "main"
+        and .path == ".github/workflows/recovery-release-handoff.yml"
+        and .event == "workflow_dispatch")]'
+}
+# This is the pinned-path form of: gh workflow run recovery-release-handoff.yml
+handoff_runs="$(handoff_run_candidates)"
+handoff_run_count="$(printf '%s' "$handoff_runs" | /usr/bin/jq -er length)"
+case "$handoff_run_count" in
+  0)
+    GH_TOKEN="$GH_TOKEN" "$ARC_RECOVERY_GH_PATH" workflow run recovery-release-handoff.yml \
+      --repo FerrumVir/arc-chain \
+      --ref main \
+      -f handoff_commit_sha="$handoff_commit_sha"
+    for _ in {1..30}; do
+      /usr/bin/sleep 2
+      handoff_runs="$(handoff_run_candidates)"
+      handoff_run_count="$(printf '%s' "$handoff_runs" | /usr/bin/jq -er length)"
+      [ "$handoff_run_count" -eq 0 ] || break
+    done
+    test "$handoff_run_count" -eq 1
+    ;;
+  1)
+    printf 'reusing the one exact existing compact-handoff run\n' >&2
+    ;;
+  *)
+    printf 'compact-handoff run selection is ambiguous; preserve and stop\n' >&2
+    exit 1
+    ;;
+esac
+handoff_run_id="$(printf '%s' "$handoff_runs" | /usr/bin/jq -er '.[0].id')"
+handoff_run_attempt="$(printf '%s' "$handoff_runs" | /usr/bin/jq -er '.[0].run_attempt')"
+[[ "$handoff_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$handoff_run_attempt" =~ ^[1-9][0-9]*$ ]]
+/usr/bin/jq -cnS --argjson id "$handoff_run_id" \
+  --argjson attempt "$handoff_run_attempt" --arg sha "$protected_main_sha" \
+  --argjson workflow_id "$handoff_workflow_id" \
+  '{schema:"arc.release-handoff-run-selection.v1",repository:"FerrumVir/arc-chain",
+    workflow_id:$workflow_id,
+    workflow_path:".github/workflows/recovery-release-handoff.yml",
+    event:"workflow_dispatch",head_branch:"main",head_sha:$sha,
+    run_id:$id,run_attempt:$attempt}' \
+  | write_once_or_compare "$release_control_root/HANDOFF-RUN-SELECTION.json"
+printf 'Approve only handoff run %s attempt %s, then wait here.\n' \
+  "$handoff_run_id" "$handoff_run_attempt"
+"$ARC_RECOVERY_GH_PATH" run watch "$handoff_run_id" \
+  --repo FerrumVir/arc-chain --interval 10 --exit-status
+```
+
+Approve that one exact `release`-environment deployment, wait for the
+`recovery-release-handoff.yml` run selected above to succeed. Then independently
+resolve its one live artifact. The API object must
+name the exact main commit, successful producer run, numeric immutable ID, and
+GitHub server digest; values copied only from a log line are not release
+inputs.
+
+```bash
+"$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/actions/runs/$handoff_run_id" \
+  | /usr/bin/jq -e --arg sha "$protected_main_sha" --argjson id "$handoff_run_id" \
+      --argjson attempt "$handoff_run_attempt" --argjson workflow_id "$handoff_workflow_id" \
+      '.id == $id and .workflow_id == $workflow_id
+       and .head_repository.full_name == "FerrumVir/arc-chain"
+       and .head_sha == $sha and .head_branch == "main"
+       and .path == ".github/workflows/recovery-release-handoff.yml"
+       and .event == "workflow_dispatch" and .run_attempt == $attempt
+       and .status == "completed" and .conclusion == "success"' >/dev/null
+handoff_artifact_json="$(
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    "repos/FerrumVir/arc-chain/actions/runs/$handoff_run_id/artifacts?per_page=100" \
+    --jq '.artifacts[]' \
+  | /usr/bin/jq -cs --arg name "arc-recovery-release-handoff-$protected_main_sha" \
+      --arg sha "$protected_main_sha" --argjson run_id "$handoff_run_id" \
+      '[.[] | select(.name == $name and .expired == false
+          and .workflow_run.id == $run_id and .workflow_run.head_sha == $sha
+          and (.digest | test("^sha256:[0-9a-f]{64}$"))
+          and (.size_in_bytes > 0 and .size_in_bytes <= 33554432))]
+       | if length == 1 then .[0]
+         else error("expected exactly one live compact handoff artifact") end'
+)"
+handoff_artifact_id="$(printf '%s' "$handoff_artifact_json" | /usr/bin/jq -er '.id')"
+handoff_artifact_digest="$(printf '%s' "$handoff_artifact_json" | /usr/bin/jq -er '.digest')"
+[[ "$handoff_artifact_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$handoff_artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+```
+
+Immediately before tag creation, re-prove the owner session and immutable-release
+setting, require the exact direct-collaborator set `FerrumVir` plus
+`arisarcmarket`, and use one bounded owner API call to reduce only
+`arisarcmarket` to `pull`. Then re-query the complete set to prove that the sole
+non-owner retains no `write`, `maintain`, or `admin`. An unexpected collaborator
+fails closed instead of being silently mutated. Also prove unchanged protected `main` and the
+remote absence of both the tag and its release. If any check fails, do not
+create the tag. Create the lightweight protected tag with one isolated,
+authenticated Git push to the exact credential-free HTTPS URL. The push clears
+ambient credential helpers and HTTP headers, disables hooks and all protocols
+except HTTPS, uses only the pinned `gh auth git-credential` helper, and carries
+an empty expected-value lease so it can create but never move the tag. Re-read
+the remote ref after every push result instead of treating the Git exit status
+as the final proof.
+
+```bash
+test "$("$ARC_RECOVERY_GH_PATH" api /user --jq .login)" = FerrumVir
+test "$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/immutable-releases --jq .enabled)" = true
+test "$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/branches/main \
+  --jq .commit.sha)" = "$protected_main_sha"
+direct_collaborators_before="$(
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/collaborators?affiliation=direct&per_page=100' \
+    --jq '.[]' | /usr/bin/jq -cs 'sort_by(.login)'
+)"
+printf '%s' "$direct_collaborators_before" | /usr/bin/jq -e '
+  length == 2 and .[0].login == "FerrumVir" and .[0].permissions.admin == true
+  and .[1].login == "arisarcmarket"
+  and (.[1].role_name == "write" or .[1].role_name == "read")' >/dev/null
+"$ARC_RECOVERY_GH_PATH" api --method PUT \
+  repos/FerrumVir/arc-chain/collaborators/arisarcmarket \
+  -f permission=pull >/dev/null
+direct_collaborators_after="$(
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/collaborators?affiliation=direct&per_page=100' \
+    --jq '.[]' | /usr/bin/jq -cs 'sort_by(.login)'
+)"
+printf '%s' "$direct_collaborators_after" | /usr/bin/jq -e '
+  length == 2 and .[0].login == "FerrumVir" and .[0].permissions.admin == true
+  and .[1].login == "arisarcmarket" and .[1].role_name == "read"
+  and .[1].permissions.pull == true and .[1].permissions.push == false
+  and .[1].permissions.maintain == false and .[1].permissions.admin == false' >/dev/null
+pending_writer_invitations="$(
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/invitations?per_page=100' --jq '.[]' \
+  | /usr/bin/jq -cs \
+      '[.[] | select(.permissions == "write" or .permissions == "maintain"
+                     or .permissions == "admin")] | length'
+)"
+test "$pending_writer_invitations" = 0
+remote_tag_before="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/git/matching-refs/tags/v0.8.0 --jq .)"
+remote_tag_state="$(printf '%s' "$remote_tag_before" | /usr/bin/jq -er \
+  --arg sha "$protected_main_sha" '
+    [.[] | select(.ref == "refs/tags/v0.8.0")] as $matches
+    | if ($matches | length) == 0 then "absent"
+    elif ($matches | length) == 1
+         and $matches[0].object.type == "commit"
+         and $matches[0].object.sha == $sha then "exact"
+    else "mismatch" end')"
+case "$remote_tag_state" in
+  absent|exact) ;;
+  mismatch)
+    printf 'v0.8.0 exists at a different remote identity; preserve and stop\n' >&2
+    exit 1
+    ;;
+  *) exit 1 ;;
+esac
+remote_release_count="$(
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/releases?per_page=100' --jq '.[]' \
+  | /usr/bin/jq -cs '[.[] | select(.tag_name == "v0.8.0")] | length'
+)"
+test "$remote_release_count" = 0
+creation_ruleset="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/rulesets/21690216)"
+printf '%s' "$creation_ruleset" | /usr/bin/jq -e '
+  .id == 21690216 and .name == "Restrict all ARC tag creation"
+  and .target == "tag" and .enforcement == "active"
+  and .conditions == {"ref_name":{"exclude":[],"include":["~ALL"]}}
+  and .rules == [{"type":"creation"}]
+  and .bypass_actors == [{"actor_id":111036403,"actor_type":"User",
+                          "bypass_mode":"always"}]' >/dev/null
+mutation_ruleset="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/rulesets/21667203)"
+printf '%s' "$mutation_ruleset" | /usr/bin/jq -e '
+  .id == 21667203 and .name == "Protect all ARC tags from mutation"
+  and .target == "tag" and .enforcement == "active"
+  and .conditions == {"ref_name":{"exclude":[],"include":["~ALL"]}}
+  and .rules == [{"type":"update"},{"type":"deletion"},
+                 {"type":"non_fast_forward"}]
+  and .bypass_actors == []' >/dev/null
+tag_ref_push_status=0
+if [ "$remote_tag_state" = absent ]; then
+  tag_push_attempt_root="$(
+    /usr/bin/mktemp -d "$release_control_root/tag-push.XXXXXXXX"
+  )"
+  test "$(/usr/bin/stat --format='%a:%h' "$tag_push_attempt_root")" = 700:1
+  tag_push_stdout="$tag_push_attempt_root/STDOUT.txt"
+  tag_push_stderr="$tag_push_attempt_root/STDERR.txt"
+  ( umask 077
+    set -o noclobber
+    /usr/bin/env -i \
+      HOME="$git_home" PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
+      GH_TOKEN="$GH_TOKEN" GH_PROMPT_DISABLED=1 \
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_TERMINAL_PROMPT=0 \
+      /usr/bin/git -C "$operator_checkout" \
+        -c core.hooksPath=/dev/null \
+        -c credential.helper= \
+        -c "credential.https://github.com.helper=!$ARC_RECOVERY_GH_PATH auth git-credential" \
+        -c http.extraHeader= \
+        -c http.https://github.com/.extraHeader= \
+        -c http.sslVerify=true \
+        -c protocol.allow=never \
+        -c protocol.https.allow=always \
+        push --porcelain --atomic --no-verify \
+        --force-with-lease=refs/tags/v0.8.0: \
+        -- https://github.com/FerrumVir/arc-chain.git \
+        "$protected_main_sha:refs/tags/v0.8.0" \
+        >"$tag_push_stdout" 2>"$tag_push_stderr"
+  ) || tag_ref_push_status=$?
+fi
+remote_tag_after="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/git/matching-refs/tags/v0.8.0 --jq .)"
+remote_tag_after_state="$(printf '%s' "$remote_tag_after" | /usr/bin/jq -er \
+  --arg sha "$protected_main_sha" '
+    [.[] | select(.ref == "refs/tags/v0.8.0")] as $matches
+    | if ($matches | length) == 0 then "absent"
+    elif ($matches | length) == 1
+         and $matches[0].object.type == "commit"
+         and $matches[0].object.sha == $sha then "exact"
+    else "mismatch" end')"
+case "$remote_tag_after_state" in
+  exact)
+    if [ "$tag_ref_push_status" -ne 0 ]; then
+      printf 'tag push returned %s, but the mandatory post-query proved the exact tag\n' \
+        "$tag_ref_push_status" >&2
+    fi
+    ;;
+  absent)
+    printf 'tag push did not create a remote ref; absence is proven and a fresh retry is safe\n' >&2
+    exit 1
+    ;;
+  mismatch)
+    printf 'post-create v0.8.0 remote identity differs; preserve and stop\n' >&2
+    exit 1
+    ;;
+  *) exit 1 ;;
+esac
+```
+
+Tag creation automatically starts exactly one `push` form of `release.yml`;
+that run is expected to fail in its initial validation job because a tag-push event
+cannot carry the protected handoff artifact ID and digest. Select it by
+workflow ID, path, event, branch, and exact SHA rather than copying a run ID
+from the UI. An exact existing selection is resumable; zero or multiple runs
+after the bounded discovery poll stop without moving or re-pushing the tag.
+
+```bash
+release_workflow_id="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/actions/workflows/release.yml --jq .id)"
+[[ "$release_workflow_id" =~ ^[1-9][0-9]*$ ]]
+tag_push_run_candidates() {
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/actions/workflows/release.yml/runs?event=push&branch=v0.8.0&per_page=100' \
+    --jq '.workflow_runs[]' \
+  | /usr/bin/jq -cs --arg sha "$protected_main_sha" \
+      --argjson workflow_id "$release_workflow_id" '
+      [.[] | select(.workflow_id == $workflow_id and .head_sha == $sha
+        and .head_branch == "v0.8.0"
+        and .path == ".github/workflows/release.yml" and .event == "push")]'
+}
+tag_push_runs='[]'
+for _ in {1..30}; do
+  tag_push_runs="$(tag_push_run_candidates)"
+  tag_push_run_count="$(printf '%s' "$tag_push_runs" | /usr/bin/jq -er length)"
+  [ "$tag_push_run_count" -eq 0 ] || break
+  /usr/bin/sleep 2
+done
+test "$tag_push_run_count" -eq 1
+tag_push_run_id="$(printf '%s' "$tag_push_runs" | /usr/bin/jq -er '.[0].id')"
+tag_push_run_attempt="$(printf '%s' "$tag_push_runs" | /usr/bin/jq -er '.[0].run_attempt')"
+[[ "$tag_push_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$tag_push_run_attempt" =~ ^[1-9][0-9]*$ ]]
+/usr/bin/jq -cnS --argjson id "$tag_push_run_id" \
+  --argjson attempt "$tag_push_run_attempt" --arg sha "$protected_main_sha" \
+  --argjson workflow_id "$release_workflow_id" \
+  '{schema:"arc.release-tag-push-run-selection.v1",repository:"FerrumVir/arc-chain",
+    workflow_id:$workflow_id,workflow_path:".github/workflows/release.yml",
+    event:"push",head_branch:"v0.8.0",head_sha:$sha,
+    run_id:$id,run_attempt:$attempt}' \
+  | write_once_or_compare "$release_control_root/TAG-PUSH-RUN-SELECTION.json"
+"$ARC_RECOVERY_GH_PATH" run watch "$tag_push_run_id" \
+  --repo FerrumVir/arc-chain --interval 10
+"$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/actions/runs/$tag_push_run_id" \
+  | /usr/bin/jq -e --arg sha "$protected_main_sha" --argjson id "$tag_push_run_id" \
+      --argjson attempt "$tag_push_run_attempt" --argjson workflow_id "$release_workflow_id" \
+      '.id == $id and .run_attempt == $attempt and .workflow_id == $workflow_id
+       and .head_repository.full_name == "FerrumVir/arc-chain"
+       and .head_sha == $sha and .head_branch == "v0.8.0"
+       and .path == ".github/workflows/release.yml" and .event == "push"
+       and .status == "completed" and .conclusion == "failure"' >/dev/null
+"$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/actions/runs/$tag_push_run_id/jobs?filter=all&per_page=100" \
+  | /usr/bin/jq -e '
+      ([.jobs[] | select(.name == "Validate release tag and pin commit"
+        and .conclusion == "failure")] | length) == 1
+      and ([.jobs[] | select(
+        (.name == "Create and upload one isolated release draft"
+         or .name == "Publish only the independently verified draft")
+        and .conclusion != "skipped")] | length) == 0' >/dev/null
+tag_push_failure_log="$(
+  "$ARC_RECOVERY_GH_PATH" run view "$tag_push_run_id" \
+    --repo FerrumVir/arc-chain --log-failed
+)"
+printf '%s\n' "$tag_push_failure_log" | /usr/bin/grep -Fq \
+  'Release requires workflow_dispatch with a positive cutover_handoff_artifact_id.'
+```
+
+Only after that automatic run has stopped and passed the negative proof above,
+select or create exactly one manual run of the same workflow definition on
+`main`. This block is resumable: an already-dispatched exact-SHA run is reused,
+and an existing release prevents a second dispatch. More than one matching run,
+or a release without its matching run, is ambiguous and stops. The create-only
+selection receipt records the run ID and attempt before any environment
+approval. Approve deployments only when GitHub shows that exact run ID and
+attempt. Do not move, delete, recreate, or re-push the tag.
+
+```bash
+release_workflow_id="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/actions/workflows/release.yml --jq .id)"
+[[ "$release_workflow_id" =~ ^[1-9][0-9]*$ ]]
+release_run_candidates() {
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/actions/workflows/release.yml/runs?event=workflow_dispatch&branch=main&per_page=100' \
+    --jq '.workflow_runs[]' \
+  | /usr/bin/jq -cs --arg sha "$protected_main_sha" \
+      --argjson workflow_id "$release_workflow_id" '
+      [.[] | select(.workflow_id == $workflow_id and .head_sha == $sha
+        and .head_branch == "main"
+        and .path == ".github/workflows/release.yml"
+        and .event == "workflow_dispatch")]'
+}
+manual_release_runs="$(release_run_candidates)"
+manual_release_run_count="$(printf '%s' "$manual_release_runs" | /usr/bin/jq -er length)"
+existing_release_count="$(
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/releases?per_page=100' --jq '.[]' \
+  | /usr/bin/jq -cs '[.[] | select(.tag_name == "v0.8.0")] | length'
+)"
+case "$manual_release_run_count:$existing_release_count" in
+  0:0)
+    "$ARC_RECOVERY_GH_PATH" workflow run release.yml \
+      --repo FerrumVir/arc-chain \
+      --ref main \
+      -f tag=v0.8.0 \
+      -f cutover_handoff_artifact_id="$handoff_artifact_id" \
+      -f cutover_handoff_artifact_digest="$handoff_artifact_digest"
+    for _ in {1..30}; do
+      /usr/bin/sleep 2
+      manual_release_runs="$(release_run_candidates)"
+      manual_release_run_count="$(printf '%s' "$manual_release_runs" | /usr/bin/jq -er length)"
+      [ "$manual_release_run_count" -eq 0 ] || break
+    done
+    test "$manual_release_run_count" -eq 1
+    ;;
+  1:0|1:1)
+    printf 'reusing the one exact existing manual release run\n' >&2
+    ;;
+  0:1)
+    printf 'v0.8.0 exists without its exact manual release run; preserve and stop\n' >&2
+    exit 1
+    ;;
+  *)
+    printf 'manual release run/release selection is ambiguous; preserve and stop\n' >&2
+    exit 1
+    ;;
+esac
+release_run_id="$(printf '%s' "$manual_release_runs" | /usr/bin/jq -er '.[0].id')"
+release_run_attempt="$(printf '%s' "$manual_release_runs" | /usr/bin/jq -er '.[0].run_attempt')"
+[[ "$release_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$release_run_attempt" =~ ^[1-9][0-9]*$ ]]
+/usr/bin/jq -cnS --argjson id "$release_run_id" \
+  --argjson attempt "$release_run_attempt" --arg sha "$protected_main_sha" \
+  --argjson workflow_id "$release_workflow_id" \
+  '{schema:"arc.release-run-selection.v1",repository:"FerrumVir/arc-chain",
+    workflow_id:$workflow_id,workflow_path:".github/workflows/release.yml",
+    event:"workflow_dispatch",head_branch:"main",head_sha:$sha,
+    run_id:$id,run_attempt:$attempt}' \
+  | write_once_or_compare "$release_control_root/RELEASE-RUN-SELECTION.json"
+printf 'Approve only release run %s attempt %s, then wait here.\n' \
+  "$release_run_id" "$release_run_attempt"
+"$ARC_RECOVERY_GH_PATH" run watch "$release_run_id" \
+  --repo FerrumVir/arc-chain --interval 10 --exit-status
+```
+
+After the watch returns success, re-read the run rather than trusting terminal
+output. Require the exact workflow/path/event/branch/SHA/attempt, every required
+matrix and publication job, and the final read-only immutable-release verifier.
+Then query the live release by tag and prove its lifecycle, target, publisher,
+and complete 32-asset name/size/digest/uploader contract. These projections are
+stored create-only so a resumed audit must reproduce the same terminal facts.
+
+```bash
+release_run_final="$release_control_root/RELEASE-RUN-FINAL.json"
+release_jobs_final="$release_control_root/RELEASE-JOBS-FINAL.json"
+release_api_final="$release_control_root/RELEASE-API-FINAL.json"
+release_run_live="$("$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/actions/runs/$release_run_id")"
+printf '%s' "$release_run_live" | /usr/bin/jq -e \
+  --argjson id "$release_run_id" --argjson attempt "$release_run_attempt" \
+  --argjson workflow_id "$release_workflow_id" --arg sha "$protected_main_sha" '
+  .id == $id and .run_attempt == $attempt and .workflow_id == $workflow_id
+  and .head_repository.full_name == "FerrumVir/arc-chain"
+  and .head_sha == $sha and .head_branch == "main"
+  and .path == ".github/workflows/release.yml"
+  and .event == "workflow_dispatch"
+  and .status == "completed" and .conclusion == "success"' >/dev/null
+printf '%s' "$release_run_live" | /usr/bin/jq -cS \
+  '{id,run_attempt,workflow_id,path,event,head_branch,head_sha,status,conclusion}' \
+  | write_once_or_compare "$release_run_final"
+
+required_release_jobs='[
+  "Validate release tag and pin commit",
+  "Full quality gate on validated release commit",
+  "Cargo dependency policy (workspace)",
+  "Cargo dependency policy (desktop)",
+  "Cargo dependency policy (updater-verifier)",
+  "Golden vectors (linux-x86_64)",
+  "Golden vectors (linux-arm64)",
+  "Golden vectors (macos-arm64)",
+  "Golden vectors (macos-x86_64)",
+  "Golden vectors (windows-x86_64)",
+  "Verify exact pre-tag headless linux-x86_64",
+  "Verify exact pre-tag headless linux-arm64",
+  "Verify exact pre-tag headless macos-arm64",
+  "Verify exact pre-tag headless macos-x86_64",
+  "Verify exact pre-tag headless windows-x86_64",
+  "Ubuntu server smoke (linux-x86_64)",
+  "Ubuntu server smoke (linux-arm64)",
+  "Verify exact pre-tag desktop macos-arm64",
+  "Verify exact pre-tag desktop macos-x86_64",
+  "Verify exact pre-tag desktop windows-x86_64",
+  "Verify exact pre-tag desktop linux-x86_64",
+  "Assemble the exact unsigned release manifest",
+  "Sign only the verified release manifest",
+  "Create and upload one isolated release draft",
+  "Verify GitHub draft bytes without publication authority",
+  "Publish only the independently verified draft",
+  "Verify the immutable GitHub release without publication authority"
+]'
+release_jobs_live="$("$ARC_RECOVERY_GH_PATH" api --paginate \
+  "repos/FerrumVir/arc-chain/actions/runs/$release_run_id/jobs?filter=all&per_page=100" \
+  --jq '.jobs[]' | /usr/bin/jq -cs 'sort_by(.name)')"
+printf '%s' "$release_jobs_live" | /usr/bin/jq -e \
+  --argjson required "$required_release_jobs" '
+  ([.[] | select(.status == "completed" and .conclusion == "success") | .name]
+    | sort) == ($required | sort)
+  and ([.[] | select(.name == "Delete a draft rejected by the unprivileged verifier"
+    and .status == "completed" and .conclusion == "skipped")] | length) == 1
+  and length == (($required | length) + 1)' >/dev/null
+printf '%s' "$release_jobs_live" | /usr/bin/jq -cS \
+  '[.[] | {id,name,status,conclusion}] | sort_by(.name)' \
+  | write_once_or_compare "$release_jobs_final"
+
+expected_release_assets='[
+  "arc-node-linux-x86_64","arc-cli-linux-x86_64",
+  "arc-node-linux-arm64","arc-cli-linux-arm64",
+  "arc-node-macos-arm64","arc-cli-macos-arm64",
+  "arc-node-macos-x86_64","arc-cli-macos-x86_64",
+  "arc-node-windows-x86_64.exe","arc-cli-windows-x86_64.exe",
+  "arc-desktop-macos-arm64.app.tar.gz","arc-desktop-macos-arm64.app.tar.gz.sig",
+  "arc-desktop-macos-arm64.dmg","arc-desktop-macos-x86_64.app.tar.gz",
+  "arc-desktop-macos-x86_64.app.tar.gz.sig","arc-desktop-macos-x86_64.dmg",
+  "arc-desktop-windows-x86_64-setup.exe","arc-desktop-windows-x86_64-setup.exe.sig",
+  "arc-desktop-windows-x86_64.msi","arc-desktop-linux-x86_64.AppImage",
+  "arc-desktop-linux-x86_64.AppImage.sig","arc-desktop-linux-x86_64.deb",
+  "arc-desktop-linux-x86_64.rpm","install.sh","testnet-seeds.txt","genesis.toml",
+  "arc-legacy-maintenance-boundary.json","arc-recovery-checkpoint-descriptor.json",
+  "arc-cutover-policy.json","latest.json","SHA256SUMS","SHA256SUMS.sig"
+]'
+release_api_live="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/releases/tags/v0.8.0)"
+printf '%s' "$release_api_live" | /usr/bin/jq -e \
+  --arg sha "$protected_main_sha" --argjson expected "$expected_release_assets" '
+  .tag_name == "v0.8.0" and .target_commitish == $sha
+  and .draft == false and .prerelease == false and .immutable == true
+  and .author.login == "github-actions[bot]"
+  and ([.assets[].name] | sort) == ($expected | sort)
+  and ([.assets[].name] | unique | length) == 32
+  and ([.assets[].size] | add) <= 12884901888
+  and all(.assets[];
+    .state == "uploaded" and (.digest | test("^sha256:[0-9a-f]{64}$"))
+    and .uploader.login == "github-actions[bot]" and .size > 0
+    and .size <= (if .name == "arc-recovery-checkpoint-descriptor.json" then 1048576
+                  elif (.name | endswith(".sig") or endswith(".json")) then 4194304
+                  else 2147483648 end))' >/dev/null
+release_id="$(printf '%s' "$release_api_live" | /usr/bin/jq -er .id)"
+[[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+printf '%s' "$release_api_live" | /usr/bin/jq -cS \
+  '{id,tag_name,target_commitish,draft,prerelease,immutable,author:.author.login,
+    assets:(.assets | map({id,name,size,digest,state,uploader:.uploader.login})
+      | sort_by(.name))}' \
+  | write_once_or_compare "$release_api_final"
+unset GH_TOKEN
+```
+
+A rejected draft
+may be deleted before publication only after re-proving its exact release ID,
+tag, target commit, `draft: true`, and `immutable: false` state. Once the
+publication PATCH has been attempted, the workflow deliberately retains the
+release on every error. If `immutable: true` is not observed within the bounded
+poll, stop and manually verify that exact release ID and the repository audit
+trail. Never delete the ambiguous or published object and never rerun the tag
+or release workflow.
 
 Keep the runtime package-mutation masks in place through the immutable tag,
 six-validator restart proof, public frontend hash proof, and installer/update
-canaries. Only after all of those gates are green, restore the operator VM's
-normal security-update schedule and prove the three enabled units are active:
+canaries. Do not unmask anything at this point; the executable post-release
+gates below come first.
+
+An air-gapped review may instead supply both `--archive-manifest` and
+`--archive-complete`; they must be canonical mode-read-only files matching the
+same finalized roots. Supplying only one fails closed. The default has no
+manual local-file handoff and still never mounts or serves Drive.
+
+### Publish the recovered frontend through one reviewed PR
+
+The output and sidecar are create-only mode `0444`. Derive a deterministic
+single-parent commit that changes only `shared/frontend/arc-network.json`,
+publish its dedicated branch with a create-only lease, and reuse only an exact
+existing branch on resume. Never push directly to `main`. The pull request must
+retain the exact head and pass every required check. Prefer an exact-head
+approval from `arisarcmarket`. If that reviewer is unavailable, the owner may
+temporarily change only the main ruleset's approval count from one to zero and
+last-push approval from true to false. That exception is allowed only from the
+sealed exact policy snapshot, is recorded, and is guarded by an EXIT/signal
+restoration trap; it never disables checks, thread resolution, linear history,
+or any tag rule. A leftover exact exception is restored before a retry, while
+any third policy state stops without mutation. Merge by squash, as required by
+the live linear-history rule. The resulting `main` commit must have the release
+source as its sole parent and exactly the reviewed frontend tree and bytes.
+Finally re-prove the protected tag and the canonical ruleset snapshot hash.
+
+```bash
+test "$(arc_sha256 "$frontend_config")" = \
+  "$(/usr/bin/awk '{print $1}' "$frontend_config.sha256")"
+test "$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/branches/main \
+  --jq .commit.sha)" = "$protected_main_sha"
+test "$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/git/ref/tags/v0.8.0 --jq .object.sha)" = \
+  "$protected_main_sha"
+
+repository_ruleset_snapshot() {
+  local ruleset_ids id
+  ruleset_ids="$("$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/rulesets?includes_parents=true&per_page=100' \
+    --jq '.[].id' | /usr/bin/sort -n)"
+  while IFS= read -r id; do
+    [[ "$id" =~ ^[1-9][0-9]*$ ]]
+    "$ARC_RECOVERY_GH_PATH" api "repos/FerrumVir/arc-chain/rulesets/$id" \
+      | /usr/bin/jq -cS \
+          '{id,name,target,source,source_type,enforcement,bypass_actors,conditions,rules}'
+  done <<< "$ruleset_ids" | /usr/bin/jq -csS 'sort_by(.id)'
+}
+rulesets_before_frontend="$(repository_ruleset_snapshot)"
+test "$(printf '%s' "$rulesets_before_frontend" | /usr/bin/jq -er length)" -gt 0
+
+frontend_branch='arc-recovery/frontend-v0.8.0'
+frontend_index="$(/usr/bin/mktemp "$release_control_root/frontend-index.XXXXXXXX")"
+/usr/bin/rm -f -- "$frontend_index"
+arc_index_git() {
+  /usr/bin/env -i HOME="$git_home" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$frontend_index" \
+    /usr/bin/git -C "$operator_checkout" "$@"
+}
+arc_index_git read-tree "$protected_main_sha^{tree}"
+frontend_blob_sha="$(arc_git -C "$operator_checkout" hash-object -w -- "$frontend_config")"
+[[ "$frontend_blob_sha" =~ ^[0-9a-f]{40}$ ]]
+arc_index_git update-index --add --cacheinfo 100644 "$frontend_blob_sha" \
+  shared/frontend/arc-network.json
+frontend_tree_sha="$(arc_index_git write-tree)"
+frontend_parent_date="$(arc_git -C "$operator_checkout" show -s --format=%cI \
+  "$protected_main_sha")"
+frontend_commit_sha="$(
+  /usr/bin/printf '%s\n' 'Publish verified ARC v0.8 recovery frontend' \
+  | /usr/bin/env -i HOME="$git_home" PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
+      GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=FerrumVir \
+      GIT_AUTHOR_EMAIL=111036403+FerrumVir@users.noreply.github.com \
+      GIT_AUTHOR_DATE="$frontend_parent_date" GIT_COMMITTER_NAME=FerrumVir \
+      GIT_COMMITTER_EMAIL=111036403+FerrumVir@users.noreply.github.com \
+      GIT_COMMITTER_DATE="$frontend_parent_date" \
+      /usr/bin/git -C "$operator_checkout" -c commit.gpgSign=false \
+        commit-tree "$frontend_tree_sha" -p "$protected_main_sha"
+)"
+/usr/bin/rm -f -- "$frontend_index"
+[[ "$frontend_commit_sha" =~ ^[0-9a-f]{40}$ ]]
+test "$(arc_git -C "$operator_checkout" rev-list --parents -n 1 \
+  "$frontend_commit_sha")" = "$frontend_commit_sha $protected_main_sha"
+test "$(arc_git -C "$operator_checkout" diff-tree --no-commit-id --name-only -r \
+  "$frontend_commit_sha")" = shared/frontend/arc-network.json
+arc_git -C "$operator_checkout" show \
+  "$frontend_commit_sha:shared/frontend/arc-network.json" \
+  | /usr/bin/cmp -s - "$frontend_config"
+
+frontend_remote_refs="$("$ARC_RECOVERY_GH_PATH" api \
+  'repos/FerrumVir/arc-chain/git/matching-refs/heads/arc-recovery/frontend/v0.8.0' \
+  --jq .)"
+frontend_remote_state="$(printf '%s' "$frontend_remote_refs" | /usr/bin/jq -er \
+  --arg sha "$frontend_commit_sha" --arg ref "refs/heads/$frontend_branch" '
+  [.[] | select(.ref == $ref)] as $matches
+  | if ($matches | length) == 0 then "absent"
+    elif ($matches | length) == 1 and $matches[0].object.type == "commit"
+         and $matches[0].object.sha == $sha then "exact"
+    else "mismatch" end')"
+case "$frontend_remote_state" in
+  absent)
+    frontend_git_token="$("$ARC_RECOVERY_GH_PATH" auth token \
+      --hostname github.com --user "$ARC_RECOVERY_GITHUB_LOGIN")"
+    test -n "$frontend_git_token"
+    frontend_push_attempt_root="$(
+      /usr/bin/mktemp -d "$release_control_root/frontend-push.XXXXXXXX"
+    )"
+    test "$(/usr/bin/stat --format='%a:%h' "$frontend_push_attempt_root")" = 700:1
+    frontend_push_status=0
+    ( umask 077
+      set -o noclobber
+      /usr/bin/env -i HOME="$git_home" PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
+        GH_TOKEN="$frontend_git_token" GH_PROMPT_DISABLED=1 \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        /usr/bin/git -C "$operator_checkout" -c core.hooksPath=/dev/null \
+          -c credential.helper= \
+          -c "credential.https://github.com.helper=!$ARC_RECOVERY_GH_PATH auth git-credential" \
+          -c http.extraHeader= -c http.https://github.com/.extraHeader= \
+          -c http.sslVerify=true \
+          -c protocol.allow=never -c protocol.https.allow=always \
+          push --porcelain --atomic --no-verify \
+          --force-with-lease="refs/heads/$frontend_branch:" \
+          -- https://github.com/FerrumVir/arc-chain.git \
+          "$frontend_commit_sha:refs/heads/$frontend_branch" \
+          >"$frontend_push_attempt_root/STDOUT.txt" \
+          2>"$frontend_push_attempt_root/STDERR.txt"
+    ) || frontend_push_status=$?
+    unset frontend_git_token
+    ;;
+  exact) frontend_push_status=0 ;;
+  *) printf 'frontend branch exists at another identity; preserve and stop\n' >&2; exit 1 ;;
+esac
+frontend_remote_after="$("$ARC_RECOVERY_GH_PATH" api \
+  'repos/FerrumVir/arc-chain/git/matching-refs/heads/arc-recovery/frontend/v0.8.0' \
+  --jq .)"
+printf '%s' "$frontend_remote_after" | /usr/bin/jq -e \
+  --arg sha "$frontend_commit_sha" --arg ref "refs/heads/$frontend_branch" '
+  [.[] | select(.ref == $ref and .object.type == "commit" and .object.sha == $sha)]
+  | length == 1' >/dev/null
+if [ "$frontend_push_status" -ne 0 ]; then
+  printf 'branch push returned %s, but the post-query proved the exact branch\n' \
+    "$frontend_push_status" >&2
+fi
+
+frontend_pr_title='Publish verified ARC v0.8 recovery frontend'
+frontend_pr_body='Publishes only the create-only, rollout-derived recovered frontend configuration after immutable v0.8.0 verification.'
+frontend_prs="$("$ARC_RECOVERY_GH_PATH" api --method GET \
+  repos/FerrumVir/arc-chain/pulls -f state=all \
+  -f head="FerrumVir:$frontend_branch" -f base=main \
+  | /usr/bin/jq -c --arg sha "$frontend_commit_sha" \
+      '[.[] | select(.head.sha == $sha and .head.ref == "arc-recovery/frontend-v0.8.0"
+        and .base.ref == "main")]')"
+frontend_pr_count="$(printf '%s' "$frontend_prs" | /usr/bin/jq -er length)"
+case "$frontend_pr_count" in
+  0)
+    test "$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/branches/main \
+      --jq .commit.sha)" = "$protected_main_sha"
+    "$ARC_RECOVERY_GH_PATH" api --method POST repos/FerrumVir/arc-chain/pulls \
+      -f title="$frontend_pr_title" -f head="$frontend_branch" -f base=main \
+      -f body="$frontend_pr_body" -F draft=false >/dev/null
+    ;;
+  1) ;;
+  *) printf 'frontend pull-request selection is ambiguous; preserve and stop\n' >&2; exit 1 ;;
+esac
+frontend_prs="$("$ARC_RECOVERY_GH_PATH" api --method GET \
+  repos/FerrumVir/arc-chain/pulls -f state=all \
+  -f head="FerrumVir:$frontend_branch" -f base=main \
+  | /usr/bin/jq -c --arg sha "$frontend_commit_sha" \
+      '[.[] | select(.head.sha == $sha and .head.ref == "arc-recovery/frontend-v0.8.0"
+        and .base.ref == "main")]')"
+test "$(printf '%s' "$frontend_prs" | /usr/bin/jq -er length)" -eq 1
+frontend_pr_number="$(printf '%s' "$frontend_prs" | /usr/bin/jq -er '.[0].number')"
+[[ "$frontend_pr_number" =~ ^[1-9][0-9]*$ ]]
+frontend_main_ruleset_id=21689753
+frontend_main_ruleset_policy() {
+  "$ARC_RECOVERY_GH_PATH" api \
+    "repos/FerrumVir/arc-chain/rulesets/$frontend_main_ruleset_id" \
+    | /usr/bin/jq -cS \
+        '{id,name,target,source,source_type,enforcement,bypass_actors,conditions,rules}'
+}
+frontend_main_ruleset_put() {
+  printf '%s' "$1" | /usr/bin/jq -cS \
+    '{name,target,enforcement,bypass_actors,conditions,rules}' \
+    | "$ARC_RECOVERY_GH_PATH" api --method PUT \
+        "repos/FerrumVir/arc-chain/rulesets/$frontend_main_ruleset_id" \
+        --input - >/dev/null
+}
+frontend_ruleset_baseline_receipt="$release_control_root/FRONTEND-MAIN-RULESET-BASELINE.json"
+if [ ! -e "$frontend_ruleset_baseline_receipt" ]; then
+  frontend_main_ruleset_policy | write_once_or_compare \
+    "$frontend_ruleset_baseline_receipt"
+fi
+test -f "$frontend_ruleset_baseline_receipt" \
+  && test ! -L "$frontend_ruleset_baseline_receipt"
+test "$(/usr/bin/stat --format='%a:%h' "$frontend_ruleset_baseline_receipt")" = 400:1
+frontend_ruleset_baseline="$(/usr/bin/jq -cS . "$frontend_ruleset_baseline_receipt")"
+printf '%s' "$frontend_ruleset_baseline" | /usr/bin/jq -e \
+  --argjson id "$frontend_main_ruleset_id" '
+  .id == $id and .name == "Protect ARC main release path"
+  and .target == "branch" and .source == "FerrumVir/arc-chain"
+  and .source_type == "Repository" and .enforcement == "active"
+  and .bypass_actors == []
+  and .conditions == {"ref_name":{"exclude":[],"include":["refs/heads/main"]}}
+  and ([.rules[] | select(.type == "required_linear_history")] | length) == 1
+  and ([.rules[] | select(.type == "pull_request"
+    and .parameters.required_approving_review_count == 1
+    and .parameters.require_last_push_approval == true
+    and .parameters.dismiss_stale_reviews_on_push == true
+    and .parameters.require_extra_approval_for_unattributed_changes == true
+    and .parameters.required_review_thread_resolution == true
+    and (.parameters.allowed_merge_methods | sort) == ["rebase","squash"])]
+    | length) == 1
+  and ([.rules[] | select(.type == "required_status_checks"
+    and .parameters.strict_required_status_checks_policy == true
+    and (.parameters.required_status_checks | length) > 0)] | length) == 1' >/dev/null
+frontend_ruleset_exception="$(printf '%s' "$frontend_ruleset_baseline" \
+  | /usr/bin/jq -cS '
+      .rules |= map(if .type == "pull_request" then
+        .parameters.required_approving_review_count = 0
+        | .parameters.require_last_push_approval = false
+      else . end)')"
+frontend_ruleset_current="$(frontend_main_ruleset_policy)"
+case "$frontend_ruleset_current" in
+  "$frontend_ruleset_baseline") ;;
+  "$frontend_ruleset_exception")
+    printf 'restoring an exact interrupted frontend ruleset exception before retry\n' >&2
+    frontend_main_ruleset_put "$frontend_ruleset_baseline"
+    test "$(frontend_main_ruleset_policy)" = "$frontend_ruleset_baseline"
+    ;;
+  *)
+    printf 'main ruleset differs from both sealed baseline and exact exception; preserve and stop\n' >&2
+    exit 1
+    ;;
+esac
+test "$(printf '%s' "$rulesets_before_frontend" | /usr/bin/jq -cS \
+  --argjson id "$frontend_main_ruleset_id" '.[] | select(.id == $id)')" = \
+  "$frontend_ruleset_baseline"
+frontend_ruleset_baseline_sha="$(arc_sha256 "$frontend_ruleset_baseline_receipt")"
+[[ "$frontend_ruleset_baseline_sha" =~ ^[0-9a-f]{64}$ ]]
+frontend_ruleset_exception_active=false
+restore_frontend_main_ruleset() {
+  local current
+  current="$(frontend_main_ruleset_policy)" || return 1
+  case "$current" in
+    "$frontend_ruleset_baseline") ;;
+    "$frontend_ruleset_exception")
+      frontend_main_ruleset_put "$frontend_ruleset_baseline" || return 1
+      test "$(frontend_main_ruleset_policy)" = "$frontend_ruleset_baseline" || return 1
+      ;;
+    *)
+      printf 'main ruleset changed concurrently; refusing to overwrite it during restore\n' >&2
+      return 1
+      ;;
+  esac
+  frontend_ruleset_exception_active=false
+}
+frontend_restore_on_exit() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$frontend_ruleset_exception_active" = true ]; then
+    restore_frontend_main_ruleset || status=1
+  fi
+  exit "$status"
+}
+trap frontend_restore_on_exit EXIT
+trap 'exit 130' HUP INT TERM
+
+frontend_pr_state="$(printf '%s' "$frontend_prs" | /usr/bin/jq -er '.[0].state')"
+frontend_review_authorization="$release_control_root/FRONTEND-REVIEW-AUTHORIZATION.json"
+case "$frontend_pr_state" in
+  open)
+    "$ARC_RECOVERY_GH_PATH" pr checks "$frontend_pr_number" \
+      --repo FerrumVir/arc-chain --required --watch --interval 10
+    frontend_pr_view="$("$ARC_RECOVERY_GH_PATH" pr view "$frontend_pr_number" \
+      --repo FerrumVir/arc-chain --json state,headRefOid,baseRefOid,reviewDecision)"
+    printf '%s' "$frontend_pr_view" | /usr/bin/jq -e \
+      --arg head "$frontend_commit_sha" --arg base "$protected_main_sha" '
+      .state == "OPEN" and .headRefOid == $head and .baseRefOid == $base
+      and .reviewDecision != "CHANGES_REQUESTED"' >/dev/null
+    frontend_aris_approval_count="$(
+      "$ARC_RECOVERY_GH_PATH" api --paginate \
+        "repos/FerrumVir/arc-chain/pulls/$frontend_pr_number/reviews?per_page=100" \
+        --jq '.[]' \
+      | /usr/bin/jq -cs --arg head "$frontend_commit_sha" '
+          [.[] | select(.user.login == "arisarcmarket" and .state == "APPROVED"
+            and .commit_id == $head)] | length'
+    )"
+    if [ ! -e "$frontend_review_authorization" ]; then
+      if [ "$(printf '%s' "$frontend_pr_view" | /usr/bin/jq -r .reviewDecision)" = APPROVED ] \
+          && [ "$frontend_aris_approval_count" -ge 1 ]; then
+        frontend_review_mode=arisarcmarket-approval
+      else
+        frontend_review_mode=temporary-ruleset-exception
+      fi
+      /usr/bin/jq -cnS --argjson pr "$frontend_pr_number" \
+        --arg head "$frontend_commit_sha" --arg base "$protected_main_sha" \
+        --arg mode "$frontend_review_mode" \
+        --arg baseline_sha "$frontend_ruleset_baseline_sha" \
+        '{schema:"arc.frontend-review-authorization.v1",pull_request:$pr,
+          head_commit:$head,base_commit:$base,mode:$mode,
+          reviewer:(if $mode == "arisarcmarket-approval" then "arisarcmarket" else null end),
+          main_ruleset_id:21689753,main_ruleset_baseline_sha256:$baseline_sha}' \
+        | write_once_or_compare "$frontend_review_authorization"
+    fi
+    frontend_review_mode="$(/usr/bin/jq -er \
+      --argjson pr "$frontend_pr_number" --arg head "$frontend_commit_sha" \
+      --arg base "$protected_main_sha" --arg baseline_sha "$frontend_ruleset_baseline_sha" '
+      select(.schema == "arc.frontend-review-authorization.v1"
+        and .pull_request == $pr and .head_commit == $head and .base_commit == $base
+        and .main_ruleset_id == 21689753
+        and .main_ruleset_baseline_sha256 == $baseline_sha
+        and (.mode == "arisarcmarket-approval"
+          or .mode == "temporary-ruleset-exception")) | .mode' \
+      "$frontend_review_authorization")"
+    case "$frontend_review_mode" in
+      arisarcmarket-approval)
+        test "$(printf '%s' "$frontend_pr_view" | /usr/bin/jq -r .reviewDecision)" = APPROVED
+        test "$frontend_aris_approval_count" -ge 1
+        ;;
+      temporary-ruleset-exception)
+        frontend_ruleset_exception_active=true
+        frontend_main_ruleset_put "$frontend_ruleset_exception"
+        test "$(frontend_main_ruleset_policy)" = "$frontend_ruleset_exception"
+        ;;
+      *) exit 1 ;;
+    esac
+    test "$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/branches/main \
+      --jq .commit.sha)" = "$protected_main_sha"
+    "$ARC_RECOVERY_GH_PATH" api --method PUT \
+      "repos/FerrumVir/arc-chain/pulls/$frontend_pr_number/merge" \
+      -f commit_title="$frontend_pr_title" -f merge_method=squash \
+      -f sha="$frontend_commit_sha" \
+      | /usr/bin/jq -e '.merged == true and (.sha | test("^[0-9a-f]{40}$"))' >/dev/null
+    restore_frontend_main_ruleset
+    ;;
+  closed)
+    printf '%s' "$frontend_prs" | /usr/bin/jq -e '.[0].merged_at != null' >/dev/null
+    test -f "$frontend_review_authorization" && test ! -L "$frontend_review_authorization"
+    frontend_review_mode="$(/usr/bin/jq -er \
+      --argjson pr "$frontend_pr_number" --arg head "$frontend_commit_sha" \
+      --arg base "$protected_main_sha" --arg baseline_sha "$frontend_ruleset_baseline_sha" '
+      select(.schema == "arc.frontend-review-authorization.v1"
+        and .pull_request == $pr and .head_commit == $head and .base_commit == $base
+        and .main_ruleset_id == 21689753
+        and .main_ruleset_baseline_sha256 == $baseline_sha
+        and (.mode == "arisarcmarket-approval"
+          or .mode == "temporary-ruleset-exception")) | .mode' \
+      "$frontend_review_authorization")"
+    ;;
+  *) exit 1 ;;
+esac
+restore_frontend_main_ruleset
+trap - EXIT HUP INT TERM
+frontend_pr_live="$("$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/pulls/$frontend_pr_number")"
+printf '%s' "$frontend_pr_live" | /usr/bin/jq -e --arg head "$frontend_commit_sha" '
+  .state == "closed" and .merged == true and .head.sha == $head
+  and .base.ref == "main" and (.merge_commit_sha | test("^[0-9a-f]{40}$"))' >/dev/null
+frontend_main_sha="$(printf '%s' "$frontend_pr_live" | /usr/bin/jq -er .merge_commit_sha)"
+arc_git -C "$operator_checkout" fetch --no-tags origin "$frontend_main_sha"
+test "$(arc_git -C "$operator_checkout" rev-list --parents -n 1 \
+  "$frontend_main_sha")" = "$frontend_main_sha $protected_main_sha"
+test "$(arc_git -C "$operator_checkout" rev-parse "$frontend_main_sha^{tree}")" = \
+  "$frontend_tree_sha"
+test "$(arc_git -C "$operator_checkout" diff --name-only \
+  "$protected_main_sha" "$frontend_main_sha")" = shared/frontend/arc-network.json
+arc_git -C "$operator_checkout" show \
+  "$frontend_main_sha:shared/frontend/arc-network.json" \
+  | /usr/bin/cmp -s - "$frontend_config"
+test "$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/branches/main \
+  --jq .commit.sha)" = "$frontend_main_sha"
+test "$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/git/ref/tags/v0.8.0 --jq .object.sha)" = \
+  "$protected_main_sha"
+rulesets_after_frontend="$(repository_ruleset_snapshot)"
+test "$rulesets_after_frontend" = "$rulesets_before_frontend"
+test "$(frontend_main_ruleset_policy)" = "$frontend_ruleset_baseline"
+frontend_ruleset_exception_used=false
+if [ "$frontend_review_mode" = temporary-ruleset-exception ]; then
+  frontend_ruleset_exception_used=true
+fi
+/usr/bin/jq -cnS --arg branch "$frontend_branch" --arg commit "$frontend_commit_sha" \
+  --argjson pr "$frontend_pr_number" --arg merge "$frontend_main_sha" \
+  --arg source "$protected_main_sha" --arg config_sha "$(arc_sha256 "$frontend_config")" \
+  --arg review_mode "$frontend_review_mode" \
+  --argjson ruleset_exception_used "$frontend_ruleset_exception_used" \
+  --arg ruleset_baseline_sha "$frontend_ruleset_baseline_sha" \
+  '{schema:"arc.frontend-merge-receipt.v1",branch:$branch,source_commit:$source,
+    frontend_commit:$commit,pull_request:$pr,merge_commit:$merge,
+    merge_method:"squash",review_authorization:$review_mode,
+    temporary_ruleset_exception_used:$ruleset_exception_used,
+    main_ruleset_baseline_sha256:$ruleset_baseline_sha,
+    config_sha256:$config_sha,changed_paths:["shared/frontend/arc-network.json"]}' \
+  | write_once_or_compare "$release_control_root/FRONTEND-MERGE.json"
+```
+
+Rollback, if a later Pages or live gate fails, is a new reviewed PR that reverts
+only this config change and then repeats the same Pages run and deployed-byte
+proof. It restores maintenance without moving `v0.8.0`, rolling back or
+renumbering canonical blocks, or deleting any archive. A fork view is always
+explicitly selected and provenance-verified; it is never canonical or a reward
+source.
+
+### Prove the exact Pages deployment and every advertised archive provenance
+
+The merge uniquely triggers `deploy-explorer.yml`. Select its `push` run by
+workflow/path/event/main/SHA, never by the most recent run. Reuse one exact run
+on resume, wait for terminal success, require both named jobs, then bind one
+successful `github-pages` deployment to that merge. The CDN check polls only
+for convergence and accepts only the exact merged config bytes and
+`deployed-commit.txt`; it also verifies those bytes against the deployed site
+manifest. Every advertised legacy-fork provenance URL is fetched again and
+compared field-for-field with its immutable config commitments.
+
+```bash
+post_release_attempt_root="$(
+  /usr/bin/mktemp -d "$release_control_root/post-release.XXXXXXXX"
+)"
+test "$(/usr/bin/stat --format='%a:%h' "$post_release_attempt_root")" = 700:1
+pages_workflow_id="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/actions/workflows/deploy-explorer.yml --jq .id)"
+[[ "$pages_workflow_id" =~ ^[1-9][0-9]*$ ]]
+pages_run_candidates() {
+  "$ARC_RECOVERY_GH_PATH" api --paginate \
+    'repos/FerrumVir/arc-chain/actions/workflows/deploy-explorer.yml/runs?event=push&branch=main&per_page=100' \
+    --jq '.workflow_runs[]' \
+  | /usr/bin/jq -cs --arg sha "$frontend_main_sha" \
+      --argjson workflow_id "$pages_workflow_id" '
+      [.[] | select(.workflow_id == $workflow_id and .head_sha == $sha
+        and .head_branch == "main"
+        and .path == ".github/workflows/deploy-explorer.yml"
+        and .event == "push")]'
+}
+pages_runs='[]'
+for _ in {1..30}; do
+  pages_runs="$(pages_run_candidates)"
+  pages_run_count="$(printf '%s' "$pages_runs" | /usr/bin/jq -er length)"
+  [ "$pages_run_count" -eq 0 ] || break
+  /usr/bin/sleep 2
+done
+test "$pages_run_count" -eq 1
+pages_run_id="$(printf '%s' "$pages_runs" | /usr/bin/jq -er '.[0].id')"
+pages_run_attempt="$(printf '%s' "$pages_runs" | /usr/bin/jq -er '.[0].run_attempt')"
+[[ "$pages_run_id" =~ ^[1-9][0-9]*$ ]]
+[[ "$pages_run_attempt" =~ ^[1-9][0-9]*$ ]]
+/usr/bin/jq -cnS --argjson id "$pages_run_id" --argjson attempt "$pages_run_attempt" \
+  --arg sha "$frontend_main_sha" --argjson workflow_id "$pages_workflow_id" \
+  '{schema:"arc.pages-run-selection.v1",repository:"FerrumVir/arc-chain",
+    workflow_id:$workflow_id,workflow_path:".github/workflows/deploy-explorer.yml",
+    event:"push",head_branch:"main",head_sha:$sha,run_id:$id,run_attempt:$attempt}' \
+  | write_once_or_compare "$release_control_root/PAGES-RUN-SELECTION.json"
+"$ARC_RECOVERY_GH_PATH" run watch "$pages_run_id" \
+  --repo FerrumVir/arc-chain --interval 10 --exit-status
+pages_run_live="$("$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/actions/runs/$pages_run_id")"
+printf '%s' "$pages_run_live" | /usr/bin/jq -e \
+  --argjson id "$pages_run_id" --argjson attempt "$pages_run_attempt" \
+  --argjson workflow_id "$pages_workflow_id" --arg sha "$frontend_main_sha" '
+  .id == $id and .run_attempt == $attempt and .workflow_id == $workflow_id
+  and .head_repository.full_name == "FerrumVir/arc-chain"
+  and .head_sha == $sha and .head_branch == "main"
+  and .path == ".github/workflows/deploy-explorer.yml" and .event == "push"
+  and .status == "completed" and .conclusion == "success"' >/dev/null
+pages_jobs_live="$("$ARC_RECOVERY_GH_PATH" api --paginate \
+  "repos/FerrumVir/arc-chain/actions/runs/$pages_run_id/jobs?filter=all&per_page=100" \
+  --jq '.jobs[]' | /usr/bin/jq -cs 'sort_by(.name)')"
+printf '%s' "$pages_jobs_live" | /usr/bin/jq -e '
+  length == 2
+  and ([.[] | select(.name == "Verify and assemble public console"
+    and .status == "completed" and .conclusion == "success")] | length) == 1
+  and ([.[] | select(.name == "Publish GitHub Pages"
+    and .status == "completed" and .conclusion == "success")] | length) == 1' >/dev/null
+printf '%s' "$pages_run_live" > "$post_release_attempt_root/pages-run.json"
+printf '%s' "$pages_jobs_live" > "$post_release_attempt_root/pages-jobs.json"
+
+pages_api_live="$("$ARC_RECOVERY_GH_PATH" api repos/FerrumVir/arc-chain/pages)"
+printf '%s' "$pages_api_live" | /usr/bin/jq -e '
+  .build_type == "workflow"
+  and (.html_url | test("^https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~/-]*)?/$"))' >/dev/null
+pages_url="$(printf '%s' "$pages_api_live" | /usr/bin/jq -er '.html_url | rtrimstr("/")')"
+pages_deployments="$("$ARC_RECOVERY_GH_PATH" api --method GET \
+  repos/FerrumVir/arc-chain/deployments -f sha="$frontend_main_sha" \
+  -f environment=github-pages -f per_page=100 \
+  | /usr/bin/jq -c --arg sha "$frontend_main_sha" '
+      [.[] | select(.sha == $sha and .ref == "main"
+        and .environment == "github-pages" and .task == "deploy")]')"
+test "$(printf '%s' "$pages_deployments" | /usr/bin/jq -er length)" -eq 1
+pages_deployment_id="$(printf '%s' "$pages_deployments" | /usr/bin/jq -er '.[0].id')"
+[[ "$pages_deployment_id" =~ ^[1-9][0-9]*$ ]]
+pages_deployment_statuses="$("$ARC_RECOVERY_GH_PATH" api \
+  "repos/FerrumVir/arc-chain/deployments/$pages_deployment_id/statuses?per_page=100")"
+printf '%s' "$pages_deployment_statuses" | /usr/bin/jq -e \
+  --arg url "$pages_url" '
+  [.[] | select(.state == "success" and .environment == "github-pages"
+    and ((.environment_url | rtrimstr("/")) == $url))] | length == 1' >/dev/null
+printf '%s' "$pages_api_live" > "$post_release_attempt_root/pages-api.json"
+printf '%s' "$pages_deployments" > "$post_release_attempt_root/pages-deployments.json"
+printf '%s' "$pages_deployment_statuses" > "$post_release_attempt_root/pages-statuses.json"
+
+deployed_config="$post_release_attempt_root/arc-network.json"
+deployed_commit="$post_release_attempt_root/deployed-commit.txt"
+deployed_sums="$post_release_attempt_root/SHA256SUMS"
+pages_bytes_match=false
+for _ in {1..12}; do
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 30 \
+    --max-filesize 4194304 \
+    "$pages_url/shared/frontend/arc-network.json?commit=$frontend_main_sha" \
+    -o "$deployed_config.tmp"
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 30 \
+    --max-filesize 1024 \
+    "$pages_url/deployed-commit.txt?commit=$frontend_main_sha" \
+    -o "$deployed_commit.tmp"
+  if /usr/bin/cmp -s "$deployed_config.tmp" "$frontend_config" \
+     && test "$(/usr/bin/tr -d '\r\n' < "$deployed_commit.tmp")" = "$frontend_main_sha"; then
+    /usr/bin/mv -- "$deployed_config.tmp" "$deployed_config"
+    /usr/bin/mv -- "$deployed_commit.tmp" "$deployed_commit"
+    pages_bytes_match=true
+    break
+  fi
+  /usr/bin/rm -f -- "$deployed_config.tmp" "$deployed_commit.tmp"
+  /usr/bin/sleep 5
+done
+test "$pages_bytes_match" = true
+/usr/bin/curl --fail --silent --show-error --location \
+  --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 30 \
+  --max-filesize 1048576 "$pages_url/SHA256SUMS?commit=$frontend_main_sha" \
+  -o "$deployed_sums"
+test "$(/usr/bin/awk '$2 == "./shared/frontend/arc-network.json" {print $1}' \
+  "$deployed_sums")" = "$(arc_sha256 "$frontend_config")"
+test "$(/usr/bin/awk '$2 == "./deployed-commit.txt" {print $1}' \
+  "$deployed_sums")" = "$(arc_sha256 "$deployed_commit")"
+/usr/bin/chmod 0400 "$deployed_config" "$deployed_commit" "$deployed_sums" \
+  "$post_release_attempt_root"/*.json
+
+legacy_provenance_count=0
+while IFS= read -r archive_source; do
+  legacy_provenance_count=$((legacy_provenance_count + 1))
+  archive_node="$(printf '%s' "$archive_source" | /usr/bin/jq -er '.archive.node')"
+  [[ "$archive_node" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]
+  archive_url="$(printf '%s' "$archive_source" | /usr/bin/jq -er \
+    '(.baseUrl | rtrimstr("/")) + .archive.provenancePath')"
+  archive_response="$post_release_attempt_root/provenance-$archive_node.json"
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 30 \
+    --max-filesize 1048576 "$archive_url" -o "$archive_response"
+  printf '%s' "$archive_source" | /usr/bin/jq -e \
+    --slurpfile actual "$archive_response" '
+    .archive as $a | $actual[0] == {
+      schema:"arc.legacy-archive.query.v1",read_only:true,
+      classification:$a.classification,capture_id:$a.captureId,node:$a.node,
+      rollout_manifest_sha256:$a.rolloutManifestSha256,
+      archive_manifest_sha256:$a.archiveManifestSha256,
+      complete_sha256:$a.completeSha256,bundle_sha256:$a.bundleSha256,
+      inventory_sha256:$a.inventorySha256,
+      binding_index_sha256:$a.bindingIndexSha256,binding_sha256:$a.bindingSha256,
+      checkpoint_sha256:$a.checkpointSha256,
+      checkpoint_manifest_hash:$a.checkpointManifestHash,
+      checkpoint_payload_hash:$a.checkpointPayloadHash,
+      canonical_checkpoint_height:$a.canonicalCheckpointHeight,
+      source_height:$a.sourceHeight,source_block_hash:$a.sourceBlockHash,
+      source_state_root:$a.sourceStateRoot}' >/dev/null
+  /usr/bin/chmod 0400 "$archive_response"
+done < <(/usr/bin/jq -c '.sources[] | select(.kind == "legacy-fork")' "$deployed_config")
+test "$legacy_provenance_count" = \
+  "$(/usr/bin/jq '[.sources[] | select(.kind == "legacy-fork")] | length' \
+    "$deployed_config")"
+```
+
+### Run published installer/update and live inference/reward acceptance gates
+
+Use a fresh, no-service install root on the reviewed Linux x86_64 operator.
+The bootstrap is downloaded from the exact immutable release and matched to
+the API digest already sealed above. A partial canary root without its final
+receipt is preserved and stops; a completed exact root is read-only verified
+and reused. The update-only pass must resolve the public channel back to
+v0.8.0 and report equality without replacement. Finally, rerun the rollout's
+read-only live verifier against the immutable two-canary reward evidence. This
+does not issue a third reward: it re-proves all-six convergence, inference
+attestations, the two mined `0x25` receipts, exact 5 ARC delta, and honest
+projection state from the existing evidence.
+
+```bash
+installer_canary_root="$release_control_root/installer-canary-linux-x86_64"
+installer_canary_receipt="$installer_canary_root/ACCEPTED.json"
+release_api_canary="$("$ARC_RECOVERY_GH_PATH" api \
+  repos/FerrumVir/arc-chain/releases/tags/v0.8.0)"
+printf '%s' "$release_api_canary" | /usr/bin/jq -e \
+  --argjson release_id "$release_id" --arg sha "$protected_main_sha" '
+  .id == $release_id and .tag_name == "v0.8.0" and .target_commitish == $sha
+  and .draft == false and .prerelease == false and .immutable == true' >/dev/null
+installer_expected_digest="$(printf '%s' "$release_api_canary" | /usr/bin/jq -er \
+  '.assets[] | select(.name == "install.sh") | .digest | sub("^sha256:"; "")')"
+node_expected_digest="$(printf '%s' "$release_api_canary" | /usr/bin/jq -er \
+  '.assets[] | select(.name == "arc-node-linux-x86_64") | .digest | sub("^sha256:"; "")')"
+cli_expected_digest="$(printf '%s' "$release_api_canary" | /usr/bin/jq -er \
+  '.assets[] | select(.name == "arc-cli-linux-x86_64") | .digest | sub("^sha256:"; "")')"
+[[ "$installer_expected_digest" =~ ^[0-9a-f]{64}$ ]]
+[[ "$node_expected_digest" =~ ^[0-9a-f]{64}$ ]]
+[[ "$cli_expected_digest" =~ ^[0-9a-f]{64}$ ]]
+if [ -e "$installer_canary_root" ] && [ ! -f "$installer_canary_receipt" ]; then
+  printf 'partial installer canary exists without acceptance receipt; preserve and stop\n' >&2
+  exit 1
+fi
+if [ ! -e "$installer_canary_root" ]; then
+  /usr/bin/mkdir -m 0700 "$installer_canary_root"
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
+    --max-filesize 4194304 \
+    https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh \
+    -o "$installer_canary_root/install.sh"
+  test "$(arc_sha256 "$installer_canary_root/install.sh")" = \
+    "$installer_expected_digest"
+  /usr/bin/chmod 0500 "$installer_canary_root/install.sh"
+  /usr/bin/bash "$installer_canary_root/install.sh" --version 0.8.0 \
+    --install-dir "$installer_canary_root/install" \
+    --data-dir "$installer_canary_root/data" \
+    --no-service --no-auto-update \
+    >"$installer_canary_root/install.stdout" \
+    2>"$installer_canary_root/install.stderr"
+  "$installer_canary_root/install/bin/arc-node" --version \
+    | /usr/bin/grep -F ' 0.8.0'
+  "$installer_canary_root/install/bin/arc-cli" --version \
+    | /usr/bin/grep -F ' 0.8.0'
+  /usr/bin/bash "$installer_canary_root/install.sh" --update-only \
+    --install-dir "$installer_canary_root/install" --no-service --no-auto-update \
+    >"$installer_canary_root/update.stdout" \
+    2>"$installer_canary_root/update.stderr"
+  /usr/bin/grep -Fq 'Already up to date at v0.8.0' \
+    "$installer_canary_root/update.stdout"
+  test "$(arc_sha256 "$installer_canary_root/install/bin/arc-node")" = \
+    "$node_expected_digest"
+  test "$(arc_sha256 "$installer_canary_root/install/bin/arc-cli")" = \
+    "$cli_expected_digest"
+  /usr/bin/jq -cnS --argjson release_run_id "$release_run_id" \
+    --argjson release_run_attempt "$release_run_attempt" --argjson release_id "$release_id" \
+    --arg node_sha "$node_expected_digest" --arg cli_sha "$cli_expected_digest" \
+    --arg update_sha "$(arc_sha256 "$installer_canary_root/update.stdout")" \
+    '{schema:"arc.post-release-installer-canary.v1",version:"0.8.0",
+      platform:"linux-x86_64",release_run_id:$release_run_id,
+      release_run_attempt:$release_run_attempt,release_id:$release_id,
+      node_sha256:$node_sha,cli_sha256:$cli_sha,update_stdout_sha256:$update_sha,
+      service_started:false,update_result:"already-up-to-date"}' \
+    | write_once_or_compare "$installer_canary_receipt"
+fi
+test "$(/usr/bin/stat --format='%a:%h' "$installer_canary_root")" = 700:1
+test "$(/usr/bin/stat --format='%a:%h' "$installer_canary_receipt")" = 400:1
+test ! -L "$installer_canary_receipt"
+test "$(arc_sha256 "$installer_canary_root/install.sh")" = "$installer_expected_digest"
+test "$(arc_sha256 "$installer_canary_root/install/bin/arc-node")" = \
+  "$node_expected_digest"
+test "$(arc_sha256 "$installer_canary_root/install/bin/arc-cli")" = \
+  "$cli_expected_digest"
+/usr/bin/jq -e --argjson release_run_id "$release_run_id" \
+  --argjson release_run_attempt "$release_run_attempt" --argjson release_id "$release_id" \
+  --arg node_sha "$node_expected_digest" --arg cli_sha "$cli_expected_digest" \
+  --arg update_sha "$(arc_sha256 "$installer_canary_root/update.stdout")" '
+  . == {schema:"arc.post-release-installer-canary.v1",version:"0.8.0",
+    platform:"linux-x86_64",release_run_id:$release_run_id,
+    release_run_attempt:$release_run_attempt,release_id:$release_id,
+    node_sha256:$node_sha,cli_sha256:$cli_sha,update_stdout_sha256:$update_sha,
+    service_started:false,update_result:"already-up-to-date"}' \
+  "$installer_canary_receipt" >/dev/null
+/usr/bin/grep -Fq 'Already up to date at v0.8.0' \
+  "$installer_canary_root/update.stdout"
+"$installer_canary_root/install/bin/arc-node" --version | /usr/bin/grep -F ' 0.8.0'
+"$installer_canary_root/install/bin/arc-cli" --version | /usr/bin/grep -F ' 0.8.0'
+
+live_acceptance="$post_release_attempt_root/live-rollout-verify.txt"
+"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/recovery_rollout.py verify \
+  --manifest "$final_manifest" --reward-evidence "$reward_evidence" \
+  >"$live_acceptance"
+test -s "$live_acceptance"
+/usr/bin/chmod 0400 "$live_acceptance"
+(cd /secure/operator && \
+  /usr/bin/sha256sum --check --strict recovery-v3.reward-evidence.json.sha256)
+
+acceptance_receipt="$post_release_attempt_root/POST-RELEASE-ACCEPTANCE.json"
+/usr/bin/jq -cnS --arg source_sha "$protected_main_sha" \
+  --argjson release_run_id "$release_run_id" \
+  --argjson release_run_attempt "$release_run_attempt" --argjson release_id "$release_id" \
+  --arg frontend_commit "$frontend_commit_sha" --argjson frontend_pr "$frontend_pr_number" \
+  --arg frontend_main "$frontend_main_sha" --argjson pages_run_id "$pages_run_id" \
+  --argjson pages_run_attempt "$pages_run_attempt" \
+  --argjson pages_deployment_id "$pages_deployment_id" \
+  --arg config_sha "$(arc_sha256 "$deployed_config")" \
+  --arg installer_receipt_sha "$(arc_sha256 "$installer_canary_receipt")" \
+  --arg reward_evidence_sha "$(arc_sha256 "$reward_evidence")" \
+  --arg live_verify_sha "$(arc_sha256 "$live_acceptance")" '
+  {schema:"arc.post-release-acceptance.v1",repository:"FerrumVir/arc-chain",
+   release_source_sha:$source_sha,release_run_id:$release_run_id,
+   release_run_attempt:$release_run_attempt,release_id:$release_id,
+   frontend_commit:$frontend_commit,frontend_pull_request:$frontend_pr,
+   frontend_main_sha:$frontend_main,pages_run_id:$pages_run_id,
+   pages_run_attempt:$pages_run_attempt,pages_deployment_id:$pages_deployment_id,
+   deployed_config_sha256:$config_sha,installer_receipt_sha256:$installer_receipt_sha,
+   reward_evidence_sha256:$reward_evidence_sha,live_verify_sha256:$live_verify_sha,
+   release_immutable:true,pages_jobs_succeeded:true,provenance_verified:true,
+   installer_update_verified:true,inference_reward_evidence_verified:true}' \
+  > "$acceptance_receipt"
+/usr/bin/chmod 0400 "$acceptance_receipt"
+/usr/bin/sync -f "$acceptance_receipt"
+/usr/bin/sync -f "$post_release_attempt_root"
+```
+
+Only now may the operator restore the normal package-update schedule:
 
 ```bash
 /usr/bin/systemctl unmask --runtime "${operator_package_units[@]}"
@@ -2335,24 +3650,12 @@ for unit in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service;
 done
 ```
 
+<!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->
+
 If the enclave reboots before that point, the runtime masks disappear by
 design. Do not recreate them and continue from remembered values: rerun every
 preceding read-only package-version, file-hash, artifact, and remote-state
 proof first.
-
-An air-gapped review may instead supply both `--archive-manifest` and
-`--archive-complete`; they must be canonical mode-read-only files matching the
-same finalized roots. Supplying only one fails closed. The default has no
-manual local-file handoff and still never mounts or serves Drive.
-
-The output and sidecar are create-only mode `0444`. Publish the exact bytes in
-a dedicated Git commit replacing `shared/frontend/arc-network.json` only after
-the dashboard and explorer contract tests pass. Verify the deployed Pages file
-hash equals the generated hash and re-fetch every advertised provenance URL.
-Rollback is `git revert <that-config-commit>` followed by the same Pages deploy
-and hash check; this restores the tracked maintenance config without changing
-canonical blocks or deleting any archive. A fork view is always explicitly
-selected and provenance-verified; it is never canonical or a reward source.
 
 ## Reward gates
 

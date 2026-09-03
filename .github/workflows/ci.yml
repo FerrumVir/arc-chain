@@ -437,6 +437,49 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Native Windows signer handoff permission boundary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python_bin="$(command -v python.exe)"
+          case "$python_bin" in
+            /*) ;;
+            *)
+              echo "::error::Python did not resolve to an absolute Windows executable."
+              exit 1
+              ;;
+          esac
+          [ -f "$python_bin" ] && [ ! -L "$python_bin" ] && [ -x "$python_bin" ]
+          "$python_bin" -I tests/release/test_unsigned_desktop_windows_permissions.py -v
+
+          probe_pid=''
+          cleanup_probe() {
+            if [ -n "$probe_pid" ] && kill -0 "$probe_pid" 2>/dev/null; then
+              MSYS_NO_PATHCONV=1 taskkill.exe \
+                /PID "$probe_pid" /T /F >/dev/null 2>&1 || \
+                kill -KILL "$probe_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_probe EXIT HUP INT TERM
+          "$python_bin" -I -c 'import time; time.sleep(300)' &
+          probe_pid=$!
+          kill -0 "$probe_pid"
+          MSYS_NO_PATHCONV=1 taskkill.exe \
+            /PID "$probe_pid" /T /F >/dev/null
+          for _ in {1..40}; do
+            if ! kill -0 "$probe_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          if kill -0 "$probe_pid" 2>/dev/null; then
+            echo '::error::Native taskkill did not terminate the Windows probe.' >&2
+            exit 1
+          fi
+          wait "$probe_pid" 2>/dev/null || true
+          probe_pid=''
+          trap - EXIT HUP INT TERM
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24

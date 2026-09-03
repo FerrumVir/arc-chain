@@ -23,7 +23,7 @@ jobs:
     environment: release
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
       handoff-commit-sha: ${{ steps.select.outputs.handoff_commit_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -119,13 +119,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           artifact="$RUNNER_TEMP/recovery-handoff-artifact.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$artifact"
           jq -e \
             --argjson id "$ARTIFACT_ID" \
             --arg name "arc-recovery-release-handoff-$GITHUB_SHA" \
-            --arg digest "$ARTIFACT_DIGEST" \
+            --arg digest "sha256:$ARTIFACT_DIGEST" \
             --argjson run_id "$GITHUB_RUN_ID" \
             '.id == $id and .name == $name and .digest == $digest
              and .expired == false and .workflow_run.id == $run_id

@@ -1378,7 +1378,10 @@ for prepare_unit in prepare_units:
     unit_states[prepare_unit] = {
         "active_state": prepare_prop("ActiveState"),
         "sub_state": prepare_prop("SubState"),
-        "main_pid": int(prepare_prop("MainPID")),
+        # MainPID is not a property of timer units, so systemd returns an
+        # empty value for arc-node-update.timer.  Normalize that service-only
+        # property to the same quiescent zero represented by inactive services.
+        "main_pid": int(prepare_prop("MainPID") or "0"),
         "job": prepare_prop("Job") or "0",
         "enablement": enabled_result.stdout.strip(),
     }

@@ -20,6 +20,7 @@ DRIVE_PREFREEZE_TEST="$REPO_ROOT/tests/release/drive_prefreeze_gate_test.sh"
 CANARY_RUNBOOK="$REPO_ROOT/docs/MACOS-PRETAG-COMMUNITY-CANARY.md"
 CANARY_HELPER="$REPO_ROOT/scripts/release/macos-community-canary.py"
 VAULT_HELPER="$REPO_ROOT/scripts/release/restore-validator-vault.py"
+CUTOVER_HANDOFF_HELPER="$REPO_ROOT/scripts/release/create-cutover-handoff-commit.py"
 PRODUCTION_RECOVERY_AUDIT="$REPO_ROOT/docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md"
 GETTING_STARTED="$REPO_ROOT/docs/GETTING_STARTED.md"
 STATUS_DOC="$REPO_ROOT/docs/STATUS.md"
@@ -804,7 +805,7 @@ recovery_archive_commands_are_exact_and_resumable() {
 }
 
 operator_recovery_commands_are_linux_pinned_and_ordered() {
-    local file literal pair count line previous audit_block
+    local file literal pair count line previous audit_block handoff_help handoff_section
 
     (
         local procedure_file rollout_file
@@ -1297,6 +1298,222 @@ PY
             'recovery README omits a create-only input or Linux archive/download invariant' \
             || return 1
     done
+
+    handoff_help="$(python3 "$CUTOVER_HANDOFF_HELPER" --help)" || return 1
+    for literal in \
+        --repository-root --full-handoff-dir --verifier-binary \
+        --inspector-binary --genesis --main-commit --tag --repository --push-remote
+    do
+        printf '%s\n' "$handoff_help" | grep -Fq -- "$literal" || {
+            printf 'cutover handoff helper omits documented option: %s\n' "$literal"
+            return 1
+        }
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits compact handoff helper option' || return 1
+    done
+    for literal in \
+        'arc-recovery-final.lock.json.sha256' \
+        'legacy-maintenance-boundary.json' \
+        'recovery.arcchkpt' \
+        'refs/arc-recovery-handoffs/$protected_main_sha' \
+        'scripts/release/create-cutover-handoff-commit.py' \
+        'workflow run recovery-release-handoff.yml' \
+        'arc-recovery-release-handoff-$protected_main_sha' \
+        'handoff_run_id=' \
+        'handoff_artifact_id="$(printf' \
+        'handoff_artifact_digest="$(printf' \
+        'unset GH_TOKEN' \
+        'GH_TOKEN="$GH_TOKEN" "$ARC_RECOVERY_PYTHON_PATH" -I' \
+        '--push-remote origin' \
+        '.local_ref_state == "created" or .local_ref_state == "reused"' \
+        '.remote_ref_state == "created" or .remote_ref_state == "reused"' \
+        'collaborators?affiliation=direct&per_page=100' \
+        'direct_collaborators_before=' \
+        'repos/FerrumVir/arc-chain/collaborators/arisarcmarket' \
+        '-f permission=pull' \
+        'direct_collaborators_after=' \
+        '.[1].login == "arisarcmarket" and .[1].role_name == "read"' \
+        'repos/FerrumVir/arc-chain/invitations?per_page=100' \
+        'pending_writer_invitations' \
+        'remote_release_count=' \
+        '[.[] | select(.tag_name == "v0.8.0")] | length' \
+        'repos/FerrumVir/arc-chain/immutable-releases --jq .enabled' \
+        'repos/FerrumVir/arc-chain/rulesets/21690216' \
+        'Restrict all ARC tag creation' \
+        'repos/FerrumVir/arc-chain/rulesets/21667203' \
+        'Protect all ARC tags from mutation' \
+        'tag_ref_push_status=0' \
+        '[.[] | select(.ref == "refs/tags/v0.8.0")] as $matches' \
+        'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' \
+        'GH_TOKEN="$GH_TOKEN" GH_PROMPT_DISABLED=1' \
+        '-c core.hooksPath=/dev/null' \
+        '-c credential.helper=' \
+        'credential.https://github.com.helper=!$ARC_RECOVERY_GH_PATH auth git-credential' \
+        '-c http.extraHeader=' \
+        '-c http.https://github.com/.extraHeader=' \
+        '-c protocol.allow=never' \
+        '-c protocol.https.allow=always' \
+        'push --porcelain --atomic --no-verify' \
+        '--force-with-lease=refs/tags/v0.8.0:' \
+        '$protected_main_sha:refs/tags/v0.8.0' \
+        'remote_tag_after_state=' \
+        'absence is proven and a fresh retry is safe' \
+        'mandatory post-query proved the exact tag' \
+        'tag_push_run_id=' \
+        'actions/runs/$tag_push_run_id/jobs?filter=all&per_page=100' \
+        'Release requires workflow_dispatch with a positive cutover_handoff_artifact_id.' \
+        'workflow run release.yml' \
+        '-f tag=v0.8.0' \
+        '-f cutover_handoff_artifact_id="$handoff_artifact_id"' \
+        '-f cutover_handoff_artifact_digest="$handoff_artifact_digest"' \
+        'a tag-push event' \
+        'cannot carry the protected handoff artifact ID' \
+        'Do not move, delete, recreate, or re-push the tag' \
+        'never rerun the tag' \
+        'or release workflow'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits compact handoff or manual release contract' \
+            || return 1
+    done
+    for literal in \
+        'HANDOFF-RUN-SELECTION.json' \
+        'TAG-PUSH-RUN-SELECTION.json' \
+        'RELEASE-RUN-SELECTION.json' \
+        'Verify the immutable GitHub release without publication authority' \
+        'expected_release_assets=' \
+        '.immutable == true' \
+        '| length) == 32' \
+        'RELEASE-API-FINAL.json' \
+        'frontend-push.XXXXXXXX' \
+        '-c http.sslVerify=true' \
+        'FRONTEND-MAIN-RULESET-BASELINE.json' \
+        '.parameters.required_approving_review_count = 0' \
+        '.parameters.require_last_push_approval = false' \
+        'trap frontend_restore_on_exit EXIT' \
+        '-f commit_title="$frontend_pr_title" -f merge_method=squash' \
+        '"$frontend_main_sha $protected_main_sha"' \
+        'PAGES-RUN-SELECTION.json' \
+        'Verify and assemble public console' \
+        'Publish GitHub Pages' \
+        'repos/FerrumVir/arc-chain/deployments' \
+        './shared/frontend/arc-network.json' \
+        'arc.post-release-installer-canary.v1' \
+        'Already up to date at v0.8.0' \
+        'scripts/recovery/recovery_rollout.py verify' \
+        'POST-RELEASE-ACCEPTANCE.json'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits an executable release or post-release receipt gate' \
+            || return 1
+    done
+    for forbidden in \
+        "handoff_run_id='<" \
+        "handoff_run_attempt='<" \
+        "tag_push_run_id='<" \
+        "release_run_id='<"
+    do
+        if grep -Fq -- "$forbidden" "$RECOVERY_README"; then
+            printf 'recovery README retains unsafe manual run placeholder: %s\n' "$forbidden"
+            return 1
+        fi
+    done
+    if grep -Fq -- '.status == "built" and .build_type == "workflow"' \
+        "$RECOVERY_README"; then
+        printf 'recovery README treats nullable Pages status as a deployment proof\n'
+        return 1
+    fi
+    for literal in \
+        'scripts/release/create-cutover-handoff-commit.py --full-handoff-dir' \
+        'Manually dispatch' \
+        '`recovery-release-handoff.yml`' \
+        '`cutover_handoff_artifact_id`' \
+        '`cutover_handoff_artifact_digest`' \
+        'exact direct set `FerrumVir` plus `arisarcmarket`' \
+        '`arisarcmarket` to `pull`' \
+        'zero pending invitations' \
+        '21690216' \
+        '21667203' \
+        'isolated authenticated Git push' \
+        '`--force-with-lease=refs/tags/v0.8.0:`' \
+        'proven absence is safe to retry' \
+        'automatic `release.yml`' \
+        'tag-push run is expected to fail' \
+        'expected to fail in the initial validation job' \
+        'Prove that exact error' \
+        'move or recreate the tag'
+    do
+        require_literal "$ROLLOUT" "$literal" \
+            'validator rollout omits compact handoff or manual release contract' \
+            || return 1
+    done
+    for literal in \
+        'API-select exactly one workflow/path/event/branch/SHA run' \
+        'independent immutable-release verifier' \
+        'unique 32-asset digest-bound contract' \
+        'temporarily' \
+        'approval count and last-push approval' \
+        'squash merge' \
+        'successful `github-pages` deployment' \
+        '`POST-RELEASE-ACCEPTANCE.json`'
+    do
+        require_literal "$ROLLOUT" "$literal" \
+            'validator rollout omits an executable release or post-release receipt gate' \
+            || return 1
+    done
+    if grep -Fq -- 'immediately deletes that exact release ID without' \
+        "$RECOVERY_README" "$ROLLOUT"; then
+        printf 'operator docs still claim an attempted publication is deleted\n'
+        return 1
+    fi
+    handoff_section="$(awk '
+        /^## Create the compact release handoff and publish$/ { capture=1 }
+        capture { print }
+        capture && /^Keep the runtime package-mutation masks/ { exit }
+    ' "$RECOVERY_README")"
+    if printf '%s\n' "$handoff_section" | grep -Fq 'export GH_TOKEN'; then
+        printf 'compact handoff runbook exports GitHub authority to repository code\n'
+        return 1
+    fi
+    previous=0
+    for literal in \
+        'unset GH_TOKEN' \
+        'GH_TOKEN="$(' \
+        'handoff_receipt="$(' \
+        'workflow run recovery-release-handoff.yml' \
+        'handoff_artifact_id="$(printf' \
+        'repos/FerrumVir/arc-chain/collaborators/arisarcmarket' \
+        'pending_writer_invitations=' \
+        'creation_ruleset=' \
+        'mutation_ruleset=' \
+        'tag_ref_push_status=0' \
+        'tag_push_run_id=' \
+        'workflow run release.yml'
+    do
+        line="$(printf '%s\n' "$handoff_section" | grep -nF -- "$literal" \
+            | head -n 1 | cut -d: -f1)"
+        if [ -z "$line" ] || [ "$line" -le "$previous" ]; then
+            printf 'compact handoff/release command is absent or out of order: %s\n' \
+                "$literal"
+            return 1
+        fi
+        previous="$line"
+    done
+
+    post_release_acceptance_line="$(grep -nF -- 'POST-RELEASE-ACCEPTANCE.json' \
+        "$RECOVERY_README" | tail -n 1 | cut -d: -f1)"
+    post_release_unmask_line="$(grep -nF -- '/usr/bin/systemctl unmask --runtime' \
+        "$RECOVERY_README" | tail -n 1 | cut -d: -f1)"
+    procedure_end_line="$(grep -nF -- \
+        '<!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->' \
+        "$RECOVERY_README" | cut -d: -f1)"
+    if [ -z "$post_release_acceptance_line" ] || [ -z "$post_release_unmask_line" ] \
+        || [ -z "$procedure_end_line" ] \
+        || [ "$post_release_acceptance_line" -ge "$post_release_unmask_line" ] \
+        || [ "$post_release_unmask_line" -ge "$procedure_end_line" ]; then
+        printf 'executable procedure ends before post-release acceptance and unmask gates\n'
+        return 1
+    fi
 
     if grep -Eq '751619276800|750 GiB|700 GiB' \
         "$RECOVERY_README" "$DRIVE_PREFREEZE_GATE"; then
