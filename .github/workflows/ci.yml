@@ -465,8 +465,12 @@ jobs:
           "$python_bin" -I -c 'import time; time.sleep(300)' &
           probe_pid=$!
           kill -0 "$probe_pid"
+          # Git Bash can expose an MSYS PID for a native child. Exercise the
+          # exact production cleanup chain: prefer native taskkill, then use
+          # the MSYS-aware signal path and a bounded force fallback.
           MSYS_NO_PATHCONV=1 taskkill.exe \
-            /PID "$probe_pid" /T /F >/dev/null
+            /PID "$probe_pid" /T /F >/dev/null 2>&1 || \
+            kill "$probe_pid" 2>/dev/null || true
           for _ in {1..40}; do
             if ! kill -0 "$probe_pid" 2>/dev/null; then
               break
@@ -474,7 +478,16 @@ jobs:
             sleep 0.25
           done
           if kill -0 "$probe_pid" 2>/dev/null; then
-            echo '::error::Native taskkill did not terminate the Windows probe.' >&2
+            kill -KILL "$probe_pid" 2>/dev/null || true
+            for _ in {1..20}; do
+              if ! kill -0 "$probe_pid" 2>/dev/null; then
+                break
+              fi
+              sleep 0.25
+            done
+          fi
+          if kill -0 "$probe_pid" 2>/dev/null; then
+            echo '::error::Native Windows cleanup did not terminate the probe.' >&2
             exit 1
           fi
           wait "$probe_pid" 2>/dev/null || true

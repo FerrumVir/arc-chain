@@ -151,7 +151,8 @@ class PermissionModelTests(unittest.TestCase):
             "if: runner.os == 'Windows'",
             "test_unsigned_desktop_windows_permissions.py -v",
             "MSYS_NO_PATHCONV=1 taskkill.exe",
-            "Native taskkill did not terminate the Windows probe.",
+            "kill -KILL \"$probe_pid\"",
+            "Native Windows cleanup did not terminate the probe.",
         ):
             with self.subTest(literal=literal):
                 self.assertIn(literal, job)
