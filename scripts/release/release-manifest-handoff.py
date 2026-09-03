@@ -47,6 +47,9 @@ BASE_FILES = HEADLESS + DESKTOP + (
     "install.sh",
     "testnet-seeds.txt",
     "genesis.toml",
+    "arc-legacy-maintenance-boundary.json",
+    "arc-recovery-checkpoint-descriptor.json",
+    "arc-cutover-policy.json",
     "latest.json",
     "SHA256SUMS",
 )

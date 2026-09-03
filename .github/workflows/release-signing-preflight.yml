@@ -200,6 +200,10 @@ jobs:
           restored="$WORK_DIR/restored"
           archive="$WORK_DIR/signing-keys.tar"
           derived_manifest="$WORK_DIR/derived-manifest.pub"
+          expected_manifest="$WORK_DIR/expected-manifest.pub"
+          derived_manifest_canonical="$WORK_DIR/derived-manifest.canonical"
+          restored_manifest_canonical="$WORK_DIR/restored-manifest.canonical"
+          expected_manifest_canonical="$WORK_DIR/expected-manifest.canonical"
           cleanup_plaintext() {
             unset ARC_SIGNING_BACKUP_PASSPHRASE passphrase \
               ARC_EXPECTED_MANIFEST_PUBLIC_KEY
@@ -208,7 +212,11 @@ jobs:
               "$restored/release-manifest-ed25519" \
               "$restored/release-manifest-ed25519.pub" \
               "$restored/tauri-updater.key" \
-              "$archive" "$derived_manifest"; do
+              "$archive" "$derived_manifest" \
+              "$expected_manifest" \
+              "$derived_manifest_canonical" \
+              "$restored_manifest_canonical" \
+              "$expected_manifest_canonical"; do
               if [ -f "$secret_path" ] && [ ! -L "$secret_path" ]; then
                 /usr/bin/shred -u -- "$secret_path" || true
               fi
@@ -250,8 +258,36 @@ jobs:
 
           /usr/bin/ssh-keygen -y -f "$restored/release-manifest-ed25519" \
             > "$derived_manifest"
-          [ "$(/usr/bin/tr -d '\r\n' < "$derived_manifest")" = "$ARC_EXPECTED_MANIFEST_PUBLIC_KEY" ]
-          [ "$(/usr/bin/tr -d '\r\n' < "$restored/release-manifest-ed25519.pub")" = "$ARC_EXPECTED_MANIFEST_PUBLIC_KEY" ]
+          canonicalize_manifest_public_key() {
+            local input_path="$1"
+            local output_path="$2"
+            /usr/bin/awk '
+              BEGIN { valid = 0 }
+              NR != 1 { exit 1 }
+              {
+                if (NF != 2 && NF != 3) exit 1
+                if ($1 != "ssh-ed25519") exit 1
+                if ($2 !~ /^[A-Za-z0-9+\/]+={0,2}$/) exit 1
+                if (NF == 3 && $3 != "arc-release-manifest-v1") exit 1
+                print $1 " " $2
+                valid = 1
+              }
+              END { if (NR != 1 || valid != 1) exit 1 }
+            ' "$input_path" > "$output_path"
+          }
+          canonicalize_manifest_public_key \
+            "$derived_manifest" "$derived_manifest_canonical"
+          canonicalize_manifest_public_key \
+            "$restored/release-manifest-ed25519.pub" \
+            "$restored_manifest_canonical"
+          /usr/bin/printf '%s\n' "$ARC_EXPECTED_MANIFEST_PUBLIC_KEY" \
+            > "$expected_manifest"
+          canonicalize_manifest_public_key \
+            "$expected_manifest" "$expected_manifest_canonical"
+          /usr/bin/cmp -s \
+            "$derived_manifest_canonical" "$expected_manifest_canonical"
+          /usr/bin/cmp -s \
+            "$restored_manifest_canonical" "$expected_manifest_canonical"
 
           manifest_canary="$WORK_DIR/manifest-canary"
           updater_canary="$WORK_DIR/updater-canary"
@@ -507,9 +543,28 @@ jobs:
              and .packages[$native].integrity == $native_integrity' \
             desktop/package-lock.json >/dev/null
           npm ci --prefix desktop --ignore-scripts
-          node_bin="$(command -v node)"
+          case "$RUNNER_OS" in
+            Windows)
+              node_bin="$(command -v node.exe)"
+              ;;
+            Linux|macOS)
+              node_bin="$(command -v node)"
+              ;;
+            *)
+              echo "::error::Unsupported runner OS for the locked Node runtime: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          case "$node_bin" in
+            /*) ;;
+            *)
+              echo "::error::The locked Node runtime did not resolve to an absolute executable."
+              exit 1
+              ;;
+          esac
           tauri_cli="$GITHUB_WORKSPACE/desktop/node_modules/@tauri-apps/cli/tauri.js"
-          [ -x "$node_bin" ] && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
+          [ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ] \
+            && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
           [ "$("$node_bin" --version)" = "v24.20.0" ]
           case "$RUNNER_OS" in
             macOS)
@@ -692,17 +747,51 @@ jobs:
           # Invoked indirectly by trap.
           # shellcheck disable=SC2317,SC2329
           cleanup() {
+            cleanup_rc=$?
+            trap - EXIT HUP INT TERM
             if [ -n "${node_pid:-}" ]; then
               if [ "$RUNNER_OS" = Windows ]; then
-                taskkill.exe /PID "$node_pid" /T /F >/dev/null 2>&1 || true
+                # Git Bash otherwise rewrites taskkill's /PID, /T, and /F
+                # switches as MSYS paths. If taskkill itself fails, bounded
+                # TERM/KILL fallbacks ensure cleanup can never block in wait.
+                if kill -0 "$node_pid" 2>/dev/null; then
+                  MSYS_NO_PATHCONV=1 taskkill.exe \
+                    /PID "$node_pid" /T /F >/dev/null 2>&1 || \
+                    kill "$node_pid" 2>/dev/null || true
+                fi
+                for _ in {1..40}; do
+                  if ! kill -0 "$node_pid" 2>/dev/null; then
+                    break
+                  fi
+                  sleep 0.25
+                done
+                if kill -0 "$node_pid" 2>/dev/null; then
+                  kill -KILL "$node_pid" 2>/dev/null || true
+                  for _ in {1..20}; do
+                    if ! kill -0 "$node_pid" 2>/dev/null; then
+                      break
+                    fi
+                    sleep 0.25
+                  done
+                fi
+                if kill -0 "$node_pid" 2>/dev/null; then
+                  echo '::error::The Windows headless smoke process could not be terminated.' >&2
+                  cleanup_rc=1
+                else
+                  wait "$node_pid" 2>/dev/null || true
+                fi
               else
                 kill "$node_pid" 2>/dev/null || true
+                wait "$node_pid" 2>/dev/null || true
               fi
-              wait "$node_pid" 2>/dev/null || true
             fi
-            rm -rf -- "$smoke_dir"
+            rm -rf -- "$smoke_dir" || cleanup_rc=1
+            exit "$cleanup_rc"
           }
-          trap cleanup EXIT HUP INT TERM
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
           "$node" \
             --rpc 127.0.0.1:19944 \
             --p2p-port 19945 \
@@ -1002,7 +1091,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
       artifact_name: ${{ steps.seal.outputs.artifact_name }}
       manifest_sha: ${{ steps.seal.outputs.manifest_sha }}
     steps:
@@ -1247,7 +1336,60 @@ jobs:
           [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           expected_name="arc-desktop-signer-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_MANIFEST_SHA"
           [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
-          /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" \
+
+          # The hosted Windows Python is not installed at /usr/bin/python3.
+          # Resolve it before any release secret is exposed, resolve POSIX
+          # symlinks through the isolated interpreter itself, and pin the
+          # executable bytes for the duration of this validation step.
+          case "$RUNNER_OS" in
+            Windows)
+              python_candidate="$(command -v python.exe)"
+              python_bin="$python_candidate"
+              ;;
+            Linux|macOS)
+              python_candidate="$(command -v python3)"
+              case "$python_candidate" in
+                /*) ;;
+                *)
+                  echo "::error::Python did not resolve to an absolute executable."
+                  exit 1
+                  ;;
+              esac
+              python_bin="$("$python_candidate" -I -c \
+                'import os, sys; print(os.path.realpath(sys.executable))')"
+              ;;
+            *)
+              echo "::error::Unsupported runner OS for the isolated Python runtime: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          case "$python_bin" in
+            /*) ;;
+            *)
+              echo "::error::Python did not resolve to an absolute executable."
+              exit 1
+              ;;
+          esac
+          [ -f "$python_bin" ] && [ ! -L "$python_bin" ] && [ -x "$python_bin" ]
+          case "$RUNNER_OS" in
+            macOS)
+              python_sha256="$(/usr/bin/shasum -a 256 "$python_bin" | /usr/bin/awk '{print $1}')"
+              ;;
+            Linux|Windows)
+              python_sha256="$(/usr/bin/sha256sum "$python_bin" | /usr/bin/awk '{print $1}')"
+              ;;
+          esac
+          [[ "$python_sha256" =~ ^[0-9a-f]{64}$ ]]
+          case "$RUNNER_OS" in
+            macOS)
+              current_python_sha256="$(/usr/bin/shasum -a 256 "$python_bin" | /usr/bin/awk '{print $1}')"
+              ;;
+            Linux|Windows)
+              current_python_sha256="$(/usr/bin/sha256sum "$python_bin" | /usr/bin/awk '{print $1}')"
+              ;;
+          esac
+          [ "$current_python_sha256" = "$python_sha256" ]
+          "$python_bin" -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$PLATFORM" "$TARGET" \
             "$EXPECTED_MANIFEST_SHA" signer-handoff <<'PY'
           import hashlib, json, os, pathlib, stat, sys
@@ -1367,9 +1509,28 @@ jobs:
         run: |
           set -Eeuo pipefail
           [ "$(jq -r '.version' desktop/node_modules/@tauri-apps/cli/package.json)" = '2.11.4' ]
-          node_bin="$(command -v node)"
+          case "$RUNNER_OS" in
+            Windows)
+              node_bin="$(command -v node.exe)"
+              ;;
+            Linux|macOS)
+              node_bin="$(command -v node)"
+              ;;
+            *)
+              echo "::error::Unsupported runner OS for the locked Node runtime: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          case "$node_bin" in
+            /*) ;;
+            *)
+              echo "::error::The locked Node runtime did not resolve to an absolute executable."
+              exit 1
+              ;;
+          esac
           tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"
-          [ -x "$node_bin" ] && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
+          [ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ] \
+            && [ -f "$tauri_cli" ] && [ ! -L "$tauri_cli" ]
           [ "$("$node_bin" --version)" = "v24.20.0" ]
           case "$RUNNER_OS" in
             macOS)
@@ -1487,7 +1648,7 @@ jobs:
           verifier_target="$RUNNER_TEMP/tauri-updater-verifier"
           CARGO_TARGET_DIR="$verifier_target" cargo build --quiet --locked \
             --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
-          "$verifier_target/debug/tauri-updater-verifier" \
+          "$verifier_target/debug/tauri-updater-verifier${{ matrix.binary-suffix }}" \
             "$public_key" \
             "unsigned-materialized/$updater_file" \
             "unsigned-materialized/$updater_file.sig"

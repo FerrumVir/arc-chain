@@ -731,7 +731,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.unsigned-upload.outputs.artifact-id }}
-      artifact_digest: ${{ steps.unsigned-upload.outputs.artifact-digest }}
+      artifact_digest: ${{ format('sha256:{0}', steps.unsigned-upload.outputs.artifact-digest) }}
       artifact_name: ${{ steps.unsigned-stage.outputs.artifact_name }}
       metadata_sha: ${{ steps.unsigned-stage.outputs.metadata_sha }}
       manifest_sha: ${{ steps.unsigned-stage.outputs.manifest_sha }}
@@ -864,7 +864,7 @@ jobs:
       contents: read
     outputs:
       artifact_id: ${{ steps.sealed-upload.outputs.artifact-id }}
-      artifact_digest: ${{ steps.sealed-upload.outputs.artifact-digest }}
+      artifact_digest: ${{ format('sha256:{0}', steps.sealed-upload.outputs.artifact-digest) }}
       artifact_name: ${{ steps.sealed-stage.outputs.artifact_name }}
       metadata_sha: ${{ steps.sealed-stage.outputs.metadata_sha }}
     steps:
@@ -1092,7 +1092,7 @@ jobs:
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
       evidence_id: ${{ steps.evidence.outputs.artifact-id }}
-      evidence_digest: ${{ steps.evidence.outputs.artifact-digest }}
+      evidence_digest: ${{ format('sha256:{0}', steps.evidence.outputs.artifact-digest) }}
       evidence_name: ${{ steps.draft.outputs.evidence_name }}
       evidence_sha: ${{ steps.draft.outputs.evidence_sha }}
     steps:
@@ -1583,7 +1583,7 @@ jobs:
       contents: write
     outputs:
       evidence_id: ${{ steps.evidence.outputs.artifact-id }}
-      evidence_digest: ${{ steps.evidence.outputs.artifact-digest }}
+      evidence_digest: ${{ format('sha256:{0}', steps.evidence.outputs.artifact-digest) }}
       evidence_name: ${{ steps.finalize.outputs.evidence_name }}
       evidence_sha: ${{ steps.finalize.outputs.evidence_sha }}
     steps:

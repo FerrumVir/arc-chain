@@ -308,7 +308,9 @@ class EmbeddedProgramTests(unittest.TestCase):
         precommit = self.outer[self.outer.index('if mode in {"precommit-status", "stopped-precommit"}:'):
                                self.outer.index("def validate_stopped_transition(")]
         for marker in (
-            'if recovery_started <= deadline:',
+            'accepted_elapsed = acceptance.get("accepted_monotonic_ns")',
+            'current_elapsed - accepted_elapsed <= lease_ns',
+            'fail("precommit stopped status is not after monotonic lease expiry")',
             '"Job", "MainPID", "Requires", "After", "DropInPaths"',
             'properties["ActiveState"] not in {"inactive", "failed"}',
             'properties["Job"] not in {"", "0"}',
@@ -321,16 +323,18 @@ class EmbeddedProgramTests(unittest.TestCase):
 
     def test_helper_deadline_and_writer_checks_immediately_precede_nft(self) -> None:
         initial = self.helper.index("# initial:")
-        deadline_check = self.helper.index(
-            "authorization expired immediately before", initial
-        )
+        lease_check = self.helper.index("enforce_monotonic_lease()", initial)
         nft = self.helper.index(
             'subprocess.run([str(nft),"-f",str(STATE/"rendered-policy.nft")],check=True)',
-            deadline_check,
+            lease_check,
         )
         prefix = self.helper[initial:nft]
         self.assertIn("verify_writer(contract)", prefix)
-        self.assertIn("authorization expired immediately before", prefix)
+        self.assertIn("enforce_monotonic_lease()", prefix)
+        self.assertLess(
+            prefix.rindex("verify_writer(contract)"),
+            prefix.rindex("enforce_monotonic_lease()"),
+        )
         self.assertIn("nft-deadline-gate.json", self.helper)
 
     def test_ensure_requires_durable_commit(self) -> None:

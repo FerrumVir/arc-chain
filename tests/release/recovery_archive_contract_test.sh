@@ -55,6 +55,24 @@ for bad in ("-drive:path","arc-drive:../escape","arc-drive:path/../escape","arc-
 PY
 }
 
+timer_units_with_empty_mainpid_normalize_to_zero() {
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+audit = text[text.index("audit_writers()") : text.index("seal_freeze_plan()")]
+expected = '"main_pid": int(prepare_prop("MainPID") or "0"),'
+assert expected in audit
+assert '"main_pid": int(prepare_prop("MainPID")),' not in audit
+
+# Ubuntu systemd emits an empty MainPID for timer units.  Keep the exact
+# production normalization executable in this regression, not just documented.
+prepare_prop = lambda _name: ""
+assert int(prepare_prop("MainPID") or "0") == 0
+PY
+}
+
 sealed_stake_quorum_never_claims_global_halt() {
     for required in 'source_total_stake") != 40_000_000' controlled_writer_stake \
       controlled_quorum_unavailable_after_all_stops global_legacy_halt_claimed \
@@ -2536,10 +2554,27 @@ assert 'arc.recovery.shared-input-source.v1' in t
 PY
 )
 
-archive_scripts_are_lintable() { bash -n "$NODE_HELPER" "$ORCHESTRATOR" && PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$ROLLOUT" "$FREEZE_MODULE" "$FREEZE_MODULE_TEST" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "$REPO_ROOT/scripts/recovery/test_recovery_rollout.py" >/dev/null && PYTHONDONTWRITEBYTECODE=1 python3 "$FREEZE_MODULE_TEST" >/dev/null && python3 -m json.tool "$SCHEMA" >/dev/null && shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"; }
+archive_scripts_are_lintable() {
+    bash -n "$NODE_HELPER" "$ORCHESTRATOR" &&
+        PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
+            "$ROLLOUT" "$FREEZE_MODULE" "$FREEZE_MODULE_TEST" &&
+        PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+            "$REPO_ROOT/scripts/recovery/test_recovery_rollout.py" >/dev/null &&
+        PYTHONDONTWRITEBYTECODE=1 python3 "$FREEZE_MODULE_TEST" >/dev/null &&
+        PYTHONDONTWRITEBYTECODE=1 python3 \
+            "$REPO_ROOT/scripts/recovery/test_archive_node_quarantine_runtime.py" \
+            >/dev/null &&
+        PYTHONDONTWRITEBYTECODE=1 python3 \
+            "$REPO_ROOT/scripts/recovery/test_quarantine_rounds.py" >/dev/null &&
+        PYTHONDONTWRITEBYTECODE=1 python3 \
+            "$REPO_ROOT/scripts/recovery/test_community_reward_probe.py" >/dev/null &&
+        python3 -m json.tool "$SCHEMA" >/dev/null &&
+        shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"
+}
 
 run_test 'exact authorizations bind every domain' exact_authorizations_bind_every_domain
 run_test 'capture id and destination fail closed' capture_id_and_destination_fail_closed
+run_test 'timer units normalize an empty MainPID to zero' timer_units_with_empty_mainpid_normalize_to_zero
 run_test 'sealed stake proof never claims global halt' sealed_stake_quorum_never_claims_global_halt
 run_test 'all six exact writers stop before capture' all_six_exact_writers_stop_before_content_capture
 run_test 'first quarantine boundary is temporally authorized before write' first_quarantine_boundary_is_temporally_authorized_before_write
@@ -2581,5 +2616,5 @@ run_test 'persisted-head truncated partials resume at every completed-at offset'
 run_test 'stateful fake nft/systemctl quarantine crash matrix is fail-closed' stateful_fake_nft_systemctl_quarantine_contract
 run_test 'quarantine retirement is exact, one-way, read-only on status, and crash-resumable' quarantine_retirement_is_one_way_resumable_and_exact
 run_test 'shared archive inputs stream without work-root materialization' shared_inputs_stream_without_work_root_materialization
-run_test 'archive scripts pass syntax and lint' archive_scripts_are_lintable
+run_test 'archive scripts pass syntax, lint, and embedded runtime suites' archive_scripts_are_lintable
 finish_tests

@@ -26,6 +26,7 @@ for test_file in \
     "$TEST_DIR/release_publication_contract_test.sh" \
     "$TEST_DIR/validator_vault_rewrap_contract_test.sh" \
     "$TEST_DIR/validator_vault_restore_contract_test.sh" \
+    "$TEST_DIR/cutover_handoff_commit_test.sh" \
     "$TEST_DIR/release_assembly_test.sh" \
     "$TEST_DIR/release_manifest_signature_test.sh" \
     "$TEST_DIR/signing_key_backup_behavior_test.sh" \

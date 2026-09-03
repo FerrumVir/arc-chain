@@ -7,6 +7,7 @@ TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 unsigned_handoff_is_exact_and_adversarially_verified() {
     python3 "$TEST_DIR/test_unsigned_desktop_handoff.py"
+    python3 "$TEST_DIR/test_unsigned_desktop_windows_permissions.py"
 }
 
 run_test \

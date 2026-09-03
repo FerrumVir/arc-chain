@@ -526,10 +526,16 @@ tag creation. GitHub's endpoint requires repository Administration read access,
 which is intentionally unavailable to the workflow `GITHUB_TOKEN`. The
 least-privilege publisher instead creates a hidden draft, uploads and compares
 every GitHub-computed asset digest to the local bytes, publishes the validated
-draft, and requires the resulting release to report `immutable: true`. If it
-does not, the workflow immediately deletes that exact release ID without
-deleting the protected tag, so the same unchanged tag can be rerun after the
-setting is repaired.
+draft, and requires the resulting release to report `immutable: true`.
+Before publication, a failed upload or independent verification may delete
+only the exact release ID after re-proving that it is still the expected hidden
+`draft: true`, `immutable: false` object for the protected tag and commit.
+Once the publication PATCH has been attempted, every failure path retains that
+release ID: the workflow polls the one object for bounded eventual consistency
+and, if immutable state is still not observed, stops for manual verification.
+Never delete that ambiguous or already-published release, and do not rerun the
+tag or release workflow; the tag and its release are create-only incident
+evidence.
 
 - protect `main` with a no-bypass PR/check/review ruleset. Protect **all** tag
   names with two `~ALL` tag rulesets: owner-only creation, plus no-bypass
@@ -1057,11 +1063,73 @@ argv/output hashes must verify before any new validator key is installed.
    optional air-gapped input, never a required handoff.) The generator derives
    fork membership from the sealed six-node classification and URLs from
    sealed validator origins, verifies every live provenance pin, then writes
-   create-only config bytes. Publish those exact
-   bytes in one reviewable Git commit; verify the Pages hash and all
-   provenance endpoints. Rollback by reverting only that config commit, which
-   restores maintenance without rolling back or renumbering the canonical
-   chain.
+   create-only config bytes. Preserve them and their checksum outside the
+   checkout; do not change `main` before the exact-main handoff, tag, and
+   immutable release in step 17.
+17. Create the compact public release handoff from the exact four-file private
+   handoff only with
+   `scripts/release/create-cutover-handoff-commit.py --full-handoff-dir ...
+   --verifier-binary ... --inspector-binary ... --genesis ...
+   --main-commit ... --tag v0.8.0 --push-remote origin`. The source directory
+   must contain only the finalized manifest and sidecar, the capture's
+   maintenance boundary, and the quorum-signed checkpoint, all read-only; it
+   stays under protected operator storage. The helper strips credentials from
+   its isolated derivation and compiled-verifier children; only its hardened
+   exact-remote Git publisher receives the bounded token through a temporary
+   askpass boundary. The hidden ref contains only the three derived public JSON
+   files and has the exact current protected-main commit as its sole parent. An
+   exact existing local or remote ref is resumable after a fresh re-derivation;
+   a different ref is never replaced. Snapshot the exact-SHA run set. Manually dispatch
+   `recovery-release-handoff.yml` on `main` only when none exists, then
+   API-select exactly one workflow/path/event/branch/SHA run and seal its run ID
+   and attempt before approval. Record the successful artifact's immutable
+   numeric ID and `sha256:` server digest.
+   Immediately re-prove immutable releases and unchanged `main`, require the
+   exact direct set `FerrumVir` plus `arisarcmarket`, reduce only
+   `arisarcmarket` to `pull`, and re-query the complete set to prove that the
+   sole non-owner is now `read` with no `write`, `maintain`, or `admin`. An
+   unexpected collaborator fails closed without mutation. Require
+   zero pending invitations with any of those roles. Re-query active ruleset
+   21690216 as the `~ALL` creation gate with only FerrumVir's owner bypass and
+   active ruleset 21667203 as the no-bypass `~ALL` update/deletion/
+   non-fast-forward gate; then prove remote tag/release absence and create the
+   protected tag once with an isolated authenticated Git push to the exact
+   credential-free HTTPS repository URL. Clear credential helpers, HTTP
+   headers, hooks, and non-HTTPS protocols; use the pinned `gh` credential
+   helper and the atomic create-only
+   `--force-with-lease=refs/tags/v0.8.0:` guard. Whether the push succeeds or
+   returns an ambiguous error, re-read the remote ref and accept only the exact
+   main SHA; proven absence is safe to retry and any mismatch stops. Its
+   automatic `release.yml`
+   tag-push run is expected to fail in the initial validation job because a
+   push event cannot supply those two handoff inputs. API-select that exact
+   failed tag-push run rather than entering an ID. Prove that exact error and
+   that no publisher job ran. After that expected failure is confirmed,
+   create or reuse exactly one manual `release.yml` run with `tag`,
+   `cutover_handoff_artifact_id`, and `cutover_handoff_artifact_digest`. Never
+   move or recreate the tag, and never retry publication by pushing it again.
+   Bind the manual run's ID/attempt, wait for terminal success, require every
+   named job including the independent immutable-release verifier, and prove
+   through the release API that v0.8.0 is live, immutable, non-draft,
+   non-prerelease, targets the exact source SHA, and contains the complete
+   unique 32-asset digest-bound contract. The exact production commands and
+   API checks are in the recovery README.
+18. Only after the immutable release and its independent read-only verification
+   succeed, publish the preserved recovered frontend bytes in one deterministic
+   reviewable commit and create-only branch. Prefer `arisarcmarket`'s exact-head
+   approval. If unavailable, seal the exact main-ruleset policy, temporarily
+   relax only approval count and last-push approval under an EXIT/signal restore
+   trap, squash merge, and prove the policy snapshot hash was restored. The new
+   main commit must have the release source as its sole parent and exactly the
+   reviewed tree/config bytes. API-select the exact successful Pages run and
+   jobs, bind its successful `github-pages` deployment, compare the CDN config,
+   commit marker, and deployed SHA256SUMS, and re-fetch every advertised archive
+   provenance object field-for-field. Finally run a fresh no-service Linux
+   installer plus already-up-to-date canary and the read-only six-node
+   inference/reward verifier; seal `POST-RELEASE-ACCEPTANCE.json` before
+   unmasking package updates. Rollback by reverting only that config commit,
+   which restores maintenance without moving v0.8.0 or rolling back or
+   renumbering the canonical chain.
 
 Each production validator accepts RPC only on its rollout-derived Unix-domain
 socket. The remote unit passes `--rpc-unix` and omits `--rpc`; the manifest's

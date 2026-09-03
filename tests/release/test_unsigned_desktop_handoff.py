@@ -430,6 +430,18 @@ class UnsignedDesktopHandoffTests(unittest.TestCase):
             succeeds=False,
         )
 
+        _, writable = self.materialized("macos-x86_64")
+        (writable / "arc-desktop-macos-x86_64.dmg").chmod(0o600)
+        (writable / "arc-desktop-macos-x86_64.app.tar.gz.sig").write_bytes(b"sig")
+        result = self.invoke(
+            "verify-signed",
+            "macos-x86_64",
+            "--workspace",
+            str(writable),
+            succeeds=False,
+        )
+        self.assertIn("regained permissions", result.stderr)
+
         _, extra = self.materialized("windows-x86_64")
         (extra / "arc-desktop-windows-x86_64-setup.exe.sig").write_bytes(b"sig")
         (extra / "unexpected.sig").write_bytes(b"extra")
