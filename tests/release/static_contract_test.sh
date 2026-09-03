@@ -2375,7 +2375,7 @@ import sys
 
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 boundaries = {
-    "audit_writers": "seal_freeze_plan() (",
+    "audit_writers": "seal_freeze_plan() {",
     "seal_freeze_plan": "freeze_plan_hash() {",
     "prepare_writers": "run_remote() {",
     "verify_offline_stop_phase": "create_offline_stop_evidence() {",
@@ -2386,7 +2386,7 @@ boundaries = {
 }
 bodies = {}
 for name, next_declaration in boundaries.items():
-    declaration = f"{name}() ("
+    declaration = f"{name}() {{"
     start = text.index(declaration)
     end = text.index(next_declaration, start + len(declaration))
     body = text[start:end]
@@ -2442,8 +2442,99 @@ for root in roots:
         raise SystemExit(f"new command scope can inherit {root}")
 if scope.count("trap cleanup_temporary_root EXIT") != 1:
     raise SystemExit("temporary scope does not install exactly one EXIT cleanup")
-if 'audit_writers --legacy-validator-set "$legacy_validators" --output "$output"' not in bodies["prepare_writers"]:
+for required in ("trap 'exit 129' HUP", "trap 'exit 130' INT", "trap 'exit 143' TERM"):
+    if scope.count(required) != 1:
+        raise SystemExit(f"temporary scope omits exact signal cleanup status: {required}")
+if '( audit_writers --legacy-validator-set "$legacy_validators" --output "$output" )' not in bodies["prepare_writers"]:
     raise SystemExit("prepare-writers no longer exercises the nested audit scope")
+
+dispatcher_start = text.index("archive_write_current_process_id() {")
+dispatcher = text[dispatcher_start:]
+for required in (
+    "set -m",
+    "set +m",
+    'ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false',
+    'builtin kill -s "$ARC_ARCHIVE_DISPATCH_SIGNAL" --',
+    '( archive_dispatch_phase "$supervisor_pid" "$gate" "$command_name" "$@" ) &',
+    'mkdir -m 700 "$gate/runtime"',
+    'TMPDIR="$gate/runtime"',
+    'export TMPDIR',
+    'archive_remove_dispatch_gate "$gate"',
+    'archive_remove_dispatch_gate_until_absent "$gate"',
+    'archive_dispatch_parent_watchdog "$supervisor_pid" "$phase_pid" "$phase_pgid" "$gate" &',
+    'archive_request_guardian_state "$gate" "$watchdog_pid" phase-drained',
+    'archive_request_guardian_state "$gate" "$watchdog_pid" takeover',
+    'archive_request_guardian_state "$gate" "$watchdog_pid" cleanup-now',
+    'archive_guardian_acknowledge_state "$gate" "$watchdog_pid" phase-drained',
+    '[ "$ready_pid" != "$phase_pid" ] || [ "$ready_pgid" != "$phase_pid" ]',
+    '[ "$ready_pid" != "$watchdog_pid" ] || [ "$ready_pgid" != "$watchdog_pid" ]',
+    'observed_parent="$(archive_process_field ppid "$watchdog_pid")"',
+    'archive_signal_group_members_except KILL "$phase_pgid" "$phase_pid"',
+    'wait "$phase_pid"',
+    'archive_restore_signal_trap "$saved_hup" HUP',
+    'archive_restore_signal_trap "$saved_int" INT',
+    'archive_restore_signal_trap "$saved_term" TERM',
+):
+    if required not in dispatcher:
+        raise SystemExit(f"archive dispatcher omits supervised signal contract: {required}")
+phase_body = text[
+    text.index("archive_dispatch_phase() {"):
+    text.index("archive_dispatch_parent_watchdog() {")
+]
+if '\n    "$command_name" "$@"\n' not in phase_body:
+    raise SystemExit("archive phase is not invoked as a direct fail-fast simple command")
+if re.search(r'(?m)^\s*(?:if|!)[^\n]*"\$command_name"', phase_body) or \
+        re.search(r'"\$command_name"[^\n]*(?:&&|\|\|)', phase_body):
+    raise SystemExit("archive phase command is in a context that disables function errexit")
+if 'TMPDIR="$work_root" verify_reference_pair' in text:
+    raise SystemExit("seal reference scratch escapes the supervisor-owned dispatch gate")
+if 'mktemp -d "$work_root/arc-archive-seal.' in text:
+    raise SystemExit("seal execution scratch escapes the supervisor-owned dispatch gate")
+if 'gate_parent="$requested_work_root"' not in dispatcher:
+    raise SystemExit("seal dispatcher gate no longer uses its protected large work root")
+dispatch_body = dispatcher[
+    dispatcher.index("dispatch_archive_command() {"):
+    dispatcher.index('COMMAND="${1:-}"')
+]
+phase_drained_request = dispatch_body.rindex(
+    'archive_request_guardian_state "$gate" "$watchdog_pid" phase-drained'
+)
+final_clear = dispatch_body.index('ARC_ARCHIVE_DISPATCH_PHASE_PGID=""', phase_drained_request)
+final_sweep = dispatch_body.index('archive_remove_dispatch_gate "$gate"', phase_drained_request)
+if not phase_drained_request < final_clear < final_sweep:
+    raise SystemExit(
+        "dispatcher does not acknowledge cleanup-only guardian state and clear the reusable PGID before sweep"
+    )
+if 'if [ "$phase_group_drained" = true ]; then' not in dispatch_body:
+    raise SystemExit("dispatcher final sweep is not guarded by proven phase-group absence")
+if 'guardian_handed_off=true\n            ARC_ARCHIVE_DISPATCH_PHASE_PGID=""' not in dispatch_body:
+    raise SystemExit("residual phase group is not explicitly handed to its guardian before return")
+if 'guardian_phase_drained=true' not in dispatch_body or \
+        'archive_request_guardian_state "$gate" "$watchdog_pid" cleanup-now' not in dispatch_body:
+    raise SystemExit("failed final gate sweep is not handed to the acknowledged cleanup-only guardian")
+setup_return = dispatch_body.rindex('[ "$setup_status" -eq 0 ] || return "$setup_status"')
+signal_return = dispatch_body.rindex('return "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"')
+if signal_return > setup_return:
+    raise SystemExit("internal cleanup status masks the required exact signal status")
+
+case_start = text.index('case "$COMMAND" in', dispatcher_start)
+case_body = text[case_start:]
+case_routes = {
+    "prepare-writers": "prepare_writers",
+    "audit-writers": "audit_writers",
+    "seal-freeze-plan": "seal_freeze_plan",
+    "capture": "capture_phase",
+    "verify-offline-stop": "verify_offline_stop_phase",
+    "verify-installed-keys": "verify_installed_keys_phase",
+    "seal": "seal_phase",
+    "verify-complete": "verify_complete_phase",
+}
+for cli_name, function_name in case_routes.items():
+    route = f'{cli_name}) dispatch_archive_command {function_name} "$@" ;;'
+    if case_body.count(route) != 1:
+        raise SystemExit(f"{cli_name} does not route exactly once through the dispatcher")
+if "-h|--help|help|'') usage ;;" not in case_body:
+    raise SystemExit("global help no longer bypasses the supervised phase dispatcher")
 for required in (
     'create("known_hosts", known_payload, 0o400)',
     'create("id_ed25519", identity_payload, 0o400)',

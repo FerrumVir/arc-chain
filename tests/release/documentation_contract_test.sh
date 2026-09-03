@@ -1689,13 +1689,28 @@ recovery_plan_read_only_scope_is_truthful() {
     fi
 
     for literal in \
-        'invocation-scoped subshell' \
+        'dedicated, invocation-scoped process group' \
         'disposable mode-0600 rclone config copy' \
         'source SSH identity and rclone config' \
         'remain byte-for-byte unchanged' \
         'normal success, plan return, or fail-closed error' \
         'Nested `prepare-writers` -> `audit-writers` execution' \
-        '`SIGKILL` or loss of the operator host cannot run an EXIT handler'
+        'mode-0700 dispatcher gate beneath the caller' \
+        'physically contained by the gate' \
+        'forwards a parent-targeted `SIGHUP`, `SIGINT`, or' \
+        '`SIGTERM` exactly once to the entire phase group' \
+        'removes and verifies absence of the whole gate' \
+        'returning 129, 130, or' \
+        'signal-ignoring descendant tries to recreate' \
+        'bounded opportunity to finish its EXIT' \
+        'acknowledge `phase-drained` state' \
+        'acknowledge explicit takeover' \
+        'hands an unbounded, verified' \
+        'An unsignaled internal cleanup failure returns 125' \
+        'preserves its required 129, 130, or' \
+        'guardian takes over if the dispatcher is lost to `SIGKILL`' \
+        'Direct `SIGKILL` of both the' \
+        'phase and its guardian, or loss of the operator'
     do
         require_literal "$RECOVERY_README" "$literal" \
             'recovery README omits the invocation-scoped credential cleanup contract' \

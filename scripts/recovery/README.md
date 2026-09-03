@@ -1192,10 +1192,14 @@ printf '%s  %s\n' "$ssh_identity_sha256" "$ssh_identity" \
   --receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json
 ```
 
-Every archive command that initializes Python, SSH, or Drive runs in an
-invocation-scoped subshell and installs its cleanup handler before argument
-parsing or configuration. It creates a private mode-0700 Python HOME and
-transport root, copies `known_hosts` and `id_ed25519` at mode 0400, and, for a
+Every archive command that initializes Python, SSH, or Drive runs as the leader
+of a dedicated, invocation-scoped process group and installs its cleanup
+handler before argument parsing or configuration. It creates a private
+mode-0700 dispatcher gate beneath the caller's `TMPDIR` (beneath the validated
+`--work-root` for `seal`) and exports only that gate's private runtime child as
+the phase `TMPDIR`. The Python HOME, transport root, and every other invocation
+scratch directory are therefore physically contained by the gate. The phase
+copies `known_hosts` and `id_ed25519` at mode 0400 and, for a
 Drive command, copies the reviewed rclone executable at mode 0500 plus a
 disposable mode-0600 rclone config copy. All `ssh`, `scp`, and `rclone` calls
 then use only those copies in a clean environment. A token refresh can change
@@ -1204,9 +1208,29 @@ remain byte-for-byte unchanged. The invocation removes all of these roots on
 a normal success, plan return, or fail-closed error, including an error partway
 through configuration. Nested `prepare-writers` -> `audit-writers` execution
 owns separate roots, so the nested cleanup cannot remove its parent's active
-transport. `SIGKILL` or loss of the operator host cannot run an EXIT handler;
-any resulting orphan remains inside its private mode-0700 `TMPDIR` root and
-must be securely removed before retrying.
+transport. The dispatcher forwards a parent-targeted `SIGHUP`, `SIGINT`, or
+`SIGTERM` exactly once to the entire phase group, waits until the phase is
+reaped, drains any surviving same-group descendants, and then independently
+removes and verifies absence of the whole gate before returning 129, 130, or
+143 respectively. The phase gets a bounded opportunity to finish its EXIT
+cleanup; the supervisor-owned final gate sweep is authoritative and also
+removes bytes a signal-ignoring descendant tries to recreate after that
+cleanup starts. Before the sweep, the separately grouped guardian must
+acknowledge `phase-drained` state, so it can no longer signal a reusable old
+phase PGID if the parent disappears. If a process group remains after bounded
+TERM/KILL attempts, the guardian must instead acknowledge explicit takeover;
+it retains the gate, retries KILL until that group is absent, and only then
+removes and verifies the gate. A transient final-sweep failure similarly emits
+a loud `FATAL` message with the exact path and hands an unbounded, verified
+retry to the guardian. An unsignaled internal cleanup failure returns 125; a
+run that already received HUP, INT, or TERM preserves its required 129, 130, or
+143 status while reporting that acknowledged containment is continuing.
+The same guardian takes over if the dispatcher is lost to `SIGKILL`; it first
+gives the cleanup-owning phase leader a TERM path, then kills a TERM-ignoring
+foreground descendant so the deferred cleanup or final gate sweep can finish.
+Direct `SIGKILL` of both the phase and its guardian, or loss of the operator
+host/kernel, cannot run an EXIT handler or final sweep; securely remove any
+private mode-0700 dispatcher-gate orphan before retrying after either event.
 
 After all six exact writers are stopped, `capture` re-runs the hash-pinned
 remote `stopped-status` command with every frozen writer argument and seals a
