@@ -5,8 +5,14 @@
 # Rust toolchain or cargo-deny release.
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd)"
+# Resolve physically. MANIFEST_DIR below uses `pwd -P`, so a logical `pwd` here
+# makes MANIFEST_ABS and ROOT_MANIFEST/DESKTOP_MANIFEST disagree on any checkout
+# path containing a symlink (/tmp on macOS, a symlinked CI workspace).
+# SHADOW_PROFILE then stays empty, the whole vendored-advisory scan is skipped,
+# and this release gate exits 0 without having checked anything.
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+ARGUMENT_COUNT="$#"
 MANIFEST_PATH="${1:-$REPO_ROOT/Cargo.toml}"
 VERSION=0.20.2
 
@@ -78,6 +84,16 @@ case "$MANIFEST_ABS" in
         SHADOW_PROFILE=desktop
         ;;
 esac
+
+# Skipping the shadow scan is legitimate only for a caller-supplied manifest
+# that is neither the workspace root nor desktop. With no argument we defaulted
+# to the root manifest, so an empty profile means path resolution disagreed and
+# this gate would pass silently. Fail loudly instead.
+if [ "$ARGUMENT_COUNT" -eq 0 ] && [ -z "$SHADOW_PROFILE" ]; then
+    printf '%s: default manifest %s did not resolve to workspace root %s\n' \
+        "$0" "$MANIFEST_ABS" "$ROOT_MANIFEST" >&2
+    exit 2
+fi
 
 if [ -n "$SHADOW_PROFILE" ]; then
     ACTUAL_METADATA="$WORK_DIR/$SHADOW_PROFILE-metadata.json"
