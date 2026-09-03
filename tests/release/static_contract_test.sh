@@ -18,6 +18,8 @@ GENESIS_VALIDATOR="$REPO_ROOT/scripts/release/validate-genesis.py"
 SECRET_SCANNER="$TEST_DIR/current_tree_secret_scan.sh"
 SECRET_MATERIALIZER="$TEST_DIR/materialize_releasable_tree.py"
 QUALITY_HARNESS="$REPO_ROOT/scripts/ci_check.sh"
+CARGO_DENY_RUNNER="$REPO_ROOT/scripts/ci/run-cargo-deny.sh"
+VENDORED_ADVISORY_SHADOW="$REPO_ROOT/scripts/ci/vendored-advisory-shadow.py"
 COMMUNITY_JOIN="$REPO_ROOT/scripts/join-testnet.sh"
 INFERENCE_JOIN="$REPO_ROOT/scripts/join-inference.sh"
 INFERENCE_INSTALL="$REPO_ROOT/scripts/install-inference-node.sh"
@@ -969,6 +971,37 @@ release_supply_chain_and_npm_audits_are_blocking() {
         printf 'pull-request cargo-deny gate is advisory\n'
         return 1
     fi
+
+    for required in \
+        'SHADOW_HELPER="$SCRIPT_DIR/vendored-advisory-shadow.py"' \
+        'SHADOW_PROFILE=root' \
+        'SHADOW_PROFILE=desktop' \
+        'python3 "$SHADOW_HELPER" write-policy' \
+        '--config "$SHADOW_POLICY"' \
+        '--metadata-path "$SHADOW_METADATA"' \
+        'check --audit-compatible-output advisories' \
+        'python3 "$SHADOW_HELPER" verify-report'
+    do
+        if [ "$(grep -Fc -- "$required" "$CARGO_DENY_RUNNER")" -ne 1 ]; then
+            printf 'vendored advisory registry-shadow wiring drifted: %s\n' "$required"
+            return 1
+        fi
+    done
+    if grep -Fq -- 'vendored-glib-advisory-shadow.py' "$CARGO_DENY_RUNNER"; then
+        printf 'cargo-deny runner retained the partial glib-only advisory helper\n'
+        return 1
+    fi
+    for required in \
+        'write_shadow_policy' \
+        'ignore = []' \
+        'registry-shadow advisory policy must be suppression-free' \
+        'root vendored packages have live advisory findings'
+    do
+        grep -Fq -- "$required" "$VENDORED_ADVISORY_SHADOW" || {
+            printf 'vendored advisory helper omits fail-closed invariant: %s\n' "$required"
+            return 1
+        }
+    done
 
     printf '%s\n' "$quality_block" \
         | grep -Fq 'npm --prefix "$package" audit --package-lock-only --audit-level=low' \

@@ -59,19 +59,33 @@ CARGO_DENY="$WORK_DIR/cargo-deny-$VERSION-$TARGET/cargo-deny"
     check advisories bans sources licenses
 
 # cargo-deny intentionally omits local-path packages from advisory matching.
-# For the desktop graph, shadow only the reviewed glib backport with its exact
-# canonical registry identity, then require the live database to report exactly
-# the one advisory whose upstream fix is carried in the vendored source.
+# After proving each provenance-pinned path patch is reachable in the real
+# graph, project only those packages under their exact canonical registry
+# identities and re-scan them with the database refreshed above. The root
+# profile requires zero findings for all three Wasmer patches under a generated
+# suppression-free policy. The desktop profile still
+# requires exactly the one glib advisory whose upstream fix is carried locally.
 MANIFEST_DIR="$(CDPATH='' cd -- "$(dirname -- "$MANIFEST_PATH")" && pwd -P)"
 MANIFEST_ABS="$MANIFEST_DIR/$(basename -- "$MANIFEST_PATH")"
+ROOT_MANIFEST="$REPO_ROOT/Cargo.toml"
 DESKTOP_MANIFEST="$REPO_ROOT/desktop/src-tauri/Cargo.toml"
-if [ "$MANIFEST_ABS" = "$DESKTOP_MANIFEST" ]; then
-    ACTUAL_METADATA="$WORK_DIR/desktop-metadata.json"
-    SHADOW_METADATA="$WORK_DIR/desktop-registry-shadow-metadata.json"
-    SHADOW_REPORT="$WORK_DIR/desktop-registry-shadow-advisories.jsonl"
-    SHADOW_DIAGNOSTICS="$WORK_DIR/desktop-registry-shadow-diagnostics.jsonl"
-    SHADOW_HELPER="$SCRIPT_DIR/vendored-glib-advisory-shadow.py"
-    VENDORED_GLIB_MANIFEST="$REPO_ROOT/vendor/third_party/glib-0.18.5/Cargo.toml"
+SHADOW_PROFILE=
+case "$MANIFEST_ABS" in
+    "$ROOT_MANIFEST")
+        SHADOW_PROFILE=root
+        ;;
+    "$DESKTOP_MANIFEST")
+        SHADOW_PROFILE=desktop
+        ;;
+esac
+
+if [ -n "$SHADOW_PROFILE" ]; then
+    ACTUAL_METADATA="$WORK_DIR/$SHADOW_PROFILE-metadata.json"
+    SHADOW_METADATA="$WORK_DIR/$SHADOW_PROFILE-registry-shadow-metadata.json"
+    SHADOW_REPORT="$WORK_DIR/$SHADOW_PROFILE-registry-shadow-advisories.jsonl"
+    SHADOW_DIAGNOSTICS="$WORK_DIR/$SHADOW_PROFILE-registry-shadow-diagnostics.jsonl"
+    SHADOW_POLICY="$WORK_DIR/vendored-registry-shadow-deny.toml"
+    SHADOW_HELPER="$SCRIPT_DIR/vendored-advisory-shadow.py"
 
     cargo metadata \
         --manifest-path "$MANIFEST_ABS" \
@@ -79,13 +93,16 @@ if [ "$MANIFEST_ABS" = "$DESKTOP_MANIFEST" ]; then
         --locked \
         --offline >"$ACTUAL_METADATA"
     python3 "$SHADOW_HELPER" rewrite-metadata \
+        "$SHADOW_PROFILE" \
         "$ACTUAL_METADATA" \
-        "$SHADOW_METADATA" \
-        "$VENDORED_GLIB_MANIFEST"
+        "$SHADOW_METADATA"
+    python3 "$SHADOW_HELPER" write-policy \
+        "$REPO_ROOT/deny.toml" \
+        "$SHADOW_POLICY"
 
     set +e
     "$CARGO_DENY" \
-        --config "$REPO_ROOT/deny.toml" \
+        --config "$SHADOW_POLICY" \
         --manifest-path "$MANIFEST_ABS" \
         --metadata-path "$SHADOW_METADATA" \
         --format json \
@@ -93,14 +110,15 @@ if [ "$MANIFEST_ABS" = "$DESKTOP_MANIFEST" ]; then
         --offline \
         check --audit-compatible-output advisories \
         >"$SHADOW_REPORT" 2>"$SHADOW_DIAGNOSTICS"
-    SHADOW_STATUS=$?
+    SHADOW_EXIT=$?
     set -e
 
     if ! python3 "$SHADOW_HELPER" verify-report \
+        "$SHADOW_PROFILE" \
         "$SHADOW_REPORT" \
         "$SHADOW_DIAGNOSTICS" \
-        "$REPO_ROOT/deny.toml" \
-        "$SHADOW_STATUS"; then
+        "$SHADOW_POLICY" \
+        "$SHADOW_EXIT"; then
         sed -n '1,160p' "$SHADOW_DIAGNOSTICS" >&2
         exit 1
     fi

@@ -12,7 +12,7 @@ DESKTOP_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DENY_CONFIG="$REPO_ROOT/deny.toml"
 RELEASE_TEST_RUNNER="$TEST_DIR/run.sh"
 CARGO_DENY_RUNNER="$REPO_ROOT/scripts/ci/run-cargo-deny.sh"
-ADVISORY_SHADOW_HELPER="$REPO_ROOT/scripts/ci/vendored-glib-advisory-shadow.py"
+ADVISORY_SHADOW_HELPER="$REPO_ROOT/scripts/ci/vendored-advisory-shadow.py"
 GIT_ATTRIBUTES="$REPO_ROOT/.gitattributes"
 
 vendored_source_and_backport_are_exact() {
@@ -202,7 +202,8 @@ if runner.count(needle) != 1:
 
 deny_runner = deny_runner_path.read_text()
 required_shadow_steps = (
-    'SHADOW_HELPER="$SCRIPT_DIR/vendored-glib-advisory-shadow.py"',
+    'SHADOW_HELPER="$SCRIPT_DIR/vendored-advisory-shadow.py"',
+    'SHADOW_PROFILE=desktop',
     'python3 "$SHADOW_HELPER" rewrite-metadata',
     '--metadata-path "$SHADOW_METADATA"',
     'check --audit-compatible-output advisories',
@@ -228,6 +229,7 @@ import tempfile
 helper, manifest = map(pathlib.Path, sys.argv[1:])
 python = sys.executable
 old_id = "path+file:///reviewed/glib-0.18.5#glib@0.18.5"
+parent_id = "path+file:///reviewed/arc-desktop#0.8.0"
 registry_source = "registry+https://github.com/rust-lang/crates.io-index"
 registry_id = f"{registry_source}#glib@0.18.5"
 archive_sha = "233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5"
@@ -260,7 +262,6 @@ with tempfile.TemporaryDirectory(prefix="arc-glib-advisory-shadow.") as temporar
     report_path = temporary / "report.jsonl"
     diagnostics_path = temporary / "diagnostics.jsonl"
     deny_path = temporary / "deny.toml"
-    transitive_deny_path = temporary / "transitive-deny.toml"
     metadata = {
         "packages": [
             {
@@ -272,11 +273,27 @@ with tempfile.TemporaryDirectory(prefix="arc-glib-advisory-shadow.") as temporar
                 "manifest_path": str(manifest),
             }
         ],
-        "resolve": {"root": old_id, "nodes": [{"id": old_id, "dependencies": []}]},
+        "resolve": {
+            "root": parent_id,
+            "nodes": [
+                {"id": old_id, "deps": []},
+                {
+                    "id": parent_id,
+                    "deps": [
+                        {
+                            "name": "glib",
+                            "pkg": old_id,
+                            "dep_kinds": [{"kind": None, "target": None}],
+                        }
+                    ],
+                },
+            ],
+        },
+        "workspace_members": [parent_id],
     }
     actual_path.write_text(json.dumps(metadata))
     require_success(
-        run("rewrite-metadata", actual_path, shadow_path, manifest),
+        run("rewrite-metadata", "desktop", actual_path, shadow_path),
         "canonical registry-shadow rewrite",
     )
     shadow = json.loads(shadow_path.read_text())
@@ -288,6 +305,7 @@ with tempfile.TemporaryDirectory(prefix="arc-glib-advisory-shadow.") as temporar
         "source": registry_source,
         "checksum": archive_sha,
         "manifest_path": str(manifest),
+        "dependencies": [],
     }:
         raise SystemExit(f"registry-shadow package identity drifted: {package}")
     if old_id in shadow_path.read_text():
@@ -297,20 +315,38 @@ with tempfile.TemporaryDirectory(prefix="arc-glib-advisory-shadow.") as temporar
     already_registry["packages"][0]["source"] = registry_source
     actual_path.write_text(json.dumps(already_registry))
     require_failure(
-        run("rewrite-metadata", actual_path, shadow_path, manifest),
+        run("rewrite-metadata", "desktop", actual_path, shadow_path),
         "non-path glib metadata",
     )
 
     finding = {
         "advisory": {
-            "id": "RUSTSEC-2024-0429",
-            "package": "glib",
             "aliases": ["GHSA-wrw7-89jp-8q8g"],
+            "categories": [],
+            "collection": "crates",
+            "cvss": None,
+            "date": "2024-03-04",
+            "description": "fixture",
+            "expect-deleted": False,
+            "id": "RUSTSEC-2024-0429",
             "informational": "unsound",
+            "keywords": [],
+            "license": "CC0-1.0",
+            "package": "glib",
+            "references": [],
+            "related": [],
+            "source": None,
+            "title": "fixture",
+            "url": "https://example.invalid/advisory",
+            "withdrawn": None,
         },
+        "affected": None,
         "kind": "unsound",
         "package": {
+            "checksum": None,
+            "dependencies": [],
             "name": "glib",
+            "replace": None,
             "version": "0.18.5",
             "source": registry_source,
         },
@@ -318,29 +354,52 @@ with tempfile.TemporaryDirectory(prefix="arc-glib-advisory-shadow.") as temporar
     }
     report = {
         "lockfile": {"dependency-count": 1},
-        "settings": {"ignore": []},
+        "settings": {
+            "ignore": [],
+            "informational_warnings": ["notice", "unmaintained", "unsound"],
+            "severity": None,
+            "target_arch": [],
+            "target_os": [],
+        },
         "vulnerabilities": [],
         "warnings": {"unsound": [finding]},
     }
+    unsound_error = {
+        "fields": {
+            "advisory": {},
+            "code": "unsound",
+            "graphs": [],
+            "labels": [],
+            "message": "fixture",
+            "notes": [],
+            "severity": "error",
+        },
+        "type": "diagnostic",
+    }
     summary = {
         "fields": {
-            "advisories": {"errors": 0, "helps": 0, "notes": 0, "warnings": 1}
+            "advisories": {"errors": 1, "helps": 0, "notes": 0, "warnings": 0}
         },
         "type": "summary",
     }
-    deny_path.write_text('[advisories]\nversion = 2\nignore = []\n')
-    diagnostics_path.write_text(json.dumps(summary) + "\n")
+    deny_path.write_text(
+        '[advisories]\nversion = 2\nunsound = "all"\nyanked = "deny"\nignore = []\n'
+    )
+    diagnostics_path.write_text(json.dumps(unsound_error) + "\n" + json.dumps(summary) + "\n")
     report_path.write_text(json.dumps(report) + "\n")
     require_success(
-        run("verify-report", report_path, diagnostics_path, deny_path, 0),
+        run("verify-report", "desktop", report_path, diagnostics_path, deny_path, 1),
         "exact advisory set",
     )
 
     missing = copy.deepcopy(report)
     missing["warnings"]["unsound"] = []
+    clean_summary = copy.deepcopy(summary)
+    clean_summary["fields"]["advisories"]["errors"] = 0
+    diagnostics_path.write_text(json.dumps(clean_summary) + "\n")
     report_path.write_text(json.dumps(missing) + "\n")
     require_failure(
-        run("verify-report", report_path, diagnostics_path, deny_path, 0),
+        run("verify-report", "desktop", report_path, diagnostics_path, deny_path, 0),
         "missing reviewed advisory",
     )
 
@@ -348,65 +407,60 @@ with tempfile.TemporaryDirectory(prefix="arc-glib-advisory-shadow.") as temporar
     extra = copy.deepcopy(finding)
     extra["advisory"]["id"] = "RUSTSEC-2099-0001"
     additional["warnings"]["unsound"].append(extra)
+    diagnostics_path.write_text(json.dumps(unsound_error) + "\n" + json.dumps(summary) + "\n")
     report_path.write_text(json.dumps(additional) + "\n")
     require_failure(
-        run("verify-report", report_path, diagnostics_path, deny_path, 0),
+        run("verify-report", "desktop", report_path, diagnostics_path, deny_path, 1),
         "additional glib advisory",
     )
 
     suppressed = copy.deepcopy(report)
     suppressed["settings"]["ignore"] = ["RUSTSEC-2024-0429"]
+    deny_path.write_text(
+        '[advisories]\nversion = 2\nunsound = "all"\nyanked = "deny"\n'
+        'ignore = ["RUSTSEC-2024-0429"]\n'
+    )
     report_path.write_text(json.dumps(suppressed) + "\n")
     require_failure(
-        run("verify-report", report_path, diagnostics_path, deny_path, 0),
+        run("verify-report", "desktop", report_path, diagnostics_path, deny_path, 0),
         "suppressed reviewed advisory",
+    )
+    deny_path.write_text(
+        '[advisories]\nversion = 2\nunsound = "all"\nyanked = "deny"\nignore = []\n'
     )
 
     shape_drift = copy.deepcopy(report)
     shape_drift["unexpected"] = True
     report_path.write_text(json.dumps(shape_drift) + "\n")
     require_failure(
-        run("verify-report", report_path, diagnostics_path, deny_path, 0),
+        run("verify-report", "desktop", report_path, diagnostics_path, deny_path, 1),
         "cargo-deny output shape drift",
     )
 
     report_path.write_text(json.dumps(report) + "\n")
+    drifted_diagnostic = copy.deepcopy(unsound_error)
+    drifted_diagnostic["fields"]["unexpected"] = True
+    diagnostics_path.write_text(
+        json.dumps(drifted_diagnostic) + "\n" + json.dumps(summary) + "\n"
+    )
     require_failure(
-        run("verify-report", report_path, diagnostics_path, deny_path, 1),
-        "unexplained nonzero cargo-deny status",
+        run("verify-report", "desktop", report_path, diagnostics_path, deny_path, 1),
+        "cargo-deny diagnostic shape drift",
     )
 
-    transitive_deny_path.write_text(
-        '[advisories]\nversion = 2\nunsound = "all"\nignore = []\n'
-    )
-    unsound_error = {
-        "fields": {"code": "unsound", "severity": "error"},
-        "type": "diagnostic",
-    }
-    transitive_summary = copy.deepcopy(summary)
-    transitive_summary["fields"]["advisories"]["errors"] = 1
     diagnostics_path.write_text(
-        json.dumps(unsound_error) + "\n" + json.dumps(transitive_summary) + "\n"
-    )
-    require_success(
-        run(
-            "verify-report",
-            report_path,
-            diagnostics_path,
-            transitive_deny_path,
-            1,
-        ),
-        "transitive-unsound policy advisory exit",
+        json.dumps(unsound_error) + "\n" + json.dumps(summary) + "\n"
     )
     require_failure(
         run(
             "verify-report",
+            "desktop",
             report_path,
             diagnostics_path,
-            transitive_deny_path,
-            0,
+            deny_path,
+            2,
         ),
-        "missing transitive-unsound policy failure",
+        "unexpected cargo-deny exit",
     )
 PY
 }
