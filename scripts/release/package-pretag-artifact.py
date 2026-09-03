@@ -56,6 +56,18 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kind", required=True, choices=("headless", "desktop"))
@@ -133,9 +145,7 @@ def main() -> None:
         "files": files,
     }
     metadata_path = args.payload_dir / "BUILD-METADATA.json"
-    metadata_path.write_text(
-        json.dumps(metadata, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
+    metadata_path.write_bytes(canonical_json_bytes(metadata))
 
     stem = (
         f"arc-pretag-{args.kind}-{args.platform}-{args.commit}-"

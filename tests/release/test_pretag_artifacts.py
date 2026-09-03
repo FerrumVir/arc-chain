@@ -338,6 +338,13 @@ class PretagArtifactTests(unittest.TestCase):
         metadata = json.loads(
             (output / "BUILD-METADATA.json").read_text(encoding="utf-8")
         )
+        self.assertEqual(
+            (
+                json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8"),
+            (output / "BUILD-METADATA.json").read_bytes(),
+        )
         self.assertEqual("arc.pretag.artifact.v1", metadata["schema"])
         self.assertEqual(COMMIT, metadata["commit"])
         self.assertEqual("macos-arm64", metadata["platform"])
@@ -570,6 +577,30 @@ class PretagArtifactTests(unittest.TestCase):
             "headless", "linux-x86_64", tar_bytes(values)
         )
         self.assert_materialize_fails("payload hash mismatch", "headless:linux-x86_64")
+
+    def test_materializer_rejects_noncanonical_build_metadata(self) -> None:
+        outer = self.fixture.outer_entries("headless", "linux-x86_64")
+        archive_name = next(key for key in outer if key.endswith(".tar.gz"))
+        original = io.BytesIO(outer[archive_name])
+        values: list[tuple[tarfile.TarInfo, bytes]] = []
+        with tarfile.open(fileobj=original, mode="r:gz") as archive:
+            for member in archive.getmembers():
+                extracted = archive.extractfile(member)
+                value = extracted.read() if extracted is not None else b""
+                if member.name == "BUILD-METADATA.json":
+                    metadata = json.loads(value)
+                    value = (
+                        json.dumps(metadata, sort_keys=True, indent=2) + "\n"
+                    ).encode("utf-8")
+                replacement = tarfile.TarInfo(member.name)
+                replacement.mode = member.mode
+                values.append((replacement, value))
+        self.fixture.replace_inner(
+            "headless", "linux-x86_64", tar_bytes(values)
+        )
+        self.assert_materialize_fails(
+            "build metadata is not canonical JSON", "headless:linux-x86_64"
+        )
 
     def test_packager_rejects_wrong_target_and_extra_payload(self) -> None:
         stage = Path(self.temporary.name) / "bad-package"

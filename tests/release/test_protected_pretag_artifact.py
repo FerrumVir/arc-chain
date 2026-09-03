@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import email.utils
 import hashlib
+import io
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -163,6 +165,56 @@ class Fixture:
             for index, (label, value) in enumerate(values.items(), start=1)
         }
 
+    def replace_build_metadata(self, replacement: bytes) -> None:
+        with zipfile.ZipFile(self.zip, "r") as outer:
+            archive_name = next(
+                name for name in outer.namelist() if name.endswith(".tar.gz")
+            )
+            archive_bytes = outer.read(archive_name)
+
+        rebuilt = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as source:
+            with tarfile.open(
+                fileobj=rebuilt, mode="w:gz", format=tarfile.PAX_FORMAT
+            ) as target:
+                for member in source.getmembers():
+                    extracted = source.extractfile(member)
+                    payload = extracted.read() if extracted is not None else b""
+                    if member.name == "BUILD-METADATA.json":
+                        payload = replacement
+                    member.size = len(payload)
+                    target.addfile(member, io.BytesIO(payload))
+
+        archive_bytes = rebuilt.getvalue()
+        self.archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+        stem = (
+            f"arc-pretag-{self.kind}-{self.platform}-{COMMIT}-"
+            f"{RUN_ID}-{RUN_ATTEMPT}"
+        )
+        archive_name = f"{stem}.tar.gz"
+        checksums = "\n".join(
+            (
+                "# ARC pre-tag artifact v1",
+                f"# kind={self.kind}",
+                f"# repository={provenance.REPOSITORY}",
+                f"# commit={COMMIT}",
+                f"# run_id={RUN_ID}",
+                f"# run_attempt={RUN_ATTEMPT}",
+                f"# platform={self.platform}",
+                f"{self.archive_sha256}  {archive_name}",
+                "",
+            )
+        ).encode()
+        self.artifact_name = f"{stem}-{self.archive_sha256}"
+        self.zip.chmod(0o600)
+        with zipfile.ZipFile(self.zip, "w", compression=zipfile.ZIP_STORED) as outer:
+            outer.writestr(archive_name, archive_bytes)
+            outer.writestr("SHA256SUMS", checksums)
+        self.zip.chmod(0o400)
+        self.zip_sha256 = digest(self.zip)
+        self.zip_size = self.zip.stat().st_size
+        self.documents = self.api_documents()
+
     @contextmanager
     def verify(self):
         curl, curl_sha, ca, ca_sha = protected_runtime()
@@ -217,6 +269,30 @@ class ProtectedArtifactTests(unittest.TestCase):
             self.assertEqual(0o400, final.path.stat().st_mode & 0o777)
             root = verified.transaction_root
         self.assertFalse(root.exists())
+
+    def test_rehashed_semantic_build_metadata_must_still_be_canonical(self) -> None:
+        with zipfile.ZipFile(self.fixture.zip, "r") as outer:
+            archive_name = next(
+                name for name in outer.namelist() if name.endswith(".tar.gz")
+            )
+            with tarfile.open(
+                fileobj=io.BytesIO(outer.read(archive_name)), mode="r:gz"
+            ) as archive:
+                metadata_file = archive.extractfile("BUILD-METADATA.json")
+                assert metadata_file is not None
+                metadata = json.loads(metadata_file.read())
+        noncanonical = (
+            json.dumps(metadata, sort_keys=True, indent=2) + "\n"
+        ).encode()
+        self.assertNotEqual(noncanonical, provenance.canonical_json(metadata))
+        self.fixture.replace_build_metadata(noncanonical)
+
+        with self.assertRaisesRegex(
+            provenance.ProvenanceError,
+            "pre-tag BUILD-METADATA is not canonical JSON",
+        ):
+            with self.fixture.verify():
+                pass
 
     def test_forged_local_receipt_is_not_an_authorization_input(self) -> None:
         forged = self.fixture.root / "MATERIALIZATION-RECEIPT.json"

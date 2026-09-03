@@ -3696,10 +3696,9 @@ def verify_protected_pretag_stage_payloads(
         fail("Linux headless BUILD-METADATA.json is invalid JSON")
     if (
         not isinstance(metadata_value, dict)
-        or metadata_raw
-        != (json.dumps(metadata_value, sort_keys=True, indent=2) + "\n").encode()
+        or metadata_raw != canonical_bytes(metadata_value)
     ):
-        fail("Linux headless BUILD-METADATA.json is not the exact packaged JSON form")
+        fail("Linux headless BUILD-METADATA.json is not canonical JSON")
     metadata = require_keys(
         metadata_value,
         "Linux headless BUILD-METADATA.json",

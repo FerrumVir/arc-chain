@@ -417,13 +417,11 @@ def verify_group(
                         shutil.copyfileobj(extracted, handle)
                     os.chmod(target, member.mode & 0o777)
 
+            metadata_path = temporary_root / "BUILD-METADATA.json"
             try:
-                metadata = json.loads(
-                    (temporary_root / "BUILD-METADATA.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
-            except (OSError, json.JSONDecodeError) as error:
+                metadata_raw = metadata_path.read_bytes()
+                metadata = json.loads(metadata_raw)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 fail(f"invalid build metadata for {kind}/{platform}: {error}")
             expected_metadata = {
                 "schema": "arc.pretag.artifact.v1",
@@ -435,6 +433,29 @@ def verify_group(
                 "workflow_run_id": args.run_id,
                 "workflow_run_attempt": args.run_attempt,
             }
+            expected_metadata_fields = set(expected_metadata) | {
+                "rust_target",
+                "files",
+            }
+            if not isinstance(metadata, dict) or set(metadata) != expected_metadata_fields:
+                fail(f"metadata field set differs for {kind}/{platform}")
+            try:
+                canonical_metadata = (
+                    json.dumps(
+                        metadata,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                fail(
+                    f"build metadata is not canonical JSON for "
+                    f"{kind}/{platform}: {error}"
+                )
+            if metadata_raw != canonical_metadata:
+                fail(f"build metadata is not canonical JSON for {kind}/{platform}")
             for field, expected in expected_metadata.items():
                 if metadata.get(field) != expected:
                     fail(

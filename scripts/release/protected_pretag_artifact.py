@@ -1198,6 +1198,8 @@ def extract_inner(
         metadata = json.loads(metadata_raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
         fail("pre-tag BUILD-METADATA is not valid JSON")
+    if not isinstance(metadata, dict) or metadata_raw != canonical_json(metadata):
+        fail("pre-tag BUILD-METADATA is not canonical JSON")
     metadata = exact_object(
         metadata,
         {

@@ -1513,10 +1513,8 @@ def validate_build_metadata(args: argparse.Namespace) -> tuple[dict[str, Any], s
         "files",
     }
     metadata = require_exact_object(metadata, fields, "pre-tag build metadata")
-    if payload != (
-        json.dumps(metadata, sort_keys=True, indent=2, ensure_ascii=True) + "\n"
-    ).encode("utf-8"):
-        fail("retained pre-tag BUILD-METADATA.json bytes are not the packaged canonical form")
+    if payload != canonical_bytes(metadata):
+        fail("retained pre-tag BUILD-METADATA.json bytes are not canonical JSON")
     expected = {
         "schema": "arc.pretag.artifact.v1",
         "kind": "headless",
