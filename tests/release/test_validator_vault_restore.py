@@ -1450,6 +1450,20 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         self.assertEqual([], list(remote_root.iterdir()))
 
         value = json.loads(original)
+        cached_window = [1_800_000_000, 1_800_000_001, 1_800_000_001, 1_800_000_002]
+        for phase in ("pretag_initial_provenance", "pretag_final_provenance"):
+            for row, response_unix in zip(
+                value[phase]["api"]["responses"], cached_window
+            ):
+                row["response_unix"] = response_unix
+            value[phase]["live"]["api_verified_at_unix"] = cached_window[0]
+        receipt_path.write_bytes(canonical(value))
+        receipt_path.chmod(0o600)
+        cached_dates = run(command, success=False)
+        self.assertIn("predates the initial proof", cached_dates.stderr)
+        self.assertEqual([], list(remote_root.iterdir()))
+
+        value = json.loads(original)
         for final, initial in zip(
             value["pretag_final_provenance"]["api"]["responses"],
             value["pretag_initial_provenance"]["api"]["responses"],
