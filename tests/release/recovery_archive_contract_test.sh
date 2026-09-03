@@ -2461,7 +2461,11 @@ printf "%s\t%s\n" "$supervisor_pid" "$!" > "$gate/test-startup.info"
 while :; do /bin/sleep 1; done
 ' arc-archive-startup-test "$ORCHESTRATOR" "$startup_gate" &
     startup_supervisor="$!"
-    for ((attempt = 0; attempt < 500; attempt += 1)); do
+    # Ceiling, not a deadline. 500*0.02s = 10s proved too tight on a loaded
+    # Linux CI runner and flaked this test once on PR #81 while the assertions
+    # themselves were correct. Nothing here weakens: the checks below still
+    # require readiness to have been published.
+    for ((attempt = 0; attempt < 1500; attempt += 1)); do
         [ -f "$startup_gate/phase.ready" ] && [ -f "$startup_gate/test-startup.info" ] && break
         /bin/sleep 0.02
     done
@@ -2495,7 +2499,11 @@ while :; do /bin/sleep 1; done
     esac
     builtin kill -s KILL -- "$startup_phase" "$startup_supervisor" 2>/dev/null || true
     wait "$startup_supervisor" 2>/dev/null || true
-    for ((attempt = 0; attempt < 500; attempt += 1)); do
+    # Ceiling, not a deadline. The pre-watchdog sentinel must notice its own
+    # PPID change after the double SIGKILL and sweep the gate; 10s is tight on
+    # a contended runner. The assertion immediately below is unchanged and
+    # still fails if the gate survives.
+    for ((attempt = 0; attempt < 1500; attempt += 1)); do
         { [ ! -e "$startup_gate" ] && [ ! -L "$startup_gate" ]; } && break
         /bin/sleep 0.02
     done
