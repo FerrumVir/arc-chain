@@ -518,8 +518,15 @@ def require_platform_node_resolution(job: Job, *, label: str) -> None:
     ).strip()
     if resolution not in textwrap.dedent(run):
         raise BoundaryError(f"{label} does not resolve the locked Node executable per OS")
-    if '[ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ]' not in run:
+    if 'tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"' not in run:
+        raise BoundaryError(f"{label} does not use the checkout's absolute POSIX Tauri path")
+    if (
+        '[ ! -f "$node_bin" ] || [ -L "$node_bin" ] || [ ! -x "$node_bin" ]'
+        not in run
+    ):
         raise BoundaryError(f"{label} does not reject a missing, linked, or non-executable Node path")
+    if '[ ! -f "$tauri_cli" ] || [ -L "$tauri_cli" ]' not in run:
+        raise BoundaryError(f"{label} does not reject a missing or linked Tauri CLI path")
 
 
 def require_platform_python_resolution(job: Job, *, label: str) -> None:
@@ -1051,8 +1058,12 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
         attacks = (
             ('node_bin="$(command -v node.exe)"', 'node_bin="$(command -v node)"'),
             (
-                '[ -f "$node_bin" ] && [ ! -L "$node_bin" ] && [ -x "$node_bin" ]',
-                '[ -x "$node_bin" ]',
+                '[ ! -f "$node_bin" ] || [ -L "$node_bin" ] || [ ! -x "$node_bin" ]',
+                '[ ! -x "$node_bin" ]',
+            ),
+            (
+                'tauri_cli="$PWD/desktop/node_modules/@tauri-apps/cli/tauri.js"',
+                'tauri_cli="$GITHUB_WORKSPACE/desktop/node_modules/@tauri-apps/cli/tauri.js"',
             ),
         )
         for old, new in attacks:
