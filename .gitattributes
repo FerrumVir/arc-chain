@@ -3,3 +3,5 @@
 # MIT text intentionally contains its published blank line at EOF.
 vendor/third_party/glib-0.18.5/** text eol=lf
 vendor/third_party/glib-0.18.5/LICENSE whitespace=-blank-at-eof
+vendor/shared-buffer/** text eol=lf
+vendor/wasmer-compiler/** text eol=lf

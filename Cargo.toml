@@ -123,12 +123,16 @@ parking_lot = "0.12"
 bytes = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# Wasmer 6.1.0 still depends on the abandoned `proc-macro-error2` crate even
-# though wasmer-derive only uses it for diagnostics. Keep the runtime and its
-# generated valid-code behavior pinned to 6.1.0, while replacing that helper
-# in a narrowly vendored derive crate. See vendor/wasmer-derive/README.md.
+# Keep the Wasmer runtime and its generated valid-code behavior pinned to
+# 6.1.0 while carrying three narrow dependency-only repairs. wasmer-derive
+# removes its abandoned diagnostics helper. shared-buffer and wasmer-compiler
+# retain their exact upstream source while moving both of Wasmer's memmap2
+# edges to the sound 0.9.11 line. Each vendor directory records exact archive,
+# source-tree, license, and local-delta provenance.
 [patch.crates-io]
 wasmer-derive = { path = "vendor/wasmer-derive" }
+shared-buffer = { path = "vendor/shared-buffer" }
+wasmer-compiler = { path = "vendor/wasmer-compiler" }
 
 [profile.release]
 opt-level = 3
