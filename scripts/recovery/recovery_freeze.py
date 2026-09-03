@@ -1110,10 +1110,18 @@ def _validate_prepare_barrier(
                 f"node {node_name} activation closure {unit} has an alias or following target"
             )
         state = states[unit]
+        # MainPID is a service-only property.  Older prepared contracts can
+        # contain systemd's empty rendering for an inert timer, while the
+        # canonical unit-state row represents the same quiescent value as 0.
+        # Normalize only this exact timer field; an empty service MainPID still
+        # fails closed below.
+        closure_main_pid = row["MainPID"]
+        if unit == "arc-node-update.timer" and closure_main_pid == "":
+            closure_main_pid = "0"
         if (
             row["ActiveState"] != state["active_state"]
             or row["SubState"] != state["sub_state"]
-            or row["MainPID"] != str(state["main_pid"])
+            or closure_main_pid != str(state["main_pid"])
             or (row["Job"] or "0") != state["job"]
         ):
             raise FreezeValidationError(
