@@ -80,19 +80,23 @@ ARC_OPERATOR_GH_TOKEN=""
 ARC_OPERATOR_GH_HOME=""
 
 cleanup_temporary_root() {
+    # Only ever installed as the invocation EXIT trap. Every rm was previously
+    # unchecked, so a partial sweep -- the pinned SSH identity or the rclone
+    # config surviving on a read-only mount, a busy file, a chmod'd parent --
+    # was indistinguishable from a clean one. Report each surviving root by
+    # exact path so an operator can remove it before retrying.
+    local cleanup_status=0 root
     ARC_OPERATOR_GH_TOKEN=""
-    if [ -n "$ARCHIVE_FLEET_TEMP_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_TEMP_ROOT"
-    fi
-    if [ -n "$ARCHIVE_FLEET_PINNED_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_PINNED_ROOT"
-    fi
-    if [ -n "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
-    fi
-    if [ -n "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
-    fi
+    for root in "$ARCHIVE_FLEET_TEMP_ROOT" "$ARCHIVE_FLEET_PINNED_ROOT" \
+        "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT" "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"; do
+        [ -n "$root" ] || continue
+        rm -rf -- "$root" || cleanup_status=1
+        if [ -e "$root" ] || [ -L "$root" ]; then
+            printf 'archive fleet: FATAL credential sweep incomplete: %s\n' "$root" >&2
+            cleanup_status=1
+        fi
+    done
+    return "$cleanup_status"
 }
 
 begin_temporary_scope() {
@@ -12671,17 +12675,6 @@ archive_process_exists() {
     case "$state" in Z*) return 1 ;; *) return 0 ;; esac
 }
 
-archive_process_group_exists() {
-    local wanted="$1" process_pid process_pgid process_state snapshot
-    builtin kill -0 -- "-$wanted" 2>/dev/null || return 1
-    snapshot="$(LC_ALL=C /bin/ps -ax -o pid= -o pgid= -o stat= 2>/dev/null)" || return 0
-    while read -r process_pid process_pgid process_state; do
-        [ "$process_pgid" = "$wanted" ] || continue
-        case "$process_state" in ''|Z*) ;; *) return 0 ;; esac
-    done <<< "$snapshot"
-    return 1
-}
-
 archive_process_in_group() {
     local process_pid="$1" wanted_pgid="$2" observed_pgid
     archive_process_exists "$process_pid" || return 1
@@ -12865,7 +12858,7 @@ archive_dispatch_sentinel() {
     local supervisor_pid="$1" phase_pid="$2" gate="$3" phase_pgid="$4" stop_token="$5"
     local fifo="$gate/sentinel.fifo" request_token request_verb request_argument
     local sentinel_pid sentinel_pgid observed_parent attempt
-    local watchdog_pid="" watchdog_pgid="" watchdog_sequence="" last_watchdog_sequence=""
+    local watchdog_pid="" watchdog_pgid="" last_watchdog_sequence=""
     local supervisor_sequence="" last_supervisor_sequence=""
     local watchdog_started_at=0 watchdog_last_seen_at=0 supervisor_last_seen_at=0
     local guardian_requested=false guardian_finalizing=false guardian_finalized=false armed=false
@@ -12950,7 +12943,7 @@ archive_dispatch_sentinel() {
             watchdog_pid="$!"
             set +m
             watchdog_pgid="$watchdog_pid"
-            watchdog_sequence=""; last_watchdog_sequence=""
+            last_watchdog_sequence=""
             watchdog_started_at="$SECONDS"; watchdog_last_seen_at="$SECONDS"
         fi
 
@@ -13131,58 +13124,6 @@ archive_write_phase_override_snapshot() {
     /bin/mv -f "$partial" "$gate/phase-overrides.sh"
 }
 
-archive_guardian_acknowledge_state() {
-    local gate="$1" watchdog_pid="$2" state="$3"
-    local acknowledgement="$gate/guardian.$state.ack"
-    while :; do
-        if (umask 077; printf '%s\n' "$watchdog_pid" > "$acknowledgement.partial") && \
-            /bin/mv -f "$acknowledgement.partial" "$acknowledgement"; then
-            return 0
-        fi
-        # Losing the already-private gate is equivalent to completed cleanup;
-        # otherwise retain ownership and retry rather than silently abandoning
-        # credentials because of a transient filesystem error.
-        if [ ! -e "$gate" ] && [ ! -L "$gate" ]; then
-            return 0
-        fi
-        /bin/sleep 0.1
-    done
-}
-
-archive_request_guardian_state() {
-    local gate="$1" watchdog_pid="$2" state="$3"
-    local request="$gate/guardian.$state" acknowledgement="$gate/guardian.$state.ack"
-    local acknowledged_pid=""
-    case "$state" in phase-drained|sentinel-stopped|takeover|cleanup-now) ;; *) return 2 ;; esac
-    while :; do
-        if (umask 077; printf '%s\n' "$watchdog_pid" > "$request.partial") && \
-            /bin/mv -f "$request.partial" "$request"; then
-            break
-        fi
-        archive_process_exists "$watchdog_pid" || return 1
-        [ -e "$gate" ] || [ -L "$gate" ] || return 1
-        /bin/sleep 0.1
-    done
-    while archive_process_exists "$watchdog_pid"; do
-        if [ -f "$acknowledgement" ] && [ ! -L "$acknowledgement" ]; then
-            acknowledged_pid=""
-            IFS= read -r acknowledged_pid < "$acknowledgement" || acknowledged_pid=""
-            [ "$acknowledged_pid" = "$watchdog_pid" ] && return 0
-        fi
-        if [ ! -e "$gate" ] && [ ! -L "$gate" ]; then
-            return 0
-        fi
-        /bin/sleep 0.02
-    done
-    # A guardian may acknowledge and complete any requested transition before
-    # the parent samples its in-gate acknowledgement. Verified gate absence is
-    # stronger evidence: takeover and cleanup are already complete.
-    if [ ! -e "$gate" ] && [ ! -L "$gate" ]; then
-        return 0
-    fi
-    return 1
-}
-
 archive_remove_dispatch_gate_until_absent() {
     local gate="$1" attempts=0
     while ! archive_remove_dispatch_gate "$gate"; do
@@ -13196,17 +13137,6 @@ archive_remove_dispatch_gate_until_absent() {
     return 0
 }
 
-archive_stop_dispatch_guardian() {
-    local watchdog_pid="$1"
-    builtin kill -s USR1 -- "$watchdog_pid" 2>/dev/null || true
-    while archive_process_exists "$watchdog_pid"; do
-        wait "$watchdog_pid" 2>/dev/null || true
-    done
-    wait "$watchdog_pid" 2>/dev/null || true
-}
-
-ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-ARC_ARCHIVE_DISPATCH_PHASE_PID=""
 ARC_ARCHIVE_DISPATCH_GATE=""
 ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
 ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
@@ -13448,383 +13378,6 @@ archive_dispatch_parent_watchdog() {
     return 0
 }
 
-dispatch_archive_command_legacy_unused() {
-    local command_name="$1"
-    shift
-    case "$command_name" in
-        prepare_writers|audit_writers|seal_freeze_plan|capture_phase|\
-        verify_offline_stop_phase|verify_installed_keys_phase|seal_phase|verify_complete_phase) ;;
-        *) printf 'archive fleet: internal dispatcher rejected command: %s\n' "$command_name" >&2; return 2 ;;
-    esac
-    if [ -n "${ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES:-}" ] && \
-        [ "${BASH_SOURCE[0]}" = "$0" ]; then
-        printf 'archive fleet: FATAL phase test overrides are forbidden in the executable operator CLI\n' >&2
-        return 125
-    fi
-
-    local supervisor_pid gate="" gate_parent="${TMPDIR:-/tmp}"
-    local requested_work_root="" resolved_work_root=""
-    local phase_pid="" phase_pgid="" sentinel_pid="" sentinel_pgid="" stop_token=""
-    local watchdog_pid="" ready_pid="" ready_pgid="" ready_sentinel_pid=""
-    local ready_sentinel_pgid="" ready_stop_token=""
-    local phase_status=125 setup_status=0 attempt
-    local phase_group_drained=true
-    local guardian_ready=false guardian_handed_off=false guardian_phase_drained=false
-    local gate_removed=false sentinel_adopted=false sentinel_membership_valid=false
-    local ready_fields_valid=true
-    local monitor_enabled=false saved_hup saved_int saved_term
-    saved_hup="$(trap -p HUP)"
-    saved_int="$(trap -p INT)"
-    saved_term="$(trap -p TERM)"
-    case $- in *m*) monitor_enabled=true ;; esac
-    ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-    ARC_ARCHIVE_DISPATCH_PHASE_PID=""
-    ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
-    ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-    ARC_ARCHIVE_DISPATCH_SIGNAL=""
-    ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS=0
-    ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false
-    trap 'archive_dispatch_forward_signal HUP 129' HUP
-    trap 'archive_dispatch_forward_signal INT 130' INT
-    trap 'archive_dispatch_forward_signal TERM 143' TERM
-
-    if [ "$command_name" = seal_phase ]; then
-        local argument_index argument_value
-        argument_index=1
-        while [ "$argument_index" -le "$#" ]; do
-            argument_value="${!argument_index}"
-            if [ "$argument_value" = --work-root ] && [ "$argument_index" -lt "$#" ]; then
-                argument_index=$((argument_index + 1))
-                requested_work_root="${!argument_index}"
-            fi
-            argument_index=$((argument_index + 1))
-        done
-        case "$requested_work_root" in
-            /*)
-                if [ -d "$requested_work_root" ] && [ ! -L "$requested_work_root" ] && \
-                    [ -O "$requested_work_root" ] && \
-                    resolved_work_root="$(CDPATH='' cd -- "$requested_work_root" 2>/dev/null && pwd -P)" && \
-                    [ "$resolved_work_root" = "$requested_work_root" ]; then
-                    gate_parent="$requested_work_root"
-                fi
-                ;;
-        esac
-    fi
-    if gate="$(mktemp -d "$gate_parent/arc-archive-dispatch.XXXXXX")"; then
-        chmod 700 "$gate" || setup_status=125
-        mkdir -m 700 "$gate/runtime" || setup_status=125
-        archive_write_current_process_id "$gate/supervisor.pid" || setup_status=125
-        archive_write_phase_override_snapshot "$gate" || setup_status=125
-        if [ "$setup_status" -eq 0 ]; then
-            IFS= read -r supervisor_pid < "$gate/supervisor.pid" || setup_status=125
-            case "$supervisor_pid" in ''|*[!0-9]*) setup_status=125 ;; esac
-        fi
-    else
-        setup_status=125
-    fi
-    if [ "$setup_status" -eq 0 ] && [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
-        set -m
-        # A fresh interpreter is required: Bash propagates ignored-errexit
-        # context from a caller's if/!/&&/|| into functions and ordinary
-        # subshells. The new Bash sources the exact orchestrator; a narrow,
-        # private override file exists only for sourced contract tests.
-        BASH_ENV=/dev/null ENV=/dev/null /bin/bash --noprofile --norc -Eeuo pipefail -c '
-for imported_function in $(builtin compgen -A function); do
-    builtin unset -f "$imported_function"
-done
-unset imported_function
-phase_orchestrator=$1
-phase_overrides=$2
-shift 2
-phase_arguments=("$@")
-set --
-. "$phase_orchestrator" >/dev/null
-. "$phase_overrides"
-archive_dispatch_phase "${phase_arguments[@]}"
-' arc-archive-dispatch-phase "$ORCHESTRATOR" "$gate/phase-overrides.sh" \
-            "$supervisor_pid" "$gate" "$command_name" "$@" &
-        phase_pid="$!"
-        # Before the sentinel/PGID proof is ready, signals target only Bash's
-        # current phase job. Never interpret an unvalidated child PID as a PGID.
-        ARC_ARCHIVE_DISPATCH_PHASE_PID="$phase_pid"
-        ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=true
-        for ((attempt = 0; attempt < 250; attempt += 1)); do
-            [ -f "$gate/phase.ready" ] && break
-            archive_process_exists "$phase_pid" || break
-            /bin/sleep 0.02
-        done
-        if [ ! -f "$gate/phase.ready" ]; then
-            for ((attempt = 0; attempt < 250; attempt += 1)); do
-                [ -f "$gate/sentinel.ready" ] && break
-                /bin/sleep 0.02
-            done
-        fi
-        if [ -f "$gate/phase.ready" ] && [ ! -L "$gate/phase.ready" ]; then
-            IFS=$'\t' read -r ready_pid ready_pgid ready_sentinel_pid ready_sentinel_pgid \
-                ready_stop_token \
-                < "$gate/phase.ready" || setup_status=125
-            case "$ready_pid:$ready_pgid:$ready_sentinel_pid:$ready_sentinel_pgid" in
-                *[!0-9:]*) ready_fields_valid=false ;;
-            esac
-            if [ "$ready_fields_valid" = false ] || \
-                [ "$ready_pid" != "$phase_pid" ] || [ "$ready_pgid" != "$phase_pid" ] || \
-                [ "$ready_sentinel_pid" = "$ready_pid" ] || \
-                [ "$ready_sentinel_pgid" != "$ready_pgid" ] || \
-                [ -z "$ready_stop_token" ]; then
-                setup_status=125
-            else
-                phase_pgid="$ready_pgid"
-                sentinel_pid="$ready_sentinel_pid"
-                sentinel_pgid="$ready_sentinel_pgid"
-                stop_token="$ready_stop_token"
-                sentinel_adopted=true
-            fi
-        else
-            setup_status=125
-        fi
-        if [ "$sentinel_adopted" = false ] && [ -f "$gate/sentinel.ready" ] && \
-            [ ! -L "$gate/sentinel.ready" ]; then
-            ready_sentinel_pid=""; ready_sentinel_pgid=""; ready_stop_token=""
-            IFS=$'\t' read -r ready_sentinel_pid ready_sentinel_pgid ready_stop_token \
-                < "$gate/sentinel.ready" || true
-            case "$ready_sentinel_pid:$ready_sentinel_pgid" in
-                *[!0-9:]*) ;;
-                *)
-                    if [ "$ready_sentinel_pgid" = "$phase_pid" ] && \
-                        [ -n "$ready_stop_token" ]; then
-                        phase_pgid="$ready_sentinel_pgid"
-                        sentinel_pid="$ready_sentinel_pid"
-                        sentinel_pgid="$ready_sentinel_pgid"
-                        stop_token="$ready_stop_token"
-                        sentinel_adopted=true
-                    fi
-                    ;;
-            esac
-        fi
-        if [ "$sentinel_adopted" = true ]; then
-            for ((attempt = 0; attempt < 250; attempt += 1)); do
-                if archive_process_in_group "$sentinel_pid" "$phase_pgid"; then
-                    sentinel_membership_valid=true
-                    break
-                fi
-                archive_process_exists "$sentinel_pid" || break
-                /bin/sleep 0.02
-            done
-            if [ "$sentinel_membership_valid" = true ]; then
-                ARC_ARCHIVE_DISPATCH_PHASE_PGID="$phase_pgid"
-                ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=true
-                ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-            else
-                setup_status=125
-            fi
-        else
-            setup_status=125
-        fi
-    fi
-    if [ "$setup_status" -eq 0 ] && [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
-        archive_dispatch_parent_watchdog "$supervisor_pid" "$phase_pid" "$phase_pgid" \
-            "$sentinel_pid" "$stop_token" "$gate" &
-        watchdog_pid="$!"
-        ready_pid=""; ready_pgid=""
-        for ((attempt = 0; attempt < 250; attempt += 1)); do
-            [ -f "$gate/watchdog.ready" ] && break
-            archive_process_exists "$watchdog_pid" || break
-            [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ] || break
-            /bin/sleep 0.02
-        done
-        if [ -f "$gate/watchdog.ready" ]; then
-            IFS=$'\t' read -r ready_pid ready_pgid < "$gate/watchdog.ready" || setup_status=125
-            if [ "$ready_pid" != "$watchdog_pid" ] || [ "$ready_pgid" != "$watchdog_pid" ] || \
-                [ "$ready_pgid" = "$phase_pgid" ]; then
-                setup_status=125
-            else
-                guardian_ready=true
-            fi
-        else
-            setup_status=125
-        fi
-    fi
-    if [ "$monitor_enabled" = false ]; then
-        set +m
-    fi
-
-    if [ "$setup_status" -eq 0 ] && [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
-        if ! (umask 077; printf 'go\n' > "$gate/go.partial") || \
-            ! /bin/mv -f "$gate/go.partial" "$gate/go"; then
-            setup_status=125
-            builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
-        fi
-    elif [ -n "$phase_pid" ]; then
-        if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
-            archive_dispatch_forward_signal "$ARC_ARCHIVE_DISPATCH_SIGNAL" \
-                "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
-        elif [ -n "$phase_pgid" ]; then
-            builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
-        else
-            builtin kill -s TERM -- "$phase_pid" 2>/dev/null || true
-        fi
-    fi
-
-    if [ -n "$phase_pid" ]; then
-        if wait "$phase_pid"; then phase_status=0; else phase_status=$?; fi
-        while archive_process_exists "$phase_pid" && \
-            [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; do
-            if wait "$phase_pid"; then phase_status=0; else phase_status=$?; fi
-        done
-        if archive_process_exists "$phase_pid"; then
-            if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
-                archive_dispatch_forward_signal "$ARC_ARCHIVE_DISPATCH_SIGNAL" \
-                    "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
-            else
-                builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
-            fi
-            for ((attempt = 0; attempt < 250; attempt += 1)); do
-                archive_process_exists "$phase_pid" || break
-                /bin/sleep 0.02
-            done
-        fi
-        if archive_process_exists "$phase_pid"; then
-            archive_stop_and_kill_group_members_except "$phase_pgid" \
-                "$phase_pid" "$sentinel_pid" || true
-            for ((attempt = 0; attempt < 250; attempt += 1)); do
-                archive_process_exists "$phase_pid" || break
-                /bin/sleep 0.02
-            done
-        fi
-        if archive_process_exists "$phase_pid"; then
-            archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
-            setup_status=125
-        fi
-        # Bash caches a completed job's status. This final wait occurs only
-        # after the process is gone, proving it was reaped before return.
-        if wait "$phase_pid" 2>/dev/null; then phase_status=0; else phase_status=$?; fi
-        ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-    fi
-
-    # The phase leader has exited (normally, through its EXIT cleanup, or after
-    # the bounded fail-safe). Drain every mutable member while the sentinel
-    # deliberately keeps the PGID allocated and unambiguous.
-    if [ -n "$phase_pgid" ] && \
-        archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
-        phase_group_drained=false
-        builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
-        for ((attempt = 0; attempt < 250; attempt += 1)); do
-            archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid" || break
-            /bin/sleep 0.02
-        done
-        if archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
-            archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
-            for ((attempt = 0; attempt < 250; attempt += 1)); do
-                archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid" || break
-                /bin/sleep 0.02
-            done
-            if archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
-                setup_status=125
-            else
-                phase_group_drained=true
-            fi
-        else
-            phase_group_drained=true
-        fi
-    fi
-    if [ "$phase_group_drained" = true ]; then
-        # Only the sentinel remains. It anchors the PGID while both signal
-        # owners transition permanently away from group signaling.
-        if [ "$guardian_ready" = true ]; then
-            if archive_request_guardian_state "$gate" "$watchdog_pid" phase-drained; then
-                guardian_phase_drained=true
-            else
-                printf 'archive fleet: FATAL guardian did not acknowledge drained phase group: %s\n' \
-                    "$gate" >&2
-                setup_status=125
-                guardian_ready=false
-            fi
-        fi
-        # The guardian has acknowledged no-more-group-signals while the
-        # sentinel still prevents reuse. Clear the parent target next, then ask
-        # the guardian (the single termination owner) to stop that exact anchor.
-        ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-        ARC_ARCHIVE_DISPATCH_PHASE_PID=""
-        ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
-        ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-        if [ "$guardian_phase_drained" = true ]; then
-            if ! archive_request_guardian_state "$gate" "$watchdog_pid" sentinel-stopped; then
-                printf 'archive fleet: FATAL guardian did not acknowledge sentinel stop: %s\n' \
-                    "$gate" >&2
-                setup_status=125
-                guardian_ready=false
-                archive_stop_dispatch_sentinel "$sentinel_pid" "$phase_pgid" \
-                    "$gate/sentinel.fifo" "$stop_token"
-            fi
-        elif [ -n "$sentinel_pid" ]; then
-            archive_stop_dispatch_sentinel "$sentinel_pid" "$phase_pgid" \
-                "$gate/sentinel.fifo" "$stop_token"
-        fi
-        if [ -z "$gate" ]; then
-            gate_removed=true
-        elif archive_remove_dispatch_gate "$gate"; then
-            gate_removed=true
-        else
-            printf 'archive fleet: FATAL could not remove private dispatch gate: %s\n' "$gate" >&2
-            setup_status=125
-        fi
-        if [ "$gate_removed" = false ] && [ "$guardian_phase_drained" = true ]; then
-            if archive_request_guardian_state "$gate" "$watchdog_pid" cleanup-now; then
-                guardian_handed_off=true
-            else
-                guardian_ready=false
-            fi
-        fi
-        if [ "$gate_removed" = false ] && [ "$guardian_handed_off" = false ]; then
-            # No acknowledged guardian remains. Safety takes precedence over
-            # bounded return on this internal failure path.
-            archive_remove_dispatch_gate_until_absent "$gate"
-            gate_removed=true
-        fi
-    else
-        setup_status=125
-        if [ "$guardian_ready" = true ] && \
-            archive_request_guardian_state "$gate" "$watchdog_pid" takeover; then
-            guardian_handed_off=true
-            ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-            ARC_ARCHIVE_DISPATCH_PHASE_PID=""
-            ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
-            ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-            printf 'archive fleet: FATAL phase group remains; guardian takeover acknowledged for private gate: %s\n' \
-                "$gate" >&2
-        else
-            printf 'archive fleet: FATAL phase group remains without guardian acknowledgement; waiting for containment: %s\n' \
-                "$gate" >&2
-            while archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; do
-                archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
-                /bin/sleep 0.1
-            done
-            ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-            ARC_ARCHIVE_DISPATCH_PHASE_PID=""
-            ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
-            ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-            archive_stop_dispatch_sentinel "$sentinel_pid" "$phase_pgid" \
-                "$gate/sentinel.fifo" "$stop_token"
-            archive_remove_dispatch_gate_until_absent "$gate"
-            gate_removed=true
-        fi
-    fi
-    if [ "$gate_removed" = true ] && [ "$guardian_handed_off" = false ] && \
-        [ -n "$watchdog_pid" ]; then
-        archive_stop_dispatch_guardian "$watchdog_pid"
-    fi
-    archive_restore_signal_trap "$saved_hup" HUP
-    archive_restore_signal_trap "$saved_int" INT
-    archive_restore_signal_trap "$saved_term" TERM
-    if [ "$monitor_enabled" = true ]; then set -m; else set +m; fi
-
-    if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
-        return "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
-    fi
-    [ "$setup_status" -eq 0 ] || return "$setup_status"
-    return "$phase_status"
-}
-
 dispatch_archive_command() {
     local command_name="$1"
     shift
@@ -13857,8 +13410,6 @@ dispatch_archive_command() {
     saved_int="$(trap -p INT)"
     saved_term="$(trap -p TERM)"
     case $- in *m*) monitor_enabled=true ;; esac
-    ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-    ARC_ARCHIVE_DISPATCH_PHASE_PID=""
     ARC_ARCHIVE_DISPATCH_GATE=""
     ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
     ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
@@ -13926,7 +13477,6 @@ archive_dispatch_phase "${phase_arguments[@]}"
 ' arc-archive-dispatch-phase "$ORCHESTRATOR" "$gate/phase-overrides.sh" \
             "$supervisor_pid" "$gate" "$command_name" "$@" &
         phase_pid="$!"
-        ARC_ARCHIVE_DISPATCH_PHASE_PID="$phase_pid"
         ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=true
         for ((attempt = 0; attempt < 250; attempt += 1)); do
             [ -f "$gate/phase.ready" ] && break
@@ -14075,7 +13625,6 @@ archive_dispatch_phase "${phase_arguments[@]}"
         fi
         [ "$sentinel_armed" = true ] || setup_status=125
         if [ "$sentinel_armed" = true ]; then
-            ARC_ARCHIVE_DISPATCH_PHASE_PGID="$phase_pgid"
             ARC_ARCHIVE_DISPATCH_GATE="$gate"
             ARC_ARCHIVE_DISPATCH_STOP_TOKEN="$stop_token"
             ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=true
@@ -14208,8 +13757,6 @@ archive_dispatch_phase "${phase_arguments[@]}"
         fi
         ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
         ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-        ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-        ARC_ARCHIVE_DISPATCH_PHASE_PID=""
         ARC_ARCHIVE_DISPATCH_GATE=""
         ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
         for ((attempt = 0; attempt < 1000; attempt += 1)); do
@@ -14241,8 +13788,6 @@ archive_dispatch_phase "${phase_arguments[@]}"
     fi
     ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
     ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
-    ARC_ARCHIVE_DISPATCH_PHASE_PGID=""
-    ARC_ARCHIVE_DISPATCH_PHASE_PID=""
     ARC_ARCHIVE_DISPATCH_GATE=""
     ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
     archive_restore_signal_trap "$saved_hup" HUP

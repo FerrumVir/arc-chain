@@ -2398,7 +2398,7 @@ PY
 archive_dispatcher_preserves_errexit_and_accepts_completed_takeover() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
-    local fixture runtime gate watcher_pid startup_gate startup_supervisor startup_phase
+    local fixture runtime startup_gate startup_supervisor startup_phase
     local startup_sentinel startup_sentinel_pgid startup_token attempt
     fixture="$(mktemp -d "$REPO_ROOT/.archive-dispatch-errexit-test.XXXXXX")"
     trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
@@ -2427,23 +2427,11 @@ archive_dispatcher_preserves_errexit_and_accepts_completed_takeover() (
     }
     [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || return 1
 
-    # Reproduce the acknowledgement sampling race: the guardian completes the
-    # requested takeover and removes its gate before the requester reads an
-    # in-gate ack. Verified absence must count as stronger completed success.
-    gate="$(mktemp -d "$runtime/arc-archive-dispatch.XXXXXX")"
-    chmod 700 "$gate"
-    (
-        while [ ! -f "$gate/guardian.takeover" ]; do /bin/sleep 0.01; done
-        rm -rf -- "$gate"
-    ) &
-    watcher_pid="$!"
-    archive_request_guardian_state "$gate" "$watcher_pid" takeover || {
-        wait "$watcher_pid" 2>/dev/null || true
-        printf 'completed guardian takeover was misclassified as unacknowledged\n' >&2
-        return 1
-    }
-    wait "$watcher_pid" || return 1
-    [ ! -e "$gate" ] && [ ! -L "$gate" ]
+    # The guardian takeover/acknowledge handshake this block exercised belonged
+    # to dispatch_archive_command_legacy_unused, which was unreachable and has
+    # been removed. The live design has no in-gate ack protocol: the sentinel
+    # sweeps on the guardian completion receipt alone. Covered now by the
+    # static contract ordering assertions and by the signal matrix below.
 
     # Kill both a phase that has published readiness and its supervisor before
     # any watchdog exists. The self-publishing sentinel must notice its own
@@ -2454,9 +2442,13 @@ archive_dispatcher_preserves_errexit_and_accepts_completed_takeover() (
     mkdir -m 700 "$startup_gate/runtime"
     /bin/bash -c '
 set -Eeuo pipefail
-set --
-. "$1" >/dev/null
+# Read the positionals BEFORE clearing them: the previous order ran "set --"
+# first, so "$1"/"$2" were already gone and this whole block died on the
+# empty source argument instead of exercising supervisor death.
+orchestrator=$1
 gate=$2
+set --
+. "$orchestrator" >/dev/null
 archive_write_current_process_id "$gate/test-supervisor.pid"
 IFS= read -r supervisor_pid < "$gate/test-supervisor.pid"
 set -m
@@ -2474,9 +2466,12 @@ while :; do /bin/sleep 1; done
     [ "$recorded_supervisor" = "$startup_supervisor" ] || return 1
     IFS=$'\t' read -r startup_sentinel startup_sentinel_pgid startup_token \
         < "$startup_gate/sentinel.ready"
-    case "$startup_sentinel:$startup_sentinel_pgid:$startup_token" in
-        *[!0-9:ARC-HIVE_STOP-]*) return 1 ;;
-    esac
+    # The previous check was "*[!0-9:ARC-HIVE_STOP-]*", where C-H is a bracket
+    # RANGE (C,D,E,F,G,H), so tokens like POTATO:12:34 passed. Assert the real
+    # shape: two numeric ids plus the ARC-ARCHIVE-STOP: prefixed token.
+    case "$startup_sentinel" in ""|*[!0-9]*) return 1 ;; esac
+    case "$startup_sentinel_pgid" in ""|*[!0-9]*) return 1 ;; esac
+    case "$startup_token" in ARC-ARCHIVE-STOP:*) ;; *) return 1 ;; esac
     builtin kill -s KILL -- "$startup_phase" "$startup_supervisor" 2>/dev/null || true
     wait "$startup_supervisor" 2>/dev/null || true
     for ((attempt = 0; attempt < 500; attempt += 1)); do
@@ -2487,7 +2482,10 @@ while :; do /bin/sleep 1; done
         printf 'pre-watchdog sentinel did not self-clean after phase/supervisor loss\n' >&2
         return 1
     }
-    archive_process_exists "$startup_sentinel" && return 1
+    # As the last command of this () subshell, "cmd && return 1" fails BOTH
+    # ways: present -> return 1; absent -> the compound takes the helper's own
+    # non-zero status. Negate so absence is the success case.
+    ! archive_process_exists "$startup_sentinel" || return 1
 )
 
 archive_dispatcher_signals_stop_the_full_phase_group_and_clean() (
@@ -2570,7 +2568,16 @@ command = [
     "/bin/bash", "-c",
     'archive_source=$1; probe_source=$2; set --; '
     '. "$archive_source" >/dev/null; . "$probe_source"; '
-    'export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES=capture_phase; '
+    # The phase is a fresh interpreter that unsets every inherited function and
+    # re-sources only the names listed here. The sweep runs in the sentinel,
+    # inside the phase -- so a gate-removal double declared only in this
+    # supervisor shell never reached the code under test and the injection
+    # silently never fired. Name it too, but only when the probe defines it:
+    # the snapshot writer rejects a name with no function behind it.
+    'overrides=capture_phase; '
+    '[ "${ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE:-false}" = true ] && '
+    'overrides="capture_phase archive_remove_dispatch_gate"; '
+    'export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES="$overrides"; '
     'dispatch_archive_command capture_phase',
     "archive-dispatch-signal-test", str(orchestrator), str(probe),
 ]
@@ -2591,6 +2598,7 @@ cases.extend((
     ("KILL", signal.SIGKILL, 137, False, False, 0, False),
 ))
 
+fast_teardowns = []
 for (name, sent_signal, expected_status, child_ignores, child_resurrects,
      cleanup_delay, gate_remove_fails) in cases:
     case = fixture / name.lower()
@@ -2632,7 +2640,17 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
             sentinel_pid, sentinel_pgid, sentinel_token = read_sentinel_info(
                 gates[0] / "sentinel.ready"
             )
-            watchdog_pid, watchdog_pgid = read_info(gates[0] / "watchdog.ready")
+            # Production writes watchdog.ready as pid \t pgid \t stop_token
+            # (three fields). read_info demands exactly two, so every case in
+            # this matrix died here on "malformed process proof" before a
+            # single signal was ever delivered.
+            watchdog_pid, watchdog_pgid, watchdog_token = read_sentinel_info(
+                gates[0] / "watchdog.ready"
+            )
+            if watchdog_token != sentinel_token:
+                raise AssertionError(
+                    f"{name} watchdog and sentinel disagree on the stop token"
+                )
             if not (phase_pid == phase_pgid == sentinel_pgid == background_pgid == foreground_pgid):
                 raise AssertionError(f"{name} phase descendants escaped the dedicated group")
             if sentinel_pid in {phase_pid, process.pid} or not sentinel_token.startswith(
@@ -2670,7 +2688,63 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
             # Signal only the dispatcher parent. Its trap/guardian must close
             # the entire phase group; the test never signals a child directly.
             os.kill(process.pid, sent_signal)
-            raw_status = process.wait(timeout=20)
+            # Budget per case profile, measured on bash 3.2 / macOS after the
+            # gate-sweep fix: baseline teardown is ~2.2s, a 10s injected
+            # cleanup delay lands at ~12.2s, and a TERM-ignoring foreground
+            # child forces the guardian's full escalation ladder (bounded TERM
+            # wait, STOP + exact-PID KILL, drain, gate-absence poll) at ~43.7s.
+            # A single flat 60s would pass all of these while hiding a
+            # regression in the 50 fast stress cases, so keep those tight.
+            # Ceiling only. A tight per-case timeout flakes: HUP_STRESS_00
+            # measures ~2.2s alone but exceeded 30s inside a full run, purely
+            # from the preceding suites' teardown contending for CPU. Teardown
+            # SPEED is asserted after the loop on the median of the fast cases,
+            # which one contended outlier cannot flake but which still catches
+            # a regression pushing ordinary signals into the ~43s escalation
+            # ladder.
+            wait_budget = 120 + cleanup_delay
+            signal_sent_at = time.monotonic()
+            try:
+                raw_status = process.wait(timeout=wait_budget)
+            except subprocess.TimeoutExpired as error:
+                # Name the case AND say where it is stuck. A bare
+                # TimeoutExpired traceback gives no clue which of the 57 cases
+                # hung, nor why, which is most of the debugging.
+                diagnosis = [f"{name} did not exit within {wait_budget}s of {sent_signal}"]
+                try:
+                    diagnosis.append(f"stderr={stderr_path.read_text(encoding='utf-8')[-1500:]!r}")
+                except OSError as exc:
+                    diagnosis.append(f"stderr unreadable: {exc}")
+                try:
+                    diagnosis.append(f"gate={sorted(entry.name for entry in gates[0].iterdir())}")
+                except OSError as exc:
+                    diagnosis.append(f"gate unreadable: {exc}")
+                diagnosis.append(
+                    f"group_rows={[row for row in process_rows() if row[1] == phase_pgid]}"
+                )
+                diagnosis.append(
+                    "arc_env=" + repr(sorted(
+                        key for key in environment if key.startswith("ARC_")
+                    ))
+                )
+                # If the shell that launched this python had HUP ignored, the
+                # disposition is inherited and a non-interactive child bash
+                # CANNOT trap it (POSIX): the signal is silently discarded and
+                # the dispatcher waits forever. That is exactly this symptom.
+                diagnosis.append(
+                    "inherited_dispositions=" + repr({
+                        name: str(signal.getsignal(getattr(signal, name)))
+                        for name in ("SIGHUP", "SIGINT", "SIGTERM")
+                    })
+                )
+                try:
+                    cwd = os.getcwd()
+                    diagnosis.append(f"cwd={cwd!r} exists={os.path.isdir(cwd)}")
+                except OSError as exc:
+                    diagnosis.append(f"cwd UNAVAILABLE: {exc}")
+                raise AssertionError(" | ".join(diagnosis)) from error
+            if not child_ignores and not cleanup_delay:
+                fast_teardowns.append(time.monotonic() - signal_sent_at)
             status = 128 - raw_status if raw_status < 0 else raw_status
             if status != expected_status:
                 raise AssertionError(f"{name} dispatcher status {status}, expected {expected_status}")
@@ -2683,7 +2757,11 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
             if gate_remove_fails:
                 if not (case / "gate-remove-failed-once").is_dir():
                     raise AssertionError(f"{name} did not inject the final-sweep failure")
-                if "FATAL could not remove private dispatch gate" not in \
+                # The live retry path emits this exact line from
+                # archive_remove_dispatch_gate_until_absent. The previously
+                # asserted "FATAL could not remove private dispatch gate"
+                # appears nowhere in the tree.
+                if "FATAL guardian retaining and retrying private dispatch gate" not in \
                         stderr_path.read_text(encoding="utf-8"):
                     raise AssertionError(f"{name} cleanup handoff failure was not loud")
             if (not child_ignores and not child_resurrects and not cleanup_delay
@@ -2703,15 +2781,25 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
                 if not (case / "cleanup.started").is_file():
                     raise AssertionError(f"{name} did not enter its deliberately slow EXIT cleanup")
             elif child_ignores:
-                # Bash 3.2 may consume INT while waiting for an INT-ignoring
-                # foreground child; the bounded fallback can therefore KILL
-                # the phase before its EXIT marker. The supervisor contract is
-                # the exact caller status plus authoritative gate cleanup.
+                # A signal-ignoring foreground child forces the guardian's
+                # escalation ladder, so the phase's EXIT cleanup is driven by
+                # whichever signal actually reaches it. Bash 3.2 additionally
+                # consumes INT while waiting on such a child, so the phase's own
+                # INT trap never runs. Measured on bash 3.2 / macOS: HUP -> 129
+                # (own trap wins), INT -> 143 (guardian TERM), TERM -> 143; a
+                # further escalation to KILL leaves no marker at all (137).
+                # The contracts that matter are asserted separately and
+                # unconditionally above: the exact caller-visible status, an
+                # emptied gate, and no surviving credential root.
                 if cleanup.is_file() and cleanup.read_text(encoding="utf-8") not in {
                         f"cleanup-complete exit={expected_status}\n",
+                        "cleanup-complete exit=143\n",
                         "cleanup-complete exit=137\n",
                 }:
-                    raise AssertionError(f"{name} cleanup status differs")
+                    raise AssertionError(
+                        f"{name} cleanup status differs: "
+                        f"{cleanup.read_text(encoding='utf-8')!r}"
+                    )
             else:
                 wait_until(cleanup.is_file, 15, f"{name} phase cleanup")
                 expected_cleanup_status = 143 if name == "KILL" else expected_status
@@ -2737,6 +2825,18 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
         if phase_pgid is not None and live_group(phase_pgid):
             try: os.killpg(phase_pgid, signal.SIGKILL)
             except ProcessLookupError: pass
+
+if fast_teardowns:
+    ordered = sorted(fast_teardowns)
+    median_teardown = ordered[len(ordered) // 2]
+    # Measured ~2.2s on bash 3.2 / macOS. The guardian escalation ladder
+    # measures ~43s, so a median above 15s means ordinary signal teardown
+    # started escalating -- the regression a per-case timeout used to catch.
+    if median_teardown > 15:
+        raise AssertionError(
+            f"median fast-path teardown regressed to {median_teardown:.1f}s "
+            f"across {len(ordered)} cases (expected ~2s)"
+        )
 PY
 )
 

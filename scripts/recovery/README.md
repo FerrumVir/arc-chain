@@ -1215,16 +1215,18 @@ removes and verifies absence of the whole gate before returning 129, 130, or
 143 respectively. The phase gets a bounded opportunity to finish its EXIT
 cleanup; the supervisor-owned final gate sweep is authoritative and also
 removes bytes a signal-ignoring descendant tries to recreate after that
-cleanup starts. Before the sweep, the separately grouped guardian must
-acknowledge `phase-drained` state, so it can no longer signal a reusable old
-phase PGID if the parent disappears. If a process group remains after bounded
-TERM/KILL attempts, the guardian must instead acknowledge explicit takeover;
-it retains the gate, retries KILL until that group is absent, and only then
-removes and verifies the gate. A transient final-sweep failure similarly emits
-a loud `FATAL` message with the exact path and hands an unbounded, verified
-retry to the guardian. An unsignaled internal cleanup failure returns 125; a
-run that already received HUP, INT, or TERM preserves its required 129, 130, or
-143 status while reporting that acknowledged containment is continuing.
+cleanup starts. Before the sweep, the separately grouped guardian drains the
+phase group. The guardian leads its own process group, which is what makes its
+membership queries trustworthy; it retries bounded TERM and then exact-PID KILL
+of every member except the sentinel until that group is verifiably empty, and
+only then publishes its completion receipt. The sentinel exists to anchor the
+phase PGID so it can never be reused while members are being killed by exact
+PID, and it sweeps the gate on that receipt alone, verifying absence. The
+sentinel must never query phase-group membership itself: it runs inside that
+group, so its own `ps` child is counted as a member and the sweep would never
+fire. An unsignaled internal cleanup failure returns 125; a run that already
+received HUP, INT, or TERM preserves its required 129, 130, or 143 status while
+reporting that containment is continuing.
 The same guardian takes over if the dispatcher is lost to `SIGKILL`; it first
 gives the cleanup-owning phase leader a TERM path, then kills a TERM-ignoring
 foreground descendant so the deferred cleanup or final gate sweep can finish.

@@ -57,3 +57,14 @@ __pycache__/
 
 # Claude Code local config (per-machine, not for git)
 .claude/
+
+# Release contract-test fixtures (credential-shaped: ssh identities, rclone.conf).
+# Fixtures now allocate under TMPDIR; these patterns stay as a guard so a stray
+# run can never leave key-shaped files where `git add -A` would sweep them in.
+.archive-*-test.*/
+.archive-dispatch-*/
+.verify-complete-plan-test.*/
+.late-height-test.*/
+.freeze-plan-reuse-test.*/
+.offline-stop-test.*/
+.arc-production-builder-test-*/

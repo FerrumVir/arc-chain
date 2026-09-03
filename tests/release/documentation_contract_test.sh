@@ -1703,9 +1703,10 @@ recovery_plan_read_only_scope_is_truthful() {
         'returning 129, 130, or' \
         'signal-ignoring descendant tries to recreate' \
         'bounded opportunity to finish its EXIT' \
-        'acknowledge `phase-drained` state' \
-        'acknowledge explicit takeover' \
-        'hands an unbounded, verified' \
+        'guardian leads its own process group' \
+        'sweeps the gate on that receipt alone' \
+        'sentinel must never query phase-group membership itself' \
+        'own `ps` child is counted as a member' \
         'An unsignaled internal cleanup failure returns 125' \
         'preserves its required 129, 130, or' \
         'guardian takes over if the dispatcher is lost to `SIGKILL`' \

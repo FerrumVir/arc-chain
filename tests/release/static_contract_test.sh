@@ -2441,8 +2441,19 @@ roots = (
     "ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT", "ARCHIVE_FLEET_PINNED_PYTHON_ROOT",
 )
 for root in roots:
-    if f'rm -rf -- "${root}"' not in cleanup:
+    if f'"${root}"' not in cleanup:
         raise SystemExit(f"cleanup omits {root}")
+# The sweep is a loop over exactly those four roots. Assert it does not merely
+# call rm: it must verify absence afterwards and propagate a non-zero status,
+# because an unchecked rm reported a partial credential sweep as success.
+for required in (
+    'rm -rf -- "$root" || cleanup_status=1',
+    'if [ -e "$root" ] || [ -L "$root" ]; then',
+    'FATAL credential sweep incomplete',
+    'return "$cleanup_status"',
+):
+    if required not in cleanup:
+        raise SystemExit(f"cleanup no longer guarantees a verified sweep: {required}")
     if f'{root}=""' not in scope:
         raise SystemExit(f"new command scope can inherit {root}")
 if scope.count("trap cleanup_temporary_root EXIT") != 1:
@@ -2460,21 +2471,34 @@ for required in (
     "set +m",
     'ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false',
     'builtin kill -s "$ARC_ARCHIVE_DISPATCH_SIGNAL" --',
-    '( archive_dispatch_phase "$supervisor_pid" "$gate" "$command_name" "$@" ) &',
+    # The phase is a fresh profile-free Bash that drops every inherited
+    # function before sourcing the orchestrator. That unset loop is the
+    # defense against exported functions shadowing rm/mv/mktemp.
+    'for imported_function in $(builtin compgen -A function); do',
+    'arc-archive-dispatch-phase',
     'mkdir -m 700 "$gate/runtime"',
     'TMPDIR="$gate/runtime"',
     'export TMPDIR',
     'archive_remove_dispatch_gate "$gate"',
     'archive_remove_dispatch_gate_until_absent "$gate"',
-    'archive_dispatch_parent_watchdog "$supervisor_pid" "$phase_pid" "$phase_pgid" "$gate" &',
-    'archive_request_guardian_state "$gate" "$watchdog_pid" phase-drained',
-    'archive_request_guardian_state "$gate" "$watchdog_pid" takeover',
-    'archive_request_guardian_state "$gate" "$watchdog_pid" cleanup-now',
-    'archive_guardian_acknowledge_state "$gate" "$watchdog_pid" phase-drained',
-    '[ "$ready_pid" != "$phase_pid" ] || [ "$ready_pgid" != "$phase_pid" ]',
-    '[ "$ready_pid" != "$watchdog_pid" ] || [ "$ready_pgid" != "$watchdog_pid" ]',
+    # The sentinel anchors the phase PGID so it cannot be reused while members
+    # are being killed by exact PID.
+    '[ "$sentinel_pgid" = "$phase_pgid" ] || exit 125',
+    # The guardian must lead its OWN group. This is precisely what makes its
+    # archive_process_group_has_members_except calls sound while the sentinel's
+    # were not: the guardian's ps children land outside the counted group.
+    '[ "$watchdog_pid" = "$watchdog_pgid" ] || exit 125',
+    # The guardian heartbeat is identity-bound to the exact watchdog pid/pgid.
+    '[ "$ready_pid" = "$watchdog_pid" ] && [ "$ready_pgid" = "$watchdog_pgid" ]',
+    # The supervisor accepts watchdog.ready only from a process that leads its
+    # own process group AND whose group is not the phase group -- the property
+    # that makes the guardian's membership queries trustworthy.
+    '[ "$ready_pid" = "$ready_pgid" ] && [ "$ready_pgid" != "$phase_pgid" ]',
     'observed_parent="$(archive_process_field ppid "$watchdog_pid")"',
-    'archive_signal_group_members_except KILL "$phase_pgid" "$phase_pid"',
+    # Bash 3.2 + set -u: an unguarded empty-array expansion is fatal and no
+    # caller-side "|| true" suppresses it. Dying there leaves the whole group
+    # SIGSTOPped with its matching CONT never reached.
+    '${targets[@]+"${targets[@]}"}',
     'wait "$phase_pid"',
     'archive_restore_signal_trap "$saved_hup" HUP',
     'archive_restore_signal_trap "$saved_int" INT',
@@ -2497,26 +2521,49 @@ if 'mktemp -d "$work_root/arc-archive-seal.' in text:
     raise SystemExit("seal execution scratch escapes the supervisor-owned dispatch gate")
 if 'gate_parent="$requested_work_root"' not in dispatcher:
     raise SystemExit("seal dispatcher gate no longer uses its protected large work root")
+sentinel_body = text[
+    text.index("archive_dispatch_sentinel() {"):
+    text.index("archive_dispatch_parent_watchdog() {")
+]
+# REGRESSION GUARD (credential leak). The sentinel runs inside phase_pgid, so
+# any call it makes to archive_process_group_has_members_except forks a /bin/ps
+# child INTO the very group being counted; that child is not in the exclusion
+# list, so the answer is unconditionally "members exist". Gating the terminal
+# sweep on such a call made archive_remove_dispatch_gate_until_absent
+# unreachable and stranded the 0700 gate -- which IS the phase TMPDIR holding
+# id_ed25519, known_hosts and rclone.conf -- on every guardian-kill path.
+# Excluding the caller's own PID does NOT fix it: Bash forks twice for
+# "$(...)", so the exec'd ps is a grandchild of the sentinel.
+if "archive_process_group_has_members_except" in sentinel_body:
+    raise SystemExit(
+        "sentinel queries phase-group membership from inside phase_pgid; its own "
+        "ps child is counted and the terminal gate sweep becomes unreachable"
+    )
+finalized_gate = sentinel_body.index('if [ "$guardian_finalized" = true ]; then')
+sentinel_sweep = sentinel_body.index(
+    'archive_remove_dispatch_gate_until_absent "$gate"', finalized_gate
+)
+if not finalized_gate < sentinel_sweep:
+    raise SystemExit("sentinel sweep is not gated on the guardian completion receipt")
+
+# The receipt that sweep now trusts must itself be earned: the guardian only
+# publishes guardian.finalized after its anchor-validated drain loop empties
+# the group. Its identical membership calls ARE sound because it leads its own
+# PGID (asserted in the required-literal list above).
+guardian_body = text[text.index("archive_dispatch_parent_watchdog() {"):]
+guardian_drain = guardian_body.index(
+    'while archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; do'
+)
+guardian_receipt = guardian_body.index("guardian.finalized.partial", guardian_drain)
+if not guardian_drain < guardian_receipt:
+    raise SystemExit(
+        "guardian publishes its completion receipt before draining the phase group"
+    )
+
 dispatch_body = dispatcher[
     dispatcher.index("dispatch_archive_command() {"):
     dispatcher.index('COMMAND="${1:-}"')
 ]
-phase_drained_request = dispatch_body.rindex(
-    'archive_request_guardian_state "$gate" "$watchdog_pid" phase-drained'
-)
-final_clear = dispatch_body.index('ARC_ARCHIVE_DISPATCH_PHASE_PGID=""', phase_drained_request)
-final_sweep = dispatch_body.index('archive_remove_dispatch_gate "$gate"', phase_drained_request)
-if not phase_drained_request < final_clear < final_sweep:
-    raise SystemExit(
-        "dispatcher does not acknowledge cleanup-only guardian state and clear the reusable PGID before sweep"
-    )
-if 'if [ "$phase_group_drained" = true ]; then' not in dispatch_body:
-    raise SystemExit("dispatcher final sweep is not guarded by proven phase-group absence")
-if 'guardian_handed_off=true\n            ARC_ARCHIVE_DISPATCH_PHASE_PGID=""' not in dispatch_body:
-    raise SystemExit("residual phase group is not explicitly handed to its guardian before return")
-if 'guardian_phase_drained=true' not in dispatch_body or \
-        'archive_request_guardian_state "$gate" "$watchdog_pid" cleanup-now' not in dispatch_body:
-    raise SystemExit("failed final gate sweep is not handed to the acknowledged cleanup-only guardian")
 setup_return = dispatch_body.rindex('[ "$setup_status" -eq 0 ] || return "$setup_status"')
 signal_return = dispatch_body.rindex('return "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"')
 if signal_return > setup_return:
