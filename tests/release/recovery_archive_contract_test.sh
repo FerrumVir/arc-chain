@@ -2565,6 +2565,9 @@ archive_scripts_are_lintable() {
             "$REPO_ROOT/scripts/recovery/test_archive_node_quarantine_runtime.py" \
             >/dev/null &&
         PYTHONDONTWRITEBYTECODE=1 python3 \
+            "$REPO_ROOT/scripts/recovery/test_archive_node_prepare_runtime.py" \
+            >/dev/null &&
+        PYTHONDONTWRITEBYTECODE=1 python3 \
             "$REPO_ROOT/scripts/recovery/test_quarantine_rounds.py" >/dev/null &&
         PYTHONDONTWRITEBYTECODE=1 python3 \
             "$REPO_ROOT/scripts/recovery/test_community_reward_probe.py" >/dev/null &&
