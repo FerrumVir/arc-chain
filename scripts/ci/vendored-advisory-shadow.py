@@ -127,6 +127,13 @@ ADVISORY_KEYS = {
 VERSIONS_KEYS = {"patched", "unaffected"}
 BASIC_DIAGNOSTIC_KEYS = {"code", "graphs", "labels", "message", "severity"}
 ADVISORY_DIAGNOSTIC_KEYS = BASIC_DIAGNOSTIC_KEYS | {"advisory", "notes"}
+# cargo-deny also emits non-advisory diagnostics that carry `notes` but no
+# `advisory` -- notably code "index-failure" ("unable to check for yanked
+# crates") for crates that are vendored or patched and therefore absent from
+# the registry index. That is expected for vendor/wasmer-* and shared-buffer,
+# and cargo-deny itself reports it as a warning with zero errors. Rejecting the
+# shape turned an expected warning into a hard release-gate failure.
+NOTED_DIAGNOSTIC_KEYS = BASIC_DIAGNOSTIC_KEYS | {"notes"}
 
 
 def fail(message: str) -> None:
@@ -519,7 +526,11 @@ def load_diagnostics(path: pathlib.Path) -> tuple[list[dict[str, Any]], dict[str
         if not isinstance(fields, dict):
             fail("cargo-deny registry-shadow diagnostic fields drifted")
         if value["type"] == "diagnostic":
-            if set(fields) not in (BASIC_DIAGNOSTIC_KEYS, ADVISORY_DIAGNOSTIC_KEYS):
+            if set(fields) not in (
+                BASIC_DIAGNOSTIC_KEYS,
+                ADVISORY_DIAGNOSTIC_KEYS,
+                NOTED_DIAGNOSTIC_KEYS,
+            ):
                 fail("cargo-deny registry-shadow diagnostic payload shape drifted")
             if (
                 not isinstance(fields.get("code"), str)
@@ -529,6 +540,10 @@ def load_diagnostics(path: pathlib.Path) -> tuple[list[dict[str, Any]], dict[str
                 or not isinstance(fields.get("labels"), list)
             ):
                 fail("cargo-deny registry-shadow diagnostic payload type drifted")
+            if set(fields) == NOTED_DIAGNOSTIC_KEYS and not isinstance(
+                fields.get("notes"), list
+            ):
+                fail("cargo-deny registry-shadow diagnostic notes drifted")
             if set(fields) == ADVISORY_DIAGNOSTIC_KEYS and (
                 not isinstance(fields.get("advisory"), dict)
                 or not isinstance(fields.get("notes"), list)

@@ -2425,7 +2425,11 @@ archive_dispatcher_preserves_errexit_and_accepts_completed_takeover() (
         printf 'dispatcher disabled phase errexit and continued into mutation\n' >&2
         return 1
     }
-    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || return 1
+    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || {
+        printf 'errexit phase left runtime residue: %s\n' \
+            "$(find "$runtime" -mindepth 1 | head -5 | tr '\n' ' ')" >&2
+        return 1
+    }
 
     # The guardian takeover/acknowledge handshake this block exercised belonged
     # to dispatch_archive_command_legacy_unused, which was unreachable and has
@@ -2461,17 +2465,34 @@ while :; do /bin/sleep 1; done
         [ -f "$startup_gate/phase.ready" ] && [ -f "$startup_gate/test-startup.info" ] && break
         /bin/sleep 0.02
     done
-    [ -f "$startup_gate/phase.ready" ] && [ -f "$startup_gate/test-startup.info" ] || return 1
+    [ -f "$startup_gate/phase.ready" ] && [ -f "$startup_gate/test-startup.info" ] || {
+        printf 'startup phase never published readiness: gate=[%s]\n' \
+            "$(ls -A "$startup_gate" 2>/dev/null | tr '\n' ' ')" >&2
+        return 1
+    }
     IFS=$'\t' read -r recorded_supervisor startup_phase < "$startup_gate/test-startup.info"
-    [ "$recorded_supervisor" = "$startup_supervisor" ] || return 1
+    [ "$recorded_supervisor" = "$startup_supervisor" ] || {
+        printf 'recorded supervisor %s != spawned %s\n' \
+            "$recorded_supervisor" "$startup_supervisor" >&2
+        return 1
+    }
     IFS=$'\t' read -r startup_sentinel startup_sentinel_pgid startup_token \
         < "$startup_gate/sentinel.ready"
     # The previous check was "*[!0-9:ARC-HIVE_STOP-]*", where C-H is a bracket
     # RANGE (C,D,E,F,G,H), so tokens like POTATO:12:34 passed. Assert the real
     # shape: two numeric ids plus the ARC-ARCHIVE-STOP: prefixed token.
-    case "$startup_sentinel" in ""|*[!0-9]*) return 1 ;; esac
-    case "$startup_sentinel_pgid" in ""|*[!0-9]*) return 1 ;; esac
-    case "$startup_token" in ARC-ARCHIVE-STOP:*) ;; *) return 1 ;; esac
+    case "$startup_sentinel" in ""|*[!0-9]*)
+        printf 'sentinel.ready pid not numeric: [%s]\n' "$startup_sentinel" >&2
+        return 1 ;;
+    esac
+    case "$startup_sentinel_pgid" in ""|*[!0-9]*)
+        printf 'sentinel.ready pgid not numeric: [%s]\n' "$startup_sentinel_pgid" >&2
+        return 1 ;;
+    esac
+    case "$startup_token" in ARC-ARCHIVE-STOP:*) ;; *)
+        printf 'sentinel.ready token lacks prefix: [%s]\n' "$startup_token" >&2
+        return 1 ;;
+    esac
     builtin kill -s KILL -- "$startup_phase" "$startup_supervisor" 2>/dev/null || true
     wait "$startup_supervisor" 2>/dev/null || true
     for ((attempt = 0; attempt < 500; attempt += 1)); do
@@ -2485,7 +2506,11 @@ while :; do /bin/sleep 1; done
     # As the last command of this () subshell, "cmd && return 1" fails BOTH
     # ways: present -> return 1; absent -> the compound takes the helper's own
     # non-zero status. Negate so absence is the success case.
-    ! archive_process_exists "$startup_sentinel" || return 1
+    ! archive_process_exists "$startup_sentinel" || {
+        printf 'pre-watchdog sentinel %s survived phase+supervisor SIGKILL\n' \
+            "$startup_sentinel" >&2
+        return 1
+    }
 )
 
 archive_dispatcher_signals_stop_the_full_phase_group_and_clean() (
