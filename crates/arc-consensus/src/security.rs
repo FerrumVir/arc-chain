@@ -141,6 +141,14 @@ impl WithholdingDetector {
         self.expected.retain(|_, rounds| !rounds.is_empty());
         self.received.retain(|_, rounds| !rounds.is_empty());
     }
+
+    /// Total retained (validator, round) observations. Crate-test visibility
+    /// only, so the engine can assert that its retention bound really holds.
+    #[cfg(test)]
+    pub(crate) fn retained_observations(&self) -> usize {
+        self.expected.values().map(HashSet::len).sum::<usize>()
+            + self.received.values().map(HashSet::len).sum::<usize>()
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -686,6 +694,13 @@ impl StakeTracker {
     /// Prune vote records for rounds before `before_round`.
     pub fn prune_votes(&mut self, before_round: u64) {
         self.votes.retain(|&(_, r), _| r >= before_round);
+    }
+
+    /// Number of retained (validator, round) vote records. Crate-test
+    /// visibility only, so the engine can assert its retention bound.
+    #[cfg(test)]
+    pub(crate) fn retained_vote_rounds(&self) -> usize {
+        self.votes.len()
     }
 }
 
