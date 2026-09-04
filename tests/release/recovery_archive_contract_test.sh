@@ -2514,6 +2514,15 @@ while :; do /bin/sleep 1; done
     # As the last command of this () subshell, "cmd && return 1" fails BOTH
     # ways: present -> return 1; absent -> the compound takes the helper's own
     # non-zero status. Negate so absence is the success case.
+    # The sentinel removes the gate and THEN exits, so gate absence does not
+    # imply the process is already reaped. Asserting instantly made this test
+    # fail under full-harness load (observed: gate swept, sentinel still alive a
+    # moment later) while passing 5/5 standalone. Wait for the exit on a bounded
+    # ceiling; the assertion below is unchanged and still fails if it never goes.
+    for ((attempt = 0; attempt < 1500; attempt += 1)); do
+        archive_process_exists "$startup_sentinel" || break
+        /bin/sleep 0.02
+    done
     ! archive_process_exists "$startup_sentinel" || {
         printf 'pre-watchdog sentinel %s survived phase+supervisor SIGKILL\n' \
             "$startup_sentinel" >&2

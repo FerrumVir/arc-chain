@@ -1311,6 +1311,19 @@ release_secret_jobs_require_the_owner_environment() {
         capture { print }
         capture && /^  seal:/ { exit }
     ' "$RELEASE_PREFLIGHT_WORKFLOW")"
+
+    # An empty capture means we failed to READ the workflow, not that the job is
+    # missing a literal. Under resource pressure a command substitution can fork
+    # -fail and return empty, which then reports as "omits <literal>" and sends
+    # the reader hunting a non-existent workflow regression. Distinguish them.
+    for captured in unsigned_block handoff_block signer_block; do
+        eval "captured_value=\${$captured}"
+        [ -n "$captured_value" ] || {
+            printf 'could not capture %s from %s (empty awk result, not a missing literal)\n' \
+                "$captured" "$RELEASE_PREFLIGHT_WORKFLOW"
+            return 1
+        }
+    done
     assembly_block="$(awk '
         /^  assemble-release:/ { capture=1 }
         capture { print }
