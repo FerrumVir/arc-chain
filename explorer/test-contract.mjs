@@ -415,4 +415,219 @@ await test("legacy explorer entry redirects to the composite explorer", () => {
   assert.doesNotMatch(legacyHtml, /innerHTML|RPC_BENCH|bench-latest/);
 });
 
+// #/tx/<value> and #/address/<value> reach queryTransaction/queryAddress
+// straight from the URL fragment, bypassing the search form's classifyLookup.
+// An unvalidated value is interpolated into the RPC path, so dot segments walk
+// out of /tx/ and query an unrelated endpoint on an approved node.
+await test("fragment lookups refuse values that are not 32-byte hashes before any request", async () => {
+  const calls = [];
+  const fetchImpl = mockFetch({}, calls);
+  for (const value of ["../../maintenance/status", "not-a-hash", `${hex("2")}00`]) {
+    await assert.rejects(
+      app.queryTransaction({ resolver, fetchImpl, hash: value, sourceId: "canonical", checkpointAudit: verifiedAudit }),
+      /32-byte/,
+    );
+    await assert.rejects(
+      app.queryAddress({ resolver, fetchImpl, address: value, sourceId: "canonical", checkpointAudit: verifiedAudit }),
+      /32-byte/,
+    );
+  }
+  assert.equal(calls.length, 0);
+});
+
+// A minimal DOM so boot()'s render layer can be exercised. Every field the
+// explorer touches is present; nothing schedules real time or network work.
+function fakeElement(tag) {
+  return {
+    tagName: tag,
+    className: "",
+    textContent: "",
+    title: "",
+    value: "",
+    type: "",
+    colSpan: 0,
+    hidden: false,
+    children: [],
+    listeners: new Map(),
+    classList: { add() {}, remove() {} },
+    append(...kids) { this.children.push(...kids); },
+    replaceChildren(...kids) { this.children = kids; },
+    addEventListener(type, fn) { this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]); },
+    removeEventListener() {},
+  };
+}
+
+function installFakeDom(injectedConfig, fetchImpl) {
+  const byId = new Map();
+  let markBooted;
+  const booted = new Promise((resolve) => { markBooted = resolve; });
+  const win = {
+    __ARC_NETWORK_CONFIG__: injectedConfig,
+    location: { hash: "" },
+    fetch: fetchImpl,
+    addEventListener() {},
+    setInterval() { markBooted(); return 0; },
+  };
+  globalThis.document = {
+    hidden: false,
+    getElementById(id) {
+      if (!byId.has(id)) byId.set(id, fakeElement("div"));
+      return byId.get(id);
+    },
+    createElement: (tag) => fakeElement(tag),
+    querySelector: () => null,
+    addEventListener() {},
+  };
+  globalThis.window = win;
+  const settled = Promise.race([booted, new Promise((resolve) => {
+    const timer = setTimeout(resolve, 5_000);
+    timer.unref?.();
+  })]);
+  return { byId, win, settled, said: (id) => byId.get(id)?.textContent ?? null };
+}
+
+const REPLICA_IDS = ["v3-1", "v3-2", "v3-3", "v3-4", "v3-5", "v3-6"];
+const domConfig = {
+  schema: "arc.frontend.network.v1",
+  state: "recovered",
+  network: { name: "ARC Testnet", chainId: "arc-testnet-v3" },
+  checkpoint: {
+    height: H,
+    recoveryHeight: H + 1,
+    legacyPublicMaxHeight: H + 10,
+    blockHash: hex("a"),
+    stateRoot: hex("b"),
+    manifestHash: hex("c"),
+    boundaryBlockHash: hex("d"),
+    boundaryStateRoot: hex("e"),
+    recoveryDomain: hex("f"),
+    recoveryEpoch: 7,
+    validatorSetId: 9,
+    protocolVersion: "3.0.0",
+    legacySourceId: "legacy",
+    v3SourceId: "v3-1",
+  },
+  sources: [
+    { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
+    ...REPLICA_IDS.map((id, index) => ({
+      id,
+      name: `v3 ${index + 1}`,
+      kind: "v3",
+      replicaGroup: "v3-main",
+      baseUrl: `https://${id}.example.test`,
+    })),
+  ],
+  services: {
+    maintenanceInterlock: {
+      schema: network.MAINTENANCE_SERVICE_SCHEMA,
+      path: "/maintenance/status",
+      sourceSetSha256: hex("1"),
+      boundarySha256: hex("2"),
+      toolSha256: hex("3"),
+      sourceMainCommit: "4".repeat(40),
+      observedCutoffHeight: 1120,
+      requiredHealthyReplicas: 6,
+      maxStalenessSeconds: 90,
+    },
+  },
+};
+
+function freshMaintenanceStatus() {
+  const utc = (ms) => new Date(ms).toISOString().replace(".000Z", "Z");
+  const sampled = Math.floor(Date.now() / 1000) * 1000 - 10_000;
+  return {
+    schema: network.MAINTENANCE_STATUS_SCHEMA,
+    source_main_commit: "4".repeat(40),
+    boundary_sha256: hex("2"),
+    source_set_sha256: hex("1"),
+    tool_sha256: hex("3"),
+    sampled_at: utc(sampled),
+    expires_at: utc(sampled + 90_000),
+    poll_interval_seconds: 30,
+    max_staleness_seconds: 90,
+    observations: [
+      ...network.OFFICIAL_RETIRED_ORIGINS.map(({ name, origin }) => ({
+        name, origin, scope: "retired", outcome: "unreachable",
+        height: null, block_hash: null, state_root: null, response_sha256: null,
+      })),
+      {
+        name: "community-one",
+        origin: "https://community.example.test:9443",
+        scope: "community",
+        outcome: "observed",
+        height: H,
+        block_hash: hex("a"),
+        state_root: hex("b"),
+        response_sha256: { info_before: hex("6"), latest: hex("7"), exact: hex("8"), info_after: hex("9") },
+      },
+    ],
+    state: "HEALTHY",
+    gate_reason: "capture-bound-retirement-tripwire-clear",
+    incident_sha256: null,
+    required_community_observations: 1,
+    healthy_community_observations: 1,
+    global_absence_claimed: false,
+  };
+}
+
+await test("a failed refresh clears canonical evidence instead of leaving stale rows on screen", async () => {
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const block = (height, hash) => ({ header: { height, hash, parent_hash: hex("a"), state_root: hex("e"), timestamp: nowSecs } });
+  let snapshotReachable = true;
+  const routes = () => {
+    const table = {
+      "https://legacy.example.test/block/88": { header: { height: H, hash: hex("a"), state_root: hex("b") } },
+    };
+    for (const id of REPLICA_IDS) {
+      table[`https://${id}.example.test/maintenance/status`] = freshMaintenanceStatus();
+      table[`https://${id}.example.test/block/89`] = block(H + 1, hex("d"));
+      table[`https://${id}.example.test/network/info`] = exactNetworkInfo();
+    }
+    if (snapshotReachable) {
+      Object.assign(table, {
+        "https://v3-1.example.test/health": { chain_advancing: true, last_block_age_secs: 1, peers: 5, version: "3.0.0" },
+        "https://v3-1.example.test/info": { block_height: H + 11 },
+        "https://v3-1.example.test/stats": { block_height: H + 11, total_transactions: 42, validators: 6 },
+        "https://v3-1.example.test/validators": { validators: { "0xabc": { stake: 1 } } },
+        "https://v3-1.example.test/block/latest": block(H + 11, hex("1")),
+        "https://v3-1.example.test/blocks?from=88&to=99&limit=12": {
+          blocks: [block(H + 11, hex("1")), block(H + 10, hex("2")), block(H + 9, hex("3"))],
+        },
+      });
+    }
+    Object.assign(table, {
+      "https://v3-1.example.test/inference/attestations?limit=20": { activities: [] },
+      "https://v3-1.example.test/economics/rewards": {},
+    });
+    return table;
+  };
+  const dom = installFakeDom(domConfig, async (url) => {
+    const parsed = new URL(url);
+    const table = routes();
+    const key = `${parsed.origin}${parsed.pathname}${parsed.search}`;
+    return Object.hasOwn(table, key) ? response(200, table[key]) : response(503, { error: "unreachable" });
+  });
+  app.boot();
+  await dom.settled;
+
+  // The verified-canonical render is reachable end to end, not a dead branch.
+  assert.equal(dom.said("banner-title"), "Canonical recovery verified");
+  assert.equal(dom.said("blocks-status"), "3 shown · v3 1");
+  assert.equal(dom.byId.get("blocks-body").children.length, 3);
+  assert.equal(dom.said("metric-height").replace(/\D/g, ""), String(H + 11));
+  // A non-array /validators payload must not render "undefined records returned".
+  assert.equal(dom.said("metric-validator-note"), "Validator records unavailable");
+
+  snapshotReachable = false;
+  await dom.byId.get("refresh-button").listeners.get("click")[0]();
+
+  assert.equal(dom.said("banner-title"), "Selected source is unreachable");
+  assert.equal(dom.byId.get("blocks-body").children.length, 1);
+  assert.match(dom.byId.get("blocks-body").children[0].children[0].textContent, /No retained blocks/);
+  assert.equal(dom.said("blocks-status"), "Unavailable");
+  assert.equal(dom.said("inference-status"), "Unavailable");
+  assert.equal(dom.said("rewards-status"), "Unavailable");
+  assert.equal(dom.said("last-refreshed"), "Refresh failed");
+});
+
 process.stdout.write(`\nARC composite explorer contract: ${count}/${count} checks passed\n`);

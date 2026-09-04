@@ -207,14 +207,19 @@
 
   async function queryTransaction(options) {
     const { resolver, fetchImpl, hash, sourceId, signal, checkpointAudit } = options;
+    // The hash reaches this function straight from the URL fragment, so it is
+    // normalized before it is ever interpolated into an RPC path. Without this
+    // an unvalidated fragment escapes /tx/ and queries arbitrary node paths.
+    const txHash = network.normalizeHex(hash, 32);
+    if (!txHash) throw new RpcError("Transactions must be 32-byte hexadecimal values", 0, null);
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
       const archiveVerification = await requireLegacyArchiveProvenance(source, fetchImpl, signal);
       const [full, receipt, occurrence] = await Promise.all([
-        optionalRequest(fetchImpl, source, `/tx/${hash}/full`, { signal }),
-        optionalRequest(fetchImpl, source, `/tx/${hash}`, { signal }),
+        optionalRequest(fetchImpl, source, `/tx/${txHash}/full`, { signal }),
+        optionalRequest(fetchImpl, source, `/tx/${txHash}`, { signal }),
         source.kind === "legacy-fork"
-          ? optionalRequest(fetchImpl, source, `/tx/${hash}/occurrences`, { signal })
+          ? optionalRequest(fetchImpl, source, `/tx/${txHash}/occurrences`, { signal })
           : Promise.resolve({ ok: false, error: null }),
       ]);
       if (!full.ok && !receipt.ok && !occurrence.ok) {
@@ -256,12 +261,16 @@
 
   async function queryAddress(options) {
     const { resolver, fetchImpl, address, sourceId, signal, checkpointAudit } = options;
+    // Same fragment-supplied input as queryTransaction: normalize before it can
+    // reach an RPC path.
+    const accountAddress = network.normalizeHex(address, 32);
+    if (!accountAddress) throw new RpcError("Addresses must be 32-byte hexadecimal values", 0, null);
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
       const archiveVerification = await requireLegacyArchiveProvenance(source, fetchImpl, signal);
       const [account, history] = await Promise.all([
-        optionalRequest(fetchImpl, source, `/account/${address}`, { signal }),
-        optionalRequest(fetchImpl, source, `/account/${address}/txs`, { signal }),
+        optionalRequest(fetchImpl, source, `/account/${accountAddress}`, { signal }),
+        optionalRequest(fetchImpl, source, `/account/${accountAddress}/txs`, { signal }),
       ]);
       const historyValue = history.ok ? history.value : null;
       const txHashes = historyValue?.tx_hashes ?? historyValue?.transactions ?? [];
@@ -573,7 +582,7 @@
         text(elements.metricPeers, formatInteger(numberOrNull(snapshot.health?.peers, snapshot.info?.peer_count, snapshot.stats?.connected_peers)));
         const validatorRows = Array.isArray(snapshot.validators) ? snapshot.validators : snapshot.validators?.validators;
         text(elements.metricValidators, formatInteger(numberOrNull(snapshot.stats?.validators, snapshot.info?.validator_count, validatorRows?.length)));
-        text(elements.metricValidatorNote, validatorRows ? `${validatorRows.length} records returned` : "Validator records unavailable");
+        text(elements.metricValidatorNote, Array.isArray(validatorRows) ? `${validatorRows.length} records returned` : "Validator records unavailable");
         renderFacts(source, snapshot, liveness);
         renderBlocks(snapshot.blocks, source);
         renderRecovery(checkpointAudit);
@@ -587,9 +596,20 @@
         else setBanner("degraded", "Canonical evidence incomplete", `${sourceDisplay(source)} is reachable, but exact checkpoint evidence is unavailable. No result is labeled canonical.`);
       } catch (error) {
         if (!signal.aborted) {
+          // Evidence panels are cleared with the metrics. Leaving the previous
+          // block, inference, and reward renders on screen would present stale
+          // rows - possibly from a different source - as current evidence while
+          // the banner reports the selected source as unreachable.
           resetMetrics();
           renderFacts(source, null, null);
           renderRecovery(null);
+          renderBlocks([], source);
+          renderInference(null, source);
+          renderRewards(null);
+          text(elements.blocksStatus, "Unavailable");
+          text(elements.inferenceStatus, "Unavailable");
+          text(elements.rewardsStatus, "Unavailable");
+          text(elements.lastRefreshed, "Refresh failed");
           setBanner("error", "Selected source is unreachable", `${sourceDisplay(source)}: ${error.message}`);
         }
       } finally {
