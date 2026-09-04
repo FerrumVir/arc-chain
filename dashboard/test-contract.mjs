@@ -191,16 +191,18 @@ await test("stale canonical source is reported as degraded", async () => {
 await test("active publication requires six reachable agreeing commitments and advancing liveness", () => {
   const maintenance = { state: "healthy", samples: Array.from({ length: 6 }, () => ({ ok: true })) };
   const samples = Array.from({ length: 6 }, (_, index) => ({ source: { id: `v3-${index + 1}` }, reachable: true }));
+  const commitments = samples.map((sample) => ({ sourceId: sample.source.id, ok: true, height: 700, blockHash: hex("7"), stateRoot: hex("8") }));
   const fleet = {
     state: "healthy",
     samples,
     reachable: samples,
     current: { reachable: true, liveness: { state: "advancing" } },
     commonHeight: 700,
-    commonAudit: { state: "consistent" },
-    commitments: samples.map((sample) => ({ sourceId: sample.source.id, ok: true, height: 700, blockHash: hex("7"), stateRoot: hex("8") })),
+    commonAudit: network.auditCommonHeight(commitments),
+    commitments,
     replicaCount: 6,
   };
+  assert.equal(fleet.commonAudit.samples.length, 6);
   assert.equal(app.activeFleetPublicationError({ state: "recovered" }, fleet, maintenance), null);
   assert.match(app.activeFleetPublicationError({ state: "recovered" }, fleet, { state: "maintenance", samples: [] }), /maintenance interlocks/);
 
@@ -215,6 +217,51 @@ await test("active publication requires six reachable agreeing commitments and a
 
   assert.equal(app.activeFleetPublicationError({ state: "degraded" }, { ...fleet, state: "degraded" }, maintenance), null);
   assert.match(app.activeFleetPublicationError({ state: "recovered" }, { ...fleet, state: "degraded" }, maintenance), /healthy fleet/);
+});
+
+await test("a commitment audit that compared fewer than six replicas cannot publish", async () => {
+  const ids = ["v3-1", "v3-2", "v3-3", "v3-4", "v3-5", "v3-6"];
+  const resolver = network.createCanonicalResolver({
+    schema: "arc.frontend.network.v1",
+    state: "recovered",
+    network: { name: "ARC Testnet", chainId: "arc-testnet-v3" },
+    checkpoint: {
+      height: H, recoveryHeight: H + 1, legacyPublicMaxHeight: H + 10,
+      blockHash: hex("a"), stateRoot: hex("b"), manifestHash: hex("c"),
+      boundaryBlockHash: hex("d"), boundaryStateRoot: hex("e"), recoveryDomain: hex("f"),
+      recoveryEpoch: 7, validatorSetId: 9, protocolVersion: "3.0.0",
+      legacySourceId: "legacy", v3SourceId: "v3-1",
+    },
+    sources: [
+      { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
+      ...ids.map((id) => ({ id, name: id, kind: "v3", replicaGroup: "main", baseUrl: `https://${id}.example.test` })),
+    ],
+  });
+
+  // Every replica is reachable and advancing and answers /block/<common> with
+  // HTTP 200, but only two serve a body that carries a comparable commitment.
+  const routes = {};
+  for (const [index, id] of ids.entries()) {
+    routes[`https://${id}.example.test/health`] = { body: { height: 101, chain_advancing: true, last_block_age_secs: 4 } };
+    routes[`https://${id}.example.test/info`] = { body: { block_height: 101 } };
+    routes[`https://${id}.example.test/block/latest`] = { body: { header: { height: 101, hash: hex("1"), state_root: hex("2"), timestamp: 2_000 } } };
+    routes[`https://${id}.example.test/block/101`] = index < 2
+      ? { body: { header: { height: 101, hash: hex("1"), state_root: hex("2") } } }
+      : { body: { note: "block body without a commitment" } };
+  }
+
+  const fleet = await app.collectFleetHealth({ resolver, fetchImpl: mockFetch(routes), nowMs: 2_005_000 });
+  assert.equal(fleet.commitments.length, 6);
+  assert.ok(fleet.commitments.every((entry) => entry.ok), "every replica answered the common-height query");
+  assert.equal(fleet.commonAudit.state, "consistent");
+  assert.equal(fleet.commonAudit.samples.length, 2, "only two commitments were actually comparable");
+
+  const maintenance = { state: "healthy", samples: ids.map(() => ({ ok: true })) };
+  assert.match(
+    app.activeFleetPublicationError(resolver.config, fleet, maintenance),
+    /commitments must agree/,
+    "a six-validator agreement claim must not be published from a two-replica comparison",
+  );
 });
 
 await test("recovery audit verifies exact H, H+1, and every replica identity", async () => {
