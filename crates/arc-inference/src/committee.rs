@@ -137,15 +137,27 @@ pub fn aggregate_votes(
         entry.1 += 1;
     }
 
-    // Check if any output_hash has sufficient agreement
-    for (output_hash, count) in vote_counts.values() {
-        if *count >= committee.min_agreement {
-            return CommitteeResult::Consensus {
-                output_hash: *output_hash,
-                agreeing: *count,
-                total: committee.members.len(),
-            };
-        }
+    // Check if any output_hash has sufficient agreement.
+    //
+    // More than one hash can clear `min_agreement` (any committee at least
+    // twice the threshold, e.g. k=10 split 5/5). `vote_counts` is a
+    // std::collections::HashMap, whose iteration order is randomized per map
+    // instance, so returning the first qualifying entry made the finalized
+    // output hash depend on allocator/hasher state: two honest nodes
+    // aggregating the identical vote set could commit to different results.
+    // Select deterministically instead - highest count wins, ties broken by
+    // the lexicographically smallest output hash. When exactly one hash
+    // qualifies (the ordinary case) this is the same answer as before.
+    let winner = vote_counts
+        .values()
+        .filter(|(_, count)| *count >= committee.min_agreement)
+        .min_by_key(|(output_hash, count)| (std::cmp::Reverse(*count), output_hash.0));
+    if let Some((output_hash, count)) = winner {
+        return CommitteeResult::Consensus {
+            output_hash: *output_hash,
+            agreeing: *count,
+            total: committee.members.len(),
+        };
     }
 
     CommitteeResult::Disagreement {
@@ -317,6 +329,52 @@ mod tests {
         // 50% malicious → much higher
         let p = corruption_probability(0.5, 7, 5);
         assert!(p > 0.1, "P(corrupt) = {p}, expected > 10%");
+    }
+
+    /// Two output hashes can both clear `min_agreement` whenever the committee
+    /// is at least twice the agreement threshold (here k=10, min_agreement=5,
+    /// split 5/5). Aggregation must then pick the SAME winner on every node
+    /// that recomputes it. Selecting whichever entry a `std::collections::
+    /// HashMap` happens to yield first is per-map randomized, so two honest
+    /// nodes aggregating the identical vote set could finalize different
+    /// output hashes for the same request.
+    #[test]
+    fn tied_agreement_resolves_to_the_same_hash_on_every_aggregation() {
+        let validators = make_validators(10, 2);
+        let seed = hash_bytes(b"tie-determinism");
+        let committee = select_committee(&seed, &validators, 2, 10);
+        assert_eq!(committee.members.len(), 10);
+        assert_eq!(committee.min_agreement, 5);
+
+        let hash_a = hash_bytes(b"branch-a");
+        let hash_b = hash_bytes(b"branch-b");
+        let mut votes: Vec<_> = committee.members[..5]
+            .iter()
+            .map(|m| (*m, hash_a))
+            .collect();
+        votes.extend(committee.members[5..].iter().map(|m| (*m, hash_b)));
+
+        // Tie-break is defined as the lexicographically smallest output hash.
+        let expected = if hash_a.0 <= hash_b.0 { hash_a } else { hash_b };
+
+        // A fresh HashMap per call: repeat enough that an order-dependent
+        // winner cannot survive by luck.
+        for attempt in 0..200 {
+            match aggregate_votes(&committee, &votes) {
+                CommitteeResult::Consensus {
+                    output_hash,
+                    agreeing,
+                    ..
+                } => {
+                    assert_eq!(agreeing, 5);
+                    assert_eq!(
+                        output_hash, expected,
+                        "aggregation picked a different winner on attempt {attempt}"
+                    );
+                }
+                other => panic!("expected consensus at the threshold, got {other:?}"),
+            }
+        }
     }
 
     #[test]

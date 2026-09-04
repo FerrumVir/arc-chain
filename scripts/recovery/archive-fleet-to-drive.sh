@@ -80,19 +80,43 @@ ARC_OPERATOR_GH_TOKEN=""
 ARC_OPERATOR_GH_HOME=""
 
 cleanup_temporary_root() {
+    # Only ever installed as the invocation EXIT trap. Every rm was previously
+    # unchecked, so a partial sweep -- the pinned SSH identity or the rclone
+    # config surviving on a read-only mount, a busy file, a chmod'd parent --
+    # was indistinguishable from a clean one. Report each surviving root by
+    # exact path so an operator can remove it before retrying.
+    local cleanup_status=0 root
     ARC_OPERATOR_GH_TOKEN=""
-    if [ -n "$ARCHIVE_FLEET_TEMP_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_TEMP_ROOT"
-    fi
-    if [ -n "$ARCHIVE_FLEET_PINNED_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_PINNED_ROOT"
-    fi
-    if [ -n "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
-    fi
-    if [ -n "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT" ]; then
-        rm -rf -- "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
-    fi
+    for root in "$ARCHIVE_FLEET_TEMP_ROOT" "$ARCHIVE_FLEET_PINNED_ROOT" \
+        "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT" "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"; do
+        [ -n "$root" ] || continue
+        rm -rf -- "$root" || cleanup_status=1
+        if [ -e "$root" ] || [ -L "$root" ]; then
+            printf 'archive fleet: FATAL credential sweep incomplete: %s\n' "$root" >&2
+            cleanup_status=1
+        fi
+    done
+    return "$cleanup_status"
+}
+
+begin_temporary_scope() {
+    # Each dispatched command runs as the leader of its supervised process
+    # group. Never inherit ownership of a caller's temporary roots or
+    # initialized wrappers: every invocation allocates and cleans only its own
+    # private runtime state.
+    ARCHIVE_FLEET_TEMP_ROOT=""
+    ARCHIVE_FLEET_PINNED_ROOT=""
+    ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT=""
+    ARCHIVE_FLEET_PINNED_PYTHON_ROOT=""
+    ARC_OPERATOR_TRANSPORT_READY=false
+    ARC_OPERATOR_TRANSPORT_RCLONE=false
+    ARC_OPERATOR_PYTHON_READY=false
+    ARC_OPERATOR_GH_READY=false
+    ARC_OPERATOR_GH_TOKEN=""
+    trap cleanup_temporary_root EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }
 
 die() {
@@ -429,7 +453,7 @@ configure_operator_transport() {
     local runtime
     runtime="$(mktemp -d)"
     ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT="$runtime"
-    chmod 700 -- "$runtime"
+    chmod 700 "$runtime"
     python3 - "$runtime" "$known_hosts" "$known_hosts_sha" "$identity" "$identity_sha" \
         "$ARC_OPERATOR_SSH_BIN" "$ssh_sha" "$ARC_OPERATOR_SCP_BIN" "$scp_sha" \
         "$require_rclone" "$rclone_path" "$rclone_sha" "$rclone_config" "${NODES[@]}" <<'PY'
@@ -1303,6 +1327,10 @@ PY
 }
 
 audit_writers() {
+    # This command pins the SSH identity into a private temporary transport
+    # root.  Install cleanup before argument validation or transport setup so
+    # both successful plans and every fail-closed exit remove that copy.
+    begin_temporary_scope
     local legacy_validators="" output=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -1321,7 +1349,6 @@ audit_writers() {
     legacy_sha="$(hash_file "$legacy_validators")"
     temporary="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$temporary"
-    trap cleanup_temporary_root EXIT
     for node in nyc lax ams lhr nrt sgp; do
         host="$(host_for "$node")"
         ssh_remote_exact "$host" /usr/bin/env -i HOME=/root \
@@ -2177,6 +2204,9 @@ PY
 }
 
 seal_freeze_plan() {
+    # Python receives a private HOME even for this local-only command.  Keep
+    # that runtime root invocation-scoped on success and failure.
+    begin_temporary_scope
     local window="" output="" legacy_validators="" writer_contracts=""
     local drive_remote_root="$DRIVE_REMOTE" drive_client_sha="" drive_account_sha=""
     local drive_daily_budget="" dedicated_drive_uploader=false
@@ -2640,6 +2670,9 @@ PY' \
 }
 
 prepare_writers() {
+    # Plan mode still authenticates the transport contract.  Its private SSH
+    # identity copy must disappear before the plan command returns.
+    begin_temporary_scope
     local legacy_validators="" output="" execute=false
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -2663,7 +2696,7 @@ prepare_writers() {
     printf 'archive fleet: PREPARE-WRITERS authorization=%s\n' "$expected_go"
     printf 'archive fleet: preparation stages only fail-open persistent start barriers, stops/disables process-free alternatives, and seals either a systemd-owned writer or an exact detached root-session writer relationship; the shared allow marker remains present and no writer is stopped\n'
     if [ "$execute" != true ]; then
-        printf 'archive fleet: PLAN ONLY; no host file, unit, cgroup, or local audit was changed\n'
+        printf 'archive fleet: PLAN ONLY; no persistent host file, unit, cgroup, or local audit was changed\n'
         return 0
     fi
     [ "${ARC_RECOVERY_PREPARE_GO:-}" = "$expected_go" ] || \
@@ -2673,7 +2706,6 @@ prepare_writers() {
     local pids=() names=()
     log_root="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
-    trap cleanup_temporary_root EXIT
     for node in nyc lax ams lhr nrt sgp; do
         run_remote "$node" stage-recovery-barrier "$node" > "$log_root/$node.log" 2>&1 &
         pids+=("$!"); names+=("$node")
@@ -2689,7 +2721,7 @@ prepare_writers() {
     done
     [ "$failed" -eq 0 ] || \
         die "preparation is safely resumable while each present allow marker keeps its staged start barrier fail-open"
-    audit_writers --legacy-validator-set "$legacy_validators" --output "$output"
+    ( audit_writers --legacy-validator-set "$legacy_validators" --output "$output" )
 }
 
 run_remote() {
@@ -3299,7 +3331,10 @@ secure_hash(pathlib.Path("/usr/bin/ssh"), ssh_sha, "reviewed OpenSSH", False)
 PY
 }
 
-verify_offline_stop_phase() (
+verify_offline_stop_phase() {
+    # The challenged verifier allocates a private Python HOME before its
+    # evidence scratch directory.  Own both from the first instruction.
+    begin_temporary_scope
     local freeze_plan="" evidence="" evidence_sha="" known_hosts="" known_sha=""
     local identity="" challenge="" python_path="" python_sha="" ssh_sha=""
     while [ "$#" -gt 0 ]; do
@@ -3340,7 +3375,7 @@ verify_offline_stop_phase() (
     local transition_kind transition_sha
     local pids=() names=()
     temporary="$(/usr/bin/mktemp -d)"
-    trap 'chmod -R u+w "$temporary" 2>/dev/null || true; rm -rf -- "$temporary"' EXIT
+    ARCHIVE_FLEET_TEMP_ROOT="$temporary"
     read -r started started_at < <(python3 - <<'PY'
 import datetime, time
 print(time.monotonic_ns(), datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
@@ -3375,7 +3410,7 @@ PY
     build_offline_stop_remote_verification "$freeze_plan" "$freeze_sha" "$evidence" \
         "$evidence_sha" "$known_sha" "$challenge" "$started_at" "$completed_at" \
         "$duration_ms" "$temporary" "$ssh_sha"
-)
+}
 
 create_offline_stop_evidence() {
     local freeze_plan="$1" freeze_sha="$2" capture_id="$3" status_root="$4" output="$5"
@@ -4503,7 +4538,7 @@ PY
                 proof_failed=1
                 break
             fi
-            chmod 400 -- "$temporary"
+            chmod 400 "$temporary"
             publish_canonical_maintenance_input "$temporary" "$proof_root/$node.json"
         done
         if [ "$proof_failed" -ne 0 ]; then
@@ -4685,7 +4720,7 @@ PY
             failed=1
             break
         fi
-        chmod 400 -- "$temporary"
+        chmod 400 "$temporary"
         publish_canonical_maintenance_input "$temporary" "$proof_root/$node.json"
     done
     [ "$failed" -eq 0 ] || return 1
@@ -5183,7 +5218,7 @@ capture_all_live_observations() {
     [ "$failed" -eq 0 ] || \
         die "live-observation receipt set is incomplete; this execution sent no writer freeze/stop signal"
     : > "$statuses"
-    chmod 600 -- "$statuses"
+    chmod 600 "$statuses"
     for node in nyc lax ams lhr nrt sgp; do
         run_remote "$node" live-observations-status "$capture_id" "$observation_generation" \
             "$generation_receipt_sha" "$drive_receipt_sha" "$node" "$freeze_sha" >> "$statuses"
@@ -7367,7 +7402,7 @@ capture_quarantine_round_prior_statuses() {
         run_remote "$node" quarantine-round-status "$capture_id" "$node" "$freeze_sha" \
             "$round" "$auth_sha" "$readiness_sha" "$applied_sha" \
             > "$log_root/$node-prior-fenced-status.new.json"
-        chmod 400 -- "$log_root/$node-prior-fenced-status.new.json"
+        chmod 400 "$log_root/$node-prior-fenced-status.new.json"
         publish_canonical_maintenance_input \
             "$log_root/$node-prior-fenced-status.new.json" "$output_root/$node.json"
     done
@@ -7403,7 +7438,7 @@ PY
                 "$(legacy_height_row_field "$public_receipt" "$node" info_after_height)" \
                 "$(legacy_height_row_field "$public_receipt" "$node" latest_block_hash)" \
                 "$challenge" > "$bracket_root/$node.new.json"
-            chmod 400 -- "$bracket_root/$node.new.json"
+            chmod 400 "$bracket_root/$node.new.json"
             publish_canonical_maintenance_input \
                 "$bracket_root/$node.new.json" "$bracket_root/$node.json"
         ) > "$attempt_root/$node-authenticated-bracket.log" 2>&1 &
@@ -7476,7 +7511,7 @@ capture_quarantine_round_live_sources() {
                 "$(quarantine_cross_node_field "$cross" "$node" loopback_latest_block_hash)" \
                 "$public_sha" "$cross_sha" preauthorization-boundary \
                 "$minimum_height" - - - "$cross_sha" - - > "$temporary"
-            chmod 400 -- "$temporary"
+            chmod 400 "$temporary"
             publish_canonical_maintenance_input "$temporary" "$output_root/$node.json"
         ) > "$attempt_root/$node-live-source.log" 2>&1 &
         pids+=("$!")
@@ -7681,7 +7716,7 @@ PY
                 post-quarantine-final-export "$minimum_height" "$expected_height" \
                 "$expected_hash" "$expected_state" "$stability_sha" \
                 "$network_receipt_sha" "$owned_ruleset_sha" > "$temporary"
-            chmod 400 -- "$temporary"
+            chmod 400 "$temporary"
             python3 - "$temporary" "$node" "$expected_height" "$expected_hash" \
                 "$expected_state" "$stability_sha" <<'PY'
 import hashlib,json,pathlib,sys
@@ -8022,7 +8057,7 @@ PY
             if run_remote "$node" quarantine-round-applied-status "$capture_id" "$node" \
                     "$freeze_sha" "$round_number" "$auth_sha" "$readiness_sha" \
                     > "$temporary" 2> "$temporary.stderr"; then
-                chmod 400 -- "$temporary"
+                chmod 400 "$temporary"
                 publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
             else
                 temporary="$log_root/$node-round-$round_number-stopped-precommit.new.json"
@@ -8033,7 +8068,7 @@ PY
                         "$inspector_genesis_sha" "$inspector_validators_sha" \
                         "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal" \
                         > "$temporary" 2> "$temporary.stderr"; then
-                    chmod 400 -- "$temporary"
+                    chmod 400 "$temporary"
                     publish_canonical_maintenance_input "$temporary" \
                         "$applied_root/$node.json"
                 fi
@@ -8064,7 +8099,7 @@ PY
                             quarantine-round-authorize "$capture_id" "$node" "$freeze_sha" \
                             "$round_number" "$auth_sha" > "$temporary"
                     fi
-                    chmod 400 -- "$temporary"
+                    chmod 400 "$temporary"
                     publish_canonical_maintenance_input "$temporary" \
                         "$acceptance_root/$node.json"
                 ) > "$log_root/$node-round-$round_number-authorize.log" 2>&1 &
@@ -8102,7 +8137,7 @@ PY
                     run_remote_canonical_input "$node" "$readiness" quarantine-round-ready \
                         "$capture_id" "$node" "$freeze_sha" "$round_number" "$auth_sha" \
                         "$readiness_sha" > "$temporary"
-                    chmod 400 -- "$temporary"
+                    chmod 400 "$temporary"
                     cmp --silent "$readiness" "$temporary" || \
                         die "remote quarantine-round readiness bytes differ for $node"
                 ) > "$log_root/$node-round-$round_number-ready.log" 2>&1 &
@@ -8121,7 +8156,7 @@ PY
                     run_remote "$node" quarantine-round-apply "$capture_id" "$node" \
                         "$freeze_sha" "$round_number" "$auth_sha" "$readiness_sha" \
                         > "$temporary"
-                    chmod 400 -- "$temporary"
+                    chmod 400 "$temporary"
                     publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
                 ) > "$log_root/$node-round-$round_number-apply.log" 2>&1 &
                 pids+=("$!")
@@ -8145,7 +8180,7 @@ PY
             if run_remote "$node" quarantine-round-applied-status "$capture_id" "$node" \
                     "$freeze_sha" "$round_number" "$auth_sha" "$readiness_sha" \
                     > "$temporary" 2> "$temporary.stderr"; then
-                chmod 400 -- "$temporary"
+                chmod 400 "$temporary"
                 publish_canonical_maintenance_input "$temporary" "$applied_root/$node.json"
             else
                 temporary="$log_root/$node-round-$round_number-final-stopped-precommit.new.json"
@@ -8155,7 +8190,7 @@ PY
                         "$inspector_genesis_sha" "$inspector_validators_sha" \
                         "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal" \
                         > "$temporary" 2> "$temporary.stderr"; then
-                    chmod 400 -- "$temporary"
+                    chmod 400 "$temporary"
                     publish_canonical_maintenance_input "$temporary" \
                         "$applied_root/$node.json"
                 fi
@@ -8287,7 +8322,7 @@ run_quarantine_generation_rounds() {
             mkdir -m 700 -- "$round_dir"
         fi
         attempt_root="$(mktemp -d "$round_dir/attempt.XXXXXX")"
-        chmod 700 -- "$attempt_root"
+        chmod 700 "$attempt_root"
         public_receipt="$attempt_root/target-public-height.json"
         python3 -B -I "$LEGACY_HEIGHT_TOOL" sample-targets \
             --source-main "$source_main" --freeze-plan "$freeze_plan" \
@@ -8547,6 +8582,10 @@ PY
 }
 
 capture_phase() {
+    # Plan mode initializes both SSH and Drive transports.  Register cleanup
+    # before parsing or validating anything so OAuth/identity copies never
+    # survive a successful plan or a fail-closed exit.
+    begin_temporary_scope
     local freeze_plan="" offline_stop_output="" legacy_height_receipt=""
     local legacy_height_receipt_sha="" legacy_height_sample_output=""
     local inspector_binary="" inspector_binary_sha=""
@@ -8627,8 +8666,7 @@ capture_phase() {
     ARCHIVE_FLEET_PINNED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-freeze-plan.XXXXXX")"
     [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
         die "cannot create private freeze-plan snapshot root"
-    chmod 700 -- "$ARCHIVE_FLEET_PINNED_ROOT"
-    trap cleanup_temporary_root EXIT
+    chmod 700 "$ARCHIVE_FLEET_PINNED_ROOT"
     freeze_plan="$(pin_freeze_plan "$OPERATOR_FREEZE_PLAN" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
@@ -8665,7 +8703,7 @@ capture_phase() {
     REMOTE_HELPER_PATH="/root/.arc-recovery-helpers/$REMOTE_HELPER_SHA/archive-node.sh"
     run_drive_prefreeze_gate preflight "$freeze_plan" "$freeze_sha" "$capture_id"
     if [ "$execute" != true ]; then
-        printf 'archive fleet: PLAN ONLY; no service or remote/local file was changed\n'
+        printf 'archive fleet: PLAN ONLY; no persistent service or recovery-managed remote/local file was changed\n'
         return 0
     fi
     local expected_go="FREEZE $freeze_sha CAPTURE $capture_id"
@@ -8697,6 +8735,7 @@ capture_phase() {
     install_freeze_plan "$freeze_plan" "$freeze_sha"
     local inspector_stage_root
     inspector_stage_root="$(mktemp -d)"
+    ARCHIVE_FLEET_TEMP_ROOT="$inspector_stage_root"
     local inspector_stage_pids=() inspector_stage_nodes=() inspector_stage_failed=0
     local inspector_stage_index inspector_stage_node
     for inspector_stage_node in nyc lax ams lhr nrt sgp; do
@@ -8720,6 +8759,7 @@ capture_phase() {
     [ "$inspector_stage_failed" -eq 0 ] || \
         die "exact capture recovery-export inputs were not staged on all six writers"
     find "$inspector_stage_root" -depth -delete
+    ARCHIVE_FLEET_TEMP_ROOT=""
     printf 'archive fleet: staged exact hash-bound v0.8 recovery exporter inputs on all six writers\n'
     printf 'archive fleet: running exact ARC Drive identity/capacity/write-read-delete gate\n'
     local drive_execute_output drive_prefreeze_receipt
@@ -8730,7 +8770,6 @@ capture_phase() {
     local log_root
     log_root="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
-    trap cleanup_temporary_root EXIT
     local maintenance_input_root
     maintenance_input_root="$(prepare_protected_maintenance_directory \
         "${offline_stop_output}.maintenance-inputs")"
@@ -8931,7 +8970,7 @@ PY
         python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
             --ledger "$quarantine_generation_ledger" --node "$quarantine_node" \
             --kind network > "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
-        chmod 400 -- "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
+        chmod 400 "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
         publish_canonical_maintenance_input \
             "$log_root/$quarantine_node-network-quarantine-receipt.new.json" \
             "$quarantine_root/$quarantine_node-network-quarantine-receipt.json"
@@ -9566,6 +9605,9 @@ PY
 }
 
 verify_installed_keys_phase() {
+    # The identity verifier pins Python and SSH state before its proof scratch
+    # root; keep every copy inside one invocation-scoped cleanup boundary.
+    begin_temporary_scope
     local freeze_plan="" manifest="" cli="" cli_sha="" validators="" validators_sha=""
     local install_receipt="" install_sha="" restore_receipt="" restore_sha=""
     local challenge="" output=""
@@ -9611,7 +9653,6 @@ verify_installed_keys_phase() {
     ARCHIVE_FLEET_PINNED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-key-proof.XXXXXX")"
     [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
         die "cannot allocate the private validator identity proof root"
-    trap cleanup_temporary_root EXIT
     freeze_plan="$(pin_freeze_plan "$freeze_plan" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id manifest_sha verification_output
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
@@ -9661,7 +9702,7 @@ verify_installed_keys_phase() {
         "$(manifest_field "$manifest" artifacts.genesis.sha256)" \
         "$ARC_OPERATOR_SSH_KNOWN_HOSTS_SHA256" "$sealed_ssh_sha" \
         "$ARC_OPERATOR_SCP_SHA256" "$freeze_sha" "$offline_sha" > "$receipt_rows"
-    chmod 400 -- "$receipt_rows"
+    chmod 400 "$receipt_rows"
 
     REMOTE_HELPER_SHA="$(manifest_field "$freeze_plan" remote_helper_sha256)"
     require_hash "$REMOTE_HELPER_SHA" "sealed remote helper hash"
@@ -9681,7 +9722,7 @@ verify_installed_keys_phase() {
         verify_remote_validator_key_identity_transient \
             "$node" "$cli" "$cli_sha" "$key_sha" "$address" "$challenge" \
             > "$log_root/$node.json"
-        chmod 400 -- "$log_root/$node.json"
+        chmod 400 "$log_root/$node.json"
         row_count=$((row_count + 1))
     done < "$receipt_rows"
     [ "$row_count" -eq 6 ] || die "validator receipt chain did not prove exactly six identities"
@@ -9819,7 +9860,7 @@ stream_bundle_to_drive() {
     local archive_sidecar="$work_root/$archive_name.sha256"
     local status="$work_root/$node-bundle-status.json"
     run_remote "$node" stream-inventory "$capture_id" "$node" "$manifest_sha" > "$inventory"
-    chmod 400 -- "$inventory"
+    chmod 400 "$inventory"
 
     local classification
     classification="$(sed -n 's/^classification=//p' "$inventory")"
@@ -9876,7 +9917,7 @@ stream_bundle_to_drive() {
     printf '%s  %s\n' "$archive_sha" "$archive_name" > "$archive_sidecar"
     inventory_sha="$(hash_file "$inventory")"
     printf '%s  %s\n' "$inventory_sha" "${inventory##*/}" > "$inventory_sidecar"
-    chmod 400 -- "$archive_sidecar" "$inventory_sidecar"
+    chmod 400 "$archive_sidecar" "$inventory_sidecar"
     upload_immutable "$archive_sidecar" "$destination/${archive_sidecar##*/}"
     upload_immutable "$inventory" "$destination/${inventory##*/}"
     upload_immutable "$inventory_sidecar" "$destination/${inventory_sidecar##*/}"
@@ -10132,7 +10173,7 @@ create_live_observation_fleet_binding() {
     local statuses="$8"
     local node
     : > "$statuses"
-    chmod 600 -- "$statuses"
+    chmod 600 "$statuses"
     for node in nyc lax ams lhr nrt sgp; do
         run_remote "$node" live-observations-status "$capture_id" "$observation_generation" \
             "$generation_receipt_sha" "$drive_receipt_sha" "$node" "$freeze_sha" >> "$statuses"
@@ -11765,6 +11806,11 @@ PY
 )
 
 verify_complete_phase() {
+    # ``verify-complete`` is also the production rollout's pre-GO archive
+    # preflight.  Keep every pinned transport/config copy and metadata scratch
+    # inside this function's subprocess, and remove it on both success and any
+    # fail-closed exit.
+    begin_temporary_scope
     local destination="" expected_complete_sha="" expected_manifest_sha="" expected_sums_sha="" expected_prearchive_sha=""
     local verify_live_captures=false
     local new_node_paths=()
@@ -11797,10 +11843,11 @@ verify_complete_phase() {
     if [ "${#new_node_paths[@]}" -gt 0 ] || [ "$verify_live_captures" = true ]; then
         local temporary freeze_plan freeze_sha capture_id
         temporary="$(mktemp -d)"
+        ARCHIVE_FLEET_TEMP_ROOT="$temporary"
         freeze_plan="$temporary/freeze-plan.json"
         rclone cat "$destination/freeze-plan.json" > "$freeze_plan"
         rclone cat "$destination/freeze-plan.json.sha256" > "${freeze_plan}.sha256"
-        chmod 444 -- "$freeze_plan" "${freeze_plan}.sha256"
+        chmod 444 "$freeze_plan" "${freeze_plan}.sha256"
         freeze_sha="$(freeze_plan_hash "$freeze_plan")"
         capture_id="$(capture_id_for_freeze_plan_hash "$freeze_sha")"
         [ "$destination" = "$DRIVE_REMOTE/captures/$capture_id" ] || \
@@ -11969,6 +12016,10 @@ PY
 }
 
 seal_phase() {
+    # Seal plans authenticate SSH and Drive before any GO check.  Install the
+    # invocation cleanup boundary first so all private transport copies are
+    # removed on plan, success, and every ordinary error path.
+    begin_temporary_scope
     local freeze_plan="" manifest="" validators="" finalization_intent="" work_root=""
     local validator_install_receipt="" vault_restore_receipt=""
     local execute=false allow_unbound=false
@@ -12006,7 +12057,6 @@ seal_phase() {
     ARCHIVE_FLEET_PINNED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-seal-freeze-plan.XXXXXX")"
     [ -d "$ARCHIVE_FLEET_PINNED_ROOT" ] && [ ! -L "$ARCHIVE_FLEET_PINNED_ROOT" ] || \
         die "cannot allocate the private seal freeze-plan snapshot"
-    trap cleanup_temporary_root EXIT
     freeze_plan="$(pin_freeze_plan "$freeze_plan" "$ARCHIVE_FLEET_PINNED_ROOT")"
     local freeze_sha capture_id verification_output manifest_sha
     freeze_sha="$(freeze_plan_hash "$freeze_plan")"
@@ -12157,7 +12207,7 @@ PY
         "$manifest" "$source_commit" "$cli_sha" "$genesis_sha" \
         "$ssh_known_hosts_sha" "$sealed_ssh_sha" "$ARC_OPERATOR_SCP_SHA256" \
         "$freeze_sha" "$offline_stop_evidence_sha" > "$validator_receipt_rows"
-    chmod 400 -- "$validator_receipt_rows"
+    chmod 400 "$validator_receipt_rows"
 
     local archive_work_required
     archive_work_required="$(verify_archive_work_root_capacity "$work_root" "$manifest")"
@@ -12165,7 +12215,7 @@ PY
     printf 'archive fleet: PASS protected work root reserves %s bytes plus reviewed inode headroom\n' \
         "$archive_work_required"
 
-    TMPDIR="$work_root" verify_reference_pair \
+    verify_reference_pair \
         "$binary" "$genesis" "$validators" "$legacy_validator_set" \
         "$source_snapshot" "$source_wal" "$source_round" "$created_at_unix_ms" \
         "$recovery_epoch" "$validator_set_id" "$source_height" "$source_hash" \
@@ -12195,7 +12245,7 @@ PY
     done
     rclone lsd "$DRIVE_REMOTE" >/dev/null
     if [ "$execute" != true ]; then
-        printf 'archive fleet: PLAN ONLY; no remote or Drive file was changed\n'
+        printf 'archive fleet: PLAN ONLY; no persistent remote, Drive, or source credential/config file was changed\n'
         return 0
     fi
     local expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"
@@ -12209,9 +12259,8 @@ PY
     [ "$(freeze_plan_hash "$freeze_plan")" = "$freeze_sha" ] || \
         die "freeze plan or source bindings changed before execution"
     local log_root github_gist_canary_receipt
-    log_root="$(mktemp -d "$work_root/arc-archive-seal.XXXXXX")"
+    log_root="$(mktemp -d)"
     ARCHIVE_FLEET_TEMP_ROOT="$log_root"
-    trap cleanup_temporary_root EXIT
     github_gist_canary_receipt="$log_root/github-gist-write-canary.json"
     run_github_gist_anchor_canary "$freeze_sha" "$capture_id" \
         "$github_gist_canary_receipt" >/dev/null
@@ -12404,7 +12453,7 @@ with os.fdopen(fd, "wb") as handle:
     handle.flush()
     os.fsync(handle.fileno())
 PY
-    chmod 400 -- "$shared_generated/source-commit.txt" "$shared_generated/capture-id.txt"
+    chmod 400 "$shared_generated/source-commit.txt" "$shared_generated/capture-id.txt"
     register_shared_input "$shared_generated/source-commit.txt" \
         "$(hash_file "$shared_generated/source-commit.txt")" "$shared_root" source-commit.txt
     register_shared_input "$shared_generated/capture-id.txt" \
@@ -12598,19 +12647,1179 @@ PY
         "$(hash_file "$metadata_root/SHA256SUMS")" "$manifest_sha"
 }
 
+archive_write_current_process_id() {
+    # Bash 3.2 keeps $$ fixed in subshells.  A short-lived /bin/sh reports the
+    # actual PID of the Bash process that spawned it through its PPID. Write it
+    # directly: command substitution would insert another Bash process.
+    /bin/sh -c 'printf "%s\n" "$PPID"' > "$1"
+}
+
+archive_process_field() {
+    local field="$1" pid="$2" value
+    case "$field" in ppid|pgid) ;; *) return 2 ;; esac
+    if value="$(/bin/ps -o "$field=" -p "$pid" 2>/dev/null)"; then
+        value="${value//[[:space:]]/}"
+    else
+        return 1
+    fi
+    case "$value" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$value"
+}
+
+archive_process_exists() {
+    local state
+    builtin kill -0 -- "$1" 2>/dev/null || return 1
+    # A transient ps failure is not proof that a killable process exited.
+    state="$(/bin/ps -o stat= -p "$1" 2>/dev/null)" || return 0
+    state="${state//[[:space:]]/}"
+    case "$state" in Z*) return 1 ;; *) return 0 ;; esac
+}
+
+archive_process_in_group() {
+    local process_pid="$1" wanted_pgid="$2" observed_pgid
+    archive_process_exists "$process_pid" || return 1
+    observed_pgid="$(archive_process_field pgid "$process_pid")" || return 1
+    [ "$observed_pgid" = "$wanted_pgid" ]
+}
+
+archive_process_group_has_members_except() {
+    local wanted="$1"
+    shift
+    local process_pid process_pgid process_state excluded skip snapshot
+    snapshot="$(LC_ALL=C /bin/ps -ax -o pid= -o pgid= -o stat= 2>/dev/null)" || return 0
+    while read -r process_pid process_pgid process_state; do
+        [ "$process_pgid" = "$wanted" ] || continue
+        case "$process_state" in ''|Z*) continue ;; esac
+        skip=false
+        for excluded in "$@"; do
+            if [ -n "$excluded" ] && [ "$process_pid" = "$excluded" ]; then
+                skip=true
+                break
+            fi
+        done
+        [ "$skip" = true ] || return 0
+    done <<< "$snapshot"
+    return 1
+}
+
+archive_stop_and_kill_group_members_except() {
+    local wanted="$1"
+    shift
+    local process_pid process_pgid process_state excluded skip snapshot attempt
+    local all_stopped=false
+    local -a targets=()
+    # SIGSTOP is uncatchable. While the sentinel anchors the PGID, freezing the
+    # complete group prevents a target from exiting/reusing its PID between the
+    # identity snapshot and exact KILL. Always CONT the excluded owners before
+    # returning so a pending phase trap can run.
+    builtin kill -s STOP -- "-$wanted" 2>/dev/null || return 1
+    for ((attempt = 0; attempt < 250; attempt += 1)); do
+        all_stopped=true
+        snapshot="$(LC_ALL=C /bin/ps -ax -o pid= -o pgid= -o stat= 2>/dev/null)" || {
+            all_stopped=false
+            break
+        }
+        while read -r process_pid process_pgid process_state; do
+            [ "$process_pgid" = "$wanted" ] || continue
+            case "$process_state" in ''|Z*|T*|t*) ;; *) all_stopped=false; break ;; esac
+        done <<< "$snapshot"
+        [ "$all_stopped" = true ] && break
+        /bin/sleep 0.02
+    done
+    if [ "$all_stopped" != true ]; then
+        builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
+        return 1
+    fi
+    # Re-snapshot only while every member is stopped. No member can spawn or
+    # voluntarily exit during target selection.
+    snapshot="$(LC_ALL=C /bin/ps -ax -o pid= -o pgid= -o stat= 2>/dev/null)" || {
+        builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
+        return 1
+    }
+    while read -r process_pid process_pgid process_state; do
+        [ "$process_pgid" = "$wanted" ] || continue
+        case "$process_state" in ''|Z*) continue ;; T*|t*) ;; *)
+            builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
+            return 1
+            ;;
+        esac
+        skip=false
+        for excluded in "$@"; do
+            if [ -n "$excluded" ] && [ "$process_pid" = "$excluded" ]; then
+                skip=true
+                break
+            fi
+        done
+        [ "$skip" = true ] || targets+=("$process_pid")
+    done <<< "$snapshot"
+    # Bash 3.2 treats "${targets[@]}" on an empty array as an unbound-variable
+    # fatal under set -u, which no caller-side "|| true" can suppress. Dying
+    # here leaves the entire group SIGSTOPped by the kill above with the CONT
+    # below never reached. The ${x[@]+...} guard keeps the expansion legal.
+    for process_pid in ${targets[@]+"${targets[@]}"}; do
+        builtin kill -s KILL -- "$process_pid" 2>/dev/null || true
+    done
+    builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
+    return 0
+}
+
+archive_send_sentinel_command() {
+    local gate="$1" stop_token="$2" verb="$3" argument="${4:-}"
+    local fifo="$gate/sentinel.fifo"
+    case "$verb" in ARM|FINALIZE) [ -z "$argument" ] || return 2 ;; SIGNAL)
+        case "$argument" in HUP|INT|TERM) ;; *) return 2 ;; esac
+        ;; *) return 2 ;;
+    esac
+    # Never let a missing FIFO turn the redirection into a regular file.  The
+    # gate is private, but its disappearance is also the completion signal.
+    [ -p "$fifo" ] && [ ! -L "$fifo" ] || return 1
+    if exec 8<> "$fifo"; then
+        printf '%s\t%s\t%s\n' "$stop_token" "$verb" "$argument" >&8 || {
+            exec 8>&-
+            exec 8<&-
+            return 1
+        }
+        exec 8>&-
+        exec 8<&-
+        return 0
+    fi
+    return 1
+}
+
+archive_guardian_publish_heartbeat() {
+    local gate="$1" watchdog_pid="$2" watchdog_pgid="$3" stop_token="$4" sequence="$5"
+    (umask 077; printf '%s\t%s\t%s\t%s\n' \
+        "$watchdog_pid" "$watchdog_pgid" "$stop_token" "$sequence" \
+        > "$gate/guardian.heartbeat.partial") && \
+        /bin/mv -f "$gate/guardian.heartbeat.partial" "$gate/guardian.heartbeat"
+}
+
+archive_supervisor_publish_heartbeat() {
+    local gate="$1" supervisor_pid="$2" stop_token="$3" sequence="$4"
+    (umask 077; printf '%s\t%s\t%s\n' "$supervisor_pid" "$stop_token" "$sequence" \
+        > "$gate/supervisor.heartbeat.partial") && \
+        /bin/mv -f "$gate/supervisor.heartbeat.partial" "$gate/supervisor.heartbeat"
+}
+
+archive_guardian_anchor_valid() {
+    local watchdog_pid="$1" sentinel_pid="$2" phase_pgid="$3"
+    local observed_parent observed_sentinel_pgid
+    observed_parent="$(archive_process_field ppid "$watchdog_pid")" || return 1
+    [ "$observed_parent" = "$sentinel_pid" ] || return 1
+    observed_sentinel_pgid="$(archive_process_field pgid "$sentinel_pid")" || return 1
+    [ "$observed_sentinel_pgid" = "$phase_pgid" ]
+}
+
+archive_guardian_job_is_active() {
+    local expected_pid="$1" job_pid=""
+    job_pid="$(jobs -p '%+' 2>/dev/null)" || job_pid=""
+    [ "$job_pid" = "$expected_pid" ]
+}
+
+archive_terminate_guardian_job() {
+    local watchdog_pid="$1" watchdog_pgid="$2" sentinel_pid="$3"
+    local observed_parent observed_pgid process_pid process_pgid process_state snapshot attempt
+    local all_stopped=false
+    archive_guardian_job_is_active "$watchdog_pid" || {
+        wait "$watchdog_pid" 2>/dev/null || true
+        return 0
+    }
+    observed_parent="$(archive_process_field ppid "$watchdog_pid")" || return 1
+    observed_pgid="$(archive_process_field pgid "$watchdog_pid")" || return 1
+    [ "$observed_parent" = "$sentinel_pid" ] || return 1
+    [ "$observed_pgid" = "$watchdog_pgid" ] || return 1
+    [ "$watchdog_pid" = "$watchdog_pgid" ] || return 1
+    # The guardian is this sentinel's sole job. A job-spec resolves through
+    # Bash's unreaped child table and therefore cannot target a recycled PID.
+    builtin kill -s STOP -- '%+' 2>/dev/null || return 1
+    for ((attempt = 0; attempt < 250; attempt += 1)); do
+        all_stopped=true
+        snapshot="$(LC_ALL=C /bin/ps -ax -o pid= -o pgid= -o stat= 2>/dev/null)" || {
+            all_stopped=false
+            break
+        }
+        while read -r process_pid process_pgid process_state; do
+            [ "$process_pgid" = "$watchdog_pgid" ] || continue
+            case "$process_state" in ''|Z*|T*|t*) ;; *) all_stopped=false; break ;; esac
+        done <<< "$snapshot"
+        [ "$all_stopped" = true ] && break
+        /bin/sleep 0.02
+    done
+    if [ "$all_stopped" != true ]; then
+        builtin kill -s CONT -- '%+' 2>/dev/null || true
+        return 1
+    fi
+    builtin kill -s KILL -- '%+' 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    return 0
+}
+
+archive_dispatch_sentinel() {
+    local supervisor_pid="$1" phase_pid="$2" gate="$3" phase_pgid="$4" stop_token="$5"
+    local fifo="$gate/sentinel.fifo" request_token request_verb request_argument
+    local sentinel_pid sentinel_pgid observed_parent attempt
+    local watchdog_pid="" watchdog_pgid="" last_watchdog_sequence=""
+    local supervisor_sequence="" last_supervisor_sequence=""
+    local watchdog_started_at=0 watchdog_last_seen_at=0 supervisor_last_seen_at=0
+    local guardian_requested=false guardian_finalizing=false guardian_finalized=false armed=false
+    local guardian_failed=false completion_ack_pid="" completion_ack_token=""
+    local guardian_initial_mode=monitor ready_pid ready_pgid ready_token ready_sequence
+    trap '' HUP INT TERM
+    archive_write_current_process_id "$gate/sentinel.pid.partial" || exit 125
+    IFS= read -r sentinel_pid < "$gate/sentinel.pid.partial" || exit 125
+    sentinel_pgid="$(archive_process_field pgid "$sentinel_pid")" || exit 125
+    [ "$sentinel_pgid" = "$phase_pgid" ] || exit 125
+    # Open the endpoint before publishing readiness. Otherwise a writer could
+    # successfully open its own RDWR descriptor, lose a command when it closes,
+    # and mistake that unacknowledged write for delivery.
+    exec 9<> "$fifo"
+    (umask 077; printf '%s\t%s\t%s\n' "$sentinel_pid" "$sentinel_pgid" "$stop_token" \
+        > "$gate/sentinel.ready.partial")
+    /bin/mv -f "$gate/sentinel.ready.partial" "$gate/sentinel.ready"
+    supervisor_last_seen_at="$SECONDS"
+    if [ -n "${ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES:-}" ] && \
+        [ "${ARC_ARCHIVE_DISPATCH_TEST_STOP_PHASE_AFTER_SENTINEL_READY:-false}" = true ] && \
+        mkdir "$gate/test-phase-stopped-once" 2>/dev/null; then
+        builtin kill -s STOP -- "$phase_pid"
+    fi
+    # Read/write keeps bootstrap nonblocking. Only this sentinel interprets
+    # authenticated control messages and it is itself a member of the phase
+    # group, so it can never signal a recycled numeric PGID.
+    while :; do
+        request_token=""; request_verb=""; request_argument=""
+        # Bash 3.2 accepts only integral read timeouts. A control write wakes
+        # this immediately; one second also gives portable lease pacing.
+        IFS=$'\t' read -r -t 1 -u 9 request_token request_verb request_argument || true
+        if [ "$request_token" = "$stop_token" ]; then
+            case "$request_verb:$request_argument" in
+                SIGNAL:HUP|SIGNAL:INT|SIGNAL:TERM)
+                    if builtin kill -s "$request_argument" -- "-$sentinel_pgid" 2>/dev/null; then
+                        (umask 077; printf '%s\n' "$stop_token" \
+                            > "$gate/signal.$request_argument.ack.partial") && \
+                            /bin/mv -f "$gate/signal.$request_argument.ack.partial" \
+                                "$gate/signal.$request_argument.ack"
+                    fi
+                    ;;
+                ARM:)
+                    if [ -n "$watchdog_pid" ] && archive_process_exists "$watchdog_pid" && \
+                        [ -f "$gate/watchdog.ready" ]; then
+                        armed=true
+                        (umask 077; printf '%s\t%s\n' "$sentinel_pid" "$stop_token" \
+                            > "$gate/sentinel.armed.partial") && \
+                            /bin/mv -f "$gate/sentinel.armed.partial" "$gate/sentinel.armed"
+                    fi
+                    ;;
+                FINALIZE:)
+                    guardian_requested=true
+                    guardian_finalizing=true
+                    ;;
+            esac
+            if [ "$request_verb" = FINALIZE ]; then
+                (umask 077; printf '%s\n' "$stop_token" \
+                    > "$gate/sentinel.finalize.ack.partial") && \
+                    /bin/mv -f "$gate/sentinel.finalize.ack.partial" \
+                        "$gate/sentinel.finalize.ack"
+            fi
+        fi
+
+        if [ "$guardian_requested" = false ] && [ -f "$gate/guardian.start" ] && \
+            [ ! -L "$gate/guardian.start" ]; then
+            ready_token=""
+            IFS= read -r ready_token < "$gate/guardian.start" || ready_token=""
+            [ "$ready_token" = "$stop_token" ] && guardian_requested=true
+        fi
+
+        if [ "$guardian_requested" = true ] && [ -z "$watchdog_pid" ]; then
+            rm -f -- "$gate/watchdog.ready" "$gate/guardian.heartbeat" \
+                "$gate/guardian.finalized"
+            if [ "$guardian_finalizing" = true ]; then
+                guardian_initial_mode=finalize
+            else
+                guardian_initial_mode=monitor
+            fi
+            set -m
+            archive_dispatch_parent_watchdog "$sentinel_pid" "$phase_pid" "$phase_pgid" \
+                "$sentinel_pid" "$stop_token" "$gate" "$guardian_initial_mode" &
+            watchdog_pid="$!"
+            set +m
+            watchdog_pgid="$watchdog_pid"
+            last_watchdog_sequence=""
+            watchdog_started_at="$SECONDS"; watchdog_last_seen_at="$SECONDS"
+        fi
+
+        if [ -n "$watchdog_pid" ]; then
+            if ! archive_guardian_job_is_active "$watchdog_pid"; then
+                wait "$watchdog_pid" 2>/dev/null || true
+                guardian_finalized=false
+                if [ -f "$gate/guardian.finalized" ] && [ ! -L "$gate/guardian.finalized" ]; then
+                    ready_pid=""; ready_token=""
+                    IFS=$'\t' read -r ready_pid ready_token < "$gate/guardian.finalized" || true
+                    [ "$ready_pid" = "$watchdog_pid" ] && [ "$ready_token" = "$stop_token" ] && \
+                        guardian_finalized=true
+                fi
+                watchdog_pid=""; watchdog_pgid=""
+                # Gate the sweep on the guardian receipt ALONE. The sentinel
+                # runs inside phase_pgid (set +m before the fork; asserted at
+                # sentinel start), so its own /bin/ps command-substitution
+                # children are members of the group being counted and are not
+                # in the exclusion list -- the predicate is structurally always
+                # true here, which made this sweep unreachable and stranded the
+                # 0700 gate (the phase TMPDIR holding id_ed25519, known_hosts
+                # and rclone.conf) on every guardian-kill path.
+                # It is also redundant: the guardian leads its own PGID
+                # (watchdog_pid == watchdog_pgid, :13329), so its identical
+                # calls are sound, and it writes guardian.finalized only after
+                # its anchor-validated drain loop has emptied the group.
+                if [ "$guardian_finalized" = true ]; then
+                    (umask 077; printf '%s\t%s\t%s\n' "$sentinel_pid" "$stop_token" \
+                        "$guardian_failed" > "$gate/sentinel.complete.partial") && \
+                        /bin/mv -f "$gate/sentinel.complete.partial" "$gate/sentinel.complete"
+                    # Preserve the terminal receipt until the live supervisor
+                    # acknowledges it. If that lease is gone, sweep anyway;
+                    # a resumed supervisor treats missing receipt as failure.
+                    for ((attempt = 0; attempt < 250; attempt += 1)); do
+                        if [ -f "$gate/supervisor.complete.ack" ] && \
+                            [ ! -L "$gate/supervisor.complete.ack" ]; then
+                            completion_ack_pid=""; completion_ack_token=""
+                            IFS=$'\t' read -r completion_ack_pid completion_ack_token \
+                                < "$gate/supervisor.complete.ack" || true
+                            if [ "$completion_ack_pid" = "$supervisor_pid" ] && \
+                                [ "$completion_ack_token" = "$stop_token" ]; then
+                                break
+                            fi
+                        fi
+                        /bin/sleep 0.02
+                    done
+                    archive_remove_dispatch_gate_until_absent "$gate"
+                    return 0
+                fi
+                # Any unplanned guardian exit closes the mutation boundary.
+                guardian_failed=true
+                (umask 077; printf '%s\n' "$stop_token" \
+                    > "$gate/guardian.failed.partial") && \
+                    /bin/mv -f "$gate/guardian.failed.partial" "$gate/guardian.failed"
+                guardian_finalizing=true
+                guardian_requested=true
+                continue
+            fi
+            if [ -f "$gate/guardian.heartbeat" ] && [ ! -L "$gate/guardian.heartbeat" ]; then
+                ready_pid=""; ready_pgid=""; ready_token=""; ready_sequence=""
+                IFS=$'\t' read -r ready_pid ready_pgid ready_token ready_sequence \
+                    < "$gate/guardian.heartbeat" || true
+                if [ "$ready_pid" = "$watchdog_pid" ] && [ "$ready_pgid" = "$watchdog_pgid" ] && \
+                    [ "$ready_token" = "$stop_token" ] && [ -n "$ready_sequence" ] && \
+                    [ "$ready_sequence" != "$last_watchdog_sequence" ]; then
+                    last_watchdog_sequence="$ready_sequence"
+                    watchdog_last_seen_at="$SECONDS"
+                fi
+            fi
+            if [ $((SECONDS - watchdog_last_seen_at)) -ge 3 ] || \
+                { [ ! -f "$gate/watchdog.ready" ] && \
+                    [ $((SECONDS - watchdog_started_at)) -ge 3 ]; }; then
+                # The guardian is an unreaped direct child and its separate
+                # process group is the sentinel's sole job. Stop/kill/reap that
+                # exact job before any replacement; if it cannot be stopped,
+                # retain the sentinel and gate indefinitely.
+                if archive_terminate_guardian_job "$watchdog_pid" "$watchdog_pgid" "$sentinel_pid"; then
+                    guardian_failed=true
+                    (umask 077; printf '%s\n' "$stop_token" \
+                        > "$gate/guardian.failed.partial") && \
+                        /bin/mv -f "$gate/guardian.failed.partial" "$gate/guardian.failed"
+                    watchdog_pid=""; watchdog_pgid=""
+                    guardian_finalizing=true
+                    guardian_requested=true
+                    continue
+                fi
+            fi
+        fi
+
+        if [ "$guardian_requested" = true ] && [ "$guardian_finalizing" = false ]; then
+            if [ -f "$gate/supervisor.heartbeat" ] && [ ! -L "$gate/supervisor.heartbeat" ]; then
+                ready_pid=""; ready_token=""; supervisor_sequence=""
+                IFS=$'\t' read -r ready_pid ready_token supervisor_sequence \
+                    < "$gate/supervisor.heartbeat" || true
+                if [ "$ready_pid" = "$supervisor_pid" ] && [ "$ready_token" = "$stop_token" ] && \
+                    [ -n "$supervisor_sequence" ] && \
+                    [ "$supervisor_sequence" != "$last_supervisor_sequence" ]; then
+                    last_supervisor_sequence="$supervisor_sequence"
+                    supervisor_last_seen_at="$SECONDS"
+                fi
+            fi
+            # A stopped, killed, or wedged supervisor loses its mutation lease.
+            # It has no numeric PGID capability, so a later resume cannot hit a
+            # released/reused group after this fail-closed finalization.
+            [ $((SECONDS - supervisor_last_seen_at)) -lt 3 ] || guardian_finalizing=true
+        elif [ "$armed" = false ]; then
+            observed_parent="$(archive_process_field ppid "$phase_pid")" || observed_parent=""
+            if [ "$observed_parent" != "$supervisor_pid" ]; then
+                guardian_requested=true
+                guardian_finalizing=true
+            fi
+        fi
+
+        if [ "$guardian_finalizing" = true ] && [ -n "$watchdog_pid" ] && \
+            [ -f "$gate/watchdog.ready" ] && [ ! -L "$gate/watchdog.ready" ]; then
+            (umask 077; printf '%s\t%s\n' "$watchdog_pid" "$stop_token" \
+                > "$gate/guardian.finalize.partial") && \
+                /bin/mv -f "$gate/guardian.finalize.partial" "$gate/guardian.finalize"
+        fi
+    done
+}
+
+archive_stop_dispatch_sentinel() {
+    local sentinel_pid="$1" phase_pgid="$2" fifo="$3" stop_token="$4"
+    local observed_pgid
+    while archive_process_exists "$sentinel_pid"; do
+        observed_pgid="$(archive_process_field pgid "$sentinel_pid")" || {
+            /bin/sleep 0.02
+            continue
+        }
+        # A different group proves that the anchored process exited and its PID
+        # was reused. Never signal that unrelated replacement.
+        [ "$observed_pgid" = "$phase_pgid" ] || return 0
+        # Opening the private FIFO read/write never blocks even if the sentinel
+        # exits between identity validation and this cooperative exact-token
+        # stop. Do not numeric-kill across that PID-reuse window.
+        if [ -p "$fifo" ] && [ ! -L "$fifo" ] && exec 8<> "$fifo"; then
+            printf '%s\tFINALIZE\t\n' "$stop_token" >&8 || true
+            exec 8>&-
+            exec 8<&-
+        fi
+        /bin/sleep 0.02
+    done
+    return 0
+}
+
+archive_remove_dispatch_gate() {
+    local gate="$1" attempt
+    for ((attempt = 0; attempt < 3; attempt += 1)); do
+        rm -rf -- "$gate" 2>/dev/null || true
+        if [ ! -e "$gate" ] && [ ! -L "$gate" ]; then
+            return 0
+        fi
+        /bin/sleep 0.02
+    done
+    return 1
+}
+
+archive_write_phase_override_snapshot() {
+    local gate="$1" partial="$1/phase-overrides.sh.partial"
+    local function_name override_names="${ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES:-}"
+    local IFS=$' \t\n'
+    # The executable production CLI rejects overrides below. Sourced contract
+    # tests may name only the few test doubles that the fresh phase interpreter
+    # must retain; never serialize the whole shell function table (Bash 3.2
+    # cannot round-trip some heredoc definitions emitted by `declare -f`).
+    (umask 077; : > "$partial") || return 1
+    for function_name in $override_names; do
+        case "$function_name" in
+            ''|*[!A-Za-z0-9_]*) return 1 ;;
+        esac
+        case "$function_name" in [0-9]*) return 1 ;; esac
+        declare -F "$function_name" >/dev/null || return 1
+        declare -f "$function_name" >> "$partial" || return 1
+    done
+    /bin/bash -n "$partial" || return 1
+    chmod 400 "$partial" || return 1
+    /bin/mv -f "$partial" "$gate/phase-overrides.sh"
+}
+
+archive_remove_dispatch_gate_until_absent() {
+    local gate="$1" attempts=0
+    while ! archive_remove_dispatch_gate "$gate"; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -eq 1 ] || [ $((attempts % 60)) -eq 0 ]; then
+            printf 'archive fleet: FATAL guardian retaining and retrying private dispatch gate: %s\n' \
+                "$gate" >&2
+        fi
+        /bin/sleep 1
+    done
+    return 0
+}
+
+ARC_ARCHIVE_DISPATCH_GATE=""
+ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
+ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
+ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
+ARC_ARCHIVE_DISPATCH_SIGNAL=""
+ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS=0
+ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false
+
+archive_dispatch_forward_signal() {
+    local signal="$1" status="$2"
+    if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
+        ARC_ARCHIVE_DISPATCH_SIGNAL="$signal"
+        ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS="$status"
+    fi
+    if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED" = false ]; then
+        if [ "$ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED" = true ]; then
+            # After the arm handshake, only the in-group sentinel may interpret
+            # the numeric phase PGID. This parent writes an authenticated FIFO
+            # command and later requires the sentinel's acknowledgement.
+            if archive_send_sentinel_command "$ARC_ARCHIVE_DISPATCH_GATE" \
+                "$ARC_ARCHIVE_DISPATCH_STOP_TOKEN" SIGNAL \
+                "$ARC_ARCHIVE_DISPATCH_SIGNAL"; then
+                ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=true
+            fi
+        else
+            if [ "$ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE" = true ]; then
+                # The shell job table cannot resolve a completed job to a
+                # recycled numeric PID. The phase is the sole parent job until
+                # validated sentinel-anchored group signaling takes over.
+                if builtin kill -s "$ARC_ARCHIVE_DISPATCH_SIGNAL" -- '%%' 2>/dev/null; then
+                    ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=true
+                fi
+            fi
+        fi
+    fi
+}
+
+archive_restore_signal_trap() {
+    local saved="$1" signal="$2"
+    trap - "$signal"
+    if [ -n "$saved" ]; then
+        # `trap -p` emits shell-quoted Bash syntax; evaluating only that
+        # interpreter-generated value restores the caller's exact handler.
+        # shellcheck disable=SC2294
+        eval "$saved"
+    fi
+}
+
+archive_dispatch_phase() {
+    local supervisor_pid="$1" gate="$2" command_name="$3"
+    shift 3
+    local phase_pid="" phase_pgid="" sentinel_pid="" sentinel_pgid=""
+    local observed_parent="" stop_token="" ready_sentinel_pid="" ready_stop_token=""
+    local bootstrap_exit_status=0 bootstrap_attempt
+    local bootstrap_signal_status=0 sentinel_handed_off=false
+    set +m
+    trap 'bootstrap_exit_status=$?; trap - EXIT; \
+        if [ "$sentinel_handed_off" = false ] && [ -n "$sentinel_pid" ] && \
+            [ -n "$phase_pgid" ] && [ -n "$stop_token" ]; then \
+            archive_stop_dispatch_sentinel "$sentinel_pid" "$phase_pgid" \
+                "$gate/sentinel.fifo" "$stop_token"; \
+        fi; \
+        exit "$bootstrap_exit_status"' EXIT
+    # Bootstrap signals are recorded, not allowed to orphan a half-published
+    # sentinel. They become exact exits immediately after readiness is durable.
+    trap 'bootstrap_signal_status=129' HUP
+    trap 'bootstrap_signal_status=130' INT
+    trap 'bootstrap_signal_status=143' TERM
+    archive_write_current_process_id "$gate/phase.pid.partial" || exit 125
+    IFS= read -r phase_pid < "$gate/phase.pid.partial" || exit 125
+    phase_pgid="$(archive_process_field pgid "$phase_pid")" || exit 125
+    mkfifo "$gate/sentinel.fifo" || exit 125
+    chmod 600 "$gate/sentinel.fifo" || exit 125
+    stop_token="ARC-ARCHIVE-STOP:$supervisor_pid:$phase_pid:$RANDOM:$RANDOM"
+    archive_dispatch_sentinel "$supervisor_pid" "$phase_pid" "$gate" "$phase_pgid" \
+        "$stop_token" &
+    sentinel_pid="$!"
+    for ((bootstrap_attempt = 0; bootstrap_attempt < 250; bootstrap_attempt += 1)); do
+        [ -f "$gate/sentinel.ready" ] && break
+        archive_process_exists "$sentinel_pid" || break
+        /bin/sleep 0.02
+    done
+    if [ ! -f "$gate/sentinel.ready" ] || [ -L "$gate/sentinel.ready" ]; then
+        exit 125
+    fi
+    IFS=$'\t' read -r ready_sentinel_pid sentinel_pgid ready_stop_token \
+        < "$gate/sentinel.ready" || exit 125
+    if [ "$ready_sentinel_pid" != "$sentinel_pid" ] || \
+        [ "$sentinel_pgid" != "$phase_pgid" ] || \
+        [ "$ready_stop_token" != "$stop_token" ] || [ "$sentinel_pid" = "$phase_pid" ]; then
+        exit 125
+    fi
+    TMPDIR="$gate/runtime"
+    export TMPDIR
+    (umask 077; printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$phase_pid" "$phase_pgid" "$sentinel_pid" "$sentinel_pgid" "$stop_token" \
+        > "$gate/phase.ready.partial")
+    /bin/mv -f "$gate/phase.ready.partial" "$gate/phase.ready"
+    sentinel_handed_off=true
+    trap - EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    case "$bootstrap_signal_status" in
+        0) ;;
+        129|130|143) exit "$bootstrap_signal_status" ;;
+        *) exit 125 ;;
+    esac
+    while [ ! -f "$gate/go" ]; do
+        observed_parent="$(archive_process_field ppid "$phase_pid")" || observed_parent=""
+        if [ "$observed_parent" != "$supervisor_pid" ]; then
+            archive_stop_dispatch_sentinel "$sentinel_pid" "$phase_pgid" \
+                "$gate/sentinel.fifo" "$stop_token"
+            archive_remove_dispatch_gate_until_absent "$gate"
+            exit 143
+        fi
+        /bin/sleep 0.02
+    done
+    # Keep this as a direct simple command. Placing a phase function in an
+    # if/!/&&/|| condition disables errexit throughout that function and could
+    # let a failed precondition continue into a later mutation.
+    "$command_name" "$@"
+}
+
+archive_dispatch_parent_watchdog() {
+    local sentinel_parent_pid="$1" phase_pid="$2" phase_pgid="$3" sentinel_pid="$4"
+    local stop_token="$5" gate="$6" guardian_mode="${7:-monitor}"
+    local watchdog_pid watchdog_pgid observed_parent attempt requested_pid requested_token
+    local heartbeat_sequence=0
+    set +m
+    trap '' HUP INT TERM
+    archive_write_current_process_id "$gate/watchdog.pid.partial" || exit 125
+    IFS= read -r watchdog_pid < "$gate/watchdog.pid.partial" || exit 125
+    watchdog_pgid="$(archive_process_field pgid "$watchdog_pid")" || exit 125
+    [ "$watchdog_pid" = "$watchdog_pgid" ] || exit 125
+    observed_parent="$(archive_process_field ppid "$watchdog_pid")" || exit 125
+    [ "$observed_parent" = "$sentinel_parent_pid" ] || exit 125
+    if [ -n "${ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES:-}" ] && \
+        [ "${ARC_ARCHIVE_DISPATCH_TEST_STOP_WATCHDOG_BEFORE_READY:-false}" = true ] && \
+        mkdir "$gate/test-watchdog-stopped-once" 2>/dev/null; then
+        builtin kill -s STOP -- "$watchdog_pid"
+    fi
+    (umask 077; printf '%s\t%s\t%s\n' "$watchdog_pid" "$watchdog_pgid" "$stop_token" \
+        > "$gate/watchdog.ready.partial")
+    /bin/mv -f "$gate/watchdog.ready.partial" "$gate/watchdog.ready"
+    if [ "$guardian_mode" = monitor ]; then
+        while :; do
+            heartbeat_sequence=$((heartbeat_sequence + 1))
+            archive_guardian_publish_heartbeat "$gate" "$watchdog_pid" "$watchdog_pgid" \
+                "$stop_token" "$heartbeat_sequence" || exit 125
+            if [ -f "$gate/guardian.finalize" ] && [ ! -L "$gate/guardian.finalize" ]; then
+                requested_pid=""; requested_token=""
+                IFS=$'\t' read -r requested_pid requested_token \
+                    < "$gate/guardian.finalize" || true
+                if [ "$requested_pid" = "$watchdog_pid" ] && \
+                    [ "$requested_token" = "$stop_token" ]; then
+                    guardian_mode=finalize
+                    break
+                fi
+            fi
+            observed_parent="$(archive_process_field ppid "$watchdog_pid")" || observed_parent=""
+            # A guardian never acts on a numeric phase PGID after losing the
+            # sentinel that anchors it. Retain the gate and exit harmlessly;
+            # normal teardown always has the sentinel reap this child first.
+            [ "$observed_parent" = "$sentinel_parent_pid" ] || return 125
+            /bin/sleep 0.02
+        done
+    fi
+
+    [ "$guardian_mode" = finalize ] || return 125
+    archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+    # The in-group sentinel anchors phase_pgid throughout this drain. Give the
+    # phase a bounded cooperative path before exact stopped-member KILL.
+    builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 250; attempt += 1)); do
+        heartbeat_sequence=$((heartbeat_sequence + 1))
+        archive_guardian_publish_heartbeat "$gate" "$watchdog_pid" "$watchdog_pgid" \
+            "$stop_token" "$heartbeat_sequence" || return 125
+        archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+        archive_process_exists "$phase_pid" || break
+        /bin/sleep 0.02
+    done
+    if archive_process_exists "$phase_pid"; then
+        # A foreground child may ignore TERM while Bash defers its trap. Kill
+        # only the other group members. Releasing Bash's already-pending TERM
+        # lets its EXIT handler run without a second signal interrupting it.
+        archive_stop_and_kill_group_members_except "$phase_pgid" \
+            "$phase_pid" "$sentinel_pid" || true
+        for ((attempt = 0; attempt < 250; attempt += 1)); do
+            heartbeat_sequence=$((heartbeat_sequence + 1))
+            archive_guardian_publish_heartbeat "$gate" "$watchdog_pid" "$watchdog_pgid" \
+                "$stop_token" "$heartbeat_sequence" || return 125
+            archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+            archive_process_exists "$phase_pid" || break
+            /bin/sleep 0.02
+        done
+    fi
+    if archive_process_exists "$phase_pid"; then
+        # No software can make an EXIT trap run in a permanently wedged Bash.
+        # Bound the guardian instead of permitting post-parent mutations.
+        archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
+    fi
+    if archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
+        archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+        builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
+        for ((attempt = 0; attempt < 250; attempt += 1)); do
+            heartbeat_sequence=$((heartbeat_sequence + 1))
+            archive_guardian_publish_heartbeat "$gate" "$watchdog_pid" "$watchdog_pgid" \
+                "$stop_token" "$heartbeat_sequence" || return 125
+            archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+            archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid" || break
+            /bin/sleep 0.02
+        done
+    fi
+    if archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
+        # The cleanup owner is already gone, so only signal-ignoring leaked
+        # descendants remain and can be force-killed without interrupting it.
+        archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
+        for ((attempt = 0; attempt < 250; attempt += 1)); do
+            archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid" || break
+            /bin/sleep 0.02
+        done
+    fi
+    # A KILL-pending task can remain temporarily visible while uninterruptible.
+    # Retain the sentinel/gate and retry exact member kills until every mutable
+    # member is truly gone; only then release the PGID anchor by exact PID.
+    while archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; do
+        heartbeat_sequence=$((heartbeat_sequence + 1))
+        archive_guardian_publish_heartbeat "$gate" "$watchdog_pid" "$watchdog_pgid" \
+            "$stop_token" "$heartbeat_sequence" || return 125
+        archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+        archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
+        /bin/sleep 0.1
+    done
+    archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
+    (umask 077; printf '%s\t%s\n' "$watchdog_pid" "$stop_token" \
+        > "$gate/guardian.finalized.partial") || return 125
+    /bin/mv -f "$gate/guardian.finalized.partial" "$gate/guardian.finalized"
+    return 0
+}
+
+dispatch_archive_command() {
+    local command_name="$1"
+    shift
+    case "$command_name" in
+        prepare_writers|audit_writers|seal_freeze_plan|capture_phase|\
+        verify_offline_stop_phase|verify_installed_keys_phase|seal_phase|verify_complete_phase) ;;
+        *) printf 'archive fleet: internal dispatcher rejected command: %s\n' "$command_name" >&2; return 2 ;;
+    esac
+    if [ -n "${ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES:-}" ] && \
+        [ "${BASH_SOURCE[0]}" = "$0" ]; then
+        printf 'archive fleet: FATAL phase test overrides are forbidden in the executable operator CLI\n' >&2
+        return 125
+    fi
+
+    local supervisor_pid gate="" gate_parent="${TMPDIR:-/tmp}"
+    local requested_work_root="" resolved_work_root=""
+    local phase_pid="" phase_pgid="" sentinel_pid="" sentinel_pgid="" stop_token=""
+    local candidate_phase_pid="" candidate_phase_pgid="" candidate_sentinel_pid=""
+    local candidate_sentinel_pgid="" candidate_stop_token=""
+    local watchdog_pid="" watchdog_pgid="" ready_pid="" ready_pgid="" ready_token=""
+    local ready_sequence="" last_guardian_sequence="" guardian_last_seen=0
+    local supervisor_sequence=0 loop_count=0 closing_ticks=0
+    local phase_status=125 setup_status=0 attempt
+    local guardian_ready=false sentinel_adopted=false sentinel_membership_valid=false
+    local sentinel_armed=false finalize_acknowledged=false gate_removed=false
+    local terminal_receipt=false terminal_guardian_failed=""
+    local ready_fields_valid=true signal_acknowledged=false
+    local monitor_enabled=false saved_hup saved_int saved_term
+    saved_hup="$(trap -p HUP)"
+    saved_int="$(trap -p INT)"
+    saved_term="$(trap -p TERM)"
+    case $- in *m*) monitor_enabled=true ;; esac
+    ARC_ARCHIVE_DISPATCH_GATE=""
+    ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
+    ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
+    ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
+    ARC_ARCHIVE_DISPATCH_SIGNAL=""
+    ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS=0
+    ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false
+    trap 'archive_dispatch_forward_signal HUP 129' HUP
+    trap 'archive_dispatch_forward_signal INT 130' INT
+    trap 'archive_dispatch_forward_signal TERM 143' TERM
+
+    if [ "$command_name" = seal_phase ]; then
+        local argument_index argument_value
+        argument_index=1
+        while [ "$argument_index" -le "$#" ]; do
+            argument_value="${!argument_index}"
+            if [ "$argument_value" = --work-root ] && [ "$argument_index" -lt "$#" ]; then
+                argument_index=$((argument_index + 1))
+                requested_work_root="${!argument_index}"
+            fi
+            argument_index=$((argument_index + 1))
+        done
+        case "$requested_work_root" in
+            /*)
+                if [ -d "$requested_work_root" ] && [ ! -L "$requested_work_root" ] && \
+                    [ -O "$requested_work_root" ] && \
+                    resolved_work_root="$(CDPATH='' cd -- "$requested_work_root" 2>/dev/null && pwd -P)" && \
+                    [ "$resolved_work_root" = "$requested_work_root" ]; then
+                    gate_parent="$requested_work_root"
+                fi
+                ;;
+        esac
+    fi
+    if gate="$(mktemp -d "$gate_parent/arc-archive-dispatch.XXXXXX")"; then
+        chmod 700 "$gate" || setup_status=125
+        mkdir -m 700 "$gate/runtime" || setup_status=125
+        archive_write_current_process_id "$gate/supervisor.pid" || setup_status=125
+        archive_write_phase_override_snapshot "$gate" || setup_status=125
+        if [ "$setup_status" -eq 0 ]; then
+            IFS= read -r supervisor_pid < "$gate/supervisor.pid" || setup_status=125
+            case "$supervisor_pid" in ''|*[!0-9]*) setup_status=125 ;; esac
+        fi
+    else
+        setup_status=125
+    fi
+
+    if [ "$setup_status" -eq 0 ] && [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
+        set -m
+        # A fresh Bash boundary restores errexit even when the caller invokes
+        # this dispatcher under if/!/&&/||. Remove every environment-imported
+        # function before sourcing the exact orchestrator and narrow test file.
+        BASH_ENV=/dev/null ENV=/dev/null /bin/bash --noprofile --norc -Eeuo pipefail -c '
+for imported_function in $(builtin compgen -A function); do
+    builtin unset -f "$imported_function"
+done
+unset imported_function
+phase_orchestrator=$1
+phase_overrides=$2
+shift 2
+phase_arguments=("$@")
+set --
+. "$phase_orchestrator" >/dev/null
+. "$phase_overrides"
+archive_dispatch_phase "${phase_arguments[@]}"
+' arc-archive-dispatch-phase "$ORCHESTRATOR" "$gate/phase-overrides.sh" \
+            "$supervisor_pid" "$gate" "$command_name" "$@" &
+        phase_pid="$!"
+        ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=true
+        for ((attempt = 0; attempt < 250; attempt += 1)); do
+            [ -f "$gate/phase.ready" ] && break
+            archive_process_exists "$phase_pid" || break
+            /bin/sleep 0.02
+        done
+        if [ ! -f "$gate/phase.ready" ]; then
+            for ((attempt = 0; attempt < 250; attempt += 1)); do
+                [ -f "$gate/sentinel.ready" ] && break
+                archive_process_exists "$phase_pid" || break
+                /bin/sleep 0.02
+            done
+        fi
+        if [ -f "$gate/phase.ready" ] && [ ! -L "$gate/phase.ready" ]; then
+            IFS=$'\t' read -r candidate_phase_pid candidate_phase_pgid \
+                candidate_sentinel_pid candidate_sentinel_pgid candidate_stop_token \
+                < "$gate/phase.ready" || setup_status=125
+            case "$candidate_phase_pid:$candidate_phase_pgid:$candidate_sentinel_pid:$candidate_sentinel_pgid" in
+                *[!0-9:]*) ready_fields_valid=false ;;
+            esac
+            if [ "$ready_fields_valid" = false ] || \
+                [ "$candidate_phase_pid" != "$phase_pid" ] || \
+                [ "$candidate_phase_pgid" != "$phase_pid" ] || \
+                [ "$candidate_sentinel_pid" = "$candidate_phase_pid" ] || \
+                [ "$candidate_sentinel_pgid" != "$candidate_phase_pgid" ] || \
+                [ -z "$candidate_stop_token" ]; then
+                setup_status=125
+            else
+                phase_pgid="$candidate_phase_pgid"
+                sentinel_pid="$candidate_sentinel_pid"
+                sentinel_pgid="$candidate_sentinel_pgid"
+                stop_token="$candidate_stop_token"
+                sentinel_adopted=true
+            fi
+        else
+            setup_status=125
+        fi
+        if [ "$sentinel_adopted" = false ] && [ -f "$gate/sentinel.ready" ] && \
+            [ ! -L "$gate/sentinel.ready" ]; then
+            candidate_sentinel_pid=""; candidate_sentinel_pgid=""; candidate_stop_token=""
+            IFS=$'\t' read -r candidate_sentinel_pid candidate_sentinel_pgid candidate_stop_token \
+                < "$gate/sentinel.ready" || true
+            case "$candidate_sentinel_pid:$candidate_sentinel_pgid" in
+                *[!0-9:]*) ;;
+                *)
+                    if [ "$candidate_sentinel_pgid" = "$phase_pid" ] && \
+                        [ -n "$candidate_stop_token" ]; then
+                        phase_pgid="$candidate_sentinel_pgid"
+                        sentinel_pid="$candidate_sentinel_pid"
+                        sentinel_pgid="$candidate_sentinel_pgid"
+                        stop_token="$candidate_stop_token"
+                        sentinel_adopted=true
+                    fi
+                    ;;
+            esac
+        fi
+        if [ "$sentinel_adopted" = true ]; then
+            for ((attempt = 0; attempt < 250; attempt += 1)); do
+                if archive_process_in_group "$sentinel_pid" "$phase_pgid"; then
+                    sentinel_membership_valid=true
+                    break
+                fi
+                archive_process_exists "$sentinel_pid" || break
+                /bin/sleep 0.02
+            done
+        fi
+        [ "$sentinel_membership_valid" = true ] || setup_status=125
+    fi
+
+    if [ "$sentinel_membership_valid" = true ] && \
+        [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
+        supervisor_sequence=$((supervisor_sequence + 1))
+        archive_supervisor_publish_heartbeat "$gate" "$supervisor_pid" "$stop_token" \
+            "$supervisor_sequence" || setup_status=125
+        if ! (umask 077; printf '%s\n' "$stop_token" > "$gate/guardian.start.partial") || \
+            ! /bin/mv -f "$gate/guardian.start.partial" "$gate/guardian.start"; then
+            setup_status=125
+        fi
+        for ((attempt = 0; attempt < 500; attempt += 1)); do
+            [ -f "$gate/watchdog.ready" ] && break
+            [ -e "$gate" ] || break
+            supervisor_sequence=$((supervisor_sequence + 1))
+            archive_supervisor_publish_heartbeat "$gate" "$supervisor_pid" "$stop_token" \
+                "$supervisor_sequence" || { setup_status=125; break; }
+            /bin/sleep 0.02
+        done
+        if [ -f "$gate/watchdog.ready" ] && [ ! -L "$gate/watchdog.ready" ]; then
+            ready_pid=""; ready_pgid=""; ready_token=""
+            IFS=$'\t' read -r ready_pid ready_pgid ready_token \
+                < "$gate/watchdog.ready" || setup_status=125
+            if [ "$ready_pid" = "$ready_pgid" ] && [ "$ready_pgid" != "$phase_pgid" ] && \
+                [ "$ready_token" = "$stop_token" ]; then
+                watchdog_pid="$ready_pid"
+                watchdog_pgid="$ready_pgid"
+                for ((attempt = 0; attempt < 250; attempt += 1)); do
+                    ready_pid="$(archive_process_field ppid "$watchdog_pid")" || ready_pid=""
+                    if [ "$ready_pid" = "$sentinel_pid" ] && \
+                        archive_process_in_group "$watchdog_pid" "$watchdog_pgid"; then
+                        guardian_ready=true
+                        break
+                    fi
+                    /bin/sleep 0.02
+                done
+            fi
+        fi
+        [ "$guardian_ready" = true ] || setup_status=125
+        if [ "$guardian_ready" = true ]; then
+            guardian_ready=false
+            for ((attempt = 0; attempt < 250; attempt += 1)); do
+                if [ -f "$gate/guardian.heartbeat" ] && \
+                    [ ! -L "$gate/guardian.heartbeat" ]; then
+                    ready_pid=""; ready_pgid=""; ready_token=""; ready_sequence=""
+                    IFS=$'\t' read -r ready_pid ready_pgid ready_token ready_sequence \
+                        < "$gate/guardian.heartbeat" || true
+                    if [ "$ready_pid" = "$watchdog_pid" ] && \
+                        [ "$ready_pgid" = "$watchdog_pgid" ] && \
+                        [ "$ready_token" = "$stop_token" ] && [ -n "$ready_sequence" ]; then
+                        last_guardian_sequence="$ready_sequence"
+                        guardian_last_seen="$SECONDS"
+                        guardian_ready=true
+                        break
+                    fi
+                fi
+                /bin/sleep 0.02
+            done
+            [ "$guardian_ready" = true ] || setup_status=125
+        fi
+        [ ! -f "$gate/guardian.failed" ] || setup_status=125
+        if [ "$guardian_ready" = true ]; then
+            for ((attempt = 0; attempt < 250; attempt += 1)); do
+                supervisor_sequence=$((supervisor_sequence + 1))
+                archive_supervisor_publish_heartbeat "$gate" "$supervisor_pid" "$stop_token" \
+                    "$supervisor_sequence" || { setup_status=125; break; }
+                archive_send_sentinel_command "$gate" "$stop_token" ARM || true
+                if [ -f "$gate/sentinel.armed" ] && [ ! -L "$gate/sentinel.armed" ]; then
+                    ready_pid=""; ready_token=""
+                    IFS=$'\t' read -r ready_pid ready_token < "$gate/sentinel.armed" || true
+                    if [ "$ready_pid" = "$sentinel_pid" ] && [ "$ready_token" = "$stop_token" ]; then
+                        sentinel_armed=true
+                        break
+                    fi
+                fi
+                [ -e "$gate" ] || break
+                /bin/sleep 0.02
+            done
+        fi
+        [ "$sentinel_armed" = true ] || setup_status=125
+        if [ "$sentinel_armed" = true ]; then
+            ARC_ARCHIVE_DISPATCH_GATE="$gate"
+            ARC_ARCHIVE_DISPATCH_STOP_TOKEN="$stop_token"
+            ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=true
+            ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
+        fi
+    fi
+
+    if [ "$setup_status" -eq 0 ] && [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
+        if ! (umask 077; printf 'go\n' > "$gate/go.partial") || \
+            ! /bin/mv -f "$gate/go.partial" "$gate/go"; then
+            setup_status=125
+        fi
+    fi
+    if [ "$setup_status" -ne 0 ] || [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
+        if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
+            archive_dispatch_forward_signal "$ARC_ARCHIVE_DISPATCH_SIGNAL" \
+                "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
+        fi
+        if [ "$sentinel_membership_valid" = true ] && [ "$setup_status" -ne 0 ]; then
+            archive_send_sentinel_command "$gate" "$stop_token" FINALIZE || true
+        elif [ "$sentinel_membership_valid" = false ] && [ -n "$phase_pid" ]; then
+            builtin kill -s TERM -- '%%' 2>/dev/null || true
+            builtin kill -s CONT -- '%%' 2>/dev/null || true
+        fi
+    fi
+
+    if [ -n "$phase_pid" ]; then
+        while archive_process_exists "$phase_pid"; do
+            loop_count=$((loop_count + 1))
+            if [ "$sentinel_membership_valid" = true ] && [ -e "$gate" ] && \
+                [ $((loop_count % 5)) -eq 0 ]; then
+                supervisor_sequence=$((supervisor_sequence + 1))
+                archive_supervisor_publish_heartbeat "$gate" "$supervisor_pid" "$stop_token" \
+                    "$supervisor_sequence" || setup_status=125
+            fi
+            if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
+                archive_dispatch_forward_signal "$ARC_ARCHIVE_DISPATCH_SIGNAL" \
+                    "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
+                if [ -f "$gate/signal.$ARC_ARCHIVE_DISPATCH_SIGNAL.ack" ] && \
+                    [ ! -L "$gate/signal.$ARC_ARCHIVE_DISPATCH_SIGNAL.ack" ]; then
+                    ready_token=""
+                    IFS= read -r ready_token \
+                        < "$gate/signal.$ARC_ARCHIVE_DISPATCH_SIGNAL.ack" || true
+                    [ "$ready_token" = "$stop_token" ] && signal_acknowledged=true
+                fi
+            fi
+            if [ "$guardian_ready" = true ]; then
+                if [ -f "$gate/guardian.failed" ] || [ ! -f "$gate/guardian.heartbeat" ]; then
+                    setup_status=125
+                else
+                    ready_pid=""; ready_pgid=""; ready_token=""; ready_sequence=""
+                    IFS=$'\t' read -r ready_pid ready_pgid ready_token ready_sequence \
+                        < "$gate/guardian.heartbeat" || true
+                    if [ "$ready_pid" = "$watchdog_pid" ] && \
+                        [ "$ready_pgid" = "$watchdog_pgid" ] && \
+                        [ "$ready_token" = "$stop_token" ] && \
+                        [ -n "$ready_sequence" ] && \
+                        [ "$ready_sequence" != "$last_guardian_sequence" ]; then
+                        last_guardian_sequence="$ready_sequence"
+                        guardian_last_seen="$SECONDS"
+                    elif [ $((SECONDS - guardian_last_seen)) -ge 5 ]; then
+                        setup_status=125
+                    fi
+                fi
+            fi
+            if [ "$setup_status" -ne 0 ]; then
+                archive_send_sentinel_command "$gate" "$stop_token" FINALIZE || true
+                closing_ticks=$((closing_ticks + 1))
+            elif [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
+                closing_ticks=$((closing_ticks + 1))
+            fi
+            [ "$closing_ticks" -lt 1000 ] || break
+            /bin/sleep 0.02
+        done
+        if ! archive_process_exists "$phase_pid"; then
+            if wait "$phase_pid" 2>/dev/null; then phase_status=0; else phase_status=$?; fi
+        elif [ "$sentinel_membership_valid" = false ]; then
+            builtin kill -s STOP -- '%%' 2>/dev/null || true
+            builtin kill -s KILL -- '%%' 2>/dev/null || true
+            wait "$phase_pid" 2>/dev/null || true
+            setup_status=125
+        else
+            setup_status=125
+        fi
+    fi
+
+    if [ "$sentinel_membership_valid" = true ] && [ -e "$gate" ]; then
+        for ((attempt = 0; attempt < 500; attempt += 1)); do
+            archive_send_sentinel_command "$gate" "$stop_token" FINALIZE || true
+            if [ -f "$gate/sentinel.finalize.ack" ] && \
+                [ ! -L "$gate/sentinel.finalize.ack" ]; then
+                ready_token=""
+                IFS= read -r ready_token < "$gate/sentinel.finalize.ack" || true
+                [ "$ready_token" = "$stop_token" ] && finalize_acknowledged=true
+            fi
+            [ "$finalize_acknowledged" = true ] && break
+            [ -e "$gate" ] || break
+            supervisor_sequence=$((supervisor_sequence + 1))
+            archive_supervisor_publish_heartbeat "$gate" "$supervisor_pid" "$stop_token" \
+                "$supervisor_sequence" || true
+            /bin/sleep 0.02
+        done
+        if [ "$finalize_acknowledged" = false ] && [ -e "$gate" ]; then
+            setup_status=125
+        fi
+        for ((attempt = 0; attempt < 1000; attempt += 1)); do
+            if [ -f "$gate/sentinel.complete" ] && [ ! -L "$gate/sentinel.complete" ]; then
+                ready_pid=""; ready_token=""; terminal_guardian_failed=""
+                IFS=$'\t' read -r ready_pid ready_token terminal_guardian_failed \
+                    < "$gate/sentinel.complete" || true
+                if [ "$ready_pid" = "$sentinel_pid" ] && [ "$ready_token" = "$stop_token" ]; then
+                    case "$terminal_guardian_failed" in true|false) terminal_receipt=true ;; esac
+                    break
+                fi
+            fi
+            [ -e "$gate" ] || break
+            /bin/sleep 0.02
+        done
+        if [ "$terminal_receipt" = true ]; then
+            [ "$terminal_guardian_failed" = false ] || setup_status=125
+            (umask 077; printf '%s\t%s\n' "$supervisor_pid" "$stop_token" \
+                > "$gate/supervisor.complete.ack.partial") && \
+                /bin/mv -f "$gate/supervisor.complete.ack.partial" \
+                    "$gate/supervisor.complete.ack" || setup_status=125
+        else
+            # The sentinel may have failed closed while this supervisor was
+            # stopped. Absence without the sticky terminal receipt is not a
+            # normal success proof.
+            setup_status=125
+        fi
+        ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
+        ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
+        ARC_ARCHIVE_DISPATCH_GATE=""
+        ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
+        for ((attempt = 0; attempt < 1000; attempt += 1)); do
+            if [ ! -e "$gate" ] && [ ! -L "$gate" ]; then
+                gate_removed=true
+                break
+            fi
+            /bin/sleep 0.02
+        done
+        if [ "$gate_removed" = false ]; then
+            printf 'archive fleet: FATAL containment continues asynchronously in private gate: %s\n' \
+                "$gate" >&2
+            setup_status=125
+        fi
+    elif [ -n "$gate" ]; then
+        if [ -n "$phase_pid" ] && archive_process_exists "$phase_pid"; then
+            setup_status=125
+        elif archive_remove_dispatch_gate "$gate"; then
+            gate_removed=true
+        else
+            archive_remove_dispatch_gate_until_absent "$gate"
+            gate_removed=true
+            setup_status=125
+        fi
+    fi
+
+    if [ -n "$phase_pid" ] && ! archive_process_exists "$phase_pid"; then
+        wait "$phase_pid" 2>/dev/null || true
+    fi
+    ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false
+    ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=false
+    ARC_ARCHIVE_DISPATCH_GATE=""
+    ARC_ARCHIVE_DISPATCH_STOP_TOKEN=""
+    archive_restore_signal_trap "$saved_hup" HUP
+    archive_restore_signal_trap "$saved_int" INT
+    archive_restore_signal_trap "$saved_term" TERM
+    if [ "$monitor_enabled" = true ]; then set -m; else set +m; fi
+
+    if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -ne 0 ]; then
+        if [ "$sentinel_armed" = true ] && [ "$signal_acknowledged" = false ] && \
+            [ "$gate_removed" = false ]; then
+            printf 'archive fleet: FATAL signal delivery unacknowledged; containment retained: %s\n' \
+                "$gate" >&2
+        fi
+        return "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"
+    fi
+    [ "$setup_status" -eq 0 ] || return "$setup_status"
+    return "$phase_status"
+}
+
 COMMAND="${1:-}"
 if [ -n "$COMMAND" ]; then
     shift
 fi
 case "$COMMAND" in
-    prepare-writers) prepare_writers "$@" ;;
-    audit-writers) audit_writers "$@" ;;
-    seal-freeze-plan) seal_freeze_plan "$@" ;;
-    capture) capture_phase "$@" ;;
-    verify-offline-stop) verify_offline_stop_phase "$@" ;;
-    verify-installed-keys) verify_installed_keys_phase "$@" ;;
-    seal) seal_phase "$@" ;;
-    verify-complete) verify_complete_phase "$@" ;;
+    prepare-writers) dispatch_archive_command prepare_writers "$@" ;;
+    audit-writers) dispatch_archive_command audit_writers "$@" ;;
+    seal-freeze-plan) dispatch_archive_command seal_freeze_plan "$@" ;;
+    capture) dispatch_archive_command capture_phase "$@" ;;
+    verify-offline-stop) dispatch_archive_command verify_offline_stop_phase "$@" ;;
+    verify-installed-keys) dispatch_archive_command verify_installed_keys_phase "$@" ;;
+    seal) dispatch_archive_command seal_phase "$@" ;;
+    verify-complete) dispatch_archive_command verify_complete_phase "$@" ;;
     -h|--help|help|'') usage ;;
     *) usage >&2; exit 2 ;;
 esac

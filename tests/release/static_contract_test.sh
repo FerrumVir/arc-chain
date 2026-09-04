@@ -18,6 +18,8 @@ GENESIS_VALIDATOR="$REPO_ROOT/scripts/release/validate-genesis.py"
 SECRET_SCANNER="$TEST_DIR/current_tree_secret_scan.sh"
 SECRET_MATERIALIZER="$TEST_DIR/materialize_releasable_tree.py"
 QUALITY_HARNESS="$REPO_ROOT/scripts/ci_check.sh"
+CARGO_DENY_RUNNER="$REPO_ROOT/scripts/ci/run-cargo-deny.sh"
+VENDORED_ADVISORY_SHADOW="$REPO_ROOT/scripts/ci/vendored-advisory-shadow.py"
 COMMUNITY_JOIN="$REPO_ROOT/scripts/join-testnet.sh"
 INFERENCE_JOIN="$REPO_ROOT/scripts/join-inference.sh"
 INFERENCE_INSTALL="$REPO_ROOT/scripts/install-inference-node.sh"
@@ -42,6 +44,8 @@ VALIDATOR_VAULT_RESTORE="$REPO_ROOT/scripts/release/restore-validator-vault.py"
 PRODUCTION_MANIFEST_BUILDER="$REPO_ROOT/scripts/recovery/build-production-manifest.py"
 PRODUCTION_MANIFEST_TEST="$TEST_DIR/production_manifest_builder_test.sh"
 RECOVERY_RUNBOOK="$REPO_ROOT/scripts/recovery/README.md"
+RECOVERY_ROLLOUT="$REPO_ROOT/scripts/recovery/recovery_rollout.py"
+RECOVERY_ARCHIVE="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
 RELEASE_TEST_RUNNER="$TEST_DIR/run.sh"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
@@ -968,6 +972,37 @@ release_supply_chain_and_npm_audits_are_blocking() {
         return 1
     fi
 
+    for required in \
+        'SHADOW_HELPER="$SCRIPT_DIR/vendored-advisory-shadow.py"' \
+        'SHADOW_PROFILE=root' \
+        'SHADOW_PROFILE=desktop' \
+        'python3 "$SHADOW_HELPER" write-policy' \
+        '--config "$SHADOW_POLICY"' \
+        '--metadata-path "$SHADOW_METADATA"' \
+        'check --audit-compatible-output advisories' \
+        'python3 "$SHADOW_HELPER" verify-report'
+    do
+        if [ "$(grep -Fc -- "$required" "$CARGO_DENY_RUNNER")" -ne 1 ]; then
+            printf 'vendored advisory registry-shadow wiring drifted: %s\n' "$required"
+            return 1
+        fi
+    done
+    if grep -Fq -- 'vendored-glib-advisory-shadow.py' "$CARGO_DENY_RUNNER"; then
+        printf 'cargo-deny runner retained the partial glib-only advisory helper\n'
+        return 1
+    fi
+    for required in \
+        'write_shadow_policy' \
+        'ignore = []' \
+        'registry-shadow advisory policy must be suppression-free' \
+        'root vendored packages have live advisory findings'
+    do
+        grep -Fq -- "$required" "$VENDORED_ADVISORY_SHADOW" || {
+            printf 'vendored advisory helper omits fail-closed invariant: %s\n' "$required"
+            return 1
+        }
+    done
+
     printf '%s\n' "$quality_block" \
         | grep -Fq 'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
         || {
@@ -1276,6 +1311,19 @@ release_secret_jobs_require_the_owner_environment() {
         capture { print }
         capture && /^  seal:/ { exit }
     ' "$RELEASE_PREFLIGHT_WORKFLOW")"
+
+    # An empty capture means we failed to READ the workflow, not that the job is
+    # missing a literal. Under resource pressure a command substitution can fork
+    # -fail and return empty, which then reports as "omits <literal>" and sends
+    # the reader hunting a non-existent workflow regression. Distinguish them.
+    for captured in unsigned_block handoff_block signer_block; do
+        eval "captured_value=\${$captured}"
+        [ -n "$captured_value" ] || {
+            printf 'could not capture %s from %s (empty awk result, not a missing literal)\n' \
+                "$captured" "$RELEASE_PREFLIGHT_WORKFLOW"
+            return 1
+        }
+    done
     assembly_block="$(awk '
         /^  assemble-release:/ { capture=1 }
         capture { print }
@@ -2245,6 +2293,332 @@ validator_vault_restore_and_install_are_fail_closed() {
     fi
 }
 
+recovery_plan_remote_transport_is_read_only() {
+    python3 - "$RECOVERY_ROLLOUT" <<'PY'
+import ast
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+tree = ast.parse(source)
+rollout_class = next(
+    node
+    for node in tree.body
+    if isinstance(node, ast.ClassDef) and node.name == "RecoveryRollout"
+)
+methods = {
+    node.name: node
+    for node in rollout_class.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+
+required_methods = {
+    "_preflight_production", "ssh_read_only", "ssh", "_run_ssh_script",
+    "_rclone_cat_pinned_archive_object",
+}
+if not required_methods.issubset(methods):
+    raise SystemExit("recovery rollout omits the explicit read-only SSH boundary")
+
+preflight_calls = []
+for call in ast.walk(methods["_preflight_production"]):
+    if (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "self"
+        and call.func.attr in {"ssh_read_only", "ssh", "scp", "_run_ssh_script"}
+    ):
+        preflight_calls.append(call.func.attr)
+if preflight_calls.count("ssh_read_only") != 3 or any(
+    name != "ssh_read_only" for name in preflight_calls
+):
+    raise SystemExit(
+        "production preflight must contain exactly three streamed read-only SSH call sites"
+    )
+
+read_only = ast.get_source_segment(source, methods["ssh_read_only"]) or ""
+for required in (
+    '"/usr/bin/env", "-i"',
+    '"HOME=/root"',
+    '"PATH=/usr/bin:/bin:/usr/sbin:/sbin"',
+    '"LANG=C", "LC_ALL=C"',
+    '"/bin/sh", "-s", "--"',
+    "self._run_ssh_script(",
+):
+    if required not in read_only:
+        raise SystemExit(f"read-only SSH transport omits exact streamed boundary: {required}")
+for forbidden in (
+    ".arc-recovery-rollout-helpers", "mkdir", "mktemp", "/bin/ln", "/bin/chmod"
+):
+    if forbidden in read_only:
+        raise SystemExit(f"read-only SSH transport can persist remote state: {forbidden}")
+
+mutating = ast.get_source_segment(source, methods["ssh"]) or ""
+if "/root/.arc-recovery-rollout-helpers" not in mutating:
+    raise SystemExit("execute transport lost its content-addressed helper contract")
+
+rclone_read = ast.get_source_segment(
+    source, methods["_rclone_cat_pinned_archive_object"]
+) or ""
+for required in (
+    "tempfile.TemporaryDirectory(",
+    'private_config = temporary_root / "rclone.conf"',
+    "_exclusive_write(private_config, config_payload, 0o600)",
+    '"HOME": os.fspath(temporary_root)',
+    "finally:",
+    "self._assert_production_rclone_transport()",
+):
+    if required not in rclone_read:
+        raise SystemExit(
+            f"pre-GO rclone metadata read omits private transport boundary: {required}"
+        )
+if "os.fspath(self.production_rclone_config)" in rclone_read:
+    raise SystemExit("pre-GO rclone metadata read passes the operator config directly")
+if "no persistent recovery-managed change" not in source:
+    raise SystemExit("plan output does not state the scoped recovery-state boundary")
+PY
+}
+
+archive_transport_configuration_is_invocation_scoped() {
+    python3 - "$RECOVERY_ARCHIVE" <<'PY' || return 1
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+boundaries = {
+    "audit_writers": "seal_freeze_plan() {",
+    "seal_freeze_plan": "freeze_plan_hash() {",
+    "prepare_writers": "run_remote() {",
+    "verify_offline_stop_phase": "create_offline_stop_evidence() {",
+    "capture_phase": "manifest_field() {",
+    "verify_installed_keys_phase": "upload_immutable() {",
+    "verify_complete_phase": "verify_reference_pair() (",
+    # seal_phase ends at the next top-level declaration. The previous anchor
+    # COMMAND="${1:-}" now sits ~1,600 lines further down, past the whole
+    # dispatcher, so the slice swallowed its `trap - EXIT` and aborted this
+    # gate with "seal_phase overrides its invocation EXIT cleanup" before a
+    # single dispatcher assertion could run.
+    "seal_phase": 'archive_write_current_process_id() {',
+}
+bodies = {}
+for name, next_declaration in boundaries.items():
+    declaration = f"{name}() {{"
+    start = text.index(declaration)
+    end = text.index(next_declaration, start + len(declaration))
+    body = text[start:end]
+    bodies[name] = body
+    meaningful = [
+        line.strip()
+        for line in body.splitlines()[1:]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not meaningful or meaningful[0] != "begin_temporary_scope":
+        raise SystemExit(f"{name} does not enter its temporary scope before parsing/configuration")
+    if re.search(r"(?m)^\s*trap\s+.*\sEXIT\s*$", body):
+        raise SystemExit(f"{name} overrides its invocation EXIT cleanup")
+
+transport_owners = {
+    name for name, body in bodies.items()
+    if re.search(r"(?m)^\s*configure_operator_transport\s+(?:true|false)\s*$", body)
+}
+python_owners = {
+    name for name, body in bodies.items()
+    if re.search(r"(?m)^\s*configure_operator_python\s*$", body)
+}
+if transport_owners != {
+    "audit_writers", "prepare_writers", "capture_phase",
+    "verify_installed_keys_phase", "verify_complete_phase", "seal_phase",
+}:
+    raise SystemExit(f"unexpected transport configuration owners: {sorted(transport_owners)}")
+if python_owners != {"seal_freeze_plan", "verify_offline_stop_phase"}:
+    raise SystemExit(f"unexpected direct Python configuration owners: {sorted(python_owners)}")
+
+all_transport_calls = re.findall(
+    r"(?m)^\s*configure_operator_transport\s+(?:true|false)\s*$", text
+)
+all_python_calls = re.findall(r"(?m)^\s*configure_operator_python\s*$", text)
+if len(all_transport_calls) != 6 or len(all_python_calls) != 3:
+    # The third Python call is the transport helper's internal dependency.
+    raise SystemExit("a configure call was added outside the enumerated command scopes")
+
+cleanup_start = text.index("cleanup_temporary_root() {")
+cleanup_end = text.index("begin_temporary_scope() {", cleanup_start)
+cleanup = text[cleanup_start:cleanup_end]
+scope_start = cleanup_end
+scope_end = text.index("die() {", scope_start)
+scope = text[scope_start:scope_end]
+roots = (
+    "ARCHIVE_FLEET_TEMP_ROOT", "ARCHIVE_FLEET_PINNED_ROOT",
+    "ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT", "ARCHIVE_FLEET_PINNED_PYTHON_ROOT",
+)
+for root in roots:
+    if f'"${root}"' not in cleanup:
+        raise SystemExit(f"cleanup omits {root}")
+# The sweep is a loop over exactly those four roots. Assert it does not merely
+# call rm: it must verify absence afterwards and propagate a non-zero status,
+# because an unchecked rm reported a partial credential sweep as success.
+for required in (
+    'rm -rf -- "$root" || cleanup_status=1',
+    'if [ -e "$root" ] || [ -L "$root" ]; then',
+    'FATAL credential sweep incomplete',
+    'return "$cleanup_status"',
+):
+    if required not in cleanup:
+        raise SystemExit(f"cleanup no longer guarantees a verified sweep: {required}")
+    if f'{root}=""' not in scope:
+        raise SystemExit(f"new command scope can inherit {root}")
+if scope.count("trap cleanup_temporary_root EXIT") != 1:
+    raise SystemExit("temporary scope does not install exactly one EXIT cleanup")
+for required in ("trap 'exit 129' HUP", "trap 'exit 130' INT", "trap 'exit 143' TERM"):
+    if scope.count(required) != 1:
+        raise SystemExit(f"temporary scope omits exact signal cleanup status: {required}")
+if '( audit_writers --legacy-validator-set "$legacy_validators" --output "$output" )' not in bodies["prepare_writers"]:
+    raise SystemExit("prepare-writers no longer exercises the nested audit scope")
+
+dispatcher_start = text.index("archive_write_current_process_id() {")
+dispatcher = text[dispatcher_start:]
+for required in (
+    "set -m",
+    "set +m",
+    'ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false',
+    'builtin kill -s "$ARC_ARCHIVE_DISPATCH_SIGNAL" --',
+    # The phase is a fresh profile-free Bash that drops every inherited
+    # function before sourcing the orchestrator. That unset loop is the
+    # defense against exported functions shadowing rm/mv/mktemp.
+    'for imported_function in $(builtin compgen -A function); do',
+    'arc-archive-dispatch-phase',
+    'mkdir -m 700 "$gate/runtime"',
+    'TMPDIR="$gate/runtime"',
+    'export TMPDIR',
+    'archive_remove_dispatch_gate "$gate"',
+    'archive_remove_dispatch_gate_until_absent "$gate"',
+    # The sentinel anchors the phase PGID so it cannot be reused while members
+    # are being killed by exact PID.
+    '[ "$sentinel_pgid" = "$phase_pgid" ] || exit 125',
+    # The guardian must lead its OWN group. This is precisely what makes its
+    # archive_process_group_has_members_except calls sound while the sentinel's
+    # were not: the guardian's ps children land outside the counted group.
+    '[ "$watchdog_pid" = "$watchdog_pgid" ] || exit 125',
+    # The guardian heartbeat is identity-bound to the exact watchdog pid/pgid.
+    '[ "$ready_pid" = "$watchdog_pid" ] && [ "$ready_pgid" = "$watchdog_pgid" ]',
+    # The supervisor accepts watchdog.ready only from a process that leads its
+    # own process group AND whose group is not the phase group -- the property
+    # that makes the guardian's membership queries trustworthy.
+    '[ "$ready_pid" = "$ready_pgid" ] && [ "$ready_pgid" != "$phase_pgid" ]',
+    'observed_parent="$(archive_process_field ppid "$watchdog_pid")"',
+    # Bash 3.2 + set -u: an unguarded empty-array expansion is fatal and no
+    # caller-side "|| true" suppresses it. Dying there leaves the whole group
+    # SIGSTOPped with its matching CONT never reached.
+    '${targets[@]+"${targets[@]}"}',
+    'wait "$phase_pid"',
+    'archive_restore_signal_trap "$saved_hup" HUP',
+    'archive_restore_signal_trap "$saved_int" INT',
+    'archive_restore_signal_trap "$saved_term" TERM',
+):
+    if required not in dispatcher:
+        raise SystemExit(f"archive dispatcher omits supervised signal contract: {required}")
+phase_body = text[
+    text.index("archive_dispatch_phase() {"):
+    text.index("archive_dispatch_parent_watchdog() {")
+]
+if '\n    "$command_name" "$@"\n' not in phase_body:
+    raise SystemExit("archive phase is not invoked as a direct fail-fast simple command")
+if re.search(r'(?m)^\s*(?:if|!)[^\n]*"\$command_name"', phase_body) or \
+        re.search(r'"\$command_name"[^\n]*(?:&&|\|\|)', phase_body):
+    raise SystemExit("archive phase command is in a context that disables function errexit")
+if 'TMPDIR="$work_root" verify_reference_pair' in text:
+    raise SystemExit("seal reference scratch escapes the supervisor-owned dispatch gate")
+if 'mktemp -d "$work_root/arc-archive-seal.' in text:
+    raise SystemExit("seal execution scratch escapes the supervisor-owned dispatch gate")
+if 'gate_parent="$requested_work_root"' not in dispatcher:
+    raise SystemExit("seal dispatcher gate no longer uses its protected large work root")
+sentinel_body = text[
+    text.index("archive_dispatch_sentinel() {"):
+    text.index("archive_dispatch_parent_watchdog() {")
+]
+# REGRESSION GUARD (credential leak). The sentinel runs inside phase_pgid, so
+# any call it makes to archive_process_group_has_members_except forks a /bin/ps
+# child INTO the very group being counted; that child is not in the exclusion
+# list, so the answer is unconditionally "members exist". Gating the terminal
+# sweep on such a call made archive_remove_dispatch_gate_until_absent
+# unreachable and stranded the 0700 gate -- which IS the phase TMPDIR holding
+# id_ed25519, known_hosts and rclone.conf -- on every guardian-kill path.
+# Excluding the caller's own PID does NOT fix it: Bash forks twice for
+# "$(...)", so the exec'd ps is a grandchild of the sentinel.
+if "archive_process_group_has_members_except" in sentinel_body:
+    raise SystemExit(
+        "sentinel queries phase-group membership from inside phase_pgid; its own "
+        "ps child is counted and the terminal gate sweep becomes unreachable"
+    )
+finalized_gate = sentinel_body.index('if [ "$guardian_finalized" = true ]; then')
+sentinel_sweep = sentinel_body.index(
+    'archive_remove_dispatch_gate_until_absent "$gate"', finalized_gate
+)
+if not finalized_gate < sentinel_sweep:
+    raise SystemExit("sentinel sweep is not gated on the guardian completion receipt")
+
+# The receipt that sweep now trusts must itself be earned: the guardian only
+# publishes guardian.finalized after its anchor-validated drain loop empties
+# the group. Its identical membership calls ARE sound because it leads its own
+# PGID (asserted in the required-literal list above).
+guardian_body = text[text.index("archive_dispatch_parent_watchdog() {"):]
+guardian_drain = guardian_body.index(
+    'while archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; do'
+)
+guardian_receipt = guardian_body.index("guardian.finalized.partial", guardian_drain)
+if not guardian_drain < guardian_receipt:
+    raise SystemExit(
+        "guardian publishes its completion receipt before draining the phase group"
+    )
+
+dispatch_body = dispatcher[
+    dispatcher.index("dispatch_archive_command() {"):
+    dispatcher.index('COMMAND="${1:-}"')
+]
+setup_return = dispatch_body.rindex('[ "$setup_status" -eq 0 ] || return "$setup_status"')
+signal_return = dispatch_body.rindex('return "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS"')
+if signal_return > setup_return:
+    raise SystemExit("internal cleanup status masks the required exact signal status")
+
+case_start = text.index('case "$COMMAND" in', dispatcher_start)
+case_body = text[case_start:]
+case_routes = {
+    "prepare-writers": "prepare_writers",
+    "audit-writers": "audit_writers",
+    "seal-freeze-plan": "seal_freeze_plan",
+    "capture": "capture_phase",
+    "verify-offline-stop": "verify_offline_stop_phase",
+    "verify-installed-keys": "verify_installed_keys_phase",
+    "seal": "seal_phase",
+    "verify-complete": "verify_complete_phase",
+}
+for cli_name, function_name in case_routes.items():
+    route = f'{cli_name}) dispatch_archive_command {function_name} "$@" ;;'
+    if case_body.count(route) != 1:
+        raise SystemExit(f"{cli_name} does not route exactly once through the dispatcher")
+if "-h|--help|help|'') usage ;;" not in case_body:
+    raise SystemExit("global help no longer bypasses the supervised phase dispatcher")
+for required in (
+    'create("known_hosts", known_payload, 0o400)',
+    'create("id_ed25519", identity_payload, 0o400)',
+    'create("rclone.conf", config_payload, 0o600)',
+    'ARC_OPERATOR_RCLONE_CONFIG="$runtime/rclone.conf"',
+    'HOME="$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"',
+    '"$ARC_OPERATOR_RCLONE_BIN" --config "$ARC_OPERATOR_RCLONE_CONFIG"',
+):
+    if required not in text:
+        raise SystemExit(f"private transport copy/wrapper contract omits: {required}")
+capture = bodies["capture_phase"]
+if not re.search(
+    r'inspector_stage_root="\$\(mktemp -d\)"\s*\n'
+    r'\s*ARCHIVE_FLEET_TEMP_ROOT="\$inspector_stage_root"', capture
+):
+    raise SystemExit("capture inspector scratch is not cleanup-owned immediately after allocation")
+PY
+}
+
 macos_pretag_community_canary_is_exact_private_and_fail_closed() {
     local required origin
     for required in \
@@ -2391,6 +2765,8 @@ run_test 'Windows desktop shutdown is private, authenticated, and uses the full 
 run_test 'signing-key backups are encrypted, create-only, and restore-tested' signing_key_backup_is_encrypted_create_only_and_restore_tested
 run_test 'validator-vault restore/install is profile-bound, offline-proof gated, and create-only' validator_vault_restore_and_install_are_fail_closed
 run_test 'production manifest builder is hermetic, sealed, documented, and release-gated' production_manifest_builder_is_release_gated
+run_test 'production recovery plan streams probes without persistent remote helpers' recovery_plan_remote_transport_is_read_only
+run_test 'archive transport credentials and temp roots are invocation-scoped' archive_transport_configuration_is_invocation_scoped
 run_test 'macOS pre-tag community canary is exact, private, SIGTERM-only, and preservation-safe' macos_pretag_community_canary_is_exact_private_and_fail_closed
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 

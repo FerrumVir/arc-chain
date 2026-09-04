@@ -1653,6 +1653,91 @@ PY
     fi
 }
 
+recovery_plan_read_only_scope_is_truthful() {
+    local literal
+    for literal in \
+        'makes no persistent recovery-managed change' \
+        'Production probes stream directly over the pinned' \
+        'do not install a remote rollout helper before the exact GO' \
+        'private mode-`0600` rclone-config copy and an isolated disposable `HOME`.' \
+        'OAuth refresh and cache writes remain inside that root' \
+        'original operator config is re-proved afterward.' \
+        'Normal SSH and service audit logs may record that read access.'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits the scoped non-mutating plan contract' \
+            || return 1
+    done
+    for literal in \
+        'defaults to recovery-state read-only' \
+        'streams production probes over pinned SSH without installing a remote rollout' \
+        'Root-pinned archive metadata fetches use an exact private mode-`0600`' \
+        'writes are removed with that root on success or failure' \
+        'operator config is re-proved afterward.' \
+        'before any persistent' \
+        'Normal SSH and service audit logs may record plan access.'
+    do
+        require_literal "$PRODUCTION_RECOVERY_AUDIT" "$literal" \
+            'production recovery audit omits the scoped non-mutating plan contract' \
+            || return 1
+    done
+    if grep -Fq -- \
+        'It changes no local/remote directory, process, service,' \
+        "$RECOVERY_README"; then
+        printf 'recovery README retains the impossible absolute no-host-change claim\n'
+        return 1
+    fi
+
+    for literal in \
+        'dedicated, invocation-scoped process group' \
+        'disposable mode-0600 rclone config copy' \
+        'source SSH identity and rclone config' \
+        'remain byte-for-byte unchanged' \
+        'normal success, plan return, or fail-closed error' \
+        'Nested `prepare-writers` -> `audit-writers` execution' \
+        'mode-0700 dispatcher gate beneath the caller' \
+        'physically contained by the gate' \
+        'forwards a parent-targeted `SIGHUP`, `SIGINT`, or' \
+        '`SIGTERM` exactly once to the entire phase group' \
+        'removes and verifies absence of the whole gate' \
+        'returning 129, 130, or' \
+        'signal-ignoring descendant tries to recreate' \
+        'bounded opportunity to finish its EXIT' \
+        'guardian leads its own process group' \
+        'sweeps the gate on that receipt alone' \
+        'sentinel must never query phase-group membership itself' \
+        'own `ps` child is counted as a member' \
+        'An unsignaled internal cleanup failure returns 125' \
+        'preserves its required 129, 130, or' \
+        'guardian takes over if the dispatcher is lost to `SIGKILL`' \
+        'Direct `SIGKILL` of both the' \
+        'phase and its guardian, or loss of the operator'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits the invocation-scoped credential cleanup contract' \
+            || return 1
+    done
+    for literal in \
+        '`preflight` makes no Drive object mutation' \
+        'may refresh OAuth state only in the caller-selected RCLONE_CONFIG' \
+        'orchestrator supplies a disposable mode-0600 copy' \
+        'standalone caller must provide the same isolation'
+    do
+        require_literal "$DRIVE_PREFREEZE_GATE" "$literal" \
+            'Drive prefreeze help obscures its local OAuth refresh boundary' \
+            || return 1
+    done
+    for literal in \
+        'PLAN ONLY; no persistent host file, unit, cgroup, or local audit was changed' \
+        'PLAN ONLY; no persistent service or recovery-managed remote/local file was changed' \
+        'PLAN ONLY; no persistent remote, Drive, or source credential/config file was changed'
+    do
+        require_literal "$ARCHIVE_TOOL" "$literal" \
+            'archive plan output omits its persistent-state scope' \
+            || return 1
+    done
+}
+
 run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
 run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
@@ -1667,5 +1752,6 @@ run_test 'candidate facts remain source-bound and dated without unsupported floo
 run_test 'hardened canary and vault runbooks match their current command parsers' hardened_canary_and_vault_commands_match_current_parsers
 run_test 'recovery archive commands pin tools, external intent, and exact rollout journals' recovery_archive_commands_are_exact_and_resumable
 run_test 'operator recovery commands are Ubuntu-pinned, create-only, and ordered' operator_recovery_commands_are_linux_pinned_and_ordered
+run_test 'recovery plan documents a scoped persistent-state read-only boundary' recovery_plan_read_only_scope_is_truthful
 
 finish_tests

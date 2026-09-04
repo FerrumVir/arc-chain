@@ -5,8 +5,14 @@
 # Rust toolchain or cargo-deny release.
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd)"
+# Resolve physically. MANIFEST_DIR below uses `pwd -P`, so a logical `pwd` here
+# makes MANIFEST_ABS and ROOT_MANIFEST/DESKTOP_MANIFEST disagree on any checkout
+# path containing a symlink (/tmp on macOS, a symlinked CI workspace).
+# SHADOW_PROFILE then stays empty, the whole vendored-advisory scan is skipped,
+# and this release gate exits 0 without having checked anything.
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+ARGUMENT_COUNT="$#"
 MANIFEST_PATH="${1:-$REPO_ROOT/Cargo.toml}"
 VERSION=0.20.2
 
@@ -57,3 +63,79 @@ CARGO_DENY="$WORK_DIR/cargo-deny-$VERSION-$TARGET/cargo-deny"
     --manifest-path "$MANIFEST_PATH" \
     --locked \
     check advisories bans sources licenses
+
+# cargo-deny intentionally omits local-path packages from advisory matching.
+# After proving each provenance-pinned path patch is reachable in the real
+# graph, project only those packages under their exact canonical registry
+# identities and re-scan them with the database refreshed above. The root
+# profile requires zero findings for all three Wasmer patches under a generated
+# suppression-free policy. The desktop profile still
+# requires exactly the one glib advisory whose upstream fix is carried locally.
+MANIFEST_DIR="$(CDPATH='' cd -- "$(dirname -- "$MANIFEST_PATH")" && pwd -P)"
+MANIFEST_ABS="$MANIFEST_DIR/$(basename -- "$MANIFEST_PATH")"
+ROOT_MANIFEST="$REPO_ROOT/Cargo.toml"
+DESKTOP_MANIFEST="$REPO_ROOT/desktop/src-tauri/Cargo.toml"
+SHADOW_PROFILE=
+case "$MANIFEST_ABS" in
+    "$ROOT_MANIFEST")
+        SHADOW_PROFILE=root
+        ;;
+    "$DESKTOP_MANIFEST")
+        SHADOW_PROFILE=desktop
+        ;;
+esac
+
+# Skipping the shadow scan is legitimate only for a caller-supplied manifest
+# that is neither the workspace root nor desktop. With no argument we defaulted
+# to the root manifest, so an empty profile means path resolution disagreed and
+# this gate would pass silently. Fail loudly instead.
+if [ "$ARGUMENT_COUNT" -eq 0 ] && [ -z "$SHADOW_PROFILE" ]; then
+    printf '%s: default manifest %s did not resolve to workspace root %s\n' \
+        "$0" "$MANIFEST_ABS" "$ROOT_MANIFEST" >&2
+    exit 2
+fi
+
+if [ -n "$SHADOW_PROFILE" ]; then
+    ACTUAL_METADATA="$WORK_DIR/$SHADOW_PROFILE-metadata.json"
+    SHADOW_METADATA="$WORK_DIR/$SHADOW_PROFILE-registry-shadow-metadata.json"
+    SHADOW_REPORT="$WORK_DIR/$SHADOW_PROFILE-registry-shadow-advisories.jsonl"
+    SHADOW_DIAGNOSTICS="$WORK_DIR/$SHADOW_PROFILE-registry-shadow-diagnostics.jsonl"
+    SHADOW_POLICY="$WORK_DIR/vendored-registry-shadow-deny.toml"
+    SHADOW_HELPER="$SCRIPT_DIR/vendored-advisory-shadow.py"
+
+    cargo metadata \
+        --manifest-path "$MANIFEST_ABS" \
+        --format-version 1 \
+        --locked \
+        --offline >"$ACTUAL_METADATA"
+    python3 "$SHADOW_HELPER" rewrite-metadata \
+        "$SHADOW_PROFILE" \
+        "$ACTUAL_METADATA" \
+        "$SHADOW_METADATA"
+    python3 "$SHADOW_HELPER" write-policy \
+        "$REPO_ROOT/deny.toml" \
+        "$SHADOW_POLICY"
+
+    set +e
+    "$CARGO_DENY" \
+        --config "$SHADOW_POLICY" \
+        --manifest-path "$MANIFEST_ABS" \
+        --metadata-path "$SHADOW_METADATA" \
+        --format json \
+        --color never \
+        --offline \
+        check --audit-compatible-output advisories \
+        >"$SHADOW_REPORT" 2>"$SHADOW_DIAGNOSTICS"
+    SHADOW_EXIT=$?
+    set -e
+
+    if ! python3 "$SHADOW_HELPER" verify-report \
+        "$SHADOW_PROFILE" \
+        "$SHADOW_REPORT" \
+        "$SHADOW_DIAGNOSTICS" \
+        "$SHADOW_POLICY" \
+        "$SHADOW_EXIT"; then
+        sed -n '1,160p' "$SHADOW_DIAGNOSTICS" >&2
+        exit 1
+    fi
+fi

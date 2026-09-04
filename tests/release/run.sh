@@ -15,7 +15,10 @@ for test_file in \
     "$TEST_DIR/legacy_validator_set_contract_test.sh" \
     "$TEST_DIR/documentation_contract_test.sh" \
     "$TEST_DIR/legacy_operations_retirement_test.sh" \
+    "$TEST_DIR/glib_backport_contract_test.sh" \
+    "$TEST_DIR/vendored_advisory_shadow_contract_test.sh" \
     "$TEST_DIR/supply_chain_semantic_test.sh" \
+    "$TEST_DIR/memmap_soundness_contract_test.sh" \
     "$TEST_DIR/secret_scan_materialization_test.sh" \
     "$TEST_DIR/genesis_contract_test.sh" \
     "$TEST_DIR/pretag_artifact_test.sh" \

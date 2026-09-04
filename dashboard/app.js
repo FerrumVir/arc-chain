@@ -152,7 +152,14 @@
     if (fleet?.replicaCount !== 6 || fleet?.samples?.length !== 6) return "active recovery must declare exactly six validator replicas";
     if (fleet.reachable?.length !== fleet.replicaCount) return "all six validator health snapshots must be reachable";
     if (fleet.commitments?.length !== fleet.replicaCount || fleet.commitments.some((entry) => !entry?.ok)) return "all six validators must return a common-height commitment";
-    if (fleet.commonAudit?.state !== "consistent" || !Number.isSafeInteger(fleet.commonHeight)) return "all six current commitments must agree at one comparable height";
+    // auditCommonHeight only compares commitments that actually carry a
+    // height, a block hash, and a state root, so a "consistent" verdict can be
+    // reached from as few as two replicas while the other four answered with a
+    // body that has no commitment in it. Require the comparison to cover every
+    // configured replica before publishing a six-validator agreement claim.
+    if (fleet.commonAudit?.state !== "consistent"
+      || !Number.isSafeInteger(fleet.commonHeight)
+      || fleet.commonAudit?.samples?.length !== fleet.replicaCount) return "all six current commitments must agree at one comparable height";
     if (!fleet.current?.reachable) return "checkpoint-selected validator must be reachable";
     if (fleet.current?.liveness?.state !== "advancing") return "checkpoint-selected validator must prove advancing liveness";
     if (config.state === "recovered" && fleet.state !== "healthy") return "recovered publication requires a healthy fleet";

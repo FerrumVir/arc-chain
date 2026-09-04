@@ -48,11 +48,18 @@ jobs:
   release-contract:
     name: release + installer contract
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # vendored_advisory_shadow_contract_test runs `cargo metadata --locked
+      # --offline`. Offline resolution needs a warm cache, and arc-crypto pulls
+      # icicle-core from a git rev, which is not vendored -- without this the
+      # suite fails with "can't checkout ... you are in the offline mode".
+      # Fetch once, with network, so the contract test stays genuinely offline.
+      - name: Warm the cargo cache for the offline contract tests
+        run: cargo fetch --locked
       - name: Shell syntax and offline contract tests
         run: bash tests/release/run.sh
       - name: ShellCheck release/install scripts

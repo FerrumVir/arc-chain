@@ -3670,6 +3670,169 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
             with self.assertRaisesRegex(rollout.RolloutError, "ARC_RECOVERY_GO"):
                 rollout.require_go(production, locked_hash, locked_hash, "2" * 64, "2" * 64)
 
+    def test_read_only_ssh_streams_exact_script_without_installing_helper(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        node = value["validators"][0]
+        harness.production_ssh_path = Path("/usr/bin/ssh")
+        harness.production_known_hosts = Path("/secure/known_hosts")
+        harness.production_ssh_identity = Path("/secure/identity")
+        harness.production_transport_env = {
+            "HOME": "/secure/private",
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TZ": "UTC",
+        }
+        harness._assert_production_ssh_transport = mock.Mock()
+        probe = "set -eu\nprintf '%s:%s\\n' \"$1\" \"$2\"\n"
+        arguments = ("/var/lib/arc-v3", "name:value")
+        completed = SimpleNamespace(stdout="/var/lib/arc-v3:name:value\n")
+
+        with mock.patch.object(rollout, "run_checked", return_value=completed) as checked:
+            result = harness.ssh_read_only(
+                node, probe, arguments, timeout=37
+            )
+
+        self.assertEqual(result, completed.stdout)
+        checked.assert_called_once()
+        command = checked.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/ssh")
+        self.assertEqual(command[-2], f"root@{node['host']}")
+        self.assertEqual(
+            command[-1],
+            rollout.shlex.join(
+                [
+                    "/usr/bin/env", "-i",
+                    "HOME=/root",
+                    "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                    "LANG=C", "LC_ALL=C",
+                    "/bin/sh", "-s", "--", *arguments,
+                ]
+            ),
+        )
+        for option in (
+            "UserKnownHostsFile=/secure/known_hosts",
+            "GlobalKnownHostsFile=/dev/null",
+            "HostKeyAlgorithms=ssh-ed25519",
+            "PubkeyAcceptedAlgorithms=ssh-ed25519",
+            "IdentityAgent=none",
+            "IdentitiesOnly=yes",
+            "ProxyCommand=none",
+            "ProxyJump=none",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ClearAllForwardings=yes",
+            "PermitLocalCommand=no",
+            "RequestTTY=no",
+            "BatchMode=yes",
+            "StrictHostKeyChecking=yes",
+        ):
+            self.assertIn(option, command)
+        self.assertEqual(checked.call_args.kwargs["stdin"], probe)
+        self.assertEqual(checked.call_args.kwargs["timeout"], 37)
+        self.assertEqual(
+            checked.call_args.kwargs["env"], harness.production_transport_env
+        )
+        for forbidden in (
+            ".arc-recovery-rollout-helpers",
+            "mkdir",
+            "mktemp",
+            "/bin/ln",
+            "/bin/chmod",
+        ):
+            self.assertNotIn(forbidden, command[-1])
+        self.assertEqual(harness._assert_production_ssh_transport.call_count, 2)
+
+        with mock.patch.object(rollout, "run_checked") as unchecked:
+            with self.assertRaisesRegex(rollout.RolloutError, "unsafe remote argument"):
+                harness.ssh_read_only(node, "exit 0\n", ("unsafe value",))
+            unchecked.assert_not_called()
+
+        harness._assert_production_ssh_transport.reset_mock()
+        with mock.patch.object(rollout, "run_checked", return_value=completed) as persisted:
+            harness.ssh(node, "exit 0\n")
+        self.assertIn(
+            "/root/.arc-recovery-rollout-helpers",
+            persisted.call_args.args[0][-1],
+        )
+        self.assertEqual(harness._assert_production_ssh_transport.call_count, 2)
+
+    def test_run_plan_and_invalid_go_never_enter_execute_boundary(self) -> None:
+        value = self.fixture(production=True)
+        locked_hash = "d" * 64
+        archive_hash = "2" * 64
+        rollback_journal = self.root / "rollback-plan-boundary"
+        evidence_output = self.root / "reward-evidence.json"
+        base_args = [
+            "run",
+            "--manifest", str(self.root / "locked.json"),
+            "--rollback-journal", str(rollback_journal),
+            "--reward-evidence-output", str(evidence_output),
+        ]
+
+        def invoke(arguments, environment):
+            harness = mock.Mock()
+            harness.preflight.return_value = archive_hash
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    rollout, "load_sealed_manifest", return_value=(value, locked_hash)
+                ),
+                mock.patch.object(rollout, "RecoveryRollout", return_value=harness),
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(sys, "stdout", stdout),
+                mock.patch.object(sys, "stderr", stderr),
+            ):
+                result = rollout.main(arguments)
+            return result, harness, stdout.getvalue(), stderr.getvalue()
+
+        result, planned, stdout, stderr = invoke(base_args, {})
+        self.assertEqual(result, 0, stderr)
+        planned.preflight.assert_called_once_with()
+        planned.reserve_reward_evidence_output.assert_not_called()
+        planned.execute.assert_not_called()
+        self.assertIn("no persistent recovery-managed change", stdout)
+        self.assertFalse(rollback_journal.exists())
+        self.assertFalse(evidence_output.exists())
+
+        execute_args = [
+            *base_args,
+            "--execute",
+            "--go-hash", locked_hash,
+            "--archive-manifest-sha256", archive_hash,
+        ]
+        result, rejected, _stdout, stderr = invoke(
+            execute_args, {"ARC_RECOVERY_GO": "wrong"}
+        )
+        self.assertEqual(result, 1)
+        self.assertIn("execution requires ARC_RECOVERY_GO", stderr)
+        rejected.preflight.assert_called_once_with()
+        rejected.reserve_reward_evidence_output.assert_not_called()
+        rejected.execute.assert_not_called()
+        self.assertFalse(rollback_journal.exists())
+        self.assertFalse(evidence_output.exists())
+
+        authorization = rollout.execution_authorization(
+            value, locked_hash, archive_hash
+        )
+        result, approved, _stdout, stderr = invoke(
+            execute_args, {"ARC_RECOVERY_GO": authorization}
+        )
+        self.assertEqual(result, 0, stderr)
+        self.assertEqual(
+            approved.method_calls,
+            [
+                mock.call.describe_plan(),
+                mock.call.preflight(),
+                mock.call.reserve_reward_evidence_output(),
+                mock.call.execute(),
+            ],
+        )
+
     def test_runtime_uses_six_explicit_origins_and_restart_omits_checkpoint(self) -> None:
         value = self.fixture()
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
@@ -4671,9 +4834,14 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
                 return ""
             return baseline
 
-        harness.ssh = mock.Mock(side_effect=fake_ssh)
+        harness.ssh_read_only = mock.Mock(side_effect=fake_ssh)
+        harness.ssh = mock.Mock(
+            side_effect=AssertionError("production preflight used persistent SSH")
+        )
 
         harness._preflight_production()
+        self.assertEqual(harness.ssh_read_only.call_count, 18)
+        harness.ssh.assert_not_called()
         self.assertEqual(len(preflights), 6)
         script, args = preflights[0]
         self.assertEqual(
@@ -4844,7 +5012,12 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         harness.configure_production_transport = mock.Mock()
         harness._assert_production_rclone_transport = mock.Mock()
         harness.production_rclone_path = Path("/reviewed/rclone")
-        harness.production_rclone_config = Path("/secure/rclone.conf")
+        harness.production_rclone_config = self.root / "rclone.conf"
+        harness.production_rclone_config.write_bytes(b"reviewed-rclone-config\n")
+        harness.production_rclone_config.chmod(0o600)
+        harness.production_transport_pins = {
+            "rclone_config": digest(harness.production_rclone_config)
+        }
         harness.production_transport_env = {"PATH": "/usr/bin:/bin"}
         with self.assertRaisesRegex(rollout.RolloutError, "same-process"):
             harness.load_production_archive_metadata()
@@ -4861,6 +5034,141 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         invalid.chmod(0o444)
         with self.assertRaisesRegex(rollout.RolloutError, "cannot read archive metadata"):
             rollout._read_canonical_read_only_json(invalid, "archive metadata")
+
+    def test_archive_metadata_rclone_is_private_disposable_and_fail_closed(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        original = self.root / "operator-rclone.conf"
+        original_payload = b"[arc]\ntype = drive\ntoken = stale\n"
+        original.write_bytes(original_payload)
+        original.chmod(0o600)
+        original_identity = original.lstat()
+        harness.configure_production_transport = mock.Mock()
+        harness._assert_production_rclone_transport = mock.Mock()
+        harness.production_rclone_path = Path("/reviewed/rclone")
+        harness.production_rclone_config = original
+        harness.production_transport_pins = {
+            "rclone_config": hashlib.sha256(original_payload).hexdigest()
+        }
+        harness.production_transport_env = {
+            "HOME": "/persistent-home-must-not-be-used",
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "TZ": "UTC",
+        }
+        temporary_roots: list[Path] = []
+
+        def assert_original_unchanged() -> None:
+            current = original.lstat()
+            self.assertEqual(original.read_bytes(), original_payload)
+            self.assertEqual(
+                (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mode,
+                    current.st_uid,
+                    current.st_gid,
+                    current.st_nlink,
+                    current.st_size,
+                    current.st_mtime_ns,
+                    current.st_ctime_ns,
+                ),
+                (
+                    original_identity.st_dev,
+                    original_identity.st_ino,
+                    original_identity.st_mode,
+                    original_identity.st_uid,
+                    original_identity.st_gid,
+                    original_identity.st_nlink,
+                    original_identity.st_size,
+                    original_identity.st_mtime_ns,
+                    original_identity.st_ctime_ns,
+                ),
+            )
+
+        def mutate_private_state(command, environment) -> Path:
+            self.assertEqual(command[0], "/reviewed/rclone")
+            self.assertEqual(command[1], "--config")
+            private_config = Path(command[2])
+            temporary_root = private_config.parent
+            temporary_roots.append(temporary_root)
+            self.assertNotEqual(private_config, original)
+            self.assertNotIn(os.fspath(original), command)
+            self.assertEqual(private_config.read_bytes(), original_payload)
+            self.assertEqual(stat.S_IMODE(private_config.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(temporary_root.stat().st_mode), 0o700)
+            self.assertEqual(environment["HOME"], os.fspath(temporary_root))
+            self.assertNotEqual(environment["HOME"], harness.production_transport_env["HOME"])
+            refreshed = temporary_root / "rclone.conf.refreshed"
+            refreshed.write_bytes(b"refreshed-oauth-token\n")
+            refreshed.chmod(0o600)
+            os.replace(refreshed, private_config)
+            cache = temporary_root / ".cache" / "rclone"
+            cache.mkdir(parents=True)
+            (cache / "state").write_text("private-cache\n", encoding="utf-8")
+            assert_original_unchanged()
+            return temporary_root
+
+        wanted = b'{"schema":"arc.test"}\n'
+        wanted_sha = hashlib.sha256(wanted).hexdigest()
+
+        def successful_run(command, **kwargs):
+            mutate_private_state(command, kwargs["env"])
+            return SimpleNamespace(stdout=wanted)
+
+        with mock.patch.object(
+            rollout, "run_checked_bytes", side_effect=successful_run
+        ):
+            self.assertEqual(
+                harness._rclone_cat_pinned_archive_object(
+                    "ARCHIVE-MANIFEST.json", wanted_sha, max_bytes=len(wanted)
+                ),
+                wanted,
+            )
+        self.assertTrue(temporary_roots)
+        self.assertTrue(all(not path.exists() for path in temporary_roots))
+        self.assertEqual(harness._assert_production_rclone_transport.call_count, 2)
+        assert_original_unchanged()
+
+        harness._assert_production_rclone_transport.reset_mock()
+        temporary_roots.clear()
+
+        def failed_run(command, **kwargs):
+            mutate_private_state(command, kwargs["env"])
+            raise rollout.RolloutError("injected rclone failure")
+
+        with mock.patch.object(rollout, "run_checked_bytes", side_effect=failed_run):
+            with self.assertRaisesRegex(rollout.RolloutError, "injected rclone failure"):
+                harness._rclone_cat_pinned_archive_object(
+                    "COMPLETE.json", wanted_sha, max_bytes=len(wanted)
+                )
+        self.assertTrue(temporary_roots)
+        self.assertTrue(all(not path.exists() for path in temporary_roots))
+        self.assertEqual(harness._assert_production_rclone_transport.call_count, 2)
+        assert_original_unchanged()
+
+        harness._assert_production_rclone_transport.reset_mock()
+        temporary_roots.clear()
+
+        def bad_payload_run(command, **kwargs):
+            mutate_private_state(command, kwargs["env"])
+            return SimpleNamespace(stdout=b"wrong-but-bounded\n")
+
+        with mock.patch.object(
+            rollout, "run_checked_bytes", side_effect=bad_payload_run
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError,
+                "changed after complete-archive verification",
+            ):
+                harness._rclone_cat_pinned_archive_object(
+                    "legacy-nyc.inventory", wanted_sha, max_bytes=64
+                )
+        self.assertTrue(temporary_roots)
+        self.assertTrue(all(not path.exists() for path in temporary_roots))
+        self.assertEqual(harness._assert_production_rclone_transport.call_count, 2)
+        assert_original_unchanged()
 
     def test_production_execute_reverifies_live_captures_before_first_mutation(self) -> None:
         value = self.fixture(production=True)
@@ -4898,9 +5206,15 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         harness._preflight_production = mock.Mock(side_effect=refresh_first_baseline)
         harness.verify_execution_provenance = mock.Mock()
         harness.verify_production_archive = mock.Mock(return_value="2" * 64)
-        harness._stage_production_node = mock.Mock(
-            side_effect=rollout.RolloutError("sentinel first mutation")
-        )
+        def fail_first_mutation(_node):
+            self.assertTrue(harness.rollback_journal_reserved)
+            self.assertEqual(harness.rollback_journal_state, "forward")
+            self.assertTrue(
+                (self.root / "first-mutation-rollback" / "HEADER.json").is_file()
+            )
+            raise rollout.RolloutError("sentinel first mutation")
+
+        harness._stage_production_node = mock.Mock(side_effect=fail_first_mutation)
         harness._rollback_production = mock.Mock()
         with self.assertRaisesRegex(rollout.RolloutError, "sentinel first mutation"):
             harness.execute_production()

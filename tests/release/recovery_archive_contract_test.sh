@@ -11,6 +11,7 @@ ROLLOUT="$REPO_ROOT/scripts/recovery/recovery_rollout.py"
 SCHEMA="$REPO_ROOT/scripts/recovery/recovery-manifest.schema.json"
 FREEZE_MODULE="$REPO_ROOT/scripts/recovery/recovery_freeze.py"
 FREEZE_MODULE_TEST="$REPO_ROOT/scripts/recovery/test_recovery_freeze.py"
+SIGNAL_PROBE="$REPO_ROOT/tests/release/fixtures/archive_dispatch_signal_probe.sh"
 
 exact_authorizations_bind_every_domain() {
     for required in 'expected_go="STAGE-BARRIERS $orchestrator_sha HELPER $helper_sha"' \
@@ -2098,6 +2099,789 @@ SH
     return 0
 )
 
+verify_complete_plan_cleans_transport_state_and_never_uses_ssh() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture digest destination
+    fixture="$(mktemp -d "$REPO_ROOT/.verify-complete-plan-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    mkdir -m 700 "$fixture/success-tmp" "$fixture/failure-tmp"
+    digest="$(printf 'a%.0s' {1..64})"
+    DRIVE_REMOTE=arc-test
+    ARC_RECOVERY_DRIVE_REMOTE=arc-test
+    export fixture digest DRIVE_REMOTE ARC_RECOVERY_DRIVE_REMOTE
+    destination="$DRIVE_REMOTE/captures/$digest"
+
+    # Exercise the phase boundary rather than Drive/GitHub parsing, which has
+    # separate fixtures above.  These mocks materialize the same sensitive
+    # pinned roots as configure_operator_transport so cleanup is observable.
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    configure_operator_transport() {
+        ARCHIVE_FLEET_PINNED_PYTHON_ROOT="$(mktemp -d)"
+        ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT="$(mktemp -d)"
+        printf 'operator-python-home\n' > "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT/state"
+        printf 'ssh-identity-and-rclone-config\n' > "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/private"
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    configure_github_anchor_transport() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    require_commands() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    validate_drive_remote() { return 0; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    verify_remote_complete() {
+        printf '%s\n' "$digest"
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    rclone() {
+        [ "${ARC_TEST_FAIL_RCLONE:-0}" != 1 ] || die "injected metadata download failure"
+        [ "$1" = cat ] || return 74
+        case "$2" in
+            */freeze-plan.json)
+                printf '%s\n' '{"nodes":[{"name":"nyc","data_dir":"/var/lib/arc-old-nyc"},{"name":"lax","data_dir":"/var/lib/arc-old-lax"},{"name":"ams","data_dir":"/var/lib/arc-old-ams"},{"name":"lhr","data_dir":"/var/lib/arc-old-lhr"},{"name":"nrt","data_dir":"/var/lib/arc-old-nrt"},{"name":"sgp","data_dir":"/var/lib/arc-old-sgp"}]}'
+                ;;
+            */freeze-plan.json.sha256)
+                printf '%s  freeze-plan.json\n' "$digest"
+                ;;
+            *) return 75 ;;
+        esac
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by verify_complete_phase
+    capture_id_for_freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # Plan archive verification must not reach either SSH entry point unless
+    # execute explicitly requests --verify-live-captures.
+    # shellcheck disable=SC2329 # tripwire invoked only on a regression
+    ssh() { : > "$fixture/ssh-called"; return 91; }
+    # shellcheck disable=SC2329 # tripwire invoked only on a regression
+    ssh_remote_exact() { : > "$fixture/ssh-called"; return 92; }
+
+    export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES='configure_operator_transport configure_github_anchor_transport require_commands validate_drive_remote verify_remote_complete rclone freeze_plan_hash capture_id_for_freeze_plan_hash ssh ssh_remote_exact'
+
+    TMPDIR="$fixture/success-tmp" dispatch_archive_command verify_complete_phase \
+        --destination "$destination" \
+        --new-node-paths nyc /opt/arc-v3-nyc /var/lib/arc-v3-nyc \
+        --new-node-paths lax /opt/arc-v3-lax /var/lib/arc-v3-lax \
+        --new-node-paths ams /opt/arc-v3-ams /var/lib/arc-v3-ams \
+        --new-node-paths lhr /opt/arc-v3-lhr /var/lib/arc-v3-lhr \
+        --new-node-paths nrt /opt/arc-v3-nrt /var/lib/arc-v3-nrt \
+        --new-node-paths sgp /opt/arc-v3-sgp /var/lib/arc-v3-sgp \
+        > "$fixture/success.out" || return 1
+    grep -Fq -- "archive_manifest=$digest" "$fixture/success.out" || return 1
+    [ ! -e "$fixture/ssh-called" ] || return 1
+    [ -z "$(find "$fixture/success-tmp" -mindepth 1 -print -quit)" ] || return 1
+
+    if ARC_TEST_FAIL_RCLONE=1 TMPDIR="$fixture/failure-tmp" \
+        dispatch_archive_command verify_complete_phase --destination "$destination" \
+        --new-node-paths nyc /opt/arc-v3-nyc /var/lib/arc-v3-nyc \
+        --new-node-paths lax /opt/arc-v3-lax /var/lib/arc-v3-lax \
+        --new-node-paths ams /opt/arc-v3-ams /var/lib/arc-v3-ams \
+        --new-node-paths lhr /opt/arc-v3-lhr /var/lib/arc-v3-lhr \
+        --new-node-paths nrt /opt/arc-v3-nrt /var/lib/arc-v3-nrt \
+        --new-node-paths sgp /opt/arc-v3-sgp /var/lib/arc-v3-sgp \
+        > "$fixture/failure.out" 2>&1; then
+        printf 'verify-complete accepted a failed archive verifier\n' >&2
+        return 1
+    fi
+    [ ! -e "$fixture/ssh-called" ] || return 1
+    [ -z "$(find "$fixture/failure-tmp" -mindepth 1 -print -quit)" ] || return 1
+)
+
+archive_command_scopes_clean_plan_failure_and_nested_success() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture runtime roots_log digest artifact_digest original_identity_sha original_config_sha
+    fixture="$(mktemp -d "$REPO_ROOT/.archive-command-scope-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    runtime="$fixture/runtime"
+    roots_log="$fixture/roots.tsv"
+    mkdir -m 700 "$runtime"
+    : > "$roots_log"
+    printf 'sealed-test-identity\n' > "$fixture/id_ed25519"
+    printf 'sealed-test-oauth-config\n' > "$fixture/rclone.conf"
+    chmod 400 "$fixture/id_ed25519"
+    chmod 600 "$fixture/rclone.conf"
+    original_identity_sha="$(hash_file "$fixture/id_ed25519")"
+    original_config_sha="$(hash_file "$fixture/rclone.conf")"
+    digest="$(printf '9%.0s' {1..64})"
+    printf '{}\n' > "$fixture/legacy-validators.json"
+    printf 'capture-plan-input\n' > "$fixture/capture-input"
+    artifact_digest="$(hash_file "$fixture/capture-input")"
+    export fixture roots_log digest artifact_digest
+    for name in freeze.json height.json inspector genesis.toml validators.json capture-legacy.json; do
+        cp "$fixture/capture-input" "$fixture/$name"
+    done
+
+    mode_of() {
+        python3 - "$1" <<'PY'
+import pathlib, stat, sys
+print(f"{stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode):03o}")
+PY
+    }
+    assert_logged_roots_absent() {
+        local kind path drive
+        while IFS=$'\t' read -r kind path drive; do
+            [ -n "$kind" ] && [ -n "$path" ] || return 1
+            [ ! -e "$path" ] && [ ! -L "$path" ] || {
+                printf 'temporary %s root (Drive=%s) survived command exit: %s\n' \
+                    "$kind" "$drive" "$path" >&2
+                return 1
+            }
+        done < "$roots_log"
+    }
+    assert_original_credentials_unchanged() {
+        [ "$(hash_file "$fixture/id_ed25519")" = "$original_identity_sha" ] &&
+            [ "$(hash_file "$fixture/rclone.conf")" = "$original_config_sha" ] &&
+            [ "$(mode_of "$fixture/id_ed25519")" = 400 ] &&
+            [ "$(mode_of "$fixture/rclone.conf")" = 600 ]
+    }
+
+    # These test doubles materialize the same three private classes as the
+    # real configuration helpers: nonsecret Python HOME, SSH identity, and
+    # OAuth-bearing rclone config. The command boundary, not parsing/network
+    # behavior (covered elsewhere), is under test here.
+    # shellcheck disable=SC2329 # invoked through each command function
+    configure_operator_python() {
+        ARCHIVE_FLEET_PINNED_PYTHON_ROOT="$(mktemp -d "$TMPDIR/python-home.XXXXXX")"
+        chmod 700 "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
+        printf 'isolated-python-home\n' > "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT/state"
+        [ "$(mode_of "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT")" = 700 ] || return 1
+        printf 'python\t%s\tfalse\n' "$ARCHIVE_FLEET_PINNED_PYTHON_ROOT" >> "$roots_log"
+    }
+    # shellcheck disable=SC2329 # invoked through each command function
+    configure_operator_transport() {
+        local require_drive="${1:-false}"
+        configure_operator_python
+        ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT="$(mktemp -d "$TMPDIR/transport.XXXXXX")"
+        chmod 700 "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
+        cp "$fixture/id_ed25519" "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/id_ed25519"
+        chmod 400 "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/id_ed25519"
+        if [ "$require_drive" = true ]; then
+            cp "$fixture/rclone.conf" "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf"
+            chmod 600 "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf"
+            printf 'simulated-token-refresh\n' >> "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf"
+            [ "$(mode_of "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/rclone.conf")" = 600 ] || return 1
+        fi
+        [ "$(mode_of "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT")" = 700 ] || return 1
+        [ "$(mode_of "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT/id_ed25519")" = 400 ] || return 1
+        printf 'transport\t%s\t%s\n' "$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT" "$require_drive" >> "$roots_log"
+        [ "${ARC_TEST_CONFIGURE_FAIL:-0}" != 1 ] || die "injected transport configuration failure"
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by command functions
+    require_commands() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    tracked_source_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    install_helpers() { :; }
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    run_remote() { :; }
+
+    export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES='mode_of configure_operator_python configure_operator_transport require_commands tracked_source_hash install_helpers run_remote'
+
+    TMPDIR="$runtime" dispatch_archive_command prepare_writers \
+        --legacy-validator-set "$fixture/legacy-validators.json" \
+        --output "$fixture/writers-plan.json" --plan > "$fixture/plan.out" || return 1
+    grep -Fq -- 'archive fleet: PLAN ONLY;' "$fixture/plan.out" || return 1
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+
+    # A real capture plan asks for Drive transport, so this success path
+    # exercises simultaneous Python-HOME, SSH-identity, and OAuth-config copies.
+    # Its heavyweight evidence validators are independently covered above.
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    pin_freeze_plan() { printf '%s\n' "$1"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    capture_id_for_freeze_plan_hash() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    manifest_field() { printf '%s\n' "$digest"; }
+    # shellcheck disable=SC2329 # invoked indirectly by capture plan
+    run_drive_prefreeze_gate() { :; }
+    ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES="$ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES pin_freeze_plan freeze_plan_hash capture_id_for_freeze_plan_hash manifest_field run_drive_prefreeze_gate"
+    export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES
+    TMPDIR="$runtime" dispatch_archive_command capture_phase \
+        --freeze-plan "$fixture/freeze.json" \
+        --legacy-public-height-receipt "$fixture/height.json" \
+        --legacy-public-height-receipt-sha256 "$artifact_digest" \
+        --inspector-binary "$fixture/inspector" \
+        --inspector-binary-sha256 "$artifact_digest" \
+        --genesis "$fixture/genesis.toml" \
+        --genesis-sha256 "$artifact_digest" \
+        --validator-public-keys "$fixture/validators.json" \
+        --validator-public-keys-sha256 "$artifact_digest" \
+        --legacy-validator-set "$fixture/capture-legacy.json" \
+        --legacy-validator-set-sha256 "$artifact_digest" \
+        --offline-stop-evidence-output "$fixture/offline-stop.json" \
+        --plan > "$fixture/capture-plan.out" || return 1
+    grep -Fq -- \
+        'PLAN ONLY; no persistent service or recovery-managed remote/local file was changed' \
+        "$fixture/capture-plan.out" || return 1
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+
+    # Help is an early successful return. It must retain its output/status and
+    # allocate no runtime state after begin_temporary_scope installs cleanup.
+    local roots_before_help
+    roots_before_help="$(wc -l < "$roots_log" | tr -d ' ')"
+    TMPDIR="$runtime" dispatch_archive_command prepare_writers --help > "$fixture/help.out" || return 1
+    grep -Fq -- 'Usage:' "$fixture/help.out" || return 1
+    [ "$(wc -l < "$roots_log" | tr -d ' ')" = "$roots_before_help" ] || return 1
+
+    # Exercise the successful prepare -> nested audit shape. The nested scope
+    # first forgets inherited ownership, then proves its own cleanup removed
+    # only its roots while all three parent roots still exist.
+    # shellcheck disable=SC2329 # invoked indirectly by prepare-writers
+    audit_writers() {
+        local parent_temp="$ARCHIVE_FLEET_TEMP_ROOT"
+        local parent_transport="$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
+        local parent_python="$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
+        begin_temporary_scope
+        configure_operator_transport false
+        local nested_transport="$ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT"
+        local nested_python="$ARCHIVE_FLEET_PINNED_PYTHON_ROOT"
+        nested_cleanup_check() {
+            cleanup_temporary_root
+            if [ -d "$parent_temp" ] && [ -d "$parent_transport" ] && [ -d "$parent_python" ] &&
+                [ ! -e "$nested_transport" ] && [ ! -e "$nested_python" ]; then
+                printf 'PASS\n' > "$fixture/nested-scope.out"
+            else
+                printf 'FAIL\n' > "$fixture/nested-scope.out"
+                return 1
+            fi
+        }
+        trap nested_cleanup_check EXIT
+        nested_cleanup_check
+        trap - EXIT
+    }
+    ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES="$ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES audit_writers"
+    export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES
+    ARC_RECOVERY_PREPARE_GO="STAGE-BARRIERS $digest HELPER $digest" \
+        TMPDIR="$runtime" dispatch_archive_command prepare_writers \
+        --legacy-validator-set "$fixture/legacy-validators.json" \
+        --output "$fixture/writers-execute.json" --execute > "$fixture/execute.out" || return 1
+    [ "$(cat "$fixture/nested-scope.out")" = PASS ] || return 1
+    assert_logged_roots_absent || return 1
+    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || return 1
+
+    # Fail inside transport configuration, after all three private classes
+    # exist but before the helper returns. The command's already-installed
+    # EXIT handler must still remove every copy, including the OAuth config.
+    # shellcheck disable=SC2329 # invoked indirectly by verify-complete
+    validate_drive_remote() { return 0; }
+    ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES="$ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES validate_drive_remote"
+    export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES
+    if ARC_TEST_CONFIGURE_FAIL=1 TMPDIR="$runtime" \
+        dispatch_archive_command verify_complete_phase --destination "arc-test:captures/$digest" \
+        > "$fixture/configure-failure.out" 2>&1; then
+        printf 'verify-complete accepted injected transport setup failure\n' >&2
+        return 1
+    fi
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+
+    # The local freeze-plan command configures only its private Python HOME.
+    # A validation error after configuration must clean that nonsecret root.
+    if TMPDIR="$runtime" dispatch_archive_command seal_freeze_plan \
+        > "$fixture/python-failure.out" 2>&1; then
+        printf 'seal-freeze-plan accepted empty required arguments\n' >&2
+        return 1
+    fi
+    assert_logged_roots_absent || return 1
+    assert_original_credentials_unchanged || return 1
+    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || return 1
+)
+
+archive_dispatcher_preserves_errexit_and_accepts_completed_takeover() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture runtime startup_gate startup_supervisor startup_phase
+    local startup_sentinel startup_sentinel_pgid startup_token attempt
+    fixture="$(mktemp -d "$REPO_ROOT/.archive-dispatch-errexit-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    runtime="$fixture/runtime"
+    mkdir -m 700 "$runtime"
+    export ARC_TEST_FAILFAST_MARKER="$fixture/mutation-after-failure"
+
+    # A command function must be invoked as a direct simple command. Calling it
+    # from an if/!/&&/|| condition disables errexit throughout the function and
+    # would let this marker mutation run after the failed prerequisite.
+    capture_phase() {
+        begin_temporary_scope
+        false
+        : > "$ARC_TEST_FAILFAST_MARKER"
+    }
+    export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES=capture_phase
+    if TMPDIR="$runtime" dispatch_archive_command capture_phase \
+        > "$fixture/failfast.out" 2>&1; then
+        printf 'dispatcher accepted an early phase failure\n' >&2
+        return 1
+    fi
+    [ ! -e "$fixture/mutation-after-failure" ] || {
+        printf 'dispatcher disabled phase errexit and continued into mutation\n' >&2
+        return 1
+    }
+    [ -z "$(find "$runtime" -mindepth 1 -print -quit)" ] || {
+        printf 'errexit phase left runtime residue: %s\n' \
+            "$(find "$runtime" -mindepth 1 | head -5 | tr '\n' ' ')" >&2
+        return 1
+    }
+
+    # The guardian takeover/acknowledge handshake this block exercised belonged
+    # to dispatch_archive_command_legacy_unused, which was unreachable and has
+    # been removed. The live design has no in-gate ack protocol: the sentinel
+    # sweeps on the guardian completion receipt alone. Covered now by the
+    # static contract ordering assertions and by the signal matrix below.
+
+    # Kill both a phase that has published readiness and its supervisor before
+    # any watchdog exists. The self-publishing sentinel must notice its own
+    # PPID change, remove the pre-GO gate, and exit; numeric supervisor liveness
+    # must play no role.
+    startup_gate="$(mktemp -d "$runtime/arc-archive-dispatch.XXXXXX")"
+    chmod 700 "$startup_gate"
+    mkdir -m 700 "$startup_gate/runtime"
+    /bin/bash -c '
+set -Eeuo pipefail
+# Read the positionals BEFORE clearing them: the previous order ran "set --"
+# first, so "$1"/"$2" were already gone and this whole block died on the
+# empty source argument instead of exercising supervisor death.
+orchestrator=$1
+gate=$2
+set --
+. "$orchestrator" >/dev/null
+archive_write_current_process_id "$gate/test-supervisor.pid"
+IFS= read -r supervisor_pid < "$gate/test-supervisor.pid"
+set -m
+( archive_dispatch_phase "$supervisor_pid" "$gate" capture_phase ) &
+printf "%s\t%s\n" "$supervisor_pid" "$!" > "$gate/test-startup.info"
+while :; do /bin/sleep 1; done
+' arc-archive-startup-test "$ORCHESTRATOR" "$startup_gate" &
+    startup_supervisor="$!"
+    # Ceiling, not a deadline. 500*0.02s = 10s proved too tight on a loaded
+    # Linux CI runner and flaked this test once on PR #81 while the assertions
+    # themselves were correct. Nothing here weakens: the checks below still
+    # require readiness to have been published.
+    for ((attempt = 0; attempt < 1500; attempt += 1)); do
+        [ -f "$startup_gate/phase.ready" ] && [ -f "$startup_gate/test-startup.info" ] && break
+        /bin/sleep 0.02
+    done
+    [ -f "$startup_gate/phase.ready" ] && [ -f "$startup_gate/test-startup.info" ] || {
+        printf 'startup phase never published readiness: gate=[%s]\n' \
+            "$(ls -A "$startup_gate" 2>/dev/null | tr '\n' ' ')" >&2
+        return 1
+    }
+    IFS=$'\t' read -r recorded_supervisor startup_phase < "$startup_gate/test-startup.info"
+    [ "$recorded_supervisor" = "$startup_supervisor" ] || {
+        printf 'recorded supervisor %s != spawned %s\n' \
+            "$recorded_supervisor" "$startup_supervisor" >&2
+        return 1
+    }
+    IFS=$'\t' read -r startup_sentinel startup_sentinel_pgid startup_token \
+        < "$startup_gate/sentinel.ready"
+    # The previous check was "*[!0-9:ARC-HIVE_STOP-]*", where C-H is a bracket
+    # RANGE (C,D,E,F,G,H), so tokens like POTATO:12:34 passed. Assert the real
+    # shape: two numeric ids plus the ARC-ARCHIVE-STOP: prefixed token.
+    case "$startup_sentinel" in ""|*[!0-9]*)
+        printf 'sentinel.ready pid not numeric: [%s]\n' "$startup_sentinel" >&2
+        return 1 ;;
+    esac
+    case "$startup_sentinel_pgid" in ""|*[!0-9]*)
+        printf 'sentinel.ready pgid not numeric: [%s]\n' "$startup_sentinel_pgid" >&2
+        return 1 ;;
+    esac
+    case "$startup_token" in ARC-ARCHIVE-STOP:*) ;; *)
+        printf 'sentinel.ready token lacks prefix: [%s]\n' "$startup_token" >&2
+        return 1 ;;
+    esac
+    builtin kill -s KILL -- "$startup_phase" "$startup_supervisor" 2>/dev/null || true
+    wait "$startup_supervisor" 2>/dev/null || true
+    # Ceiling, not a deadline. The pre-watchdog sentinel must notice its own
+    # PPID change after the double SIGKILL and sweep the gate; 10s is tight on
+    # a contended runner. The assertion immediately below is unchanged and
+    # still fails if the gate survives.
+    for ((attempt = 0; attempt < 1500; attempt += 1)); do
+        { [ ! -e "$startup_gate" ] && [ ! -L "$startup_gate" ]; } && break
+        /bin/sleep 0.02
+    done
+    [ ! -e "$startup_gate" ] && [ ! -L "$startup_gate" ] || {
+        printf 'pre-watchdog sentinel did not self-clean after phase/supervisor loss\n' >&2
+        return 1
+    }
+    # As the last command of this () subshell, "cmd && return 1" fails BOTH
+    # ways: present -> return 1; absent -> the compound takes the helper's own
+    # non-zero status. Negate so absence is the success case.
+    # The sentinel removes the gate and THEN exits, so gate absence does not
+    # imply the process is already reaped. Asserting instantly made this test
+    # fail under full-harness load (observed: gate swept, sentinel still alive a
+    # moment later) while passing 5/5 standalone. Wait for the exit on a bounded
+    # ceiling; the assertion below is unchanged and still fails if it never goes.
+    for ((attempt = 0; attempt < 1500; attempt += 1)); do
+        archive_process_exists "$startup_sentinel" || break
+        /bin/sleep 0.02
+    done
+    ! archive_process_exists "$startup_sentinel" || {
+        printf 'pre-watchdog sentinel %s survived phase+supervisor SIGKILL\n' \
+            "$startup_sentinel" >&2
+        return 1
+    }
+)
+
+archive_dispatcher_signals_stop_the_full_phase_group_and_clean() (
+    local fixture python_bin
+    fixture="$(mktemp -d "$REPO_ROOT/.archive-dispatch-signal-test.XXXXXX")"
+    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    chmod 700 "$fixture"
+    python_bin="$(type -P python3)" || return 1
+    [ -x "$python_bin" ] || return 1
+
+    python3 - "$ORCHESTRATOR" "$SIGNAL_PROBE" "$fixture" "$python_bin" <<'PY' || return 1
+import hashlib
+import os
+import pathlib
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+orchestrator = pathlib.Path(sys.argv[1])
+probe = pathlib.Path(sys.argv[2])
+fixture = pathlib.Path(sys.argv[3])
+python_bin = pathlib.Path(sys.argv[4])
+identity = fixture / "id_ed25519"
+config = fixture / "rclone.conf"
+identity.write_bytes(b"sealed-test-identity\n")
+config.write_bytes(b"sealed-test-oauth-config\n")
+identity.chmod(0o400)
+config.chmod(0o600)
+
+def snapshot(path):
+    details = path.lstat()
+    return hashlib.sha256(path.read_bytes()).hexdigest(), stat.S_IMODE(details.st_mode), details.st_ino
+
+sealed_identity = snapshot(identity)
+sealed_config = snapshot(config)
+
+def process_rows():
+    result = subprocess.run(
+        ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    rows = []
+    for raw in result.stdout.splitlines():
+        fields = raw.split(None, 2)
+        if len(fields) == 3:
+            rows.append((int(fields[0]), int(fields[1]), fields[2]))
+    return rows
+
+def live_pid(pid):
+    return any(row_pid == pid and not state.startswith("Z")
+               for row_pid, _pgid, state in process_rows())
+
+def live_group(pgid):
+    return any(row_pgid == pgid and not state.startswith("Z")
+               for _pid, row_pgid, state in process_rows())
+
+def wait_until(predicate, seconds, label):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {label}")
+
+def read_info(path):
+    raw = path.read_text(encoding="utf-8").strip().split("\t")
+    if len(raw) != 2 or not all(item.isdigit() for item in raw):
+        raise AssertionError(f"malformed process proof: {path}")
+    return int(raw[0]), int(raw[1])
+
+def read_sentinel_info(path):
+    raw = path.read_text(encoding="utf-8").strip().split("\t")
+    if len(raw) != 3 or not raw[0].isdigit() or not raw[1].isdigit() or not raw[2]:
+        raise AssertionError(f"malformed sentinel proof: {path}")
+    return int(raw[0]), int(raw[1]), raw[2]
+
+command = [
+    "/bin/bash", "-c",
+    'archive_source=$1; probe_source=$2; set --; '
+    '. "$archive_source" >/dev/null; . "$probe_source"; '
+    # The phase is a fresh interpreter that unsets every inherited function and
+    # re-sources only the names listed here. The sweep runs in the sentinel,
+    # inside the phase -- so a gate-removal double declared only in this
+    # supervisor shell never reached the code under test and the injection
+    # silently never fired. Name it too, but only when the probe defines it:
+    # the snapshot writer rejects a name with no function behind it.
+    'overrides=capture_phase; '
+    '[ "${ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE:-false}" = true ] && '
+    'overrides="capture_phase archive_remove_dispatch_gate"; '
+    'export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES="$overrides"; '
+    'dispatch_archive_command capture_phase',
+    "archive-dispatch-signal-test", str(orchestrator), str(probe),
+]
+signals = (("HUP", signal.SIGHUP, 129), ("INT", signal.SIGINT, 130),
+           ("TERM", signal.SIGTERM, 143))
+cases = [
+    (f"{label}_STRESS_{index:02d}", sent, status, False, False, 0, False)
+    for index in range(50)
+    for label, sent, status in (signals[index % len(signals)],)
+]
+cases.extend((
+    ("HUP_IGNORING_CHILD", signal.SIGHUP, 129, True, False, 0, False),
+    ("INT_IGNORING_CHILD", signal.SIGINT, 130, True, False, 0, False),
+    ("TERM_IGNORING_CHILD", signal.SIGTERM, 143, True, False, 0, False),
+    ("TERM_RESURRECTING_CHILD", signal.SIGTERM, 143, False, True, 0, False),
+    ("TERM_SLOW_EXIT_CLEANUP", signal.SIGTERM, 143, False, False, 10, False),
+    ("TERM_GATE_SWEEP_RETRY", signal.SIGTERM, 143, False, False, 0, True),
+    ("KILL", signal.SIGKILL, 137, False, False, 0, False),
+))
+
+fast_teardowns = []
+for (name, sent_signal, expected_status, child_ignores, child_resurrects,
+     cleanup_delay, gate_remove_fails) in cases:
+    case = fixture / name.lower()
+    runtime = case / "runtime"
+    case.mkdir(mode=0o700)
+    runtime.mkdir(mode=0o700)
+    environment = os.environ.copy()
+    environment.update({
+        "TMPDIR": str(runtime),
+        "ARC_SIGNAL_CASE_DIR": str(case),
+        "ARC_SIGNAL_PYTHON": str(python_bin),
+        "ARC_SIGNAL_IDENTITY": str(identity),
+        "ARC_SIGNAL_RCLONE_CONFIG": str(config),
+        "ARC_SIGNAL_FOREGROUND_IGNORES": "true" if child_ignores else "false",
+        "ARC_SIGNAL_BACKGROUND_RESURRECTS": "true" if child_resurrects else "false",
+        "ARC_SIGNAL_CLEANUP_DELAY_SECONDS": str(cleanup_delay),
+        "ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE": "true" if gate_remove_fails else "false",
+    })
+    stdout_path = case / "supervisor.stdout"
+    stderr_path = case / "supervisor.stderr"
+    phase_pid = phase_pgid = sentinel_pid = background_pid = foreground_pid = watchdog_pid = None
+    process = None
+    try:
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                command, env=environment, stdout=stdout, stderr=stderr,
+                start_new_session=True,
+            )
+            ready = (case / "phase.info", case / "background.info", case / "foreground.info")
+            wait_until(lambda: all(path.is_file() for path in ready), 10, f"{name} phase readiness")
+            phase_pid, phase_pgid = read_info(case / "phase.info")
+            background_pid, background_pgid = read_info(case / "background.info")
+            foreground_pid, foreground_pgid = read_info(case / "foreground.info")
+            gates = list(runtime.glob("arc-archive-dispatch.*"))
+            if len(gates) != 1:
+                raise AssertionError(f"{name} dispatcher gate count differs: {gates}")
+            wait_until(lambda: (gates[0] / "watchdog.ready").is_file(), 5,
+                       f"{name} watchdog readiness")
+            sentinel_pid, sentinel_pgid, sentinel_token = read_sentinel_info(
+                gates[0] / "sentinel.ready"
+            )
+            # Production writes watchdog.ready as pid \t pgid \t stop_token
+            # (three fields). read_info demands exactly two, so every case in
+            # this matrix died here on "malformed process proof" before a
+            # single signal was ever delivered.
+            watchdog_pid, watchdog_pgid, watchdog_token = read_sentinel_info(
+                gates[0] / "watchdog.ready"
+            )
+            if watchdog_token != sentinel_token:
+                raise AssertionError(
+                    f"{name} watchdog and sentinel disagree on the stop token"
+                )
+            if not (phase_pid == phase_pgid == sentinel_pgid == background_pgid == foreground_pgid):
+                raise AssertionError(f"{name} phase descendants escaped the dedicated group")
+            if sentinel_pid in {phase_pid, process.pid} or not sentinel_token.startswith(
+                    "ARC-ARCHIVE-STOP:"):
+                raise AssertionError(f"{name} sentinel identity differs")
+            if process.pid == phase_pid or watchdog_pgid in {phase_pgid, process.pid}:
+                raise AssertionError(f"{name} supervisor/watchdog group separation differs")
+            for pid in (process.pid, phase_pid, sentinel_pid, background_pid,
+                        foreground_pid, watchdog_pid):
+                if not live_pid(pid):
+                    raise AssertionError(f"{name} process was not live before the signal: {pid}")
+
+            roots = []
+            for line in (case / "roots.tsv").read_text(encoding="utf-8").splitlines():
+                kind, raw_path = line.split("\t")
+                path = pathlib.Path(raw_path)
+                roots.append((kind, path))
+                details = path.lstat()
+                if path.is_symlink() or not stat.S_ISDIR(details.st_mode) or stat.S_IMODE(details.st_mode) != 0o700:
+                    raise AssertionError(f"{name} {kind} root is not a private directory")
+                try:
+                    path.relative_to(gates[0] / "runtime")
+                except ValueError as error:
+                    raise AssertionError(f"{name} {kind} root escaped the dispatcher gate") from error
+            if [kind for kind, _path in roots] != ["scratch", "pinned", "transport", "python"]:
+                raise AssertionError(f"{name} did not register all four temp-root classes")
+            transport = dict(roots)["transport"]
+            if stat.S_IMODE((transport / "id_ed25519").lstat().st_mode) != 0o400:
+                raise AssertionError(f"{name} temporary SSH identity mode differs")
+            if stat.S_IMODE((transport / "rclone.conf").lstat().st_mode) != 0o600:
+                raise AssertionError(f"{name} temporary OAuth config mode differs")
+            if (transport / "rclone.conf").read_bytes() == config.read_bytes():
+                raise AssertionError(f"{name} temporary OAuth refresh was not exercised")
+
+            # Signal only the dispatcher parent. Its trap/guardian must close
+            # the entire phase group; the test never signals a child directly.
+            os.kill(process.pid, sent_signal)
+            # Budget per case profile, measured on bash 3.2 / macOS after the
+            # gate-sweep fix: baseline teardown is ~2.2s, a 10s injected
+            # cleanup delay lands at ~12.2s, and a TERM-ignoring foreground
+            # child forces the guardian's full escalation ladder (bounded TERM
+            # wait, STOP + exact-PID KILL, drain, gate-absence poll) at ~43.7s.
+            # A single flat 60s would pass all of these while hiding a
+            # regression in the 50 fast stress cases, so keep those tight.
+            # Ceiling only. A tight per-case timeout flakes: HUP_STRESS_00
+            # measures ~2.2s alone but exceeded 30s inside a full run, purely
+            # from the preceding suites' teardown contending for CPU. Teardown
+            # SPEED is asserted after the loop on the median of the fast cases,
+            # which one contended outlier cannot flake but which still catches
+            # a regression pushing ordinary signals into the ~43s escalation
+            # ladder.
+            wait_budget = 120 + cleanup_delay
+            signal_sent_at = time.monotonic()
+            try:
+                raw_status = process.wait(timeout=wait_budget)
+            except subprocess.TimeoutExpired as error:
+                # Name the case AND say where it is stuck. A bare
+                # TimeoutExpired traceback gives no clue which of the 57 cases
+                # hung, nor why, which is most of the debugging.
+                diagnosis = [f"{name} did not exit within {wait_budget}s of {sent_signal}"]
+                try:
+                    diagnosis.append(f"stderr={stderr_path.read_text(encoding='utf-8')[-1500:]!r}")
+                except OSError as exc:
+                    diagnosis.append(f"stderr unreadable: {exc}")
+                try:
+                    diagnosis.append(f"gate={sorted(entry.name for entry in gates[0].iterdir())}")
+                except OSError as exc:
+                    diagnosis.append(f"gate unreadable: {exc}")
+                diagnosis.append(
+                    f"group_rows={[row for row in process_rows() if row[1] == phase_pgid]}"
+                )
+                diagnosis.append(
+                    "arc_env=" + repr(sorted(
+                        key for key in environment if key.startswith("ARC_")
+                    ))
+                )
+                # If the shell that launched this python had HUP ignored, the
+                # disposition is inherited and a non-interactive child bash
+                # CANNOT trap it (POSIX): the signal is silently discarded and
+                # the dispatcher waits forever. That is exactly this symptom.
+                diagnosis.append(
+                    "inherited_dispositions=" + repr({
+                        name: str(signal.getsignal(getattr(signal, name)))
+                        for name in ("SIGHUP", "SIGINT", "SIGTERM")
+                    })
+                )
+                try:
+                    cwd = os.getcwd()
+                    diagnosis.append(f"cwd={cwd!r} exists={os.path.isdir(cwd)}")
+                except OSError as exc:
+                    diagnosis.append(f"cwd UNAVAILABLE: {exc}")
+                raise AssertionError(" | ".join(diagnosis)) from error
+            if not child_ignores and not cleanup_delay:
+                fast_teardowns.append(time.monotonic() - signal_sent_at)
+            status = 128 - raw_status if raw_status < 0 else raw_status
+            if status != expected_status:
+                raise AssertionError(f"{name} dispatcher status {status}, expected {expected_status}")
+            cleanup = case / "cleanup.complete"
+            if name != "KILL" and not gate_remove_fails and any(
+                    path.exists() or path.is_symlink() for _kind, path in roots):
+                raise AssertionError(f"{name} supervisor returned before its final root sweep")
+            if name != "KILL" and not gate_remove_fails and any(runtime.iterdir()):
+                raise AssertionError(f"{name} supervisor returned before removing its private gate")
+            if gate_remove_fails:
+                if not (case / "gate-remove-failed-once").is_dir():
+                    raise AssertionError(f"{name} did not inject the final-sweep failure")
+                # The live retry path emits this exact line from
+                # archive_remove_dispatch_gate_until_absent. The previously
+                # asserted "FATAL could not remove private dispatch gate"
+                # appears nowhere in the tree.
+                if "FATAL guardian retaining and retrying private dispatch gate" not in \
+                        stderr_path.read_text(encoding="utf-8"):
+                    raise AssertionError(f"{name} cleanup handoff failure was not loud")
+            if (not child_ignores and not child_resurrects and not cleanup_delay
+                    and name != "KILL" and not cleanup.is_file()):
+                time.sleep(0.2)
+                failed_cleanup = case / "cleanup.failed"
+                details = failed_cleanup.read_text(encoding="utf-8") if failed_cleanup.is_file() else "absent"
+                raise AssertionError(
+                    f"{name} supervisor returned before phase EXIT cleanup "
+                    f"(raw status {raw_status}; cleanup after 200ms={cleanup.is_file()}; "
+                    f"failure={details!r}; case entries={sorted(path.name for path in case.iterdir())})"
+                )
+            if child_resurrects:
+                if not (case / "resurrection.attempted").is_file():
+                    raise AssertionError(f"{name} did not exercise post-cleanup root resurrection")
+            elif cleanup_delay:
+                if not (case / "cleanup.started").is_file():
+                    raise AssertionError(f"{name} did not enter its deliberately slow EXIT cleanup")
+            elif child_ignores:
+                # A signal-ignoring foreground child forces the guardian's
+                # escalation ladder, so the phase's EXIT cleanup is driven by
+                # whichever signal actually reaches it. Bash 3.2 additionally
+                # consumes INT while waiting on such a child, so the phase's own
+                # INT trap never runs. Measured on bash 3.2 / macOS: HUP -> 129
+                # (own trap wins), INT -> 143 (guardian TERM), TERM -> 143; a
+                # further escalation to KILL leaves no marker at all (137).
+                # The contracts that matter are asserted separately and
+                # unconditionally above: the exact caller-visible status, an
+                # emptied gate, and no surviving credential root.
+                if cleanup.is_file() and cleanup.read_text(encoding="utf-8") not in {
+                        f"cleanup-complete exit={expected_status}\n",
+                        "cleanup-complete exit=143\n",
+                        "cleanup-complete exit=137\n",
+                }:
+                    raise AssertionError(
+                        f"{name} cleanup status differs: "
+                        f"{cleanup.read_text(encoding='utf-8')!r}"
+                    )
+            else:
+                wait_until(cleanup.is_file, 15, f"{name} phase cleanup")
+                expected_cleanup_status = 143 if name == "KILL" else expected_status
+                if cleanup.read_text(encoding="utf-8") != f"cleanup-complete exit={expected_cleanup_status}\n":
+                    raise AssertionError(f"{name} cleanup status differs")
+            wait_until(lambda: not any(live_pid(pid) for pid in (
+                phase_pid, sentinel_pid, background_pid, foreground_pid, watchdog_pid,
+            )), 15, f"{name} processes to exit")
+            wait_until(lambda: not live_group(phase_pgid), 15, f"{name} phase group to exit")
+            wait_until(lambda: not any(runtime.iterdir()), 15, f"{name} runtime cleanup")
+            if any(path.exists() or path.is_symlink() for _kind, path in roots):
+                raise AssertionError(f"{name} left a temporary root behind")
+            if not child_resurrects and not cleanup_delay and (case / "cleanup.failed").exists():
+                raise AssertionError(f"{name} phase cleanup reported failure")
+            if snapshot(identity) != sealed_identity or snapshot(config) != sealed_config:
+                raise AssertionError(f"{name} changed an original credential/config")
+    finally:
+        if process is not None and process.poll() is None:
+            try: os.kill(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            try: process.wait(timeout=2)
+            except subprocess.TimeoutExpired: pass
+        if phase_pgid is not None and live_group(phase_pgid):
+            try: os.killpg(phase_pgid, signal.SIGKILL)
+            except ProcessLookupError: pass
+
+if fast_teardowns:
+    ordered = sorted(fast_teardowns)
+    median_teardown = ordered[len(ordered) // 2]
+    # Measured ~2.2s on bash 3.2 / macOS. The guardian escalation ladder
+    # measures ~43s, so a median above 15s means ordinary signal teardown
+    # started escalating -- the regression a per-case timeout used to catch.
+    if median_teardown > 15:
+        raise AssertionError(
+            f"median fast-path teardown regressed to {median_teardown:.1f}s "
+            f"across {len(ordered)} cases (expected ~2s)"
+        )
+PY
+)
+
 complete_is_last_and_fully_verified() {
     python3 - "$ORCHESTRATOR" <<'PY' || return 1
 import pathlib,sys
@@ -2712,6 +3496,10 @@ run_test 'remote zero-progress heals only reviewed publish orphans' remote_zero_
 run_test 'capture lock and monotonic lease are portable and bound' capture_lock_and_monotonic_lease_are_portable_and_bound
 run_test 'canonical reference is independently required' reference_pair_is_independent_of_final_capture_classes
 run_test 'remote COMPLETE rejects object attacks' remote_complete_rejects_missing_tampered_extra
+run_test 'verify-complete plan cleanup is total and SSH-free' verify_complete_plan_cleans_transport_state_and_never_uses_ssh
+run_test 'archive command scopes clean plan, failure, and nested success state' archive_command_scopes_clean_plan_failure_and_nested_success
+run_test 'archive dispatcher preserves phase errexit and completed takeover' archive_dispatcher_preserves_errexit_and_accepts_completed_takeover
+run_test 'archive dispatcher signals stop the full phase group and clean' archive_dispatcher_signals_stop_the_full_phase_group_and_clean
 run_test 'COMPLETE is last and fully verified' complete_is_last_and_fully_verified
 run_test 'immutable Gist revision recovers a lost local intent after latest edit' gist_revision_recovers_lost_local_intent_after_latest_edit
 run_test 'new v3 paths preserve frozen source' new_v3_paths_and_post_cutover_source_are_verified

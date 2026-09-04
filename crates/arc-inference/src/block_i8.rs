@@ -129,11 +129,23 @@ impl BlockI8Weights {
 pub fn matmul_block_i8_into(weights: &BlockI8Weights, input: &[i64], output: &mut [i64]) {
     let n_rows = weights.n_rows;
     let n_cols = weights.n_cols;
-    assert_eq!(input.len(), n_cols, "input width mismatch");
-    assert_eq!(output.len(), n_rows, "output row count mismatch");
-    if n_rows == 0 || n_cols == 0 {
+    // Empty-weight guard, BEFORE the shape asserts. Shard-mode models
+    // pre-allocate every layer slot and only populate the range this node
+    // holds; a non-held slot is `BlockI8Weights::empty()` but the activation
+    // and output buffers around it are still full width. Checking the shape
+    // first turned that skipped layer into an `assert_eq!` panic - and the
+    // release profile is `panic = "abort"`, so it takes the node down instead
+    // of returning a number. Zero the output and return, exactly as the
+    // sibling `matmul_i8_into` / `matmul_i16_into` kernels do. A genuinely
+    // mismatched non-empty shape still trips the asserts below.
+    if n_rows == 0 || n_cols == 0 || weights.data.is_empty() {
+        for o in output.iter_mut() {
+            *o = 0;
+        }
         return;
     }
+    assert_eq!(input.len(), n_cols, "input width mismatch");
+    assert_eq!(output.len(), n_rows, "output row count mismatch");
 
     let blocks_per_row = n_cols / BLOCK_SIZE;
 
@@ -315,5 +327,21 @@ mod tests {
         let mut out: Vec<i64> = Vec::new();
         matmul_block_i8_into(&w, &[], &mut out);
         assert_eq!(out.len(), 0);
+    }
+
+    /// The real shard-placeholder shape: a zero-sized weight slot reached with
+    /// a full-width activation and a full-width output buffer. `empty()`
+    /// exists precisely for "slot this node doesn't hold", so this must zero
+    /// the output and return - the sibling kernels `matmul_i8_into` and
+    /// `matmul_i16_into` both do. Asserting on the shape first turns a skipped
+    /// layer into a panic, and the release profile aborts on panic, so it
+    /// would take the whole node down rather than produce a wrong number.
+    #[test]
+    fn empty_placeholder_with_live_width_zeroes_instead_of_panicking() {
+        let w = BlockI8Weights::empty();
+        let input = vec![ONE; 4 * BLOCK_SIZE];
+        let mut out = vec![7i64; 16];
+        matmul_block_i8_into(&w, &input, &mut out);
+        assert_eq!(out, vec![0i64; 16]);
     }
 }

@@ -144,8 +144,15 @@ and creates a mode-`0444` `.sha256` sidecar. It never replaces either file.
 `run` rechecks the seal and all artifact hashes, executes offline ARCCHKPT
 `inspect` plus quorum `verify`, checks six fresh-or-exact-resume
 data/key/host prerequisites,
-and prints `PLAN ONLY`. It changes no local/remote directory, process, service,
-package, proxy, certificate, or data.
+and prints `PLAN ONLY`. It makes no persistent recovery-managed change to a
+local or remote directory, file, process/service state, package, proxy,
+certificate, or chain data. Production probes stream directly over the pinned
+SSH channel and do not install a remote rollout helper before the exact GO
+authorization. Each post-archive, root-pinned metadata fetch uses an exact
+private mode-`0600` rclone-config copy and an isolated disposable `HOME`.
+OAuth refresh and cache writes remain inside that root, which is removed on
+success or failure, and the original operator config is re-proved afterward.
+Normal SSH and service audit logs may record that read access.
 
 If any artifact, endpoint, node, key path, stake, activation rule, timeout, or
 probe changes, create and approve a new sealed manifest. Do not chmod/edit an
@@ -192,8 +199,8 @@ Use a roots-only finalized, sealed `mode: "production"` manifest only after the
 exact capture-scoped archive has a fully verified `COMPLETE.json` and all six
 controlled legacy writers remain persistently fenced. This is not a claim that
 all dynamically observed external legacy forks are globally halted. Run the
-read-only plan to obtain the verified archive-manifest hash and exact extended
-phrase:
+recovery-state read-only plan to obtain the verified archive-manifest hash and
+exact extended phrase:
 
 ```bash
 python3 scripts/recovery/recovery_rollout.py run \
@@ -1184,6 +1191,48 @@ printf '%s  %s\n' "$ssh_identity_sha256" "$ssh_identity" \
   --scp-sha256 "$ARC_RESTORE_SCP_SHA256" \
   --receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json
 ```
+
+Every archive command that initializes Python, SSH, or Drive runs as the leader
+of a dedicated, invocation-scoped process group and installs its cleanup
+handler before argument parsing or configuration. It creates a private
+mode-0700 dispatcher gate beneath the caller's `TMPDIR` (beneath the validated
+`--work-root` for `seal`) and exports only that gate's private runtime child as
+the phase `TMPDIR`. The Python HOME, transport root, and every other invocation
+scratch directory are therefore physically contained by the gate. The phase
+copies `known_hosts` and `id_ed25519` at mode 0400 and, for a
+Drive command, copies the reviewed rclone executable at mode 0500 plus a
+disposable mode-0600 rclone config copy. All `ssh`, `scp`, and `rclone` calls
+then use only those copies in a clean environment. A token refresh can change
+the disposable config copy, but the source SSH identity and rclone config
+remain byte-for-byte unchanged. The invocation removes all of these roots on
+a normal success, plan return, or fail-closed error, including an error partway
+through configuration. Nested `prepare-writers` -> `audit-writers` execution
+owns separate roots, so the nested cleanup cannot remove its parent's active
+transport. The dispatcher forwards a parent-targeted `SIGHUP`, `SIGINT`, or
+`SIGTERM` exactly once to the entire phase group, waits until the phase is
+reaped, drains any surviving same-group descendants, and then independently
+removes and verifies absence of the whole gate before returning 129, 130, or
+143 respectively. The phase gets a bounded opportunity to finish its EXIT
+cleanup; the supervisor-owned final gate sweep is authoritative and also
+removes bytes a signal-ignoring descendant tries to recreate after that
+cleanup starts. Before the sweep, the separately grouped guardian drains the
+phase group. The guardian leads its own process group, which is what makes its
+membership queries trustworthy; it retries bounded TERM and then exact-PID KILL
+of every member except the sentinel until that group is verifiably empty, and
+only then publishes its completion receipt. The sentinel exists to anchor the
+phase PGID so it can never be reused while members are being killed by exact
+PID, and it sweeps the gate on that receipt alone, verifying absence. The
+sentinel must never query phase-group membership itself: it runs inside that
+group, so its own `ps` child is counted as a member and the sweep would never
+fire. An unsignaled internal cleanup failure returns 125; a run that already
+received HUP, INT, or TERM preserves its required 129, 130, or 143 status while
+reporting that containment is continuing.
+The same guardian takes over if the dispatcher is lost to `SIGKILL`; it first
+gives the cleanup-owning phase leader a TERM path, then kills a TERM-ignoring
+foreground descendant so the deferred cleanup or final gate sweep can finish.
+Direct `SIGKILL` of both the phase and its guardian, or loss of the operator
+host/kernel, cannot run an EXIT handler or final sweep; securely remove any
+private mode-0700 dispatcher-gate orphan before retrying after either event.
 
 After all six exact writers are stopped, `capture` re-runs the hash-pinned
 remote `stopped-status` command with every frozen writer argument and seals a

@@ -593,9 +593,17 @@ or EOS.
 Coordinators batch the whole prompt into one round-trip per shard (`"prefill":"batch"`) and pick the lowest-latency replica for each range. Racing several replicas at once and taking the first to finish is designed but not shipped.
 
 Each node holds exactly 16 of the 32 layers, and every layer has exactly three
-validator replicas. Verify the post-cutover map through a reviewed HTTPS
-origin, for example `curl https://104.238.171.11/shards`; raw public
-`:9090` is intentionally unavailable.
+validator replicas. Once the locked rollout has installed and verified the v3
+gateways, verify the post-cutover map through the reviewed HTTPS origin, for
+example `curl https://104.238.171.11/shards`.
+
+Neither half of that is true of the live fleet before the cutover, and the
+pre-cutover reality is the inverse: measured 2026-09-03, all six legacy
+coordinators refuse TCP 443 (connection refused, no gateway installed) and all
+six still serve raw `http://IP:9090` publicly. Treat any `:9090` response as
+pre-cutover legacy diagnostics from the superseded validator identities, never
+as v3 evidence, and do not rely on `:9090` being closed until the rollout has
+installed the gateways and closed it.
 
 ---
 

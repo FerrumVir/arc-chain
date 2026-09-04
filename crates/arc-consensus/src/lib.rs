@@ -636,6 +636,21 @@ impl FinalityProof {
 /// Number of rounds to keep for reorg safety during DAG pruning.
 pub const PRUNE_DEPTH: u64 = 100;
 
+/// Rounds of local security-detector history the engine retains.
+///
+/// `WithholdingDetector` and `StakeTracker` are appended on every accepted
+/// block, so without a bound their per-round maps grow for the whole life of
+/// the process. The widest consumer window is
+/// `WithholdingDetector::detect_withholding(100)` (`detect_double_voting` only
+/// reads the current round), so this keeps at least 9x that window resident.
+///
+/// The trigger is NOT once every `PRUNE_DEPTH` rounds. It fires once per
+/// accepted block whose round is a multiple of `PRUNE_DEPTH` -- that is, once
+/// per proposing validator on each such round -- and each firing performs an
+/// O(retained) `retain` over the full map. Budget O(V * retained) work on a
+/// trigger round, where V is the number of validators that proposed in it.
+pub const SECURITY_HISTORY_DEPTH: u64 = 10 * PRUNE_DEPTH;
+
 // ── Cross-Shard Lock Timeout ─────────────────────────────────────────────────
 
 /// Maximum time a cross-shard lock can be held before automatic expiry (30 seconds).
@@ -1513,6 +1528,7 @@ impl ConsensusEngine {
             wd.report_expected(self.local_address, round);
             wd.report_received(self.local_address, round);
         }
+        self.prune_security_history(round);
 
         Ok(block)
     }
@@ -1798,6 +1814,8 @@ impl ConsensusEngine {
             }
         }
 
+        self.prune_security_history(block.round);
+
         debug!(
             round = block.round,
             author = %block.author,
@@ -2046,6 +2064,31 @@ impl ConsensusEngine {
         newly_committed
     }
 
+    /// Bound the local security detectors to [`SECURITY_HISTORY_DEPTH`] rounds.
+    ///
+    /// `report_received`/`report_vote` are called for every accepted block and
+    /// `report_expected` for every local proposal, but nothing pruned either
+    /// map outside their own unit tests. A node that keeps advancing rounds
+    /// without committing therefore accumulated one entry per (author, round)
+    /// forever, and `detect_double_voting` rescans the whole vote map on every
+    /// received block. Driving this from the block round rather than from a
+    /// commit keeps it bounded even while the commit cursor is stalled.
+    ///
+    /// Cost: this is reached once per accepted block, so on a round that is a
+    /// multiple of `PRUNE_DEPTH` it runs once per proposing validator, each
+    /// doing an O(retained) `retain` over both maps -- O(V * retained) for the
+    /// round, not a single sweep.
+    fn prune_security_history(&self, round: u64) {
+        if !round.is_multiple_of(PRUNE_DEPTH) {
+            return;
+        }
+        let Some(before_round) = round.checked_sub(SECURITY_HISTORY_DEPTH) else {
+            return;
+        };
+        self.withholding_detector.lock().prune(before_round);
+        self.stake_tracker.lock().prune_votes(before_round);
+    }
+
     /// Prune DAG data older than PRUNE_DEPTH rounds behind the current round.
     /// Keeps recent rounds for reorg safety. Removes blocks, round index entries,
     /// committed hashes, and author-round tracking for pruned rounds.
@@ -2054,7 +2097,16 @@ impl ConsensusEngine {
         if current <= PRUNE_DEPTH {
             return;
         }
-        let prune_below = current - PRUNE_DEPTH;
+        // Never prune at or above the commit cursor. `try_commit` scans from
+        // `last_committed_round` and needs rounds r, r+1 and r+2 to certify a
+        // leader. The DAG round runs far ahead of the commit cursor whenever a
+        // leader certificate is late, so `current - PRUNE_DEPTH` alone deletes
+        // the exact rounds the scan has not passed yet. `blocks_in_round`
+        // then returns empty at `scan_start`, the scan breaks there on every
+        // later call, and the commit cursor is fenced permanently while
+        // `advance_round` keeps turning rounds.
+        let prune_below =
+            (current - PRUNE_DEPTH).min(self.last_committed_round.load(Ordering::SeqCst));
 
         let mut pruned_blocks = 0usize;
         let mut pruned_rounds = 0usize;
@@ -4990,6 +5042,127 @@ mod tests {
                 round
             );
         }
+    }
+
+    #[test]
+    fn commit_prune_never_discards_rounds_at_or_above_the_commit_cursor() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+
+        // Rounds 0..=2, every validator, each block referencing every block of
+        // the previous round. Round 0's leader is therefore certified by the
+        // two-round rule as soon as round 2 exists.
+        for round in 0..=2u64 {
+            let parents = if round == 0 {
+                Vec::new()
+            } else {
+                engine.blocks_in_round(round - 1)
+            };
+            for v in 0..4u8 {
+                let block = make_block(
+                    test_addr(v),
+                    round,
+                    parents.clone(),
+                    vec![],
+                    round * 10 + v as u64,
+                );
+                engine.receive_block(&block).expect("valid block");
+            }
+            if round < 2 {
+                assert!(engine.advance_round());
+            }
+        }
+        assert_eq!(engine.current_round(), 2);
+
+        // The DAG round keeps turning while the commit cursor waits for the
+        // round-3 certifiers that would finish round 1's certificate. This is
+        // the live failure shape: dag_round far ahead of dag_committed.
+        for _ in 0..=PRUNE_DEPTH {
+            engine.force_advance_round();
+        }
+        assert!(engine.current_round() > PRUNE_DEPTH + 2);
+
+        let committed = engine.try_commit();
+        assert_eq!(committed.len(), 1, "round 0 leader must commit");
+        assert_eq!(engine.last_committed_round(), 1);
+
+        // Post-commit pruning used `current_round - PRUNE_DEPTH`, which deletes
+        // the rounds the commit cursor has NOT passed yet. Once round 1 is gone
+        // `try_commit` breaks on an empty `blocks_in_round(scan_start)` on every
+        // later call, so the node advances rounds forever and never commits
+        // again.
+        assert!(
+            !engine.blocks_in_round(1).is_empty(),
+            "round 1 is the commit cursor and must survive pruning"
+        );
+        assert!(
+            !engine.blocks_in_round(2).is_empty(),
+            "round 2 certifies round 1 and must survive pruning"
+        );
+
+        // Liveness: the late round-3 certifiers complete round 1's certificate.
+        let round3_parents = engine.blocks_in_round(2);
+        assert_eq!(round3_parents.len(), 4);
+        for v in 0..4u8 {
+            let block = make_block(
+                test_addr(v),
+                3,
+                round3_parents.clone(),
+                vec![],
+                300 + v as u64,
+            );
+            engine.dag.insert(block.hash, block.clone());
+            engine.rounds.entry(3).or_default().push(block.hash);
+            engine
+                .author_round_blocks
+                .insert((block.author, 3), block.hash);
+        }
+
+        let committed = engine.try_commit();
+        assert!(
+            committed.iter().any(|block| block.round == 1),
+            "round 1 must still be committable after pruning"
+        );
+    }
+
+    #[test]
+    fn security_detector_history_is_bounded_by_round_progress() {
+        let vs = test_validator_set(1);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+
+        let rounds = SECURITY_HISTORY_DEPTH + 5 * PRUNE_DEPTH;
+        for round in 0..=rounds {
+            let parents = if round == 0 {
+                Vec::new()
+            } else {
+                engine.blocks_in_round(round - 1)
+            };
+            let block = make_block(test_addr(0), round, parents, vec![], round);
+            engine.receive_block(&block).expect("valid block");
+            assert!(engine.advance_round());
+        }
+
+        // Both detectors are appended on every accepted block. Nothing pruned
+        // them outside their own unit tests, so a node that keeps advancing
+        // rounds without committing grew them for the life of the process.
+        let bound = (SECURITY_HISTORY_DEPTH + PRUNE_DEPTH) as usize;
+        let retained_votes = engine.stake_tracker().lock().retained_vote_rounds();
+        assert!(
+            retained_votes <= bound,
+            "stake tracker retained {retained_votes} vote rounds over {rounds} rounds (bound {bound})"
+        );
+        let retained_observations = engine.withholding_detector().lock().retained_observations();
+        assert!(
+            retained_observations <= bound,
+            "withholding detector retained {retained_observations} observations over {rounds} rounds (bound {bound})"
+        );
+
+        // The retained window must still cover every consumer: withholding uses
+        // a 100-round window and double-vote detection uses the current round.
+        assert!(
+            retained_votes >= PRUNE_DEPTH as usize,
+            "retention must not fall below the widest detector window"
+        );
     }
 
     // ── 17. Equivocation Detection & Slashing (A3) ──────────────────────────

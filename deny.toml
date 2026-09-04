@@ -10,6 +10,10 @@ all-features = false
 # ----------------------------------------------------------- advisories ----
 [advisories]
 version = 2
+# Soundness notices apply to the complete shipped graph. The cargo-deny v0.20
+# default checks only direct workspace dependencies, which would miss unsafe
+# transitive runtime crates such as Wasmer's memory-mapping implementation.
+unsound = "all"
 # Yanked crates are denied rather than warned: a yanked dependency in a
 # workspace that ships signed binaries to third-party node operators via
 # `curl | bash` is a release-blocking fact, not a note.

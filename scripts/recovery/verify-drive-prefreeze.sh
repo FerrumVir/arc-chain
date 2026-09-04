@@ -50,7 +50,11 @@ Usage:
     --expected-account-sha256 HASH \
     --daily-upload-budget-bytes BYTES
 
-`preflight` is read-only. `execute` repeats the same checks, then uploads,
+`preflight` makes no Drive object mutation. Its authenticated `rclone about`
+may refresh OAuth state only in the caller-selected RCLONE_CONFIG. The archive
+orchestrator supplies a disposable mode-0600 copy and removes it at command
+exit; a standalone caller must provide the same isolation if its source config
+must remain unchanged. `execute` repeats the same checks, then uploads,
 downloads, SHA-256 verifies, and permanently deletes one unique 8 MiB canary.
 Run `execute` after validating the exact FREEZE authorization and immediately
 before the first validator SIGTERM.
@@ -66,8 +70,10 @@ remote with a read-only `rclone about`, then pipes one decrypted selected-remote
 single in-memory stream the helper hashes the custom OAuth client ID, consumes
 the bearer token, and calls the fixed Google Drive v3
 `about?fields=user(emailAddress,permissionId,me)` endpoint with verified TLS.
-OAuth material and raw client/account/permission fields are never written to a
-receipt, temporary file, argv, environment variable, or log.
+OAuth material and raw client/account/permission fields are never written by
+this gate to a receipt, gate-owned temporary file, argv, environment variable,
+or log. The caller-selected config may already contain OAuth material and may
+be refreshed as described above.
 
 `--daily-upload-budget-bytes` is the independently reviewed *remaining* budget
 for this dedicated ARC uploader in its current Google quota window, capped here
