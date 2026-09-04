@@ -637,9 +637,30 @@ pub async fn fetch_network_stats(state: State<'_, AppState>) -> CmdResult<Networ
     Ok(rpc_client::fetch_network_stats(&state.http, &host).await)
 }
 
+/// Enforce, natively, the same scheme policy the desktop capability declares.
+///
+/// `capabilities/default.json` scopes `shell:allow-open` to `http://**` and
+/// `https://**`, but this command reaches the OS handler through
+/// `OpenerExt::open_url`, which is a direct Rust call and therefore never
+/// consults that scope. Without this check an IPC caller could hand the
+/// platform handler a `file:`, `smb:`, or Windows shell URL that the app has
+/// no reason to open. Every in-app caller already passes an `http(s)` URL.
+fn external_web_url(url: &str) -> CmdResult<()> {
+    let parsed = tauri::Url::parse(url)
+        .map_err(|_| format!("refusing to open a malformed external URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "refusing to open an external URL with unsupported scheme '{}'",
+            parsed.scheme()
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
+    external_web_url(&url)?;
     app.opener().open_url(url, None::<&str>).map_err(map_err)
 }
 
@@ -1267,12 +1288,45 @@ fn direct_inference_error_must_not_retry(error: &str) -> bool {
             .any(|status| normalized.contains(&format!("http {status}")))
 }
 
+/// Exact prefix of the aggregate "every reachable coordinator declined the
+/// direct community path" error.
+///
+/// `Inference.tsx` switches to the standalone `/run_consensus` fallback only on
+/// this literal substring, so it must stay verbatim in the produced message.
+/// It previously read `all {n} reachable coordinators failed (direct path)`,
+/// which never matched, so the fallback was unreachable in the packaged app.
+const DIRECT_PATH_EXHAUSTED_SENTINEL: &str = "all coordinators failed (direct path)";
+
+fn direct_path_exhausted_error(reachable: usize, last_error: &str) -> String {
+    format!("{DIRECT_PATH_EXHAUSTED_SENTINEL}; {reachable} reachable, last: {last_error}")
+}
+
 #[cfg(test)]
 mod inference_retry_tests {
     use super::{
         community_receipt_source_is_pinned, direct_inference_error_must_not_retry,
-        COORDINATOR_HOSTS,
+        direct_path_exhausted_error, COORDINATOR_HOSTS, DIRECT_PATH_EXHAUSTED_SENTINEL,
     };
+
+    #[test]
+    fn exhausted_direct_path_error_carries_the_ui_consensus_fallback_sentinel() {
+        let message = direct_path_exhausted_error(3, "HTTP 503: no eligible workers");
+        assert!(message.contains(DIRECT_PATH_EXHAUSTED_SENTINEL));
+        assert!(message.contains("3 reachable"));
+        assert!(message.contains("HTTP 503: no eligible workers"));
+
+        // The Inference screen only falls through to `/run_consensus` when it
+        // recognizes this exact substring. An aggregate error that does not
+        // contain it silently removes the sharded-consensus fallback in the
+        // packaged app, where the browser mock's wording is never used.
+        let ui = include_str!("../../src/screens/Inference.tsx");
+        assert!(
+            ui.contains(&format!(
+                "message.includes(\"{DIRECT_PATH_EXHAUSTED_SENTINEL}\")"
+            )),
+            "Inference.tsx no longer gates its consensus fallback on the native sentinel"
+        );
+    }
 
     #[test]
     fn claimed_or_terminal_direct_failures_never_retry_elsewhere() {
@@ -1352,11 +1406,7 @@ pub async fn run_inference_via_coordinator_direct(
             Err(e) => last_err = e,
         }
     }
-    Err(format!(
-        "all {} reachable coordinators failed (direct path); last: {}",
-        candidates.len(),
-        last_err
-    ))
+    Err(direct_path_exhausted_error(candidates.len(), &last_err))
 }
 
 const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.0 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
@@ -3265,6 +3315,34 @@ mod release_binary_tests {
         let legacy_model_label = ["arc", "testnet", "llama", "2", "7b", "chat", "q4"].join("-");
         assert!(!source.contains(&legacy_shape_label));
         assert!(!source.contains(&legacy_model_label));
+    }
+
+    #[test]
+    fn external_open_enforces_the_declared_http_only_capability_scope() {
+        for allowed in [
+            "https://github.com/FerrumVir/arc-chain",
+            "http://140.82.16.112:9090/block/latest",
+        ] {
+            external_web_url(allowed).unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        for refused in [
+            "file:///etc/passwd",
+            "file://C:/Windows/System32/cmd.exe",
+            "smb://attacker.example/share",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(
+                external_web_url(refused).is_err(),
+                "native opener accepted {refused}"
+            );
+        }
+
+        // The native command must never be looser than the scope the shipped
+        // capability declares for the WebView's own opener.
+        let capability = include_str!("../capabilities/default.json");
+        assert!(capability.contains("\"url\": \"https://**\""));
+        assert!(capability.contains("\"url\": \"http://**\""));
     }
 
     #[test]
