@@ -2711,6 +2711,7 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
     local required origin
     for required in \
         'STOP_BUDGET_SECONDS = 4_420' \
+        'START_PROOF_SECONDS = 300' \
         'CANONICAL_MODEL_SIZE_BYTES = 4_081_004_224' \
         '08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa' \
         '8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269' \
@@ -2744,12 +2745,16 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
         '"-i",' \
         'protected canary runner tool is unsafe' \
         '("ps", "-ww", "-p", str(pid), "-o", "command=")' \
+        '("ps", "-ww", "-p", str(pid), "-o", "comm=")' \
         '("lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn")' \
         '"-sTCP:LISTEN"' \
         'listener_names != [RPC]' \
         '"-iUDP"' \
         'udp_names' \
-        'sole ephemeral loopback' \
+        'must own no UDP sockets' \
+        'print-disabled' \
+        'recovered_loaded_disabled' \
+        '_classify_start_phase' \
         'failed-start canary did not exit within the graceful' \
         'bootout was not attempted across a racy no-PID observation' \
         'loaded canary has no provable PID' \
