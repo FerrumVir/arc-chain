@@ -95,6 +95,7 @@ t=pathlib.Path(sys.argv[1]).read_text(); b=t[t.index("capture_phase()"):t.index(
 assert b.index('run_drive_prefreeze_gate execute') < b.index('capture_all_live_observations')
 late_sample=b.index('legacy_height_receipt_sha="$(sample_legacy_public_height_late')
 height_cross=b.index('capture_authenticated_legacy_height_cross_proof "$freeze_plan"')
+fresh_capacity=b.index('remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan"')
 rounds=b.index('run_quarantine_generation_rounds')
 first_boundary=b.index('build-first-boundary')
 stop=b.index('stop_after_quarantine_round_exact')
@@ -102,7 +103,9 @@ capture=b.index('ensure_offline_capture "$capture_id" "$node"')
 persisted=b.index('run_persisted_head_exact "$freeze_plan"')
 boundary=b.index('create_legacy_maintenance_boundary')
 offline=b.index('create_offline_stop_evidence')
-assert b.index('capture_all_live_observations') < late_sample < height_cross < rounds < first_boundary
+assert b.index('capture_all_live_observations') < late_sample < height_cross < fresh_capacity < rounds < first_boundary
+assert ('remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan"\n'
+        '    quarantine_generation_ledger_sha="$(run_quarantine_generation_rounds \\' in b)
 assert first_boundary < stop < capture < persisted < boundary < offline
 assert 'ALL SIX CONTROLLED WRITERS HALTED' in b and 'no global halt is claimed' in b
 for required in ('sample-targets', 'quarantine-round-authorize',
@@ -1091,6 +1094,69 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
     remote_readiness "$(printf 'b%.0s' {1..64})" "$(printf 'a%.0s' {1..64})" /sealed/freeze.json >/dev/null || return 1
     grep -Fq 'nyc stopped-status' "$f/actions" && grep -Fq 'nyc status' "$f/actions" && \
         grep -Fq 'lax stopped-status' "$f/actions" && grep -Fq 'lax status' "$f/actions"
+)
+
+stale_freeze_capacity_cannot_cross_current_readiness_gate() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f gib sealed_data_bytes current_data_bytes available_bytes
+    local sealed_required_bytes current_required_bytes capture_id freeze_sha
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    gib=$((1024 * 1024 * 1024))
+    sealed_data_bytes=$((28 * gib))
+    current_data_bytes=$((29 * gib))
+    available_bytes=$((59 * gib))
+    sealed_required_bytes=$((sealed_data_bytes * 2 + 2 * gib))
+    current_required_bytes=$((current_data_bytes * 2 + 2 * gib))
+    [ "$available_bytes" -ge "$sealed_required_bytes" ] || return 1
+    [ "$available_bytes" -lt "$current_required_bytes" ] || return 1
+    capture_id="$(printf 'b%.0s' {1..64})"
+    freeze_sha="$(printf 'a%.0s' {1..64})"
+
+    # Fixture overrides invoked indirectly by sourced remote_readiness.
+    # shellcheck disable=SC2317,SC2329
+    host_for() { printf '%s\n' "$1"; }
+    # shellcheck disable=SC2317,SC2329
+    freeze_node_field() {
+        case "$3" in
+            writer_pid|writer_start_ticks|supervisor_main_pid|supervisor_start_ticks) printf '1\n' ;;
+            boot_id) printf '00000000-0000-0000-0000-000000000000\n' ;;
+            writer_supervision_mode) printf 'systemd-unit\n' ;;
+            supervisor_unit) printf 'arc-node.service\n' ;;
+            executable_path|supervisor_executable_path|data_dir|model_path) printf '/safe/%s/%s\n' "$2" "$3" ;;
+            executable_sha256|argv_sha256|writer_cgroup_sha256|supervisor_executable_sha256|supervisor_argv_sha256|model_sha256) printf 'a%.0s' {1..64}; printf '\n' ;;
+            model_size_bytes) printf '4081004224\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    # Model the remote current-capacity probe after the sealed plan passed:
+    # data growth raises the live requirement from 58 GiB to 60 GiB.
+    # shellcheck disable=SC2317,SC2329
+    ssh_remote_exact() {
+        local host="$1" command
+        shift
+        command="$*"
+        [ "$host" = nyc ] || return 0
+        [[ "$command" == *'bytes=$(du -s -B1 "$data"'* ]] || return 97
+        [[ "$command" == *'required_bytes=$((bytes + binding_bytes))'* ]] || return 97
+        [[ "$command" == *'free_bytes=$(df -PB1 /root'* ]] || return 97
+        [[ "$command" == *'test "$free_bytes" -ge "$required_bytes"'* ]] || return 97
+        : > "$f/nyc-current-capacity-probed"
+        [ "$available_bytes" -ge "$current_required_bytes" ]
+    }
+    # shellcheck disable=SC2317,SC2329
+    run_stopped_status_exact() {
+        : > "$f/nyc-stopped-fallback-checked"
+        return 1
+    }
+
+    if ( remote_readiness "$capture_id" "$freeze_sha" /sealed/stale-freeze.json \
+        >/dev/null 2>&1; : > "$f/quarantine-mutation-reached" ); then
+        return 1
+    fi
+    [ -e "$f/nyc-current-capacity-probed" ] && \
+        [ -e "$f/nyc-stopped-fallback-checked" ] && \
+        [ ! -e "$f/quarantine-mutation-reached" ]
 )
 
 fleet_live_observation_retry_rejects_any_stopped_writer() (
@@ -3482,6 +3548,7 @@ run_test 'v5 freeze transaction is fault-closed' v5_freeze_transaction_is_fault_
 run_test 'v5 stop journal semantics are fault-closed' v5_stop_journal_semantics_are_fault_closed
 run_test 'classification requires each node once' classification_requires_each_node_once
 run_test 'capture readiness resumes exact stopped state' capture_readiness_resumes_stopped_and_indexed_nodes
+run_test 'stale freeze capacity cannot cross current readiness gate' stale_freeze_capacity_cannot_cross_current_readiness_gate
 run_test 'fleet observation retry rejects any stopped writer' fleet_live_observation_retry_rejects_any_stopped_writer
 run_test 'same-generation observation selection resume is byte-identical' live_observation_selection_resume_is_byte_identical
 run_test 'mutation dispatch publication is no-replace and crash-resumable' mutation_dispatch_publication_is_no_replace_and_resumable
