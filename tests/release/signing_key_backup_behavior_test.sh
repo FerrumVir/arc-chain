@@ -34,6 +34,69 @@ new_fixture() {
     NEW_FIXTURE="$fixture"
 }
 
+canonicalize_with_verifier() {
+    local input_path="$1"
+    local output_path="$2"
+    local function_source
+    function_source="$(sed -n \
+        '/^canonicalize_manifest_public_key() {$/,/^}$/p' \
+        "$VERIFY_SCRIPT")"
+    [ -n "$function_source" ] || {
+        printf 'manifest public-key canonicalizer is unavailable\n'
+        return 1
+    }
+    {
+        printf '%s\n' "$function_source"
+        printf '%s\n' 'canonicalize_manifest_public_key "$1" "$2"'
+    } | /bin/bash -s -- "$input_path" "$output_path"
+}
+
+manifest_public_key_comments_do_not_change_identity() {
+    local fixture commented_key no_comment_key commented_raw uncommented_raw
+    local no_comment_raw unexpected_comment_raw commented_canonical
+    local uncommented_canonical no_comment_canonical
+    new_fixture
+    fixture="$NEW_FIXTURE"
+    commented_key="$fixture/commented-manifest-key"
+    no_comment_key="$fixture/no-comment-manifest-key"
+    commented_raw="$fixture/commented.pub"
+    uncommented_raw="$fixture/uncommented.pub"
+    no_comment_raw="$fixture/no-comment.pub"
+    unexpected_comment_raw="$fixture/unexpected-comment.pub"
+    commented_canonical="$fixture/commented.canonical"
+    uncommented_canonical="$fixture/uncommented.canonical"
+    no_comment_canonical="$fixture/no-comment.canonical"
+
+    ssh-keygen -q -t ed25519 -N '' \
+        -C 'arc-release-manifest-v1' -f "$commented_key"
+    ssh-keygen -q -t ed25519 -N '' -C '' -f "$no_comment_key"
+    ssh-keygen -y -f "$commented_key" > "$commented_raw"
+    awk '{print $1 " " $2}' "$commented_raw" > "$uncommented_raw"
+    awk '{print $1 " " $2 " unexpected-comment"}' "$commented_raw" \
+        > "$unexpected_comment_raw"
+    ssh-keygen -y -f "$no_comment_key" > "$no_comment_raw"
+
+    canonicalize_with_verifier "$commented_raw" "$commented_canonical" \
+        || return 1
+    canonicalize_with_verifier "$uncommented_raw" "$uncommented_canonical" \
+        || return 1
+    canonicalize_with_verifier "$no_comment_raw" "$no_comment_canonical" \
+        || return 1
+    cmp -s "$commented_canonical" "$uncommented_canonical" || {
+        printf 'public-key comment changed the canonical key identity\n'
+        return 1
+    }
+    if cmp -s "$commented_canonical" "$no_comment_canonical"; then
+        printf 'different manifest keys collapsed to one canonical identity\n'
+        return 1
+    fi
+    if canonicalize_with_verifier \
+        "$unexpected_comment_raw" "$fixture/unexpected-comment.canonical"; then
+        printf 'unexpected manifest key comment passed strict canonicalization\n'
+        return 1
+    fi
+}
+
 encrypted_backup_round_trips_and_cleans_plaintext() {
     local fixture output restored members expected leftovers
     new_fixture
@@ -138,6 +201,8 @@ inherited_xtrace_never_discloses_passphrase() {
 
 run_test 'encrypted signing-key backup round-trips and removes plaintext workdirs' \
     encrypted_backup_round_trips_and_cleans_plaintext
+run_test 'manifest key comments are ignored without weakening key identity' \
+    manifest_public_key_comments_do_not_change_identity
 run_test 'wrong passphrase and truncated ciphertext fail closed' \
     wrong_passphrase_and_truncation_fail_closed
 run_test 'existing ciphertext is create-only and never replaced' \
