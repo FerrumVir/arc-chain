@@ -2820,7 +2820,7 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
                 raw_status = process.wait(timeout=wait_budget)
             except subprocess.TimeoutExpired as error:
                 # Name the case AND say where it is stuck. A bare
-                # TimeoutExpired traceback gives no clue which of the 57 cases
+                # TimeoutExpired traceback gives no clue which of the 58 cases
                 # hung, nor why, which is most of the debugging.
                 diagnosis = [f"{name} did not exit within {wait_budget}s of {sent_signal}"]
                 try:
