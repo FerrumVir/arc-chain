@@ -2627,6 +2627,24 @@ sentinel_body = text[
     text.index("archive_dispatch_sentinel() {"):
     text.index("archive_dispatch_parent_watchdog() {")
 ]
+sentinel_move_body = text[
+    text.index("archive_sentinel_atomic_move() {"):
+    text.index("archive_dispatch_sentinel() {")
+]
+if '/bin/mv -f "$1" "$2"' not in sentinel_move_body:
+    raise SystemExit("sentinel atomic publication no longer uses the fixed mv path")
+normalized_sentinel = " ".join(sentinel_body.replace("\\\n", " ").split())
+# The guardian may kill an external mv child in the phase group while preserving
+# the sentinel shell itself. Each publication that can overlap that drain must
+# tolerate the child failure; its existing receipt handshake retries or retains
+# the private gate fail closed.
+for required in (
+    'archive_sentinel_atomic_move "$gate/signal.$request_argument.ack.partial" "$gate/signal.$request_argument.ack" || true',
+    'archive_sentinel_atomic_move "$gate/sentinel.finalize.ack.partial" "$gate/sentinel.finalize.ack" || true',
+    'archive_sentinel_atomic_move "$gate/guardian.finalize.partial" "$gate/guardian.finalize" || true',
+):
+    if required not in normalized_sentinel:
+        raise SystemExit(f"sentinel drain-time publication can abort its sweeper: {required}")
 # REGRESSION GUARD (credential leak). The sentinel runs inside phase_pgid, so
 # any call it makes to archive_process_group_has_members_except forks a /bin/ps
 # child INTO the very group being counted; that child is not in the exclusion

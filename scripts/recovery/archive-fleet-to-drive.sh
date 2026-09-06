@@ -12855,6 +12855,15 @@ archive_terminate_guardian_job() {
     return 0
 }
 
+archive_sentinel_atomic_move() {
+    # The guardian drains the phase group that also contains this sentinel. It
+    # excludes the sentinel shell itself, but an external mv is a separate group
+    # member and can be killed during escalation. Drain-time callers put this
+    # helper in an explicit failure-tolerant list and rely on their existing
+    # receipt handshakes to retry or fail closed.
+    /bin/mv -f "$1" "$2"
+}
+
 archive_dispatch_sentinel() {
     local supervisor_pid="$1" phase_pid="$2" gate="$3" phase_pgid="$4" stop_token="$5"
     local fifo="$gate/sentinel.fifo" request_token request_verb request_argument
@@ -12897,8 +12906,9 @@ archive_dispatch_sentinel() {
                     if builtin kill -s "$request_argument" -- "-$sentinel_pgid" 2>/dev/null; then
                         (umask 077; printf '%s\n' "$stop_token" \
                             > "$gate/signal.$request_argument.ack.partial") && \
-                            /bin/mv -f "$gate/signal.$request_argument.ack.partial" \
-                                "$gate/signal.$request_argument.ack"
+                            archive_sentinel_atomic_move \
+                                "$gate/signal.$request_argument.ack.partial" \
+                                "$gate/signal.$request_argument.ack" || true
                     fi
                     ;;
                 ARM:)
@@ -12918,8 +12928,8 @@ archive_dispatch_sentinel() {
             if [ "$request_verb" = FINALIZE ]; then
                 (umask 077; printf '%s\n' "$stop_token" \
                     > "$gate/sentinel.finalize.ack.partial") && \
-                    /bin/mv -f "$gate/sentinel.finalize.ack.partial" \
-                        "$gate/sentinel.finalize.ack"
+                    archive_sentinel_atomic_move "$gate/sentinel.finalize.ack.partial" \
+                        "$gate/sentinel.finalize.ack" || true
             fi
         fi
 
@@ -13062,7 +13072,8 @@ archive_dispatch_sentinel() {
             [ -f "$gate/watchdog.ready" ] && [ ! -L "$gate/watchdog.ready" ]; then
             (umask 077; printf '%s\t%s\n' "$watchdog_pid" "$stop_token" \
                 > "$gate/guardian.finalize.partial") && \
-                /bin/mv -f "$gate/guardian.finalize.partial" "$gate/guardian.finalize"
+                archive_sentinel_atomic_move "$gate/guardian.finalize.partial" \
+                    "$gate/guardian.finalize" || true
         fi
     done
 }
