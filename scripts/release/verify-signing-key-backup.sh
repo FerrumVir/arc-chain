@@ -12,6 +12,29 @@ die() {
     exit 1
 }
 
+# OpenSSH preserves an optional private-key comment in `ssh-keygen -y`
+# output. Comments are metadata rather than key identity, so compare the
+# validated algorithm and key blob only. Keep this parser identical to the
+# protected preflight policy: exactly one Ed25519 record, with either no
+# comment or the provisioned manifest-key comment, is accepted.
+canonicalize_manifest_public_key() {
+    local input_path="$1"
+    local output_path="$2"
+    awk '
+        BEGIN { valid = 0 }
+        NR != 1 { exit 1 }
+        {
+            if (NF != 2 && NF != 3) exit 1
+            if ($1 != "ssh-ed25519") exit 1
+            if ($2 !~ /^[A-Za-z0-9+\/]+={0,2}$/) exit 1
+            if (NF == 3 && $3 != "arc-release-manifest-v1") exit 1
+            print $1 " " $2
+            valid = 1
+        }
+        END { if (NR != 1 || valid != 1) exit 1 }
+    ' "$input_path" > "$output_path"
+}
+
 [ "$#" -eq 3 ] || die 'usage: verify-signing-key-backup.sh /absolute/backup.tar.gpg EXPECTED_MAIN_SHA EXPECTED_CIPHERTEXT_SHA256'
 BACKUP="$1"
 EXPECTED_MAIN_SHA="$2"
@@ -132,11 +155,21 @@ tar -xf "$WORK_DIR/signing-keys.tar" -C "$WORK_DIR/restored" \
 
 ssh-keygen -y -f "$WORK_DIR/restored/release-manifest-ed25519" \
     > "$WORK_DIR/derived-manifest.pub"
-cmp -s "$WORK_DIR/derived-manifest.pub" "$WORK_DIR/restored/release-manifest-ed25519.pub" \
+canonicalize_manifest_public_key \
+    "$WORK_DIR/derived-manifest.pub" "$WORK_DIR/derived-manifest.canonical" \
+    || die 'restored manifest private key emitted an invalid public-key record'
+canonicalize_manifest_public_key \
+    "$WORK_DIR/restored/release-manifest-ed25519.pub" \
+    "$WORK_DIR/restored-manifest.canonical" \
+    || die 'restored manifest public key is invalid'
+cmp -s "$WORK_DIR/derived-manifest.canonical" "$WORK_DIR/restored-manifest.canonical" \
     || die 'restored manifest private and public keys disagree'
 awk '{print $3 " " $4}' "$REPO_ROOT/release/arc-release-allowed-signers" \
     > "$WORK_DIR/allowed-manifest.pub"
-cmp -s "$WORK_DIR/derived-manifest.pub" "$WORK_DIR/allowed-manifest.pub" \
+canonicalize_manifest_public_key \
+    "$WORK_DIR/allowed-manifest.pub" "$WORK_DIR/allowed-manifest.canonical" \
+    || die 'committed release trust root is invalid'
+cmp -s "$WORK_DIR/derived-manifest.canonical" "$WORK_DIR/allowed-manifest.canonical" \
     || die 'restored manifest key does not match the committed release trust root'
 
 printf '%s\n' 'ARC downloaded-backup manifest canary v1' > "$WORK_DIR/manifest-canary"

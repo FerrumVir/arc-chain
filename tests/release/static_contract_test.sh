@@ -2309,6 +2309,7 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         'decrypted archive membership differs from the four-file contract' \
         'shasum -a 256 -c KEY-SHA256SUMS' \
         'release/arc-release-allowed-signers' \
+        'canonicalize_manifest_public_key' \
         'awk '\''{print $3 " " $4}'\'' "$REPO_ROOT/release/arc-release-allowed-signers"' \
         'EXPECTED_CIPHERTEXT_SHA256' \
         'git -C "$REPO_ROOT" diff --quiet "$EXPECTED_MAIN_SHA"' \
