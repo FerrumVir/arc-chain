@@ -52,8 +52,10 @@ fi
 for required in \
     dashboard/index.html dashboard/tailwind.css dashboard/app.css dashboard/app.js \
     explorer/index.html explorer/app.js explorer/styles.css \
-    shared/frontend/arc-network.js shared/frontend/arc-network.json; do
-    [ -s "$required" ] || die "required source is missing or empty: $required"
+    shared/frontend/arc-network.js shared/frontend/arc-network.json \
+    shared/frontend/production-status.json; do
+    [ -f "$required" ] && [ ! -L "$required" ] && [ -s "$required" ] \
+        || die "required source is missing, empty, or not a regular file: $required"
 done
 
 OUTPUT_STAGE_DIR="$(mktemp -d "$OUTPUT_PARENT/.${OUTPUT_BASENAME}.arc-public-site-stage.XXXXXX")" \
@@ -107,6 +109,7 @@ if grep -Fq '../explorer/' "$OUTPUT_DIR/app.js"; then
 fi
 cp -- explorer/index.html explorer/app.js explorer/styles.css "$OUTPUT_DIR/explorer/"
 cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
+    shared/frontend/production-status.json \
     "$OUTPUT_DIR/shared/frontend/"
 
 # The legacy wallet is deliberately excluded: it stores a private key in

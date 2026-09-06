@@ -1,9 +1,18 @@
 name: Release signing preflight
 
-run-name: Release preflight at ${{ github.sha }}
+run-name: Release preflight at ${{ github.sha }} with signing backup ${{ inputs.signing_backup_run_id }}/${{ inputs.signing_backup_run_attempt }}
 
 on:
   workflow_dispatch:
+    inputs:
+      signing_backup_run_id:
+        description: Exact successful signing-key backup workflow run ID for this protected-main SHA
+        required: true
+        type: string
+      signing_backup_run_attempt:
+        description: Exact successful signing-key backup workflow attempt containing the selected ciphertext
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -77,6 +86,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          REQUESTED_BACKUP_RUN_ID: ${{ inputs.signing_backup_run_id }}
+          REQUESTED_BACKUP_RUN_ATTEMPT: ${{ inputs.signing_backup_run_attempt }}
         run: |
           set +x
           set -Eeuo pipefail
@@ -85,30 +96,46 @@ jobs:
           [ "$(git rev-parse HEAD)" = "$main_sha" ]
           git fetch --no-tags --force origin main:refs/remotes/origin/main
           [ "$main_sha" = "$(git rev-parse refs/remotes/origin/main)" ]
-          backup_run_id="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow release-signing-backup.yml \
-            --commit "$main_sha" \
-            --event workflow_dispatch \
-            --status success \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')"
-          if [ -z "$backup_run_id" ]; then
-            echo "::error::No successful restore-tested signing-key backup exists for exact protected-main commit $main_sha."
-            exit 1
-          fi
+          [[ "$REQUESTED_BACKUP_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REQUESTED_BACKUP_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          backup_run_id="$REQUESTED_BACKUP_RUN_ID"
+          backup_run_attempt="$REQUESTED_BACKUP_RUN_ATTEMPT"
+          backup_workflow_id="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release-signing-backup.yml" \
+            --jq '.id')"
+          [[ "$backup_workflow_id" =~ ^[1-9][0-9]*$ ]]
+          backup_run_json="$RUNNER_TEMP/selected-signing-backup-run.json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$backup_run_id/attempts/$backup_run_attempt" \
+            > "$backup_run_json"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$main_sha" \
+            --argjson workflow_id "$backup_workflow_id" \
+            --argjson run_id "$backup_run_id" \
+            --argjson run_attempt "$backup_run_attempt" '
+            .id == $run_id and .run_attempt == $run_attempt
+            and .workflow_id == $workflow_id
+            and .head_repository.full_name == $repository
+            and .head_branch == "main" and .head_sha == $sha
+            and .path == ".github/workflows/release-signing-backup.yml"
+            and .event == "workflow_dispatch"
+            and .status == "completed" and .conclusion == "success"' \
+            "$backup_run_json" >/dev/null || {
+              echo "::error::Selected signing-key backup run $backup_run_id attempt $backup_run_attempt is not a successful exact-main restore-tested run."
+              exit 1
+            }
           artifact_json="$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/runs/$backup_run_id/artifacts" \
             --jq '[.artifacts[] | select(.expired == false) | {id, name}]')"
           artifact_name="$(printf '%s' "$artifact_json" | jq -r \
-            --arg prefix "arc-signing-backup-$main_sha-$backup_run_id-" \
+            --arg prefix "arc-signing-backup-$main_sha-$backup_run_id-$backup_run_attempt-" \
             '[.[] | select(.name | startswith($prefix))] | if length == 1 then .[0].name else empty end')"
           if [ -z "$artifact_name" ]; then
-            echo "::error::Exact-main backup run $backup_run_id has no unique unexpired ciphertext artifact."
+            echo "::error::Exact-main backup run $backup_run_id attempt $backup_run_attempt has no unique unexpired ciphertext artifact."
             exit 1
           fi
-          if [[ ! "$artifact_name" =~ ^arc-signing-backup-${main_sha}-${backup_run_id}-[1-9][0-9]*-([0-9a-f]{64})$ ]]; then
+          if [[ ! "$artifact_name" =~ ^arc-signing-backup-${main_sha}-${backup_run_id}-${backup_run_attempt}-([0-9a-f]{64})$ ]]; then
             echo "::error::Backup artifact name is not bound to run, attempt, and ciphertext hash."
             exit 1
           fi
@@ -143,6 +170,7 @@ jobs:
           [ "$(jq -r '.version' desktop/node_modules/@tauri-apps/cli/package.json)" = "2.11.4" ]
           {
             echo "backup_run_id=$backup_run_id"
+            echo "backup_run_attempt=$backup_run_attempt"
             echo "ciphertext=$ciphertext"
             echo "cipher_sha256=$cipher_sha256"
             echo "work_dir=$work_dir"

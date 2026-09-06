@@ -35,7 +35,8 @@ trap cleanup EXIT HUP INT TERM
 WORKFLOW_ID="$(gh api \
     "repos/$REPOSITORY/actions/workflows/release-signing-preflight.yml" \
     --jq '.id')"
-gh api "repos/$REPOSITORY/actions/runs/$RUN_ID" > "$TEMPORARY/run.json"
+gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" \
+    > "$TEMPORARY/run.json"
 jq -e \
     --arg repository "$REPOSITORY" \
     --arg sha "$COMMIT" \

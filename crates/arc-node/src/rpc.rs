@@ -5516,6 +5516,30 @@ fn live_inference_worker_count(node: &NodeState) -> usize {
         .count()
 }
 
+fn exact_live_inference_worker(node: &NodeState, expected_worker: &str) -> bool {
+    let Ok((_, coordinator_model_id)) = exact_model_identity(node) else {
+        return false;
+    };
+    let Some(entry) = node.community_workers.get(expected_worker) else {
+        return false;
+    };
+    let (worker, refreshed_at) = entry.value();
+    std::time::Instant::now().duration_since(*refreshed_at)
+        <= std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS)
+        && !node.community_active_jobs.contains_key(expected_worker)
+        && worker
+            .capabilities
+            .iter()
+            .any(|capability| capability == "inference")
+        && worker.execution_profile.as_deref()
+            == Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE)
+        && worker
+            .model_id
+            .as_deref()
+            .and_then(|model_id| parse_hash256_hex(model_id, "model_id").ok())
+            == Some(coordinator_model_id)
+}
+
 /// Consensus activation plus the operator's local ingress/issuance switch.
 /// This is enough to accept an already-threshold-authorized external 0x25,
 /// but not enough for this coordinator to create one.
@@ -5739,6 +5763,7 @@ fn recovery_probe_status_response(
     node: &NodeState,
     probe_id: Hash256,
     expected_job_id: Hash256,
+    expected_worker_id: Option<&str>,
 ) -> Result<Option<Value>, String> {
     let Some(existing_job_id) = recovery_probe_existing_job(node, probe_id)? else {
         return Ok(None);
@@ -5754,10 +5779,10 @@ fn recovery_probe_status_response(
         pending_mined_receipt_value(node, existing_job_id, &submission)
     } else if let Some(record) = node.community_verified_settlements.get(&existing_job_id) {
         pending_settlement_value(node, &record)
-    } else if node
+    } else if let Some(pending) = node
         .community_work_results
         .as_ref()
-        .is_some_and(|results| results.contains_key(&existing_job_id.to_hex()))
+        .and_then(|results| results.get(&existing_job_id.to_hex()))
     {
         let assigned_worker = node
             .community_active_jobs
@@ -5766,7 +5791,8 @@ fn recovery_probe_status_response(
                 parse_hash256_hex(entry.value(), "active job id")
                     .is_ok_and(|job_id| job_id == existing_job_id)
             })
-            .map(|entry| entry.key().clone());
+            .map(|entry| entry.key().clone())
+            .or_else(|| pending.item.expected_worker_id.clone());
         json!({
             "status": "assignment_in_progress",
             "tx_type": "0x25",
@@ -5784,6 +5810,20 @@ fn recovery_probe_status_response(
     } else {
         return Err("recovery probe job exists without discoverable coordinator state".to_string());
     };
+    if let Some(expected_worker) = expected_worker_id {
+        let actual_worker = settlement
+            .get("worker")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "recovery probe settlement does not expose its assigned worker".to_string()
+            })?;
+        if actual_worker != expected_worker {
+            return Err(
+                "recovery probe identity is bound to a worker other than the accepted canary"
+                    .to_string(),
+            );
+        }
+    }
     Ok(Some(json!({
         "success": true,
         "idempotent_replay": true,
@@ -5854,6 +5894,7 @@ async fn dispatch_to_community_worker_with_probe(
     max_tokens: u32,
     model_id_hint: Option<String>,
     recovery_probe_id: Option<Hash256>,
+    expected_worker_id: Option<String>,
 ) -> Result<CommunityDispatchOutcome, CommunityDispatchError> {
     if recovery_probe_id.is_some_and(|probe_id| {
         !arc_types::transaction::CommunityInferenceRewardBody::is_recovery_probe_assignment(
@@ -5862,6 +5903,18 @@ async fn dispatch_to_community_worker_with_probe(
     }) {
         return Err(CommunityDispatchError::before_enqueue(
             "recovery_probe_id is outside the protocol recovery namespace",
+        ));
+    }
+    if recovery_probe_id.is_some() != expected_worker_id.is_some() {
+        return Err(CommunityDispatchError::before_enqueue(
+            "recovery probes require one exact expected_worker and normal jobs forbid it",
+        ));
+    }
+    if let Some(expected_worker) = expected_worker_id.as_deref()
+        && parse_hash256_hex(expected_worker, "expected_worker").is_err()
+    {
+        return Err(CommunityDispatchError::before_enqueue(
+            "expected_worker must be one lowercase 32-byte hexadecimal address",
         ));
     }
     let _inference_permit = node
@@ -5957,6 +6010,7 @@ async fn dispatch_to_community_worker_with_probe(
             .state
             .transaction_domain_hash()
             .map(|domain| format!("0x{}", domain.to_hex())),
+        expected_worker_id,
         submitted_at_unix_ms: submitted_at,
         expires_at_unix_ms,
     };
@@ -6069,7 +6123,8 @@ async fn dispatch_to_community_worker(
     max_tokens: u32,
     model_id_hint: Option<String>,
 ) -> Result<CommunityDispatchOutcome, CommunityDispatchError> {
-    dispatch_to_community_worker_with_probe(node, input, max_tokens, model_id_hint, None).await
+    dispatch_to_community_worker_with_probe(node, input, max_tokens, model_id_hint, None, None)
+        .await
 }
 
 /// Tier 1 write ingress is intentionally unavailable.
@@ -6303,6 +6358,32 @@ async fn inference_run(
             Some(probe_id)
         }
     };
+    let recovery_expected_worker = match req.get("expected_worker") {
+        None if recovery_probe_id.is_some() => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "recovery probes require expected_worker from the accepted canary",
+            ));
+        }
+        None => None,
+        Some(_) if recovery_probe_id.is_none() => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "expected_worker is reserved for recovery probes",
+            ));
+        }
+        Some(value) => {
+            let encoded = value.as_str().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "expected_worker must be a lowercase 32-byte hexadecimal string",
+                )
+            })?;
+            let worker = parse_hash256_hex(encoded, "expected_worker")
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+            Some(format!("0x{}", worker.to_hex()))
+        }
+    };
 
     // ── Smart router: prefer community workers when any are online ──────
     //
@@ -6343,7 +6424,12 @@ async fn inference_run(
         );
         let existing = {
             let _gate = node.community_verified_settlements_gate.lock();
-            recovery_probe_status_response(&node, probe_id, expected)
+            recovery_probe_status_response(
+                &node,
+                probe_id,
+                expected,
+                recovery_expected_worker.as_deref(),
+            )
         }
         .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
         if let Some(response) = existing {
@@ -6353,10 +6439,15 @@ async fn inference_run(
     } else {
         None
     };
-    if recovery_probe_id.is_some() && (live_workers == 0 || node.community_work_tx.is_none()) {
+    if recovery_probe_id.is_some()
+        && (recovery_expected_worker
+            .as_deref()
+            .is_none_or(|worker| !exact_live_inference_worker(&node, worker))
+            || node.community_work_tx.is_none())
+    {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "sealed recovery probe coordinator has no eligible community worker dispatch path",
+            "sealed recovery probe coordinator cannot dispatch to the exact accepted canary worker",
         ));
     }
     if !force_local && live_workers > 0 && node.community_work_tx.is_some() {
@@ -6370,6 +6461,7 @@ async fn inference_run(
             max_tokens,
             assigned_model_id.clone(),
             recovery_probe_id,
+            recovery_expected_worker.clone(),
         )
         .await
         {
@@ -6436,7 +6528,12 @@ async fn inference_run(
                 {
                     let replay = {
                         let _gate = node.community_verified_settlements_gate.lock();
-                        recovery_probe_status_response(&node, probe_id, expected_job)
+                        recovery_probe_status_response(
+                            &node,
+                            probe_id,
+                            expected_job,
+                            recovery_expected_worker.as_deref(),
+                        )
                     }
                     .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
                     if let Some(response) = replay {
@@ -7123,6 +7220,7 @@ async fn workers_scoreboard(
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(50)
         .min(500);
+    let worker_filter = params.get("worker_id");
 
     let now = std::time::Instant::now();
     let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
@@ -7149,6 +7247,9 @@ async fn workers_scoreboard(
     let mut rows: Vec<WorkerScore> = Vec::new();
     for entry in node.community_workers.iter() {
         let (w, ts) = entry.value();
+        if worker_filter.is_some_and(|expected| expected != &w.worker_id) {
+            continue;
+        }
         if now.duration_since(*ts) > ttl {
             continue;
         }
@@ -12043,6 +12144,10 @@ pub struct WorkItem {
     /// Absent on legacy/dev networks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_domain: Option<String>,
+    /// Recovery-only target identity. Other workers must leave this item in
+    /// the queue so the accepted pre-tag canary alone can claim it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_worker_id: Option<String>,
     /// Unix timestamp (ms) when the dispatcher queued the job. Workers
     /// echo this back so the dispatcher can compute end-to-end latency.
     pub submitted_at_unix_ms: i64,
@@ -12934,6 +13039,7 @@ fn validate_reward_approval_payload(
             .state
             .transaction_domain_hash()
             .map(|domain| format!("0x{}", domain.to_hex())),
+        expected_worker_id: None,
         submitted_at_unix_ms: 0,
         expires_at_unix_ms: u64::MAX,
     };
@@ -14279,6 +14385,24 @@ pub async fn community_claim_work(
                 return Ok(Json(json!({
                     "status": "no_work",
                     "reason": "job_expired",
+                })));
+            }
+            if item
+                .expected_worker_id
+                .as_deref()
+                .is_some_and(|expected| expected != req.worker_id)
+            {
+                if let Some(ref tx) = node.community_work_tx {
+                    let job_id = item.job_id.clone();
+                    if tx.try_send(item).is_err()
+                        && let Some(results) = node.community_work_results.as_ref()
+                    {
+                        results.remove(&job_id);
+                    }
+                }
+                return Ok(Json(json!({
+                    "status": "no_work",
+                    "reason": "worker_mismatch",
                 })));
             }
             // Exact model commitments, not display names, decide whether this
@@ -17485,6 +17609,7 @@ mod tests {
             model_id: Some("0xdeadbeef".to_string()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1_700_000_000_000,
             expires_at_unix_ms: 1_700_000_001_000,
         };
@@ -17518,6 +17643,7 @@ mod tests {
             model_id: None,
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 0,
             expires_at_unix_ms: u64::MAX,
         };
@@ -18271,6 +18397,7 @@ mod tests {
             execution_profile:
                 arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -18980,6 +19107,7 @@ mod tests {
             model_id: None,
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         })
@@ -19016,6 +19144,7 @@ mod tests {
                 model_id: None,
                 execution_profile: canonical_profile(),
                 transaction_domain: None,
+                expected_worker_id: None,
                 submitted_at_unix_ms: 0,
                 expires_at_unix_ms: u64::MAX,
             })
@@ -19397,9 +19526,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let recovery_replay = recovery_probe_status_response(&node, recovery_probe_id, job_id)
-            .unwrap()
-            .expect("the recovery replay discovers the same pending submission");
+        let recovery_replay =
+            recovery_probe_status_response(&node, recovery_probe_id, job_id, None)
+                .unwrap()
+                .expect("the recovery replay discovers the same pending submission");
         for pending in [
             &pending_by_hash,
             &pending_by_job,
@@ -19453,7 +19583,7 @@ mod tests {
         // submitted once it has neither mempool presence nor chain inclusion,
         // while retaining the durable independently verified job for retry.
         node.mempool.clear();
-        let stale_recovery = recovery_probe_status_response(&node, recovery_probe_id, job_id)
+        let stale_recovery = recovery_probe_status_response(&node, recovery_probe_id, job_id, None)
             .unwrap()
             .expect("durable verified recovery work remains discoverable");
         let stale_recovery = &stale_recovery["settlement"];
@@ -20462,6 +20592,7 @@ mod tests {
                     model_id: Some(test_model_id()),
                     execution_profile: canonical_profile(),
                     transaction_domain: None,
+                    expected_worker_id: None,
                     submitted_at_unix_ms: 0,
                     expires_at_unix_ms: u64::MAX,
                 })
@@ -20553,8 +20684,9 @@ mod tests {
     #[tokio::test]
     async fn recovery_probe_dispatch_is_restart_stable_and_rejects_duplicate_or_tampered_semantics()
     {
+        let expected_worker = format!("0x{}", "1".repeat(64));
         let node = fake_node_with_workers(vec![(
-            worker("w1", &["inference"]),
+            worker(&expected_worker, &["inference"]),
             std::time::Instant::now(),
         )]);
         let mut probe_bytes = [0u8; 32];
@@ -20564,6 +20696,7 @@ mod tests {
         let probe_id = Hash256(probe_bytes);
         let queue = node.community_work_queue.as_ref().unwrap().clone();
         let task_node = node.clone();
+        let task_worker = expected_worker.clone();
         let first = tokio::spawn(async move {
             dispatch_to_community_worker_with_probe(
                 &task_node,
@@ -20571,6 +20704,7 @@ mod tests {
                 1,
                 Some(test_model_id()),
                 Some(probe_id),
+                Some(task_worker),
             )
             .await
         });
@@ -20594,6 +20728,7 @@ mod tests {
             1,
             Some(test_model_id()),
             Some(probe_id),
+            Some(expected_worker.clone()),
         )
         .await
         .expect_err("same probe must discover the existing job");
@@ -20604,6 +20739,7 @@ mod tests {
             1,
             Some(test_model_id()),
             Some(probe_id),
+            Some(expected_worker),
         )
         .await
         .expect_err("one recovery identity cannot bind different input");
@@ -20615,8 +20751,9 @@ mod tests {
 
     #[tokio::test]
     async fn inference_run_recovery_retry_discovers_inflight_job_without_second_enqueue() {
+        let expected_worker = format!("0x{}", "1".repeat(64));
         let node = fake_node_with_workers(vec![(
-            worker("w1", &["inference"]),
+            worker(&expected_worker, &["inference"]),
             std::time::Instant::now(),
         )]);
         let mut probe_bytes = [0u8; 32];
@@ -20628,6 +20765,7 @@ mod tests {
             "input": "ARC RPC recovery probe",
             "max_tokens": 1,
             "recovery_probe_id": format!("0x{}", probe_id.to_hex()),
+            "expected_worker": expected_worker,
         });
         let first_node = node.clone();
         let first_request = request.clone();
@@ -20645,7 +20783,7 @@ mod tests {
         assert_eq!(replay["recovery_probe_id"], request["recovery_probe_id"]);
         assert_eq!(replay["job_id"], format!("0x{}", item.job_id));
         assert_eq!(replay["settlement"]["status"], "assignment_in_progress");
-        assert!(replay["settlement"]["worker"].is_null());
+        assert_eq!(replay["settlement"]["worker"], request["expected_worker"]);
         assert!(replay["settlement"]["tx_hash"].is_null());
         assert_eq!(replay["settlement"]["submitted"], false);
         assert_eq!(replay["settlement"]["included"], false);
@@ -21402,6 +21540,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21433,6 +21572,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: Some(format!("0x{}", recovery_domain.to_hex())),
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21526,6 +21666,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_work_can_only_be_claimed_by_its_exact_accepted_worker() {
+        let accepted_key = KeyPair::generate_ed25519();
+        let foreign_key = KeyPair::generate_ed25519();
+        let accepted_worker = format!("0x{}", accepted_key.address().to_hex());
+        let foreign_worker = format!("0x{}", foreign_key.address().to_hex());
+        let node = fake_node_with_workers(vec![
+            (worker(&accepted_worker, &["inference"]), Instant::now()),
+            (worker(&foreign_worker, &["inference"]), Instant::now()),
+        ]);
+        let item = WorkItem {
+            job_id: arc_crypto::hash_bytes(b"accepted-worker-only").to_hex(),
+            input: "ARC exact canary".to_string(),
+            max_tokens: 1,
+            model_id: Some(test_model_id()),
+            execution_profile: canonical_profile(),
+            transaction_domain: None,
+            expected_worker_id: Some(accepted_worker.clone()),
+            submitted_at_unix_ms: 1,
+            expires_at_unix_ms: u64::MAX,
+        };
+        let _receiver = insert_pending_job(&node, item.clone(), None);
+        node.community_work_tx
+            .as_ref()
+            .unwrap()
+            .send(item.clone())
+            .await
+            .unwrap();
+
+        let Json(foreign_response) = community_claim_work(
+            AxumState(node.clone()),
+            Json(ClaimWorkRequest {
+                worker_id: foreign_worker.clone(),
+                capabilities: vec!["inference".to_string()],
+                model_id: test_model_id(),
+                execution_profile: canonical_profile(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(foreign_response["status"], "no_work");
+        assert_eq!(foreign_response["reason"], "worker_mismatch");
+        assert!(!node.community_active_jobs.contains_key(&foreign_worker));
+
+        let Json(accepted_response) = community_claim_work(
+            AxumState(node.clone()),
+            Json(ClaimWorkRequest {
+                worker_id: accepted_worker.clone(),
+                capabilities: vec!["inference".to_string()],
+                model_id: test_model_id(),
+                execution_profile: canonical_profile(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted_response["status"], "work");
+        assert_eq!(accepted_response["job_id"], item.job_id);
+        assert_eq!(
+            node.community_work_results
+                .as_ref()
+                .unwrap()
+                .get(&item.job_id)
+                .unwrap()
+                .assigned_worker
+                .as_deref(),
+            Some(accepted_worker.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn second_claim_for_busy_worker_cannot_dequeue_another_job() {
         let worker_key = KeyPair::generate_ed25519();
         let worker_id = worker_key.address().to_hex();
@@ -21538,6 +21747,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21548,6 +21758,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 2,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21609,6 +21820,7 @@ mod tests {
             model_id: None,
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21656,6 +21868,7 @@ mod tests {
             model_id: None,
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21703,6 +21916,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21781,6 +21995,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21810,6 +22025,7 @@ mod tests {
             model_id: Some(test_model_id()),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21908,6 +22124,7 @@ mod tests {
             model_id: None,
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -21979,6 +22196,7 @@ mod tests {
             model_id: None,
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -22698,6 +22916,7 @@ mod tests {
             )),
             execution_profile: canonical_profile(),
             transaction_domain: None,
+            expected_worker_id: None,
             submitted_at_unix_ms: 1,
             expires_at_unix_ms: u64::MAX,
         };
@@ -22868,6 +23087,25 @@ mod tests {
             Some(10),
             "the walkthrough must use the server-authoritative completion counter"
         );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_exact_worker_filter_is_not_displaced_by_ranking() {
+        let now = std::time::Instant::now();
+        let node = fake_node_with_workers(vec![
+            (worker_with_stats("top", 10, 0, 10, 1), now),
+            (worker_with_stats("accepted-canary", 0, 0, 0, 0), now),
+        ]);
+        let params = HashMap::from([
+            ("limit".to_string(), "1".to_string()),
+            ("worker_id".to_string(), "accepted-canary".to_string()),
+        ]);
+        let value = workers_scoreboard(AxumState(node), Query(params)).await.0;
+        let rows = value["workers"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["worker_id"], "accepted-canary");
+        assert_eq!(value["count_visible"], 1);
+        assert_eq!(value["count_total"], 2);
     }
 
     #[tokio::test]

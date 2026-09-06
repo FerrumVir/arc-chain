@@ -16,6 +16,7 @@ upstream components vendored for reproducibility are identified under
 
 ## v0.8.0 release status and quickstart
 
+<!-- ARC_PUBLIC_TRUTH_BEGIN -->
 > **Source-freeze snapshot (2026-08-31; tag-stable):** At this commit's review
 > cutoff, v0.8.0 / protocol v3 was not published or deployed, and GitHub
 > `latest` was still the desktop-only v0.7.11 bundle. This is a historical
@@ -81,6 +82,7 @@ cutover is proven, the
 demonstrates install, assignment, inference verification, a mined reward
 receipt, earnings, and the matching explorer block without overstating any
 missing evidence.
+<!-- ARC_PUBLIC_TRUTH_END -->
 
 📄 Paper: *On the Foundations of Trustworthy Artificial Intelligence*
 

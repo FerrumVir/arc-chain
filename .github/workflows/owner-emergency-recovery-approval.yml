@@ -1,0 +1,224 @@
+name: Owner emergency recovery approval
+
+run-name: Owner recovery approval for ${{ inputs.expected_main_sha }} at ${{ inputs.checkpoint_manifest_hash }}
+
+# This workflow is the authentication boundary for the one-person repository-
+# owner emergency decision. It has no secret, deployment, package, or write
+# authority. GitHub supplies both actor identities; a collaborator cannot mint
+# an approval by writing the same JSON locally or by rerunning the owner's job.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_main_sha:
+        description: Exact protected-main commit authorized for recovery
+        required: true
+        type: string
+      checkpoint_manifest_hash:
+        description: Exact 0x-prefixed recovery checkpoint manifest hash
+        required: true
+        type: string
+      validator_public_keys_sha256:
+        description: SHA-256 of the canonical six-validator public-key manifest
+        required: true
+        type: string
+      nyc_public_key:
+        description: NYC validator public key (64 lowercase hex)
+        required: true
+        type: string
+      lax_public_key:
+        description: LAX validator public key (64 lowercase hex)
+        required: true
+        type: string
+      ams_public_key:
+        description: AMS validator public key (64 lowercase hex)
+        required: true
+        type: string
+      lhr_public_key:
+        description: LHR validator public key (64 lowercase hex)
+        required: true
+        type: string
+      nrt_public_key:
+        description: NRT validator public key (64 lowercase hex)
+        required: true
+        type: string
+      sgp_public_key:
+        description: SGP validator public key (64 lowercase hex)
+        required: true
+        type: string
+      confirmation:
+        description: Type AUTHORIZE ARC OWNER EMERGENCY RECOVERY followed by one space and expected_main_sha
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: owner-emergency-recovery-${{ inputs.expected_main_sha }}-${{ inputs.checkpoint_manifest_hash }}
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    name: authenticate owner and seal exact recovery decision
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - id: approval
+        name: Bind GitHub owner actor, protected main, and recovery scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR_LOGIN: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+          TRIGGERING_ACTOR_LOGIN: ${{ github.triggering_actor }}
+          EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
+          CHECKPOINT_MANIFEST_HASH: ${{ inputs.checkpoint_manifest_hash }}
+          VALIDATOR_PUBLIC_KEYS_SHA256: ${{ inputs.validator_public_keys_sha256 }}
+          NYC_PUBLIC_KEY: ${{ inputs.nyc_public_key }}
+          LAX_PUBLIC_KEY: ${{ inputs.lax_public_key }}
+          AMS_PUBLIC_KEY: ${{ inputs.ams_public_key }}
+          LHR_PUBLIC_KEY: ${{ inputs.lhr_public_key }}
+          NRT_PUBLIC_KEY: ${{ inputs.nrt_public_key }}
+          SGP_PUBLIC_KEY: ${{ inputs.sgp_public_key }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set +x
+          set -Eeuo pipefail
+          umask 077
+          [ "$GITHUB_REPOSITORY" = FerrumVir/arc-chain ]
+          [ "$GITHUB_REF" = refs/heads/main ]
+          [ "$ACTOR_LOGIN" = FerrumVir ]
+          [ "$ACTOR_ID" = 111036403 ]
+          [ "$TRIGGERING_ACTOR_LOGIN" = FerrumVir ]
+          [ "$CONFIRMATION" = "AUTHORIZE ARC OWNER EMERGENCY RECOVERY $EXPECTED_MAIN_SHA" ]
+          [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CHECKPOINT_MANIFEST_HASH" =~ ^0x[0-9a-f]{64}$ ]]
+          [[ "$VALIDATOR_PUBLIC_KEYS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          for public_key in \
+            "$NYC_PUBLIC_KEY" "$LAX_PUBLIC_KEY" "$AMS_PUBLIC_KEY" \
+            "$LHR_PUBLIC_KEY" "$NRT_PUBLIC_KEY" "$SGP_PUBLIC_KEY"
+          do
+            [[ "$public_key" =~ ^[0-9a-f]{64}$ ]]
+          done
+          [ "$(printf '%s\n' \
+            "$NYC_PUBLIC_KEY" "$LAX_PUBLIC_KEY" "$AMS_PUBLIC_KEY" \
+            "$LHR_PUBLIC_KEY" "$NRT_PUBLIC_KEY" "$SGP_PUBLIC_KEY" \
+            | sort -u | wc -l | tr -d ' ')" = 6 ]
+          [ "$GITHUB_SHA" = "$EXPECTED_MAIN_SHA" ]
+
+          actor_json="$RUNNER_TEMP/actor.json"
+          triggering_actor_json="$RUNNER_TEMP/triggering-actor.json"
+          main_json="$RUNNER_TEMP/main.json"
+          run_json="$RUNNER_TEMP/run.json"
+          gh api users/FerrumVir > "$actor_json"
+          gh api "users/$TRIGGERING_ACTOR_LOGIN" > "$triggering_actor_json"
+          gh api "repos/$GITHUB_REPOSITORY/branches/main" > "$main_json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            > "$run_json"
+          jq -es 'length == 2 and all(.[]; .login == "FerrumVir" and .id == 111036403)' \
+            "$actor_json" "$triggering_actor_json" >/dev/null
+          jq -e --arg sha "$EXPECTED_MAIN_SHA" '.commit.sha == $sha' \
+            "$main_json" >/dev/null
+          jq -e --arg sha "$EXPECTED_MAIN_SHA" \
+            --argjson id "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" '
+            .id == $id and .run_attempt == $attempt
+            and .head_repository.full_name == "FerrumVir/arc-chain"
+            and .head_branch == "main" and .head_sha == $sha
+            and .path == ".github/workflows/owner-emergency-recovery-approval.yml"
+            and .event == "workflow_dispatch"
+            and .actor.login == "FerrumVir" and .actor.id == 111036403
+            and .triggering_actor.login == "FerrumVir"
+            and .triggering_actor.id == 111036403' "$run_json" >/dev/null
+
+          approved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -m 0700 approval
+          jq -cnS \
+            --arg approved_at "$approved_at" \
+            --arg source "$EXPECTED_MAIN_SHA" \
+            --arg checkpoint "$CHECKPOINT_MANIFEST_HASH" \
+            --arg public_keys_sha "$VALIDATOR_PUBLIC_KEYS_SHA256" \
+            --arg nyc "$NYC_PUBLIC_KEY" --arg lax "$LAX_PUBLIC_KEY" \
+            --arg ams "$AMS_PUBLIC_KEY" --arg lhr "$LHR_PUBLIC_KEY" \
+            --arg nrt "$NRT_PUBLIC_KEY" --arg sgp "$SGP_PUBLIC_KEY" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" '
+            {
+              schema:"arc.recovery.owner-emergency-recovery.v2",
+              decision:{
+                authorization_kind:"owner_emergency_recovery",
+                authority_basis:"repository-owner emergency authorization authenticated by an exact GitHub Actions run; not approval by six independent humans",
+                approver:{github_login:"FerrumVir",github_user_id:111036403,repository_role:"owner"},
+                approved_at:$approved_at,
+                reason_code:"legacy_fleet_divergence_history_preserving_v080_cutover",
+                reason:"The divergent public validator fleet requires the reviewed, history-preserving ARC v0.8 emergency cutover.",
+                risk_acknowledgement:"I authorize five reviewed ARC validator identities to sign the recovery checkpoint rooted at preserved source block 137145 and transition block 137146. I understand that the six legacy forks remain preserved read-only, that rollback cannot rewrite signed history, and that this receipt does not represent approval by six independent humans."
+              },
+              github_authentication:{
+                repository:"FerrumVir/arc-chain",
+                workflow_path:".github/workflows/owner-emergency-recovery-approval.yml",
+                event:"workflow_dispatch",head_branch:"main",head_sha:$source,
+                run_id:$run_id,run_attempt:$run_attempt,
+                actor:{login:"FerrumVir",user_id:111036403},
+                triggering_actor:{login:"FerrumVir",user_id:111036403}
+              },
+              scope:{
+                repository:"FerrumVir/arc-chain",protected_branch:"main",
+                source_main_sha:$source,checkpoint_manifest_hash:$checkpoint,
+                source_height:137145,transition_height:137146,
+                recovery_epoch:1,validator_set_id:1,
+                validator_public_keys_sha256:$public_keys_sha
+              },
+              signing_policy:{
+                validator_count:6,signatures_required:5,total_stake:40000000,
+                minimum_signed_stake:26666667,
+                strict_stake_supermajority_required:true,
+                authorized_signer_order:["NYC","LAX","AMS","LHR","NRT"],
+                unused_recovery_member:"SGP",
+                ordered_validators:[
+                  {ordinal:1,node:"NYC",address:"adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f",public_key:$nyc,stake:6666667},
+                  {ordinal:2,node:"LAX",address:"44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780",public_key:$lax,stake:6666667},
+                  {ordinal:3,node:"AMS",address:"5772741c93d8a4b04ec39007cb568a31e13ffba0d3e786596d1900d30e529f21",public_key:$ams,stake:6666667},
+                  {ordinal:4,node:"LHR",address:"228787281308d6c1a560848c2c168814bde1b6153e9e65a286d7211f04628fdd",public_key:$lhr,stake:6666667},
+                  {ordinal:5,node:"NRT",address:"f03cbab49cf553a05541ddebc09b32a4c5507efb157d354b6d7f8c6682c32f5f",public_key:$nrt,stake:6666666},
+                  {ordinal:6,node:"SGP",address:"f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",public_key:$sgp,stake:6666666}
+                ]
+              }
+            }' > approval/OWNER-EMERGENCY-RECOVERY.json
+          chmod 0400 approval/OWNER-EMERGENCY-RECOVERY.json
+          jq -cS . approval/OWNER-EMERGENCY-RECOVERY.json \
+            | cmp -s - approval/OWNER-EMERGENCY-RECOVERY.json
+          receipt_sha256="$(sha256sum approval/OWNER-EMERGENCY-RECOVERY.json | cut -d ' ' -f 1)"
+          echo "receipt_sha256=$receipt_sha256" >> "$GITHUB_OUTPUT"
+
+      - id: upload
+        name: Upload owner-authenticated approval
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1; gitleaks:allow -- immutable upstream action commit
+        with:
+          name: arc-owner-emergency-recovery-${{ inputs.expected_main_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: approval/OWNER-EMERGENCY-RECOVERY.json
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Report authenticated approval identity
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          RECEIPT_SHA256: ${{ steps.approval.outputs.receipt_sha256 }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "Owner-authenticated recovery approval"
+            echo "- run/attempt: \`$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT\`"
+            echo "- artifact ID: \`$ARTIFACT_ID\`"
+            echo "- artifact digest: \`sha256:$ARTIFACT_DIGEST\`"
+            echo "- receipt SHA-256: \`$RECEIPT_SHA256\`"
+          } >> "$GITHUB_STEP_SUMMARY"

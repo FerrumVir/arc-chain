@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/FerrumVir/arc-chain/blob/main/scripts/recovery/owner-emergency-recovery.schema.json",
+  "title": "ARC GitHub-owner-authenticated emergency-recovery approval receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "github_authentication",
+    "schema",
+    "scope",
+    "signing_policy"
+  ],
+  "properties": {
+    "schema": {
+      "const": "arc.recovery.owner-emergency-recovery.v2"
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approver",
+        "approved_at",
+        "authority_basis",
+        "authorization_kind",
+        "reason",
+        "reason_code",
+        "risk_acknowledgement"
+      ],
+      "properties": {
+        "authorization_kind": {
+          "const": "owner_emergency_recovery"
+        },
+        "authority_basis": {
+          "const": "repository-owner emergency authorization authenticated by an exact GitHub Actions run; not approval by six independent humans"
+        },
+        "approver": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "github_login",
+            "github_user_id",
+            "repository_role"
+          ],
+          "properties": {
+            "github_login": {
+              "const": "FerrumVir"
+            },
+            "github_user_id": {
+              "const": 111036403
+            },
+            "repository_role": {
+              "const": "owner"
+            }
+          }
+        },
+        "approved_at": {
+          "$ref": "#/$defs/utcSeconds"
+        },
+        "reason": {
+          "const": "The divergent public validator fleet requires the reviewed, history-preserving ARC v0.8 emergency cutover."
+        },
+        "reason_code": {
+          "const": "legacy_fleet_divergence_history_preserving_v080_cutover"
+        },
+        "risk_acknowledgement": {
+          "const": "I authorize five reviewed ARC validator identities to sign the recovery checkpoint rooted at preserved source block 137145 and transition block 137146. I understand that the six legacy forks remain preserved read-only, that rollback cannot rewrite signed history, and that this receipt does not represent approval by six independent humans."
+        }
+      }
+    },
+    "github_authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actor",
+        "event",
+        "head_branch",
+        "head_sha",
+        "repository",
+        "run_attempt",
+        "run_id",
+        "triggering_actor",
+        "workflow_path"
+      ],
+      "properties": {
+        "repository": {
+          "const": "FerrumVir/arc-chain"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/owner-emergency-recovery-approval.yml"
+        },
+        "event": {
+          "const": "workflow_dispatch"
+        },
+        "head_branch": {
+          "const": "main"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/commit"
+        },
+        "run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "actor": {
+          "$ref": "#/$defs/ownerActor"
+        },
+        "triggering_actor": {
+          "$ref": "#/$defs/ownerActor"
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_manifest_hash",
+        "protected_branch",
+        "recovery_epoch",
+        "repository",
+        "source_height",
+        "source_main_sha",
+        "transition_height",
+        "validator_public_keys_sha256",
+        "validator_set_id"
+      ],
+      "properties": {
+        "repository": {
+          "const": "FerrumVir/arc-chain"
+        },
+        "protected_branch": {
+          "const": "main"
+        },
+        "source_main_sha": {
+          "$ref": "#/$defs/commit"
+        },
+        "checkpoint_manifest_hash": {
+          "type": "string",
+          "pattern": "^0x[0-9a-f]{64}$"
+        },
+        "source_height": {
+          "const": 137145
+        },
+        "transition_height": {
+          "const": 137146
+        },
+        "recovery_epoch": {
+          "const": 1
+        },
+        "validator_set_id": {
+          "const": 1
+        },
+        "validator_public_keys_sha256": {
+          "$ref": "#/$defs/hash"
+        }
+      }
+    },
+    "signing_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorized_signer_order",
+        "minimum_signed_stake",
+        "ordered_validators",
+        "signatures_required",
+        "strict_stake_supermajority_required",
+        "total_stake",
+        "unused_recovery_member",
+        "validator_count"
+      ],
+      "properties": {
+        "authorized_signer_order": {
+          "const": [
+            "NYC",
+            "LAX",
+            "AMS",
+            "LHR",
+            "NRT"
+          ]
+        },
+        "minimum_signed_stake": {
+          "const": 26666667
+        },
+        "signatures_required": {
+          "const": 5
+        },
+        "strict_stake_supermajority_required": {
+          "const": true
+        },
+        "total_stake": {
+          "const": 40000000
+        },
+        "unused_recovery_member": {
+          "const": "SGP"
+        },
+        "validator_count": {
+          "const": 6
+        },
+        "ordered_validators": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "address",
+              "node",
+              "ordinal",
+              "public_key",
+              "stake"
+            ],
+            "properties": {
+              "address": {
+                "$ref": "#/$defs/hash"
+              },
+              "node": {
+                "enum": [
+                  "NYC",
+                  "LAX",
+                  "AMS",
+                  "LHR",
+                  "NRT",
+                  "SGP"
+                ]
+              },
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 6
+              },
+              "public_key": {
+                "$ref": "#/$defs/hash"
+              },
+              "stake": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ownerActor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "login",
+        "user_id"
+      ],
+      "properties": {
+        "login": {
+          "const": "FerrumVir"
+        },
+        "user_id": {
+          "const": 111036403
+        }
+      }
+    },
+    "utcSeconds": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    }
+  }
+}

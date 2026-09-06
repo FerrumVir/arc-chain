@@ -187,6 +187,7 @@ scripts/release/macos-community-canary.py install \
 
 scripts/release/macos-community-canary.py start
 scripts/release/macos-community-canary.py status
+scripts/release/macos-community-canary.py accept
 ```
 
 `start` succeeds only after launchd, `ps`, and `lsof` prove the exact PID,
@@ -197,6 +198,16 @@ exposing the RPC listener:
 curl -fsS http://127.0.0.1:19944/health | python3 -m json.tool
 curl -fsS http://127.0.0.1:19944/node/info | python3 -m json.tool
 ```
+
+`accept` repeats the complete installation and live-process proof and then
+create-only seals
+`~/.arc-pretag-community-canary/evidence/ACCEPTED.json`. That canonical receipt
+binds the dedicated worker address to the protected commit/run/attempt,
+artifact ID and digests, exact node/model/genesis bytes, six HTTPS coordinator
+origins, stake-zero/full-integer argv, and proved PID/listeners. Keep the worker
+running: the production manifest must be built within six hours of this
+timestamp, and its reward probes target this exact address. A retry accepts only
+byte-identical already-sealed evidence.
 
 A live process or a `degraded` isolated-chain health classification is not a
 reward claim. Record actual registration, assigned work, mined `0x25` receipt,

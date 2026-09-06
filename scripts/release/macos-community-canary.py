@@ -527,6 +527,7 @@ class Paths:
     provenance_recheck: Path
     config: Path
     config_checksum: Path
+    acceptance_receipt: Path
     log: Path
     launch_agent: Path
     lifecycle_lock: Path
@@ -586,6 +587,7 @@ def managed_paths(root: Path, home: Path) -> Paths:
         provenance_recheck=root / "config/LIVE-RECHECK.json",
         config=root / "config/canary.json",
         config_checksum=root / "config/canary.json.sha256",
+        acceptance_receipt=root / "evidence/ACCEPTED.json",
         log=root / "logs/node.log",
         launch_agent=home / f"Library/LaunchAgents/{LABEL}.plist",
         # This lock is deliberately outside the managed root and is never
@@ -1643,6 +1645,7 @@ class CanaryController:
                 "root": str(self.paths.root),
                 "data": str(self.paths.data_dir),
                 "evidence": str(self.paths.evidence_dir),
+                "acceptance_receipt": str(self.paths.acceptance_receipt),
                 "tmp": str(self.paths.tmp_dir),
                 "log": str(self.paths.log),
                 "runner": str(self.paths.runner),
@@ -1980,6 +1983,8 @@ class CanaryController:
             managed.get("root") != str(self.paths.root)
             or managed.get("data") != str(self.paths.data_dir)
             or managed.get("evidence") != str(self.paths.evidence_dir)
+            or managed.get("acceptance_receipt")
+            != str(self.paths.acceptance_receipt)
             or managed.get("tmp") != str(self.paths.tmp_dir)
             or managed.get("log") != str(self.paths.log)
             or managed.get("runner") != str(self.paths.runner)
@@ -2001,7 +2006,106 @@ class CanaryController:
             private_file(self.paths.launch_agent, self.uid, "canary LaunchAgent")
             if self.paths.launch_agent.read_bytes() != expected_plist:
                 fail("canary LaunchAgent differs from the exact expected plist")
+        if self.paths.acceptance_receipt.exists() or self.paths.acceptance_receipt.is_symlink():
+            self._validate_acceptance_receipt(config)
         return config
+
+    def _acceptance_payload(
+        self, config: dict[str, Any], *, pid: int, accepted_at_unix_ns: int
+    ) -> dict[str, Any]:
+        """Return the immutable handoff that binds production probes to this worker."""
+
+        return {
+            "schema": "arc.macos.pretag-community-canary.acceptance.v1",
+            "accepted": True,
+            "accepted_at_unix_ns": accepted_at_unix_ns,
+            "canary_schema": SCHEMA,
+            "label": LABEL,
+            "platform": PLATFORM,
+            "rust_target": RUST_TARGET,
+            "config_sha256": sha256(self.paths.config),
+            "worker": "0x" + config["identity"]["public_address"],
+            "pretag": {
+                "repository": config["pretag"]["repository"],
+                "commit": config["pretag"]["commit"],
+                "run_id": config["pretag"]["run_id"],
+                "run_attempt": config["pretag"]["run_attempt"],
+                "artifact_id": config["pretag"]["artifact_id"],
+                "artifact_digest": config["pretag"]["artifact_digest"],
+                "archive_sha256": config["pretag"]["archive_sha256"],
+                "metadata_sha256": config["pretag"]["metadata_sha256"],
+            },
+            "runtime": {
+                "stake": config["runtime"]["stake"],
+                "community_mode": config["runtime"]["community_mode"],
+                "full_integer_worker": config["runtime"]["full_integer_worker"],
+                "rpc_loopback_only": config["runtime"]["rpc_loopback_only"],
+                "p2p_peers": config["runtime"]["p2p_peers"],
+                "p2p_port": config["runtime"]["p2p_port"],
+                "community_rpc_urls": config["runtime"]["community_rpc_urls"],
+                "argv_sha256": config["runtime"]["argv_sha256"],
+            },
+            "artifacts": {
+                "node_sha256": config["node"]["sha256"],
+                "model_sha256": config["model"]["sha256"],
+                "genesis_sha256": config["genesis"]["sha256"],
+            },
+            "process": {
+                "pid": pid,
+                "exact_executable_argv_and_listeners_proved": True,
+            },
+        }
+
+    def _validate_acceptance_receipt(self, config: dict[str, Any]) -> dict[str, Any]:
+        private_file(
+            self.paths.acceptance_receipt,
+            self.uid,
+            "macOS canary acceptance receipt",
+        )
+        payload = self.paths.acceptance_receipt.read_bytes()
+        if len(payload) > 64 * 1024:
+            fail("macOS canary acceptance receipt is oversized")
+        try:
+            receipt = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            fail(f"macOS canary acceptance receipt is invalid: {error}")
+        if not isinstance(receipt, dict) or payload != canonical_json(receipt):
+            fail("macOS canary acceptance receipt is not canonical JSON")
+        if set(receipt) != {
+            "schema", "accepted", "accepted_at_unix_ns", "canary_schema",
+            "label", "platform", "rust_target", "config_sha256", "worker",
+            "pretag", "runtime", "artifacts", "process",
+        }:
+            fail("macOS canary acceptance receipt field set differs")
+        timestamp = receipt.get("accepted_at_unix_ns")
+        process = receipt.get("process")
+        if (
+            receipt.get("schema")
+            != "arc.macos.pretag-community-canary.acceptance.v1"
+            or receipt.get("accepted") is not True
+            or isinstance(timestamp, bool)
+            or not isinstance(timestamp, int)
+            or timestamp <= 0
+            or receipt.get("canary_schema") != SCHEMA
+            or receipt.get("label") != LABEL
+            or receipt.get("platform") != PLATFORM
+            or receipt.get("rust_target") != RUST_TARGET
+            or not isinstance(process, dict)
+            or set(process) != {"pid", "exact_executable_argv_and_listeners_proved"}
+            or isinstance(process.get("pid"), bool)
+            or not isinstance(process.get("pid"), int)
+            or process["pid"] <= 0
+            or process.get("exact_executable_argv_and_listeners_proved") is not True
+        ):
+            fail("macOS canary acceptance receipt header/process proof is malformed")
+        expected = self._acceptance_payload(
+            config,
+            pid=process["pid"],
+            accepted_at_unix_ns=timestamp,
+        )
+        if receipt != expected:
+            fail("macOS canary acceptance receipt differs from the validated canary config")
+        return receipt
 
     def _service_target(self) -> str:
         return f"{self.domain}/{LABEL}"
@@ -2191,6 +2295,44 @@ class CanaryController:
         return 0
 
     @lifecycle_transaction
+    def accept(self) -> None:
+        """Seal the exact running worker identity for production reward probes."""
+
+        config = self._validate_installation(require_launch_agent=True)
+        pid = self._prove_process(config)
+        if self.paths.acceptance_receipt.exists() or self.paths.acceptance_receipt.is_symlink():
+            receipt = self._validate_acceptance_receipt(config)
+            print(
+                "Canary acceptance already sealed for exact worker "
+                f"{receipt['worker']}; sha256={sha256(self.paths.acceptance_receipt)}"
+            )
+            return
+        payload = self._acceptance_payload(
+            config,
+            pid=pid,
+            accepted_at_unix_ns=time.time_ns(),
+        )
+        publish_bytes_create_only(
+            self.paths.acceptance_receipt,
+            canonical_json(payload),
+            0o600,
+            self.uid,
+        )
+        receipt = self._validate_acceptance_receipt(config)
+        self._write_evidence(
+            "accept",
+            {
+                "worker": receipt["worker"],
+                "acceptance_sha256": sha256(self.paths.acceptance_receipt),
+            },
+        )
+        print(
+            "Accepted exact pre-tag community canary worker "
+            f"{receipt['worker']}; receipt={self.paths.acceptance_receipt}; "
+            f"sha256={sha256(self.paths.acceptance_receipt)}"
+        )
+
+    @lifecycle_transaction
     def stop(self) -> None:
         require_plist = self.paths.launch_agent.exists() or self.paths.launch_agent.is_symlink()
         config = self._validate_installation(require_launch_agent=require_plist)
@@ -2324,7 +2466,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "install"):
         add_candidate_arguments(subparsers.add_parser(name))
-    for name in ("start", "status", "stop", "cleanup"):
+    for name in ("start", "status", "accept", "stop", "cleanup"):
         add_root_argument(subparsers.add_parser(name))
     return parser.parse_args(argv)
 
@@ -2355,6 +2497,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "status":
         return controller.status()
+    if args.command == "accept":
+        controller.accept()
+        return 0
     if args.command == "stop":
         controller.stop()
         return 0

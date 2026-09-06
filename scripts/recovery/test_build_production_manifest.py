@@ -363,6 +363,56 @@ print(json.dumps(value,sort_keys=True))
         self.caddy = root / "caddy"
         write(self.caddy, b"reviewed-caddy", 0o555)
         self.reward_probe = SCRIPT_DIR / "community-reward-probe.py"
+        mac_proof = self.make_provenance("headless", "macos-arm64")
+        self.macos_canary_acceptance = root / "MACOS-CANARY-ACCEPTANCE.json"
+        write(
+            self.macos_canary_acceptance,
+            canonical(
+                {
+                    "schema": "arc.macos.pretag-community-canary.acceptance.v1",
+                    "accepted": True,
+                    "accepted_at_unix_ns": self.proof_now * 1_000_000_000,
+                    "canary_schema": "arc.macos.pretag-community-canary.v1",
+                    "label": "network.arc.pretag-community-canary",
+                    "platform": "macos-arm64",
+                    "rust_target": "aarch64-apple-darwin",
+                    "config_sha256": "a" * 64,
+                    "worker": "0x" + "b" * 64,
+                    "pretag": {
+                        "repository": builder.REPOSITORY,
+                        "commit": self.commit,
+                        "run_id": self.run_id,
+                        "run_attempt": self.run_attempt,
+                        "artifact_id": mac_proof["live"]["artifact_id"],
+                        "artifact_digest": mac_proof["live"]["artifact_digest"],
+                        "archive_sha256": mac_proof["artifact"]["archive_sha256"],
+                        "metadata_sha256": mac_proof["artifact"]["build_metadata_sha256"],
+                    },
+                    "runtime": {
+                        "stake": 0,
+                        "community_mode": True,
+                        "full_integer_worker": True,
+                        "rpc_loopback_only": True,
+                        "p2p_peers": [],
+                        "p2p_port": 0,
+                        "community_rpc_urls": [
+                            f"https://{host}" for _name, host in builder.FLEET
+                        ],
+                        "argv_sha256": "c" * 64,
+                    },
+                    "artifacts": {
+                        "node_sha256": mac_proof["artifact"]["files"]["arc-node-macos-arm64"],
+                        "model_sha256": builder.rollout.CANONICAL_MODEL_SHA256,
+                        "genesis_sha256": mac_proof["artifact"]["files"]["genesis.toml"],
+                    },
+                    "process": {
+                        "pid": 4242,
+                        "exact_executable_argv_and_listeners_proved": True,
+                    },
+                }
+            ),
+            0o400,
+        )
         self.freeze = root / "freeze.json"
         self.freeze_sha = self.write_freeze()
         self.height = root / "legacy-height.json"
@@ -2495,6 +2545,7 @@ print(json.dumps(value,sort_keys=True))
             source_wal=self.wal,
             caddy=self.caddy,
             reward_probe=self.reward_probe,
+            macos_canary_acceptance=self.macos_canary_acceptance,
             stage_root=self.last_stage_root,
             acme_email=builder.APPROVED_ACME_EMAIL,
             output=output or self.output,
@@ -2821,6 +2872,9 @@ print(json.dumps(value,sort_keys=True))
             "recovery.arcchkpt": art("checkpoint", "recovery.arcchkpt"),
             "caddy": art("caddy", "caddy"),
             "community-reward-probe.py": art("reward_probe", "community-reward-probe.py"),
+            "MACOS-CANARY-ACCEPTANCE.json": art(
+                "macos_canary_acceptance", "MACOS-CANARY-ACCEPTANCE.json"
+            ),
             "PRETAG-ARTIFACT-INPUT-SET.json": art(
                 "pretag_artifact_input_set", "PRETAG-ARTIFACT-INPUT-SET.json"
             ),
@@ -3190,6 +3244,18 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         self.assertEqual(value["validators"][0]["host"], builder.FLEET[0][1])
         self.assertEqual(value["validators"][0]["shard_ranges"], builder.SHARDS["nyc"])
         self.assertEqual(value["archive"]["complete_sha256"], builder.ZERO_HASH)
+        self.assertEqual(
+            value["checks"]["reward"]["expected_worker"],
+            "0x" + "b" * 64,
+        )
+        self.assertEqual(
+            value["checks"]["reward"]["macos_canary_acceptance_sha256"],
+            value["artifacts"]["macos_canary_acceptance"]["sha256"],
+        )
+        self.assertEqual(
+            value["checks"]["reward"]["probe_argv"][-2:],
+            ["--expected-worker", "0x" + "b" * 64],
+        )
         assert self.fixture.last_stage_root is not None
         stage_root = self.fixture.last_stage_root
         self.assertEqual(stat.S_IMODE(stage_root.stat().st_mode), 0o500)
@@ -3776,14 +3842,39 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         finally:
             builder.execute_installed_key_verifier.side_effect = original_side_effect
 
-    def test_prearchive_rejects_tampered_duplicate_symlink_and_wrong_commit(self) -> None:
+    def test_prearchive_rejects_wrong_build_metadata_commit(self) -> None:
         metadata = json.loads(self.fixture.build_metadata.read_text())
         metadata["commit"] = "7" * 40
         write(self.fixture.build_metadata, canonical(metadata), 0o444)
         with self.assertRaisesRegex(builder.BuilderError, "metadata commit differs"):
             builder.prearchive(self.fixture.args())
 
+    def test_prearchive_rejects_stale_or_rebound_macos_canary_acceptance(self) -> None:
+        receipt = json.loads(self.fixture.macos_canary_acceptance.read_text())
+        receipt["accepted_at_unix_ns"] = (
+            self.fixture.proof_now
+            - builder.MAX_MACOS_CANARY_ACCEPTANCE_AGE_SECONDS
+            - 1
+        ) * 1_000_000_000
+        write(self.fixture.macos_canary_acceptance, canonical(receipt), 0o400)
+        with self.assertRaisesRegex(builder.BuilderError, "older than the six-hour"):
+            builder.prearchive(self.fixture.args())
+
         self.tearDown(); self.setUp()
+        receipt = json.loads(self.fixture.macos_canary_acceptance.read_text())
+        receipt["pretag"]["artifact_id"] += 1
+        write(self.fixture.macos_canary_acceptance, canonical(receipt), 0o400)
+        with self.assertRaisesRegex(builder.BuilderError, "different protected pre-tag"):
+            builder.prearchive(self.fixture.args())
+
+        self.tearDown(); self.setUp()
+        receipt = json.loads(self.fixture.macos_canary_acceptance.read_text())
+        receipt["worker"] = "0x" + "B" * 64
+        write(self.fixture.macos_canary_acceptance, canonical(receipt), 0o400)
+        with self.assertRaisesRegex(builder.BuilderError, "lowercase address"):
+            builder.prearchive(self.fixture.args())
+
+    def test_prearchive_rejects_duplicate_symlink_and_tampered_stop(self) -> None:
         payload = self.fixture.public_keys.read_text()
         self.fixture.public_keys.chmod(0o600)
         self.fixture.public_keys.write_text(payload.replace('"address":', '"address":"0","address":', 1))

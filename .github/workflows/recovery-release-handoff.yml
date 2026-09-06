@@ -102,7 +102,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
-          name: arc-recovery-release-handoff-${{ github.sha }}
+          name: arc-recovery-release-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: derived-cutover-handoff/*
           if-no-files-found: error
           include-hidden-files: false
@@ -124,7 +124,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$artifact"
           jq -e \
             --argjson id "$ARTIFACT_ID" \
-            --arg name "arc-recovery-release-handoff-$GITHUB_SHA" \
+            --arg name "arc-recovery-release-handoff-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --arg digest "sha256:$ARTIFACT_DIGEST" \
             --argjson run_id "$GITHUB_RUN_ID" \
             '.id == $id and .name == $name and .digest == $digest
@@ -136,6 +136,7 @@ jobs:
             echo
             echo "- main commit: \`$GITHUB_SHA\`"
             echo "- derived commit: \`${{ steps.select.outputs.handoff_commit_sha }}\`"
+            echo "- workflow run/attempt: \`$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT\`"
             echo "- artifact ID: \`$ARTIFACT_ID\`"
             echo "- artifact digest: \`$ARTIFACT_DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"

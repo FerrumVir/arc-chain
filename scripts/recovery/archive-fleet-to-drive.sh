@@ -8930,6 +8930,7 @@ PY
     fi
     printf 'archive fleet: selected fresh canary-bound live-observation generation %s root=%s\n' \
         "$observation_generation" "$observation_selection_sha"
+    remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan"
     quarantine_generation_ledger_sha="$(run_quarantine_generation_rounds \
         "$freeze_plan" "$freeze_sha" "$capture_id" "$maintenance_input_root" \
         "$log_root" "$quarantine_generation_ledger" "$inspector_binary_sha" \

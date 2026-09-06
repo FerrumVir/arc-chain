@@ -613,6 +613,10 @@ class ProtectedArtifactTests(unittest.TestCase):
                     ["preflight workflow", "preflight run", "Actions artifact set", "protected main"],
                     [label for _, label in calls],
                 )
+                self.assertEqual(
+                    f"/repos/{provenance.REPOSITORY}/actions/runs/{RUN_ID}/attempts/{RUN_ATTEMPT}",
+                    calls[1][0],
+                )
                 self.assertIn("?per_page=100", calls[2][0])
                 initial_bytes = tuple(
                     verified.provenance_bytes for verified in verified_set.artifacts

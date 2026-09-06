@@ -1,0 +1,5 @@
+{
+  "schema": "arc.public-production-status.v1",
+  "state": "maintenance",
+  "notice": "The v0.8.0 public-testnet release, recovered fleet, and post-release acceptance have not all been proven yet."
+}

@@ -28,6 +28,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 from typing import Any, Mapping, NoReturn, Sequence
@@ -107,6 +108,7 @@ PRETAG_WINDOW_SET_SCHEMA = "arc.protected-pretag-artifact-window-set.v1"
 APPROVED_ACME_EMAIL = "tj@arc.ai"
 MAX_OFFLINE_STOP_VERIFICATION_AGE_SECONDS = 300
 MAX_OFFLINE_STOP_VERIFICATION_DURATION_MS = 120_000
+MAX_MACOS_CANARY_ACCEPTANCE_AGE_SECONDS = 6 * 60 * 60
 # The live capture path enforces this wall-clock bound immediately before the
 # authenticated all-writer cross-proof. The post-stop builder re-proves the
 # same bound from the immutable receipt/cross-proof timeline; the six official
@@ -152,6 +154,7 @@ PROTECTED_MAIN_EXECUTION_FILES = (
     SCRIPT_DIR / "community-reward-probe.py",
     SCRIPT_DIR / "legacy-late-fork-interlock.py",
     RELEASE_SCRIPT_DIR / "protected_pretag_artifact.py",
+    RELEASE_SCRIPT_DIR / "macos-community-canary.py",
 )
 
 
@@ -935,6 +938,15 @@ def stage_prearchive_inputs(args: argparse.Namespace) -> tuple[argparse.Namespac
                 True,
                 "root",
             ),
+            (
+                "macos_canary_acceptance",
+                args.macos_canary_acceptance,
+                "MACOS-CANARY-ACCEPTANCE.json",
+                64 * 1024,
+                0o400,
+                False,
+                "root",
+            ),
         )
         for attribute, source, name, maximum, mode, executable, directory in specs:
             destination_parent_fd = root_fd if directory == "root" else child_fds[directory]
@@ -1400,6 +1412,135 @@ def load_pretag_input_set(
             }
         )
     return result, payload, digest
+
+
+def validate_macos_canary_acceptance(
+    path: Path,
+    *,
+    source_main_sha: str,
+    run_id: int,
+    run_attempt: int,
+    verified_pretag_artifacts: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], bytes, str]:
+    """Authenticate the dedicated pre-tag Mac worker accepted for reward probes."""
+
+    value, payload, digest = load_canonical_json(
+        path,
+        label="macOS pre-tag community canary acceptance",
+        maximum_bytes=64 * 1024,
+        exact_mode=0o400,
+        require_read_only=True,
+    )
+    receipt = require_exact_object(
+        value,
+        {
+            "schema", "accepted", "accepted_at_unix_ns", "canary_schema",
+            "label", "platform", "rust_target", "config_sha256", "worker",
+            "pretag", "runtime", "artifacts", "process",
+        },
+        "macOS pre-tag community canary acceptance",
+    )
+    accepted_at = require_uint(
+        receipt["accepted_at_unix_ns"],
+        "macOS canary accepted_at_unix_ns",
+        positive=True,
+    )
+    now_ns = time.time_ns()
+    if accepted_at > now_ns + 60_000_000_000:
+        fail("macOS canary acceptance timestamp is in the future")
+    if now_ns - accepted_at > MAX_MACOS_CANARY_ACCEPTANCE_AGE_SECONDS * 1_000_000_000:
+        fail(
+            "macOS canary acceptance is older than the six-hour production-manifest window"
+        )
+    exact = {
+        "schema": "arc.macos.pretag-community-canary.acceptance.v1",
+        "accepted": True,
+        "canary_schema": "arc.macos.pretag-community-canary.v1",
+        "label": "network.arc.pretag-community-canary",
+        "platform": "macos-arm64",
+        "rust_target": "aarch64-apple-darwin",
+    }
+    for field, expected in exact.items():
+        if receipt[field] != expected:
+            fail(f"macOS canary acceptance {field} differs")
+    require_hash(receipt["config_sha256"], "macOS canary config sha256")
+    worker = receipt["worker"]
+    if not isinstance(worker, str) or re.fullmatch(r"0x[0-9a-f]{64}", worker) is None:
+        fail("macOS canary acceptance worker must be one 0x-prefixed lowercase address")
+
+    mac_rows = [
+        row
+        for row in verified_pretag_artifacts
+        if (row.get("kind"), row.get("platform")) == ("headless", "macos-arm64")
+    ]
+    if len(mac_rows) != 1:
+        fail("protected pre-tag artifact set lacks one macOS arm64 headless group")
+    proof = mac_rows[0]["provenance"]
+    live = proof["live"]
+    artifact = proof["artifact"]
+    pretag = require_exact_object(
+        receipt["pretag"],
+        {
+            "repository", "commit", "run_id", "run_attempt", "artifact_id",
+            "artifact_digest", "archive_sha256", "metadata_sha256",
+        },
+        "macOS canary acceptance pretag",
+    )
+    expected_pretag = {
+        "repository": REPOSITORY,
+        "commit": source_main_sha,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "artifact_id": live["artifact_id"],
+        "artifact_digest": live["artifact_digest"],
+        "archive_sha256": artifact["archive_sha256"],
+        "metadata_sha256": artifact["build_metadata_sha256"],
+    }
+    if pretag != expected_pretag:
+        fail("macOS canary acceptance is bound to a different protected pre-tag artifact")
+
+    runtime = require_exact_object(
+        receipt["runtime"],
+        {
+            "stake", "community_mode", "full_integer_worker", "rpc_loopback_only",
+            "p2p_peers", "p2p_port", "community_rpc_urls", "argv_sha256",
+        },
+        "macOS canary acceptance runtime",
+    )
+    expected_origins = [f"https://{host}" for _name, host in FLEET]
+    if (
+        runtime["stake"] != 0
+        or runtime["community_mode"] is not True
+        or runtime["full_integer_worker"] is not True
+        or runtime["rpc_loopback_only"] is not True
+        or runtime["p2p_peers"] != []
+        or runtime["p2p_port"] != 0
+        or runtime["community_rpc_urls"] != expected_origins
+    ):
+        fail("macOS canary acceptance runtime is not the dedicated stake-zero worker")
+    require_hash(runtime["argv_sha256"], "macOS canary runtime argv sha256")
+
+    artifacts = require_exact_object(
+        receipt["artifacts"],
+        {"node_sha256", "model_sha256", "genesis_sha256"},
+        "macOS canary acceptance artifacts",
+    )
+    expected_artifacts = {
+        "node_sha256": artifact["files"]["arc-node-macos-arm64"],
+        "model_sha256": rollout.CANONICAL_MODEL_SHA256,
+        "genesis_sha256": artifact["files"]["genesis.toml"],
+    }
+    if artifacts != expected_artifacts:
+        fail("macOS canary acceptance artifact hashes differ from protected pre-tag/canonical bytes")
+    process = require_exact_object(
+        receipt["process"],
+        {"pid", "exact_executable_argv_and_listeners_proved"},
+        "macOS canary acceptance process",
+    )
+    require_uint(process["pid"], "macOS canary acceptance pid", positive=True)
+    if process["exact_executable_argv_and_listeners_proved"] is not True:
+        fail("macOS canary acceptance lacks the exact live process proof")
+    return receipt, payload, digest
 
 
 def create_private_seal(path: Path, value: Mapping[str, Any]) -> str:
@@ -5398,6 +5539,17 @@ def prearchive(args: argparse.Namespace) -> str:
     }
     if staged_provenance_set != expected_staged_set:
         fail("staged protected pre-tag provenance set differs from the nine live proof transactions")
+    (
+        macos_canary_acceptance,
+        _macos_canary_acceptance_payload,
+        macos_canary_acceptance_sha,
+    ) = validate_macos_canary_acceptance(
+        args.macos_canary_acceptance,
+        source_main_sha=args.source_main_sha,
+        run_id=args.pretag_run_id,
+        run_attempt=args.pretag_run_attempt,
+        verified_pretag_artifacts=args.pretag_verified_artifacts,
+    )
     metadata, metadata_sha = validate_build_metadata(args)
     freeze, freeze_payload, freeze_sha, freeze_sidecar_sha, freeze_sidecar = validate_freeze_inputs(args)
     (
@@ -5608,6 +5760,10 @@ def prearchive(args: argparse.Namespace) -> str:
         "reward_probe": artifact(
             args.reward_probe, "community reward probe", executable=True
         ),
+        "macos_canary_acceptance": {
+            "path": os.fspath(args.macos_canary_acceptance),
+            "sha256": macos_canary_acceptance_sha,
+        },
         "checkpoint": artifact(args.checkpoint, "signed recovery checkpoint"),
         "legacy_validator_set": artifact(args.legacy_validator_set, "legacy validator set"),
         "source_snapshot": artifact(args.source_snapshot, "canonical source snapshot"),
@@ -5700,8 +5856,16 @@ def prearchive(args: argparse.Namespace) -> str:
                 "mode": "receipt",
                 "expect_protocol_active": True,
                 "expect_issuance_ready": True,
-                "probe_argv": [os.fspath(args.reward_probe), "--max-tokens", "1"],
+                "probe_argv": [
+                    os.fspath(args.reward_probe),
+                    "--max-tokens",
+                    "1",
+                    "--expected-worker",
+                    macos_canary_acceptance["worker"],
+                ],
                 "probe_sha256": artifacts["reward_probe"]["sha256"],
+                "expected_worker": macos_canary_acceptance["worker"],
+                "macos_canary_acceptance_sha256": macos_canary_acceptance_sha,
                 "expected_reward_base": rollout.COMMUNITY_REWARD_BASE,
             },
         },
@@ -5956,6 +6120,23 @@ def prearchive(args: argparse.Namespace) -> str:
             rollout.require_prearchive_manifest(manifest)
         except rollout.RolloutError as error:
             fail(f"final fresh protected-artifact manifest validation failed: {error}")
+        (
+            final_canary_acceptance,
+            final_canary_acceptance_payload,
+            final_canary_acceptance_sha,
+        ) = validate_macos_canary_acceptance(
+            args.macos_canary_acceptance,
+            source_main_sha=args.source_main_sha,
+            run_id=args.pretag_run_id,
+            run_attempt=args.pretag_run_attempt,
+            verified_pretag_artifacts=args.pretag_verified_artifacts,
+        )
+        if (
+            final_canary_acceptance != macos_canary_acceptance
+            or final_canary_acceptance_payload != _macos_canary_acceptance_payload
+            or final_canary_acceptance_sha != macos_canary_acceptance_sha
+        ):
+            fail("macOS canary acceptance changed before prearchive publication")
         recheck_artifact_identities()
         return create_private_seal(args.output, manifest)
 
@@ -6542,6 +6723,11 @@ def validate_archive_evidence(
             "validator_key_install_receipt",
             "VALIDATOR-KEY-INSTALL-RECEIPT.json",
         ),
+        "MACOS-CANARY-ACCEPTANCE.json": _expected_artifact_object(
+            prearchive,
+            "macos_canary_acceptance",
+            "MACOS-CANARY-ACCEPTANCE.json",
+        ),
         "drive-archive-seal-prefreeze.json": (
             "drive-archive-seal-prefreeze.json",
             len(drive_receipt_payload),
@@ -6872,6 +7058,12 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--source-wal", required=True, type=absolute_path)
     prepare.add_argument("--caddy", required=True, type=absolute_path)
     prepare.add_argument("--reward-probe", required=True, type=absolute_path)
+    prepare.add_argument(
+        "--macos-canary-acceptance",
+        required=True,
+        type=absolute_path,
+        help="canonical ACCEPTED.json from the exact running macOS arm64 pre-tag worker",
+    )
     prepare.add_argument(
         "--stage-root",
         required=True,

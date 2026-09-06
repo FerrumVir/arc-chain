@@ -153,6 +153,52 @@ checks H/H+1 continuity and restart convergence, and can require a successful
 reward receipt plus receipt-only earnings on every validator.
 Normal SSH and service audit logs may record plan access.
 
+Checkpoint signing has a separate, durable authorization boundary. The six
+validator identities are controlled recovery members, not evidence that six
+independent humans approved the cutover. Immediately before offline signing,
+the repository owner must manually dispatch the read-only, no-secret
+`owner-emergency-recovery-approval.yml` workflow on the exact protected-main
+commit with the inspected checkpoint manifest hash, public-key manifest hash,
+all six ordered public keys, and exact reviewed confirmation. The operator
+API-selects one new exact workflow/path/event/branch/SHA run and attempt whose
+actor and triggering actor are both the pinned owner, waits for that attempt to
+succeed, and preserves the workflow, run, exact-attempt jobs, artifact metadata,
+and digest-bound ZIP as root-owned mode-`0400` evidence in a new mode-`0700`
+directory.
+
+`owner-emergency-recovery.py verify-github-artifact` receives no GitHub token.
+It authenticates those GitHub API facts, the single successful named job, and
+the one-member artifact, then materializes a fresh, create-only
+`arc.recovery.owner-emergency-recovery.v2` receipt owned by the operator at mode
+`0400` with an exact mode-`0400` SHA-256 sidecar. That receipt records the pinned
+repository owner's GitHub-authenticated `owner_emergency_recovery` decision and
+UTC time, fixed reason and risk acknowledgement, protected-main commit,
+checkpoint manifest, H=137145/H+1=137146, recovery epoch/set 1/1, ordered
+validator public identities/stakes, exact five-signature order, unused sixth
+member, and strict stake-supermajority threshold. Matching locally authored
+text is not authorization. This owner emergency receipt is transparent about
+the authority actually exercised. The signing wrapper accepts no intervening
+operation after verification except root/mode/link checks and explicit
+receipt, sidecar, and attempt-directory durability syncs;
+it does not claim six-human approval and does not replace final checkpoint
+signature verification.
+
+Public live claims have a second evidence boundary. The protected-main
+`build-postrelease-public-truth.py` invocation consumes the preserved release
+API; exact Pages workflow/run/attempt/jobs/deployment/status and deployed CDN
+bytes; exact published-acceptance workflow/run/attempt/jobs/artifact metadata
+and digest-bound ZIP; final rollout manifest; and reward evidence. The outer
+artifact contains nine exact top-level/checksum members and an exact 36-file
+recursive evidence set, including the release publication ZIP itself. The
+builder re-aggregates that evidence with its exact sibling acceptance helper
+and immediately runs the exact sibling rollout verifier against all six live
+validators. It then creates exactly three root-only mode-`0400` outputs in a
+new mode-`0700` directory: `arc.post-release-acceptance.v2`, the derived README,
+and `arc.public-production-status.v1`. Only the README and production-status
+paths are committed; the status embeds the full canonical v2 receipt and its
+SHA-256 so the public claims retain their workflow, job, artifact, Pages, and
+recovery identities.
+
 The legacy archive has a separate, earlier freeze authorization because the
 final checkpoint and archive roots cannot truthfully exist before the forked
 fleet is stopped and indexed. `audit-writers` separately binds the exact

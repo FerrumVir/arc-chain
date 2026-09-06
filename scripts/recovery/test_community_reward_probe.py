@@ -29,6 +29,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
     replay_mined = False
     settlement_patch: dict[str, Any] = {}
     settlement_drop: set[str] = set()
+    scoreboard_worker = WORKER
     post_requests: list[dict[str, Any]] = []
 
     def log_message(self, _format: str, *_args: Any) -> None:
@@ -45,8 +46,21 @@ class ProbeHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/community/reward_policy":
             self.send_json({"issuance_ready": True})
-        elif self.path == "/workers/scoreboard?limit=1":
-            self.send_json({"eligible_inference_workers": 1})
+        elif self.path == f"/workers/scoreboard?limit=1&worker_id={WORKER}":
+            self.send_json(
+                {
+                    "eligible_inference_workers": 1,
+                    "coordinator_model_id": MODEL_HASH,
+                    "workers": [
+                        {
+                            "worker_id": self.scoreboard_worker,
+                            "capabilities": ["inference"],
+                            "model_id": MODEL_HASH,
+                            "execution_profile": CANONICAL_PROFILE,
+                        }
+                    ],
+                }
+            )
         else:
             self.send_error(404)
 
@@ -156,6 +170,7 @@ class CommunityRewardProbeTests(unittest.TestCase):
         ProbeHandler.replay_mined = False
         ProbeHandler.settlement_patch = {}
         ProbeHandler.settlement_drop = set()
+        ProbeHandler.scoreboard_worker = WORKER
         ProbeHandler.post_requests = []
 
     def run_probe(self, *extra_args: str) -> subprocess.CompletedProcess[str]:
@@ -175,6 +190,8 @@ class CommunityRewardProbeTests(unittest.TestCase):
                 str(probe),
                 "--http-timeout-seconds",
                 "5",
+                "--expected-worker",
+                WORKER,
                 *extra_args,
             ],
             text=True,
@@ -198,6 +215,7 @@ class CommunityRewardProbeTests(unittest.TestCase):
                 "0x" + b"ARC-RCV-PROBE1\0\0".hex()
             )
         )
+        self.assertEqual(ProbeHandler.post_requests[0]["expected_worker"], WORKER)
 
     def test_retry_discovers_same_job_without_creating_another(self) -> None:
         ProbeHandler.replay = True
@@ -271,6 +289,19 @@ class CommunityRewardProbeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("differs from", result.stderr)
+
+    def test_accepted_worker_must_be_visible_and_must_receive_the_job(self) -> None:
+        ProbeHandler.scoreboard_worker = "0x" + "9" * 64
+        result = self.run_probe()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("accepted worker", result.stderr)
+        self.assertEqual(ProbeHandler.post_requests, [])
+
+        ProbeHandler.scoreboard_worker = WORKER
+        ProbeHandler.settlement_patch = {"worker": "0x" + "9" * 64}
+        result = self.run_probe()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("settlement.worker differs", result.stderr)
 
 
 if __name__ == "__main__":
