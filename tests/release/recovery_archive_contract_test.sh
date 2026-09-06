@@ -2685,6 +2685,8 @@ command = [
     'overrides=capture_phase; '
     '[ "${ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE:-false}" = true ] && '
     'overrides="capture_phase archive_remove_dispatch_gate"; '
+    '[ "${ARC_SIGNAL_SENTINEL_MOVE_FAIL_ONCE:-false}" = true ] && '
+    'overrides="$overrides archive_sentinel_atomic_move"; '
     'export ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES="$overrides"; '
     'dispatch_archive_command capture_phase',
     "archive-dispatch-signal-test", str(orchestrator), str(probe),
@@ -2692,23 +2694,24 @@ command = [
 signals = (("HUP", signal.SIGHUP, 129), ("INT", signal.SIGINT, 130),
            ("TERM", signal.SIGTERM, 143))
 cases = [
-    (f"{label}_STRESS_{index:02d}", sent, status, False, False, 0, False)
+    (f"{label}_STRESS_{index:02d}", sent, status, False, False, 0, False, False)
     for index in range(50)
     for label, sent, status in (signals[index % len(signals)],)
 ]
 cases.extend((
-    ("HUP_IGNORING_CHILD", signal.SIGHUP, 129, True, False, 0, False),
-    ("INT_IGNORING_CHILD", signal.SIGINT, 130, True, False, 0, False),
-    ("TERM_IGNORING_CHILD", signal.SIGTERM, 143, True, False, 0, False),
-    ("TERM_RESURRECTING_CHILD", signal.SIGTERM, 143, False, True, 0, False),
-    ("TERM_SLOW_EXIT_CLEANUP", signal.SIGTERM, 143, False, False, 10, False),
-    ("TERM_GATE_SWEEP_RETRY", signal.SIGTERM, 143, False, False, 0, True),
-    ("KILL", signal.SIGKILL, 137, False, False, 0, False),
+    ("HUP_IGNORING_CHILD", signal.SIGHUP, 129, True, False, 0, False, False),
+    ("INT_IGNORING_CHILD", signal.SIGINT, 130, True, False, 0, False, False),
+    ("TERM_IGNORING_CHILD", signal.SIGTERM, 143, True, False, 0, False, False),
+    ("TERM_RESURRECTING_CHILD", signal.SIGTERM, 143, False, True, 0, False, False),
+    ("TERM_SLOW_EXIT_CLEANUP", signal.SIGTERM, 143, False, False, 10, False, False),
+    ("TERM_GATE_SWEEP_RETRY", signal.SIGTERM, 143, False, False, 0, True, False),
+    ("TERM_SENTINEL_MOVE_RETRY", signal.SIGTERM, 143, False, False, 0, False, True),
+    ("KILL", signal.SIGKILL, 137, False, False, 0, False, False),
 ))
 
 fast_teardowns = []
 for (name, sent_signal, expected_status, child_ignores, child_resurrects,
-     cleanup_delay, gate_remove_fails) in cases:
+     cleanup_delay, gate_remove_fails, sentinel_move_fails) in cases:
     case = fixture / name.lower()
     runtime = case / "runtime"
     case.mkdir(mode=0o700)
@@ -2724,6 +2727,7 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
         "ARC_SIGNAL_BACKGROUND_RESURRECTS": "true" if child_resurrects else "false",
         "ARC_SIGNAL_CLEANUP_DELAY_SECONDS": str(cleanup_delay),
         "ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE": "true" if gate_remove_fails else "false",
+        "ARC_SIGNAL_SENTINEL_MOVE_FAIL_ONCE": "true" if sentinel_move_fails else "false",
     })
     stdout_path = case / "supervisor.stdout"
     stderr_path = case / "supervisor.stderr"
@@ -2816,7 +2820,7 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
                 raw_status = process.wait(timeout=wait_budget)
             except subprocess.TimeoutExpired as error:
                 # Name the case AND say where it is stuck. A bare
-                # TimeoutExpired traceback gives no clue which of the 57 cases
+                # TimeoutExpired traceback gives no clue which of the 58 cases
                 # hung, nor why, which is most of the debugging.
                 diagnosis = [f"{name} did not exit within {wait_budget}s of {sent_signal}"]
                 try:
@@ -2872,6 +2876,8 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
                 if "FATAL guardian retaining and retrying private dispatch gate" not in \
                         stderr_path.read_text(encoding="utf-8"):
                     raise AssertionError(f"{name} cleanup handoff failure was not loud")
+            if sentinel_move_fails and not (case / "sentinel-move-failed-once").is_file():
+                raise AssertionError(f"{name} did not inject the sentinel move failure")
             if (not child_ignores and not child_resurrects and not cleanup_delay
                     and name != "KILL" and not cleanup.is_file()):
                 time.sleep(0.2)

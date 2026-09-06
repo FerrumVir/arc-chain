@@ -123,3 +123,20 @@ if [ "${ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE:-false}" = true ]; then
         [ ! -e "$gate" ] && [ ! -L "$gate" ]
     }
 fi
+
+if [ "${ARC_SIGNAL_SENTINEL_MOVE_FAIL_ONCE:-false}" = true ]; then
+    # Model the guardian killing the sentinel's external mv child during
+    # escalation. The sentinel shell must survive the 137 and retry through the
+    # existing FINALIZE handshake instead of abandoning the credential gate.
+    archive_sentinel_atomic_move() {
+        local source="$1" destination="$2"
+        if [ "${ARC_SIGNAL_SENTINEL_MOVE_HAS_FAILED:-false}" = false ] && \
+            [ "${destination##*/}" = sentinel.finalize.ack ]; then
+            ARC_SIGNAL_SENTINEL_MOVE_HAS_FAILED=true
+            (umask 077; printf 'injected move exit 137\n' \
+                > "$ARC_SIGNAL_CASE_DIR/sentinel-move-failed-once")
+            return 137
+        fi
+        /bin/mv -f "$source" "$destination"
+    }
+fi
