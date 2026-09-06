@@ -101,12 +101,31 @@ proof after all large copies and immediately before publishing runnable state.
   kickstarts or replaces that running process.
 - `stop` disables the label, re-proves the same process, and asks launchd to
   send only the node-supported `SIGTERM`. It waits up to 4,420 seconds for the
-  admitted 4,000-second work window and WAL barrier. It never sends a force
-  signal and never boots out a live process.
-- If a loaded job has no exact provable PID, `stop` disables the label and
-  leaves the job loaded for review. It neither signals nor issues `bootout`
-  across that racy no-PID observation; cleanup consequently preserves the
-  LaunchAgent plist as well.
+  admitted 4,000-second work window and WAL barrier. A dedicated drain proof
+  keeps requiring the same launchd PID, executable, hash, and complete argv.
+  Its listening TCP set may be exactly the sole loopback RPC listener or
+  empty, UDP must remain empty, and RPC may never reopen after the first empty
+  observation. Already-established local RPC or outbound HTTPS connections may
+  finish during the bounded drain; no new listener is permitted. Closing RPC
+  is not treated as process death or WAL completion.
+  The controller waits for both launchd ownership and the original PID to
+  disappear, then takes three one-second-apart observations plus a final
+  recheck requiring the exact loaded definition to report `active count = 0`,
+  `state = not running`, and `last exit code = 0` before `bootout`.
+  It never sends a force signal and never boots out a live process.
+- If an enabled loaded job has no exact provable PID, the first `stop` disables
+  it and leaves it loaded for review; it neither signals nor issues `bootout`
+  across that racy observation. A later `stop` can recover only an already
+  disabled, cleanly exited job whose exact path, program, ProgramArguments,
+  working directory, log paths, umask, and launchd definition remain stable.
+  It requires three one-second-apart `active count = 0`,
+  `state = not running`, no-PID observations plus a final recheck, scans the
+  process table for the exact canary env/runner/node commands, revalidates all
+  installed bytes, and requires the normalized definition hash to remain
+  unchanged. Only then does it unregister the inert label without signaling
+  and append explicit recovery evidence. Any PID, process, definition, state,
+  or exit-code change leaves the disabled job loaded for review; cleanup
+  consequently preserves the LaunchAgent plist as well.
 
 Runtime paths must contain no whitespace or shell metacharacters because the
 controller compares macOS `ps` output to one unambiguous complete argv. Move a

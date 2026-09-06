@@ -43,13 +43,20 @@ class FakePlatform(canary.PlatformCommands):
         self.loaded = False
         self.alive = False
         self.disabled = False
+        self.disable_takes_effect = True
         self.exit_on_term = True
         self.pid = 4242
         self.expected_command = ""
         self.expected_executable: Path | None = None
         self.reported_command: str | None = None
+        self.drain_reported_command: str | None = None
+        self.drain_executable: Path | None = None
         self.listener_names = [canary.RPC]
+        self.all_tcp_names: list[str] | None = None
         self.udp_names: list[str] = []
+        self.drain_listener_names: list[str] | None = None
+        self.drain_all_tcp_names: list[str] | None = None
+        self.drain_udp_names: list[str] | None = None
         self.extra_text_paths: list[str] = []
         self.lsof_pid: int | None = None
         self.empty_socket_rc1 = False
@@ -57,6 +64,22 @@ class FakePlatform(canary.PlatformCommands):
         self.startup_phase = 0
         self.pid_changes_on_sleep: list[int] = []
         self.start_on_kick = True
+        self.term_sent = False
+        self.exit_after_term_sleeps: int | None = None
+        self.term_sleep_calls = 0
+        self.orphan_processes: dict[int, str] = {}
+        self.ps_missing_returncode = 1
+        self.ps_missing_stdout = ""
+        self.ps_missing_stderr = ""
+        self.launch_agent_path: Path | None = None
+        self.working_directory: Path | None = None
+        self.log_path: Path | None = None
+        self.launch_arguments: list[str] = []
+        self.launch_runs = 1
+        self.launch_last_exit_code = 0
+        self.launch_properties = "inferred program"
+        self.unloaded_print_returncode = 113
+        self.unloaded_print_stderr: str | None = None
         self.commands: list[tuple[str, ...]] = []
         self.sleep_calls = 0
         self.public_address = "b" * 64
@@ -85,9 +108,45 @@ class FakePlatform(canary.PlatformCommands):
             target = args[2]
             if target.endswith(f"/{canary.LABEL}"):
                 if not self.loaded:
-                    return completed(args, 113, stderr="service not found")
-                pid = f"\n    pid = {self.pid}\n" if self.alive else "\n"
-                return completed(args, stdout=f"service = {{{pid}}}\n")
+                    stderr = self.unloaded_print_stderr or (
+                        "Bad request.\n"
+                        f'Could not find service "{canary.LABEL}" in domain for '
+                        f"user gui: {self.uid}\n"
+                    )
+                    return completed(
+                        args,
+                        self.unloaded_print_returncode,
+                        stderr=stderr,
+                    )
+                active_count = 1 if self.alive else 0
+                state = "running" if self.alive else "not running"
+                pid = f"    pid = {self.pid}\n" if self.alive else ""
+                arguments = "".join(
+                    f"        {value}\n" for value in self.launch_arguments
+                )
+                return completed(
+                    args,
+                    stdout=(
+                        f"{target} = {{\n"
+                        f"    active count = {active_count}\n"
+                        f"    path = {self.launch_agent_path}\n"
+                        "    type = LaunchAgent\n"
+                        f"    state = {state}\n"
+                        "    program = /usr/bin/env\n"
+                        "    arguments = {\n"
+                        f"{arguments}"
+                        "    }\n"
+                        f"    working directory = {self.working_directory}\n"
+                        f"    stdout path = {self.log_path}\n"
+                        f"    stderr path = {self.log_path}\n"
+                        "    umask = 77\n"
+                        f"    runs = {self.launch_runs}\n"
+                        f"    last exit code = {self.launch_last_exit_code}\n"
+                        f"    properties = {self.launch_properties}\n"
+                        f"{pid}"
+                        "}\n"
+                    ),
+                )
             return completed(args, stdout="domain = { active = true }\n")
         if args[:2] == ("launchctl", "print-disabled"):
             state = "disabled" if self.disabled else "enabled"
@@ -103,7 +162,8 @@ class FakePlatform(canary.PlatformCommands):
             self.disabled = False
             return completed(args)
         if args[:2] == ("launchctl", "disable"):
-            self.disabled = True
+            if self.disable_takes_effect:
+                self.disabled = True
             return completed(args)
         if args[:2] == ("launchctl", "bootstrap"):
             if self.loaded:
@@ -122,6 +182,8 @@ class FakePlatform(canary.PlatformCommands):
                 return completed(args, 3, stderr="bad signal target")
             if self.exit_on_term:
                 self.alive = False
+            self.term_sent = True
+            self.term_sleep_calls = 0
             return completed(args)
         if args[:2] == ("launchctl", "bootout"):
             if self.alive:
@@ -130,20 +192,42 @@ class FakePlatform(canary.PlatformCommands):
             return completed(args)
         if args[:2] == ("ps", "-p") and args[3:] == ("-o", "pid="):
             if self.alive and int(args[2]) == self.pid:
-                return completed(args, stdout=f"{self.pid}\n")
-            return completed(args, 1)
+                return completed(args, stdout=f"{self.pid:5d}\n")
+            return completed(
+                args,
+                self.ps_missing_returncode,
+                stdout=self.ps_missing_stdout,
+                stderr=self.ps_missing_stderr,
+            )
+        if args == ("ps", "-ww", "-axo", "pid=,command="):
+            rows = dict(self.orphan_processes)
+            if self.alive:
+                rows[self.pid] = self.reported_command or str(
+                    self._phase().get("command", self.expected_command)
+                )
+            return completed(
+                args,
+                stdout="".join(f"{pid:6d} {command}\n" for pid, command in sorted(rows.items())),
+            )
         if args[:3] == ("ps", "-ww", "-p") and args[4:] == ("-o", "command="):
             if self.alive and int(args[3]) == self.pid:
                 phase = self._phase()
-                command = self.reported_command or str(
-                    phase.get("command", self.expected_command)
+                command = (
+                    self.drain_reported_command
+                    if self.term_sent and self.drain_reported_command is not None
+                    else self.reported_command
+                    or str(phase.get("command", self.expected_command))
                 )
                 return completed(args, stdout=f"{command}\n")
             return completed(args, 1)
         if args[:3] == ("ps", "-ww", "-p") and args[4:] == ("-o", "comm="):
             if self.alive and int(args[3]) == self.pid:
                 phase = self._phase()
-                executable = phase.get("executable", self.expected_executable)
+                executable = (
+                    self.drain_executable
+                    if self.term_sent and self.drain_executable is not None
+                    else phase.get("executable", self.expected_executable)
+                )
                 if executable is None:
                     return completed(args, 1, stderr="no executable")
                 return completed(args, stdout=f"{executable}\n")
@@ -151,11 +235,29 @@ class FakePlatform(canary.PlatformCommands):
         if args[:3] == ("lsof", "-nP", "-a"):
             if self.alive:
                 phase = self._phase()
-                selected = (
-                    phase.get("udp", self.udp_names)
-                    if "-iUDP" in args
-                    else phase.get("tcp", self.listener_names)
-                )
+                if "-iUDP" in args:
+                    selected = (
+                        self.drain_udp_names
+                        if self.term_sent and self.drain_udp_names is not None
+                        else phase.get("udp", self.udp_names)
+                    )
+                elif "-sTCP:LISTEN" in args:
+                    selected = (
+                        self.drain_listener_names
+                        if self.term_sent and self.drain_listener_names is not None
+                        else phase.get("tcp", self.listener_names)
+                    )
+                else:
+                    selected = (
+                        self.drain_all_tcp_names
+                        if self.term_sent and self.drain_all_tcp_names is not None
+                        else phase.get(
+                            "all_tcp",
+                            self.all_tcp_names
+                            if self.all_tcp_names is not None
+                            else phase.get("tcp", self.listener_names),
+                        )
+                    )
                 if self.empty_socket_rc1 and not selected:
                     return completed(args, 1)
                 names = "".join(f"n{value}\n" for value in selected)
@@ -164,7 +266,11 @@ class FakePlatform(canary.PlatformCommands):
         if args[:2] == ("lsof", "-a"):
             if self.alive and self.expected_executable is not None:
                 phase = self._phase()
-                executable = phase.get("executable", self.expected_executable)
+                executable = (
+                    self.drain_executable
+                    if self.term_sent and self.drain_executable is not None
+                    else phase.get("executable", self.expected_executable)
+                )
                 extras = "".join(
                     f"ftxt\nn{value}\n" for value in self.extra_text_paths
                 )
@@ -198,6 +304,10 @@ class FakePlatform(canary.PlatformCommands):
 
     def sleep(self, seconds: float) -> None:
         self.sleep_calls += 1
+        if self.term_sent:
+            self.term_sleep_calls += 1
+            if self.exit_after_term_sleeps == self.term_sleep_calls:
+                self.alive = False
         if self.pid_changes_on_sleep:
             self.pid = self.pid_changes_on_sleep.pop(0)
         if self.startup_phases and self.startup_phase + 1 < len(self.startup_phases):
@@ -447,6 +557,12 @@ class MacosCommunityCanaryTests(unittest.TestCase):
         config = self.controller._load_config()
         self.fake.expected_command = " ".join(config["runtime"]["argv"])
         self.fake.expected_executable = self.controller.paths.node
+        self.fake.launch_agent_path = self.controller.paths.launch_agent
+        self.fake.working_directory = self.controller.paths.root
+        self.fake.log_path = self.controller.paths.log
+        self.fake.launch_arguments = plistlib.loads(
+            self.controller.paths.launch_agent.read_bytes()
+        )["ProgramArguments"]
 
     def exact_startup_phases(self) -> list[dict[str, object]]:
         launch_arguments = plistlib.loads(
@@ -850,6 +966,378 @@ class MacosCommunityCanaryTests(unittest.TestCase):
             any(args[:2] == ("launchctl", "kill") for args in new_commands)
         )
         self.assertFalse(any("SIGKILL" in part for args in new_commands for part in args))
+
+    def test_stop_allows_exact_rpc_to_zero_socket_drain_before_clean_exit(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.exit_on_term = False
+        self.fake.drain_listener_names = []
+        self.fake.drain_all_tcp_names = [
+            "127.0.0.1:53123->149.28.32.76:443"
+        ]
+        self.fake.drain_udp_names = []
+        self.fake.exit_after_term_sleeps = 1
+        command_count = len(self.fake.commands)
+
+        self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertFalse(self.fake.loaded)
+        self.assertFalse(self.fake.alive)
+        self.assertIn(
+            ("launchctl", "kill", "SIGTERM", self.controller._service_target()),
+            new_commands,
+        )
+        self.assertIn(
+            ("launchctl", "bootout", self.controller._service_target()),
+            new_commands,
+        )
+        evidence = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in self.controller.paths.evidence_dir.glob("*-stop-*.json")
+        ]
+        self.assertEqual(1, len(evidence))
+        self.assertFalse(evidence[0]["recovered_loaded_disabled_no_pid"])
+        self.assertRegex(evidence[0]["service_snapshot_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_graceful_drain_rejects_additional_tcp_listener(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.exit_on_term = False
+        self.fake.drain_listener_names = [canary.RPC, "*:19945"]
+        self.fake.drain_all_tcp_names = [
+            canary.RPC,
+            "*:19945",
+        ]
+        command_count = len(self.fake.commands)
+
+        with self.assertRaisesRegex(canary.CanaryError, "RPC-to-zero transition"):
+            self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.alive)
+        self.assertTrue(self.fake.disabled)
+        self.assertFalse(
+            any(args[:2] == ("launchctl", "bootout") for args in new_commands)
+        )
+
+    def test_graceful_drain_rejects_udp_socket(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.exit_on_term = False
+        self.fake.drain_listener_names = []
+        self.fake.drain_all_tcp_names = []
+        self.fake.drain_udp_names = ["127.0.0.1:55331"]
+
+        with self.assertRaisesRegex(canary.CanaryError, "must own no UDP"):
+            self.controller.stop()
+
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.alive)
+        self.assertTrue(self.fake.disabled)
+
+    def test_graceful_drain_rejects_rpc_reopen_after_zero_socket_state(self) -> None:
+        self.install()
+        self.controller.start()
+        config = self.controller._load_config()
+        self.fake.term_sent = True
+        self.fake.drain_listener_names = []
+        self.fake.drain_all_tcp_names = []
+        closed = self.controller._prove_pid_graceful_drain(
+            config,
+            self.fake.pid,
+            rpc_listener_closed=False,
+        )
+        self.assertTrue(closed)
+        self.fake.drain_listener_names = [canary.RPC]
+        self.fake.drain_all_tcp_names = [canary.RPC]
+        with self.assertRaisesRegex(canary.CanaryError, "reopened"):
+            self.controller._prove_pid_graceful_drain(
+                config,
+                self.fake.pid,
+                rpc_listener_closed=closed,
+            )
+
+    def test_graceful_drain_rejects_argv_or_pid_change_without_bootout(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.exit_on_term = False
+        self.fake.drain_listener_names = []
+        self.fake.drain_all_tcp_names = []
+        self.fake.drain_reported_command = "/tmp/not-the-canary --stake 0"
+        command_count = len(self.fake.commands)
+        with self.assertRaisesRegex(canary.CanaryError, "argv differs"):
+            self.controller.stop()
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.alive)
+        self.assertTrue(self.fake.disabled)
+        self.assertFalse(
+            any(
+                args[:2] == ("launchctl", "bootout")
+                for args in self.fake.commands[command_count:]
+            )
+        )
+
+    def test_graceful_drain_rejects_executable_change(self) -> None:
+        self.install()
+        self.controller.start()
+        config = self.controller._load_config()
+        self.fake.term_sent = True
+        self.fake.drain_listener_names = []
+        self.fake.drain_executable = Path("/bin/sh")
+
+        with self.assertRaisesRegex(canary.CanaryError, "executable differs"):
+            self.controller._prove_pid_graceful_drain(
+                config,
+                self.fake.pid,
+                rpc_listener_closed=False,
+            )
+
+    def test_graceful_drain_rejects_launchd_pid_change(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.exit_on_term = False
+        self.fake.drain_listener_names = []
+        self.fake.drain_all_tcp_names = []
+        self.fake.pid_changes_on_sleep = [self.fake.pid + 1]
+        command_count = len(self.fake.commands)
+
+        with self.assertRaisesRegex(canary.CanaryError, "PID changed"):
+            self.controller.stop()
+
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.disabled)
+        self.assertFalse(
+            any(
+                args[:2] == ("launchctl", "bootout")
+                for args in self.fake.commands[command_count:]
+            )
+        )
+
+    def test_graceful_drain_requires_clean_launchd_exit_before_bootout(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.launch_last_exit_code = 9
+        command_count = len(self.fake.commands)
+
+        with self.assertRaisesRegex(canary.CanaryError, "clean-exit contract"):
+            self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertTrue(self.fake.loaded)
+        self.assertFalse(self.fake.alive)
+        self.assertTrue(self.fake.disabled)
+        self.assertFalse(
+            any(args[:2] == ("launchctl", "bootout") for args in new_commands)
+        )
+        self.assertFalse(
+            any(self.controller.paths.evidence_dir.glob("*-stop-*.json"))
+        )
+
+    def test_post_bootout_unexpected_launchctl_error_cannot_seal_stop(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.unloaded_print_returncode = 1
+        self.fake.unloaded_print_stderr = "operation not permitted\n"
+
+        with self.assertRaisesRegex(canary.CanaryError, "unexpected error"):
+            self.controller.stop()
+
+        self.assertFalse(self.fake.loaded)
+        self.assertFalse(
+            any(self.controller.paths.evidence_dir.glob("*-stop-*.json"))
+        )
+
+    def test_unexpected_ps_absence_error_cannot_bootout_or_seal_stop(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.ps_missing_returncode = 2
+        self.fake.ps_missing_stderr = "operation not permitted\n"
+        command_count = len(self.fake.commands)
+
+        with self.assertRaisesRegex(canary.CanaryError, "process-existence proof"):
+            self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertTrue(self.fake.loaded)
+        self.assertFalse(self.fake.alive)
+        self.assertTrue(self.fake.disabled)
+        self.assertFalse(
+            any(args[:2] == ("launchctl", "bootout") for args in new_commands)
+        )
+        self.assertFalse(
+            any(self.controller.paths.evidence_dir.glob("*-stop-*.json"))
+        )
+
+    def test_malformed_ps_live_result_cannot_bootout_or_seal_stop(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.ps_missing_returncode = 0
+        self.fake.ps_missing_stdout = "9999\n"
+        command_count = len(self.fake.commands)
+
+        with self.assertRaisesRegex(canary.CanaryError, "ambiguous live-process"):
+            self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertTrue(self.fake.loaded)
+        self.assertFalse(self.fake.alive)
+        self.assertTrue(self.fake.disabled)
+        self.assertFalse(
+            any(args[:2] == ("launchctl", "bootout") for args in new_commands)
+        )
+        self.assertFalse(
+            any(self.controller.paths.evidence_dir.glob("*-stop-*.json"))
+        )
+
+    def test_process_exists_accepts_one_native_padded_exact_pid_row(self) -> None:
+        self.fake.pid = 1
+        self.fake.alive = True
+        self.assertTrue(self.controller._process_exists(1))
+        self.fake.alive = False
+        self.assertFalse(self.controller._process_exists(1))
+
+    def test_only_exact_launchctl_missing_service_result_means_unloaded(self) -> None:
+        self.install()
+        self.fake.loaded = False
+        self.assertFalse(self.controller.is_loaded())
+        for returncode, stderr in (
+            (1, "operation not permitted\n"),
+            (113, "service not found\n"),
+            (
+                113,
+                "Bad request.\n"
+                f'Could not find service "{canary.LABEL}" in domain for user gui: 999\n',
+            ),
+        ):
+            with self.subTest(returncode=returncode, stderr=stderr):
+                self.fake.unloaded_print_returncode = returncode
+                self.fake.unloaded_print_stderr = stderr
+                with self.assertRaisesRegex(canary.CanaryError, "unexpected error"):
+                    self.controller._service_pid()
+
+    def test_stop_requires_disable_to_take_effect_before_sigterm(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.disable_takes_effect = False
+        command_count = len(self.fake.commands)
+
+        with self.assertRaisesRegex(canary.CanaryError, "before graceful stop"):
+            self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.alive)
+        self.assertFalse(self.fake.disabled)
+        self.assertFalse(any(args[:2] == ("launchctl", "kill") for args in new_commands))
+        self.assertFalse(
+            any(args[:2] == ("launchctl", "bootout") for args in new_commands)
+        )
+
+    def test_loaded_disabled_clean_no_pid_recovery_is_stable_and_signal_free(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.disabled = True
+        self.fake.alive = False
+        command_count = len(self.fake.commands)
+
+        self.controller.stop()
+
+        new_commands = self.fake.commands[command_count:]
+        self.assertFalse(self.fake.loaded)
+        self.assertFalse(any(args[:2] == ("launchctl", "kill") for args in new_commands))
+        self.assertFalse(any(args[:2] == ("launchctl", "enable") for args in new_commands))
+        self.assertFalse(any(args[:2] == ("launchctl", "kickstart") for args in new_commands))
+        self.assertIn(
+            ("launchctl", "bootout", self.controller._service_target()),
+            new_commands,
+        )
+        evidence = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in self.controller.paths.evidence_dir.glob("*-stop-*.json")
+        ]
+        self.assertEqual(1, len(evidence))
+        self.assertTrue(evidence[0]["recovered_loaded_disabled_no_pid"])
+        self.assertFalse(evidence[0]["signal_sent"])
+        self.assertEqual(
+            canary.NO_PID_STABILITY_OBSERVATIONS + 1,
+            evidence[0]["stable_no_pid_observations"],
+        )
+
+    def test_loaded_disabled_no_pid_recovery_rejects_definition_change(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.disabled = True
+        self.fake.alive = False
+        original_sleep = self.fake.sleep
+
+        def mutate_definition(seconds: float) -> None:
+            original_sleep(seconds)
+            self.fake.launch_runs += 1
+
+        command_count = len(self.fake.commands)
+        with mock.patch.object(self.fake, "sleep", side_effect=mutate_definition):
+            with self.assertRaisesRegex(canary.CanaryError, "definition changed"):
+                self.controller.stop()
+        self.assertTrue(self.fake.loaded)
+        self.assertFalse(
+            any(
+                args[:2] == ("launchctl", "bootout")
+                for args in self.fake.commands[command_count:]
+            )
+        )
+
+    def test_loaded_disabled_no_pid_recovery_rejects_matching_orphan_process(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.disabled = True
+        self.fake.alive = False
+        self.fake.orphan_processes[9999] = self.fake.expected_command
+
+        with self.assertRaisesRegex(canary.CanaryError, "matching runner/node"):
+            self.controller.stop()
+
+        self.assertTrue(self.fake.loaded)
+        self.assertFalse(
+            any(args[:2] == ("launchctl", "bootout") for args in self.fake.commands)
+        )
+
+    def test_loaded_disabled_no_pid_recovery_aborts_if_pid_appears(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.disabled = True
+        self.fake.alive = False
+        original_sleep = self.fake.sleep
+
+        def revive_process(seconds: float) -> None:
+            original_sleep(seconds)
+            self.fake.alive = True
+
+        command_count = len(self.fake.commands)
+        with mock.patch.object(self.fake, "sleep", side_effect=revive_process):
+            with self.assertRaisesRegex(canary.CanaryError, "PID appeared"):
+                self.controller.stop()
+        self.assertTrue(self.fake.loaded)
+        self.assertTrue(self.fake.alive)
+        self.assertFalse(
+            any(
+                args[:2] == ("launchctl", "bootout")
+                for args in self.fake.commands[command_count:]
+            )
+        )
+
+    def test_loaded_disabled_no_pid_recovery_rejects_nonzero_exit(self) -> None:
+        self.install()
+        self.controller.start()
+        self.fake.disabled = True
+        self.fake.alive = False
+        self.fake.launch_last_exit_code = 1
+
+        with self.assertRaisesRegex(canary.CanaryError, "clean-exit contract"):
+            self.controller.stop()
+
+        self.assertTrue(self.fake.loaded)
 
     def test_graceful_timeout_never_escalates_or_boots_out_live_process(self) -> None:
         self.install()
