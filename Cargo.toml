@@ -100,7 +100,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 anyhow = "1.0"
 
 # Benchmarking
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Property-based testing
 # Seeded here so the follow-up work has a dependency to reach for. Nothing
