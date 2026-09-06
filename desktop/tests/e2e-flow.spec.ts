@@ -46,8 +46,8 @@ test.describe("Onboarding → launch end-to-end", () => {
 
     await page.getByTestId("btn-launch").click();
 
-    // Mock flow: ensureBinary + startNode + waitForPeer + faucetClaim all
-    // resolve, then dashboard renders.
+    // Mock flow: ensureBinary + startNode + waitForPeer resolve, then the
+    // dashboard renders without submitting any balance-changing request.
     await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 15_000 });
   });
 
@@ -84,16 +84,16 @@ test.describe("Onboarding → launch end-to-end", () => {
     expect(src).not.toMatch(/setRole/);
   });
 
-  test("launch pipeline auto-claims faucet after peer count ≥ 1", () => {
+  test("launch pipeline never auto-claims the faucet", () => {
     const src = fs.readFileSync(
       path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
       "utf8",
     );
-    // Faucet claim must be gated on waitForPeer returning true - not
-    // fired unconditionally (would burn the daily limit on nodes that
-    // never joined).
+    // Onboarding is a setup transaction, not authorization for a wallet
+    // write. The explicit Wallet button remains the only faucet trigger.
     expect(src).toMatch(/waitForPeer/);
-    expect(src).toMatch(/faucetClaim/);
+    expect(src).not.toMatch(/faucetClaim/);
+    expect(src).toMatch(/request testnet credit explicitly from Wallet/);
   });
 });
 

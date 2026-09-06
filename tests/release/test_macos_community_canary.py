@@ -461,6 +461,32 @@ class MacosCommunityCanaryTests(unittest.TestCase):
         self.assertEqual("SIGTERM", signals[0][2])
         self.assertFalse(any("SIGKILL" in part for args in self.fake.commands for part in args))
 
+    def test_acceptance_receipt_binds_exact_running_worker_and_is_create_only(self) -> None:
+        self.install()
+        self.controller.start()
+        self.controller.accept()
+        path = self.controller.paths.acceptance_receipt
+        first = path.read_bytes()
+        receipt = json.loads(first)
+        config = self.controller._load_config()
+        self.assertEqual(
+            "arc.macos.pretag-community-canary.acceptance.v1",
+            receipt["schema"],
+        )
+        self.assertEqual("0x" + self.fake.public_address, receipt["worker"])
+        self.assertEqual(canary.sha256(self.controller.paths.config), receipt["config_sha256"])
+        self.assertEqual(config["pretag"]["artifact_id"], receipt["pretag"]["artifact_id"])
+        self.assertTrue(receipt["process"]["exact_executable_argv_and_listeners_proved"])
+        self.controller.accept()
+        self.assertEqual(first, path.read_bytes())
+
+        hostile = json.loads(first)
+        hostile["worker"] = "0x" + "9" * 64
+        path.write_bytes(canary.canonical_json(hostile))
+        path.chmod(0o600)
+        with self.assertRaisesRegex(canary.CanaryError, "validated canary config"):
+            self.controller.status()
+
     def test_argv_mismatch_fails_before_any_signal_or_disable(self) -> None:
         self.install()
         self.controller.start()

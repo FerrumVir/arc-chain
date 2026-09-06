@@ -50,14 +50,14 @@
               "legacy_late_fork_source_set", "legacy_late_fork_source_set_sidecar",
               "legacy_late_fork_interlock_tool",
               "offline_stop_evidence", "offline_stop_evidence_sidecar",
-              "ssh_known_hosts", "reward_probe", "checkpoint", "legacy_validator_set",
+              "ssh_known_hosts", "reward_probe", "macos_canary_acceptance", "checkpoint", "legacy_validator_set",
               "source_snapshot", "source_wal", "caddy"
             ]
           },
           "checks": {
             "properties": {
               "reward": {
-                "required": ["probe_argv", "probe_sha256", "expected_reward_base"],
+                "required": ["probe_argv", "probe_sha256", "expected_worker", "macos_canary_acceptance_sha256", "expected_reward_base"],
                 "properties": {
                   "mode": { "const": "receipt" },
                   "expect_protocol_active": { "const": true },
@@ -339,6 +339,7 @@
         "offline_stop_evidence_sidecar": { "$ref": "#/$defs/artifact" },
         "ssh_known_hosts": { "$ref": "#/$defs/artifact" },
         "reward_probe": { "$ref": "#/$defs/artifact" },
+        "macos_canary_acceptance": { "$ref": "#/$defs/artifact" },
         "checkpoint": { "$ref": "#/$defs/artifact" },
         "legacy_validator_set": { "$ref": "#/$defs/artifact" },
         "source_snapshot": { "$ref": "#/$defs/artifact" },
@@ -379,6 +380,8 @@
               "items": { "type": "string", "minLength": 1 }
             },
             "probe_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "expected_worker": { "type": "string", "pattern": "^0x[0-9a-f]{64}$" },
+            "macos_canary_acceptance_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "receipts": {
               "type": "array",
               "minItems": 2,

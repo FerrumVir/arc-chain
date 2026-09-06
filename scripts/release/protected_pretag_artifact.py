@@ -849,7 +849,8 @@ def prove_live_api(
     )
     workflow_id = _validate_workflow(workflow)
     run = client.get_json(
-        f"/repos/{REPOSITORY}/actions/runs/{run_id}", label="preflight run"
+        f"/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{run_attempt}",
+        label="preflight run",
     )
     _validate_run(
         run,
@@ -939,7 +940,8 @@ def prove_live_api_set(
     )
     workflow_id = _validate_workflow(workflow)
     run = client.get_json(
-        f"/repos/{REPOSITORY}/actions/runs/{run_id}", label="preflight run"
+        f"/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{run_attempt}",
+        label="preflight run",
     )
     _validate_run(
         run,

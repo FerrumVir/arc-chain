@@ -595,9 +595,11 @@ evidence.
   ciphertext to ARC Drive and a second independent recovery medium, then
   re-download and hash-match both copies. Do not delete the short-lived Actions
   artifact yet. Keep the passphrase environment secret in place while manually
-  dispatching `release-signing-preflight.yml`: its `backup-readiness` job fails
-  unless the 32+-character secret exists, the exact protected-main SHA has one
-  successful backup artifact, that passphrase decrypts it, and both restored
+  dispatching `release-signing-preflight.yml` with the exact successful backup
+  run ID and run attempt: its `backup-readiness` job fails unless the
+  32+-character secret exists, the selected attempt is a successful backup of
+  the exact protected-main SHA, that passphrase decrypts its one attempt-bound
+  artifact, and both restored
   keys match the committed manifest and updater trust roots. After that job is
   green, delete the short-lived backup artifact; the two independently hash-matched
   ciphertext copies remain the recovery media. The same preflight binds every
@@ -610,8 +612,9 @@ evidence.
   The seal requires exactly nine unexpired, nonempty, unique artifact IDs with
   GitHub server SHA-256 digests. Use the Linux x86_64 payload from that selection
   to stage the six validators before updater users can see v0.8. These exact
-  bytes are both rollout inputs and release assets: the tag workflow re-resolves
-  the latest successful exact-commit preflight, pins its run/attempt and all nine
+  bytes are both rollout inputs and release assets: the manual tag workflow
+  requires the operator-selected successful exact-commit preflight run ID and
+  attempt, pins that attempt and all nine
   artifact IDs, downloads raw ZIPs with digest mismatch set to error, independently
   re-hashes them against the selected server digests, safely extracts them, and
   publishes those bytes without an independent release rebuild.
@@ -622,8 +625,12 @@ evidence.
   commit/run/attempt and canonical GGUF, exposes RPC on loopback only, uses all
   six literal-IP HTTPS community origins, and stops only after exact
   PID/executable/argv proof with the full 4,420-second SIGTERM budget. Preserve
-  its registration/work/receipt evidence; a running process alone is not a
-  successful inference or reward canary.
+  its registration/work/receipt evidence; run the helper's create-only
+  `accept` command while the exact process is live, then import the resulting
+  `ACCEPTED.json` without mutating its source. The production builder accepts
+  it for at most six hours and binds its exact worker address and receipt hash
+  into both reward-probe argv and the rollout manifest. A running process alone
+  is not a successful inference or reward canary.
   Only after every job in that exact-SHA preflight succeeds may the owner create
   `v0.8.0` at that SHA. Then delete only the temporary passphrase environment
   secret. Remove the one-shot workflow through a protected PR only after the
@@ -903,7 +910,8 @@ argv/output hashes must verify before any new validator key is installed.
    artifacts with their exact sidecar-bound roots, the reviewed six-host
    known-hosts anchor and explicit
    SSH identity, preserved snapshot/WAL, checkpoint, reviewed Caddy
-   2.11.4 binary, community reward probe, and a new private `--stage-root`.
+   2.11.4 binary, community reward probe, the fresh exact macOS pre-tag
+   `--macos-canary-acceptance` receipt, and a new private `--stage-root`.
    The builder copies every semantic input once through no-follow descriptors,
    fsyncs and seals the tree read-only, and only executes, reproduces, archives,
    or deploys those staged bytes. The builder—not a hand-authored
@@ -1019,28 +1027,33 @@ argv/output hashes must verify before any new validator key is installed.
    threshold and continue advancing through restarts and final publication.
 14. In receipt mode, supply `--reward-evidence-output` before plan/preflight.
    Before submitting anything, fsync the six-node-agreed complete all-v3
-   earnings baseline for every worker the sealed coordinator could select.
-   Immediately re-prove that durable history and require the current selectable
-   worker set to be a subset of the sealed set; this same GET-only check runs
-   after a baseline-only crash resume, so a new worker or unrelated receipt
-   aborts before ordinal one.
+   earnings baseline for the exact worker from the hash-bound macOS acceptance
+   receipt. Immediately re-prove that durable history and require that exact
+   worker to remain live, eligible, and model/profile-matched; this same
+   GET-only check runs after a baseline-only crash resume, so an unavailable
+   accepted worker or unrelated receipt aborts before ordinal one.
    Submit one real one-token job, wait (with the bounded rollout poll) until all
    six report the same `mined_success` 0x25 receipt, then submit the second.
    Require distinct transaction hashes, job IDs, block heights, and block
    hashes for the same worker. Each receipt must be exactly 2.5 ARC =
    2,500,000,000 base units. Every baseline block hash, transaction index, and
-   receipt identity must remain,
-   post-canary count must equal baseline + 2, and lifetime gross must equal
-   baseline + 5 ARC with no third new row. Only the empty-baseline case ends at
-   exactly two receipts; there, all six must report null observed rate and null
+   receipt identity must remain. At or before the canonical block/index cutoff
+   defined by the second canary, count must equal baseline + 2 and gross must
+   equal baseline + 5 ARC. Later verification may see legitimate activity: it
+   accepts a larger history only when all six replicas agree on the complete
+   valid history and every extra receipt is strictly after the sealed cutoff.
+   A foreign earlier row, mutation, omission, or replica disagreement fails
+   closed. At an empty-baseline cutoff there are exactly two receipts; all six
+   must report null observed rate and null
    `projected_daily_arc`, with both reasons exactly
    `collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries`. For a nonempty
    baseline, the complete all-v3 timestamp window controls projection truth: a
    window shorter than 24 hours remains null with the canonical short-window
    reason; a valid window must expose the exact observed rate, and any numeric
    projection must equal that rate times 2.5 ARC. The tool then writes the two
-   identities and selected pre-canary baseline as a create-only, mode-0444,
-   rollout-SHA-bound v2 evidence file and checksum. It then restarts all six archive validators one
+   identities, selected pre-canary baseline, and inclusive canonical
+   block-height/hash/index cutoff as a create-only, mode-0444,
+   rollout-SHA-bound v3 evidence file and checksum. It then restarts all six archive validators one
    at a time, requires continued fleet advancement, and re-proves both receipt
    rows from every restarted process. Same-height/different-hash results are a fork,
    not two blocks, and fail closed. Frontend publication may proceed with the
@@ -1085,10 +1098,12 @@ argv/output hashes must verify before any new validator key is installed.
    and attempt before approval. Record the successful artifact's immutable
    numeric ID and `sha256:` server digest.
    Immediately re-prove immutable releases and unchanged `main`, require the
-   exact direct set `FerrumVir` plus `arisarcmarket`, reduce only
-   `arisarcmarket` to `pull`, and re-query the complete set to prove that the
-   sole non-owner is now `read` with no `write`, `maintain`, or `admin`. An
-   unexpected collaborator fails closed without mutation. Require
+   exact direct set `FerrumVir` plus write-capable `arisarcmarket`, and seal that
+   exact collaborator projection create-only. Reduce only `arisarcmarket` to
+   `pull` for the tag/release authority boundary, then re-query the complete set
+   to prove that the sole non-owner is now `read` with no `write`, `maintain`,
+   or `admin`. A first attempt that finds a reduced reviewer without the sealed
+   baseline, or any unexpected collaborator, fails closed without mutation. Require
    zero pending invitations with any of those roles. Re-query active ruleset
    21690216 as the `~ALL` creation gate with only FerrumVir's owner bypass and
    active ruleset 21667203 as the no-bypass `~ALL` update/deletion/
@@ -1115,8 +1130,11 @@ argv/output hashes must verify before any new validator key is installed.
    unique 32-asset digest-bound contract. The exact production commands and
    API checks are in the recovery README.
 18. Only after the immutable release and its independent read-only verification
-   succeed, publish the preserved recovered frontend bytes in one deterministic
-   reviewable commit and create-only branch. Prefer `arisarcmarket`'s exact-head
+   succeed, restore `arisarcmarket` to the exact sealed pre-tag `write` baseline
+   and verify the complete collaborator projection. GitHub counts a required
+   approval only from a write-capable reviewer; any missing baseline or third
+   state stops without mutation. Then publish the preserved recovered frontend
+   bytes in one deterministic reviewable commit and create-only branch. Prefer `arisarcmarket`'s exact-head
    approval. If unavailable, seal the exact main-ruleset policy, temporarily
    relax only approval count and last-push approval under an EXIT/signal restore
    trap, squash merge, and prove the policy snapshot hash was restored. The new
@@ -1124,12 +1142,48 @@ argv/output hashes must verify before any new validator key is installed.
    reviewed tree/config bytes. API-select the exact successful Pages run and
    jobs, bind its successful `github-pages` deployment, compare the CDN config,
    commit marker, and deployed SHA256SUMS, and re-fetch every advertised archive
-   provenance object field-for-field. Finally run a fresh no-service Linux
-   installer plus already-up-to-date canary and the read-only six-node
-   inference/reward verifier; seal `POST-RELEASE-ACCEPTANCE.json` before
-   unmasking package updates. Rollback by reverting only that config commit,
+   provenance object field-for-field. Dispatch the unprivileged
+   `post-release-acceptance.yml` from the immutable tag and bind its exact
+   successful run/attempt plus canonical artifact ID and `sha256:` digest. It
+   downloads by release asset ID, exercises the real published AppImage and
+   macOS/Windows desktop windows, proves fresh/update-only headless Linux, and
+   uses the digest-pinned real v0.7.7 binary offline to preserve legacy state,
+   model, and history into a fresh v0.8 data namespace. Rebuild its canonical
+   receipt and its exact 36-file recursive evidence set locally, including the
+   API-digest-bound `evidence/release/published-evidence.zip`, before running the
+   independent no-service Linux installer canary and preliminary read-only
+   six-node inference/reward verifier. Preserve all of those inputs for the
+   final v2 acceptance builder in step 19. Rollback by reverting only that config commit,
    which restores maintenance without moving v0.8.0 or rolling back or
    renumbering the canonical chain.
+19. Treat the exact protected-main invocation of
+   `scripts/release/build-postrelease-public-truth.py` as the boundary for
+   public live claims. Supply its complete preserved inputs: README, release
+   API; Pages workflow, exact-attempt run and jobs, Pages API, deployment and
+   statuses; deployed config, commit marker, and SHA256SUMS; published-
+   acceptance workflow, exact-attempt run and jobs, artifact metadata and
+   digest-bound ZIP; reward evidence; and final rollout manifest. It rebuilds
+   the published artifact with the exact sibling helper and performs one final
+   read-only live verification with the exact sibling rollout verifier. Its new
+   private mode-0700 directory contains exactly three create-only mode-0400
+   files: `POST-RELEASE-ACCEPTANCE.json` schema
+   `arc.post-release-acceptance.v2`, `README.md`, and
+   `production-status.json` schema `arc.public-production-status.v1`. The
+   status embeds the complete canonical v2 receipt and binds its hash, so the
+   workflow/run/job/artifact and recovery identities remain publicly
+   verifiable. Retain the standalone receipt as a protected audit copy and
+   publish only `README.md` and `shared/frontend/production-status.json` in a
+   second single-parent PR that changes only those two paths, passes all required
+   checks, and has `arisarcmarket` approval for the exact head; public claims
+   have no ruleset-exception merge path. Because a squash merge cannot embed
+   its own future SHA, bind the resulting main commit separately: API-select
+   the exact second `deploy-explorer.yml` run ID and run attempt, require its
+   two named successful jobs and one successful `github-pages` deployment,
+   then cache-bust and byte-compare the deployed config, production status,
+   and `deployed-commit.txt`. Require deployed `SHA256SUMS` to match all three
+   local hashes and seal `PUBLIC-TRUTH-ACCEPTANCE.json`. The fully executable
+   second-PR, exact-attempt, and CDN-byte procedure is in the recovery README;
+   package-update timers remain masked until it finishes.
 
 Each production validator accepts RPC only on its rollout-derived Unix-domain
 socket. The remote unit passes `--rpc-unix` and omits `--rpc`; the manifest's

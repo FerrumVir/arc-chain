@@ -120,7 +120,9 @@ def rpc_origins(cli_origins: list[str]) -> list[str]:
     return origins
 
 
-def eligible_coordinators(origins: list[str], timeout: float) -> list[str]:
+def eligible_coordinators(
+    origins: list[str], timeout: float, expected_worker: str
+) -> list[str]:
     eligible: list[str] = []
     diagnostics: list[str] = []
     for origin in origins:
@@ -133,17 +135,53 @@ def eligible_coordinators(origins: list[str], timeout: float) -> list[str]:
                 diagnostics.append(f"{origin}: reward issuance is not ready")
                 continue
             scoreboard = require_object(
-                request_json(origin, "/workers/scoreboard?limit=1", timeout),
+                request_json(
+                    origin,
+                    f"/workers/scoreboard?limit=1&worker_id={expected_worker}",
+                    timeout,
+                ),
                 f"{origin} worker scoreboard",
             )
-            if require_int(
+            eligible_count = require_int(
                 scoreboard.get("eligible_inference_workers"),
                 f"{origin} eligible_inference_workers",
                 0,
-            ) > 0:
+            )
+            workers = scoreboard.get("workers")
+            if not isinstance(workers, list):
+                fail(f"{origin} worker scoreboard workers must be an array")
+            coordinator_model_id = require_hash(
+                scoreboard.get("coordinator_model_id"),
+                f"{origin} coordinator_model_id",
+            )
+            matching = []
+            for index, row in enumerate(workers):
+                worker = require_object(row, f"{origin} workers[{index}]")
+                worker_id = require_hash(
+                    worker.get("worker_id"), f"{origin} workers[{index}].worker_id"
+                )
+                if worker_id != expected_worker:
+                    continue
+                capabilities = worker.get("capabilities")
+                if (
+                    not isinstance(capabilities, list)
+                    or not all(isinstance(item, str) for item in capabilities)
+                    or "inference" not in capabilities
+                    or worker.get("execution_profile") != CANONICAL_PROFILE
+                    or require_hash(
+                        worker.get("model_id"),
+                        f"{origin} workers[{index}].model_id",
+                    )
+                    != coordinator_model_id
+                ):
+                    fail(f"{origin} accepted worker is not exact-model reward eligible")
+                matching.append(worker)
+            if eligible_count > 0 and len(matching) == 1:
                 eligible.append(origin)
             else:
-                diagnostics.append(f"{origin}: no eligible full-model worker")
+                diagnostics.append(
+                    f"{origin}: accepted worker is absent, duplicated, or not eligible"
+                )
         except ProbeError as error:
             diagnostics.append(str(error))
     if not eligible:
@@ -209,7 +247,7 @@ def require_reward_transaction_state(
 
 
 def evidence_from_inference(
-    value: Any, origin: str, expected_probe_id: str
+    value: Any, origin: str, expected_probe_id: str, expected_worker: str
 ) -> dict[str, str]:
     body = require_object(value, f"{origin} inference response")
     if body.get("success") is not True:
@@ -219,6 +257,8 @@ def evidence_from_inference(
 
     worker = require_object(body.get("worker"), f"{origin} worker evidence")
     worker_id = require_hash(worker.get("worker_id"), "worker.worker_id")
+    if worker_id != expected_worker:
+        fail(f"{origin} routed recovery work to a worker other than the accepted canary")
     routed_via = body.get("routed_via")
     if routed_via != f"community:{worker.get('worker_id')}":
         fail(f"{origin} did not route through the evidenced community worker")
@@ -269,6 +309,7 @@ def evidence_from_replay(
     value: Any,
     origin: str,
     expected_probe_id: str,
+    expected_worker: str,
     timeout: float,
 ) -> dict[str, str]:
     body = require_object(value, f"{origin} recovery replay response")
@@ -298,6 +339,8 @@ def evidence_from_replay(
                 settlement_worker = require_hash(
                     settlement.get("worker"), "settlement.worker"
                 )
+                if settlement_worker != expected_worker:
+                    fail("replay settlement belongs to a worker other than the accepted canary")
                 body_worker = body.get("worker")
                 if body_worker is not None:
                     routed_worker = require_hash(
@@ -341,6 +384,11 @@ def parse_args() -> argparse.Namespace:
         help="distinct receipt in the required two-receipt rollout proof",
     )
     parser.add_argument(
+        "--expected-worker",
+        required=True,
+        help="exact 32-byte worker identity from the macOS canary acceptance receipt",
+    )
+    parser.add_argument(
         "--recovery-probe-id",
         default=None,
         help="optional exact derived identity; any mismatch is rejected",
@@ -362,6 +410,7 @@ def main() -> int:
     checkpoint = os.environ.get("ARC_RECOVERY_CHECKPOINT_MANIFEST_HASH", "")
     if not re.fullmatch(r"[0-9a-f]{64}", checkpoint):
         fail("ARC_RECOVERY_CHECKPOINT_MANIFEST_HASH is missing or invalid")
+    expected_worker = require_hash(args.expected_worker, "--expected-worker")
     probe_id = recovery_probe_id(manifest, args.probe_ordinal)
     if args.recovery_probe_id is not None:
         supplied = require_hash(args.recovery_probe_id, "--recovery-probe-id")
@@ -373,7 +422,9 @@ def main() -> int:
         fail("probe input must be 1..512 UTF-8 bytes without NUL")
 
     origin = sealed_coordinator(origins, manifest)
-    eligible_coordinators([origin], min(args.http_timeout_seconds, 30.0))
+    eligible_coordinators(
+        [origin], min(args.http_timeout_seconds, 30.0), expected_worker
+    )
     response = request_json(
         origin,
         "/inference/run",
@@ -382,13 +433,20 @@ def main() -> int:
             "input": prompt,
             "max_tokens": args.max_tokens,
             "recovery_probe_id": probe_id,
+            "expected_worker": expected_worker,
         },
     )
     body = require_object(response, f"{origin} inference response")
     evidence = (
-        evidence_from_replay(response, origin, probe_id, args.http_timeout_seconds)
+        evidence_from_replay(
+            response,
+            origin,
+            probe_id,
+            expected_worker,
+            args.http_timeout_seconds,
+        )
         if body.get("idempotent_replay") is True
-        else evidence_from_inference(response, origin, probe_id)
+        else evidence_from_inference(response, origin, probe_id, expected_worker)
     )
     sys.stdout.write(json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
     return 0

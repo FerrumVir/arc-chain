@@ -10,6 +10,8 @@ for test_file in \
     "$TEST_DIR/community_diagnostics_contract_test.sh" \
     "$TEST_DIR/recovery_archive_contract_test.sh" \
     "$TEST_DIR/production_manifest_builder_test.sh" \
+    "$TEST_DIR/postrelease_public_truth_test.sh" \
+    "$TEST_DIR/owner_emergency_recovery_test.sh" \
     "$TEST_DIR/legacy_public_height_test.sh" \
     "$TEST_DIR/drive_prefreeze_gate_test.sh" \
     "$TEST_DIR/legacy_validator_set_contract_test.sh" \
@@ -25,8 +27,10 @@ for test_file in \
     "$TEST_DIR/unsigned_desktop_handoff_test.sh" \
     "$TEST_DIR/release_manifest_handoff_test.sh" \
     "$TEST_DIR/privileged_workflow_boundary_test.sh" \
+    "$TEST_DIR/workflow_attempt_wait_test.sh" \
     "$TEST_DIR/macos_community_canary_test.sh" \
     "$TEST_DIR/release_publication_contract_test.sh" \
+    "$TEST_DIR/published_artifact_acceptance_contract_test.sh" \
     "$TEST_DIR/validator_vault_rewrap_contract_test.sh" \
     "$TEST_DIR/validator_vault_restore_contract_test.sh" \
     "$TEST_DIR/cutover_handoff_commit_test.sh" \

@@ -63,7 +63,7 @@ export function Onboarding() {
 
   const [launching, setLaunching] = useState(false);
   const [launchStage, setLaunchStage] = useState<
-    "idle" | "model" | "downloading" | "starting" | "connecting" | "claiming"
+    "idle" | "model" | "downloading" | "starting" | "connecting"
   >("idle");
   const [modelProgress, setModelProgress] =
     useState<ModelDownloadProgress | null>(null);
@@ -188,14 +188,6 @@ export function Onboarding() {
       }
       if (joinResult) {
         setConnectedVia(joinResult.via ?? null);
-      }
-      if (joinResult) {
-        setLaunchStage("claiming");
-        try {
-          await api.faucetClaim();
-        } catch {
-          /* faucet is a best-effort welcome gift; non-fatal */
-        }
       }
       setOnboarded(true);
     } catch (err) {
@@ -750,15 +742,13 @@ export function Onboarding() {
                           ? "Starting your node"
                           : launchStage === "connecting"
                             ? "Connecting to a coordinator"
-                            : launchStage === "claiming"
-                              ? "Claiming welcome tokens"
-                              : "Finishing up"}
+                            : "Finishing up"}
                 </h1>
                 <p className="onboarding-subtitle" data-testid="launch-summary">
                   {!launching &&
                     (selectedTier === "skip"
-                      ? "We'll download the node binary, start an observer/router without local model execution, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards."
-                      : "We'll fetch the selected model, download the node binary, start the process, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards.")}
+                      ? "We'll download the node binary and start an observer/router without local model execution. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards."
+                      : "We'll fetch the selected model, download the node binary, and start the process. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards.")}
                   {launching && launchStage === "model" && modelProgress && (
                     <>
                       {formatBytes(modelProgress.downloadedBytes)} of{" "}
@@ -789,9 +779,6 @@ export function Onboarding() {
                       connectedVia={connectedVia}
                     />
                   )}
-                  {launching &&
-                    launchStage === "claiming" &&
-                    "Asking the testnet faucet for your starter balance."}
                 </p>
 
                 {launching && launchStage === "model" && modelProgress && (

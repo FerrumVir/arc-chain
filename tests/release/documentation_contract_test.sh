@@ -13,6 +13,8 @@ WALKTHROUGH="$REPO_ROOT/docs/COMMUNITY-NODE-WALKTHROUGH.md"
 SCRIPTS_README="$REPO_ROOT/scripts/README.md"
 ROLLOUT="$REPO_ROOT/docs/VALIDATOR-FLEET-ROLLOUT.md"
 RECOVERY_README="$REPO_ROOT/scripts/recovery/README.md"
+OWNER_EMERGENCY_HELPER="$REPO_ROOT/scripts/recovery/owner-emergency-recovery.py"
+OWNER_EMERGENCY_SCHEMA="$REPO_ROOT/scripts/recovery/owner-emergency-recovery.schema.json"
 ARCHIVE_TOOL="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
 DRIVE_PREFREEZE_GATE="$REPO_ROOT/scripts/recovery/verify-drive-prefreeze.sh"
 DRIVE_IDENTITY_HELPER="$REPO_ROOT/scripts/recovery/drive-account-identity.py"
@@ -21,6 +23,7 @@ CANARY_RUNBOOK="$REPO_ROOT/docs/MACOS-PRETAG-COMMUNITY-CANARY.md"
 CANARY_HELPER="$REPO_ROOT/scripts/release/macos-community-canary.py"
 VAULT_HELPER="$REPO_ROOT/scripts/release/restore-validator-vault.py"
 CUTOVER_HANDOFF_HELPER="$REPO_ROOT/scripts/release/create-cutover-handoff-commit.py"
+PUBLIC_TRUTH_HELPER="$REPO_ROOT/scripts/release/build-postrelease-public-truth.py"
 PRODUCTION_RECOVERY_AUDIT="$REPO_ROOT/docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md"
 GETTING_STARTED="$REPO_ROOT/docs/GETTING_STARTED.md"
 STATUS_DOC="$REPO_ROOT/docs/STATUS.md"
@@ -842,6 +845,7 @@ PY
 
 operator_recovery_commands_are_linux_pinned_and_ordered() {
     local file literal pair count line previous audit_block handoff_help handoff_section
+    local public_truth_help public_truth_section option obsolete
 
     (
         local procedure_file rollout_file
@@ -893,8 +897,8 @@ for block_index, block in enumerate(blocks):
             embedded_python += 1
             cursor = end_cursor
         cursor += 1
-if embedded_python != 6:
-    raise SystemExit(f"expected six compiled embedded Python programs, got {embedded_python}")
+if embedded_python != 8:
+    raise SystemExit(f"expected eight compiled embedded Python programs, got {embedded_python}")
 pathlib.Path(sys.argv[2]).write_text(
     "#!/usr/bin/env bash\n" + "\n".join(blocks), encoding="utf-8"
 )
@@ -916,8 +920,8 @@ compile(signer_source, "executable-runbook-offline-signer", "exec")
 
 def undefined_before_definition(program):
     defined = {
-        "IFS", "OLDPWD", "OPTARG", "OPTIND", "PPID", "PWD", "RANDOM",
-        "SECONDS", "UID", "EUID",
+        "BASH_VERSION", "HOME", "IFS", "OLDPWD", "OPTARG", "OPTIND",
+        "PPID", "PWD", "RANDOM", "SECONDS", "UID", "EUID",
     }
     single_quoted = False
     heredoc = None
@@ -1033,8 +1037,13 @@ archive = one("scripts/recovery/archive-fleet-to-drive.sh seal \\")
 downloads = one('\ndownload_root="$(\n')
 finalize = one("scripts/recovery/build-production-manifest.py finalize")
 frontend = one("scripts/recovery/recovery_rollout.py frontend-config")
+macos_transfer = one("# BEGIN NATIVE MACOS CANARY TRANSFER")
+lima_canary_import = one(
+    "# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT"
+)
 ordered = [initial[0], restore[0], capture[0], install[0], export[0], sign[0],
-           verify[0], prearchive[0], archive[0], downloads[0], finalize[0], frontend[0]]
+           verify[0], macos_transfer[0], lima_canary_import[0], prearchive[0],
+           archive[0], downloads[0], finalize[0], frontend[0]]
 if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
     raise SystemExit("executable production bash blocks are absent or out of mandatory order")
 
@@ -1114,6 +1123,56 @@ require(
     'outgoing_checkpoint="$signing_attempt_root/candidate.signed-$((index + 1)).arcchkpt"',
     'arc_install_or_reuse_exact "$incoming_checkpoint" "$recovery_checkpoint"',
 )
+require(
+    macos_transfer[1], "# BEGIN NATIVE MACOS CANARY TRANSFER",
+    "set -Eeuo pipefail", 'test "$(/usr/bin/uname -s)" = Darwin',
+    'test "$(/usr/bin/uname -m)" = arm64', 'test "$(/usr/bin/id -u)" -ne 0',
+    "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'",
+    'case "$ARC_MACOS_PROTECTED_CHECKOUT" in /*)',
+    'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"',
+    'ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    '"$macos_canary_helper" status', '"$macos_canary_helper" accept',
+    'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
+    '"$ARC_LIMACTL" copy --backend=scp',
+)
+require_order(
+    macos_transfer[1], '"$macos_canary_helper" status',
+    '"$macos_canary_helper" accept', '"$ARC_LIMACTL" copy --backend=scp',
+)
+require(
+    lima_canary_import[1],
+    "# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT",
+    "set -Eeuo pipefail", 'test "$(/usr/bin/uname -s)" = Linux',
+    'test "$(/usr/bin/uname -m)" = x86_64', 'test "$(/usr/bin/id -u)" = 0',
+    ': "${operator_checkout:?the original Lima root shell was lost}"',
+    'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
+    'macos_canary_acceptance=/secure/operator/MACOS-CANARY-ACCEPTANCE.json',
+    "os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow",
+    "or (final_stat.st_uid, final_stat.st_gid) != (0, 0)",
+)
+if "/Users/" in lima_canary_import[1]:
+    raise SystemExit("Lima canary importer reads a macOS shared-mount path")
+
+# Every GitHub API or mutation must flow through the helper that gives exactly
+# one invocation an explicit phase-local token. Token discovery itself is the
+# sole direct gh command form, and tokens never appear in repository URLs.
+for token in (
+    "pretag_gh_token", "owner_recovery_gh_token", "release_gh_token", "frontend_gh_token",
+    "post_release_gh_token", "public_truth_gh_token",
+):
+    if f'{token}="$(' not in combined or f"unset {token}" not in combined:
+        raise SystemExit(f"GitHub phase token is not acquired and cleared: {token}")
+if combined.count('"$ARC_RECOVERY_GH_PATH" auth token --hostname github.com') != 6:
+    raise SystemExit("GitHub token discovery is not exactly one call per authority phase")
+if re.search(
+    r'(?m)^\s*(?:GH_TOKEN="[^"]+"\s+)?"\$ARC_RECOVERY_GH_PATH"\s+(api|workflow|pr)\b',
+    combined,
+):
+    raise SystemExit("GitHub API or mutation bypasses invocation-scoped arc_scoped_gh")
+if "export GH_TOKEN" in combined or 'GH_TOKEN="$GH_TOKEN"' in combined:
+    raise SystemExit("executable recovery procedure retains ambient GitHub authority")
+if re.search(r'https://[^\s]*\$(?:GH_TOKEN|[A-Za-z_]+_gh_token)', combined):
+    raise SystemExit("GitHub token is interpolated into a URL")
 require_order(
     sign[1],
     'offline_signer "$signing_binary" recovery inspect',
@@ -1347,6 +1406,61 @@ PY
         require_literal "$RECOVERY_README" "$literal" \
             'recovery README omits compact handoff helper option' || return 1
     done
+    public_truth_help="$(python3 "$PUBLIC_TRUTH_HELPER" --help)" || return 1
+    public_truth_section="$(awk '
+        /^### Publish the sealed public truth through a second reviewed PR$/ { capture=1 }
+        capture { print }
+        capture && /^### Prove the exact second Pages run and public bytes$/ { exit }
+    ' "$RECOVERY_README")"
+    for option in \
+        --readme --release-api --pages-workflow --pages-run --pages-jobs \
+        --pages-api --pages-deployments --pages-statuses --frontend-config \
+        --deployed-commit --deployed-sha256sums --published-workflow \
+        --published-run --published-jobs --published-artifact-metadata \
+        --published-artifact-zip --reward-evidence --rollout-manifest --output-dir
+    do
+        printf '%s\n' "$public_truth_help" | grep -Fq -- "$option" || {
+            printf 'public-truth helper omits final required option: %s\n' "$option"
+            return 1
+        }
+        printf '%s\n' "$public_truth_section" | grep -Fq -- "$option" || {
+            printf 'recovery README omits final public-truth option: %s\n' "$option"
+            return 1
+        }
+    done
+    for obsolete in '--acceptance ' '--installer '
+    do
+        if printf '%s\n' "$public_truth_section" | grep -Fq -- "$obsolete"; then
+            printf 'recovery README retains obsolete public-truth option: %s\n' "$obsolete"
+            return 1
+        fi
+    done
+    for literal in \
+        'published acceptance evidence contract is not exactly 36 files' \
+        'evidence/release/published-evidence.zip' \
+        '--evidence-manifest "$published_acceptance_root/EVIDENCE-MANIFEST.json"' \
+        '--evidence-root "$published_acceptance_root/evidence"' \
+        'POST-RELEASE-ACCEPTANCE.json | /usr/bin/sort' \
+        '.schema == "arc.post-release-acceptance.v2"' \
+        '--slurpfile receipt "$acceptance_receipt"' \
+        '.acceptance.receipt == $receipt[0]' \
+        '/usr/bin/jq -cS '\''.acceptance.receipt'\'' "$public_truth_status"'
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README is stale against the final public-truth evidence contract' \
+            || return 1
+    done
+    for literal in \
+        'exact 36-file' \
+        '`build-postrelease-public-truth.py`' \
+        '`arc.post-release-acceptance.v2`' \
+        '`arc.public-production-status.v1`' \
+        'status embeds the full canonical v2 receipt'
+    do
+        require_literal "$PRODUCTION_RECOVERY_AUDIT" "$literal" \
+            'production recovery audit is stale against the public-truth evidence boundary' \
+            || return 1
+    done
     for literal in \
         'arc-recovery-final.lock.json.sha256' \
         'legacy-maintenance-boundary.json' \
@@ -1354,12 +1468,12 @@ PY
         'refs/arc-recovery-handoffs/$protected_main_sha' \
         'scripts/release/create-cutover-handoff-commit.py' \
         'workflow run recovery-release-handoff.yml' \
-        'arc-recovery-release-handoff-$protected_main_sha' \
+        'arc-recovery-release-handoff-$protected_main_sha-$handoff_run_id-$handoff_run_attempt' \
         'handoff_run_id=' \
         'handoff_artifact_id="$(printf' \
         'handoff_artifact_digest="$(printf' \
         'unset GH_TOKEN' \
-        'GH_TOKEN="$GH_TOKEN" "$ARC_RECOVERY_PYTHON_PATH" -I' \
+        'GH_TOKEN="$release_gh_token" "$ARC_RECOVERY_PYTHON_PATH" -I' \
         '--push-remote origin' \
         '.local_ref_state == "created" or .local_ref_state == "reused"' \
         '.remote_ref_state == "created" or .remote_ref_state == "reused"' \
@@ -1368,7 +1482,9 @@ PY
         'repos/FerrumVir/arc-chain/collaborators/arisarcmarket' \
         '-f permission=pull' \
         'direct_collaborators_after=' \
-        '.[1].login == "arisarcmarket" and .[1].role_name == "read"' \
+        'PRETAG-COLLABORATOR-BASELINE.json' \
+        '.[1].login == "arisarcmarket" and .[1].role_name == "write"' \
+        'pretag_collaborator_reduced=' \
         'repos/FerrumVir/arc-chain/invitations?per_page=100' \
         'pending_writer_invitations' \
         'remote_release_count=' \
@@ -1381,7 +1497,7 @@ PY
         'tag_ref_push_status=0' \
         '[.[] | select(.ref == "refs/tags/v0.8.0")] as $matches' \
         'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null' \
-        'GH_TOKEN="$GH_TOKEN" GH_PROMPT_DISABLED=1' \
+        'GH_TOKEN="$release_gh_token" GH_PROMPT_DISABLED=1' \
         '-c core.hooksPath=/dev/null' \
         '-c credential.helper=' \
         'credential.https://github.com.helper=!$ARC_RECOVERY_GH_PATH auth git-credential' \
@@ -1396,12 +1512,16 @@ PY
         'absence is proven and a fresh retry is safe' \
         'mandatory post-query proved the exact tag' \
         'tag_push_run_id=' \
-        'actions/runs/$tag_push_run_id/jobs?filter=all&per_page=100' \
+        'actions/runs/$tag_push_run_id/attempts/$tag_push_run_attempt/jobs?per_page=100' \
         'Release requires workflow_dispatch with a positive cutover_handoff_artifact_id.' \
         'workflow run release.yml' \
         '-f tag=v0.8.0' \
         '-f cutover_handoff_artifact_id="$handoff_artifact_id"' \
         '-f cutover_handoff_artifact_digest="$handoff_artifact_digest"' \
+        '-f cutover_handoff_run_attempt="$handoff_run_attempt"' \
+        '-f pretag_run_id="$pretag_run_id"' \
+        '-f pretag_run_attempt="$pretag_run_attempt"' \
+        'scripts/release/wait-workflow-attempt.sh' \
         'a tag-push event' \
         'cannot carry the protected handoff artifact ID' \
         'Do not move, delete, recreate, or re-push the tag' \
@@ -1437,12 +1557,65 @@ PY
         'arc.post-release-installer-canary.v1' \
         'Already up to date at v0.8.0' \
         'scripts/recovery/recovery_rollout.py verify' \
-        'POST-RELEASE-ACCEPTANCE.json'
+        'POST-RELEASE-ACCEPTANCE.json' \
+        'scripts/release/build-postrelease-public-truth.py' \
+        "public_truth_branch='arc-recovery/public-truth-v0.8.0'" \
+        'and .reviewDecision == "APPROVED"' \
+        'PUBLIC-TRUTH-PAGES-RUN-SELECTION.json' \
+        'actions/runs/$public_truth_pages_run_id/attempts/$public_truth_pages_run_attempt' \
+        './shared/frontend/production-status.json' \
+        'PUBLIC-TRUTH-ACCEPTANCE.json'
     do
         require_literal "$RECOVERY_README" "$literal" \
             'recovery README omits an executable release or post-release receipt gate' \
             || return 1
     done
+    for literal in \
+        'only **native macOS shell** block' \
+        'Lima root shell open and untouched' \
+        '$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>' \
+        '# BEGIN NATIVE MACOS CANARY TRANSFER' \
+        "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'" \
+        'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"' \
+        '"$ARC_LIMACTL" copy --backend=scp' \
+        '# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT' \
+        ': "${operator_checkout:?the original Lima root shell was lost}"' \
+        'macos_canary_acceptance=/secure/operator/MACOS-CANARY-ACCEPTANCE.json' \
+        'os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow' \
+        'arc_scoped_gh() {' \
+        'PRETAG-COLLABORATOR-BASELINE.json' \
+        '-f permission=push' \
+        'required approving reviews only from collaborators with write access' \
+        '# ON THE SELECTED VALIDATOR ROOT SHELL' \
+        '# BACK IN THE LIMA OPERATOR ROOT SHELL' \
+        "sealed_validator_origin='<exact sealed https:// origin printed by the plan>'"
+    do
+        require_literal "$RECOVERY_README" "$literal" \
+            'recovery README omits a shell-boundary, scoped-authority, or restoration contract' \
+            || return 1
+    done
+    if grep -Fq -- 'https://<sealed-validator-origin>' "$RECOVERY_README"; then
+        printf 'diagnostic still prepends a scheme to an ambiguous origin placeholder\n'
+        return 1
+    fi
+    collaborator_baseline_line="$(first_literal_line "$RECOVERY_README" \
+        'PRETAG-COLLABORATOR-BASELINE.json')"
+    collaborator_reduce_line="$(first_literal_line "$RECOVERY_README" \
+        '-f permission=pull')"
+    release_terminal_line="$(first_literal_line "$RECOVERY_README" \
+        'release_api_live=')"
+    collaborator_restore_line="$(first_literal_line "$RECOVERY_README" \
+        '-f permission=push')"
+    if [ -z "$collaborator_baseline_line" ] \
+        || [ -z "$collaborator_reduce_line" ] \
+        || [ -z "$release_terminal_line" ] \
+        || [ -z "$collaborator_restore_line" ] \
+        || [ "$collaborator_baseline_line" -ge "$collaborator_reduce_line" ] \
+        || [ "$collaborator_reduce_line" -ge "$release_terminal_line" ] \
+        || [ "$release_terminal_line" -ge "$collaborator_restore_line" ]; then
+        printf 'reviewer baseline, reduction, immutable release proof, and exact restoration are misordered\n'
+        return 1
+    fi
     for forbidden in \
         "handoff_run_id='<" \
         "handoff_run_attempt='<" \
@@ -1465,8 +1638,10 @@ PY
         '`recovery-release-handoff.yml`' \
         '`cutover_handoff_artifact_id`' \
         '`cutover_handoff_artifact_digest`' \
-        'exact direct set `FerrumVir` plus `arisarcmarket`' \
-        '`arisarcmarket` to `pull`' \
+        'exact direct set `FerrumVir` plus write-capable `arisarcmarket`' \
+        'exact collaborator projection create-only' \
+        'Reduce only `arisarcmarket` to' \
+        '`pull` for the tag/release authority boundary' \
         'zero pending invitations' \
         '21690216' \
         '21667203' \
@@ -1487,11 +1662,24 @@ PY
         'API-select exactly one workflow/path/event/branch/SHA run' \
         'independent immutable-release verifier' \
         'unique 32-asset digest-bound contract' \
+        'restore `arisarcmarket` to the exact sealed pre-tag `write` baseline' \
+        'GitHub counts a required' \
+        'approval only from a write-capable reviewer' \
         'temporarily' \
         'approval count and last-push approval' \
         'squash merge' \
         'successful `github-pages` deployment' \
-        '`POST-RELEASE-ACCEPTANCE.json`'
+        '`POST-RELEASE-ACCEPTANCE.json`' \
+        'exact 36-file recursive evidence set' \
+        '`evidence/release/published-evidence.zip`' \
+        '`scripts/release/build-postrelease-public-truth.py`' \
+        'exactly three create-only mode-0400' \
+        '`arc.post-release-acceptance.v2`' \
+        '`arc.public-production-status.v1`' \
+        'status embeds the complete canonical v2 receipt' \
+        'second single-parent PR' \
+        'exact second `deploy-explorer.yml` run ID and run attempt' \
+        '`PUBLIC-TRUTH-ACCEPTANCE.json`'
     do
         require_literal "$ROLLOUT" "$literal" \
             'validator rollout omits an executable release or post-release receipt gate' \
@@ -1514,7 +1702,7 @@ PY
     previous=0
     for literal in \
         'unset GH_TOKEN' \
-        'GH_TOKEN="$(' \
+        'release_gh_token="$(' \
         'handoff_receipt="$(' \
         'workflow run recovery-release-handoff.yml' \
         'handoff_artifact_id="$(printf' \
@@ -1538,16 +1726,21 @@ PY
 
     post_release_acceptance_line="$(grep -nF -- 'POST-RELEASE-ACCEPTANCE.json' \
         "$RECOVERY_README" | tail -n 1 | cut -d: -f1)"
+    public_truth_acceptance_line="$(grep -nF -- 'PUBLIC-TRUTH-ACCEPTANCE.json' \
+        "$RECOVERY_README" | tail -n 1 | cut -d: -f1)"
     post_release_unmask_line="$(grep -nF -- '/usr/bin/systemctl unmask --runtime' \
         "$RECOVERY_README" | tail -n 1 | cut -d: -f1)"
     procedure_end_line="$(grep -nF -- \
         '<!-- END EXECUTABLE PRODUCTION RECOVERY PROCEDURE -->' \
         "$RECOVERY_README" | cut -d: -f1)"
-    if [ -z "$post_release_acceptance_line" ] || [ -z "$post_release_unmask_line" ] \
+    if [ -z "$post_release_acceptance_line" ] \
+        || [ -z "$public_truth_acceptance_line" ] \
+        || [ -z "$post_release_unmask_line" ] \
         || [ -z "$procedure_end_line" ] \
-        || [ "$post_release_acceptance_line" -ge "$post_release_unmask_line" ] \
+        || [ "$post_release_acceptance_line" -ge "$public_truth_acceptance_line" ] \
+        || [ "$public_truth_acceptance_line" -ge "$post_release_unmask_line" ] \
         || [ "$post_release_unmask_line" -ge "$procedure_end_line" ]; then
-        printf 'executable procedure ends before post-release acceptance and unmask gates\n'
+        printf 'executable procedure misorders post-release, public-truth, and unmask gates\n'
         return 1
     fi
 
@@ -1738,6 +1931,100 @@ recovery_plan_read_only_scope_is_truthful() {
     done
 }
 
+owner_emergency_recovery_receipt_replaces_ceremonial_approval() {
+    local required verify_line sync_line wrapper_call_line signing_line
+    for required in \
+        'The six validator identities are not six independent human operators.' \
+        '`owner_emergency_recovery`' \
+        '`owner-emergency-recovery-approval.yml`' \
+        '`arc.recovery.owner-emergency-recovery.v2`' \
+        'locally is not authorization.' \
+        'root-owned mode-0700 attempt directory' \
+        'input file becomes root-owned mode 0400.' \
+        'H=137145/H+1=137146' \
+        'epoch/set 1/1' \
+        'does not claim six-human' \
+        'owner_recovery_gh_token="$(' \
+        'arc_scoped_gh "$owner_recovery_gh_token" workflow run' \
+        '-f expected_main_sha="$protected_main_sha"' \
+        '-f checkpoint_manifest_hash="$checkpoint_manifest_hash"' \
+        '-f validator_public_keys_sha256="$validator_public_keys_sha256"' \
+        '-f nyc_public_key="$owner_recovery_nyc_public_key"' \
+        '-f sgp_public_key="$owner_recovery_sgp_public_key"' \
+        '-f confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY $protected_main_sha"' \
+        'GH_TOKEN="$owner_recovery_gh_token" scripts/release/wait-workflow-attempt.sh' \
+        'actions/runs/$owner_recovery_run_id/attempts/$owner_recovery_run_attempt/jobs?per_page=100' \
+        'arc-owner-emergency-recovery-$protected_main_sha-$owner_recovery_run_id-attempt-$owner_recovery_run_attempt' \
+        'actions/artifacts/$owner_recovery_artifact_id/zip' \
+        "root:root:400:1" \
+        'unset owner_recovery_gh_token' \
+        '"$owner_recovery_helper" verify-github-artifact' \
+        '--workflow-json "$owner_recovery_workflow_json"' \
+        '--run-json "$owner_recovery_run_json"' \
+        '--jobs-json "$owner_recovery_jobs_json"' \
+        '--artifact-json "$owner_recovery_artifact_json"' \
+        '--artifact-zip "$owner_recovery_artifact_zip"' \
+        '--run-id "$owner_recovery_run_id"' \
+        '--run-attempt "$owner_recovery_run_attempt"' \
+        '--artifact-id "$owner_recovery_artifact_id"' \
+        '--artifact-digest "$owner_recovery_artifact_digest"' \
+        '--source-main-sha "$protected_main_sha"' \
+        '--checkpoint-manifest-hash "$checkpoint_manifest_hash"' \
+        '--validator-public-keys "$validator_public_keys"' \
+        '--validator-public-keys-sha256 "$validator_public_keys_sha256"' \
+        '--output "$owner_recovery_receipt"' \
+        '--max-age-seconds 900' \
+        'verify_owner_recovery_authorization() {' \
+        '/usr/bin/sync -f "$owner_recovery_output"' \
+        '/usr/bin/sync -f "$owner_recovery_attempt_root"'
+    do
+        require_literal "$RECOVERY_README" "$required" \
+            'recovery signing guide omits the durable owner emergency receipt contract' \
+            || return 1
+    done
+    for required in \
+        'Checkpoint signing has a separate, durable authorization boundary.' \
+        '`owner-emergency-recovery-approval.yml`' \
+        '`owner-emergency-recovery.py verify-github-artifact`' \
+        '`arc.recovery.owner-emergency-recovery.v2`' \
+        'actor and triggering actor are both the pinned owner' \
+        'exact-attempt jobs' \
+        'text is not authorization.' \
+        'GitHub-authenticated `owner_emergency_recovery` decision' \
+        'H=137145/H+1=137146' \
+        'does not claim six-human approval'
+    do
+        require_literal "$PRODUCTION_RECOVERY_AUDIT" "$required" \
+            'production recovery audit omits the owner emergency receipt boundary' \
+            || return 1
+    done
+    verify_line="$(first_literal_line "$RECOVERY_README" \
+        '"$owner_recovery_helper" verify-github-artifact')"
+    sync_line="$(first_literal_line "$RECOVERY_README" \
+        '/usr/bin/sync -f "$owner_recovery_attempt_root"')"
+    wrapper_call_line="$(grep -nFx -- 'verify_owner_recovery_authorization' \
+        "$RECOVERY_README" | cut -d: -f1)"
+    signing_line="$(first_literal_line "$RECOVERY_README" 'for index in "${!signing_keys[@]}"; do')"
+    if [ -z "$verify_line" ] || [ -z "$sync_line" ] \
+        || [ -z "$wrapper_call_line" ] || [ -z "$signing_line" ] \
+        || [ "$verify_line" -ge "$sync_line" ] \
+        || [ "$sync_line" -ge "$wrapper_call_line" ] \
+        || [ $((wrapper_call_line + 1)) -ne "$signing_line" ]; then
+        printf 'GitHub owner verification wrapper is not immediately before the signing loop\n'
+        return 1
+    fi
+    if grep -Eq -- \
+        'checkpoint_approval_phrase=|After all six operators compare it out of band|IFS= read -r checkpoint_approval|"\$owner_recovery_helper" (draft|seal|verify) ' \
+        "$RECOVERY_README"; then
+        printf 'local or ceremonial checkpoint approval remains in the recovery guide\n'
+        return 1
+    fi
+    test -f "$OWNER_EMERGENCY_HELPER" && test -f "$OWNER_EMERGENCY_SCHEMA" || {
+        printf 'documented owner emergency helper or schema is missing\n'
+        return 1
+    }
+}
+
 run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.0' candidate_version_is_consistent
 run_test 'candidate install commands pin exact v0.8.0 without claiming publication' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
@@ -1753,5 +2040,6 @@ run_test 'hardened canary and vault runbooks match their current command parsers
 run_test 'recovery archive commands pin tools, external intent, and exact rollout journals' recovery_archive_commands_are_exact_and_resumable
 run_test 'operator recovery commands are Ubuntu-pinned, create-only, and ordered' operator_recovery_commands_are_linux_pinned_and_ordered
 run_test 'recovery plan documents a scoped persistent-state read-only boundary' recovery_plan_read_only_scope_is_truthful
+run_test 'checkpoint signing uses a durable owner emergency authorization receipt' owner_emergency_recovery_receipt_replaces_ceremonial_approval
 
 finish_tests

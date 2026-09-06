@@ -835,6 +835,36 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
         validate_secret_workflows(self.texts)
         validate_publish_authority(self.texts["release"])
 
+    def test_privileged_artifact_selection_pins_exact_workflow_attempts(self) -> None:
+        preflight = self.texts["preflight"]
+        release = self.texts["release"]
+        for literal in (
+            "signing_backup_run_id:",
+            "signing_backup_run_attempt:",
+            'actions/runs/$backup_run_id/attempts/$backup_run_attempt',
+            "arc-signing-backup-$main_sha-$backup_run_id-$backup_run_attempt-",
+        ):
+            self.assertIn(literal, preflight)
+        self.assertNotIn("backup_run_id=\"$(gh run list", preflight)
+        for literal in (
+            "pretag_run_id:",
+            "pretag_run_attempt:",
+            'actions/runs/$PREFLIGHT_RUN_ID/attempts/$PREFLIGHT_RUN_ATTEMPT',
+            'actions/runs/$SELECTED_PREFLIGHT_RUN_ID/attempts/$SELECTED_PREFLIGHT_RUN_ATTEMPT',
+        ):
+            self.assertIn(literal, release)
+        self.assertNotIn("current_preflight_id=", release)
+        self.assertNotIn('PREFLIGHT_RUN_ID="$(gh run list', release)
+        verifier = (
+            REPO_ROOT / "scripts/release/verify-pretag-run-and-artifacts.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT', verifier
+        )
+        self.assertNotIn(
+            'gh api "repos/$REPOSITORY/actions/runs/$RUN_ID"', verifier
+        )
+
     def test_backup_manifest_public_key_canonicalizer(self) -> None:
         text = self.texts["preflight"]
         self.assertIn(

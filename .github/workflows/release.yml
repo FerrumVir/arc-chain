@@ -23,6 +23,18 @@ on:
         description: "Exact server digest for that protected handoff (sha256: followed by 64 lowercase hex characters)"
         required: true
         type: string
+      cutover_handoff_run_attempt:
+        description: Exact successful recovery-release-handoff attempt that created the selected artifact
+        required: true
+        type: string
+      pretag_run_id:
+        description: Exact successful release-signing-preflight workflow run ID for the tagged protected-main SHA
+        required: true
+        type: string
+      pretag_run_attempt:
+        description: Exact successful release-signing-preflight workflow attempt containing the selected artifacts
+        required: true
+        type: string
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -56,6 +68,7 @@ jobs:
       cutover_artifact_name: ${{ steps.release.outputs.cutover_artifact_name }}
       cutover_artifact_size: ${{ steps.release.outputs.cutover_artifact_size }}
       cutover_run_id: ${{ steps.release.outputs.cutover_run_id }}
+      cutover_run_attempt: ${{ steps.release.outputs.cutover_run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,6 +84,9 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
           REQUESTED_CUTOVER_ARTIFACT_ID: ${{ inputs.cutover_handoff_artifact_id }}
           REQUESTED_CUTOVER_ARTIFACT_DIGEST: ${{ inputs.cutover_handoff_artifact_digest }}
+          REQUESTED_CUTOVER_RUN_ATTEMPT: ${{ inputs.cutover_handoff_run_attempt }}
+          REQUESTED_PREFLIGHT_RUN_ID: ${{ inputs.pretag_run_id }}
+          REQUESTED_PREFLIGHT_RUN_ATTEMPT: ${{ inputs.pretag_run_attempt }}
         run: |
           set -Eeuo pipefail
           TAG="$REQUESTED_TAG"
@@ -109,32 +125,47 @@ jobs:
             echo "::error::Release requires the exact sha256 cutover_handoff_artifact_digest."
             exit 1
           fi
+          if [[ ! "$REQUESTED_CUTOVER_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Release requires the exact positive cutover_handoff_run_attempt."
+            exit 1
+          fi
           CUTOVER_ARTIFACT_JSON="$RUNNER_TEMP/cutover-handoff-artifact.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$REQUESTED_CUTOVER_ARTIFACT_ID" \
             > "$CUTOVER_ARTIFACT_JSON"
-          CUTOVER_ARTIFACT_NAME="arc-recovery-release-handoff-$TAG_COMMIT"
           jq -e \
             --argjson artifact_id "$REQUESTED_CUTOVER_ARTIFACT_ID" \
-            --arg name "$CUTOVER_ARTIFACT_NAME" \
             --arg digest "$REQUESTED_CUTOVER_ARTIFACT_DIGEST" \
-            '.id == $artifact_id and .name == $name and .digest == $digest
+            '.id == $artifact_id and .digest == $digest
              and .expired == false
              and (.size_in_bytes | type == "number" and . > 0 and . <= 33554432)
              and (.workflow_run.id | type == "number" and . > 0)' \
             "$CUTOVER_ARTIFACT_JSON" >/dev/null || {
-              echo "::error::Cutover handoff artifact ID/name/digest/size/liveness differs."
+              echo "::error::Cutover handoff artifact ID/digest/size/liveness differs."
               exit 1
             }
           CUTOVER_RUN_ID="$(jq -er '.workflow_run.id' "$CUTOVER_ARTIFACT_JSON")"
+          CUTOVER_RUN_ATTEMPT="$REQUESTED_CUTOVER_RUN_ATTEMPT"
           CUTOVER_ARTIFACT_SIZE="$(jq -er '.size_in_bytes' "$CUTOVER_ARTIFACT_JSON")"
+          CUTOVER_ARTIFACT_NAME="arc-recovery-release-handoff-$TAG_COMMIT-$CUTOVER_RUN_ID-$CUTOVER_RUN_ATTEMPT"
+          jq -e \
+            --argjson artifact_id "$REQUESTED_CUTOVER_ARTIFACT_ID" \
+            --arg name "$CUTOVER_ARTIFACT_NAME" \
+            --arg digest "$REQUESTED_CUTOVER_ARTIFACT_DIGEST" \
+            '.id == $artifact_id and .name == $name and .digest == $digest' \
+            "$CUTOVER_ARTIFACT_JSON" >/dev/null || {
+              echo "::error::Cutover handoff artifact is not bound to the selected run attempt."
+              exit 1
+            }
           CUTOVER_RUN_JSON="$RUNNER_TEMP/cutover-handoff-run.json"
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CUTOVER_RUN_ID" \
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CUTOVER_RUN_ID/attempts/$CUTOVER_RUN_ATTEMPT" \
             > "$CUTOVER_RUN_JSON"
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg sha "$TAG_COMMIT" \
             --argjson run_id "$CUTOVER_RUN_ID" \
+            --argjson run_attempt "$CUTOVER_RUN_ATTEMPT" \
             '.id == $run_id and .head_repository.full_name == $repository
+             and .run_attempt == $run_attempt
              and .head_branch == "main" and .head_sha == $sha
              and .path == ".github/workflows/recovery-release-handoff.yml"
              and .event == "workflow_dispatch" and .status == "completed"
@@ -144,29 +175,28 @@ jobs:
               exit 1
             }
 
-          PREFLIGHT_RUN_ID="$(gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow release-signing-preflight.yml \
-            --commit "$TAG_COMMIT" \
-            --event workflow_dispatch \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')"
-          if [ -z "$PREFLIGHT_RUN_ID" ]; then
-            echo "::error::No protected signing preflight exists for exact main commit $TAG_COMMIT."
+          [[ "$REQUESTED_PREFLIGHT_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::Release requires an explicit positive pretag_run_id."
             exit 1
-          fi
+          }
+          [[ "$REQUESTED_PREFLIGHT_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::Release requires an explicit positive pretag_run_attempt."
+            exit 1
+          }
+          PREFLIGHT_RUN_ID="$REQUESTED_PREFLIGHT_RUN_ID"
+          PREFLIGHT_RUN_ATTEMPT="$REQUESTED_PREFLIGHT_RUN_ATTEMPT"
           PREFLIGHT_WORKFLOW_ID="$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/workflows/release-signing-preflight.yml" \
             --jq '.id')"
           PREFLIGHT_RUN_JSON="$RUNNER_TEMP/preflight-run.json"
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREFLIGHT_RUN_ID" \
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREFLIGHT_RUN_ID/attempts/$PREFLIGHT_RUN_ATTEMPT" \
             > "$PREFLIGHT_RUN_JSON"
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg sha "$TAG_COMMIT" \
             --argjson workflow_id "$PREFLIGHT_WORKFLOW_ID" \
             --argjson run_id "$PREFLIGHT_RUN_ID" \
+            --argjson run_attempt "$PREFLIGHT_RUN_ATTEMPT" \
             '.id == $run_id
               and .workflow_id == $workflow_id
               and .head_repository.full_name == $repository
@@ -175,12 +205,11 @@ jobs:
               and .event == "workflow_dispatch"
               and .status == "completed"
               and .conclusion == "success"
-              and (.run_attempt | type == "number" and . > 0)' \
+              and .run_attempt == $run_attempt' \
             "$PREFLIGHT_RUN_JSON" >/dev/null || {
-              echo "::error::The latest exact-commit preflight run is not a completed successful main-branch run of the protected workflow."
+              echo "::error::The selected exact-commit preflight run/attempt is not a completed successful main-branch run of the protected workflow."
               exit 1
             }
-          PREFLIGHT_RUN_ATTEMPT="$(jq -r '.run_attempt' "$PREFLIGHT_RUN_JSON")"
           PREFLIGHT_ARTIFACTS_JSON="$RUNNER_TEMP/preflight-artifacts.json"
           gh api --paginate \
             "repos/$GITHUB_REPOSITORY/actions/runs/$PREFLIGHT_RUN_ID/artifacts?per_page=100" \
@@ -244,6 +273,7 @@ jobs:
             echo "cutover_artifact_name=$CUTOVER_ARTIFACT_NAME"
             echo "cutover_artifact_size=$CUTOVER_ARTIFACT_SIZE"
             echo "cutover_run_id=$CUTOVER_RUN_ID"
+            echo "cutover_run_attempt=$CUTOVER_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
 
   # A tag is independently releasable only if its validated commit passes
@@ -1329,17 +1359,8 @@ jobs:
             exit 1
           fi
 
-          current_preflight_id="$(/usr/bin/gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow release-signing-preflight.yml \
-            --commit "$EXPECTED_SHA" --event workflow_dispatch --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')"
-          [ "$current_preflight_id" = "$SELECTED_PREFLIGHT_RUN_ID" ] || {
-            echo "::error::The selected signing preflight was superseded."
-            exit 1
-          }
           preflight_json="$RUNNER_TEMP/current-preflight-run.json"
-          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID" \
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID/attempts/$SELECTED_PREFLIGHT_RUN_ATTEMPT" \
             > "$preflight_json"
           /usr/bin/jq -e --arg sha "$EXPECTED_SHA" \
             --argjson attempt "$SELECTED_PREFLIGHT_RUN_ATTEMPT" \
@@ -1667,14 +1688,8 @@ jobs:
           [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
 
-          current_preflight_id="$(/usr/bin/gh run list \
-            --repo "$GITHUB_REPOSITORY" \
-            --workflow release-signing-preflight.yml \
-            --commit "$EXPECTED_SHA" --event workflow_dispatch --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')"
-          [ "$current_preflight_id" = "$SELECTED_PREFLIGHT_RUN_ID" ]
           preflight_json="$RUNNER_TEMP/current-preflight-run.json"
-          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID" \
+          /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID/attempts/$SELECTED_PREFLIGHT_RUN_ATTEMPT" \
             > "$preflight_json"
           /usr/bin/jq -e --arg sha "$EXPECTED_SHA" \
             --argjson attempt "$SELECTED_PREFLIGHT_RUN_ATTEMPT" \

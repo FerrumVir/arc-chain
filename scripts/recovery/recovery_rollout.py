@@ -875,6 +875,128 @@ def validate_protected_pretag_window_set(
     return groups
 
 
+def verify_macos_canary_acceptance(
+    manifest: Mapping[str, Any], stage_payloads: Mapping[str, bytes]
+) -> dict[str, Any]:
+    """Bind the reward gate to the one live-tested pre-tag macOS worker."""
+
+    payload = stage_payloads.get("macos_canary_acceptance")
+    if payload is None:
+        fail("production stage omitted the macOS canary acceptance receipt")
+    try:
+        value = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"macOS canary acceptance receipt is invalid JSON: {error}")
+    if not isinstance(value, dict) or payload != canonical_bytes(value):
+        fail("macOS canary acceptance receipt is not canonical JSON")
+    receipt = require_keys(
+        value,
+        "macOS canary acceptance receipt",
+        (
+            "schema", "accepted", "accepted_at_unix_ns", "canary_schema",
+            "label", "platform", "rust_target", "config_sha256", "worker",
+            "pretag", "runtime", "artifacts", "process",
+        ),
+    )
+    if (
+        receipt["schema"] != "arc.macos.pretag-community-canary.acceptance.v1"
+        or receipt["accepted"] is not True
+        or receipt["canary_schema"] != "arc.macos.pretag-community-canary.v1"
+        or receipt["label"] != "network.arc.pretag-community-canary"
+        or receipt["platform"] != "macos-arm64"
+        or receipt["rust_target"] != "aarch64-apple-darwin"
+    ):
+        fail("macOS canary acceptance receipt identity is unsupported")
+    required_int(
+        receipt["accepted_at_unix_ns"],
+        "macOS canary acceptance accepted_at_unix_ns",
+        minimum=1,
+    )
+    bare_hash(receipt["config_sha256"], "macOS canary acceptance config_sha256")
+    worker = "0x" + bare_hash(receipt["worker"], "macOS canary acceptance worker")
+
+    provenance = manifest["provenance"]
+    mac_group = provenance["protected_pretag_artifact"]["groups"][2]
+    if (mac_group.get("kind"), mac_group.get("platform")) != (
+        "headless",
+        "macos-arm64",
+    ):
+        fail("protected pre-tag window has no ordered macOS arm64 headless proof")
+    proof = mac_group["initial"]
+    live = proof["live"]
+    artifact = proof["artifact"]
+    pretag = require_keys(
+        receipt["pretag"],
+        "macOS canary acceptance pretag",
+        (
+            "repository", "commit", "run_id", "run_attempt", "artifact_id",
+            "artifact_digest", "archive_sha256", "metadata_sha256",
+        ),
+    )
+    expected_pretag = {
+        "repository": "FerrumVir/arc-chain",
+        "commit": provenance["source_main_commit"],
+        "run_id": provenance["pretag_workflow_run_id"],
+        "run_attempt": provenance["pretag_workflow_run_attempt"],
+        "artifact_id": live["artifact_id"],
+        "artifact_digest": live["artifact_digest"],
+        "archive_sha256": artifact["archive_sha256"],
+        "metadata_sha256": artifact["build_metadata_sha256"],
+    }
+    if pretag != expected_pretag:
+        fail("macOS canary acceptance differs from protected pre-tag provenance")
+    runtime = require_keys(
+        receipt["runtime"],
+        "macOS canary acceptance runtime",
+        (
+            "stake", "community_mode", "full_integer_worker", "rpc_loopback_only",
+            "p2p_peers", "p2p_port", "community_rpc_urls", "argv_sha256",
+        ),
+    )
+    if (
+        runtime["stake"] != 0
+        or runtime["community_mode"] is not True
+        or runtime["full_integer_worker"] is not True
+        or runtime["rpc_loopback_only"] is not True
+        or runtime["p2p_peers"] != []
+        or runtime["p2p_port"] != 0
+        or runtime["community_rpc_urls"]
+        != [f"https://{host}" for _name, host in PRODUCTION_FLEET]
+    ):
+        fail("macOS canary acceptance runtime is not the dedicated stake-zero worker")
+    bare_hash(runtime["argv_sha256"], "macOS canary acceptance argv_sha256")
+    artifacts = require_keys(
+        receipt["artifacts"],
+        "macOS canary acceptance artifacts",
+        ("node_sha256", "model_sha256", "genesis_sha256"),
+    )
+    if artifacts != {
+        "node_sha256": artifact["files"]["arc-node-macos-arm64"],
+        "model_sha256": CANONICAL_MODEL_SHA256,
+        "genesis_sha256": artifact["files"]["genesis.toml"],
+    }:
+        fail("macOS canary acceptance artifact hashes differ")
+    process = require_keys(
+        receipt["process"],
+        "macOS canary acceptance process",
+        ("pid", "exact_executable_argv_and_listeners_proved"),
+    )
+    required_int(process["pid"], "macOS canary acceptance process.pid", minimum=1)
+    if process["exact_executable_argv_and_listeners_proved"] is not True:
+        fail("macOS canary acceptance lacks exact executable/argv/listener proof")
+    reward = manifest["checks"]["reward"]
+    if worker != "0x" + bare_hash(
+        reward.get("expected_worker"), "manifest reward expected worker"
+    ):
+        fail("macOS canary acceptance worker differs from the reward probe worker")
+    if sha256_bytes(payload) != bare_hash(
+        reward.get("macos_canary_acceptance_sha256"),
+        "manifest reward macOS acceptance sha256",
+    ):
+        fail("macOS canary acceptance bytes differ from the reward binding")
+    return receipt
+
+
 def parse_listen(value: Any, field: str) -> tuple[str, int]:
     raw = required_string(value, field)
     if raw.count(":") != 1:
@@ -1314,6 +1436,7 @@ def validate_manifest(
                 "offline_stop_evidence_sidecar",
                 "ssh_known_hosts",
                 "reward_probe",
+                "macos_canary_acceptance",
                 "source_snapshot",
                 "source_wal",
                 "caddy",
@@ -1393,7 +1516,10 @@ def validate_manifest(
         checks["reward"],
         "manifest.checks.reward",
         ("mode", "expect_protocol_active", "expect_issuance_ready"),
-        ("probe_argv", "probe_sha256", "receipts", "expected_reward_base"),
+        (
+            "probe_argv", "probe_sha256", "receipts", "expected_reward_base",
+            "expected_worker", "macos_canary_acceptance_sha256",
+        ),
     )
     if reward["mode"] not in {"policy", "receipt"}:
         fail("manifest.checks.reward.mode must be policy or receipt")
@@ -1434,12 +1560,14 @@ def validate_manifest(
                 f"{COMMUNITY_REWARD_BASE} base units (2.5 ARC)"
             )
     else:
-        forbidden = set(reward) & {"probe_argv", "probe_sha256", "receipts", "expected_reward_base"}
+        forbidden = set(reward) & {
+            "probe_argv", "probe_sha256", "receipts", "expected_reward_base",
+            "expected_worker", "macos_canary_acceptance_sha256",
+        }
         if forbidden:
             fail(f"policy reward mode cannot contain: {', '.join(sorted(forbidden))}")
     if mode == "production":
         expected_probe = artifacts["reward_probe"]
-        expected_probe_argv = [expected_probe["path"], "--max-tokens", "1"]
         if reward["mode"] != "receipt":
             fail(
                 "production requires receipt reward mode with the sealed real-inference probe"
@@ -1448,6 +1576,23 @@ def validate_manifest(
             fail(
                 "production requires the sealed real-inference probe, not fixed reward receipts"
             )
+        expected_worker = "0x" + bare_hash(
+            reward.get("expected_worker"),
+            "manifest.checks.reward.expected_worker",
+        )
+        acceptance_sha = bare_hash(
+            reward.get("macos_canary_acceptance_sha256"),
+            "manifest.checks.reward.macos_canary_acceptance_sha256",
+        )
+        if acceptance_sha != artifacts["macos_canary_acceptance"]["sha256"]:
+            fail("production reward worker binding differs from the staged macOS acceptance")
+        expected_probe_argv = [
+            expected_probe["path"],
+            "--max-tokens",
+            "1",
+            "--expected-worker",
+            expected_worker,
+        ]
         if reward["probe_argv"] != expected_probe_argv:
             fail(
                 "production reward probe argv must exactly bind the staged probe and one-token canary"
@@ -1685,6 +1830,7 @@ def verify_artifacts(manifest: Mapping[str, Any]) -> None:
         stage_rows, stage_payloads = verify_production_input_stage(manifest)
         verify_legacy_maintenance_stage_payloads(manifest, stage_rows, stage_payloads)
         verify_protected_pretag_stage_payloads(manifest, stage_payloads)
+        verify_macos_canary_acceptance(manifest, stage_payloads)
 
 
 def verify_production_input_stage(
@@ -1834,6 +1980,7 @@ def verify_production_input_stage(
         "pretag_artifact_input_set", "pretag_initial_live_provenance_set",
         "build_metadata", "validator_vault_restore_receipt",
         "validator_key_install_receipt", "ssh_identity", "validator_public_keys",
+        "macos_canary_acceptance",
     }
     for raw in rows:
         row = require_keys(
@@ -4787,6 +4934,58 @@ class RewardProgressState:
 class RewardEvidenceBundle:
     earnings_baseline: RewardEarningsBaseline
     receipts: tuple[ReceiptEvidence, ...]
+    canonical_cutoff: "CanonicalRewardCutoff"
+
+
+@dataclass(frozen=True, order=True)
+class CanonicalRewardCutoff:
+    """Inclusive canonical transaction position covered by rollout acceptance."""
+
+    block_height: int
+    index: int
+    block_hash: str
+
+    @classmethod
+    def from_value(cls, value: Any) -> "CanonicalRewardCutoff":
+        body = require_keys(
+            value,
+            "reward evidence canonical cutoff",
+            ("block_height", "block_hash", "index"),
+        )
+        cutoff = cls(
+            required_int(body["block_height"], "reward cutoff.block_height", minimum=1),
+            required_int(body["index"], "reward cutoff.index"),
+            "0x" + bare_hash(body["block_hash"], "reward cutoff.block_hash"),
+        )
+        if cutoff.to_value() != body:
+            fail("reward evidence canonical cutoff is not normalized")
+        return cutoff
+
+    @classmethod
+    def from_receipt_blocks(
+        cls, receipt_blocks: Sequence[tuple[int, str, int]]
+    ) -> "CanonicalRewardCutoff":
+        locations = [
+            cls(
+                required_int(height, "reward receipt cutoff height", minimum=1),
+                required_int(index, "reward receipt cutoff index"),
+                "0x" + bare_hash(block_hash, "reward receipt cutoff block hash"),
+            )
+            for height, block_hash, index in receipt_blocks
+        ]
+        if not locations:
+            fail("cannot derive a reward cutoff without mined receipt blocks")
+        return max(locations, key=lambda item: (item.block_height, item.index))
+
+    def contains(self, receipt: CanonicalEarningsReceipt) -> bool:
+        return (receipt.block_height, receipt.index) <= (self.block_height, self.index)
+
+    def to_value(self) -> dict[str, Any]:
+        return {
+            "block_height": self.block_height,
+            "block_hash": self.block_hash,
+            "index": self.index,
+        }
 
 
 def reward_progress_payload(
@@ -4892,11 +5091,14 @@ def parse_reward_evidence_payload(
         body = require_keys(
             json.loads(payload.decode("utf-8")),
             "reward evidence file",
-            ("schema", "rollout_sha256", "earnings_baseline", "receipts"),
+            (
+                "schema", "rollout_sha256", "earnings_baseline", "receipts",
+                "canonical_cutoff",
+            ),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"cannot read reward evidence: {error}")
-    if body["schema"] != "arc.recovery.reward-evidence.v2":
+    if body["schema"] != "arc.recovery.reward-evidence.v3":
         fail("reward evidence file schema is unsupported")
     if body["rollout_sha256"] != expected_rollout_sha256:
         fail("reward evidence file is bound to a different rollout")
@@ -4906,11 +5108,12 @@ def parse_reward_evidence_payload(
     evidence = [ReceiptEvidence.from_value(row) for row in rows]
     validate_distinct_receipt_evidence(evidence)
     baseline = RewardEarningsBaseline.from_value(body["earnings_baseline"])
+    cutoff = CanonicalRewardCutoff.from_value(body["canonical_cutoff"])
     if baseline.worker != evidence[0].worker:
         fail("reward evidence baseline belongs to a different worker")
     expected = canonical_bytes(
         {
-            "schema": "arc.recovery.reward-evidence.v2",
+            "schema": "arc.recovery.reward-evidence.v3",
             "rollout_sha256": expected_rollout_sha256,
             "earnings_baseline": baseline.to_value(),
             "receipts": [
@@ -4921,11 +5124,12 @@ def parse_reward_evidence_payload(
                 }
                 for item in evidence
             ],
+            "canonical_cutoff": cutoff.to_value(),
         }
     )
     if payload != expected:
         fail("reward evidence file is not canonical")
-    return RewardEvidenceBundle(baseline, tuple(evidence))
+    return RewardEvidenceBundle(baseline, tuple(evidence), cutoff)
 
 
 class RecoveryRollout:
@@ -4959,6 +5163,7 @@ class RecoveryRollout:
         self.final_reward_evidence_sha256: str | None = None
         self.reward_earnings_baselines: dict[str, RewardEarningsBaseline] = {}
         self.reward_earnings_baseline: RewardEarningsBaseline | None = None
+        self.reward_evidence_cutoff: CanonicalRewardCutoff | None = None
         self.rollback_journal = rollback_journal
         self.rollback_journal_reserved = False
         self.rollback_journal_state = "unreserved"
@@ -5277,6 +5482,7 @@ class RecoveryRollout:
         self.reward_earnings_baselines = {
             bundle.earnings_baseline.worker: bundle.earnings_baseline
         }
+        self.reward_evidence_cutoff = bundle.canonical_cutoff
         self.final_reward_evidence_sha256 = digest
         return digest
 
@@ -7831,12 +8037,24 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             body = json.loads(result.stdout)
         except json.JSONDecodeError as error:
             fail(f"reward probe did not emit one JSON evidence object: {error}")
-        return ReceiptEvidence.from_value(body)
+        evidence = ReceiptEvidence.from_value(body)
+        expected_worker = reward.get("expected_worker")
+        if expected_worker is not None and evidence.worker != "0x" + bare_hash(
+            expected_worker, "manifest reward expected worker"
+        ):
+            fail("reward probe returned a worker other than the accepted macOS canary")
+        return evidence
 
     def _reward_baseline_candidate_workers(self) -> list[str]:
         reward = self.checks["reward"]
         if "probe_argv" not in reward:
             return [ReceiptEvidence.from_value(reward["receipts"][0]).worker]
+
+        expected_worker = reward.get("expected_worker")
+        if expected_worker is not None:
+            expected_worker = "0x" + bare_hash(
+                expected_worker, "manifest reward expected worker"
+            )
 
         coordinator_digest = hashlib.sha256(
             RECOVERY_PROBE_COORDINATOR_DOMAIN + bytes.fromhex(self.digest)
@@ -7844,7 +8062,12 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         coordinator = self.validators[
             int.from_bytes(coordinator_digest[:8], "big") % len(self.validators)
         ]
-        scoreboard = self._http_json(coordinator, "/workers/scoreboard?limit=500")
+        scoreboard_path = (
+            f"/workers/scoreboard?limit=1&worker_id={expected_worker}"
+            if expected_worker is not None
+            else "/workers/scoreboard?limit=500"
+        )
+        scoreboard = self._http_json(coordinator, scoreboard_path)
         if not isinstance(scoreboard, dict):
             fail(f"{coordinator['name']} worker scoreboard is not an object")
         eligible = required_int(
@@ -7895,13 +8118,20 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                             f"{coordinator_name} scoreboard worker_id",
                         )
                     )
-        if len(candidates) < eligible:
+        if expected_worker is None and len(candidates) < eligible:
             fail(
                 f"{coordinator['name']} scoreboard hides an eligible inference worker; "
                 "cannot seal every possible pre-canary earnings baseline"
             )
         if not candidates:
             fail(f"{coordinator['name']} has no pre-canary reward worker candidate")
+        if expected_worker is not None:
+            if expected_worker not in candidates:
+                fail(
+                    f"{coordinator['name']} does not expose the accepted macOS canary "
+                    "as an eligible exact-model worker"
+                )
+            return [expected_worker]
         return sorted(candidates)
 
     def capture_reward_earnings_baselines(self) -> None:
@@ -8252,11 +8482,19 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         ):
             fail("the two reward receipts must be mined in two distinct blocks")
         baseline = self._select_reward_earnings_baseline(evidence)
+        observed_cutoff = CanonicalRewardCutoff.from_receipt_blocks(receipt_blocks)
+        if self.reward_evidence_cutoff is None:
+            self.reward_evidence_cutoff = observed_cutoff
+        elif self.reward_evidence_cutoff != observed_cutoff:
+            fail("mined rollout receipts differ from the sealed canonical reward cutoff")
+        cutoff = self.reward_evidence_cutoff
         expected_base = self.checks["reward"]["expected_reward_base"]
-        expected_count = baseline.confirmed_receipt_count + 2
-        expected_gross_base = baseline.confirmed_gross_earnings_base + 2 * expected_base
+        expected_cutoff_count = baseline.confirmed_receipt_count + 2
+        expected_cutoff_gross_base = (
+            baseline.confirmed_gross_earnings_base + 2 * expected_base
+        )
         expected_reward_arc = expected_base / 1_000_000_000
-        expected_gross_arc = expected_gross_base / 1_000_000_000
+        expected_cutoff_gross_arc = expected_cutoff_gross_base / 1_000_000_000
         agreed_post_history: RewardEarningsBaseline | None = None
         for node in self.validators:
             earnings = self._http_json(node, f"/worker/earnings/{evidence[0].worker}")
@@ -8270,16 +8508,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                 agreed_post_history = current
             elif current != agreed_post_history:
                 fail("validators disagree on the canonical post-canary all-v3 earnings history")
-            if current.confirmed_receipt_count != expected_count:
-                fail(
-                    f"{node['name']} earnings must retain the baseline plus exactly two new rollout canaries"
-                )
-            if current.confirmed_gross_earnings_base != expected_gross_base:
-                fail(
-                    f"{node['name']} earnings gross must equal the preserved baseline plus exactly 5 ARC"
-                )
-            if expected_gross_arc != current.confirmed_gross_earnings_base / 1_000_000_000:
-                fail(f"{node['name']} earnings ARC gross does not equal the exact base-unit total")
             current_rows = set(current.confirmed_receipts)
             baseline_rows = set(baseline.confirmed_receipts)
             if not baseline_rows.issubset(current_rows):
@@ -8308,8 +8536,25 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                 canary_rows.append(row)
             if baseline_rows & set(canary_rows):
                 fail(f"{node['name']} rollout canary was already present in the pre-canary baseline")
-            if current_rows != baseline_rows | set(canary_rows):
-                fail(f"{node['name']} earnings contains a non-baseline, non-canary receipt")
+            expected_cutoff_rows = baseline_rows | set(canary_rows)
+            actual_cutoff_rows = {row for row in current_rows if cutoff.contains(row)}
+            if actual_cutoff_rows != expected_cutoff_rows:
+                fail(
+                    f"{node['name']} earnings contains a foreign, missing, or mutated "
+                    "receipt at or before the sealed reward cutoff"
+                )
+            if len(actual_cutoff_rows) != expected_cutoff_count:
+                fail(f"{node['name']} reward cutoff does not contain baseline plus two canaries")
+            cutoff_gross_base = sum(row.reward_base for row in actual_cutoff_rows)
+            if cutoff_gross_base != expected_cutoff_gross_base:
+                fail(
+                    f"{node['name']} reward cutoff gross does not equal baseline plus exactly 5 ARC"
+                )
+            if expected_cutoff_gross_arc != cutoff_gross_base / 1_000_000_000:
+                fail(f"{node['name']} reward cutoff ARC gross differs from exact base units")
+            extra_rows = current_rows - actual_cutoff_rows
+            if any(cutoff.contains(row) for row in extra_rows):
+                fail(f"{node['name']} reward superset includes an extra receipt before the cutoff")
 
             if not isinstance(earnings, dict):
                 fail(f"{node['name']} worker earnings is not an object")
@@ -8317,7 +8562,8 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             rate_reason = earnings.get("attestations_per_day_unavailable_reason")
             projection = earnings.get("projected_daily_arc")
             projection_reason = earnings.get("projected_daily_unavailable_reason")
-            if expected_count < 3:
+            current_count = current.confirmed_receipt_count
+            if current_count < 3:
                 if rate is not None or projection is not None:
                     fail(f"{node['name']} invents a rate or projection from fewer than three receipts")
                 if rate_reason != PROJECTION_COLLECTING_REASON:
@@ -8345,7 +8591,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     or rate_reason is not None
                 ):
                     fail(f"{node['name']} does not expose the receipt-derived observed rate")
-                exact_rate = (expected_count - 1) * 86_400_000 / (
+                exact_rate = (current_count - 1) * 86_400_000 / (
                     last_timestamp - first_timestamp
                 )
                 if not math.isclose(float(rate), exact_rate, rel_tol=1e-12, abs_tol=1e-12):
@@ -8376,8 +8622,9 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             elif not isinstance(projection_reason, str) or not projection_reason.strip():
                 fail(f"{node['name']} null projected_daily_arc lacks an unavailable reason")
         self.say(
-            "PASS all six validators retained the exact all-v3 earnings baseline plus two "
-            "distinct 2.5 ARC receipts; gross increased by exactly 5 ARC and projection state is truthful"
+            "PASS all six validators retained the exact baseline plus two 2.5 ARC receipts "
+            "through the sealed canonical cutoff; any agreed superset is strictly later and "
+            "projection state is truthful"
         )
 
     def prove_two_reward_receipts(self) -> list[ReceiptEvidence]:
@@ -8441,9 +8688,11 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         if self.reward_evidence_output is None:
             fail("receipt-mode execution requires --reward-evidence-output")
         baseline = self._select_reward_earnings_baseline(evidence)
+        if self.reward_evidence_cutoff is None:
+            fail("reward evidence cannot be finalized before the canonical cutoff is proved")
         payload = canonical_bytes(
             {
-                "schema": "arc.recovery.reward-evidence.v2",
+                "schema": "arc.recovery.reward-evidence.v3",
                 "rollout_sha256": self.digest,
                 "earnings_baseline": baseline.to_value(),
                 "receipts": [
@@ -8454,6 +8703,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                     }
                     for item in evidence
                 ],
+                "canonical_cutoff": self.reward_evidence_cutoff.to_value(),
             }
         )
         digest = sha256_bytes(payload)
@@ -8885,6 +9135,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             self.reward_earnings_baselines = {
                 bundle.earnings_baseline.worker: bundle.earnings_baseline
             }
+            self.reward_evidence_cutoff = bundle.canonical_cutoff
             expected_payload, digest, expected_sidecar = (
                 self._reward_evidence_payload(evidence)
             )
@@ -14052,6 +14303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     evidence_bundle.earnings_baseline.worker:
                     evidence_bundle.earnings_baseline
                 }
+                rollout.reward_evidence_cutoff = evidence_bundle.canonical_cutoff
             evidence = (
                 list(evidence_bundle.receipts)
                 if evidence_bundle is not None
@@ -14105,6 +14357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     evidence_bundle.earnings_baseline.worker:
                     evidence_bundle.earnings_baseline
                 }
+                rollout.reward_evidence_cutoff = evidence_bundle.canonical_cutoff
             evidence = (
                 list(evidence_bundle.receipts)
                 if evidence_bundle is not None

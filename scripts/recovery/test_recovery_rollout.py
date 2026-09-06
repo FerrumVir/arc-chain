@@ -57,6 +57,7 @@ class ManifestFixture:
                 "offline_stop_evidence_sidecar",
                 "ssh_known_hosts",
                 "reward_probe",
+                "macos_canary_acceptance",
                 "source_snapshot",
                 "source_wal",
                 "caddy",
@@ -326,6 +327,67 @@ class ManifestFixture:
                 "schema": "arc.protected-pretag-artifact-window-set.v1",
                 "groups": groups,
             }
+            mac_proof = groups[2]["initial"]
+            mac_acceptance = {
+                "schema": "arc.macos.pretag-community-canary.acceptance.v1",
+                "accepted": True,
+                "accepted_at_unix_ns": 1_800_000_001_000_000_000,
+                "canary_schema": "arc.macos.pretag-community-canary.v1",
+                "label": "network.arc.pretag-community-canary",
+                "platform": "macos-arm64",
+                "rust_target": "aarch64-apple-darwin",
+                "config_sha256": "4" * 64,
+                "worker": "0x" + "c" * 64,
+                "pretag": {
+                    "repository": "FerrumVir/arc-chain",
+                    "commit": "9" * 40,
+                    "run_id": 123,
+                    "run_attempt": 1,
+                    "artifact_id": mac_proof["live"]["artifact_id"],
+                    "artifact_digest": mac_proof["live"]["artifact_digest"],
+                    "archive_sha256": mac_proof["artifact"]["archive_sha256"],
+                    "metadata_sha256": mac_proof["artifact"]["build_metadata_sha256"],
+                },
+                "runtime": {
+                    "stake": 0,
+                    "community_mode": True,
+                    "full_integer_worker": True,
+                    "rpc_loopback_only": True,
+                    "p2p_peers": [],
+                    "p2p_port": 0,
+                    "community_rpc_urls": [
+                        f"https://{host}" for _name, host in rollout.PRODUCTION_FLEET
+                    ],
+                    "argv_sha256": "5" * 64,
+                },
+                "artifacts": {
+                    "node_sha256": mac_proof["artifact"]["files"][
+                        "arc-node-macos-arm64"
+                    ],
+                    "model_sha256": rollout.CANONICAL_MODEL_SHA256,
+                    "genesis_sha256": mac_proof["artifact"]["files"]["genesis.toml"],
+                },
+                "process": {
+                    "pid": 4242,
+                    "exact_executable_argv_and_listeners_proved": True,
+                },
+            }
+            acceptance_path = Path(artifacts["macos_canary_acceptance"]["path"])
+            acceptance_path.write_bytes(rollout.canonical_bytes(mac_acceptance))
+            acceptance_path.chmod(0o600)
+            artifacts["macos_canary_acceptance"]["sha256"] = digest(acceptance_path)
+            reward["expected_worker"] = mac_acceptance["worker"]
+            reward["macos_canary_acceptance_sha256"] = artifacts[
+                "macos_canary_acceptance"
+            ]["sha256"]
+            if "probe_argv" in reward:
+                reward["probe_argv"] = [
+                    artifacts["reward_probe"]["path"],
+                    "--max-tokens",
+                    "1",
+                    "--expected-worker",
+                    mac_acceptance["worker"],
+                ]
             validator_key_receipt_chain = {
                 "schema": "arc.recovery.validator-key-receipt-chain.v1",
                 "source_main_commit": "9" * 40,
@@ -610,6 +672,14 @@ class RecoveryRolloutTests(unittest.TestCase):
         )
         harness.persist_reward_earnings_baselines([baseline])
         return baseline
+
+    @staticmethod
+    def seal_reward_cutoff(harness):
+        cutoff = rollout.CanonicalRewardCutoff.from_receipt_blocks(
+            [(120, "f" * 64, 0), (121, "9" * 64, 0)]
+        )
+        harness.reward_evidence_cutoff = cutoff
+        return cutoff
 
     @staticmethod
     def prime_interlock_interpreters(harness):
@@ -2463,11 +2533,21 @@ class RecoveryRolloutTests(unittest.TestCase):
             rollout.validate_manifest(fixed_receipts)
 
         multi_token = copy.deepcopy(valid)
-        multi_token["checks"]["reward"]["probe_argv"][-1] = "2"
+        multi_token["checks"]["reward"]["probe_argv"][2] = "2"
         with self.assertRaisesRegex(
             rollout.RolloutError, "exactly bind the staged probe and one-token canary"
         ):
             rollout.validate_manifest(multi_token)
+
+        foreign_acceptance = copy.deepcopy(valid)
+        foreign_acceptance["checks"]["reward"][
+            "macos_canary_acceptance_sha256"
+        ] = "f" * 64
+        with self.assertRaisesRegex(
+            rollout.RolloutError,
+            "worker binding differs from the staged macOS acceptance",
+        ):
+            rollout.validate_manifest(foreign_acceptance)
 
         foreign_probe = copy.deepcopy(valid)
         foreign_probe["checks"]["reward"]["probe_sha256"] = "f" * 64
@@ -5698,6 +5778,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.persist_reward_baseline(harness, evidence[0].worker)
         harness.persist_reward_evidence_progress(evidence[:1])
         harness.persist_reward_evidence_progress(evidence)
+        self.seal_reward_cutoff(harness)
         reward_sha256 = harness.persist_reward_evidence(evidence)
         gate_payload = rollout.canonical_bytes(
             {
@@ -6767,8 +6848,32 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         extra_row = self.reward_receipt_row(extra, (122, "0" * 63 + "3", 0))
         extra_history = self.reward_earnings(evidence[0].worker, [*rows, extra_row])
         harness._http_json = mock.Mock(return_value=extra_history)
-        with self.assertRaisesRegex(rollout.RolloutError, "exactly two new"):
+        harness.prove_reward_projection(evidence, blocks)
+        self.assertEqual(harness._http_json.call_count, 6)
+
+        foreign_before_cutoff = self.reward_receipt_row(
+            extra,
+            (119, "0" * 63 + "4", 0),
+        )
+        earlier_history = self.reward_earnings(
+            evidence[0].worker,
+            [historical_row, foreign_before_cutoff, *rows[1:]],
+        )
+        harness._http_json = mock.Mock(return_value=earlier_history)
+        with self.assertRaisesRegex(
+            rollout.RolloutError,
+            "foreign, missing, or mutated receipt at or before",
+        ):
             harness.prove_reward_projection(evidence, blocks)
+
+        with self.assertRaisesRegex(
+            rollout.RolloutError,
+            "differ from the sealed canonical reward cutoff",
+        ):
+            harness.prove_reward_projection(
+                evidence,
+                [(120, "f" * 64, 0), (123, "9" * 64, 0)],
+            )
 
     def test_pre_canary_baseline_requires_six_node_agreement_and_survives_resume(self) -> None:
         value = self.fixture(reward_receipt=True)
@@ -7279,12 +7384,14 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         baseline = self.persist_reward_baseline(harness, evidence[0].worker)
         harness.persist_reward_evidence_progress(evidence[:1])
         harness.persist_reward_evidence_progress(evidence)
+        cutoff = self.seal_reward_cutoff(harness)
         evidence_digest = harness.persist_reward_evidence(evidence)
         self.assertEqual(evidence_digest, digest(output))
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
         parsed = rollout.parse_evidence_file(output, "d" * 64)
         self.assertEqual(list(parsed.receipts), evidence)
         self.assertEqual(parsed.earnings_baseline, baseline)
+        self.assertEqual(parsed.canonical_cutoff, cutoff)
         with self.assertRaisesRegex(rollout.RolloutError, "different rollout"):
             rollout.parse_evidence_file(output, "e" * 64)
         self.assertEqual(harness.persist_reward_evidence(evidence), evidence_digest)
@@ -7313,6 +7420,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.persist_reward_baseline(resumed, evidence[0].worker)
         resumed.persist_reward_evidence_progress(evidence[:1])
         resumed.persist_reward_evidence_progress(evidence)
+        self.seal_reward_cutoff(resumed)
         resumed.persist_reward_evidence(evidence)
         self.assertEqual(
             list(rollout.parse_evidence_file(resumed_output, "d" * 64).receipts),
@@ -7336,6 +7444,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.persist_reward_baseline(first, evidence[0].worker)
         first.persist_reward_evidence_progress(evidence[:1])
         first.persist_reward_evidence_progress(evidence)
+        self.seal_reward_cutoff(first)
         assert first.reward_evidence_reservation is not None
         output_fd, sidecar_fd = first.reward_evidence_reservation
         sidecar = output.with_name(output.name + ".sha256")
@@ -7390,6 +7499,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.persist_reward_baseline(first, evidence[0].worker)
         first.persist_reward_evidence_progress(evidence[:1])
         first.persist_reward_evidence_progress(evidence)
+        self.seal_reward_cutoff(first)
         first.persist_reward_evidence(evidence)
         sidecar = output.with_name(output.name + ".sha256")
         # Model a crash after exact final bytes reached both files but before

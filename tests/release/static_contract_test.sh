@@ -43,9 +43,17 @@ RELEASE_DELETE_HELPER="$REPO_ROOT/scripts/release/delete-release-by-id.sh"
 VALIDATOR_VAULT_RESTORE="$REPO_ROOT/scripts/release/restore-validator-vault.py"
 PRODUCTION_MANIFEST_BUILDER="$REPO_ROOT/scripts/recovery/build-production-manifest.py"
 PRODUCTION_MANIFEST_TEST="$TEST_DIR/production_manifest_builder_test.sh"
+POSTRELEASE_PUBLIC_TRUTH="$REPO_ROOT/scripts/release/build-postrelease-public-truth.py"
+POSTRELEASE_PUBLIC_TRUTH_TEST="$TEST_DIR/postrelease_public_truth_test.sh"
+PUBLIC_PRODUCTION_STATUS="$REPO_ROOT/shared/frontend/production-status.json"
+ROOT_README="$REPO_ROOT/README.md"
 RECOVERY_RUNBOOK="$REPO_ROOT/scripts/recovery/README.md"
 RECOVERY_ROLLOUT="$REPO_ROOT/scripts/recovery/recovery_rollout.py"
 RECOVERY_ARCHIVE="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
+OWNER_EMERGENCY_HELPER="$REPO_ROOT/scripts/recovery/owner-emergency-recovery.py"
+OWNER_EMERGENCY_SCHEMA="$REPO_ROOT/scripts/recovery/owner-emergency-recovery.schema.json"
+OWNER_EMERGENCY_TEST="$REPO_ROOT/scripts/recovery/test_owner_emergency_recovery.py"
+OWNER_EMERGENCY_WORKFLOW="$REPO_ROOT/.github/workflows/owner-emergency-recovery-approval.yml"
 RELEASE_TEST_RUNNER="$TEST_DIR/run.sh"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
@@ -1725,11 +1733,12 @@ publish_is_pinned_to_one_validated_commit_and_create_only() {
         'echo "sha=$TAG_COMMIT"' \
         'git fetch --no-tags --force origin main:refs/remotes/origin/main' \
         'if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then' \
-        '--workflow release-signing-preflight.yml' \
-        '--commit "$TAG_COMMIT"' \
+        'REQUESTED_PREFLIGHT_RUN_ID: ${{ inputs.pretag_run_id }}' \
+        'REQUESTED_PREFLIGHT_RUN_ATTEMPT: ${{ inputs.pretag_run_attempt }}' \
+        'actions/runs/$PREFLIGHT_RUN_ID/attempts/$PREFLIGHT_RUN_ATTEMPT' \
         '.status == "completed"' \
         '.conclusion == "success"' \
-        'PREFLIGHT_RUN_ATTEMPT="$(jq -r' \
+        'PREFLIGHT_RUN_ATTEMPT="$REQUESTED_PREFLIGHT_RUN_ATTEMPT"' \
         'python3 scripts/release/select-pretag-artifacts.py' \
         '--github-output "$GITHUB_OUTPUT"'
     do
@@ -1958,6 +1967,85 @@ relevant_shell_is_syntax_valid() {
         "$TEST_DIR"/*.sh "$TEST_DIR"/helpers/*.sh; do
         bash -n "$file" || return 1
     done
+}
+
+postrelease_public_truth_is_hermetic_exact_and_release_gated() {
+    local required
+    [ -x "$POSTRELEASE_PUBLIC_TRUTH" ] || {
+        printf 'post-release public-truth builder is missing or not executable\n'
+        return 1
+    }
+    [ -x "$POSTRELEASE_PUBLIC_TRUTH_TEST" ] || {
+        printf 'post-release public-truth test wrapper is missing or not executable\n'
+        return 1
+    }
+    grep -Fq 'postrelease_public_truth_test.sh' "$RELEASE_TEST_RUNNER" || {
+        printf 'post-release public-truth tests are not wired into the release runner\n'
+        return 1
+    }
+    python3 -m py_compile "$POSTRELEASE_PUBLIC_TRUTH" \
+        "$TEST_DIR/test_postrelease_public_truth.py" || return 1
+    for required in \
+        'REWARD_SCHEMA = "arc.recovery.reward-evidence.v3"' \
+        '"arc-node-linux-arm64"' \
+        '"arc-cli-linux-arm64"' \
+        'PROTOCOL_VERSION_RE.fullmatch(checkpoint["protocolVersion"])' \
+        'len(sources) != 12' \
+        'frontend source identities and endpoints must be unique' \
+        'legacy forks do not share one sealed capture' \
+        'REWARD_PER_RECEIPT_BASE = 2_500_000_000' \
+        '"canonical_cutoff"' \
+        'object_pairs_hook=reject_duplicate_keys' \
+        'parse_constant=reject_nonfinite_number' \
+        'os.O_NOFOLLOW' \
+        'os.O_EXCL' \
+        'output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)'
+    do
+        grep -Fq -- "$required" "$POSTRELEASE_PUBLIC_TRUTH" || {
+            printf 'post-release public-truth builder omits: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Fq -- 'arc-node-linux-aarch64' "$POSTRELEASE_PUBLIC_TRUTH" \
+        || grep -Fq -- 'arc-cli-linux-aarch64' "$POSTRELEASE_PUBLIC_TRUTH"; then
+        printf 'post-release public-truth builder uses noncanonical Linux ARM asset names\n'
+        return 1
+    fi
+    python3 - "$ROOT_README" "$PUBLIC_PRODUCTION_STATUS" <<'PY' || return 1
+import json
+import pathlib
+import sys
+
+readme = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+begin = "<!-- ARC_PUBLIC_TRUTH_BEGIN -->"
+end = "<!-- ARC_PUBLIC_TRUTH_END -->"
+if readme.count(begin) != 1 or readme.count(end) != 1 or readme.index(begin) >= readme.index(end):
+    raise SystemExit("README public-truth markers are not one ordered pair")
+
+def unique_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+status = json.loads(
+    pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"),
+    object_pairs_hook=unique_pairs,
+)
+if status.get("schema") != "arc.public-production-status.v1":
+    raise SystemExit("public production status has the wrong schema")
+if status.get("state") == "maintenance":
+    if set(status) != {"schema", "state", "notice"} or not isinstance(status["notice"], str) or not status["notice"].strip():
+        raise SystemExit("maintenance public status is not the exact fail-closed shape")
+elif status.get("state") == "recovered":
+    required = {"acceptance", "checkpoint", "fleet", "network", "pages", "release", "rewards", "schema", "services", "state"}
+    if set(status) != required:
+        raise SystemExit("recovered public status does not have the exact generated shape")
+else:
+    raise SystemExit("public production status state is unsupported")
+PY
 }
 
 production_manifest_builder_is_release_gated() {
@@ -2732,6 +2820,105 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
     }
 }
 
+owner_emergency_recovery_authorization_is_durable_and_exact() {
+    local required
+    for required in \
+        'RECEIPT_SCHEMA = "arc.recovery.owner-emergency-recovery.v2"' \
+        'REPOSITORY = "FerrumVir/arc-chain"' \
+        'WORKFLOW_PATH = ".github/workflows/owner-emergency-recovery-approval.yml"' \
+        'AUTHORIZATION_KIND = "owner_emergency_recovery"' \
+        'authenticated by an exact GitHub' \
+        'REASON_CODE = "legacy_fleet_divergence_history_preserving_v080_cutover"' \
+        'SOURCE_HEIGHT = 137_145' \
+        'TRANSITION_HEIGHT = 137_146' \
+        'RECOVERY_EPOCH = 1' \
+        'VALIDATOR_SET_ID = 1' \
+        'SIGNATURES_REQUIRED = 5' \
+        'AUTHORIZED_SIGNER_ORDER' \
+        'UNUSED_RECOVERY_MEMBER' \
+        'approval run actor' \
+        'approval run triggering actor' \
+        'approval exact-attempt jobs do not contain exactly one authorization job' \
+        'approval artifact API identity differs from the exact run attempt' \
+        'downloaded approval artifact differs from the GitHub server digest' \
+        'approval artifact must contain only' \
+        'fail(f"create-only {label} already exists")' \
+        'owner emergency-recovery receipt is stale' \
+        'exact_modes={0o400}' \
+        'SAFE_PATH_COMPONENT_RE' \
+        'os.O_EXCL' \
+        'os.O_NOFOLLOW'
+    do
+        grep -Fq -- "$required" "$OWNER_EMERGENCY_HELPER" || {
+            printf 'owner emergency-recovery helper omits: %s\n' "$required"
+            return 1
+        }
+    done
+    for required in \
+        '"const": "arc.recovery.owner-emergency-recovery.v2"' \
+        '"const": ".github/workflows/owner-emergency-recovery-approval.yml"' \
+        '"const": "workflow_dispatch"' \
+        '"const": "owner_emergency_recovery"' \
+        '"const": "legacy_fleet_divergence_history_preserving_v080_cutover"' \
+        '"const": 137145' \
+        '"const": 137146' \
+        '"const": 5' \
+        '"const": 40000000' \
+        '"const": "FerrumVir"' \
+        '"const": 111036403'
+    do
+        grep -Fq -- "$required" "$OWNER_EMERGENCY_SCHEMA" || {
+            printf 'owner emergency-recovery schema omits: %s\n' "$required"
+            return 1
+        }
+    done
+    for required in \
+        'ACTOR_LOGIN: ${{ github.actor }}' \
+        'ACTOR_ID: ${{ github.actor_id }}' \
+        'TRIGGERING_ACTOR_LOGIN: ${{ github.triggering_actor }}' \
+        '[ "$ACTOR_LOGIN" = FerrumVir ]' \
+        '[ "$ACTOR_ID" = 111036403 ]' \
+        '[ "$TRIGGERING_ACTOR_LOGIN" = FerrumVir ]' \
+        'actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT' \
+        '.actor.login == "FerrumVir" and .actor.id == 111036403' \
+        '.triggering_actor.login == "FerrumVir"' \
+        'overwrite: false' \
+        'retention-days: 90'
+    do
+        grep -Fq -- "$required" "$OWNER_EMERGENCY_WORKFLOW" || {
+            printf 'owner-authentication workflow omits: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Fq 'secrets.' "$OWNER_EMERGENCY_WORKFLOW" \
+        || grep -Eq '^[[:space:]]+(contents|actions|packages|deployments|id-token): write' \
+            "$OWNER_EMERGENCY_WORKFLOW"; then
+        printf 'owner-authentication workflow acquired a secret or mutation authority\n'
+        return 1
+    fi
+    python3 -m py_compile "$OWNER_EMERGENCY_HELPER" "$OWNER_EMERGENCY_TEST" || return 1
+    python3 - "$OWNER_EMERGENCY_SCHEMA" <<'PY' || return 1
+import json, pathlib, sys
+schema = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if schema.get("type") != "object" or schema.get("additionalProperties") is not False:
+    raise SystemExit("owner emergency-recovery receipt schema is not closed")
+PY
+    grep -Fq -- 'owner_emergency_recovery_test.sh' "$RELEASE_TEST_RUNNER" || {
+        printf 'release harness does not run the owner emergency-recovery contract\n'
+        return 1
+    }
+    grep -Fq -- 'test_cli_verifies_exact_owner_attempt_and_materializes_create_only_pair' \
+        "$OWNER_EMERGENCY_TEST" || {
+        printf 'owner emergency-recovery behavioral test is missing\n'
+        return 1
+    }
+    if grep -Fq -- 'checkpoint_approval_phrase=' "$RECOVERY_RUNBOOK" \
+        || grep -Fq -- 'After all six operators compare it out of band' "$RECOVERY_RUNBOOK"; then
+        printf 'recovery signing still relies on the ceremonial six-operator phrase\n'
+        return 1
+    fi
+}
+
 run_test 'required headless assets are built and gate the sole publisher' required_assets_are_built_and_gated
 run_test 'locked Rust and JavaScript Tauri packages are release-compatible' desktop_tauri_packages_are_release_compatible
 run_test 'desktop packages the exact canonical release seed list' packaged_desktop_network_resources_match_release
@@ -2765,9 +2952,11 @@ run_test 'Windows desktop shutdown is private, authenticated, and uses the full 
 run_test 'signing-key backups are encrypted, create-only, and restore-tested' signing_key_backup_is_encrypted_create_only_and_restore_tested
 run_test 'validator-vault restore/install is profile-bound, offline-proof gated, and create-only' validator_vault_restore_and_install_are_fail_closed
 run_test 'production manifest builder is hermetic, sealed, documented, and release-gated' production_manifest_builder_is_release_gated
+run_test 'post-release public truth is hermetic, exact-evidence bound, and release-gated' postrelease_public_truth_is_hermetic_exact_and_release_gated
 run_test 'production recovery plan streams probes without persistent remote helpers' recovery_plan_remote_transport_is_read_only
 run_test 'archive transport credentials and temp roots are invocation-scoped' archive_transport_configuration_is_invocation_scoped
 run_test 'macOS pre-tag community canary is exact, private, SIGTERM-only, and preservation-safe' macos_pretag_community_canary_is_exact_private_and_fail_closed
+run_test 'owner emergency recovery is canonical, create-only, fresh, and exact-input bound' owner_emergency_recovery_authorization_is_durable_and_exact
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 
 finish_tests

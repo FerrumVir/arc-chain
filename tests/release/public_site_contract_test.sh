@@ -142,7 +142,8 @@ site_builder_is_reproducible_and_complete() (
     for path in \
         index.html tailwind.css app.css app.js .nojekyll deployed-commit.txt SHA256SUMS \
         explorer/index.html explorer/app.js explorer/styles.css \
-        shared/frontend/arc-network.js shared/frontend/arc-network.json
+        shared/frontend/arc-network.js shared/frontend/arc-network.json \
+        shared/frontend/production-status.json
     do
         [ -e "$output/$path" ] || {
             printf 'assembled public site is missing %s\n' "$path"
@@ -165,8 +166,30 @@ site_builder_is_reproducible_and_complete() (
     ! grep -Fq '../explorer/' "$output/index.html" || return 1
     grep -Fq './explorer/#/tx/' "$output/app.js" || return 1
     ! grep -Fq '../explorer/' "$output/app.js" || return 1
+    grep -Fq '[ -f "$required" ] && [ ! -L "$required" ] && [ -s "$required" ]' \
+        "$BUILDER" || {
+        printf 'public-site builder does not reject symlinked source inputs\n'
+        return 1
+    }
+    cmp -s "$REPO_ROOT/shared/frontend/production-status.json" \
+        "$output/shared/frontend/production-status.json" || {
+        printf 'assembled public site changed the public production-status bytes\n'
+        return 1
+    }
     [ "$(cat "$output/deployed-commit.txt")" = contract-test ] || return 1
     (cd "$output" && shasum -a 256 -c SHA256SUMS) >/dev/null || return 1
+    [ "$(awk '$2 == "./shared/frontend/production-status.json" {print $1}' \
+        "$output/SHA256SUMS")" = \
+      "$(shasum -a 256 "$REPO_ROOT/shared/frontend/production-status.json" \
+        | awk '{print $1}')" ] || {
+        printf 'public-site checksum manifest does not bind production-status.json\n'
+        return 1
+    }
+    [ "$(awk '$2 == "./shared/frontend/production-status.json" {count++} END {print count+0}' \
+        "$output/SHA256SUMS")" -eq 1 ] || {
+        printf 'public-site checksum manifest does not contain one production-status row\n'
+        return 1
+    }
     first_hash="$(shasum -a 256 "$output/SHA256SUMS")"
 
     (

@@ -1,0 +1,1420 @@
+name: Published artifact acceptance
+
+# This workflow has no publication, deployment, environment, OIDC, or package
+# authority.  It is dispatched only after the exact v0.8.0 release attempt and
+# recovered validator rollout have succeeded.  Every job reuses a sealed API
+# binding and downloads public assets by immutable GitHub release asset ID.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact immutable release tag; production acceptance is pinned to v0.8.0
+        required: true
+        type: string
+      release_source_sha:
+        description: Exact 40-character protected-main commit targeted by v0.8.0
+        required: true
+        type: string
+      release_run_id:
+        description: Exact successful Release ARC workflow run ID that published v0.8.0
+        required: true
+        type: string
+      release_run_attempt:
+        description: Exact successful attempt number of that Release ARC run
+        required: true
+        type: string
+
+concurrency:
+  group: published-artifact-acceptance-${{ inputs.tag }}-${{ inputs.release_run_id }}-${{ inputs.release_run_attempt }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  ACCEPTANCE_TOOL: scripts/release/published-artifact-acceptance.py
+  LEGACY_COMMIT: 37df67b526cd0eebf6b55fa940c7646d1f4c947f
+
+jobs:
+  bind-release:
+    name: Bind exact release run, tag, and public assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      release_id: ${{ steps.selection.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: selection
+        name: Capture the exact release attempt and publication evidence artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.release_source_sha }}
+          RELEASE_RUN_ATTEMPT: ${{ inputs.release_run_attempt }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [ "$RELEASE_TAG" = v0.8.0 ]
+          [ "$GITHUB_REF" = refs/tags/v0.8.0 ]
+          [ "$GITHUB_SHA" = "$RELEASE_COMMIT" ]
+          [ "$(git rev-parse HEAD)" = "$RELEASE_COMMIT" ]
+
+          evidence="$RUNNER_TEMP/release-api"
+          mkdir -m 0700 "$evidence"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml" \
+            > "$evidence/workflow.json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID/attempts/$RELEASE_RUN_ATTEMPT" \
+            > "$evidence/run.json"
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID/attempts/$RELEASE_RUN_ATTEMPT/jobs?per_page=100" \
+            > "$evidence/jobs.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            > "$evidence/tag-ref.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            > "$evidence/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v0.7.7" \
+            > "$evidence/legacy-tag-ref.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v0.7.7" \
+            > "$evidence/legacy-release.json"
+
+          release_id="$(jq -er '.id | select(type == "number" and . > 0)' \
+            "$evidence/release.json")"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RELEASE_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[]' | jq -s '{artifacts: .}' \
+            > "$evidence/artifacts.json"
+          python3 "$ACCEPTANCE_TOOL" select-published-evidence \
+            --commit "$RELEASE_COMMIT" \
+            --release-run-id "$RELEASE_RUN_ID" \
+            --release-run-attempt "$RELEASE_RUN_ATTEMPT" \
+            --release-json "$evidence/release.json" \
+            --artifacts-json "$evidence/artifacts.json" \
+            --output "$evidence/published-evidence-artifact-api.json"
+          artifact_id="$(jq -er '.id' \
+            "$evidence/published-evidence-artifact-api.json")"
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+          {
+            echo "artifact_id=$artifact_id"
+            echo "release_id=$release_id"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download exact publication evidence by immutable artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.selection.outputs.artifact_id }}
+          path: release-published-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.release_run_id }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Seal exact read-only GitHub API selection
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_source_sha }}
+          RELEASE_RUN_ATTEMPT: ${{ inputs.release_run_attempt }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          evidence="$RUNNER_TEMP/release-api"
+          python3 "$ACCEPTANCE_TOOL" bind \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --release-run-id "$RELEASE_RUN_ID" \
+            --release-run-attempt "$RELEASE_RUN_ATTEMPT" \
+            --workflow-json "$evidence/workflow.json" \
+            --run-json "$evidence/run.json" \
+            --jobs-json "$evidence/jobs.json" \
+            --tag-ref-json "$evidence/tag-ref.json" \
+            --release-json "$evidence/release.json" \
+            --published-evidence-artifact-json \
+              "$evidence/published-evidence-artifact-api.json" \
+            --published-evidence-download-root release-published-download \
+            --legacy-tag-ref-json "$evidence/legacy-tag-ref.json" \
+            --legacy-release-json "$evidence/legacy-release.json" \
+            --jobs-output release-attempt-jobs.json \
+            --published-evidence-output release-published.json \
+            --published-evidence-zip-output published-evidence.zip \
+            --published-evidence-artifact-output published-evidence-artifact.json \
+            --output release-binding.json
+          chmod 0400 release-binding.json release-attempt-jobs.json \
+            release-published.json published-evidence.zip \
+            published-evidence-artifact.json
+          release_id="$(python3 -c \
+            'import json; print(json.load(open("release-binding.json"))["release"]["id"])')"
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          [ "$release_id" = "${{ steps.selection.outputs.release_id }}" ]
+
+      - id: upload
+        name: Upload immutable release binding
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-published-release-binding-${{ inputs.release_run_id }}-attempt-${{ inputs.release_run_attempt }}
+          path: |
+            release-binding.json
+            release-attempt-jobs.json
+            release-published.json
+            published-evidence.zip
+            published-evidence-artifact.json
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
+
+  linux-x86_64:
+    name: Linux headless, AppImage, and real v0.7.7 migration
+    needs: bind-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact release binding by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
+          path: binding
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Download v0.8.0 Linux assets by immutable release asset ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -m 0700 published
+          download_asset() {
+            local name="$1" id temporary
+            id="$(jq -er --arg name "$name" '.assets[$name].id' binding/release-binding.json)"
+            [[ "$id" =~ ^[1-9][0-9]*$ ]]
+            temporary="published/.${name}.new"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$temporary"
+            mv -- "$temporary" "published/$name"
+          }
+          for name in \
+            install.sh \
+            arc-node-linux-x86_64 \
+            arc-cli-linux-x86_64 \
+            arc-desktop-linux-x86_64.AppImage \
+            arc-desktop-linux-x86_64.AppImage.sig
+          do
+            download_asset "$name"
+          done
+          python3 "$ACCEPTANCE_TOOL" verify-files \
+            --binding binding/release-binding.json \
+            --directory published \
+            --asset install.sh \
+            --asset arc-node-linux-x86_64 \
+            --asset arc-cli-linux-x86_64 \
+            --asset arc-desktop-linux-x86_64.AppImage \
+            --asset arc-desktop-linux-x86_64.AppImage.sig \
+            --output published-files.json
+
+      - name: Install real AppImage runtime and isolation tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            dbus-x11 iptables libappindicator3-1 libayatana-appindicator3-1 \
+            librsvg2-2 libwebkit2gtk-4.1-0 x11-apps x11-utils xdotool xvfb
+
+      - name: Verify updater signature and exercise the published AppImage UI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          pubkey="$(python3 -c \
+            'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')"
+          cargo run --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml -- \
+            "$pubkey" \
+            published/arc-desktop-linux-x86_64.AppImage \
+            published/arc-desktop-linux-x86_64.AppImage.sig
+
+          runtime="$RUNNER_TEMP/appimage-runtime"
+          evidence="$PWD/evidence-linux"
+          mkdir -m 0700 "$runtime" "$runtime/home" "$runtime/config" \
+            "$runtime/cache" "$runtime/data" "$evidence"
+          chmod 0500 published/arc-desktop-linux-x86_64.AppImage
+          (
+            cd "$runtime"
+            "$GITHUB_WORKSPACE/published/arc-desktop-linux-x86_64.AppImage" \
+              --appimage-extract > "$evidence/extract.stdout" \
+              2> "$evidence/extract.stderr"
+          )
+          test -x "$runtime/squashfs-root/AppRun"
+
+          # The single-quoted program is intentionally evaluated by the inner
+          # xvfb shell, which receives APP_ROOT and EVIDENCE in its environment.
+          # shellcheck disable=SC2016
+          APP_ROOT="$runtime" EVIDENCE="$evidence" \
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1280x900x24' bash -ceu '
+            export HOME="$APP_ROOT/home"
+            export XDG_CONFIG_HOME="$APP_ROOT/config"
+            export XDG_CACHE_HOME="$APP_ROOT/cache"
+            export XDG_DATA_HOME="$APP_ROOT/data"
+            export NO_AT_BRIDGE=1
+            export WEBKIT_DISABLE_COMPOSITING_MODE=1
+            "$APP_ROOT/squashfs-root/AppRun" \
+              >"$EVIDENCE/app.stdout" 2>"$EVIDENCE/app.stderr" &
+            launcher_pid=$!
+            cleanup() {
+              kill -TERM "$launcher_pid" 2>/dev/null || true
+              wait "$launcher_pid" 2>/dev/null || true
+            }
+            trap cleanup EXIT HUP INT TERM
+            window_id=""
+            for _ in $(seq 1 120); do
+              if ! kill -0 "$launcher_pid" 2>/dev/null; then
+                cat "$EVIDENCE/app.stderr" >&2
+                exit 1
+              fi
+              window_id="$(xdotool search --onlyvisible --name "ARC Node" 2>/dev/null \
+                | head -n 1 || true)"
+              [ -z "$window_id" ] || break
+              sleep 0.25
+            done
+            [ -n "$window_id" ]
+            window_pid="$(xdotool getwindowpid "$window_id")"
+            [[ "$window_pid" =~ ^[1-9][0-9]*$ ]]
+            kill -0 "$window_pid"
+            sleep 5
+            kill -0 "$window_pid"
+            geometry="$(xdotool getwindowgeometry --shell "$window_id")"
+            width="$(printf "%s\n" "$geometry" | sed -n "s/^WIDTH=//p")"
+            height="$(printf "%s\n" "$geometry" | sed -n "s/^HEIGHT=//p")"
+            [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]
+            [ "$width" -ge 900 ] && [ "$height" -ge 600 ]
+            printf "%s\n" "$geometry" > "$EVIDENCE/window-geometry.txt"
+            xprop -id "$window_id" > "$EVIDENCE/window-properties.txt"
+            grep -Fq "ARC Node" "$EVIDENCE/window-properties.txt"
+            xwd -silent -id "$window_id" -out "$EVIDENCE/window.xwd"
+            [ "$(wc -c < "$EVIDENCE/window.xwd")" -gt 100000 ]
+            printf "%s\n" "$window_pid" > "$EVIDENCE/window-pid.txt"
+            trap - EXIT HUP INT TERM
+            cleanup
+          '
+          test -s "$evidence/window.xwd"
+
+      - name: Exercise fresh headless install and exact update-only path
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          fresh="$RUNNER_TEMP/fresh-headless"
+          install_root="$fresh/install"
+          data_root="$fresh/data"
+          mkdir -m 0700 "$fresh"
+          chmod 0500 published/install.sh
+          bash published/install.sh --version 0.8.0 \
+            --install-dir "$install_root" --data-dir "$data_root" \
+            --no-service --no-auto-update \
+            > evidence-linux/headless-install.stdout \
+            2> evidence-linux/headless-install.stderr
+          "$install_root/bin/arc-node" --version | grep -F ' 0.8.0'
+          "$install_root/bin/arc-cli" --version | grep -F ' 0.8.0'
+          [ "$(sha256sum "$install_root/bin/arc-node" | awk '{print $1}')" = \
+            "$(jq -er '.assets["arc-node-linux-x86_64"].sha256' binding/release-binding.json)" ]
+          [ "$(sha256sum "$install_root/bin/arc-cli" | awk '{print $1}')" = \
+            "$(jq -er '.assets["arc-cli-linux-x86_64"].sha256' binding/release-binding.json)" ]
+          bash published/install.sh --update-only \
+            --install-dir "$install_root" --no-service --no-auto-update \
+            > evidence-linux/headless-update.stdout \
+            2> evidence-linux/headless-update.stderr
+          grep -Fq 'Already up to date at v0.8.0' \
+            evidence-linux/headless-update.stdout
+          if pgrep -f "$install_root/bin/arc-node" >/dev/null; then
+            echo 'fresh --no-service install started an arc-node process' >&2
+            exit 1
+          fi
+
+      - name: Build real offline v0.7.7 state from pinned historical bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          legacy_source="$RUNNER_TEMP/legacy-source"
+          legacy_home="$RUNNER_TEMP/legacy-home"
+          legacy_root="$legacy_home/.arc"
+          mkdir -m 0700 "$legacy_source" "$legacy_home" "$legacy_root" \
+            "$legacy_root/bin" "$legacy_root/data"
+
+          legacy_asset_id="$(jq -er '.legacy_source.asset.id' binding/release-binding.json)"
+          [[ "$legacy_asset_id" =~ ^[1-9][0-9]*$ ]]
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$legacy_asset_id" \
+            > "$legacy_source/arc-node-linux-x86_64"
+
+          git fetch --no-tags origin "$LEGACY_COMMIT"
+          [ "$(git rev-parse FETCH_HEAD)" = "$LEGACY_COMMIT" ]
+          git show "$LEGACY_COMMIT:scripts/install-community-node.sh" \
+            > "$legacy_source/install-community-node.sh"
+          git show "$LEGACY_COMMIT:testnet-seeds.txt" \
+            > "$legacy_source/testnet-seeds.txt"
+          git show "$LEGACY_COMMIT:genesis.toml" \
+            > "$legacy_source/genesis.toml"
+          python3 "$ACCEPTANCE_TOOL" verify-legacy \
+            --binding binding/release-binding.json \
+            --binary "$legacy_source/arc-node-linux-x86_64" \
+            --installer "$legacy_source/install-community-node.sh" \
+            --seed-config "$legacy_source/testnet-seeds.txt" \
+            --genesis "$legacy_source/genesis.toml" \
+            --output evidence-linux/legacy-source.json
+
+          install -m 0700 "$legacy_source/arc-node-linux-x86_64" \
+            "$legacy_root/bin/arc-node"
+          install -m 0600 "$legacy_source/testnet-seeds.txt" "$legacy_root/seeds.txt"
+          install -m 0600 "$legacy_source/genesis.toml" "$legacy_root/genesis.toml"
+          printf '%s\n' '0.7.7' > "$legacy_root/version.txt"
+          printf '%s\n' 'community-post-release-acceptance-0707' \
+            > "$legacy_root/identity.seed"
+          printf '%s\n' 'ARC pinned migration model fixture v1' \
+            > "$legacy_root/community-model.gguf"
+          chmod 0600 "$legacy_root/version.txt" "$legacy_root/identity.seed" \
+            "$legacy_root/community-model.gguf"
+          "$legacy_root/bin/arc-node" --version \
+            | tee evidence-linux/legacy-version.txt \
+            | grep -F ' 0.7.7'
+
+          # Generate genuine v0.7.7 WAL/genesis history with the released
+          # binary inside a network namespace that has no interface or route.
+          legacy_runtime_image='ubuntu@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316'
+          docker pull "$legacy_runtime_image"
+          docker run --rm --network none \
+            --user "$(id -u):$(id -g)" \
+            --volume "$legacy_root:/legacy" \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=700 \
+            "$legacy_runtime_image" bash -ceu '
+              /legacy/bin/arc-node \
+                --rpc 127.0.0.1:19944 --p2p-port 19945 \
+                --stake 0 --min-stake 0 --eth-rpc-port 0 \
+                --data-dir /legacy/data \
+                --genesis /legacy/genesis.toml \
+                --validator-seed community-post-release-acceptance-0707 \
+                >/legacy/v0.7.7-offline.log 2>&1 &
+              node_pid=$!
+              cleanup() {
+                kill -TERM "$node_pid" 2>/dev/null || true
+                wait "$node_pid" 2>/dev/null || true
+              }
+              trap cleanup EXIT HUP INT TERM
+              ready=false
+              for _ in $(seq 1 120); do
+                kill -0 "$node_pid"
+                if response=$(timeout 1 bash -ceu '\''
+                  exec 3<>/dev/tcp/127.0.0.1/19944
+                  printf "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
+                  cat <&3
+                '\'' 2>/dev/null) && printf "%s" "$response" | grep -q "HTTP/1.1 200"; then
+                  ready=true
+                  break
+                fi
+                sleep 0.25
+              done
+              [ "$ready" = true ]
+              [ -s /legacy/data/state.wal ]
+              trap - EXIT HUP INT TERM
+              kill -TERM "$node_pid"
+              for _ in $(seq 1 60); do
+                kill -0 "$node_pid" 2>/dev/null || exit 0
+                sleep 0.25
+              done
+              echo "released v0.7.7 binary did not stop after SIGTERM" >&2
+              exit 1
+            '
+          [ -s "$legacy_root/data/state.wal" ]
+          if pgrep -f "$legacy_root/bin/arc-node" >/dev/null; then
+            echo 'offline v0.7.7 fixture process is still running' >&2
+            exit 1
+          fi
+
+          LEGACY_ROOT="$legacy_root" python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["LEGACY_ROOT"])
+          data = root / "data"
+          files = {}
+          for path in sorted(data.rglob("*")):
+              if path.is_symlink():
+                  raise SystemExit(f"legacy data contains a symlink: {path}")
+              if path.is_file():
+                  payload = path.read_bytes()
+                  files[path.relative_to(data).as_posix()] = {
+                      "sha256": hashlib.sha256(payload).hexdigest(),
+                      "size": len(payload),
+                  }
+          if "state.wal" not in files or files["state.wal"]["size"] <= 0:
+              raise SystemExit("released v0.7.7 binary produced no persistent state WAL")
+          Path("evidence-linux/legacy-data-before.json").write_text(
+              json.dumps(files, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+          sha256sum "$legacy_root/community-model.gguf" \
+            > evidence-linux/legacy-model-before.sha256
+          printf '%s\n' "$legacy_home" > evidence-linux/legacy-home.txt
+
+      - name: Migrate the exact stopped v0.7.7 layout without legacy egress
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          legacy_home="$(cat evidence-linux/legacy-home.txt)"
+          legacy_root="$legacy_home/.arc"
+          legacy_ips=(
+            149.28.32.76 140.82.16.112 136.244.109.1
+            104.238.171.11 202.182.107.41 149.28.153.31
+          )
+          legacy_rules=()
+          cleanup_rules() {
+            local rule
+            for rule in "${legacy_rules[@]}"; do
+              read -r ip port <<< "$rule"
+              sudo iptables -D OUTPUT -p tcp -d "$ip" --dport "$port" \
+                -j REJECT 2>/dev/null || true
+            done
+          }
+          trap cleanup_rules EXIT HUP INT TERM
+          for ip in "${legacy_ips[@]}"; do
+            for port in 9090 3001; do
+              sudo iptables -I OUTPUT -p tcp -d "$ip" --dport "$port" -j REJECT
+              legacy_rules+=("$ip $port")
+              sudo iptables -C OUTPUT -p tcp -d "$ip" --dport "$port" -j REJECT
+            done
+          done
+
+          HOME="$legacy_home" bash published/install.sh --version 0.8.0 \
+            --model "$legacy_root/community-model.gguf" \
+            --no-service --no-auto-update \
+            > evidence-linux/legacy-migration.stdout \
+            2> evidence-linux/legacy-migration.stderr
+          cleanup_rules
+          trap - EXIT HUP INT TERM
+
+          grep -Fq 'Adopted the verified v0.7.7 default install' \
+            evidence-linux/legacy-migration.stdout
+          "$legacy_root/bin/arc-node" --version | grep -F ' 0.8.0'
+          "$legacy_root/bin/arc-cli" --version | grep -F ' 0.8.0'
+          [ "$(sha256sum "$legacy_root/bin/arc-node" | awk '{print $1}')" = \
+            "$(jq -er '.assets["arc-node-linux-x86_64"].sha256' binding/release-binding.json)" ]
+          [ "$(sha256sum "$legacy_root/bin/arc-cli" | awk '{print $1}')" = \
+            "$(jq -er '.assets["arc-cli-linux-x86_64"].sha256' binding/release-binding.json)" ]
+          cmp "$legacy_root/legacy-v0.7-preserved/version.txt" \
+            <(printf '%s\n' '0.7.7')
+          cmp "$legacy_root/legacy-v0.7-preserved/identity.seed" \
+            <(printf '%s\n' 'community-post-release-acceptance-0707')
+          [ "$(sha256sum "$legacy_root/community-model.gguf")" = \
+            "$(cat evidence-linux/legacy-model-before.sha256)" ]
+          jq -e '
+            .schema == "arc.migration.legacy-v07-preexisting-offline-evidence.v1"
+            and .process_identity == null
+            and .supervisor.signals_sent == []
+            and .supervisor.sigkill_sent == false
+          ' "$legacy_root/legacy-v0.7-preserved/retirement-v0.8/stop-evidence.json" \
+            >/dev/null
+          [ -d "$legacy_root/data-v0.8" ]
+          [ ! -L "$legacy_root/data-v0.8" ]
+          if find "$legacy_root/data-v0.8" -mindepth 1 -print -quit | grep -q .; then
+            echo 'no-service migration reused or initialized the fresh v0.8 state directory' >&2
+            exit 1
+          fi
+
+          LEGACY_ROOT="$legacy_root" python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["LEGACY_ROOT"])
+          data = root / "data"
+          files = {}
+          for path in sorted(data.rglob("*")):
+              if path.is_symlink():
+                  raise SystemExit(f"legacy data acquired a symlink: {path}")
+              if path.is_file():
+                  payload = path.read_bytes()
+                  files[path.relative_to(data).as_posix()] = {
+                      "sha256": hashlib.sha256(payload).hexdigest(),
+                      "size": len(payload),
+                  }
+          before = json.loads(Path("evidence-linux/legacy-data-before.json").read_text())
+          if files != before:
+              raise SystemExit("v0.7.7 state/history bytes changed during migration")
+          Path("evidence-linux/legacy-data-after.json").write_text(
+              json.dumps(files, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+          cmp evidence-linux/legacy-data-before.json evidence-linux/legacy-data-after.json
+          bash published/install.sh --update-only \
+            --install-dir "$legacy_root" --no-service --no-auto-update \
+            > evidence-linux/legacy-update.stdout \
+            2> evidence-linux/legacy-update.stderr
+          grep -Fq 'Already up to date at v0.8.0' evidence-linux/legacy-update.stdout
+          if pgrep -f "$legacy_root/bin/arc-node" >/dev/null; then
+            echo 'migration or update-only started an arc-node service/process' >&2
+            exit 1
+          fi
+
+      - name: Seal Linux component receipt
+        shell: bash
+        env:
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          def digest(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          checks = {
+              "appimage_process_stable": True,
+              "appimage_updater_signature_valid": True,
+              "appimage_visible_window": True,
+              "appimage_window_capture_nonempty": True,
+              "appimage_window_capture_sha256": digest("evidence-linux/window.xwd"),
+              "headless_fresh_install": True,
+              "headless_update_only": True,
+              "legacy_binary_executed_offline": True,
+              "legacy_data_manifest_sha256": digest("evidence-linux/legacy-data-after.json"),
+              "legacy_history_preserved": True,
+              "legacy_installer_source_pinned": True,
+              "legacy_model_preserved": True,
+              "legacy_preexisting_offline": True,
+              "legacy_source_receipt_sha256": digest("evidence-linux/legacy-source.json"),
+              "legacy_state_preserved": True,
+              "service_started": False,
+              "v08_fresh_data": True,
+          }
+          Path("linux-checks.json").write_text(
+              json.dumps(checks, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+          mkdir -p artifact/receipt artifact/evidence
+          python3 "$ACCEPTANCE_TOOL" component \
+            --binding binding/release-binding.json \
+            --files-receipt published-files.json \
+            --checks-json linux-checks.json \
+            --platform linux-x86_64 \
+            --acceptance-run-id "$ACCEPTANCE_RUN_ID" \
+            --acceptance-run-attempt "$ACCEPTANCE_RUN_ATTEMPT" \
+            --output artifact/receipt/linux-x86_64.json
+          cp evidence-linux/*.json evidence-linux/*.sha256 evidence-linux/*.txt \
+            artifact/evidence/
+          cp evidence-linux/*.stdout evidence-linux/*.stderr artifact/evidence/
+          cp evidence-linux/window.xwd artifact/evidence/
+
+      - id: upload
+        name: Upload Linux acceptance and evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-published-acceptance-linux-x86_64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifact
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 90
+
+  macos-desktop:
+    name: Packaged desktop (${{ matrix.platform }})
+    needs: bind-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+            architecture: arm64
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            architecture: x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact release binding by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
+          path: binding
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Download exact macOS package bytes by release asset ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -m 0700 published
+          case "$PLATFORM" in
+            macos-arm64) prefix=arc-desktop-macos-arm64 ;;
+            macos-x86_64) prefix=arc-desktop-macos-x86_64 ;;
+            *) exit 1 ;;
+          esac
+          download_asset() {
+            local name="$1" id temporary
+            id="$(jq -er --arg name "$name" '.assets[$name].id' binding/release-binding.json)"
+            [[ "$id" =~ ^[1-9][0-9]*$ ]]
+            temporary="published/.${name}.new"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$temporary"
+            mv -- "$temporary" "published/$name"
+          }
+          download_asset "$prefix.app.tar.gz"
+          download_asset "$prefix.app.tar.gz.sig"
+          download_asset "$prefix.dmg"
+          python3 "$ACCEPTANCE_TOOL" verify-files \
+            --binding binding/release-binding.json \
+            --directory published \
+            --asset "$prefix.app.tar.gz" \
+            --asset "$prefix.app.tar.gz.sig" \
+            --asset "$prefix.dmg" \
+            --output published-files.json
+          printf '%s\n' "$prefix" > prefix.txt
+
+      - name: Verify signed updater archive, bundle, architecture, and DMG
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.architecture }}
+        run: |
+          set -Eeuo pipefail
+          prefix="$(cat prefix.txt)"
+          pubkey="$(python3 -c \
+            'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')"
+          cargo run --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml -- \
+            "$pubkey" "published/$prefix.app.tar.gz" \
+            "published/$prefix.app.tar.gz.sig"
+
+          extract="$RUNNER_TEMP/macos-app"
+          mountpoint="$RUNNER_TEMP/macos-dmg"
+          mkdir -m 0700 "$extract" "$mountpoint"
+          ARCHIVE="published/$prefix.app.tar.gz" EXTRACT="$extract" python3 - <<'PY'
+          import os, tarfile
+          from pathlib import Path, PurePosixPath
+          archive = Path(os.environ["ARCHIVE"])
+          root = Path(os.environ["EXTRACT"]).resolve()
+          with tarfile.open(archive, "r:gz") as handle:
+              members = handle.getmembers()
+              if not members:
+                  raise SystemExit("desktop archive is empty")
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"unsafe archive member: {member.name}")
+                  if member.isdev() or member.isfifo():
+                      raise SystemExit(f"special archive member: {member.name}")
+                  if member.issym() or member.islnk():
+                      target = PurePosixPath(member.linkname)
+                      if target.is_absolute() or ".." in target.parts:
+                          raise SystemExit(f"unsafe archive link: {member.name}")
+              handle.extractall(root)
+          PY
+          apps="$(find "$extract" -type d -name '*.app' -prune)"
+          [ "$(printf '%s\n' "$apps" | awk 'NF { count += 1 } END { print count + 0 }')" -eq 1 ]
+          app="$apps"
+          info="$app/Contents/Info.plist"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info")" = \
+            network.arc.desktop ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info")" = \
+            0.8.0 ]
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info")"
+          executable="$app/Contents/MacOS/$executable_name"
+          [ -x "$executable" ]
+          [ "$(lipo -archs "$executable")" = "$EXPECTED_ARCH" ]
+          codesign --verify --deep --strict --verbose=2 "$app"
+          hdiutil verify "published/$prefix.dmg"
+          attached=false
+          cleanup() {
+            if [ "$attached" = true ]; then
+              hdiutil detach "$mountpoint" -quiet || true
+            fi
+          }
+          trap cleanup EXIT HUP INT TERM
+          hdiutil attach -readonly -nobrowse -noautoopen \
+            -mountpoint "$mountpoint" "published/$prefix.dmg" >/dev/null
+          attached=true
+          dmg_apps="$(find "$mountpoint" -type d -name '*.app' -prune)"
+          [ "$(printf '%s\n' "$dmg_apps" | awk 'NF { count += 1 } END { print count + 0 }')" -eq 1 ]
+          dmg_app="$dmg_apps"
+          dmg_info="$dmg_app/Contents/Info.plist"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$dmg_info")" = \
+            network.arc.desktop ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$dmg_info")" = \
+            0.8.0 ]
+          dmg_executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$dmg_info")"
+          dmg_executable="$dmg_app/Contents/MacOS/$dmg_executable_name"
+          [ "$(lipo -archs "$dmg_executable")" = "$EXPECTED_ARCH" ]
+          codesign --verify --deep --strict --verbose=2 "$dmg_app"
+          [ "$(shasum -a 256 "$executable" | awk '{print $1}')" = \
+            "$(shasum -a 256 "$dmg_executable" | awk '{print $1}')" ]
+          cleanup
+          trap - EXIT HUP INT TERM
+
+          profile="$RUNNER_TEMP/arc-desktop-profile-$EXPECTED_ARCH"
+          mkdir -m 0700 "$profile" "$profile/tmp" evidence-macos
+          service_before="$(launchctl list | awk '$3 ~ /^(network[.]arc|arc[-_.])/ {print $3}' | LC_ALL=C sort)"
+          probe_source="$RUNNER_TEMP/arc-window-probe.swift"
+          probe_binary="$RUNNER_TEMP/arc-window-probe"
+          tee "$probe_source" >/dev/null <<'SWIFT'
+          import CoreGraphics
+          import Darwin
+          import Foundation
+
+          guard let rawPID = ProcessInfo.processInfo.environment["ARC_DESKTOP_PID"],
+                let pid = Int32(rawPID),
+                let output = ProcessInfo.processInfo.environment["ARC_WINDOW_EVIDENCE"] else {
+              exit(2)
+          }
+          guard let windows = CGWindowListCopyWindowInfo(
+              [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+          ) as? [[String: Any]] else {
+              exit(3)
+          }
+          for window in windows {
+              let owner = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+              let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
+              let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0
+              guard owner == pid, layer == 0, alpha > 0,
+                    let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                    let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+                    let height = (bounds["Height"] as? NSNumber)?.doubleValue,
+                    width >= 900, height >= 600 else {
+                  continue
+              }
+              let evidence: [String: Any] = [
+                  "height": height,
+                  "owner_name": window[kCGWindowOwnerName as String] as? String ?? "",
+                  "pid": pid,
+                  "title": window[kCGWindowName as String] as? String ?? "",
+                  "width": width,
+              ]
+              let data = try JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
+              try data.write(to: URL(fileURLWithPath: output), options: .atomic)
+              exit(0)
+          }
+          exit(1)
+          SWIFT
+          xcrun swiftc "$probe_source" -o "$probe_binary"
+
+          HOME="$profile" TMPDIR="$profile/tmp" \
+            "$executable" >evidence-macos/desktop.stdout \
+            2>evidence-macos/desktop.stderr &
+          desktop_pid=$!
+          terminate_desktop() {
+            if kill -0 "$desktop_pid" 2>/dev/null; then
+              kill -TERM "$desktop_pid" 2>/dev/null || true
+              for _ in 1 2 3 4 5; do
+                kill -0 "$desktop_pid" 2>/dev/null || return 0
+                sleep 1
+              done
+              kill -KILL "$desktop_pid" 2>/dev/null || true
+            fi
+            wait "$desktop_pid" 2>/dev/null || true
+          }
+          trap terminate_desktop EXIT HUP INT TERM
+          window_evidence="$GITHUB_WORKSPACE/evidence-macos/desktop-window.json"
+          window_found=false
+          for _ in $(seq 1 45); do
+            if ! kill -0 "$desktop_pid" 2>/dev/null; then
+              wait "$desktop_pid" || true
+              cat evidence-macos/desktop.stderr >&2
+              exit 1
+            fi
+            if ARC_DESKTOP_PID="$desktop_pid" ARC_WINDOW_EVIDENCE="$window_evidence" \
+              "$probe_binary"; then
+              window_found=true
+              break
+            fi
+            sleep 1
+          done
+          [ "$window_found" = true ]
+          sleep 5
+          kill -0 "$desktop_pid"
+          ARC_DESKTOP_PID="$desktop_pid" ARC_WINDOW_EVIDENCE="$window_evidence" \
+            "$probe_binary"
+          service_after="$(launchctl list | awk '$3 ~ /^(network[.]arc|arc[-_.])/ {print $3}' | LC_ALL=C sort)"
+          [ "$service_after" = "$service_before" ]
+          terminate_desktop
+          trap - EXIT HUP INT TERM
+
+      - name: Seal macOS component receipt
+        shell: bash
+        env:
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ github.run_id }}
+          EXPECTED_ARCH: ${{ matrix.architecture }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import json, os
+          checks = {
+              "archive_safe": True,
+              "bundle_architecture": os.environ["EXPECTED_ARCH"],
+              "bundle_codesign_valid": True,
+              "bundle_identifier": "network.arc.desktop",
+              "bundle_version": "0.8.0",
+              "desktop_process_stable": True,
+              "desktop_visible_window": True,
+              "dmg_bundle_matches": True,
+              "dmg_verified": True,
+              "isolated_profile": True,
+              "service_started": False,
+              "updater_signature_valid": True,
+          }
+          open("checks.json", "w").write(
+              json.dumps(checks, sort_keys=True, separators=(",", ":")) + "\n"
+          )
+          PY
+          mkdir -p artifact/receipt artifact/evidence
+          python3 "$ACCEPTANCE_TOOL" component \
+            --binding binding/release-binding.json \
+            --files-receipt published-files.json \
+            --checks-json checks.json \
+            --platform "$PLATFORM" \
+            --acceptance-run-id "$ACCEPTANCE_RUN_ID" \
+            --acceptance-run-attempt "$ACCEPTANCE_RUN_ATTEMPT" \
+            --output "artifact/receipt/$PLATFORM.json"
+          cp evidence-macos/desktop.stdout evidence-macos/desktop.stderr \
+            evidence-macos/desktop-window.json artifact/evidence/
+
+      - id: upload
+        name: Upload macOS component receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-published-acceptance-${{ matrix.platform }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifact
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
+
+  windows-desktop:
+    name: Packaged desktop (windows-x86_64)
+    needs: bind-release
+    runs-on: windows-latest
+    timeout-minutes: 25
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact release binding by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
+          path: binding
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Download exact Windows package bytes by release asset ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p published
+          download_asset() {
+            local name="$1" id temporary
+            id="$(jq -er --arg name "$name" '.assets[$name].id' binding/release-binding.json)"
+            [[ "$id" =~ ^[1-9][0-9]*$ ]]
+            temporary="published/.${name}.new"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$temporary"
+            mv -- "$temporary" "published/$name"
+          }
+          download_asset arc-desktop-windows-x86_64-setup.exe
+          download_asset arc-desktop-windows-x86_64-setup.exe.sig
+          download_asset arc-desktop-windows-x86_64.msi
+          python "$ACCEPTANCE_TOOL" verify-files \
+            --binding binding/release-binding.json \
+            --directory published \
+            --asset arc-desktop-windows-x86_64-setup.exe \
+            --asset arc-desktop-windows-x86_64-setup.exe.sig \
+            --asset arc-desktop-windows-x86_64.msi \
+            --output published-files.json
+
+      - name: Verify the published Tauri updater signature
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          pubkey="$(python -c \
+            'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')"
+          cargo run --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml -- \
+            "$pubkey" \
+            published/arc-desktop-windows-x86_64-setup.exe \
+            published/arc-desktop-windows-x86_64-setup.exe.sig
+
+      - name: Safely inspect PE packages and administratively extract MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class ArcWindowProbe {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct RECT { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll")]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool IsWindowVisible(IntPtr handle);
+            [DllImport("user32.dll")]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool GetWindowRect(IntPtr handle, out RECT rectangle);
+          }
+          '@
+          function Get-PeMachine([string] $Path) {
+            $stream = [System.IO.File]::OpenRead((Resolve-Path $Path))
+            try {
+              $reader = [System.IO.BinaryReader]::new($stream)
+              if ($reader.ReadUInt16() -ne 0x5A4D) { throw "missing MZ header: $Path" }
+              $stream.Position = 0x3c
+              $offset = $reader.ReadUInt32()
+              $stream.Position = $offset
+              if ($reader.ReadUInt32() -ne 0x00004550) { throw "missing PE header: $Path" }
+              $machine = $reader.ReadUInt16()
+              if ($machine -ne 0x8664) { throw "expected AMD64 PE machine, got $machine in $Path" }
+              return 'AMD64'
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          $setup = 'published/arc-desktop-windows-x86_64-setup.exe'
+          if ((Get-PeMachine $setup) -ne 'AMD64') { throw 'setup is not AMD64' }
+          $msiPath = (Resolve-Path 'published/arc-desktop-windows-x86_64.msi').Path
+          $installer = $null
+          $database = $null
+          $view = $null
+          $record = $null
+          try {
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            $database = $installer.GetType().InvokeMember(
+              'OpenDatabase', [Reflection.BindingFlags]::InvokeMethod, $null,
+              $installer, @($msiPath, 0)
+            )
+            $query = "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'ProductVersion'"
+            $view = $database.GetType().InvokeMember(
+              'OpenView', [Reflection.BindingFlags]::InvokeMethod, $null,
+              $database, @($query)
+            )
+            [void]$view.GetType().InvokeMember(
+              'Execute', [Reflection.BindingFlags]::InvokeMethod, $null, $view, $null
+            )
+            $record = $view.GetType().InvokeMember(
+              'Fetch', [Reflection.BindingFlags]::InvokeMethod, $null, $view, $null
+            )
+            if ($null -eq $record) { throw 'MSI has no ProductVersion property' }
+            $msiProductVersion = $record.GetType().InvokeMember(
+              'StringData', [Reflection.BindingFlags]::GetProperty, $null, $record, @(1)
+            )
+          } finally {
+            foreach ($comObject in @($record, $view, $database, $installer)) {
+              if ($null -ne $comObject) {
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
+              }
+            }
+          }
+          if ($msiProductVersion -cne '0.8.0') {
+            throw "MSI ProductVersion is $msiProductVersion"
+          }
+          $serviceBefore = @(Get-Service | Where-Object {
+            $_.Name -match '(?i)^arc([._-]|$)' -or $_.DisplayName -match '(?i)^ARC([ _-]|$)'
+          } | Select-Object -ExpandProperty Name | Sort-Object)
+          if ($serviceBefore.Count -ne 0) { throw 'runner unexpectedly begins with an ARC service' }
+
+          $target = Join-Path $env:RUNNER_TEMP 'arc-msi-admin'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          $log = Join-Path $env:GITHUB_WORKSPACE 'windows-msi-admin.log'
+          $arguments = @('/a', $msiPath,
+            '/qn', "TARGETDIR=$target", '/l*v', $log)
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
+          $applications = @(Get-ChildItem -Path $target -Recurse -File -Filter 'arc-desktop.exe')
+          if ($applications.Count -ne 1) {
+            throw "expected exactly one extracted arc-desktop.exe, got $($applications.Count)"
+          }
+          if ((Get-PeMachine $applications[0].FullName) -ne 'AMD64') {
+            throw 'extracted desktop is not AMD64'
+          }
+          $embeddedProductVersion = $applications[0].VersionInfo.ProductVersion
+          if ($embeddedProductVersion -notmatch '^0[.]8[.]0(?:[.]0)?$') {
+            throw "extracted desktop ProductVersion is $embeddedProductVersion"
+          }
+
+          $profile = Join-Path $env:RUNNER_TEMP 'arc-windows-profile'
+          $roaming = Join-Path $profile 'AppData\Roaming'
+          $local = Join-Path $profile 'AppData\Local'
+          $temporary = Join-Path $profile 'Temp'
+          New-Item -ItemType Directory -Force -Path $profile, $roaming, $local, $temporary |
+            Out-Null
+          $env:USERPROFILE = $profile
+          $env:HOME = $profile
+          $env:APPDATA = $roaming
+          $env:LOCALAPPDATA = $local
+          $env:TEMP = $temporary
+          $env:TMP = $temporary
+          $stdout = Join-Path $env:GITHUB_WORKSPACE 'windows-desktop.stdout'
+          $stderr = Join-Path $env:GITHUB_WORKSPACE 'windows-desktop.stderr'
+          $desktop = Start-Process -FilePath $applications[0].FullName -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(60)
+            $visible = $false
+            do {
+              Start-Sleep -Seconds 1
+              $desktop.Refresh()
+              if ($desktop.HasExited) {
+                throw "published desktop exited before UI startup: $($desktop.ExitCode)"
+              }
+              $candidateHandle = $desktop.MainWindowHandle
+              $candidateRect = [ArcWindowProbe+RECT]::new()
+              if ($candidateHandle.ToInt64() -ne 0 -and $desktop.Responding -and
+                  [ArcWindowProbe]::IsWindowVisible($candidateHandle) -and
+                  [ArcWindowProbe]::GetWindowRect($candidateHandle, [ref]$candidateRect) -and
+                  ($candidateRect.Right - $candidateRect.Left) -ge 900 -and
+                  ($candidateRect.Bottom - $candidateRect.Top) -ge 600) {
+                $visible = $true
+                break
+              }
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if (-not $visible) { throw 'published desktop never exposed a responsive window' }
+            if ($desktop.MainWindowTitle -notmatch '(?i)ARC') {
+              throw "unexpected desktop window title: $($desktop.MainWindowTitle)"
+            }
+            $initialHandle = $desktop.MainWindowHandle.ToInt64()
+            $initialWidth = $candidateRect.Right - $candidateRect.Left
+            $initialHeight = $candidateRect.Bottom - $candidateRect.Top
+            Start-Sleep -Seconds 5
+            $desktop.Refresh()
+            if ($desktop.HasExited -or -not $desktop.Responding -or
+                $desktop.MainWindowHandle.ToInt64() -ne $initialHandle -or
+                -not [ArcWindowProbe]::IsWindowVisible($desktop.MainWindowHandle)) {
+              throw 'published desktop did not remain healthy with the same visible window'
+            }
+            [ordered]@{
+              height = $initialHeight
+              main_window_handle = $initialHandle
+              main_window_title = $desktop.MainWindowTitle
+              pid = $desktop.Id
+              responding = $desktop.Responding
+              width = $initialWidth
+            } | ConvertTo-Json -Compress |
+              Set-Content -Encoding utf8NoBOM windows-desktop-window.json
+          } finally {
+            if (-not $desktop.HasExited) {
+              [void]$desktop.CloseMainWindow()
+              if (-not $desktop.WaitForExit(5000)) {
+                Stop-Process -Id $desktop.Id -Force -ErrorAction SilentlyContinue
+                [void]$desktop.WaitForExit(5000)
+              }
+            }
+          }
+          $serviceAfter = @(Get-Service | Where-Object {
+            $_.Name -match '(?i)^arc([._-]|$)' -or $_.DisplayName -match '(?i)^ARC([ _-]|$)'
+          } | Select-Object -ExpandProperty Name | Sort-Object)
+          if ($serviceAfter.Count -ne 0) { throw 'MSI administrative extraction installed a service' }
+
+          $checks = [ordered]@{
+            desktop_process_stable = $true
+            desktop_visible_window = $true
+            embedded_app_pe_machine = 'AMD64'
+            embedded_app_product_version = $embeddedProductVersion
+            isolated_profile = $true
+            msi_administrative_extract = $true
+            msi_product_version = $msiProductVersion
+            no_installed_service = $true
+            setup_pe_machine = 'AMD64'
+            updater_signature_valid = $true
+          }
+          $checks | ConvertTo-Json -Compress | Set-Content -Encoding utf8NoBOM windows-checks.json
+
+      - name: Seal Windows component receipt
+        shell: bash
+        env:
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifact/receipt artifact/evidence
+          python "$ACCEPTANCE_TOOL" component \
+            --binding binding/release-binding.json \
+            --files-receipt published-files.json \
+            --checks-json windows-checks.json \
+            --platform windows-x86_64 \
+            --acceptance-run-id "$ACCEPTANCE_RUN_ID" \
+            --acceptance-run-attempt "$ACCEPTANCE_RUN_ATTEMPT" \
+            --output artifact/receipt/windows-x86_64.json
+          cp windows-msi-admin.log windows-desktop.stdout windows-desktop.stderr \
+            windows-desktop-window.json artifact/evidence/
+
+      - id: upload
+        name: Upload Windows component receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-published-acceptance-windows-x86_64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifact
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
+
+  seal-acceptance:
+    name: Seal canonical published-artifact receipt
+    needs: [bind-release, linux-x86_64, macos-desktop, windows-desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact binding
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
+          path: binding
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - id: components
+        name: Select exact attempt-bound component artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINUX_JOB_ARTIFACT_ID: ${{ needs.linux-x86_64.outputs.artifact_id }}
+          WINDOWS_JOB_ARTIFACT_ID: ${{ needs.windows-desktop.outputs.artifact_id }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -m 0700 selected-components
+          api="$RUNNER_TEMP/component-artifacts.json"
+          found=false
+          for _ in $(seq 1 12); do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+              > "$api"
+            count="$(jq --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+              '[.artifacts[] | select(.name == ("arc-published-acceptance-linux-x86_64-" + $run + "-attempt-" + $attempt) or .name == ("arc-published-acceptance-macos-arm64-" + $run + "-attempt-" + $attempt) or .name == ("arc-published-acceptance-macos-x86_64-" + $run + "-attempt-" + $attempt) or .name == ("arc-published-acceptance-windows-x86_64-" + $run + "-attempt-" + $attempt))] | length' \
+              "$api")"
+            if [ "$count" -eq 4 ]; then
+              found=true
+              break
+            fi
+            sleep 5
+          done
+          [ "$found" = true ]
+
+          select_one() {
+            local platform="$1" key="$2" expected name match
+            name="arc-published-acceptance-$platform-$GITHUB_RUN_ID-attempt-$GITHUB_RUN_ATTEMPT"
+            expected="$(jq --arg name "$name" '[.artifacts[] | select(.name == $name)] | length' "$api")"
+            [ "$expected" -eq 1 ]
+            match="selected-components/$platform.json"
+            jq -e --arg name "$name" --arg platform "$platform" \
+              --argjson run_id "$GITHUB_RUN_ID" --arg head_sha "$GITHUB_SHA" '
+                .artifacts[] | select(.name == $name) |
+                select(.expired == false) |
+                select((.id | type) == "number" and .id > 0) |
+                select((.size_in_bytes | type) == "number" and .size_in_bytes > 0) |
+                select(.digest | test("^sha256:[0-9a-f]{64}$")) |
+                select(.workflow_run.id == $run_id) |
+                select(.workflow_run.head_sha == $head_sha) |
+                {
+                  platform: $platform,
+                  name,
+                  id,
+                  digest,
+                  size: .size_in_bytes,
+                  expired,
+                  workflow_run_id: .workflow_run.id,
+                  head_sha: .workflow_run.head_sha
+                }
+              ' "$api" > "$match"
+            [ -s "$match" ]
+            echo "${key}_id=$(jq -er '.id' "$match")" >> "$GITHUB_OUTPUT"
+            echo "${key}_digest=$(jq -er '.digest' "$match")" >> "$GITHUB_OUTPUT"
+          }
+          select_one linux-x86_64 linux
+          select_one macos-arm64 macos_arm64
+          select_one macos-x86_64 macos_x86_64
+          select_one windows-x86_64 windows
+          [ "$(jq -er '.id' selected-components/linux-x86_64.json)" = \
+            "$LINUX_JOB_ARTIFACT_ID" ]
+          [ "$(jq -er '.id' selected-components/windows-x86_64.json)" = \
+            "$WINDOWS_JOB_ARTIFACT_ID" ]
+          jq -S -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --slurpfile linux selected-components/linux-x86_64.json \
+            --slurpfile macos_arm64 selected-components/macos-arm64.json \
+            --slurpfile macos_x86_64 selected-components/macos-x86_64.json \
+            --slurpfile windows selected-components/windows-x86_64.json '
+              {
+                schema: "arc.published-artifact-component-binding.v1",
+                repository: $repository,
+                acceptance_run_id: $run_id,
+                acceptance_run_attempt: $run_attempt,
+                artifacts: {
+                  "linux-x86_64": ($linux[0] | del(.platform)),
+                  "macos-arm64": ($macos_arm64[0] | del(.platform)),
+                  "macos-x86_64": ($macos_x86_64[0] | del(.platform)),
+                  "windows-x86_64": ($windows[0] | del(.platform))
+                }
+              }
+            ' > component-artifacts.json
+
+      - name: Download exact Linux component artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.components.outputs.linux_id }}
+          path: components/linux
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Download exact macOS arm64 component artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.components.outputs.macos_arm64_id }}
+          path: components/macos-arm64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Download exact macOS x86_64 component artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.components.outputs.macos_x86_64_id }}
+          path: components/macos-x86_64
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Download exact Windows component artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.components.outputs.windows_id }}
+          path: components/windows
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          digest-mismatch: error
+
+      - name: Aggregate exact component receipts
+        shell: bash
+        env:
+          ACCEPTANCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACCEPTANCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -m 0700 component-receipts canonical canonical/evidence \
+            canonical/evidence/linux-x86_64 canonical/evidence/macos-arm64 \
+            canonical/evidence/macos-x86_64 canonical/evidence/windows-x86_64 \
+            canonical/evidence/release
+          cp components/linux/receipt/linux-x86_64.json component-receipts/
+          cp components/macos-arm64/receipt/macos-arm64.json component-receipts/
+          cp components/macos-x86_64/receipt/macos-x86_64.json component-receipts/
+          cp components/windows/receipt/windows-x86_64.json component-receipts/
+          cp -a components/linux/evidence/. canonical/evidence/linux-x86_64/
+          cp -a components/macos-arm64/evidence/. canonical/evidence/macos-arm64/
+          cp -a components/macos-x86_64/evidence/. canonical/evidence/macos-x86_64/
+          cp -a components/windows/evidence/. canonical/evidence/windows-x86_64/
+          cp binding/release-attempt-jobs.json binding/release-published.json \
+            binding/published-evidence.zip binding/published-evidence-artifact.json \
+            canonical/evidence/release/
+          python3 "$ACCEPTANCE_TOOL" evidence-manifest \
+            --binding binding/release-binding.json \
+            --component-artifacts component-artifacts.json \
+            --evidence-root canonical/evidence \
+            --acceptance-run-id "$ACCEPTANCE_RUN_ID" \
+            --acceptance-run-attempt "$ACCEPTANCE_RUN_ATTEMPT" \
+            --output canonical/EVIDENCE-MANIFEST.json
+          python3 "$ACCEPTANCE_TOOL" aggregate \
+            --binding binding/release-binding.json \
+            --component-artifacts component-artifacts.json \
+            --components component-receipts \
+            --evidence-manifest canonical/EVIDENCE-MANIFEST.json \
+            --evidence-root canonical/evidence \
+            --acceptance-run-id "$ACCEPTANCE_RUN_ID" \
+            --acceptance-run-attempt "$ACCEPTANCE_RUN_ATTEMPT" \
+            --output canonical/POST-RELEASE-ARTIFACT-ACCEPTANCE.json
+          cp binding/release-binding.json canonical/
+          cp component-artifacts.json canonical/
+          cp component-receipts/*.json canonical/
+          if find canonical -type l -print -quit | grep -q .; then
+            echo 'canonical published acceptance contains a symlink' >&2
+            exit 1
+          fi
+          checksum_manifest="$RUNNER_TEMP/POST-RELEASE-ARTIFACT-ACCEPTANCE.SHA256SUMS"
+          (cd canonical && find . -type f \
+            ! -name POST-RELEASE-ARTIFACT-ACCEPTANCE.SHA256SUMS -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum) > "$checksum_manifest"
+          mv "$checksum_manifest" \
+            canonical/POST-RELEASE-ARTIFACT-ACCEPTANCE.SHA256SUMS
+
+      - id: upload
+        name: Upload canonical published-artifact acceptance receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-published-artifact-acceptance-v0.8.0-${{ inputs.release_source_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: canonical
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 90
+
+      - name: Report exact canonical artifact identity
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          # upload-artifact exposes its output as the bare SHA-256; the Actions
+          # artifacts API used by the operator later returns the same value with
+          # a `sha256:` prefix.
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          echo "::notice::Canonical post-release acceptance: run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, artifact $ARTIFACT_ID, digest sha256:$ARTIFACT_DIGEST"
