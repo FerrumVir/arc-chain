@@ -38,7 +38,11 @@ RUST_TARGET = "aarch64-apple-darwin"
 LABEL = "network.arc.pretag-community-canary"
 RPC = "127.0.0.1:19944"
 STOP_BUDGET_SECONDS = 4_420
-START_PROOF_SECONDS = 60
+# The native runner re-hashes the 4 GB GGUF before exec, and the node then loads
+# the complete integer model before opening RPC.  Real Apple Silicon startup has
+# taken about 130 seconds end-to-end, so keep a bounded but practical proof
+# window around both exact, non-networked initialization phases.
+START_PROOF_SECONDS = 300
 CANONICAL_GENESIS_SHA256 = (
     "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269"
 )
@@ -123,6 +127,10 @@ RUNNER_ENV_UNSET = (
 
 class CanaryError(RuntimeError):
     pass
+
+
+class CanaryUnexpectedSockets(CanaryError):
+    """An exact node opened sockets outside its final canary contract."""
 
 
 def fail(message: str) -> NoReturn:
@@ -2135,60 +2143,173 @@ class CanaryController:
             return False
         return result.stdout.strip() == str(pid)
 
-    def _prove_pid_base_identity(self, config: dict[str, Any], pid: int) -> None:
-        expected_command = " ".join(config["runtime"]["argv"])
+    def _process_command(self, pid: int) -> str:
         command = self.platform.run(
             ("ps", "-ww", "-p", str(pid), "-o", "command=")
         ).stdout.rstrip("\n")
+        if not command or "\n" in command:
+            fail("ps did not return exactly one complete command for the canary PID")
+        return command
+
+    def _pid_identity_snapshot(self, pid: int) -> tuple[str, Path, tuple[str, ...]]:
+        """Read one stable command/executable view across an expected exec edge."""
+
+        for _ in range(3):
+            before = self._process_command(pid)
+            executable_text = self.platform.run(
+                ("ps", "-ww", "-p", str(pid), "-o", "comm=")
+            ).stdout.rstrip("\n")
+            if not executable_text or "\n" in executable_text:
+                fail("ps did not return exactly one executable for the canary PID")
+            executable_path = Path(executable_text)
+            if not executable_path.is_absolute():
+                fail("ps reported a non-absolute executable for the canary PID")
+            try:
+                executable = executable_path.resolve(strict=True)
+            except OSError as error:
+                fail(f"canary PID executable cannot be resolved: {error}")
+            lsof = self.platform.run(
+                ("lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn")
+            ).stdout.splitlines()
+            pid_rows = [line[1:] for line in lsof if line.startswith("p")]
+            if pid_rows != [str(pid)]:
+                fail("lsof executable proof did not bind exactly the canary PID")
+            text_paths = tuple(line[1:] for line in lsof if line.startswith("n"))
+            after = self._process_command(pid)
+            if before == after:
+                return before, executable, text_paths
+        fail("canary PID identity changed repeatedly during startup proof")
+
+    def _prove_snapshot_executable(
+        self,
+        snapshot: tuple[str, Path, tuple[str, ...]],
+        expected: Path,
+        description: str,
+    ) -> None:
+        _, executable, text_paths = snapshot
+        expected_resolved = expected.resolve(strict=True)
+        if executable != expected_resolved:
+            fail(f"canary PID executable differs from the exact {description}")
+        # Darwin may report additional `txt` mappings (for example its logging
+        # plist cache).  `ps comm` identifies the executable; lsof must
+        # independently corroborate that exact path, but unrelated text maps do
+        # not make the executable ambiguous.
+        if str(expected) not in text_paths and str(expected_resolved) not in text_paths:
+            fail(f"lsof did not corroborate the exact {description} executable")
+
+    def _prove_pid_base_identity(self, config: dict[str, Any], pid: int) -> None:
+        expected_command = " ".join(config["runtime"]["argv"])
+        snapshot = self._pid_identity_snapshot(pid)
+        command = snapshot[0]
         if command != expected_command:
             fail("canary PID argv differs from the exact hash-bound runtime argv")
-        lsof = self.platform.run(
-            ("lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn")
-        ).stdout.splitlines()
-        executable_paths = [line[1:] for line in lsof if line.startswith("n")]
-        if len(executable_paths) != 1:
-            fail("lsof did not return exactly one executable for the canary PID")
-        executable = Path(executable_paths[0]).resolve(strict=True)
-        if executable != self.paths.node.resolve(strict=True):
-            fail("canary PID executable differs from the exact preflight node")
+        self._prove_snapshot_executable(snapshot, self.paths.node, "preflight node")
+        executable = snapshot[1]
         node = config["node"]
         metadata = regular_file(executable, "running preflight node")
         if metadata.st_size != node["size_bytes"] or sha256(executable) != node["sha256"]:
             fail("running canary executable failed its exact hash/size proof")
 
-    def _prove_pid_listeners(self, pid: int) -> None:
-        listeners = self.platform.run(
+    def _lsof_socket_names(self, pid: int, *arguments: str) -> list[str]:
+        result = self.platform.run(
             (
                 "lsof",
                 "-nP",
                 "-a",
                 "-p",
                 str(pid),
-                "-iTCP",
-                "-sTCP:LISTEN",
+                *arguments,
                 "-Fn",
-            )
-        ).stdout.splitlines()
-        listener_names = [line[1:] for line in listeners if line.startswith("n")]
+            ),
+            check=False,
+        )
+        if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+            return []
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+            fail(f"lsof socket proof failed for PID {pid}: {detail}")
+        lines = result.stdout.splitlines()
+        pid_rows = [line[1:] for line in lines if line.startswith("p")]
+        if pid_rows != [str(pid)]:
+            fail("lsof socket proof did not bind exactly the canary PID")
+        return [line[1:] for line in lines if line.startswith("n")]
+
+    def _pid_socket_names(self, pid: int) -> tuple[list[str], list[str]]:
+        return (
+            self._lsof_socket_names(pid, "-iTCP", "-sTCP:LISTEN"),
+            self._lsof_socket_names(pid, "-iUDP"),
+        )
+
+    def _pid_all_network_names(self, pid: int) -> tuple[list[str], list[str]]:
+        return (
+            self._lsof_socket_names(pid, "-iTCP"),
+            self._lsof_socket_names(pid, "-iUDP"),
+        )
+
+    def _prove_pid_listeners(self, pid: int) -> None:
+        listener_names, udp_names = self._pid_socket_names(pid)
         if listener_names != [RPC]:
             fail(
                 "canary TCP listeners differ from the sole loopback RPC contract: "
                 f"{listener_names!r}"
             )
-        udp = self.platform.run(
-            ("lsof", "-nP", "-a", "-p", str(pid), "-iUDP", "-Fn")
-        ).stdout.splitlines()
-        udp_names = [line[1:] for line in udp if line.startswith("n")]
-        match = (
-            re.fullmatch(r"127[.]0[.]0[.]1:([1-9][0-9]{0,4})", udp_names[0])
-            if len(udp_names) == 1
-            else None
-        )
-        if match is None or int(match.group(1)) > 65_535:
+        if udp_names:
             fail(
-                "canary UDP sockets differ from the sole ephemeral loopback "
-                f"QUIC contract: {udp_names!r}"
+                "stake-zero community canary must own no UDP sockets because it "
+                f"has no consensus/P2P role: {udp_names!r}"
             )
+
+    def _classify_start_phase(self, config: dict[str, Any], pid: int) -> str:
+        """Return `runner`, `node-initializing`, or `ready` for one exact PID."""
+
+        final_command = " ".join(config["runtime"]["argv"])
+        launch_arguments = plistlib.loads(plist_bytes(self.paths))["ProgramArguments"]
+        bootstrap = {
+            " ".join(launch_arguments): Path("/usr/bin/env"),
+            f"/bin/sh {self.paths.runner}": Path("/bin/sh"),
+        }
+        for _ in range(3):
+            snapshot = self._pid_identity_snapshot(pid)
+            listener_names = self._lsof_socket_names(pid, "-iTCP", "-sTCP:LISTEN")
+            all_tcp_names, udp_names = self._pid_all_network_names(pid)
+            if self._process_command(pid) != snapshot[0]:
+                # The exact env -> sh -> node chain uses exec and retains this
+                # launchd PID.  Retry a boundary crossed during observation.
+                continue
+            command = snapshot[0]
+            if command == final_command:
+                self._prove_snapshot_executable(snapshot, self.paths.node, "preflight node")
+                executable = snapshot[1]
+                node = config["node"]
+                metadata = regular_file(executable, "running preflight node")
+                if (
+                    metadata.st_size != node["size_bytes"]
+                    or sha256(executable) != node["sha256"]
+                ):
+                    fail("running canary executable failed its exact hash/size proof")
+                if listener_names == [RPC] and not udp_names:
+                    return "ready"
+                if not listener_names and not all_tcp_names and not udp_names:
+                    return "node-initializing"
+                raise CanaryUnexpectedSockets(
+                    "exact canary node opened sockets outside the sole loopback RPC "
+                    "contract before readiness: "
+                    f"tcp_listen={listener_names!r}, tcp_all={all_tcp_names!r}, "
+                    f"udp={udp_names!r}"
+                )
+            expected_executable = bootstrap.get(command)
+            if expected_executable is None:
+                fail("canary PID argv is outside the exact hash-bound startup chain")
+            self._prove_snapshot_executable(
+                snapshot, expected_executable, "hash-bound startup runner"
+            )
+            if all_tcp_names or udp_names:
+                fail(
+                    "hash-bound startup runner unexpectedly owns network sockets: "
+                    f"tcp={all_tcp_names!r}, udp={udp_names!r}"
+                )
+            return "runner"
+        fail("canary PID crossed startup phases too often to prove safely")
 
     def _prove_pid_identity(self, config: dict[str, Any], pid: int) -> None:
         self._prove_pid_base_identity(config, pid)
@@ -2207,38 +2328,73 @@ class CanaryController:
         if self.platform.run(("launchctl", "print", self.domain), check=False).returncode != 0:
             fail(f"interactive launchd domain is unavailable: {self.domain}")
 
+    def _service_disabled(self) -> bool:
+        result = self.platform.run(("launchctl", "print-disabled", self.domain))
+        matches = re.findall(
+            rf'(?m)^\s*"{re.escape(LABEL)}"\s*=>\s*(true|false|disabled|enabled)\s*$',
+            result.stdout,
+        )
+        if len(matches) > 1:
+            fail("launchctl reported more than one disabled-state row for the canary")
+        return bool(matches and matches[0] in {"true", "disabled"})
+
     @lifecycle_transaction
     def start(self) -> None:
         config = self._validate_installation(require_launch_agent=True)
         self._domain_available()
         if self.is_loaded():
             pid = self._prove_process(config)
+            if self._service_disabled():
+                self.platform.run(("launchctl", "enable", self._service_target()))
+                try:
+                    if self._service_disabled():
+                        fail("launchctl left the exact running canary label disabled")
+                    self._prove_process(config, pid)
+                    self._write_evidence(
+                        "start", {"pid": pid, "recovered_loaded_disabled": True}
+                    )
+                except Exception:
+                    # Recovery is not complete until both the post-enable proof
+                    # and its append-only evidence succeed.
+                    self.platform.run(
+                        ("launchctl", "disable", self._service_target()), check=False
+                    )
+                    raise
+                print(
+                    "Recovered loaded-disabled canary after exact PID/exe/argv/"
+                    f"listener proof: pid={pid}"
+                )
+                return
             print(f"Canary is already running with exact PID/exe/argv proof: pid={pid}")
             return
         self.platform.run(("launchctl", "enable", self._service_target()))
+        if self._service_disabled():
+            fail("launchctl did not enable the canary label")
         self.platform.run(
             ("launchctl", "bootstrap", self.domain, str(self.paths.launch_agent))
         )
         self.platform.run(("launchctl", "kickstart", self._service_target()))
+        expected_pid = None
+        last_phase = "waiting-for-pid"
         for _ in range(self.start_proof_seconds):
             pid = self._service_pid()
             if pid is not None:
-                try:
-                    self._prove_pid_base_identity(config, pid)
-                except CanaryError:
-                    # Prevent a restart, but never signal a PID whose identity
-                    # has not been established.
+                if expected_pid is None:
+                    expected_pid = pid
+                elif pid != expected_pid:
                     self.platform.run(
-                        ("launchctl", "disable", self._service_target()),
-                        check=False,
+                        ("launchctl", "disable", self._service_target()), check=False
                     )
-                    raise
+                    fail(
+                        f"canary LaunchAgent PID changed from {expected_pid} to {pid} "
+                        "across an exec-only startup chain"
+                    )
                 try:
-                    self._prove_pid_listeners(pid)
-                except CanaryError:
-                    # The executable and complete argv are exact. Quarantine
-                    # an unexpected listener using SIGTERM only, then preserve
-                    # the original proof failure for the operator.
+                    phase = self._classify_start_phase(config, pid)
+                except CanaryUnexpectedSockets:
+                    # The final executable and complete argv are exact. Quarantine
+                    # an unexpected listener using SIGTERM only, then preserve the
+                    # original proof failure for the operator.
                     self.platform.run(("launchctl", "disable", self._service_target()))
                     self._prove_pid_base_identity(config, pid)
                     self.platform.run(
@@ -2263,20 +2419,52 @@ class CanaryController:
                     if self.is_loaded():
                         fail("failed-start canary remained loaded after graceful quarantine")
                     raise
-                self._write_evidence("start", {"pid": pid})
-                print(f"Started exact pre-tag community canary: pid={pid}, rpc=http://{RPC}")
-                return
+                except CanaryError:
+                    # Prevent a restart, but never signal a PID whose identity
+                    # has not been established.
+                    self.platform.run(
+                        ("launchctl", "disable", self._service_target()),
+                        check=False,
+                    )
+                    raise
+                last_phase = phase
+                if phase == "ready":
+                    self._prove_process(config, pid)
+                    if self._service_disabled():
+                        fail("ready canary label became disabled during startup proof")
+                    self._write_evidence(
+                        "start", {"pid": pid, "recovered_loaded_disabled": False}
+                    )
+                    print(
+                        f"Started exact pre-tag community canary: pid={pid}, "
+                        f"rpc=http://{RPC}"
+                    )
+                    return
             self.platform.sleep(1)
         self.platform.run(
             ("launchctl", "disable", self._service_target()), check=False
         )
         if self.is_loaded():
+            if expected_pid is None:
+                fail(
+                    "LaunchAgent did not produce a provable PID within the bounded "
+                    f"{self.start_proof_seconds}-second proof window; the label is "
+                    "disabled and the job remains loaded for review; "
+                    "bootout was not attempted across a racy no-PID observation"
+                )
+            if expected_pid is not None and self._service_pid() != expected_pid:
+                fail("canary PID changed at the bounded startup timeout")
             fail(
-                "LaunchAgent did not produce a provable PID within 60 seconds; "
+                "LaunchAgent did not become ready within the bounded "
+                f"{self.start_proof_seconds}-second proof window "
+                f"(last exact phase: {last_phase}); "
                 "the label is disabled and the job remains loaded for review; "
-                "bootout was not attempted across a racy no-PID observation"
+                "no signal or bootout was attempted"
             )
-        fail("LaunchAgent did not produce a provable canary PID within 60 seconds")
+        fail(
+            "LaunchAgent did not produce a provable canary PID within the bounded "
+            f"{self.start_proof_seconds}-second proof window"
+        )
 
     @lifecycle_transaction
     def status(self) -> int:

@@ -6805,9 +6805,15 @@ async fn main() -> Result<()> {
         drop(outbound_tx);
         drop(inbound_tx);
         drop(outbound_rx);
-        tracing::warn!(
-            "Chain P2P/consensus is OFF while genesis validator migration is pending; community HTTP inference remains active"
-        );
+        if migration_observer {
+            tracing::warn!(
+                "Chain P2P/consensus is OFF while genesis validator migration is pending; community HTTP inference remains active"
+            );
+        } else {
+            tracing::info!(
+                "Chain P2P/consensus is OFF for this stake-zero community worker; community HTTP inference remains active"
+            );
+        }
     }
 
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────

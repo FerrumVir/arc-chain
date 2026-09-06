@@ -29,16 +29,14 @@ proof after all large copies and immediately before publishing runnable state.
   executable and full argv have been proved, such a listener also disables the
   label and gracefully quarantines the exact process with `SIGTERM`; it never
   leaves a rejected listener eligible for restart and never force-kills it.
-- The node's authenticated QUIC transport necessarily owns exactly one UDP
-  socket even with `--p2p-port 0`; source semantics bind that OS-assigned port
-  to IPv4 loopback. The proof therefore also requires exactly one
-  `127.0.0.1:<nonzero-ephemeral-port>` UDP socket. Missing, wildcard, external,
-  malformed, or multiple UDP sockets fail closed.
+- A stake-zero community worker has no consensus/P2P role, even with a complete
+  production genesis. The proof therefore requires **zero UDP sockets**. Any
+  UDP socket fails closed; opening an otherwise-unused QUIC transport would
+  contradict the node's role separation rather than prove readiness.
 - The node runs with `--stake 0 --community-mode --full-integer-worker`, no
-  `--peers`, no seeds file, and `--p2p-port 0`. A stake-zero runtime takes no
-  consensus role, and its OS-assigned QUIC socket is loopback-only, so it does
-  not expose an inbound public P2P listener or require a public IP, firewall
-  rule, or port forwarding.
+  `--peers`, no seeds file, and `--p2p-port 0`. It takes no consensus role and
+  opens no QUIC socket, so it does not expose an inbound public P2P listener or
+  require a public IP, firewall rule, or port forwarding.
 - The only community endpoints are six repeated `--community-rpc-url`
   arguments: `https://149.28.32.76`, `https://140.82.16.112`,
   `https://136.244.109.1`, `https://104.238.171.11`,
@@ -79,6 +77,16 @@ proof after all large copies and immediately before publishing runnable state.
   runner defensively unsets the same hook families again before executing the
   hash-proved node. The exact root-owned `/usr/bin/env`, `/bin/sh`, `stat`,
   `shasum`, and `cut` paths are proved before lifecycle operations.
+- `start` recognizes only the same launchd PID moving through the exact
+  `/usr/bin/env` invocation, exact `/bin/sh <managed-runner>` invocation, and
+  final hash-bound node invocation. The env/shell runner and an initializing
+  node must own no TCP or UDP sockets. The final node must own exactly the
+  loopback RPC listener and no UDP sockets. Any argv/executable near miss, PID
+  change, or premature socket fails closed.
+- The proof window is bounded at 300 seconds. This includes re-hashing the 4 GB
+  managed GGUF immediately before `exec`, loading its full integer model, and
+  opening RPC. A trusted phase that does not become ready in that window is
+  disabled and left loaded for review without a signal or bootout.
 - The LaunchAgent is not `RunAtLoad`, has no `KeepAlive`, has no updater, and
   sets `ExitTimeOut=4420`. Before status or shutdown, the controller proves the
   exact launchd PID, executable path and hash, and complete argv.
@@ -86,6 +94,11 @@ proof after all large copies and immediately before publishing runnable state.
   but deliberately leaves the loaded job intact for review. It does not issue
   `bootout` across a racy no-PID observation that could hide a just-starting
   process.
+- If an earlier failed proof left an already-running exact node loaded but its
+  label disabled, a later `start` first repeats the complete PID, executable,
+  argv, hash, TCP, and zero-UDP proof. Only then does it re-enable the label,
+  re-prove the same PID, and append explicit recovery evidence. It never
+  kickstarts or replaces that running process.
 - `stop` disables the label, re-proves the same process, and asks launchd to
   send only the node-supported `SIGTERM`. It waits up to 4,420 seconds for the
   admitted 4,000-second work window and WAL barrier. It never sends a force
@@ -191,8 +204,10 @@ scripts/release/macos-community-canary.py accept
 ```
 
 `start` succeeds only after launchd, `ps`, and `lsof` prove the exact PID,
-executable, hash, size, argv, and sole loopback listener. While it runs, read local status without
-exposing the RPC listener:
+executable, hash, size, argv, sole loopback TCP listener, and absence of UDP.
+It can remain quiet for roughly two minutes while the exact runner hashes the
+managed model and the node loads it; the hard proof deadline is 300 seconds.
+While it runs, read local status without exposing the RPC listener:
 
 ```bash
 curl -fsS http://127.0.0.1:19944/health | python3 -m json.tool
