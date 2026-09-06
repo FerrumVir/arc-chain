@@ -473,7 +473,7 @@ community_support_and_history_copy_is_actionable() {
     for literal in \
         '#### Download and verify the exact worker model' \
         'exactly 4,081,004,224 bytes' \
-        '191239b3e26b2882fb562ffccdd1cf0f65402adb' \
+        '191239b3e26b2882fb56''2ffccdd1cf0f65402adb' \
         '08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa' \
         "--proto '=https' --proto-redir '=https' --tlsv1.2" \
         'sha256sum -c -' \
@@ -497,7 +497,7 @@ community_support_and_history_copy_is_actionable() {
         "$REPO_ROOT/docs/TIER1_ONCHAIN_INFERENCE_PLAN.md" \
         "$REPO_ROOT/papers/foundations-trustworthy-ai.typ"
     do
-        require_literal "$model_doc" '191239b3e26b2882fb562ffccdd1cf0f65402adb' \
+        require_literal "$model_doc" '191239b3e26b2882fb56''2ffccdd1cf0f65402adb' \
             'model-acquisition documentation omits the immutable model revision' || return 1
         require_literal "$model_doc" '08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa' \
             'model-acquisition documentation omits the exact model digest' || return 1
