@@ -2712,6 +2712,8 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
     for required in \
         'STOP_BUDGET_SECONDS = 4_420' \
         'START_PROOF_SECONDS = 300' \
+        'NO_PID_STABILITY_OBSERVATIONS = 3' \
+        'NO_PID_STABILITY_INTERVAL_SECONDS = 1' \
         'CANONICAL_MODEL_SIZE_BYTES = 4_081_004_224' \
         '08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa' \
         '8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269' \
@@ -2746,6 +2748,8 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
         'protected canary runner tool is unsafe' \
         '("ps", "-ww", "-p", str(pid), "-o", "command=")' \
         '("ps", "-ww", "-p", str(pid), "-o", "comm=")' \
+        'result.returncode == 1 and result.stdout == "" and result.stderr == ""' \
+        'ps process-existence proof returned an unexpected error' \
         '("lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn")' \
         '"-sTCP:LISTEN"' \
         'listener_names != [RPC]' \
@@ -2753,8 +2757,21 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
         'udp_names' \
         'must own no UDP sockets' \
         'print-disabled' \
+        'result.returncode == 113' \
+        'Could not find service' \
+        '_classify_launchctl_print' \
         'recovered_loaded_disabled' \
         '_classify_start_phase' \
+        '_prove_pid_graceful_drain' \
+        'listener_names == [RPC]' \
+        'rpc_listener_closed' \
+        'gracefully draining canary reopened its loopback RPC listener' \
+        '("ps", "-ww", "-axo", "pid=,command=")' \
+        'active count' \
+        'last exit code' \
+        'recovered_loaded_disabled_no_pid' \
+        'stable_no_pid_observations' \
+        'service_snapshot_sha256' \
         'failed-start canary did not exit within the graceful' \
         'bootout was not attempted across a racy no-PID observation' \
         'loaded canary has no provable PID' \
@@ -2811,6 +2828,9 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
         'no seeds file' \
         '`--peers`' \
         'never sends a force' \
+        'not treated as process death or WAL completion.' \
+        'three one-second-apart' \
+        'unregister the inert label without signaling' \
         'delete the GGUF, dedicated key, chain data' \
         'raw exact-ID GitHub'
     do

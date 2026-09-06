@@ -38,6 +38,8 @@ RUST_TARGET = "aarch64-apple-darwin"
 LABEL = "network.arc.pretag-community-canary"
 RPC = "127.0.0.1:19944"
 STOP_BUDGET_SECONDS = 4_420
+NO_PID_STABILITY_OBSERVATIONS = 3
+NO_PID_STABILITY_INTERVAL_SECONDS = 1
 # The native runner re-hashes the 4 GB GGUF before exec, and the node then loads
 # the complete integer model before opening RPC.  Real Apple Silicon startup has
 # taken about 130 seconds end-to-end, so keep a bounded but practical proof
@@ -131,6 +133,10 @@ class CanaryError(RuntimeError):
 
 class CanaryUnexpectedSockets(CanaryError):
     """An exact node opened sockets outside its final canary contract."""
+
+
+class CanaryProcessObservationLost(CanaryError):
+    """The admitted process exited between two proof-tool observations."""
 
 
 def fail(message: str) -> NoReturn:
@@ -2123,12 +2129,38 @@ class CanaryController:
             ("launchctl", "print", self._service_target()), check=False
         )
 
+    def _launchctl_service_not_found(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> bool:
+        expected_stderr = (
+            "Bad request.\n"
+            f'Could not find service "{LABEL}" in domain for user gui: {self.uid}\n'
+        )
+        return (
+            result.returncode == 113
+            and result.stdout == ""
+            and result.stderr == expected_stderr
+        )
+
+    def _classify_launchctl_print(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> bool:
+        if result.returncode == 0:
+            return True
+        if self._launchctl_service_not_found(result):
+            return False
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        fail(
+            "launchctl service-state proof returned an unexpected error "
+            f"(rc={result.returncode}): {detail}"
+        )
+
     def is_loaded(self) -> bool:
-        return self._launchctl_print().returncode == 0
+        return self._classify_launchctl_print(self._launchctl_print())
 
     def _service_pid(self) -> int | None:
         result = self._launchctl_print()
-        if result.returncode != 0:
+        if not self._classify_launchctl_print(result):
             return None
         matches = re.findall(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", result.stdout)
         if len(matches) > 1:
@@ -2139,14 +2171,35 @@ class CanaryController:
         result = self.platform.run(
             ("ps", "-p", str(pid), "-o", "pid="), check=False
         )
-        if result.returncode != 0:
+        if result.returncode == 0:
+            exact_pid_row = re.fullmatch(
+                rf"[ \t]*{pid}[ \t]*\n",
+                result.stdout,
+            )
+            if exact_pid_row is not None and result.stderr == "":
+                return True
+            fail(f"ps returned an ambiguous live-process proof for PID {pid}")
+        if result.returncode == 1 and result.stdout == "" and result.stderr == "":
             return False
-        return result.stdout.strip() == str(pid)
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        fail(
+            "ps process-existence proof returned an unexpected error "
+            f"for PID {pid} (rc={result.returncode}): {detail}"
+        )
 
     def _process_command(self, pid: int) -> str:
-        command = self.platform.run(
-            ("ps", "-ww", "-p", str(pid), "-o", "command=")
-        ).stdout.rstrip("\n")
+        result = self.platform.run(
+            ("ps", "-ww", "-p", str(pid), "-o", "command="),
+            check=False,
+        )
+        if result.returncode != 0:
+            if not self._process_exists(pid):
+                raise CanaryProcessObservationLost(
+                    f"canary PID {pid} exited during command proof"
+                )
+            detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+            fail(f"ps command proof failed for live canary PID {pid}: {detail}")
+        command = result.stdout.rstrip("\n")
         if not command or "\n" in command:
             fail("ps did not return exactly one complete command for the canary PID")
         return command
@@ -2156,9 +2209,22 @@ class CanaryController:
 
         for _ in range(3):
             before = self._process_command(pid)
-            executable_text = self.platform.run(
-                ("ps", "-ww", "-p", str(pid), "-o", "comm=")
-            ).stdout.rstrip("\n")
+            executable_result = self.platform.run(
+                ("ps", "-ww", "-p", str(pid), "-o", "comm="),
+                check=False,
+            )
+            if executable_result.returncode != 0:
+                if not self._process_exists(pid):
+                    raise CanaryProcessObservationLost(
+                        f"canary PID {pid} exited during executable proof"
+                    )
+                detail = (
+                    executable_result.stderr.strip()
+                    or executable_result.stdout.strip()
+                    or "no diagnostic"
+                )
+                fail(f"ps executable proof failed for live canary PID {pid}: {detail}")
+            executable_text = executable_result.stdout.rstrip("\n")
             if not executable_text or "\n" in executable_text:
                 fail("ps did not return exactly one executable for the canary PID")
             executable_path = Path(executable_text)
@@ -2168,9 +2234,18 @@ class CanaryController:
                 executable = executable_path.resolve(strict=True)
             except OSError as error:
                 fail(f"canary PID executable cannot be resolved: {error}")
-            lsof = self.platform.run(
-                ("lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn")
-            ).stdout.splitlines()
+            lsof_result = self.platform.run(
+                ("lsof", "-a", "-p", str(pid), "-d", "txt", "-Fn"),
+                check=False,
+            )
+            if lsof_result.returncode != 0:
+                if not self._process_exists(pid):
+                    raise CanaryProcessObservationLost(
+                        f"canary PID {pid} exited during lsof executable proof"
+                    )
+                detail = lsof_result.stderr.strip() or lsof_result.stdout.strip() or "no diagnostic"
+                fail(f"lsof executable proof failed for live canary PID {pid}: {detail}")
+            lsof = lsof_result.stdout.splitlines()
             pid_rows = [line[1:] for line in lsof if line.startswith("p")]
             if pid_rows != [str(pid)]:
                 fail("lsof executable proof did not bind exactly the canary PID")
@@ -2315,6 +2390,40 @@ class CanaryController:
         self._prove_pid_base_identity(config, pid)
         self._prove_pid_listeners(pid)
 
+    def _prove_pid_graceful_drain(
+        self,
+        config: dict[str, Any],
+        pid: int,
+        *,
+        rpc_listener_closed: bool,
+    ) -> bool:
+        """Prove one exact, monotonic network state after SIGTERM.
+
+        A proved ready node may retain its sole RPC listener briefly while it
+        drains admitted work.  Once that listener closes, it may never reopen;
+        already-established TCP connections may finish, while UDP remains
+        forbidden.  The executable, complete argv, hash, and launchd PID are
+        re-proved by the caller on every live observation.
+        """
+
+        self._prove_pid_base_identity(config, pid)
+        listener_names, udp_names = self._pid_socket_names(pid)
+        if udp_names:
+            fail(
+                "gracefully draining stake-zero canary must own no UDP sockets: "
+                f"{udp_names!r}"
+            )
+        if listener_names == [RPC]:
+            if rpc_listener_closed:
+                fail("gracefully draining canary reopened its loopback RPC listener")
+            return False
+        if listener_names:
+            fail(
+                "gracefully draining canary TCP listeners are outside the exact "
+                f"RPC-to-zero transition: {listener_names!r}"
+            )
+        return True
+
     def _prove_process(self, config: dict[str, Any], expected_pid: int | None = None) -> int:
         pid = self._service_pid()
         if pid is None:
@@ -2337,6 +2446,155 @@ class CanaryController:
         if len(matches) > 1:
             fail("launchctl reported more than one disabled-state row for the canary")
         return bool(matches and matches[0] in {"true", "disabled"})
+
+    @staticmethod
+    def _launchctl_single_field(output: str, field: str) -> str:
+        matches = re.findall(
+            rf"(?m)^\s*{re.escape(field)} = ([^\n]+?)\s*$",
+            output,
+        )
+        if len(matches) != 1:
+            fail(f"launchctl did not report exactly one {field!r} field")
+        return matches[0]
+
+    @staticmethod
+    def _launchctl_arguments(output: str) -> list[str]:
+        lines = output.splitlines()
+        starts = [index for index, line in enumerate(lines) if line.strip() == "arguments = {"]
+        if len(starts) != 1:
+            fail("launchctl did not report exactly one arguments definition")
+        values: list[str] = []
+        for line in lines[starts[0] + 1 :]:
+            value = line.strip()
+            if value == "}":
+                return values
+            if not value:
+                fail("launchctl reported a blank ProgramArguments entry")
+            values.append(value)
+        fail("launchctl arguments definition is unterminated")
+
+    def _matching_managed_process_pids(self, config: dict[str, Any]) -> list[int]:
+        launch_arguments = plistlib.loads(plist_bytes(self.paths))["ProgramArguments"]
+        exact_commands = {
+            " ".join(launch_arguments),
+            f"/bin/sh {self.paths.runner}",
+            " ".join(config["runtime"]["argv"]),
+        }
+        result = self.platform.run(("ps", "-ww", "-axo", "pid=,command="))
+        matches: list[int] = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            parsed = re.fullmatch(r"\s*([1-9][0-9]*)\s+(\S(?:.*\S)?)\s*", line)
+            if parsed is None:
+                fail("ps process-table proof returned a malformed row")
+            if parsed.group(2) in exact_commands:
+                matches.append(int(parsed.group(1)))
+        return sorted(matches)
+
+    def _prove_loaded_disabled_no_process_snapshot(self, config: dict[str, Any]) -> str:
+        """Prove one exact loaded definition has no launchd-owned process."""
+
+        result = self._launchctl_print()
+        if result.returncode != 0:
+            fail("loaded-disabled canary disappeared during no-PID recovery proof")
+        if not self._service_disabled():
+            fail("loaded canary became enabled during no-PID recovery proof")
+        output = result.stdout
+        header = output.splitlines()[0].strip() if output.splitlines() else ""
+        if header != f"{self._service_target()} = {{":
+            fail("launchctl loaded definition has an unexpected service target")
+        pid_rows = re.findall(r"(?m)^\s*pid = ([1-9][0-9]*)\s*$", output)
+        if pid_rows:
+            fail("canary PID appeared during loaded-disabled no-PID recovery proof")
+        expected_arguments = plistlib.loads(plist_bytes(self.paths))["ProgramArguments"]
+        definition = {
+            "active_count": self._launchctl_single_field(output, "active count"),
+            "path": self._launchctl_single_field(output, "path"),
+            "type": self._launchctl_single_field(output, "type"),
+            "state": self._launchctl_single_field(output, "state"),
+            "program": self._launchctl_single_field(output, "program"),
+            "arguments": self._launchctl_arguments(output),
+            "working_directory": self._launchctl_single_field(output, "working directory"),
+            "stdout_path": self._launchctl_single_field(output, "stdout path"),
+            "stderr_path": self._launchctl_single_field(output, "stderr path"),
+            "umask": self._launchctl_single_field(output, "umask"),
+            "runs": self._launchctl_single_field(output, "runs"),
+            "last_exit_code": self._launchctl_single_field(output, "last exit code"),
+            "properties": self._launchctl_single_field(output, "properties"),
+        }
+        expected_definition = {
+            "active_count": "0",
+            "path": str(self.paths.launch_agent),
+            "type": "LaunchAgent",
+            "state": "not running",
+            "program": "/usr/bin/env",
+            "arguments": expected_arguments,
+            "working_directory": str(self.paths.root),
+            "stdout_path": str(self.paths.log),
+            "stderr_path": str(self.paths.log),
+            "umask": "77",
+            "last_exit_code": "0",
+            "properties": "inferred program",
+        }
+        if {key: definition[key] for key in expected_definition} != expected_definition:
+            fail(
+                "loaded-disabled canary launchd definition/process state differs "
+                "from the exact clean-exit contract"
+            )
+        if not definition["runs"].isdigit() or int(definition["runs"]) < 1:
+            fail("loaded-disabled canary has no successful prior launchd run")
+        matching_pids = self._matching_managed_process_pids(config)
+        if matching_pids:
+            fail(
+                "loaded-disabled canary still has matching runner/node processes: "
+                f"{matching_pids!r}"
+            )
+        return sha256_bytes(canonical_json(definition))
+
+    def _prove_stable_loaded_disabled_no_pid(
+        self, config: dict[str, Any]
+    ) -> tuple[str, int]:
+        """Return the stable exact launchd definition hash and observation count."""
+
+        snapshots: list[str] = []
+        for observation in range(NO_PID_STABILITY_OBSERVATIONS):
+            snapshots.append(self._prove_loaded_disabled_no_process_snapshot(config))
+            if observation + 1 < NO_PID_STABILITY_OBSERVATIONS:
+                self.platform.sleep(NO_PID_STABILITY_INTERVAL_SECONDS)
+        # Re-prove every immutable on-disk input and then the complete service
+        # condition immediately before bootout.  The disabled label cannot
+        # launch a new instance, and bootout therefore only unregisters the
+        # stably inert job.
+        self._validate_installation(require_launch_agent=True)
+        snapshots.append(self._prove_loaded_disabled_no_process_snapshot(config))
+        if len(set(snapshots)) != 1:
+            fail("loaded-disabled canary definition changed during stable idle proof")
+        return snapshots[-1], len(snapshots)
+
+    def _recover_loaded_disabled_no_pid(self, config: dict[str, Any]) -> None:
+        """Unregister one stably inert disabled label without sending a signal."""
+
+        snapshot_sha256, observation_count = (
+            self._prove_stable_loaded_disabled_no_pid(config)
+        )
+        self.platform.run(("launchctl", "bootout", self._service_target()))
+        if self.is_loaded():
+            fail("stably inert canary LaunchAgent remained loaded after bootout")
+        self._write_evidence(
+            "stop",
+            {
+                "pid": None,
+                "signal_sent": False,
+                "recovered_loaded_disabled_no_pid": True,
+                "stable_no_pid_observations": observation_count,
+                "service_snapshot_sha256": snapshot_sha256,
+            },
+        )
+        print(
+            "Recovered stably inert loaded-disabled canary and unregistered it; "
+            "no signal was sent."
+        )
 
     @lifecycle_transaction
     def start(self) -> None:
@@ -2396,6 +2654,8 @@ class CanaryController:
                     # an unexpected listener using SIGTERM only, then preserve the
                     # original proof failure for the operator.
                     self.platform.run(("launchctl", "disable", self._service_target()))
+                    if not self._service_disabled():
+                        fail("launchctl did not disable the rejected canary label")
                     self._prove_pid_base_identity(config, pid)
                     self.platform.run(
                         ("launchctl", "kill", "SIGTERM", self._service_target())
@@ -2531,17 +2791,25 @@ class CanaryController:
             fail("refusing to control a loaded canary without its exact LaunchAgent plist")
         pid = self._service_pid()
         if pid is None:
-            self.platform.run(("launchctl", "disable", self._service_target()))
-            if self._service_pid() is not None:
-                fail("canary PID appeared after the label was disabled")
-            fail(
-                "loaded canary has no provable PID; the label is disabled and "
-                "the job remains loaded for review; bootout was not attempted "
-                "across a racy no-PID observation"
-            )
+            if not self._service_disabled():
+                self.platform.run(("launchctl", "disable", self._service_target()))
+                if not self._service_disabled():
+                    fail("launchctl did not disable the no-PID canary label")
+                if self._service_pid() is not None:
+                    fail("canary PID appeared after the label was disabled")
+                fail(
+                    "loaded canary has no provable PID; it was newly disabled and "
+                    "remains loaded for review; repeat stop only after the disabled "
+                    "no-process state can be proved stable"
+                )
+            self._recover_loaded_disabled_no_pid(config)
+            return
 
         pid = self._prove_process(config, pid)
         self.platform.run(("launchctl", "disable", self._service_target()))
+        if not self._service_disabled():
+            fail("launchctl did not disable the canary label before graceful stop")
+        signal_sent = False
         current = self._service_pid()
         if current is None:
             if self._process_exists(pid):
@@ -2551,6 +2819,8 @@ class CanaryController:
             self.platform.run(
                 ("launchctl", "kill", "SIGTERM", self._service_target())
             )
+            signal_sent = True
+            rpc_listener_closed = False
             for _ in range(self.stop_budget_seconds):
                 current = self._service_pid()
                 alive = self._process_exists(pid)
@@ -2559,7 +2829,23 @@ class CanaryController:
                 if current is not None and current != pid:
                     fail("canary PID changed during graceful SIGTERM drain")
                 if alive:
-                    self._prove_pid_identity(config, pid)
+                    if current is None:
+                        fail(
+                            "launchd lost ownership while the exact canary PID "
+                            "remained alive during graceful drain"
+                        )
+                    try:
+                        rpc_listener_closed = self._prove_pid_graceful_drain(
+                            config,
+                            pid,
+                            rpc_listener_closed=rpc_listener_closed,
+                        )
+                    except CanaryProcessObservationLost:
+                        # Exiting between ps/lsof reads is an allowed terminal
+                        # edge only when both launchd and ps now prove death.
+                        if self._service_pid() is None and not self._process_exists(pid):
+                            break
+                        raise
                 self.platform.sleep(1)
             else:
                 fail(
@@ -2568,11 +2854,28 @@ class CanaryController:
                 )
         if self._service_pid() is not None or self._process_exists(pid):
             fail("canary death is not proven after graceful SIGTERM")
+        stopped_snapshot_sha256, stopped_observation_count = (
+            self._prove_stable_loaded_disabled_no_pid(config)
+        )
         self.platform.run(("launchctl", "bootout", self._service_target()))
         if self.is_loaded():
             fail("canary LaunchAgent remained loaded after proven process death")
-        self._write_evidence("stop", {"pid": pid, "signal": "SIGTERM"})
-        print(f"Stopped exact canary PID {pid} gracefully; no force signal was used.")
+        self._write_evidence(
+            "stop",
+            {
+                "pid": pid,
+                "signal": "SIGTERM" if signal_sent else None,
+                "signal_sent": signal_sent,
+                "recovered_loaded_disabled_no_pid": False,
+                "stable_no_pid_observations": stopped_observation_count,
+                "service_snapshot_sha256": stopped_snapshot_sha256,
+            },
+        )
+        signal_summary = "SIGTERM sent" if signal_sent else "process exited before SIGTERM"
+        print(
+            f"Stopped exact canary PID {pid} gracefully ({signal_summary}); "
+            "no force signal was used."
+        )
 
     @lifecycle_transaction
     def cleanup(self) -> None:
