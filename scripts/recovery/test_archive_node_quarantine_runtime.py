@@ -12,8 +12,11 @@ from __future__ import annotations
 import ast
 import dataclasses
 import hashlib
+import os
 import pathlib
 import re
+import socket
+import sys
 import unittest
 
 
@@ -225,6 +228,118 @@ class EmbeddedProgramTests(unittest.TestCase):
         compile(self.outer, "archive-node-quarantine-round", "exec")
         compile(self.helper, "archive-node-pinned-helper", "exec")
         compile(self.live_capture, "archive-node-live-source-capture", "exec")
+
+    def test_live_capture_accepts_only_loopback_reachable_ipv4_listeners(self) -> None:
+        tree = ast.parse(self.live_capture)
+        function_names = {
+            "ipv4_loopback_reachable_listener_inodes",
+            "listener_inodes_on_port",
+            "unique_owned_listener_inode",
+        }
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in function_names
+        ]
+
+        def fail(message: str) -> None:
+            raise RuntimeError(message)
+
+        namespace: dict[str, object] = {"fail": fail}
+        exec(
+            compile(ast.Module(body=functions, type_ignores=[]), "listener-parser", "exec"),
+            namespace,
+        )
+        parse = namespace["ipv4_loopback_reachable_listener_inodes"]
+        parse_all = namespace["listener_inodes_on_port"]
+        select = namespace["unique_owned_listener_inode"]
+        header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+
+        exact_loopback = header + "0: 0100007F:2382 00000000:0000 0A 0:0 0:0 0 0 0 4242\n"
+        wildcard = header + "0: 00000000:2382 00000000:0000 0A 0:0 0:0 0 0 0 4343\n"
+        public_specific = header + "0: 4C201C95:2382 00000000:0000 0A 0:0 0:0 0 0 0 4444\n"
+        wrong_port = header + "0: 00000000:2383 00000000:0000 0A 0:0 0:0 0 0 0 4545\n"
+        non_listener = header + "0: 00000000:2382 00000000:0000 01 0:0 0:0 0 0 0 4646\n"
+
+        self.assertEqual(parse(exact_loopback, 9090), [4242])
+        self.assertEqual(parse(wildcard, 9090), [4343])
+        self.assertEqual(parse(public_specific, 9090), [])
+        self.assertEqual(parse(wrong_port, 9090), [])
+        self.assertEqual(parse(non_listener, 9090), [])
+        self.assertEqual(parse_all(public_specific, 9090), [4444])
+        self.assertEqual(select([4242], {4242}, []), 4242)
+        self.assertEqual(select([4343], {4343}, []), 4343)
+        for listeners, owned, ipv6 in (
+            ([], set(), []),
+            ([4242], set(), []),
+            ([4242, 4343], {4242, 4343}, []),
+            ([4242], {4242}, [4747]),
+        ):
+            with self.assertRaises(RuntimeError):
+                select(listeners, owned, ipv6)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc")
+    def test_live_capture_matches_real_owned_ipv4_proc_listener(self) -> None:
+        tree = ast.parse(self.live_capture)
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "ipv4_loopback_reachable_listener_inodes",
+                "listener_inodes_on_port",
+                "unique_owned_listener_inode",
+            }
+        ]
+
+        def fail(message: str) -> None:
+            raise RuntimeError(message)
+
+        namespace: dict[str, object] = {"fail": fail}
+        exec(
+            compile(ast.Module(body=functions, type_ignores=[]), "listener-proc", "exec"),
+            namespace,
+        )
+        parse = namespace["ipv4_loopback_reachable_listener_inodes"]
+        select = namespace["unique_owned_listener_inode"]
+
+        for bind_address in ("127.0.0.1", "0.0.0.0"):
+            with self.subTest(bind_address=bind_address):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                    listener.bind((bind_address, 0))
+                    listener.listen(1)
+                    port = listener.getsockname()[1]
+                    target = os.readlink(f"/proc/{os.getpid()}/fd/{listener.fileno()}")
+                    match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
+                    self.assertIsNotNone(match)
+                    inode = int(match.group(1))
+                    rows = parse(pathlib.Path("/proc/net/tcp").read_text(), port)
+                    self.assertEqual(select(rows, {inode}, []), inode)
+                    with self.assertRaises(RuntimeError):
+                        select(rows, set(), [])
+
+        if hasattr(socket, "SO_REUSEPORT"):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first:
+                first.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                first.bind(("127.0.0.1", 0))
+                first.listen(1)
+                port = first.getsockname()[1]
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as second:
+                    second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                    second.bind(("127.0.0.1", port))
+                    second.listen(1)
+                    rows = parse(pathlib.Path("/proc/net/tcp").read_text(), port)
+                    owned = {
+                        int(re.fullmatch(
+                            r"socket:\[([0-9]+)\]",
+                            os.readlink(f"/proc/{os.getpid()}/fd/{item.fileno()}"),
+                        ).group(1))
+                        for item in (first, second)
+                    }
+                    self.assertEqual(len(set(rows)), 2)
+                    with self.assertRaises(RuntimeError):
+                        select(rows, owned, [])
 
     def test_live_capture_receipt_is_durable_before_its_selector_and_reconciled_before_http(self) -> None:
         receipt = 'create(attempt/"receipt.json",raw)'

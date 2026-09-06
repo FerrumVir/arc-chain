@@ -4605,6 +4605,37 @@ def verify_writer():
     writers=sorted(int(path.parent.name) for path in pathlib.Path("/proc").glob("[0-9]*/comm")
                    if path.read_text(errors="replace").strip()=="arc-node")
     if writers!=[pid]:fail("host does not have exactly the sealed legacy writer")
+def ipv4_loopback_reachable_listener_inodes(raw,port):
+    listeners=[]
+    for line in raw.splitlines()[1:]:
+        fields=line.split()
+        if len(fields)<10:continue
+        local,state,inode=fields[1],fields[3],fields[9]
+        address,port_hex=local.split(":",1)
+        # An IPv4 wildcard listener is the socket selected by a connection to
+        # 127.0.0.1 when there is no more-specific loopback listener.  Legacy
+        # ARC nodes bind 0.0.0.0:9090, so both exact-loopback and wildcard are
+        # valid candidates; ownership and singleton checks below still bind
+        # the request to exactly one socket held by the sealed writer.
+        if (state=="0A" and address in {"00000000","0100007F"}
+                and int(port_hex,16)==port):
+            listeners.append(int(inode))
+    return listeners
+def listener_inodes_on_port(raw,port):
+    listeners=[]
+    for line in raw.splitlines()[1:]:
+        fields=line.split()
+        if len(fields)<10:continue
+        local,state,inode=fields[1],fields[3],fields[9]
+        _address,port_hex=local.split(":",1)
+        if state=="0A" and int(port_hex,16)==port:
+            listeners.append(int(inode))
+    return listeners
+def unique_owned_listener_inode(listeners,owned,ipv6_listeners):
+    matches=sorted(set(listeners)&owned)
+    if ipv6_listeners or len(matches)!=1 or len(set(listeners))!=1:
+        fail("loopback-reachable snapshot listener is not uniquely owned by the sealed writer")
+    return matches[0]
 def listener_owner():
     origin=urllib.parse.urlsplit(rpc_origin);port=origin.port
     owned=set()
@@ -4613,20 +4644,14 @@ def listener_owner():
         except (FileNotFoundError,PermissionError,OSError):continue
         match=re.fullmatch(r"socket:\[([0-9]+)\]",target)
         if match:owned.add(int(match.group(1)))
-    listeners=[]
-    for table in (pathlib.Path("/proc/net/tcp"),):
-        for line in table.read_text().splitlines()[1:]:
-            fields=line.split()
-            if len(fields)<10:continue
-            local,state,inode=fields[1],fields[3],fields[9]
-            address,port_hex=local.split(":",1)
-            if state=="0A" and address=="0100007F" and int(port_hex,16)==port:
-                listeners.append(int(inode))
-    matches=sorted(set(listeners)&owned)
-    if len(matches)!=1 or len(set(listeners))!=1:
-        fail("loopback snapshot listener is not uniquely owned by the sealed writer")
+    listeners=ipv4_loopback_reachable_listener_inodes(
+        pathlib.Path("/proc/net/tcp").read_text(),port)
+    tcp6=pathlib.Path("/proc/net/tcp6")
+    ipv6_listeners=listener_inodes_on_port(
+        tcp6.read_text() if tcp6.exists() else "",port)
+    socket_inode=unique_owned_listener_inode(listeners,owned,ipv6_listeners)
     return {"boot_id":boot_id,"pid":pid,"start_ticks":start_ticks,
-            "port":port,"socket_inode":matches[0]}
+            "port":port,"socket_inode":socket_inode}
 def verify_network_quarantine():
     if source_pair_role == "preauthorization-boundary":
         return None
