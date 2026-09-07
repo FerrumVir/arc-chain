@@ -5252,34 +5252,33 @@ run_sealed_source_status_exact() {
         "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
 }
 
-remote_readiness() {
-    local capture_id="$1" freeze_sha="$2" freeze_plan="$3"
-    local node host pid start_ticks boot_id writer_cgroup_sha writer_supervision_mode
+remote_readiness_node() {
+    local capture_id="$1" freeze_sha="$2" freeze_plan="$3" node="$4"
+    local host pid start_ticks boot_id writer_cgroup_sha writer_supervision_mode
     local unit unit_main_pid supervisor_start_ticks
     local supervisor_executable_path supervisor_executable_sha supervisor_argv_sha
     local executable_path exe_sha argv_sha data_dir
     local model_path model_sha model_size
-    for node in nyc lax ams lhr nrt sgp; do
-        host="$(host_for "$node")"
-        pid="$(freeze_node_field "$freeze_plan" "$node" writer_pid)"
-        start_ticks="$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)"
-        boot_id="$(freeze_node_field "$freeze_plan" "$node" boot_id)"
-        writer_cgroup_sha="$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)"
-        writer_supervision_mode="$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)"
-        unit="$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)"
-        unit_main_pid="$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)"
-        supervisor_start_ticks="$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)"
-        supervisor_executable_path="$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)"
-        supervisor_executable_sha="$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)"
-        supervisor_argv_sha="$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)"
-        executable_path="$(freeze_node_field "$freeze_plan" "$node" executable_path)"
-        exe_sha="$(freeze_node_field "$freeze_plan" "$node" executable_sha256)"
-        argv_sha="$(freeze_node_field "$freeze_plan" "$node" argv_sha256)"
-        data_dir="$(freeze_node_field "$freeze_plan" "$node" data_dir)"
-        model_path="$(freeze_node_field "$freeze_plan" "$node" model_path)"
-        model_sha="$(freeze_node_field "$freeze_plan" "$node" model_sha256)"
-        model_size="$(freeze_node_field "$freeze_plan" "$node" model_size_bytes)"
-        if ssh_remote_exact "$host" /bin/sh -c \
+    host="$(host_for "$node")"
+    pid="$(freeze_node_field "$freeze_plan" "$node" writer_pid)"
+    start_ticks="$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)"
+    boot_id="$(freeze_node_field "$freeze_plan" "$node" boot_id)"
+    writer_cgroup_sha="$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)"
+    writer_supervision_mode="$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)"
+    unit="$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)"
+    unit_main_pid="$(freeze_node_field "$freeze_plan" "$node" supervisor_main_pid)"
+    supervisor_start_ticks="$(freeze_node_field "$freeze_plan" "$node" supervisor_start_ticks)"
+    supervisor_executable_path="$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_path)"
+    supervisor_executable_sha="$(freeze_node_field "$freeze_plan" "$node" supervisor_executable_sha256)"
+    supervisor_argv_sha="$(freeze_node_field "$freeze_plan" "$node" supervisor_argv_sha256)"
+    executable_path="$(freeze_node_field "$freeze_plan" "$node" executable_path)"
+    exe_sha="$(freeze_node_field "$freeze_plan" "$node" executable_sha256)"
+    argv_sha="$(freeze_node_field "$freeze_plan" "$node" argv_sha256)"
+    data_dir="$(freeze_node_field "$freeze_plan" "$node" data_dir)"
+    model_path="$(freeze_node_field "$freeze_plan" "$node" model_path)"
+    model_sha="$(freeze_node_field "$freeze_plan" "$node" model_sha256)"
+    model_size="$(freeze_node_field "$freeze_plan" "$node" model_size_bytes)"
+    if ssh_remote_exact "$host" /bin/sh -c \
             'set -eu; capture=$1 pid=$2 start=$3 boot=$4 writer_cgroup_sha=$5 writer_mode=$6 unit=$7 main=$8 supervisor_start=$9 supervisor_executable=${10} supervisor_exe_sha=${11} supervisor_argv_sha=${12} executable=${13} exe_sha=${14} argv_sha=${15} data=${16} model=${17} model_sha=${18} model_size=${19}; test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"; test -d "/proc/$pid"; test "$(awk '\''{print $22}'\'' "/proc/$pid/stat")" = "$start"; test "$(cat "/proc/$pid/comm")" = arc-node; test "$(pgrep -x arc-node)" = "$pid"; test "$(sha256sum "/proc/$pid/cgroup" | cut -d" " -f1)" = "$writer_cgroup_sha"; case "$writer_mode" in systemd-unit) grep -Fq "$unit" "/proc/$pid/cgroup";; detached-root-session) ! grep -Fq "$unit" "/proc/$pid/cgroup" && test "$(awk '\''{print $4}'\'' "/proc/$pid/stat")" = 1;; *) exit 1;; esac; test "$(systemctl show "$unit" --property=MainPID --value)" = "$main"; test -d "/proc/$main"; test "$(awk '\''{print $22}'\'' "/proc/$main/stat")" = "$supervisor_start"; test "$(readlink "/proc/$main/exe")" = "$supervisor_executable"; test "$(sha256sum "/proc/$main/exe" | cut -d" " -f1)" = "$supervisor_exe_sha"; test "$(sha256sum "/proc/$main/cmdline" | cut -d" " -f1)" = "$supervisor_argv_sha"; grep -Fq "$unit" "/proc/$main/cgroup"; test "$(readlink "/proc/$pid/exe")" = "$executable"; test "$(sha256sum "/proc/$pid/exe" | cut -d" " -f1)" = "$exe_sha"; test "$(sha256sum "/proc/$pid/cmdline" | cut -d" " -f1)" = "$argv_sha"; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; command -v curl >/dev/null; command -v python3 >/dev/null; command -v sha256sum >/dev/null; command -v zstd >/dev/null; command -v tar >/dev/null; command -v systemctl >/dev/null; test ! -e /root/arc-recovery-captures || { test -d /root/arc-recovery-captures && test ! -L /root/arc-recovery-captures; }; { test ! -e "$capture" || { test -d "$capture" && test ! -L "$capture"; }; }; bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal_bytes=$(stat -c %s "$data/state.wal"); snapshot_bytes=0; for snapshot in "$data/state.snapshot.lz4" "$data.snapshot.lz4"; do if test -f "$snapshot" && test ! -L "$snapshot"; then snapshot_bytes=$((snapshot_bytes + $(stat -c %s "$snapshot"))); fi; done; binding_bytes=$((wal_bytes + snapshot_bytes)); test "$binding_bytes" -ge "$bytes" || binding_bytes=$bytes; binding_bytes=$((binding_bytes + 2147483648)); required_bytes=$((bytes + binding_bytes)); required_inodes=$((files + 10000)); free_bytes=$(df -PB1 /root | awk '\''NR==2 {print $4}'\''); free_inodes=$(df -Pi /root | awk '\''NR==2 {print $4}'\''); test "$free_bytes" -ge "$required_bytes" || { printf "insufficient recovery bytes including v3 headroom: need=%s free=%s\n" "$required_bytes" "$free_bytes" >&2; exit 1; }; test "$free_inodes" -ge "$required_inodes" || { printf "insufficient recovery inodes including v3 headroom: need=%s free=%s\n" "$required_inodes" "$free_inodes" >&2; exit 1; }' \
             /bin/sh "/root/arc-recovery-captures/$capture_id/$node" "$pid" "$start_ticks" \
             "$boot_id" "$writer_cgroup_sha" "$writer_supervision_mode" \
@@ -5287,21 +5286,58 @@ remote_readiness() {
             "$supervisor_executable_path" "$supervisor_executable_sha" "$supervisor_argv_sha" \
             "$executable_path" "$exe_sha" "$argv_sha" "$data_dir" \
             "$model_path" "$model_sha" "$model_size" >/dev/null 2>&1; then
-            printf '  exact live writer/disk ready: %s %s pid=%s data=%s\n' "$node" "$host" "$pid" "$data_dir"
-            continue
-        fi
-        run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null || \
-            die "$node is neither the exact sealed live writer nor an exact persistently fenced stop"
-        local readiness_state=stopped
-        if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
-            readiness_state=captured
-        fi
-        ssh_remote_exact "$host" /bin/sh -c \
+        printf '  exact live writer/disk ready: %s %s pid=%s data=%s\n' "$node" "$host" "$pid" "$data_dir"
+        return 0
+    fi
+    run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null || \
+        die "$node is neither the exact sealed live writer nor an exact persistently fenced stop"
+    local readiness_state=stopped
+    if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
+        readiness_state=captured
+    fi
+    ssh_remote_exact "$host" /bin/sh -c \
             'set -eu; data=$1 model=$2 model_sha=$3 model_size=$4; ! pgrep -x arc-node >/dev/null 2>&1; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal_bytes=$(stat -c %s "$data/state.wal"); snapshot_bytes=0; for snapshot in "$data/state.snapshot.lz4" "$data.snapshot.lz4"; do if test -f "$snapshot" && test ! -L "$snapshot"; then snapshot_bytes=$((snapshot_bytes + $(stat -c %s "$snapshot"))); fi; done; binding_bytes=$((wal_bytes + snapshot_bytes)); test "$binding_bytes" -ge "$bytes" || binding_bytes=$bytes; binding_bytes=$((binding_bytes + 2147483648)); required_bytes=$((bytes + binding_bytes)); required_inodes=$((files + 10000)); free_bytes=$(df -PB1 /root | awk '\''NR==2 {print $4}'\''); free_inodes=$(df -Pi /root | awk '\''NR==2 {print $4}'\''); test "$free_bytes" -ge "$required_bytes"; test "$free_inodes" -ge "$required_inodes"' \
             /bin/sh "$data_dir" "$model_path" "$model_sha" "$model_size"
-        printf '  exact %s stop/content and disk ready: %s %s data=%s\n' \
-            "$readiness_state" "$node" "$host" "$data_dir"
+    printf '  exact %s stop/content and disk ready: %s %s data=%s\n' \
+        "$readiness_state" "$node" "$host" "$data_dir"
+}
+
+remote_readiness() {
+    [ "$#" -eq 4 ] || die "remote readiness requires capture, freeze, plan, and log root"
+    local capture_id="$1" freeze_sha="$2" freeze_plan="$3" log_root="$4"
+    local readiness_log_root failed=0 index node
+    local pids=() names=()
+    [ -d "$log_root" ] && [ ! -L "$log_root" ] || \
+        die "remote readiness log root is missing or unsafe"
+    readiness_log_root="$log_root/remote-readiness"
+    mkdir -m 700 -- "$readiness_log_root"
+    # Each host re-hashes its multi-gigabyte model and current data capacity.
+    # Run the six independent, read-only probes concurrently so that cold disk
+    # caches cannot consume the 300-second first-quarantine selection lease.
+    # The dispatcher phase owns a background process group, so close stdin for
+    # every worker: an ssh client must never inherit the controlling terminal
+    # and stop the guarded phase with SIGTTIN.
+    for node in nyc lax ams lhr nrt sgp; do
+        (
+            remote_readiness_node "$capture_id" "$freeze_sha" "$freeze_plan" "$node"
+        ) </dev/null > "$readiness_log_root/$node.log" 2>&1 &
+        pids+=("$!")
+        names+=("$node")
     done
+    for index in "${!pids[@]}"; do
+        if ! wait "${pids[$index]}"; then
+            failed=1
+        fi
+    done
+    for node in "${names[@]}"; do
+        if [ "$failed" -eq 0 ]; then
+            /bin/cat -- "$readiness_log_root/$node.log"
+        else
+            printf 'archive fleet: readiness probe output: %s\n' "$node" >&2
+            /bin/cat -- "$readiness_log_root/$node.log" >&2
+        fi
+    done
+    [ "$failed" -eq 0 ] || die "one or more exact live/stopped readiness probes failed"
 }
 
 stop_after_quarantine_round_exact() {
@@ -8950,6 +8986,11 @@ PY
     local quarantine_generation_ledger_sha
     local observation_selection_sha operator_selection_monotonic_ns
     local operator_selection_realtime_ns
+    # Slow, independent model/data/disk verification must complete before the
+    # first-quarantine selection and its dual operator clocks are created.
+    # Otherwise cold caches can consume the bounded 300-second lease before
+    # every node has durably accepted the shared readiness artifact.
+    remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan" "$log_root"
     observation_selection_sha="$(seal_live_observation_selection "$observation_selection" \
         "$observation_generation_receipt" "$live_observation_statuses" \
         "$freeze_sha" "$capture_id")"
@@ -8971,7 +9012,6 @@ PY
     fi
     printf 'archive fleet: selected fresh canary-bound live-observation generation %s root=%s\n' \
         "$observation_generation" "$observation_selection_sha"
-    remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan"
     quarantine_generation_ledger_sha="$(run_quarantine_generation_rounds \
         "$freeze_plan" "$freeze_sha" "$capture_id" "$maintenance_input_root" \
         "$log_root" "$quarantine_generation_ledger" "$inspector_binary_sha" \
@@ -13335,7 +13375,7 @@ archive_dispatch_phase() {
     # Keep this as a direct simple command. Placing a phase function in an
     # if/!/&&/|| condition disables errexit throughout that function and could
     # let a failed precondition continue into a later mutation.
-    "$command_name" "$@"
+    "$command_name" "$@" </dev/null
 }
 
 archive_dispatch_parent_watchdog() {
@@ -13552,7 +13592,7 @@ set --
 . "$phase_overrides"
 archive_dispatch_phase "${phase_arguments[@]}"
 ' arc-archive-dispatch-phase "$ORCHESTRATOR" "$gate/phase-overrides.sh" \
-            "$supervisor_pid" "$gate" "$command_name" "$@" &
+            "$supervisor_pid" "$gate" "$command_name" "$@" </dev/null &
         phase_pid="$!"
         ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE=true
         for ((attempt = 0; attempt < 250; attempt += 1)); do

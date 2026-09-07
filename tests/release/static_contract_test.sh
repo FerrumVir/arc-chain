@@ -2717,8 +2717,10 @@ phase_body = text[
     text.index("archive_dispatch_phase() {"):
     text.index("archive_dispatch_parent_watchdog() {")
 ]
-if '\n    "$command_name" "$@"\n' not in phase_body:
-    raise SystemExit("archive phase is not invoked as a direct fail-fast simple command")
+if '\n    "$command_name" "$@" </dev/null\n' not in phase_body:
+    raise SystemExit(
+        "archive phase is not a direct fail-fast command with controlling-terminal stdin closed"
+    )
 if re.search(r'(?m)^\s*(?:if|!)[^\n]*"\$command_name"', phase_body) or \
         re.search(r'"\$command_name"[^\n]*(?:&&|\|\|)', phase_body):
     raise SystemExit("archive phase command is in a context that disables function errexit")
