@@ -5021,6 +5021,10 @@ def write_frontend_config(
         validate_distinct_receipt_evidence(reward_evidence)
     elif reward_evidence is not None:
         fail("--reward-evidence is permitted only for a receipt-mode frontend publication")
+    # Bind every published checkpoint identity to the exact sealed ARCCHKPT
+    # inspected in this process.  Artifact SHA verification alone cannot prove
+    # the inner payload root that the public recovery projection exposes.
+    rollout.verify_checkpoint()
     archive = rollout.manifest["archive"]
     finalized = all(archive[field] != "0" * 64 for field in ARCHIVE_FINALIZATION_FIELDS)
     if finalized:
@@ -5038,9 +5042,15 @@ def write_frontend_config(
             ]
         else:
             assert archive_complete_path is not None
-            legacy_archive_nodes = load_legacy_archive_fork_nodes(
+            local_fork_rows = load_legacy_archive_fork_nodes(
                 rollout, archive_manifest_path, archive_complete_path
             )
+            local_forks = rollout._enrich_legacy_archive_fork_rows(local_fork_rows)
+            legacy_archive_nodes = [
+                local_forks[node["name"]]
+                for node in rollout.validators
+                if node["name"] in local_forks
+            ]
     else:
         if archive_manifest_path is not None or archive_complete_path is not None:
             fail("prearchive frontend publication cannot accept finalized archive files")
@@ -5619,6 +5629,7 @@ class RecoveryRollout:
         self.production_public_listener_baseline: dict[str, dict[str, int]] = {}
         self.archive_metadata_loaded = False
         self.production_archive_verified_root: str | None = None
+        self.verified_checkpoint_identity: dict[str, str] | None = None
         self.archive_manifest_payload: bytes | None = None
         self.archive_complete_payload: bytes | None = None
         self.legacy_archive_forks: dict[str, dict[str, Any]] = {}
@@ -6715,7 +6726,7 @@ class RecoveryRollout:
         }
 
     def _legacy_archive_sources(
-        self, archived_forks: Sequence[Mapping[str, str]]
+        self, archived_forks: Sequence[Mapping[str, Any]]
     ) -> list[dict[str, Any]]:
         """Derive alternate-source config only from a live, pinned provenance proof.
 
@@ -6827,11 +6838,55 @@ class RecoveryRollout:
                 fail(f"legacy archive {index} bundle root differs from its sealed row")
             if normalized["inventory_sha256"] != archived_fork.get("inventory_sha256"):
                 fail(f"legacy archive {index} inventory root differs from its sealed row")
+            immutable_hash_fields = (
+                "binding_index_sha256",
+                "binding_sha256",
+                "checkpoint_sha256",
+                "checkpoint_manifest_hash",
+                "checkpoint_payload_hash",
+                "source_block_hash",
+                "source_state_root",
+            )
+            for field in immutable_hash_fields:
+                expected_value = archived_fork.get(field)
+                if expected_value is None:
+                    fail(
+                        f"legacy archive {index} has no immutable {field} expectation; "
+                        "fetch the verified binding metadata before publication"
+                    )
+                expected_hash = bare_hash(
+                    expected_value,
+                    f"legacy archive {index} immutable {field}",
+                )
+                if normalized[field] != expected_hash:
+                    fail(
+                        f"legacy archive {index} {field} differs from its immutable binding tree"
+                    )
+            immutable_integer_fields = (
+                "source_height",
+                "source_consensus_round",
+                "recovery_epoch",
+                "validator_set_id",
+            )
+            for field in immutable_integer_fields:
+                expected_value = archived_fork.get(field)
+                if (
+                    isinstance(expected_value, bool)
+                    or not isinstance(expected_value, int)
+                    or expected_value < 0
+                ):
+                    fail(
+                        f"legacy archive {index} has no immutable {field} expectation"
+                    )
+                if proof[field] != expected_value:
+                    fail(
+                        f"legacy archive {index} {field} differs from its immutable binding tree"
+                    )
             if proof["canonical_checkpoint_height"] != self.chain["source_height"]:
                 fail(f"legacy archive {index} canonical checkpoint height differs")
-            if proof["recovery_epoch"] != self.chain["recovery_epoch"]:
+            if archived_fork["recovery_epoch"] != self.chain["recovery_epoch"]:
                 fail(f"legacy archive {index} recovery epoch differs")
-            if proof["validator_set_id"] != self.chain["validator_set_id"]:
+            if archived_fork["validator_set_id"] != self.chain["validator_set_id"]:
                 fail(f"legacy archive {index} validator set differs")
             sources.append(
                 {
@@ -6880,6 +6935,34 @@ class RecoveryRollout:
         """
         if self.manifest["mode"] != "production":
             fail("recovered frontend config requires a production rollout manifest")
+        checkpoint_identity = self.verified_checkpoint_identity
+        if checkpoint_identity is None:
+            fail(
+                "recovered frontend config requires a same-process sealed checkpoint verification"
+            )
+        if set(checkpoint_identity) != {
+            "checkpoint_sha256",
+            "checkpoint_manifest_hash",
+            "checkpoint_payload_hash",
+        }:
+            fail("verified checkpoint identity has an unsupported field set")
+        expected_checkpoint_identity = {
+            "checkpoint_sha256": bare_hash(
+                self.manifest["artifacts"]["checkpoint"]["sha256"],
+                "manifest checkpoint artifact sha256",
+            ),
+            "checkpoint_manifest_hash": bare_hash(
+                self.chain["approved_checkpoint_manifest_hash"],
+                "manifest checkpoint manifest hash",
+            ),
+        }
+        for field, wanted in expected_checkpoint_identity.items():
+            if bare_hash(checkpoint_identity[field], f"verified {field}") != wanted:
+                fail(f"verified {field} differs from the sealed manifest")
+        checkpoint_payload_hash = bare_hash(
+            checkpoint_identity["checkpoint_payload_hash"],
+            "verified checkpoint payload hash",
+        )
         sources = [
             {
                 "id": f"v3-{node['name']}",
@@ -6921,6 +7004,10 @@ class RecoveryRollout:
                 "manifestHash": bare_hash(
                     chain["approved_checkpoint_manifest_hash"], "checkpoint manifest hash"
                 ),
+                "checkpointFileSha256": expected_checkpoint_identity[
+                    "checkpoint_sha256"
+                ],
+                "checkpointPayloadHash": checkpoint_payload_hash,
                 "boundaryBlockHash": bare_hash(
                     chain["transition_block_hash"], "transition block hash"
                 ),
@@ -7121,8 +7208,27 @@ class RecoveryRollout:
                         fail(f"recovery {output_name} {key} differs from the locked manifest")
                 elif got != wanted:
                     fail(f"recovery {output_name} {key} differs: expected {wanted!r}, got {got!r}")
+        inspected_payload = bare_hash(
+            inspected.get("payload_hash"), "recovery inspect.payload_hash"
+        )
+        verified_payload = bare_hash(
+            verified.get("payload_hash"), "recovery verify.payload_hash"
+        )
+        if inspected_payload != verified_payload:
+            fail("recovery inspect/verify payload hashes differ")
         if verified.get("status") != "VERIFIED_QUORUM" or verified.get("signature_count", 0) < REQUIRED_APPROVALS:
             fail("checkpoint does not carry a verified 5-of-6 signature quorum")
+        self.verified_checkpoint_identity = {
+            "checkpoint_sha256": bare_hash(
+                self.manifest["artifacts"]["checkpoint"]["sha256"],
+                "manifest checkpoint artifact sha256",
+            ),
+            "checkpoint_manifest_hash": bare_hash(
+                self.chain["approved_checkpoint_manifest_hash"],
+                "manifest checkpoint manifest hash",
+            ),
+            "checkpoint_payload_hash": inspected_payload,
+        }
         self.say("PASS checkpoint content, GO pin, v3 boundary, and 5-of-6 signature quorum")
 
     def verify_execution_provenance(self) -> None:
@@ -7284,6 +7390,228 @@ class RecoveryRollout:
             fail(f"archive object {name} changed after complete-archive verification")
         return payload
 
+    def _load_remote_legacy_binding_metadata(
+        self,
+        node: Mapping[str, Any],
+        *,
+        binding_index_sha256: str,
+    ) -> dict[str, Any]:
+        """Read the immutable fork identity from its stopped, hash-bound tree.
+
+        The public archive process independently validates these same objects,
+        but its ``/provenance`` response is not itself an out-of-band trust
+        root.  Capture an expected projection here so publication can compare
+        every live field with the exact binding index, binding, and ARCCHKPT
+        retained on the stopped validator.
+        """
+
+        archive = self.manifest["archive"]
+        expected_index = bare_hash(
+            binding_index_sha256,
+            f"legacy archive {node['name']} binding index sha256",
+        )
+        source_root = (
+            f"/root/arc-recovery-bindings/"
+            f"{archive['prearchive_rollout_sha256']}/{node['name']}"
+        )
+        output = self.ssh_read_only(
+            node,
+            "set -eu\n"
+            + self.remote_semantic_python_prelude(node)
+            + r'''root=$1 expected_index=$2 expected_capture=$3 expected_rollout=$4 expected_node=$5
+case "$root" in /root/arc-recovery-bindings/*/"$expected_node") ;; *) exit 1 ;; esac
+test -d "$root" && test ! -L "$root"
+for name in binding.files.sha256 binding.json candidate.arcchkpt; do
+  test -f "$root/$name" && test ! -L "$root/$name"
+  test -z "$(find "$root/$name" -maxdepth 0 -perm /0222 -print -quit)"
+done
+printf '%s  %s\n' "$expected_index" "$root/binding.files.sha256" | sha256sum --check --strict
+arc_semantic_python - "$root" "$expected_index" "$expected_capture" "$expected_rollout" "$expected_node" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+
+root=pathlib.Path(sys.argv[1])
+expected_index,expected_capture,expected_rollout,expected_node=sys.argv[2:]
+
+def digest(path):
+    value=hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda:handle.read(1024*1024),b''):
+            value.update(chunk)
+    return value.hexdigest()
+
+def bare(value,label):
+    if not isinstance(value,str): raise SystemExit(f'{label} is not a hash')
+    normalized=value.removeprefix('0x')
+    if re.fullmatch(r'[0-9a-f]{64}',normalized) is None:
+        raise SystemExit(f'{label} is malformed')
+    return normalized
+
+index_path=root/'binding.files.sha256'
+if index_path.stat().st_size>65536 or (root/'binding.json').stat().st_size>4194304:
+    raise SystemExit('binding metadata exceeds its safety limit')
+index_payload=index_path.read_bytes()
+if digest(index_path)!=expected_index or not index_payload.endswith(b'\n') or b'\r' in index_payload or b'\0' in index_payload:
+    raise SystemExit('binding index bytes differ')
+rows={}
+for line in index_payload.decode('ascii').splitlines():
+    match=re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9_.@/+:-]+)',line)
+    if match is None or match.group(2) in rows:
+        raise SystemExit('unsafe or duplicate binding index row')
+    rows[match.group(2)]=match.group(1)
+if 'binding.json' not in rows or 'candidate.arcchkpt' not in rows:
+    raise SystemExit('binding index omits archive inputs')
+
+binding_path=root/'binding.json'
+checkpoint_path=root/'candidate.arcchkpt'
+if digest(binding_path)!=rows['binding.json'] or digest(checkpoint_path)!=rows['candidate.arcchkpt']:
+    raise SystemExit('binding index content hash differs')
+binding_payload=binding_path.read_bytes()
+try: binding=json.loads(binding_payload)
+except (UnicodeDecodeError,json.JSONDecodeError) as error:
+    raise SystemExit(f'binding is invalid JSON: {error}')
+binding_fields={
+    'schema','capture_id','node','rollout_manifest_sha256',
+    'source_consensus_round','created_at_unix_ms','allow_unbound_legacy_wal',
+    'legacy_validator_set_artifact_sha256','source_snapshot_artifact_sha256',
+    'reference_source_wal_artifact_sha256','export_exit_code','classification',
+    'classification_reason','canonical_match','expected','exported',
+}
+if not isinstance(binding,dict) or set(binding)!=binding_fields:
+    raise SystemExit('binding field set differs')
+canonical=(json.dumps(binding,sort_keys=True,separators=(',',':'))+'\n').encode()
+if binding_payload!=canonical:
+    raise SystemExit('binding is not canonical JSON')
+if (binding.get('schema')!='arc.recovery.capture-binding.v3'
+        or bare(binding.get('capture_id'),'binding capture id')!=expected_capture
+        or binding.get('node')!=expected_node
+        or bare(binding.get('rollout_manifest_sha256'),'binding rollout')!=expected_rollout
+        or binding.get('classification')!='valid_noncanonical_fork'
+        or binding.get('canonical_match') is not False
+        or binding.get('export_exit_code')!=0):
+    raise SystemExit('binding identity/classification differs')
+exported=binding.get('exported')
+exported_fields={
+    'source_height','source_block_hash','source_state_root','full_state_root',
+    'source_consensus_round','created_at_unix_ms','recovery_epoch',
+    'validator_set_id','manifest_hash','payload_hash','source_validator_count',
+    'source_validator_stake','source_validator_set_hash',
+}
+if not isinstance(exported,dict) or set(exported)!=exported_fields:
+    raise SystemExit('binding exported field set differs')
+for field in ('source_height','source_consensus_round','recovery_epoch','validator_set_id'):
+    if isinstance(exported.get(field),bool) or not isinstance(exported.get(field),int) or exported[field]<0:
+        raise SystemExit(f'binding exported {field} is malformed')
+value={
+    'schema':'arc.recovery.legacy-archive-binding-projection.v1',
+    'node':expected_node,
+    'binding_index_sha256':expected_index,
+    'binding_sha256':rows['binding.json'],
+    'checkpoint_sha256':rows['candidate.arcchkpt'],
+    'checkpoint_manifest_hash':bare(exported.get('manifest_hash'),'checkpoint manifest hash'),
+    'checkpoint_payload_hash':bare(exported.get('payload_hash'),'checkpoint payload hash'),
+    'source_height':exported['source_height'],
+    'source_block_hash':bare(exported.get('source_block_hash'),'source block hash'),
+    'source_state_root':bare(exported.get('source_state_root'),'source state root'),
+    'source_consensus_round':exported['source_consensus_round'],
+    'recovery_epoch':exported['recovery_epoch'],
+    'validator_set_id':exported['validator_set_id'],
+}
+sys.stdout.write(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n')
+PY
+arc_semantic_python_revalidate
+''',
+            (
+                source_root,
+                expected_index,
+                archive["capture_id"],
+                archive["prearchive_rollout_sha256"],
+                node["name"],
+            ),
+            timeout=3600,
+        )
+        try:
+            metadata = require_keys(
+                json.loads(output),
+                f"legacy archive {node['name']} immutable binding projection",
+                (
+                    "schema", "node", "binding_index_sha256", "binding_sha256",
+                    "checkpoint_sha256", "checkpoint_manifest_hash",
+                    "checkpoint_payload_hash", "source_height", "source_block_hash",
+                    "source_state_root", "source_consensus_round", "recovery_epoch",
+                    "validator_set_id",
+                ),
+            )
+        except json.JSONDecodeError as error:
+            fail(f"legacy archive {node['name']} binding projection is invalid JSON: {error}")
+        if output.encode("utf-8") != canonical_bytes(metadata):
+            fail(f"legacy archive {node['name']} binding projection is noncanonical")
+        if metadata["schema"] != "arc.recovery.legacy-archive-binding-projection.v1":
+            fail(f"legacy archive {node['name']} binding projection schema differs")
+        if metadata["node"] != node["name"]:
+            fail(f"legacy archive {node['name']} binding projection node differs")
+        for field in (
+            "binding_index_sha256", "binding_sha256", "checkpoint_sha256",
+            "checkpoint_manifest_hash", "checkpoint_payload_hash",
+            "source_block_hash", "source_state_root",
+        ):
+            metadata[field] = bare_hash(
+                metadata[field], f"legacy archive {node['name']} {field}"
+            )
+        if metadata["binding_index_sha256"] != expected_index:
+            fail(f"legacy archive {node['name']} binding index projection differs")
+        for field in (
+            "source_height", "source_consensus_round", "recovery_epoch",
+            "validator_set_id",
+        ):
+            required_int(
+                metadata[field],
+                f"legacy archive {node['name']} {field}",
+            )
+        return metadata
+
+    def _enrich_legacy_archive_fork_rows(
+        self, fork_rows: Sequence[Mapping[str, str]]
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve every fork row through its hash-pinned inventory and binding."""
+
+        archive = self.manifest["archive"]
+        validators_by_name = {node["name"]: node for node in self.validators}
+        deployments: dict[str, dict[str, Any]] = {}
+        for supplied in fork_rows:
+            row = dict(supplied)
+            node = row["node"]
+            if node not in validators_by_name or node in deployments:
+                fail("legacy archive metadata has an unknown or duplicate validator")
+            expected_inventory_name = f"legacy-{node}.inventory"
+            expected_bundle_name = f"legacy-{node}.tar.zst"
+            if (
+                row["inventory_name"] != expected_inventory_name
+                or row["bundle_name"] != expected_bundle_name
+            ):
+                fail(f"legacy archive row for {node} uses noncanonical object names")
+            inventory_payload = self._rclone_cat_pinned_archive_object(
+                expected_inventory_name,
+                row["inventory_sha256"],
+                max_bytes=64 * 1024,
+            )
+            inventory = parse_legacy_archive_inventory(
+                inventory_payload,
+                node=node,
+                capture_id=archive["capture_id"],
+                rollout_manifest_sha256=archive["prearchive_rollout_sha256"],
+            )
+            binding_metadata = self._load_remote_legacy_binding_metadata(
+                validators_by_name[node],
+                binding_index_sha256=inventory["binding_index_sha256"],
+            )
+            deployments[node] = {
+                **row,
+                "inventory_payload": inventory_payload,
+                "binding_index_sha256": inventory["binding_index_sha256"],
+                **binding_metadata,
+            }
+        return deployments
+
     def load_production_archive_metadata(self) -> None:
         """Fetch only hash-pinned small metadata needed to deploy fork readers.
 
@@ -7319,32 +7647,7 @@ class RecoveryRollout:
                 self, archive_manifest_path, complete_path
             )
 
-        deployments: dict[str, dict[str, Any]] = {}
-        for row in fork_rows:
-            node = row["node"]
-            expected_inventory_name = f"legacy-{node}.inventory"
-            expected_bundle_name = f"legacy-{node}.tar.zst"
-            if (
-                row["inventory_name"] != expected_inventory_name
-                or row["bundle_name"] != expected_bundle_name
-            ):
-                fail(f"legacy archive row for {node} uses noncanonical object names")
-            inventory_payload = self._rclone_cat_pinned_archive_object(
-                expected_inventory_name,
-                row["inventory_sha256"],
-                max_bytes=64 * 1024,
-            )
-            inventory = parse_legacy_archive_inventory(
-                inventory_payload,
-                node=node,
-                capture_id=archive["capture_id"],
-                rollout_manifest_sha256=archive["prearchive_rollout_sha256"],
-            )
-            deployments[node] = {
-                **row,
-                "inventory_payload": inventory_payload,
-                "binding_index_sha256": inventory["binding_index_sha256"],
-            }
+        deployments = self._enrich_legacy_archive_fork_rows(fork_rows)
         self.archive_manifest_payload = manifest_payload
         self.archive_complete_payload = complete_payload
         self.legacy_archive_forks = deployments
@@ -12869,6 +13172,7 @@ arc_semantic_python_revalidate
             + self.remote_semantic_python_prelude(node)
             + r'''root=$1 service=$2 rollout=$3 target=$4 maintenance_sha=$5 live_sha=$6 intent_sha=$7
 height=$8 block_hash=$9 state_root=${10} hostname=${11} node_name=${12} gateway_user=${13}
+validator_socket=${14}
 case "$target" in live) source_name=Caddyfile.live; source_sha=$live_sha ;; maintenance) source_name=Caddyfile.maintenance; source_sha=$maintenance_sha ;; *) exit 1 ;; esac
 case "$height" in ''|*[!0-9]*) exit 1 ;; esac
 for value in "$rollout" "$maintenance_sha" "$live_sha" "$intent_sha" "$block_hash" "$state_root"; do case "$value" in *[!0-9a-f]*|'') exit 1 ;; esac; test "${#value}" = 64; done
@@ -12886,6 +13190,32 @@ if test -e "$gate"; then
   test "$(stat -c %U:%G:%a "$gate")" = root:root:700
 else
   mkdir --mode=0700 "$gate"
+fi
+if [ "$target" = live ]; then
+  test -S "$validator_socket" && test ! -L "$validator_socket"
+  curl --silent --show-error --fail --connect-timeout 5 --max-time 30 \
+    --unix-socket "$validator_socket" "http://localhost/block/$height" | \
+    arc_semantic_python -c '
+import json,re,sys
+height=int(sys.argv[1]); block_hash=sys.argv[2]; state_root=sys.argv[3]
+payload=sys.stdin.buffer.read(16*1024*1024+1)
+if len(payload)>16*1024*1024: raise SystemExit("local final block response is oversized")
+value=json.loads(payload)
+block=value.get("block",value) if isinstance(value,dict) else None
+header=block.get("header") if isinstance(block,dict) else None
+if not isinstance(header,dict): raise SystemExit("local final block has no header")
+def bare(value,label):
+    if not isinstance(value,str): raise SystemExit(f"local final {label} is not a hash")
+    value=value.removeprefix("0x")
+    if re.fullmatch(r"[0-9a-f]{64}",value) is None: raise SystemExit(f"local final {label} is malformed")
+    return value
+observed_height=header.get("height",block.get("height"))
+observed_hash=header.get("hash",block.get("hash"))
+observed_root=header.get("state_root",header.get("stateRoot",block.get("state_root")))
+if observed_height!=height or bare(observed_hash,"block hash")!=block_hash or bare(observed_root,"state root")!=state_root:
+    raise SystemExit("local validator final commitment differs immediately before promotion")
+' "$height" "$block_hash" "$state_root"
+  arc_semantic_python_revalidate
 fi
 temporary=$(mktemp "$root/.Caddyfile.active.XXXXXX")
 trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
@@ -12954,6 +13284,7 @@ arc_semantic_python_revalidate
                 node["host"],
                 node["name"],
                 CADDY_USER,
+                self.validator_rpc_socket(node),
             ),
             timeout=120,
         )
@@ -13007,11 +13338,14 @@ arc_semantic_python_revalidate
             fail("PUBLIC_GATE_MAINTENANCE_INCOMPLETE: " + "; ".join(failures))
         self.say("PASS every reachable production edge is durably maintenance-only")
 
-    def open_public_gate(
-        self,
-        initial: tuple[int, str, str],
-        final: tuple[int, str, str],
-    ) -> str:
+    def open_public_gate(self) -> str:
+        # Complete-archive verification belongs before this method.  Once the
+        # final advancing proof starts, no potentially long-running task may
+        # separate that proof from the host-local promotion checks below.
+        self.wait_nodes_ready()
+        self.prove_production_runtime_inventory()
+        self.prove_boundary()
+        initial, final = self.prove_advancing_convergence()
         legacy_max = self.chain["legacy_public_max_height"]
         if initial[0] <= legacy_max:
             fail("public gate opening proof is not strictly above the legacy maximum")
@@ -13059,32 +13393,48 @@ arc_semantic_python_revalidate
                     receipts[name] = future.result()
                 except BaseException as error:
                     failures.append(f"{name}:{type(error).__name__}:{error}")
-        if failures:
+        try:
+            if failures:
+                fail("PUBLIC_GATE_OPEN_INCOMPLETE: " + "; ".join(failures))
+            if set(receipts) != {node["name"] for node in self.validators}:
+                fail("public gate promotion receipt set is not the exact six")
+            # Keep semantic checks on authenticated SSH+loopback until every
+            # edge has switched. Any post-switch mismatch returns every
+            # reachable edge to maintenance before success is recorded.
+            self.wait_nodes_ready()
+            self.prove_boundary()
+            post_promotion = self.wait_convergence(minimum_height=final[0])
+            if post_promotion[0] < final[0]:
+                fail("post-promotion convergence fell below the promotion commitment")
+            # Host receipts contain identical commitment/config roots; preserve
+            # fleet order separately so a missing or duplicated result is visible.
+            receipt = {
+                "schema": "arc.recovery.public-gate-open-receipt.v2",
+                "rollout_manifest_sha256": self.digest,
+                "promotion_intent_sha256": intent_sha,
+                "final": self._commitment_receipt(final),
+                "post_promotion": self._commitment_receipt(post_promotion),
+                "nodes": [
+                    {
+                        "node": node["name"],
+                        "host": node["host"],
+                        "receipt_sha256": sha256_bytes(canonical_bytes(host_receipt)),
+                    }
+                    for node in self.validators
+                    for host_receipt in (receipts[node["name"]],)
+                ],
+            }
+            receipt_sha = self._rollback_journal_write(
+                "PUBLIC-GATE-OPEN-RECEIPT.json", receipt
+            )
+        except BaseException as original:
             try:
                 self.close_public_gate(intent_sha)
             except BaseException as close_error:
-                failures.append(f"maintenance-reclose:{type(close_error).__name__}:{close_error}")
-            fail("PUBLIC_GATE_OPEN_INCOMPLETE: " + "; ".join(failures))
-        if set(receipts) != {node["name"] for node in self.validators}:
-            fail("public gate promotion receipt set is not the exact six")
-        # Host receipts contain identical commitment/config roots; preserve
-        # fleet order separately so a missing or duplicated result is visible.
-        receipt = {
-            "schema": "arc.recovery.public-gate-open-receipt.v1",
-            "rollout_manifest_sha256": self.digest,
-            "promotion_intent_sha256": intent_sha,
-            "final": self._commitment_receipt(final),
-            "nodes": [
-                {
-                    "node": node["name"],
-                    "host": node["host"],
-                    "receipt_sha256": sha256_bytes(canonical_bytes(host_receipt)),
-                }
-                for node in self.validators
-                for host_receipt in (receipts[node["name"]],)
-            ],
-        }
-        receipt_sha = self._rollback_journal_write("PUBLIC-GATE-OPEN-RECEIPT.json", receipt)
+                raise RolloutError(
+                    f"{original}; public maintenance reclose failed: {close_error}"
+                ) from original
+            raise
         self.public_gate_receipt_sha256 = receipt_sha
         self.production_public_gate_open = True
         self.say(
@@ -14652,10 +15002,9 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
                     restart_index, "RESTART", "COMPLETE", node=node
                 )
                 self.say(f"PASS {node['name']} production restart; fleet advanced #{before} -> #{after[0]}")
-            promotion_initial, promotion_final = self.prove_advancing_convergence()
             self.verify_production_archive(verify_live_captures=True)
             self._rollback_journal_event(30, "PUBLIC-OPEN", "STARTED")
-            self.open_public_gate(promotion_initial, promotion_final)
+            self.open_public_gate()
             self._rollback_journal_event(30, "PUBLIC-OPEN", "COMPLETE")
             for node in self.validators:
                 self._prove_production_listener(node, public_contract=True)

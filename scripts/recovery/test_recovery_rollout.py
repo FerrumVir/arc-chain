@@ -799,6 +799,18 @@ class RecoveryRolloutTests(unittest.TestCase):
         }
 
     @staticmethod
+    def prime_checkpoint_identity(harness, payload_hash: str = "a" * 64):
+        harness.verified_checkpoint_identity = {
+            "checkpoint_sha256": harness.manifest["artifacts"]["checkpoint"][
+                "sha256"
+            ],
+            "checkpoint_manifest_hash": harness.chain[
+                "approved_checkpoint_manifest_hash"
+            ].removeprefix("0x"),
+            "checkpoint_payload_hash": payload_hash,
+        }
+
+    @staticmethod
     def public_tls_evidence(
         harness,
         node,
@@ -3367,10 +3379,17 @@ class RecoveryRolloutTests(unittest.TestCase):
         harness.production_public_gate_open = False
         initial_height = value["chain"]["legacy_public_max_height"] + 1
         final_height = initial_height + value["checks"]["min_height_advance"]
-        receipt_sha = harness.open_public_gate(
-            (initial_height, "1" * 64, "2" * 64),
-            (final_height, "3" * 64, "4" * 64),
+        initial = (initial_height, "1" * 64, "2" * 64)
+        final = (final_height, "3" * 64, "4" * 64)
+        post = (final_height + 1, "5" * 64, "6" * 64)
+        harness.wait_nodes_ready = mock.Mock()
+        harness.prove_production_runtime_inventory = mock.Mock()
+        harness.prove_boundary = mock.Mock()
+        harness.prove_advancing_convergence = mock.Mock(
+            return_value=(initial, final)
         )
+        harness.wait_convergence = mock.Mock(return_value=post)
+        receipt_sha = harness.open_public_gate()
         self.assertEqual(receipt_sha, "b" * 64)
         self.assertTrue(harness.production_public_gate_open)
         self.assertEqual(harness._set_public_gate_config.call_count, 6)
@@ -3380,6 +3399,10 @@ class RecoveryRolloutTests(unittest.TestCase):
         ]
         self.assertEqual(len(promoted), 6)
         self.assertEqual(set(promoted), {node["name"] for node in value["validators"]})
+        self.assertEqual(harness.wait_nodes_ready.call_count, 2)
+        self.assertEqual(harness.prove_boundary.call_count, 2)
+        harness.prove_production_runtime_inventory.assert_called_once_with()
+        harness.wait_convergence.assert_called_once_with(minimum_height=final_height)
         intent = harness._rollback_journal_write.call_args_list[0].args[1]
         self.assertGreater(
             intent["initial"]["height"], value["chain"]["legacy_public_max_height"]
@@ -3471,6 +3494,14 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
         self.assertEqual(len(captured), 1)
         self.assertIn("arc_semantic_python -", captured[0])
         self.assertNotIn("python3 -", captured[0])
+        self.assertIn("http://localhost/block/$height", captured[0])
+        self.assertLess(
+            captured[0].index("http://localhost/block/$height"),
+            captured[0].index('temporary=$(mktemp "$root/.Caddyfile.active.'),
+        )
+        self.assertEqual(
+            harness.ssh.call_args.args[2][-1], harness.validator_rpc_socket(node)
+        )
         syntax = rollout.subprocess.run(
             ["/bin/sh", "-n"],
             input=captured[0],
@@ -3508,16 +3539,70 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
 
         harness._set_public_gate_config = mock.Mock(side_effect=transition)
         public_floor = value["chain"]["legacy_public_max_height"]
+        initial = (public_floor + 1, "1" * 64, "2" * 64)
+        final = (public_floor + 2, "3" * 64, "4" * 64)
+        harness.wait_nodes_ready = mock.Mock()
+        harness.prove_production_runtime_inventory = mock.Mock()
+        harness.prove_boundary = mock.Mock()
+        harness.prove_advancing_convergence = mock.Mock(
+            return_value=(initial, final)
+        )
         with self.assertRaisesRegex(rollout.RolloutError, "PUBLIC_GATE_OPEN_INCOMPLETE"):
-            harness.open_public_gate(
-                (public_floor + 1, "1" * 64, "2" * 64),
-                (public_floor + 2, "3" * 64, "4" * 64),
-            )
+            harness.open_public_gate()
         self.assertFalse(harness.production_public_gate_open)
         maintenance_names = [name for target, name in calls if target == "maintenance"]
         self.assertEqual(len(maintenance_names), 6)
         self.assertEqual(
             set(maintenance_names), {node["name"] for node in value["validators"]}
+        )
+
+    def test_post_promotion_divergence_recloses_every_host_to_maintenance(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        harness.production_public_gate_open = False
+        harness._rollback_journal_write = mock.Mock(return_value="a" * 64)
+        calls: list[tuple[str, str]] = []
+
+        def transition(node, *, target, intent_sha256, final=None):
+            calls.append((target, node["name"]))
+            commitment = final or (0, "0" * 64, "0" * 64)
+            return {
+                "schema": "arc.recovery.public-gate-host.v1",
+                "rollout_manifest_sha256": harness.digest,
+                "state": target,
+                "active_caddyfile_sha256": "5" * 64,
+                "promotion_intent_sha256": intent_sha256,
+                "height": commitment[0],
+                "block_hash": commitment[1],
+                "state_root": commitment[2],
+                "node": node["name"],
+                "host": node["host"],
+            }
+
+        public_floor = value["chain"]["legacy_public_max_height"]
+        initial = (public_floor + 1, "1" * 64, "2" * 64)
+        final = (
+            initial[0] + value["checks"]["min_height_advance"],
+            "3" * 64,
+            "4" * 64,
+        )
+        harness._set_public_gate_config = mock.Mock(side_effect=transition)
+        harness.wait_nodes_ready = mock.Mock(
+            side_effect=[None, rollout.RolloutError("simulated post-switch divergence")]
+        )
+        harness.prove_production_runtime_inventory = mock.Mock()
+        harness.prove_boundary = mock.Mock()
+        harness.prove_advancing_convergence = mock.Mock(
+            return_value=(initial, final)
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "simulated post-switch divergence"
+        ):
+            harness.open_public_gate()
+        self.assertFalse(harness.production_public_gate_open)
+        self.assertEqual(
+            {name for target, name in calls if target == "maintenance"},
+            {node["name"] for node in value["validators"]},
         )
 
     def test_manifest_rejects_public_listener_and_protected_override(self) -> None:
@@ -4417,6 +4502,7 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
         body = {
             "status": "VERIFIED_QUORUM",
             "manifest_hash": value["chain"]["approved_checkpoint_manifest_hash"],
+            "payload_hash": "a" * 64,
             "genesis_hash": value["chain"]["genesis_hash"],
             "full_state_root": value["chain"]["full_state_root"],
             "source_height": 100,
@@ -4436,6 +4522,29 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
         inspected = dict(body, status="UNTRUSTED_INSPECTION")
         with mock.patch.object(rollout, "run_checked", side_effect=[SimpleNamespace(stdout=json.dumps(inspected)), SimpleNamespace(stdout=json.dumps(body))]):
             harness.verify_checkpoint()
+        self.assertEqual(
+            harness.verified_checkpoint_identity,
+            {
+                "checkpoint_sha256": value["artifacts"]["checkpoint"]["sha256"],
+                "checkpoint_manifest_hash": value["chain"][
+                    "approved_checkpoint_manifest_hash"
+                ].removeprefix("0x"),
+                "checkpoint_payload_hash": "a" * 64,
+            },
+        )
+        wrong_payload = dict(body, payload_hash="b" * 64)
+        with mock.patch.object(
+            rollout,
+            "run_checked",
+            side_effect=[
+                SimpleNamespace(stdout=json.dumps(inspected)),
+                SimpleNamespace(stdout=json.dumps(wrong_payload)),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError, "inspect/verify payload hashes differ"
+            ):
+                harness.verify_checkpoint()
         bad = dict(body, transition_height=102)
         with mock.patch.object(rollout, "run_checked", side_effect=[SimpleNamespace(stdout=json.dumps(inspected)), SimpleNamespace(stdout=json.dumps(bad))]):
             with self.assertRaisesRegex(rollout.RolloutError, "transition_height differs"):
@@ -4528,7 +4637,15 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
 
     def test_frontend_config_binds_source_boundary_domain_and_all_six_v3_replicas(self) -> None:
         value = self.fixture(production=True)
+        unverified = rollout.RecoveryRollout(
+            value, "d" * 64, output=io.StringIO()
+        )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "same-process sealed checkpoint verification"
+        ):
+            unverified.frontend_config()
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        self.prime_checkpoint_identity(harness)
         reward_evidence = self.two_receipt_evidence()
         config = harness.frontend_config()
         checkpoint = config["checkpoint"]
@@ -4547,6 +4664,11 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
         self.assertEqual(checkpoint["recoveryEpoch"], 7)
         self.assertEqual(checkpoint["validatorSetId"], 9)
         self.assertEqual(checkpoint["protocolVersion"], "3.0.0")
+        self.assertEqual(
+            checkpoint["checkpointFileSha256"],
+            value["artifacts"]["checkpoint"]["sha256"],
+        )
+        self.assertEqual(checkpoint["checkpointPayloadHash"], "a" * 64)
         self.assertEqual(
             checkpoint["recoveryDomain"], value["chain"]["recovery_domain"].removeprefix("0x")
         )
@@ -4605,9 +4727,11 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
         lax_value["chain"]["canonical_source_selection"]["sha256"] = hashlib.sha256(
             rollout.canonical_bytes(selection)
         ).hexdigest()
-        lax_config = rollout.RecoveryRollout(
+        lax_harness = rollout.RecoveryRollout(
             lax_value, "d" * 64, output=io.StringIO()
-        ).frontend_config()
+        )
+        self.prime_checkpoint_identity(lax_harness)
+        lax_config = lax_harness.frontend_config()
         self.assertEqual(lax_config["checkpoint"]["legacySourceId"], "v3-lax")
         self.assertEqual(lax_config["checkpoint"]["v3SourceId"], "v3-lax")
 
@@ -4620,6 +4744,7 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
             }
         )
         fork_harness = rollout.RecoveryRollout(fork_value, "d" * 64, output=io.StringIO())
+        self.prime_checkpoint_identity(fork_harness)
         proof = {
             "schema": "arc.legacy-archive.query.v1",
             "read_only": True,
@@ -4648,6 +4773,17 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
             "node": "nyc",
             "bundle_sha256": "1" * 64,
             "inventory_sha256": "2" * 64,
+            **{
+                field: proof[field]
+                for field in (
+                    "binding_index_sha256", "binding_sha256",
+                    "checkpoint_sha256", "checkpoint_manifest_hash",
+                    "checkpoint_payload_hash", "source_height",
+                    "source_block_hash", "source_state_root",
+                    "source_consensus_round", "recovery_epoch",
+                    "validator_set_id",
+                )
+            },
         }
         def archive_browser_boundary(
             node, path, *, method, origin=None, data=None, timeout=20
@@ -4695,7 +4831,8 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
             equal_or_lower = copy.deepcopy(proof)
             equal_or_lower["source_height"] = archive_height
             fork_harness._http_json.return_value = equal_or_lower
-            exposed = fork_harness.frontend_config([archived_fork])["sources"][-1]
+            height_bound_archive = dict(archived_fork, source_height=archive_height)
+            exposed = fork_harness.frontend_config([height_bound_archive])["sources"][-1]
             self.assertEqual(exposed["archive"]["sourceHeight"], archive_height)
             self.assertEqual(
                 exposed["archive"]["canonicalCheckpointHeight"],
@@ -4716,6 +4853,23 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
         fork_harness._http_json = mock.Mock(return_value=forged_bundle)
         with self.assertRaisesRegex(rollout.RolloutError, "bundle root differs"):
             fork_harness.frontend_config([archived_fork])
+        for field in (
+            "binding_index_sha256", "binding_sha256", "checkpoint_sha256",
+            "checkpoint_manifest_hash", "checkpoint_payload_hash",
+            "source_block_hash", "source_state_root", "source_height",
+            "source_consensus_round", "recovery_epoch", "validator_set_id",
+        ):
+            forged = copy.deepcopy(proof)
+            forged[field] = (
+                forged[field] + 1
+                if isinstance(forged[field], int)
+                else "f" * 64
+            )
+            fork_harness._http_json = mock.Mock(return_value=forged)
+            with self.subTest(immutable_archive_field=field), self.assertRaisesRegex(
+                rollout.RolloutError, "immutable binding tree"
+            ):
+                fork_harness.frontend_config([archived_fork])
         fork_harness._http_json = mock.Mock(return_value=proof)
         fork_harness._http_status_headers = mock.Mock(
             side_effect=lambda node, path, *, method, origin=None, data=None, timeout=20: (
@@ -4740,6 +4894,9 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
             fork_harness.frontend_config([archived_fork])
 
         blocked = self.root / "frontend.blocked.json"
+        harness.verify_checkpoint = mock.Mock(
+            side_effect=lambda: self.prime_checkpoint_identity(harness)
+        )
         harness.verify_live = mock.Mock(side_effect=rollout.RolloutError("height gate pending"))
         with self.assertRaisesRegex(rollout.RolloutError, "height gate pending"):
             rollout.write_frontend_config(
@@ -4890,6 +5047,31 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
             "validator_set_id": value["chain"]["validator_set_id"],
         }
         harness._http_json = mock.Mock(return_value=proof)
+        harness.verify_checkpoint = mock.Mock(
+            side_effect=lambda: self.prime_checkpoint_identity(harness)
+        )
+        harness._enrich_legacy_archive_fork_rows = mock.Mock(
+            return_value={
+                value["validators"][0]["name"]: {
+                    "node": value["validators"][0]["name"],
+                    "bundle_name": f"legacy-{value['validators'][0]['name']}.tar.zst",
+                    "inventory_name": f"legacy-{value['validators'][0]['name']}.inventory",
+                    "bundle_sha256": "1" * 64,
+                    "inventory_sha256": "2" * 64,
+                    **{
+                        field: proof[field]
+                        for field in (
+                            "binding_index_sha256", "binding_sha256",
+                            "checkpoint_sha256", "checkpoint_manifest_hash",
+                            "checkpoint_payload_hash", "source_height",
+                            "source_block_hash", "source_state_root",
+                            "source_consensus_round", "recovery_epoch",
+                            "validator_set_id",
+                        )
+                    },
+                }
+            }
+        )
         harness._http_status_headers = mock.Mock(
             side_effect=lambda node, path, *, method, origin=None, data=None, timeout=20: (
                 (405, {})
@@ -5217,6 +5399,11 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         )
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
         events: list[str] = []
+        def verify_checkpoint():
+            events.append("checkpoint-verified")
+            self.prime_checkpoint_identity(harness)
+
+        harness.verify_checkpoint = mock.Mock(side_effect=verify_checkpoint)
         harness.verify_production_archive = mock.Mock(
             side_effect=lambda: events.append("archive-verified") or "2" * 64
         )
@@ -5235,7 +5422,13 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             harness, output, reward_evidence=reward_evidence
         )
         self.assertEqual(
-            events, ["archive-verified", "metadata-loaded", "live-verified"]
+            events,
+            [
+                "checkpoint-verified",
+                "archive-verified",
+                "metadata-loaded",
+                "live-verified",
+            ],
         )
         self.assertTrue(output.exists())
 
@@ -5951,7 +6144,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         reward_sha256 = harness.persist_reward_evidence(evidence)
         gate_payload = rollout.canonical_bytes(
             {
-                "schema": "arc.recovery.public-gate-open-receipt.v1",
+                "schema": "arc.recovery.public-gate-open-receipt.v2",
                 "rollout_manifest_sha256": harness.digest,
             }
         )
@@ -6122,6 +6315,9 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
     def test_receipt_mode_frontend_publication_requires_two_bound_receipts(self) -> None:
         value = self.fixture(production=True, reward_receipt=True)
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        harness.verify_checkpoint = mock.Mock(
+            side_effect=lambda: self.prime_checkpoint_identity(harness)
+        )
         harness.verify_live = mock.Mock()
         with self.assertRaisesRegex(rollout.RolloutError, "requires --reward-evidence"):
             rollout.write_frontend_config(harness, self.root / "missing-evidence.json")
@@ -6276,11 +6472,16 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         source = MODULE_PATH.read_text(encoding="utf-8")
         before_start = source.index('self._rollback_journal_event(5, "QUORUM-START"')
         preflight = source.index('self._prove_public_tls_fleet(phase="preflight")')
-        public_open = source.index('self.open_public_gate(promotion_initial, promotion_final)')
+        archive_verify = source.index(
+            'self.verify_production_archive(verify_live_captures=True)',
+            before_start,
+        )
+        public_open = source.index('self.open_public_gate()', archive_verify)
         post_rollout = source.index(
             'self._prove_public_tls_fleet(phase="post-rollout")'
         )
         self.assertLess(preflight, before_start)
+        self.assertLess(archive_verify, public_open)
         self.assertLess(public_open, post_rollout)
 
     def test_gateway_is_https_only_loopback_limited_and_fail_closed(self) -> None:

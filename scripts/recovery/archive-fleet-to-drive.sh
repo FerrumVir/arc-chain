@@ -12340,6 +12340,8 @@ seal_phase() {
     maintenance_evidence_bundle_sha="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle.sha256)"
     maintenance_evidence_bundle_sidecar="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle_sidecar.path)"
     maintenance_evidence_bundle_sidecar_sha="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle_sidecar.sha256)"
+    local canonical_source_preselection canonical_source_preselection_sha
+    local canonical_source_preselection_sidecar canonical_source_preselection_sidecar_sha
     canonical_source_preselection="$(manifest_field "$manifest" artifacts.canonical_source_preselection.path)"
     canonical_source_preselection_sha="$(manifest_field "$manifest" artifacts.canonical_source_preselection.sha256)"
     canonical_source_preselection_sidecar="$(manifest_field "$manifest" artifacts.canonical_source_preselection_sidecar.path)"
