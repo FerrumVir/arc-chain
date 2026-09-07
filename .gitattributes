@@ -1,4 +1,8 @@
 *.pdf binary
+# Tauri serializes this manifest with LF during Windows builds. Check it out in
+# that canonical form so its strict post-build source-drift gate distinguishes
+# real changes from Git's CRLF worktree conversion.
+desktop/src-tauri/Cargo.toml text eol=lf
 # Preserve the byte-exact crates.io payload on every checkout. The canonical
 # MIT text intentionally contains its published blank line at EOF.
 vendor/third_party/glib-0.18.5/** text eol=lf

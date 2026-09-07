@@ -5,14 +5,22 @@ TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 PREFLIGHT="$REPO_ROOT/.github/workflows/release-signing-preflight.yml"
 RELEASE="$REPO_ROOT/.github/workflows/release.yml"
+ATTRIBUTES="$REPO_ROOT/.gitattributes"
 
-python3 - "$PREFLIGHT" "$RELEASE" <<'PY'
+python3 - "$PREFLIGHT" "$RELEASE" "$ATTRIBUTES" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 preflight = Path(sys.argv[1]).read_text(encoding="utf-8")
 release = Path(sys.argv[2]).read_text(encoding="utf-8")
+attributes = Path(sys.argv[3]).read_text(encoding="utf-8").splitlines()
+
+windows_tauri_manifest_rule = "desktop/src-tauri/Cargo.toml text eol=lf"
+if attributes.count(windows_tauri_manifest_rule) != 1:
+    raise SystemExit(
+        "the Windows Tauri manifest must have exactly one canonical LF checkout rule"
+    )
 
 
 def job(document: str, name: str) -> str:
