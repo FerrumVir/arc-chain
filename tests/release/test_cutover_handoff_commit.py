@@ -56,7 +56,7 @@ def replace_exact(value, old: str, new: str):
         return {key: replace_exact(item, old, new) for key, item in value.items()}
     if isinstance(value, list):
         return [replace_exact(item, old, new) for item in value]
-    return value.replace(old, new) if isinstance(value, str) else value
+    return new if value == old else value
 
 
 class GitFixture(unittest.TestCase):
@@ -194,6 +194,14 @@ class CutoverHandoffCreationCommandTests(GitFixture):
         manifest = json.loads(manifest_path.read_bytes())
         original_source_commit = manifest["provenance"]["source_main_commit"]
         manifest = replace_exact(manifest, original_source_commit, self.main_commit)
+        for group in manifest["provenance"]["protected_pretag_artifact"]["groups"]:
+            for window in ("initial", "final"):
+                live = group[window]["live"]
+                live["artifact_name"] = (
+                    f"arc-pretag-{group['kind']}-{group['platform']}-"
+                    f"{self.main_commit}-{live['run_id']}-{live['run_attempt']}-"
+                    f"{group[window]['artifact']['archive_sha256']}"
+                )
         boundary["source_main_commit"] = self.main_commit
         boundary_payload = canonical(boundary)
         boundary_path.chmod(0o600)
