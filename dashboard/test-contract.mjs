@@ -34,6 +34,34 @@ const rewardReceipt = (char, overrides = {}) => ({
   reward_arc: 2.5,
   ...overrides,
 });
+const rewardRpcReceipt = (char, overrides = {}) => ({
+  status: "mined_success",
+  tx_type: "0x25",
+  tx_hash: `0x${hex(char)}`,
+  job_id: `0x${hex("b")}`,
+  worker: `0x${hex("a")}`,
+  model_id: `0x${hex("d")}`,
+  input_hash: `0x${hex("e")}`,
+  output_hash: `0x${hex("f")}`,
+  assignment_epoch: `0x${hex("1")}`,
+  recovery_epoch: 1,
+  validator_set_id: 1,
+  validator_set_commitment: `0x${hex("2")}`,
+  transaction_domain: `0x${hex("3")}`,
+  validator_approvals: 5,
+  submitted: true,
+  included: true,
+  confirmed: true,
+  success: true,
+  block_height: H + 7,
+  block_hash: `0x${hex("c")}`,
+  index: 0,
+  reward_base: 2_500_000_000,
+  reward_arc: 2.5,
+  receipt_url: `/community/reward_receipt/0x${hex(char)}`,
+  evidence_source: "successful mined CommunityInferenceReward receipt",
+  ...overrides,
+});
 const projectionWindow = {
   observed_window_first_timestamp_ms: 1_700_000_000_000,
   observed_window_last_timestamp_ms: 1_700_086_400_000,
@@ -521,6 +549,48 @@ await test("pending reward transaction is never counted as earned", async () => 
   const fetchImpl = mockFetch({ [`https://v3-a.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "pending" } } });
   const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash, checkpointAudit: { state: "verified" } });
   assert.equal(result.occurrences[0].classification.rewardEarned, false);
+});
+
+await test("transaction lookup joins an exact canonical 0x25 reward receipt", async () => {
+  const hash = hex("6");
+  const fetchImpl = mockFetch({
+    [`https://v3-a.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash } },
+    [`https://v3-a.example.test/tx/${hash}`]: { body: { status: "success", block_height: H + 7 } },
+    [`https://v3-a.example.test/community/reward_receipt/0x${hash}`]: { body: rewardRpcReceipt("6") },
+  });
+  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash, checkpointAudit: { state: "verified" } });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3-a");
+  assert.equal(occurrence.rewardEvidenceBound, true);
+  assert.equal(occurrence.classification.rewardEarned, true);
+  assert.equal(occurrence.classification.rewardWorker, hex("a"));
+  assert.equal(occurrence.classification.rewardJob, hex("b"));
+  assert.equal(occurrence.provenance.canonical, true);
+});
+
+await test("a mismatched reward-receipt identity is never promoted", async () => {
+  const hash = hex("7");
+  const fetchImpl = mockFetch({
+    [`https://v3-a.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "pending" } },
+    [`https://v3-a.example.test/community/reward_receipt/0x${hash}`]: { body: rewardRpcReceipt("8") },
+  });
+  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash, checkpointAudit: { state: "verified" } });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3-a");
+  assert.equal(occurrence.rewardEvidenceBound, false);
+  assert.equal(occurrence.classification.rewardEarned, false);
+});
+
+await test("a malformed direct reward receipt is never promoted", async () => {
+  const hash = hex("6");
+  const fetchImpl = mockFetch({
+    [`https://v3-a.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "pending" } },
+    [`https://v3-a.example.test/community/reward_receipt/0x${hash}`]: {
+      body: rewardRpcReceipt("6", { reward_arc: 2.49 }),
+    },
+  });
+  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash, checkpointAudit: { state: "verified" } });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3-a");
+  assert.equal(occurrence.rewardEvidenceBound, false);
+  assert.equal(occurrence.classification.rewardEarned, false);
 });
 
 await test("dashboard loads shared resolver and external application code", () => {

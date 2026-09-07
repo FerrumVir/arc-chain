@@ -599,8 +599,12 @@ pub async fn fetch_earnings(state: State<'_, AppState>) -> CmdResult<Earnings> {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     };
-    let host = chain_host(&state).await;
-    Ok(rpc_client::fetch_earnings(&state.http, &host, address.as_deref()).await)
+    Ok(fetch_earnings_inner(&state, address.as_deref()).await)
+}
+
+pub(crate) async fn fetch_earnings_inner(state: &AppState, address: Option<&str>) -> Earnings {
+    let host = chain_host(state).await;
+    rpc_client::fetch_earnings(&state.http, &host, address).await
 }
 
 #[tauri::command]
@@ -696,8 +700,15 @@ pub async fn fetch_earnings_projection(
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     };
-    let host = chain_host(&state).await;
-    Ok(rpc_client::fetch_earnings_projection(&state.http, &host, address.as_deref()).await)
+    Ok(fetch_earnings_projection_inner(&state, address.as_deref()).await)
+}
+
+pub(crate) async fn fetch_earnings_projection_inner(
+    state: &AppState,
+    address: Option<&str>,
+) -> crate::types::EarningsProjection {
+    let host = chain_host(state).await;
+    rpc_client::fetch_earnings_projection(&state.http, &host, address).await
 }
 
 /// What the node on THIS machine is contributing. Local read by design — the
@@ -718,8 +729,34 @@ pub async fn fetch_node_contribution(
 pub async fn fetch_network_overview(
     state: State<'_, AppState>,
 ) -> CmdResult<crate::types::NetworkOverview> {
-    let host = chain_host(&state).await;
-    Ok(rpc_client::fetch_network_overview(&state.http, &host).await)
+    Ok(fetch_network_overview_inner(&state).await)
+}
+
+pub(crate) async fn fetch_network_overview_inner(
+    state: &AppState,
+) -> crate::types::NetworkOverview {
+    let host = chain_host(state).await;
+    fetch_network_overview_from_host_inner(state, &host).await
+}
+
+/// Read-only production acceptance preflight against one compiled origin.
+/// This does not establish or mutate a community receipt pin; only an exact
+/// successfully submitted 0x25 inference result may do that.
+pub(crate) async fn fetch_network_overview_from_host_inner(
+    state: &AppState,
+    host: &str,
+) -> crate::types::NetworkOverview {
+    rpc_client::fetch_network_overview(&state.http, host).await
+}
+
+/// Read-only packaged-acceptance preflight for the exact profile-bound model
+/// that the sealed rollout says the production coordinator must serve.
+pub(crate) async fn fetch_production_model_identity_from_host_inner(
+    state: &AppState,
+    host: &str,
+    expected_model_id: &str,
+) -> Result<String, String> {
+    rpc_client::fetch_production_model_identity(&state.http, host, expected_model_id).await
 }
 
 #[tauri::command]
@@ -727,8 +764,15 @@ pub async fn fetch_recent_blocks(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> CmdResult<crate::types::RecentBlocks> {
-    let host = chain_host(&state).await;
-    Ok(rpc_client::fetch_recent_blocks(&state.http, &host, limit.unwrap_or(10)).await)
+    Ok(fetch_recent_blocks_inner(&state, limit.unwrap_or(10)).await)
+}
+
+pub(crate) async fn fetch_recent_blocks_inner(
+    state: &AppState,
+    limit: u32,
+) -> crate::types::RecentBlocks {
+    let host = chain_host(state).await;
+    rpc_client::fetch_recent_blocks(&state.http, &host, limit).await
 }
 
 /// Transactions inside one block. Called on expand, never on the poll path.
@@ -749,8 +793,12 @@ pub async fn lookup_tx(
     state: State<'_, AppState>,
     hash: String,
 ) -> CmdResult<crate::types::TxLookup> {
-    let host = chain_host(&state).await;
-    Ok(rpc_client::lookup_tx(&state.http, &host, &hash).await)
+    Ok(lookup_tx_inner(&state, &hash).await)
+}
+
+pub(crate) async fn lookup_tx_inner(state: &AppState, hash: &str) -> crate::types::TxLookup {
+    let host = chain_host(state).await;
+    rpc_client::lookup_tx(&state.http, &host, hash).await
 }
 
 #[tauri::command]
@@ -844,10 +892,9 @@ pub async fn send_arc(
 // visible reason, or make a faucet claim they just watched succeed vanish.
 // (See CLAUDE.md rule 4.)
 //
-// So: pick the freshest seed at startup — which is the part the old code got
-// wrong, hard-pinning LAX even when it was six days stale — then stay there.
-// Re-election happens only if the pinned host stops answering, since a dead
-// host is worse than an inconsistent one.
+// So: pick the freshest seed on the first chain read — which is the part the
+// old code got wrong, hard-pinning LAX even when it was six days stale — then
+// stay there and render unavailability if it later stops answering.
 
 /// The seed whose chain view we read balances, earnings, attestations and
 /// network stats from.
@@ -946,16 +993,24 @@ async fn chain_host(state: &AppState) -> String {
         }
     }
 
-    // Stay on the pinned host as long as it still answers.
+    // A successful community inference creates an exact receipt-origin
+    // boundary for the remainder of this app session.  Do not health-failover
+    // this pin: an unavailable source must render unavailable, never silently
+    // substitute a structurally independent seed that cannot contain the
+    // transaction the user is inspecting.
+    if let Some(host) = state.community_chain_host.lock().await.clone() {
+        return host;
+    }
+
+    // A displayed structural chain is an immutable session identity. If it
+    // stops answering, callers must render unavailable instead of switching
+    // wallet, earnings, or future reward writes to an independent seed.
     let pinned = {
         let cached = state.chain_host.lock().await;
         cached.as_ref().map(|(c, _)| c.host.clone())
     };
     if let Some(host) = pinned {
-        if health_ok(&state.http, &host, std::time::Duration::from_secs(3)).await {
-            return host;
-        }
-        tracing::warn!("pinned chain host {} stopped answering - re-electing", host);
+        return host;
     }
 
     match probe_chain_host(&state.http).await {
@@ -1047,9 +1102,35 @@ fn inference_timeout(prompt: &str, max_tokens: u32) -> std::time::Duration {
 /// How long a coordinator gets to answer `/health` before we skip it.
 const COORDINATOR_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-fn inference_client(prompt: &str, max_tokens: u32) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InferenceProxyPolicy {
+    /// Interactive packaged UI honors an explicitly supplied HTTPS proxy.
+    /// This is required for restricted/headless environments and corporate
+    /// networks; redirects and automatic retries remain forbidden below.
+    Configured,
+    /// Sealed packaged-native evidence must connect directly to its exact
+    /// compiled coordinator and separately rejects all ambient proxy inputs.
+    AcceptanceDirect,
+}
+
+fn inference_client(
+    prompt: &str,
+    max_tokens: u32,
+    proxy_policy: InferenceProxyPolicy,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .timeout(inference_timeout(prompt, max_tokens))
+        // Never let reqwest replay a protocol NACK behind the caller's
+        // exact-one-dispatch accounting.
+        .retry(reqwest::retry::never())
+        // A POST may create a paid-on-chain reward.  Never let an HTTP
+        // redirect replay that write at a second origin; the caller selected
+        // and pinned one exact coordinator.
+        .redirect(reqwest::redirect::Policy::none());
+    if proxy_policy == InferenceProxyPolicy::AcceptanceDirect {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(map_err)
 }
@@ -1059,6 +1140,34 @@ async fn health_ok(http: &reqwest::Client, host: &str, timeout: std::time::Durat
         tokio::time::timeout(timeout, http.get(format!("{}/health", host)).send()).await,
         Ok(Ok(r)) if r.status().is_success()
     )
+}
+
+/// The only error class the WebView may use to choose another inference
+/// route.  It is emitted exclusively before any inference POST is sent.
+pub(crate) const INFERENCE_PRE_DISPATCH_UNAVAILABLE: &str =
+    "ARC_INFERENCE_PRE_DISPATCH_UNAVAILABLE";
+/// Every failure observed after the single POST begins is ambiguous with
+/// respect to remote assignment/settlement and therefore terminal.
+pub(crate) const INFERENCE_POST_OUTCOME_AMBIGUOUS: &str =
+    "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS";
+
+fn inference_pre_dispatch_unavailable(detail: impl std::fmt::Display) -> String {
+    format!("{INFERENCE_PRE_DISPATCH_UNAVAILABLE}: {detail}")
+}
+
+fn inference_post_outcome_ambiguous(detail: impl std::fmt::Display) -> String {
+    format!(
+        "{INFERENCE_POST_OUTCOME_AMBIGUOUS}: an inference POST was attempted and may have created an assignment or reward; do not retry another route ({detail})"
+    )
+}
+
+async fn inference_readiness_ok(http: &reqwest::Client, host: &str) -> Result<bool, String> {
+    tokio::time::timeout(
+        COORDINATOR_HEALTH_TIMEOUT,
+        rpc_client::inference_readiness(http, host),
+    )
+    .await
+    .map_err(|_| format!("{host} readiness timed out"))?
 }
 
 /// Coordinators to try, best first.
@@ -1076,6 +1185,13 @@ async fn health_ok(http: &reqwest::Client, host: &str, timeout: std::time::Durat
 ///    unreachable host cost a full timeout before the next was tried.
 async fn coordinator_candidates(state: &AppState) -> Vec<String> {
     let mut ordered = Vec::new();
+
+    if let Some(origin) = established_chain_origin(state).await {
+        if health_ok(&state.http, &origin, COORDINATOR_HEALTH_TIMEOUT).await {
+            ordered.push(origin);
+        }
+        return ordered;
+    }
 
     let port = state.node.lock().await.rpc_port;
     let local = paths::local_host(port);
@@ -1107,9 +1223,31 @@ async fn coordinator_candidates(state: &AppState) -> Vec<String> {
     ordered
 }
 
+/// Once the session has either displayed an elected chain or accepted one
+/// exact community settlement, every later reward-producing write must stay
+/// on that structural chain. A receipt pin takes precedence; otherwise the
+/// already displayed cached read origin constrains the first write.
+async fn established_chain_origin(state: &AppState) -> Option<String> {
+    if let Some(origin) = state.community_chain_host.lock().await.clone() {
+        return Some(origin);
+    }
+    state
+        .chain_host
+        .lock()
+        .await
+        .as_ref()
+        .map(|(choice, _)| choice.host.clone())
+}
+
 fn community_receipt_source_is_pinned(source_host: &str, local_host: &str) -> bool {
     source_host == local_host || COORDINATOR_HOSTS.contains(&source_host)
 }
+
+pub(crate) const RECEIPT_SOURCE_REJECTED: &str = "reward receipt unavailable: source host is not the exact local node or a compiled-in ARC coordinator";
+pub(crate) const RECEIPT_ROUTE_MISSING: &str =
+    "reward receipt unavailable: no native inference route is pinned for this transaction";
+pub(crate) const RECEIPT_ROUTE_MISMATCH: &str =
+    "reward receipt unavailable: requested identity differs from the native inference route pin";
 
 async fn pin_community_receipt_route(
     state: &AppState,
@@ -1119,6 +1257,60 @@ async fn pin_community_receipt_route(
     let Some(settlement) = result.settlement.as_ref() else {
         return;
     };
+    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    if !settlement.submitted
+        || settlement.tx_type != "0x25"
+        || !matches!(
+            settlement.status.as_str(),
+            "pending_mined_receipt" | "mined_success"
+        )
+        || !community_receipt_source_is_pinned(source_host, &local_host)
+        || result.routed_via != format!("community:{}", settlement.worker)
+        || rpc_client::validate_community_receipt_expectation(
+            &settlement.tx_hash,
+            &settlement.job_id,
+            &settlement.worker,
+            &settlement.receipt_url,
+        )
+        .is_err()
+    {
+        tracing::warn!(
+            source_host,
+            "refusing to pin a malformed or unsubmitted community settlement"
+        );
+        return;
+    }
+    if let Some(existing) = state
+        .chain_host
+        .lock()
+        .await
+        .as_ref()
+        .map(|(choice, _)| choice.host.clone())
+    {
+        if existing != source_host {
+            tracing::error!(
+                existing,
+                rejected = source_host,
+                "refusing to move the already displayed structural chain for a settlement"
+            );
+            return;
+        }
+    }
+    {
+        let mut session_origin = state.community_chain_host.lock().await;
+        if let Some(existing) = session_origin.as_deref() {
+            if existing != source_host {
+                tracing::error!(
+                    existing,
+                    rejected = source_host,
+                    "refusing to move an immutable community receipt-origin session pin"
+                );
+                return;
+            }
+        } else {
+            *session_origin = Some(source_host.to_string());
+        }
+    }
     let mut routes = state.community_receipt_routes.lock().await;
     // Keep the in-memory pin set bounded without evicting the receipt just
     // returned. This state is session-local and only supports visible results.
@@ -1152,40 +1344,50 @@ pub async fn fetch_community_reward_receipt(
     worker: String,
     receipt_url: String,
 ) -> CmdResult<InferenceSettlement> {
-    let local_host = paths::local_host(state.node.lock().await.rpc_port);
-    if !community_receipt_source_is_pinned(&source_host, &local_host) {
-        return Err(
-            "reward receipt unavailable: source host is not the exact local node or a compiled-in ARC coordinator"
-                .to_string(),
-        );
-    }
-    let pinned = state
-        .community_receipt_routes
-        .lock()
-        .await
-        .get(&tx_hash)
-        .cloned()
-        .ok_or_else(|| {
-            "reward receipt unavailable: no native inference route is pinned for this transaction"
-                .to_string()
-        })?;
-    if pinned.source_host != source_host
-        || pinned.job_id != job_id
-        || pinned.worker != worker
-        || pinned.receipt_url != receipt_url
-    {
-        return Err(
-            "reward receipt unavailable: requested identity differs from the native inference route pin"
-                .to_string(),
-        );
-    }
-    rpc_client::fetch_community_reward_receipt(
-        &state.http,
+    fetch_community_reward_receipt_inner(
+        &state,
         &source_host,
         &tx_hash,
         &job_id,
         &worker,
         &receipt_url,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_community_reward_receipt_inner(
+    state: &AppState,
+    source_host: &str,
+    tx_hash: &str,
+    job_id: &str,
+    worker: &str,
+    receipt_url: &str,
+) -> CmdResult<InferenceSettlement> {
+    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    if !community_receipt_source_is_pinned(source_host, &local_host) {
+        return Err(RECEIPT_SOURCE_REJECTED.to_string());
+    }
+    let pinned = state
+        .community_receipt_routes
+        .lock()
+        .await
+        .get(tx_hash)
+        .cloned()
+        .ok_or_else(|| RECEIPT_ROUTE_MISSING.to_string())?;
+    if pinned.source_host != source_host
+        || pinned.job_id != job_id
+        || pinned.worker != worker
+        || pinned.receipt_url != receipt_url
+    {
+        return Err(RECEIPT_ROUTE_MISMATCH.to_string());
+    }
+    rpc_client::fetch_community_reward_receipt(
+        &state.http,
+        source_host,
+        tx_hash,
+        job_id,
+        worker,
+        receipt_url,
     )
     .await
 }
@@ -1203,18 +1405,51 @@ pub async fn run_inference(
     max_tokens: Option<u32>,
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
+    run_inference_local_inner(
+        &state,
+        &prompt,
+        max_tokens.unwrap_or(32),
+        chat_template.unwrap_or(true),
+    )
+    .await
+}
+
+async fn run_inference_local_inner(
+    state: &AppState,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template: bool,
+) -> CmdResult<InferenceResult> {
+    let _write_guard = state.community_inference_write.lock().await;
     let port = state.node.lock().await.rpc_port;
     let host = paths::local_host(port);
-    let max_tokens = max_tokens.unwrap_or(32);
-    let client = inference_client(&prompt, max_tokens)?;
+    if let Some(origin) = established_chain_origin(state).await {
+        if origin != host {
+            return Err(inference_pre_dispatch_unavailable(
+                "immutable session chain origin is remote; local inference write was skipped",
+            ));
+        }
+    }
+    match inference_readiness_ok(&state.http, &host).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(inference_pre_dispatch_unavailable(format!(
+                "{host} reported no eligible inference route"
+            )))
+        }
+        Err(error) => return Err(inference_pre_dispatch_unavailable(error)),
+    }
+    let client = inference_client(prompt, max_tokens, InferenceProxyPolicy::Configured)
+        .map_err(inference_pre_dispatch_unavailable)?;
     let mut result = rpc_client::run_inference(
         &client,
         &host,
-        &prompt,
+        prompt,
         max_tokens,
-        chat_template.unwrap_or(true),
+        chat_template,
     )
-    .await?;
+    .await
+    .map_err(inference_post_outcome_ambiguous)?;
     result.served_locally = true;
     pin_community_receipt_route(&state, &host, &result).await;
     Ok(result)
@@ -1241,107 +1476,163 @@ pub async fn run_inference_via_coordinator(
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
     let max_tokens = max_tokens.unwrap_or(32);
-    let client = inference_client(&prompt, max_tokens)?;
     let k = k.unwrap_or(3);
     let chat_template = chat_template.unwrap_or(true);
 
     let candidates = coordinator_candidates(&state).await;
+    run_inference_via_coordinator_inner(
+        &state,
+        &prompt,
+        max_tokens,
+        k,
+        chat_template,
+        candidates,
+        InferenceProxyPolicy::Configured,
+    )
+    .await
+}
+
+async fn run_inference_via_coordinator_inner(
+    state: &AppState,
+    prompt: &str,
+    max_tokens: u32,
+    k: u32,
+    chat_template: bool,
+    candidates: Vec<String>,
+    proxy_policy: InferenceProxyPolicy,
+) -> CmdResult<InferenceResult> {
+    let _write_guard = state.community_inference_write.lock().await;
     if candidates.is_empty() {
-        return Err("no coordinator answered /health - check your internet connection".into());
+        return Err(inference_pre_dispatch_unavailable(
+            "no coordinator answered /health - check your internet connection",
+        ));
     }
+    let client = inference_client(prompt, max_tokens, proxy_policy)
+        .map_err(inference_pre_dispatch_unavailable)?;
     let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
-
-    let mut last_err = String::new();
-    for host in &candidates {
-        match rpc_client::run_inference_consensus(
-            &client,
-            host,
-            &prompt,
-            max_tokens,
-            k,
-            chat_template,
-        )
-        .await
-        {
-            Ok(mut r) => {
-                r.served_locally = *host == local_prefix;
-                pin_community_receipt_route(&state, host, &r).await;
-                return Ok(r);
-            }
-            Err(e) => last_err = e,
-        }
-    }
-    Err(format!(
-        "all {} reachable coordinators failed; last: {}",
-        candidates.len(),
-        last_err
-    ))
-}
-
-fn direct_inference_error_must_not_retry(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    normalized.contains("may still settle")
-        || normalized.contains("refusing a second late")
-        || normalized.contains("query its job status")
-        || [400, 401, 403, 409, 413, 422, 504]
-            .iter()
-            .any(|status| normalized.contains(&format!("http {status}")))
-}
-
-/// Exact prefix of the aggregate "every reachable coordinator declined the
-/// direct community path" error.
-///
-/// `Inference.tsx` switches to the standalone `/run_consensus` fallback only on
-/// this literal substring, so it must stay verbatim in the produced message.
-/// It previously read `all {n} reachable coordinators failed (direct path)`,
-/// which never matched, so the fallback was unreachable in the packaged app.
-const DIRECT_PATH_EXHAUSTED_SENTINEL: &str = "all coordinators failed (direct path)";
-
-fn direct_path_exhausted_error(reachable: usize, last_error: &str) -> String {
-    format!("{DIRECT_PATH_EXHAUSTED_SENTINEL}; {reachable} reachable, last: {last_error}")
+    // `/run_consensus` is itself a write/compute operation.  Health probes
+    // may inspect as many candidates as needed, but after choosing the first
+    // reachable origin the app sends exactly one POST and never migrates the
+    // same click to another coordinator on an ambiguous outcome.
+    let host = candidates
+        .first()
+        .expect("non-empty candidates established above");
+    let mut result = rpc_client::run_inference_consensus(
+        &client,
+        host,
+        prompt,
+        max_tokens,
+        k,
+        chat_template,
+    )
+    .await
+    .map_err(inference_post_outcome_ambiguous)?;
+    result.served_locally = *host == local_prefix;
+    pin_community_receipt_route(&state, host, &result).await;
+    Ok(result)
 }
 
 #[cfg(test)]
 mod inference_retry_tests {
     use super::{
-        community_receipt_source_is_pinned, direct_inference_error_must_not_retry,
-        direct_path_exhausted_error, COORDINATOR_HOSTS, DIRECT_PATH_EXHAUSTED_SENTINEL,
+        chain_host, community_receipt_source_is_pinned, inference_client,
+        pin_community_receipt_route, run_inference_local_inner,
+        run_inference_via_coordinator_direct_inner, run_inference_via_coordinator_inner,
+        ChainHostChoice, InferenceProxyPolicy, COORDINATOR_HOSTS,
+        INFERENCE_POST_OUTCOME_AMBIGUOUS, INFERENCE_PRE_DISPATCH_UNAVAILABLE,
     };
+    use crate::types::{InferenceResult, InferenceSettlement};
+    use crate::AppState;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
 
-    #[test]
-    fn exhausted_direct_path_error_carries_the_ui_consensus_fallback_sentinel() {
-        let message = direct_path_exhausted_error(3, "HTTP 503: no eligible workers");
-        assert!(message.contains(DIRECT_PATH_EXHAUSTED_SENTINEL));
-        assert!(message.contains("3 reachable"));
-        assert!(message.contains("HTTP 503: no eligible workers"));
+    fn test_state() -> AppState {
+        AppState {
+            node: Arc::new(Mutex::new(crate::node_manager::NodeManager::new())),
+            store: Arc::new(Mutex::new(crate::store::Store::default())),
+            data_dir: Arc::new(Mutex::new(PathBuf::new())),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            tier1_routes: Arc::new(Mutex::new(HashMap::new())),
+            community_receipt_routes: Arc::new(Mutex::new(HashMap::new())),
+            community_chain_host: Arc::new(Mutex::new(None)),
+            community_inference_write: Arc::new(Mutex::new(())),
+            chain_host: Arc::new(Mutex::new(None)),
+            wallet_write: Arc::new(Mutex::new(())),
+            has_tray: Arc::new(AtomicBool::new(false)),
+            data_migration_error: Arc::new(Mutex::new(None)),
+        }
+    }
 
-        // The Inference screen only falls through to `/run_consensus` when it
-        // recognizes this exact substring. An aggregate error that does not
-        // contain it silently removes the sharded-consensus fallback in the
-        // packaged app, where the browser mock's wording is never used.
-        let ui = include_str!("../../src/screens/Inference.tsx");
-        assert!(
-            ui.contains(&format!(
-                "message.includes(\"{DIRECT_PATH_EXHAUSTED_SENTINEL}\")"
-            )),
-            "Inference.tsx no longer gates its consensus fallback on the native sentinel"
-        );
+    fn valid_community_result() -> InferenceResult {
+        let worker = format!("0x{}", "11".repeat(32));
+        let tx_hash = format!("0x{}", "22".repeat(32));
+        InferenceResult {
+            input: "acceptance".to_string(),
+            output: "ok".to_string(),
+            output_hash: format!("0x{}", "33".repeat(32)),
+            model_hash: format!("0x{}", "44".repeat(32)),
+            tokens_generated: 1,
+            inference_ms: 1,
+            tx_hash: String::new(),
+            deterministic: true,
+            profile_bound: true,
+            quorum_verified: true,
+            execution_profile: "test-profile".to_string(),
+            engine: "test".to_string(),
+            explorer_url: String::new(),
+            routed_via: format!("community:{worker}"),
+            settlement: Some(InferenceSettlement {
+                status: "pending_mined_receipt".to_string(),
+                tx_type: "0x25".to_string(),
+                tx_hash: tx_hash.clone(),
+                job_id: format!("0x{}", "55".repeat(32)),
+                worker,
+                submitted: true,
+                included: false,
+                confirmed: false,
+                success: None,
+                block_height: None,
+                block_hash: None,
+                index: None,
+                reward_base: None,
+                reward_arc: None,
+                receipt_url: format!("/community/reward_receipt/{tx_hash}"),
+                model_id: String::new(),
+                input_hash: String::new(),
+                output_hash: String::new(),
+                assignment_epoch: String::new(),
+                transaction_domain: String::new(),
+                recovery_epoch: None,
+                validator_set_id: None,
+                validator_set_commitment: String::new(),
+                validator_approvals: None,
+                evidence_source: String::new(),
+            }),
+            consensus: None,
+            coordinator: Some(COORDINATOR_HOSTS[0].to_string()),
+            trace: None,
+            served_locally: false,
+        }
     }
 
     #[test]
-    fn claimed_or_terminal_direct_failures_never_retry_elsewhere() {
-        assert!(direct_inference_error_must_not_retry(
-            "HTTP 504: assignment may still settle; query its job status"
-        ));
-        assert!(direct_inference_error_must_not_retry(
-            "HTTP 422: invalid input"
-        ));
-        assert!(!direct_inference_error_must_not_retry(
-            "HTTP 503: no eligible workers or shard topology"
-        ));
-        assert!(!direct_inference_error_must_not_retry(
-            "connection refused before dispatch"
-        ));
+    fn ui_fallback_is_bound_only_to_the_exact_pre_dispatch_sentinel() {
+        let ui = include_str!("../../src/screens/Inference.tsx");
+        assert!(ui.contains(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        assert!(!ui.contains("all coordinators failed (direct path)"));
+        assert!(!ui.contains("msg.includes(\"503\")"));
+        assert!(!ui.contains("msg.includes(\"fetch\")"));
+        assert_ne!(
+            INFERENCE_PRE_DISPATCH_UNAVAILABLE,
+            INFERENCE_POST_OUTCOME_AMBIGUOUS
+        );
     }
 
     #[test]
@@ -1365,6 +1656,339 @@ mod inference_retry_tests {
             local
         ));
     }
+
+    #[tokio::test]
+    async fn a_valid_settlement_pins_all_session_chain_reads_to_its_exact_origin() {
+        let state = test_state();
+        let result = valid_community_result();
+        pin_community_receipt_route(&state, COORDINATOR_HOSTS[0], &result).await;
+        *state.chain_host.lock().await = Some((
+            ChainHostChoice {
+                host: COORDINATOR_HOSTS[1].to_string(),
+                block_timestamp_ms: u64::MAX,
+                height: u64::MAX,
+            },
+            std::time::Instant::now(),
+        ));
+        assert_eq!(chain_host(&state).await, COORDINATOR_HOSTS[0]);
+        assert_eq!(
+            state.community_chain_host.lock().await.as_deref(),
+            Some(COORDINATOR_HOSTS[0])
+        );
+
+        let mut second = valid_community_result();
+        let second_settlement = second.settlement.as_mut().unwrap();
+        second_settlement.tx_hash = format!("0x{}", "66".repeat(32));
+        second_settlement.receipt_url =
+            format!("/community/reward_receipt/{}", second_settlement.tx_hash);
+        let second_tx_hash = second_settlement.tx_hash.clone();
+        pin_community_receipt_route(&state, COORDINATOR_HOSTS[1], &second).await;
+        assert_eq!(
+            state.community_chain_host.lock().await.as_deref(),
+            Some(COORDINATOR_HOSTS[0]),
+            "a second independent seed must not move the first receipt origin"
+        );
+        assert!(!state
+            .community_receipt_routes
+            .lock()
+            .await
+            .contains_key(&second_tx_hash));
+    }
+
+    #[tokio::test]
+    async fn displayed_chain_origin_rejects_another_settlement_before_it_can_move_reads() {
+        let state = test_state();
+        *state.chain_host.lock().await = Some((
+            ChainHostChoice {
+                host: COORDINATOR_HOSTS[1].to_string(),
+                block_timestamp_ms: 1,
+                height: 1,
+            },
+            std::time::Instant::now(),
+        ));
+        pin_community_receipt_route(&state, COORDINATOR_HOSTS[0], &valid_community_result()).await;
+        assert!(state.community_chain_host.lock().await.is_none());
+        assert!(state.community_receipt_routes.lock().await.is_empty());
+        assert_eq!(chain_host(&state).await, COORDINATOR_HOSTS[1]);
+    }
+
+    #[tokio::test]
+    async fn displayed_remote_chain_blocks_local_and_other_origin_posts_before_network() {
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = test_state();
+        state.node.lock().await.rpc_port = local_listener.local_addr().unwrap().port();
+        *state.chain_host.lock().await = Some((
+            ChainHostChoice {
+                host: COORDINATOR_HOSTS[1].to_string(),
+                block_timestamp_ms: 1,
+                height: 1,
+            },
+            std::time::Instant::now(),
+        ));
+
+        let local_error = run_inference_local_inner(&state, "must not post", 1, true)
+            .await
+            .unwrap_err();
+        assert!(local_error.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        let other_origin = format!("http://{}", other_listener.local_addr().unwrap());
+        let other_error = run_inference_via_coordinator_direct_inner(
+            &state,
+            "must not post",
+            1,
+            true,
+            vec![other_origin],
+            InferenceProxyPolicy::Configured,
+        )
+        .await
+        .unwrap_err();
+        assert!(other_error.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        assert!(other_error.contains("refusing cross-origin inference"));
+        for listener in [&local_listener, &other_listener] {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "a conflicting chain origin received an inference POST"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_unsubmitted_settlements_cannot_poison_route_or_chain_pins() {
+        for mutate in 0..8 {
+            let state = test_state();
+            let mut result = valid_community_result();
+            let mut source = COORDINATOR_HOSTS[0];
+            if mutate == 7 {
+                result.routed_via = "community:wrong".to_string();
+            } else {
+                let settlement = result.settlement.as_mut().unwrap();
+                match mutate {
+                    0 => settlement.submitted = false,
+                    1 => settlement.tx_hash = format!("0x{}", "gg".repeat(32)),
+                    2 => settlement.job_id.clear(),
+                    3 => settlement.receipt_url = "/community/reward_receipt/wrong".to_string(),
+                    4 => source = "https://140.82.16.112.evil.example",
+                    5 => settlement.status = "verified_pending_approval".to_string(),
+                    6 => settlement.tx_type = "0x16".to_string(),
+                    _ => unreachable!(),
+                }
+            }
+            pin_community_receipt_route(&state, source, &result).await;
+            assert!(state.community_chain_host.lock().await.is_none());
+            assert!(state.community_receipt_routes.lock().await.is_empty());
+        }
+    }
+
+    fn readiness_body(safe: bool) -> String {
+        serde_json::json!({
+            "schema": "arc.inference.readiness.v1",
+            "safe_to_dispatch": safe,
+            "community_dispatch_ready": safe,
+            "local_model_ready": false,
+            "sharded_pipeline_ready": false,
+            "live_community_workers": if safe { 1 } else { 0 },
+            "model_id": if safe {
+                serde_json::Value::String(format!("0x{}", "ab".repeat(32)))
+            } else {
+                serde_json::Value::Null
+            },
+            "required_community_execution_profile":
+                arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE,
+            "mutation_free_observation": true,
+        })
+        .to_string()
+    }
+
+    async fn serve_readiness_then_drop_post(
+        listener: tokio::net::TcpListener,
+        post_hits: Arc<AtomicUsize>,
+    ) {
+        for expected in ["GET /inference/readiness ", "POST /inference/run "] {
+            let (mut stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                listener.accept(),
+            )
+            .await
+            .expect("expected request timed out")
+            .expect("accept request");
+            let mut request = vec![0; 16 * 1024];
+            let read = stream.read(&mut request).await.expect("read request");
+            let head = String::from_utf8_lossy(&request[..read]);
+            assert!(head.starts_with(expected), "unexpected request: {head}");
+            if expected.starts_with("GET") {
+                let body = readiness_body(true);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write readiness response");
+            } else {
+                post_hits.fetch_add(1, Ordering::SeqCst);
+                // Dropping the accepted socket without an HTTP response
+                // models a reset/EOF after the server may have accepted the
+                // write. The client must not try another origin.
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_post_reset_is_terminal_after_exactly_one_post() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let post_hits = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_readiness_then_drop_post(
+            listener,
+            post_hits.clone(),
+        ));
+        let state = test_state();
+        state.node.lock().await.rpc_port = port;
+
+        let error = run_inference_local_inner(&state, "one local post", 1, true)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with(INFERENCE_POST_OUTCOME_AMBIGUOUS));
+        assert!(!error.contains(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        server.await.unwrap();
+        assert_eq!(post_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_post_reset_never_probes_or_posts_a_second_candidate() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let first_origin = format!("http://{}", first.local_addr().unwrap());
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let second_origin = format!("http://{}", second.local_addr().unwrap());
+        let post_hits = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(serve_readiness_then_drop_post(
+            first,
+            post_hits.clone(),
+        ));
+        let state = test_state();
+
+        let error = run_inference_via_coordinator_direct_inner(
+            &state,
+            "one remote post",
+            1,
+            true,
+            vec![first_origin, second_origin],
+            InferenceProxyPolicy::Configured,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with(INFERENCE_POST_OUTCOME_AMBIGUOUS));
+        assert!(!error.contains(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        server.await.unwrap();
+        assert_eq!(post_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), second.accept())
+                .await
+                .is_err(),
+            "a second candidate was contacted after the first POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_post_reset_never_posts_a_second_candidate() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let first_origin = format!("http://{}", first.local_addr().unwrap());
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let second_origin = format!("http://{}", second.local_addr().unwrap());
+        let post_hits = Arc::new(AtomicUsize::new(0));
+        let counted = post_hits.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                first.accept(),
+            )
+            .await
+            .expect("expected consensus POST timed out")
+            .expect("accept consensus POST");
+            let mut request = vec![0; 16 * 1024];
+            let read = stream.read(&mut request).await.expect("read request");
+            let head = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                head.starts_with("POST /inference/run_consensus "),
+                "unexpected request: {head}"
+            );
+            counted.fetch_add(1, Ordering::SeqCst);
+            // EOF before an HTTP response is an ambiguous write result.
+        });
+        let state = test_state();
+
+        let error = run_inference_via_coordinator_inner(
+            &state,
+            "one consensus post",
+            1,
+            3,
+            true,
+            vec![first_origin, second_origin],
+            InferenceProxyPolicy::Configured,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with(INFERENCE_POST_OUTCOME_AMBIGUOUS));
+        server.await.unwrap();
+        assert_eq!(post_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), second.accept())
+                .await
+                .is_err(),
+            "a second consensus origin received a replayed POST"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_post_does_not_follow_a_temporary_redirect() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/replayed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = inference_client(
+            "redirect probe",
+            1,
+            InferenceProxyPolicy::AcceptanceDirect,
+        )
+        .unwrap();
+        let response = client
+            .post(format!("http://{source_addr}/inference/run"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        responder.await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
+            "redirect target received a replayed inference POST"
+        );
+    }
 }
 
 /// Community-first coordinator inference. `/inference/run` dispatches to an
@@ -1382,31 +2006,110 @@ pub async fn run_inference_via_coordinator_direct(
     max_tokens: Option<u32>,
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
-    let max_tokens = max_tokens.unwrap_or(32);
-    let client = inference_client(&prompt, max_tokens)?;
-    let chat_template = chat_template.unwrap_or(true);
-
     let candidates = coordinator_candidates(&state).await;
     if candidates.is_empty() {
-        return Err("no coordinator answered /health - check your internet connection".into());
+        return Err(inference_pre_dispatch_unavailable(
+            "no coordinator answered /health - check your internet connection",
+        ));
     }
-    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+    run_inference_via_coordinator_direct_inner(
+        &state,
+        &prompt,
+        max_tokens.unwrap_or(32),
+        chat_template.unwrap_or(true),
+        candidates,
+        InferenceProxyPolicy::Configured,
+    )
+    .await
+}
 
-    let mut last_err = String::new();
-    for host in &candidates {
-        match rpc_client::run_inference_remote(&client, host, &prompt, max_tokens, chat_template)
-            .await
-        {
-            Ok(mut r) => {
-                r.served_locally = *host == local_prefix;
-                pin_community_receipt_route(&state, host, &r).await;
-                return Ok(r);
+async fn run_inference_via_coordinator_direct_inner(
+    state: &AppState,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template: bool,
+    candidates: Vec<String>,
+    proxy_policy: InferenceProxyPolicy,
+) -> CmdResult<InferenceResult> {
+    let _write_guard = state.community_inference_write.lock().await;
+    let candidates = match established_chain_origin(state).await {
+        Some(origin) => candidates
+            .into_iter()
+            .filter(|candidate| candidate == &origin)
+            .collect::<Vec<_>>(),
+        None => candidates,
+    };
+    if candidates.is_empty() {
+        return Err(inference_pre_dispatch_unavailable(
+            "the immutable community receipt origin is unavailable; refusing cross-origin inference",
+        ));
+    }
+    // Readiness probes are mutation-free and may walk candidates.  The first
+    // origin that proves the exact v1 admission contract wins; after that
+    // selection there is exactly one POST, regardless of its outcome.
+    let mut selected = None;
+    let mut readiness_failures = Vec::new();
+    for host in candidates {
+        match inference_readiness_ok(&state.http, &host).await {
+            Ok(true) => {
+                selected = Some(host);
+                break;
             }
-            Err(e) if direct_inference_error_must_not_retry(&e) => return Err(e),
-            Err(e) => last_err = e,
+            Ok(false) => readiness_failures.push(format!("{host}: unavailable")),
+            Err(error) => readiness_failures.push(error),
         }
     }
-    Err(direct_path_exhausted_error(candidates.len(), &last_err))
+    let host = selected.ok_or_else(|| {
+        inference_pre_dispatch_unavailable(format!(
+            "no candidate proved mutation-free inference readiness ({})",
+            readiness_failures.join("; ")
+        ))
+    })?;
+    let client = inference_client(prompt, max_tokens, proxy_policy)
+        .map_err(inference_pre_dispatch_unavailable)?;
+    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+    let mut result = rpc_client::run_inference_remote(
+        &client,
+        &host,
+        prompt,
+        max_tokens,
+        chat_template,
+    )
+    .await
+    .map_err(inference_post_outcome_ambiguous)?;
+    result.served_locally = host == local_prefix;
+    pin_community_receipt_route(state, &host, &result).await;
+    Ok(result)
+}
+
+/// One exact packaged-production dispatch.  The origin must be one of the six
+/// compiled ARC coordinators; it is health-probed and then receives exactly
+/// one POST.  Unlike the interactive availability path above, this function
+/// never retries a different coordinator after an ambiguous write outcome.
+pub(crate) async fn run_inference_via_exact_production_coordinator_inner(
+    state: &AppState,
+    source_host: &str,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template: bool,
+) -> CmdResult<InferenceResult> {
+    if !COORDINATOR_HOSTS.contains(&source_host) {
+        return Err("production acceptance origin is not a compiled ARC coordinator".to_string());
+    }
+    if !health_ok(&state.http, source_host, COORDINATOR_HEALTH_TIMEOUT).await {
+        return Err(
+            "production acceptance coordinator did not pass its bounded health probe".to_string(),
+        );
+    }
+    run_inference_via_coordinator_direct_inner(
+        state,
+        prompt,
+        max_tokens,
+        chat_template,
+        vec![source_host.to_string()],
+        InferenceProxyPolicy::AcceptanceDirect,
+    )
+    .await
 }
 
 const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.0 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
@@ -1500,9 +2203,8 @@ const COORDINATOR_HOSTS: [&str; 6] = rpc_client::PRODUCTION_RPC_ORIGINS;
 
 /// The public testnet seeds, as candidates for chain reads.
 ///
-/// No longer a priority list with a pinned `[0]` — `chain_host()` elects
-/// among these by block freshness on every TTL expiry. Order is
-/// presentational only.
+/// No longer a priority list with a pinned `[0]` — `chain_host()` elects the
+/// first session source by block freshness. Order is presentational only.
 const WALLET_HOSTS: [&str; 6] = rpc_client::PRODUCTION_RPC_ORIGINS;
 
 /// Paid inference escrow is intentionally unavailable in this recovery

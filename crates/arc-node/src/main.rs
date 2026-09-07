@@ -6664,20 +6664,18 @@ async fn main() -> Result<()> {
                 tracing::info!("DAG WAL is empty - starting fresh from round 0");
             }
 
-            match arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
-                Ok(dag_wal) => {
-                    consensus.dag_wal = Some(Arc::new(dag_wal));
-                    tracing::info!(
-                        "Legacy DAG persistence WAL enabled: {}",
+            let dag_wal = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024)
+                .with_context(|| {
+                    format!(
+                        "legacy DAG persistence WAL is invalid or unavailable at {}",
                         dag_wal_path.display()
-                    );
-                }
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    path = %dag_wal_path.display(),
-                    "Legacy DAG persistence WAL is unavailable"
-                ),
-            }
+                    )
+                })?;
+            consensus.dag_wal = Some(Arc::new(dag_wal));
+            tracing::info!(
+                "Legacy DAG persistence WAL enabled: {}",
+                dag_wal_path.display()
+            );
         }
 
         // Recovery replay and durable-writer setup are complete before any

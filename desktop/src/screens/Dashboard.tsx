@@ -705,6 +705,7 @@ export function Dashboard() {
                   key={a.txHash}
                   className="feed-item"
                   data-testid={`attestation-${a.txHash.slice(0, 10)}`}
+                  data-tx-hash={a.txHash}
                 >
                   <div className="feed-item-icon">
                     <Zap />
@@ -771,7 +772,9 @@ export function Dashboard() {
             <dt>Version</dt>
             <dd>{status?.running ? `v${status.version}` : "-"}</dd>
             <dt>Block height</dt>
-            <dd>{status?.running ? formatInt(status.committed) : "-"}</dd>
+            <dd data-testid="node-block-height">
+              {status?.running ? formatInt(status.committed) : "-"}
+            </dd>
             <dt>Round</dt>
             <dd>{status?.running ? formatInt(status.round) : "-"}</dd>
             <dt>Cores</dt>

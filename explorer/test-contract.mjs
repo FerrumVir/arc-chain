@@ -49,6 +49,34 @@ const rewardActivity = (overrides = {}) => ({
   },
   ...overrides,
 });
+const rewardRpcReceipt = (overrides = {}) => ({
+  status: "mined_success",
+  tx_type: "0x25",
+  tx_hash: `0x${hex("6")}`,
+  job_id: `0x${hex("7")}`,
+  worker: `0x${hex("9")}`,
+  model_id: `0x${hex("a")}`,
+  input_hash: `0x${hex("b")}`,
+  output_hash: `0x${hex("c")}`,
+  assignment_epoch: `0x${hex("d")}`,
+  recovery_epoch: 1,
+  validator_set_id: 1,
+  validator_set_commitment: `0x${hex("e")}`,
+  transaction_domain: `0x${hex("f")}`,
+  validator_approvals: 5,
+  submitted: true,
+  included: true,
+  confirmed: true,
+  success: true,
+  block_height: H + 2,
+  block_hash: `0x${hex("8")}`,
+  index: 0,
+  reward_base: 2_500_000_000,
+  reward_arc: 2.5,
+  receipt_url: `/community/reward_receipt/0x${hex("6")}`,
+  evidence_source: "successful mined CommunityInferenceReward receipt",
+  ...overrides,
+});
 const forkArchive = {
   schema: "arc.legacy-archive.source.v1",
   readOnly: true,
@@ -333,6 +361,48 @@ await test("pending reward submissions never appear earned", async () => {
   const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.equal(result.occurrences[0].classification.rewardEarned, false);
   assert.equal(result.occurrences[0].classification.receiptBacked, false);
+});
+
+await test("canonical lookup joins the exact mined 0x25 reward receipt", async () => {
+  const hash = hex("6");
+  const fetchImpl = mockFetch({
+    [`https://v3.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash } },
+    [`https://v3.example.test/tx/${hash}`]: { body: { status: "success", block_height: H + 2 } },
+    [`https://v3.example.test/community/reward_receipt/0x${hash}`]: { body: rewardRpcReceipt() },
+  });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3");
+  assert.equal(occurrence.rewardEvidenceBound, true);
+  assert.equal(occurrence.classification.rewardEarned, true);
+  assert.equal(occurrence.classification.rewardWorker, hex("9"));
+  assert.equal(occurrence.classification.rewardJob, hex("7"));
+  assert.equal(occurrence.provenance.canonical, true);
+});
+
+await test("a reward receipt for another hash is not promoted", async () => {
+  const hash = hex("4");
+  const fetchImpl = mockFetch({
+    [`https://v3.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "submitted" } },
+    [`https://v3.example.test/community/reward_receipt/0x${hash}`]: { body: rewardRpcReceipt() },
+  });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3");
+  assert.equal(occurrence.rewardEvidenceBound, false);
+  assert.equal(occurrence.classification.rewardEarned, false);
+});
+
+await test("a malformed direct reward receipt is not promoted", async () => {
+  const hash = hex("6");
+  const fetchImpl = mockFetch({
+    [`https://v3.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "submitted" } },
+    [`https://v3.example.test/community/reward_receipt/0x${hash}`]: {
+      body: rewardRpcReceipt({ confirmed: false }),
+    },
+  });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
+  const occurrence = result.occurrences.find((row) => row.source.id === "v3");
+  assert.equal(occurrence.rewardEvidenceBound, false);
+  assert.equal(occurrence.classification.rewardEarned, false);
 });
 
 await test("successful mined inference receipts expose canonical provenance", async () => {

@@ -304,6 +304,86 @@ const COORDINATOR_HOSTS = [
   "https://149.28.153.31", // SGP
 ];
 
+const INFERENCE_PRE_DISPATCH_UNAVAILABLE =
+  "ARC_INFERENCE_PRE_DISPATCH_UNAVAILABLE";
+const INFERENCE_POST_OUTCOME_AMBIGUOUS =
+  "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS";
+const INFERENCE_READINESS_SCHEMA = "arc.inference.readiness.v1";
+const CANONICAL_REWARD_INFERENCE_PROFILE =
+  "INT8 integer (per-row, cross-platform deterministic)";
+
+function inferencePreDispatchUnavailable(detail: string): Error {
+  return new Error(`${INFERENCE_PRE_DISPATCH_UNAVAILABLE}: ${detail}`);
+}
+
+function inferencePostOutcomeAmbiguous(detail: string): Error {
+  return new Error(
+    `${INFERENCE_POST_OUTCOME_AMBIGUOUS}: an inference POST was attempted and may have created an assignment or reward; do not retry another route (${detail})`,
+  );
+}
+
+async function liveInferenceReadiness(origin: string): Promise<boolean> {
+  const response = await fetch(`${origin}/inference/readiness`, {
+    method: "GET",
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`${origin} readiness returned HTTP ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > 8_192) {
+    throw new Error(`${origin} readiness response exceeds 8192 bytes`);
+  }
+  const raw = await response.text();
+  if (new TextEncoder().encode(raw).byteLength > 8_192) {
+    throw new Error(`${origin} readiness response exceeds 8192 bytes`);
+  }
+  const parsed: unknown = JSON.parse(raw);
+  const value = asObject(parsed);
+  const exactKeys = [
+    "community_dispatch_ready",
+    "live_community_workers",
+    "local_model_ready",
+    "model_id",
+    "mutation_free_observation",
+    "required_community_execution_profile",
+    "safe_to_dispatch",
+    "schema",
+    "sharded_pipeline_ready",
+  ];
+  if (
+    !value ||
+    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(exactKeys)
+  ) {
+    throw new Error(`${origin} readiness fields differ from the reviewed contract`);
+  }
+  const safe = value.safe_to_dispatch;
+  const community = value.community_dispatch_ready;
+  const local = value.local_model_ready;
+  const sharded = value.sharded_pipeline_ready;
+  const workers = value.live_community_workers;
+  const modelId = value.model_id;
+  if (
+    value.schema !== INFERENCE_READINESS_SCHEMA ||
+    value.required_community_execution_profile !==
+      CANONICAL_REWARD_INFERENCE_PROFILE ||
+    value.mutation_free_observation !== true ||
+    typeof safe !== "boolean" ||
+    typeof community !== "boolean" ||
+    typeof local !== "boolean" ||
+    typeof sharded !== "boolean" ||
+    !Number.isSafeInteger(workers) ||
+    (workers as number) < 0 ||
+    (modelId !== null && canonicalHash32(modelId) === null) ||
+    safe !== (community || local || sharded) ||
+    community !== ((workers as number) > 0) ||
+    (safe && canonicalHash32(modelId) === null)
+  ) {
+    throw new Error(`${origin} readiness contract is internally inconsistent`);
+  }
+  return safe;
+}
+
 type CommunityRewardReceiptExpectation = {
   sourceHost: string;
   txHash: string;
@@ -684,17 +764,6 @@ function parseInferenceRunBody(
   };
 }
 
-/** Errors after a claimed community assignment must never trigger duplicate work. */
-function directInferenceMustNotRetry(message: string): boolean {
-  const normalized = message.toLowerCase();
-  return (
-    normalized.includes("may still settle") ||
-    normalized.includes("refusing a second late") ||
-    normalized.includes("query its job status") ||
-    /http (400|401|403|409|413|422|504)\b/.test(normalized)
-  );
-}
-
 async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const base = liveBase()!;
   const fetchJson = async (path: string) => {
@@ -980,6 +1049,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
                 && v.included === true
                 && v.confirmed === true
                 && /^[0-9a-f]{64}$/.test(txHash)
+                && normalizeHash32(v.worker) !== null
                 && v.receipt_url === `/community/reward_receipt/0x${txHash}`;
             }
             if (v.record_kind === "mined_inference_attestation") {
@@ -992,13 +1062,11 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           })
           .map((v) => {
             const inf = (v.inference as Raw | undefined) ?? v;
-            const txHash = (v.tx_hash as string) ?? "";
-            if (!txHash) return null;
+            const txHash = normalizeHash32(v.tx_hash);
+            if (txHash === null) return null;
             const tokens = num(inf, "tokens_generated");
             const msPerTok = num(inf, "ms_per_token");
-            const from = (((v.worker as string) ?? (v.from as string)) ?? "")
-              .replace(/^0x/, "")
-              .toLowerCase();
+            const from = normalizeHash32(v.worker ?? v.from)?.slice(2) ?? "";
             const mine = !!mineAddr && !!from && from === mineAddr;
             return {
               txHash,
@@ -1194,25 +1262,41 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         maxTokens?: number;
         chatTemplate?: boolean;
       };
-      const r = await fetch(`${base}/inference/run`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: prompt,
-          max_tokens: maxTokens ?? 32,
-          chat_template: chatTemplate ?? true,
-        }),
-      });
-      if (!r.ok) {
-        const detail = await r.text().catch(() => "");
-        throw new Error(`inference error HTTP ${r.status}: ${detail}`);
+      let ready: boolean;
+      try {
+        ready = await liveInferenceReadiness(base);
+      } catch (error) {
+        throw inferencePreDispatchUnavailable(String(error));
       }
-      const v = await r.json();
-      // liveBase() is 127.0.0.1 - this IS the local node, even when that
-      // coordinator dispatches the actual compute to a community worker.
-      const result = parseInferenceRunBody(v, true, base);
-      pinLiveCommunityReceiptRoute(result);
-      return result as T;
+      if (!ready) {
+        throw inferencePreDispatchUnavailable(
+          `${base} reported no eligible inference route`,
+        );
+      }
+      try {
+        const r = await fetch(`${base}/inference/run`, {
+          method: "POST",
+          redirect: "error",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: prompt,
+            max_tokens: maxTokens ?? 32,
+            chat_template: chatTemplate ?? true,
+          }),
+        });
+        if (!r.ok) {
+          const detail = await r.text().catch(() => "");
+          throw new Error(`inference error HTTP ${r.status}: ${detail}`);
+        }
+        const v = await r.json();
+        // liveBase() is 127.0.0.1 - this IS the local node, even when that
+        // coordinator dispatches the actual compute to a community worker.
+        const result = parseInferenceRunBody(v, true, base);
+        pinLiveCommunityReceiptRoute(result);
+        return result as T;
+      } catch (error) {
+        throw inferencePostOutcomeAmbiguous(String(error));
+      }
     }
     case "fetch_community_reward_receipt": {
       const expected = args as CommunityRewardReceiptExpectation;
@@ -1264,29 +1348,26 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         k?: number;
         chatTemplate?: boolean;
       };
-      // Live mode iterates the same seed list the Rust side uses so the
-      // browser E2E path exercises the coordinator fallback against a
-      // real chain host.
-      let lastErr = "";
-      for (const host of COORDINATOR_HOSTS) {
-        try {
-          const r = await fetch(`${host}/inference/run_consensus`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              input: prompt,
-              max_tokens: maxTokens ?? 32,
-              k: k ?? 3,
-              chat_template: chatTemplate ?? true,
-            }),
-          });
-          if (!r.ok) {
-            lastErr = `${host} → HTTP ${r.status}`;
-            continue;
-          }
-          const v = await r.json();
-          const c = v.consensus ?? {};
-          return {
+      // Health/readiness probing happens before this fallback is selected.
+      // Consensus is still compute/write work: choose one origin and never
+      // replay the same click elsewhere after a status/transport/parse error.
+      const host = COORDINATOR_HOSTS[0];
+      try {
+        const r = await fetch(`${host}/inference/run_consensus`, {
+          method: "POST",
+          redirect: "error",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: prompt,
+            max_tokens: maxTokens ?? 32,
+            k: k ?? 3,
+            chat_template: chatTemplate ?? true,
+          }),
+        });
+        if (!r.ok) throw new Error(`${host} → HTTP ${r.status}`);
+        const v = await r.json();
+        const c = v.consensus ?? {};
+        return {
             input: v.input ?? "",
             output: v.output ?? "",
             outputHash: v.output_hash ?? "",
@@ -1314,12 +1395,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             },
             coordinator: host,
             servedLocally: false,
-          } as T;
-        } catch (e) {
-          lastErr = `${host} → ${String(e)}`;
-        }
+        } as T;
+      } catch (error) {
+        throw inferencePostOutcomeAmbiguous(String(error));
       }
-      throw new Error(`all coordinators failed; last: ${lastErr}`);
     }
     case "run_inference_via_coordinator_direct": {
       const { prompt, maxTokens, chatTemplate } = args as {
@@ -1327,38 +1406,46 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         maxTokens?: number;
         chatTemplate?: boolean;
       };
-      let lastErr = "";
+      let selected: string | null = null;
+      const failures: string[] = [];
       for (const host of COORDINATOR_HOSTS) {
         try {
-          const r = await fetch(`${host}/inference/run`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              input: prompt,
-              max_tokens: maxTokens ?? 32,
-              chat_template: chatTemplate ?? true,
-            }),
-          });
-          if (!r.ok) {
-            const detail = await r.text().catch(() => "");
-            const message = `${host} → HTTP ${r.status}: ${detail}`;
-            if (directInferenceMustNotRetry(message)) {
-              throw new Error(message);
-            }
-            lastErr = message;
-            continue;
+          if (await liveInferenceReadiness(host)) {
+            selected = host;
+            break;
           }
-          const v = await r.json();
-          const result = parseInferenceRunBody(v, false, host);
-          pinLiveCommunityReceiptRoute(result);
-          return result as T;
-        } catch (e) {
-          const message = `${host} → ${String(e)}`;
-          if (directInferenceMustNotRetry(message)) throw e;
-          lastErr = message;
+          failures.push(`${host}: unavailable`);
+        } catch (error) {
+          failures.push(`${host}: ${String(error)}`);
         }
       }
-      throw new Error(`all coordinators failed (direct path); last: ${lastErr}`);
+      if (!selected) {
+        throw inferencePreDispatchUnavailable(
+          `no candidate proved mutation-free inference readiness (${failures.join("; ")})`,
+        );
+      }
+      try {
+        const r = await fetch(`${selected}/inference/run`, {
+          method: "POST",
+          redirect: "error",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input: prompt,
+            max_tokens: maxTokens ?? 32,
+            chat_template: chatTemplate ?? true,
+          }),
+        });
+        if (!r.ok) {
+          const detail = await r.text().catch(() => "");
+          throw new Error(`${selected} → HTTP ${r.status}: ${detail}`);
+        }
+        const v = await r.json();
+        const result = parseInferenceRunBody(v, false, selected);
+        pinLiveCommunityReceiptRoute(result);
+        return result as T;
+      } catch (error) {
+        throw inferencePostOutcomeAmbiguous(String(error));
+      }
     }
     case "run_paid_inference": {
       throw settlementWriteUnavailable("Paid inference escrow");

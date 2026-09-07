@@ -45,6 +45,19 @@ PRODUCTION_MANIFEST_BUILDER="$REPO_ROOT/scripts/recovery/build-production-manife
 PRODUCTION_MANIFEST_TEST="$TEST_DIR/production_manifest_builder_test.sh"
 POSTRELEASE_PUBLIC_TRUTH="$REPO_ROOT/scripts/release/build-postrelease-public-truth.py"
 POSTRELEASE_PUBLIC_TRUTH_TEST="$TEST_DIR/postrelease_public_truth_test.sh"
+POSTCUTOVER_PRODUCT_VERIFIER="$REPO_ROOT/scripts/release/verify-postcutover-product-surfaces.mjs"
+POSTCUTOVER_PRODUCT_TEST="$TEST_DIR/postcutover_product_surfaces_test.sh"
+DESKTOP_LIVE_RECEIPT_BUILDER="$REPO_ROOT/scripts/release/build-desktop-live-product-receipt.mjs"
+CUTOVER_HANDOFF_COMMIT_BUILDER="$REPO_ROOT/scripts/release/create-cutover-handoff-commit.py"
+DESKTOP_GATE_CONFIG="$REPO_ROOT/desktop/playwright.gate.config.ts"
+DESKTOP_LIVE_CONFIG="$REPO_ROOT/desktop/playwright.live.config.ts"
+DESKTOP_LIVE_SPEC="$REPO_ROOT/desktop/tests/live.spec.ts"
+PACKAGED_APPIMAGE_LIVE_GATE="$REPO_ROOT/scripts/release/packaged-appimage-live-gate.py"
+PACKAGED_APPIMAGE_LIVE_TEST="$TEST_DIR/test_packaged_appimage_live_gate.py"
+MACOS_PACKAGE_PROVENANCE="$REPO_ROOT/scripts/recovery/build-macos-package-provenance.py"
+MACOS_PACKAGE_PROVENANCE_TEST="$REPO_ROOT/scripts/recovery/test_build_macos_package_provenance.py"
+DESKTOP_TAURI_LIB="$REPO_ROOT/desktop/src-tauri/src/lib.rs"
+DESKTOP_PRODUCTION_ACCEPTANCE="$REPO_ROOT/desktop/src-tauri/src/production_acceptance.rs"
 PUBLIC_PRODUCTION_STATUS="$REPO_ROOT/shared/frontend/production-status.json"
 ROOT_README="$REPO_ROOT/README.md"
 RECOVERY_RUNBOOK="$REPO_ROOT/scripts/recovery/README.md"
@@ -56,6 +69,7 @@ OWNER_EMERGENCY_TEST="$REPO_ROOT/scripts/recovery/test_owner_emergency_recovery.
 OWNER_EMERGENCY_WORKFLOW="$REPO_ROOT/.github/workflows/owner-emergency-recovery-approval.yml"
 RELEASE_TEST_RUNNER="$TEST_DIR/run.sh"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
+DESKTOP_BUILD_RS="$REPO_ROOT/desktop/src-tauri/build.rs"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
 CANONICAL_SEEDS="$REPO_ROOT/testnet-seeds.txt"
 DESKTOP_SEEDS="$REPO_ROOT/desktop/src-tauri/resources/testnet-seeds.txt"
@@ -1383,6 +1397,7 @@ release_secret_jobs_require_the_owner_environment() {
     done
     for required in \
         'npm exec --offline -- tauri build --ci --no-bundle' \
+        'ARC_BUILD_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}' \
         'npm exec --offline -- tauri bundle --ci --no-sign' \
         'unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD' \
         'Normalize and package the exact no-key bundle handoff' \
@@ -1390,6 +1405,16 @@ release_secret_jobs_require_the_owner_environment() {
     do
         printf '%s\n' "$unsigned_block" | grep -Fq -- "$required" || {
             printf 'no-key desktop build omits: %s\n' "$required"
+            return 1
+        }
+    done
+    for required in \
+        'cargo:rerun-if-env-changed=ARC_BUILD_SOURCE_COMMIT' \
+        'ARC_BUILD_SOURCE_COMMIT must equal the exact checked-out Git HEAD' \
+        'cargo:rustc-env=ARC_BUILD_SOURCE_COMMIT='
+    do
+        grep -Fq -- "$required" "$DESKTOP_BUILD_RS" || {
+            printf 'desktop source-commit build binding omits: %s\n' "$required"
             return 1
         }
     done
@@ -1979,8 +2004,25 @@ postrelease_public_truth_is_hermetic_exact_and_release_gated() {
         printf 'post-release public-truth test wrapper is missing or not executable\n'
         return 1
     }
+    [ -x "$POSTCUTOVER_PRODUCT_VERIFIER" ] || {
+        printf 'post-cutover product-surface verifier is missing or not executable\n'
+        return 1
+    }
+    [ -x "$POSTCUTOVER_PRODUCT_TEST" ] || {
+        printf 'post-cutover product-surface test wrapper is missing or not executable\n'
+        return 1
+    }
+    [ -f "$DESKTOP_LIVE_RECEIPT_BUILDER" ] \
+        && [ ! -L "$DESKTOP_LIVE_RECEIPT_BUILDER" ] || {
+        printf 'desktop live receipt builder is missing or unsafe\n'
+        return 1
+    }
     grep -Fq 'postrelease_public_truth_test.sh' "$RELEASE_TEST_RUNNER" || {
         printf 'post-release public-truth tests are not wired into the release runner\n'
+        return 1
+    }
+    grep -Fq 'postcutover_product_surfaces_test.sh' "$RELEASE_TEST_RUNNER" || {
+        printf 'post-cutover product-surface tests are not wired into the release runner\n'
         return 1
     }
     python3 -m py_compile "$POSTRELEASE_PUBLIC_TRUTH" \
@@ -1994,18 +2036,81 @@ postrelease_public_truth_is_hermetic_exact_and_release_gated() {
         'frontend source identities and endpoints must be unique' \
         'legacy forks do not share one sealed capture' \
         'REWARD_PER_RECEIPT_BASE = 2_500_000_000' \
+        'PRODUCT_SURFACE_VERIFIER_RELATIVE' \
+        'DESKTOP_LIVE_GENERATOR_RELATIVE' \
+        'DESKTOP_LIVE_SCHEMA = "arc.desktop-live-product-gate.v2"' \
+        'PACKAGED_APPIMAGE_VERIFIER_RELATIVE' \
+        'appimage_verification = run_packaged_appimage_verify(' \
+        'validate_desktop_live_receipt(' \
+        'args.desktop_live_receipt' \
+        '"desktopLive": desktop_live' \
+        '"--desktop-live-receipt"' \
+        '"--packaged-appimage-receipt"' \
+        '"packagedAppImage", "packagedNative", "playwrightReportSha256"' \
+        'expected_node_sha256' \
+        'node_version != "v24.20.0"' \
+        '"productSurfaces": product_surfaces' \
         '"canonical_cutoff"' \
         'object_pairs_hook=reject_duplicate_keys' \
         'parse_constant=reject_nonfinite_number' \
         'os.O_NOFOLLOW' \
         'os.O_EXCL' \
-        'output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)'
+        'parent_fd = os.open(parent, directory_flags)' \
+        'os.mkdir(output_dir.name, mode=0o700, dir_fd=parent_fd)' \
+        'directory_fd = os.open(output_dir.name, directory_flags, dir_fd=parent_fd)' \
+        'os.fsync(directory_fd)' \
+        'os.fsync(parent_fd)'
     do
         grep -Fq -- "$required" "$POSTRELEASE_PUBLIC_TRUTH" || {
             printf 'post-release public-truth builder omits: %s\n' "$required"
             return 1
         }
     done
+    for required in \
+        'appImageReceipt: requiredEnv("ARC_LIVE_APPIMAGE_RECEIPT")' \
+        'nativeHome: requiredEnv("ARC_LIVE_NATIVE_HOME")'
+    do
+        grep -Fq -- "$required" "$DESKTOP_LIVE_RECEIPT_BUILDER" || {
+            printf 'desktop live receipt builder omits packaged input: %s\n' "$required"
+            return 1
+        }
+    done
+    for required in \
+        'ARC_LIVE_PLAYWRIGHT_REPORT' \
+        'ARC_LIVE_CONFIG' \
+        'ARC_LIVE_CONFIG_SHA256' \
+        'ARC_LIVE_SOURCE_COMMIT' \
+        'ARC_LIVE_RECEIPT_OUTPUT' \
+        'ARC_LIVE_NODE_ARCHIVE' \
+        'ARC_LIVE_NODE_PATH' \
+        'ARC_LIVE_NPM_CLI' \
+        'ARC_LIVE_NPM_PACKAGE' \
+        'ARC_LIVE_ROLLOUT_MANIFEST_SHA256' \
+        'ARC_LIVE_SSH_PATH' \
+        'ARC_LIVE_SSH_KNOWN_HOSTS' \
+        'ARC_LIVE_SSH_IDENTITY_SHA256' \
+        'ARC_LIVE_VALIDATOR_HOST' \
+        'ARC_LIVE_VALIDATOR_NAME' \
+        'ARC_LIVE_VALIDATOR_RPC_SOCKET' \
+        'v24.20.0' \
+        '140.82.16.112' \
+        'forbidOnly: true' \
+        'reuseExistingServer: false'
+    do
+        grep -Fq -- "$required" "$DESKTOP_LIVE_CONFIG" || {
+            printf 'desktop fail-closed live config omits: %s\n' "$required"
+            return 1
+        }
+    done
+    grep -Fq 'data-tx-hash="${CANARY_TX}"' "$DESKTOP_LIVE_SPEC" || {
+        printf 'desktop live suite does not select the complete canary hash\n'
+        return 1
+    }
+    grep -Fq 'test-desktop-live-product-receipt.mjs' \
+        "$POSTCUTOVER_PRODUCT_TEST" || {
+        printf 'desktop live receipt tests are not release-gated\n'
+        return 1
+    }
     if grep -Fq -- 'arc-node-linux-aarch64' "$POSTRELEASE_PUBLIC_TRUTH" \
         || grep -Fq -- 'arc-cli-linux-aarch64' "$POSTRELEASE_PUBLIC_TRUTH"; then
         printf 'post-release public-truth builder uses noncanonical Linux ARM asset names\n'
@@ -2135,7 +2240,7 @@ phase = text[text.index("verify_offline_stop_phase()") : text.index("create_offl
 assert "/usr/bin/stat -c" not in phase
 assert "/usr/bin/readlink -f" not in phase
 assert 'python3() {' in text
-assert '"$ARC_OPERATOR_PYTHON_BIN" -I "$@"' in text
+assert '"$ARC_OPERATOR_PYTHON_BIN" -B -I "$@"' in text
 assert "python3 -" in phase
 
 capture = text[text.index("capture_phase()") : text.index("manifest_field()")]
@@ -2963,6 +3068,167 @@ PY
     fi
 }
 
+packaged_appimage_and_native_acceptance_are_mandatory_and_fail_closed() {
+    for path in \
+        "$PACKAGED_APPIMAGE_LIVE_GATE" \
+        "$PACKAGED_APPIMAGE_LIVE_TEST" \
+        "$MACOS_PACKAGE_PROVENANCE" \
+        "$MACOS_PACKAGE_PROVENANCE_TEST" \
+        "$DESKTOP_GATE_CONFIG" \
+        "$DESKTOP_TAURI_LIB" \
+        "$DESKTOP_PRODUCTION_ACCEPTANCE"
+    do
+        [ -f "$path" ] && [ ! -L "$path" ] || {
+            printf 'packaged application acceptance input is missing/unsafe: %s\n' "$path"
+            return 1
+        }
+    done
+    grep -Fq 'python3 "$TEST_DIR/test_packaged_appimage_live_gate.py" || status=1' \
+        "$RELEASE_TEST_RUNNER" || {
+        printf 'release harness does not mandatorily run the AppImage gate tests\n'
+        return 1
+    }
+    grep -Fq 'scripts/recovery/test_build_macos_package_provenance.py" || status=1' \
+        "$RELEASE_TEST_RUNNER" || {
+        printf 'release harness does not mandatorily run the macOS package provenance tests\n'
+        return 1
+    }
+    for required in \
+        'SCHEMA = "arc.packaged-appimage-live-product.v1"' \
+        'HOST_SCHEMA = "arc.packaged-appimage-live-host.v1"' \
+        'validate_copied_inference_attempt(' \
+        'independent_blake3_short(' \
+        'verify_updater_signature_in_guest(' \
+        'os.chmod(appimage, 0o500)' \
+        'client.new_session(appimage)' \
+        'inference_submit_click_budget": 1' \
+        'external_webkit_automation_enabled": True' \
+        'webdriver_execute_script_used": False' \
+        'recovery_enclave_accessed": False'
+    do
+        grep -Fq -- "$required" "$PACKAGED_APPIMAGE_LIVE_GATE" || {
+            printf 'packaged AppImage gate omits mandatory contract: %s\n' "$required"
+            return 1
+        }
+    done
+    grep -Fq 'test_guest_attempt_copy_must_equal_durable_host_attempt' \
+        "$PACKAGED_APPIMAGE_LIVE_TEST" || {
+        printf 'AppImage gate lacks durable-attempt substitution coverage\n'
+        return 1
+    }
+    grep -Fq 'testIgnore: ["**/screenshots.spec.ts"]' "$DESKTOP_GATE_CONFIG" || {
+        printf 'blocking desktop gate can rewrite the tracked screenshot gallery\n'
+        return 1
+    }
+    grep -Fq 'CI=true npx playwright test --config playwright.gate.config.ts' \
+        "$QUALITY_HARNESS" || {
+        printf 'local release gate bypasses the non-mutating Playwright configuration\n'
+        return 1
+    }
+    grep -Fq 'export PYTHONPYCACHEPREFIX="$LOG_DIR/python-pycache"' \
+        "$QUALITY_HARNESS" || {
+        printf 'local release gate can leave ignored Python bytecode beside source\n'
+        return 1
+    }
+    grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$QUALITY_HARNESS" \
+        && grep -Fq 'run_check "Releasable-worktree source cleanliness" source_cleanliness' \
+            "$QUALITY_HARNESS" \
+        && grep -Fq 'git ls-files --others --ignored --exclude-standard' \
+            "$QUALITY_HARNESS" || {
+        printf 'local release gate does not fail closed on ignored source artifacts\n'
+        return 1
+    }
+    if grep -Eq 'python3 -I "\$QUARANTINE_ROUND_DRIVER"' \
+            "$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"; then
+        printf 'isolated quarantine driver can write bytecode beside reviewed source\n'
+        return 1
+    fi
+    grep -Fq 'python3 -B -I "$QUARANTINE_ROUND_DRIVER"' \
+        "$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh" || {
+        printf 'quarantine driver does not suppress source-adjacent bytecode\n'
+        return 1
+    }
+    python3 - "$CUTOVER_HANDOFF_COMMIT_BUILDER" \
+        "$POSTRELEASE_PUBLIC_TRUTH" <<'PY' || return 1
+import pathlib
+import re
+import sys
+
+for raw_path in sys.argv[1:]:
+    path = pathlib.Path(raw_path)
+    text = path.read_text(encoding="utf-8")
+    if re.search(r"sys[.]executable,\s*(?:\n\s*)?[\"']-I[\"']", text):
+        raise SystemExit(f"isolated helper can write bytecode beside source: {path}")
+    if not re.search(
+        r"sys[.]executable,\s*(?:\n\s*)?[\"']-B[\"'],\s*"
+        r"(?:\n\s*)?[\"']-I[\"']",
+        text,
+    ):
+        raise SystemExit(f"isolated helper lacks the -B/-I boundary: {path}")
+PY
+    python3 -m py_compile "$PACKAGED_APPIMAGE_LIVE_GATE" \
+        "$PACKAGED_APPIMAGE_LIVE_TEST" || return 1
+    python3 - "$DESKTOP_TAURI_LIB" "$DESKTOP_PRODUCTION_ACCEPTANCE" <<'PY' || return 1
+import pathlib
+import re
+import sys
+
+lib = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+native = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+dispatch = "production_acceptance::run_standalone(&request)"
+builder = "tauri::Builder::default()"
+if lib.count(dispatch) != 1 or lib.count(builder) != 1:
+    raise SystemExit("native acceptance/Tauri builder invocation count drifted")
+if lib.index(dispatch) >= lib.index(builder):
+    raise SystemExit("native packaged acceptance no longer branches before Tauri Builder")
+if "fn configured_http_client() -> Result<reqwest::Client, String>" not in lib:
+    raise SystemExit("normal desktop HTTP client is not a fail-closed constructor")
+if ".redirect(reqwest::redirect::Policy::none())" not in lib:
+    raise SystemExit("normal desktop HTTP client lost its redirect fence")
+configured_client = lib.split("fn configured_http_client()", 1)[1].split("#[cfg_attr", 1)[0]
+if ".retry(reqwest::retry::never())" not in configured_client:
+    raise SystemExit("normal desktop HTTP client can automatically replay writes")
+if ".no_proxy()" in configured_client:
+    raise SystemExit("interactive desktop client must retain an explicitly configured proxy")
+if "reqwest::Client::new()" in lib:
+    raise SystemExit("normal desktop can silently fall back to an unconstrained HTTP client")
+if "std::process::exit(70);" not in lib:
+    raise SystemExit("normal desktop does not stop when constrained HTTP setup fails")
+for required in (
+    "let production_acceptance = match production_acceptance::request_from_args",
+    "if let Some(request) = production_acceptance",
+):
+    if required not in lib:
+        raise SystemExit(f"native acceptance dispatch omits {required!r}")
+
+for required in (
+    '#[serde(rename_all = "camelCase")]\nstruct RuntimeIdentity',
+    "reviewed_environment_identity(std::env::vars_os())?",
+    "environment_names,",
+    "environment_sha256,",
+    "ipc_handlers_registered: false",
+    "plugins_loaded: false",
+    "tauri_builder_started: false",
+    "webviews_created: 0",
+):
+    if required not in native:
+        raise SystemExit(f"native runtime identity omits {required!r}")
+allowed = re.search(r'const ALLOWED: \[&str; 6\] = \[(.*?)\];', native, re.S)
+if not allowed:
+    raise SystemExit("native sanitized environment allowlist is not exact")
+names = set(re.findall(r'"([A-Z_]+)"', allowed.group(1)))
+expected = {"HOME", "LANG", "LC_ALL", "PATH", "RUST_LOG", "TMPDIR"}
+if names != expected:
+    raise SystemExit(f"native sanitized environment names drifted: {sorted(names)!r}")
+for alias in ("TAURI_AUTOMATION", "TAURI_WEBVIEW_AUTOMATION"):
+    if alias in names:
+        raise SystemExit(f"native sanitized environment permits {alias}")
+    marker = f'"{alias}",'
+    if marker not in native:
+        raise SystemExit(f"native tests do not explicitly reject {alias}")
+PY
+}
+
 run_test 'required headless assets are built and gate the sole publisher' required_assets_are_built_and_gated
 run_test 'locked Rust and JavaScript Tauri packages are release-compatible' desktop_tauri_packages_are_release_compatible
 run_test 'desktop packages the exact canonical release seed list' packaged_desktop_network_resources_match_release
@@ -3001,6 +3267,7 @@ run_test 'production recovery plan streams probes without persistent remote help
 run_test 'archive transport credentials and temp roots are invocation-scoped' archive_transport_configuration_is_invocation_scoped
 run_test 'macOS pre-tag community canary is exact, private, SIGTERM-only, and preservation-safe' macos_pretag_community_canary_is_exact_private_and_fail_closed
 run_test 'owner emergency recovery is canonical, create-only, fresh, and exact-input bound' owner_emergency_recovery_authorization_is_durable_and_exact
+run_test 'packaged AppImage and pre-Tauri native acceptance are mandatory and fail closed' packaged_appimage_and_native_acceptance_are_mandatory_and_fail_closed
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 
 finish_tests

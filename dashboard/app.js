@@ -362,17 +362,36 @@
     if (validated.error) throw new Error(validated.error);
     const plans = resolver.lookupSources();
     const attempts = await Promise.all(plans.map(async ({ source }) => {
-      const [full, receipt] = await Promise.all([
+      const [full, receipt, rewardEvidence] = await Promise.all([
         optionalRequest(fetchImpl, source, `/tx/${validated.value}/full`, { signal }),
         optionalRequest(fetchImpl, source, `/tx/${validated.value}`, { signal }),
+        source.kind === "v3"
+          ? optionalRequest(fetchImpl, source, `/community/reward_receipt/0x${validated.value}`, { signal })
+          : Promise.resolve({ ok: false, error: null }),
       ]);
-      if (!full.ok && !receipt.ok) return { source, found: false };
+      if (!full.ok && !receipt.ok && !rewardEvidence.ok) return { source, found: false };
       const fullValue = full.ok ? full.value : null;
       const receiptValue = receipt.ok ? receipt.value : null;
-      const classification = network.classifyReceipt({ tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue, receipt: receiptValue?.receipt ?? receiptValue });
+      const rewardValue = rewardEvidence.ok ? rewardEvidence.value : null;
+      const rewardClassification = rewardValue
+        ? network.classifyCommunityRewardReceipt(rewardValue, validated.value)
+        : null;
+      const rewardEvidenceBound = rewardClassification !== null;
+      const classification = rewardEvidenceBound
+        ? rewardClassification
+        : network.classifyReceipt({ tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue, receipt: receiptValue?.receipt ?? receiptValue });
       const configured = classification.height === null ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" } : resolver.classifyOccurrence(source.id, classification.height);
       const provenance = network.gateCanonical(configured, checkpointAudit);
-      return { source, found: true, full: fullValue, receipt: receiptValue, classification, provenance };
+      return {
+        source,
+        found: true,
+        full: fullValue,
+        receipt: receiptValue,
+        rewardEvidence: rewardValue,
+        rewardEvidenceBound,
+        classification,
+        provenance,
+      };
     }));
     return { hash: validated.value, occurrences: attempts.filter((attempt) => attempt.found), searched: plans.map((plan) => plan.sourceId) };
   }
@@ -525,7 +544,7 @@
           receiptField("REWARD", occurrence.classification.rewardEarned ? "Earned · mined success" : "Not counted as earned"),
         );
         card.append(grid);
-        const details = create("details"); details.append(create("summary", "", "Raw source response"), create("pre", "", JSON.stringify({ transaction: occurrence.full, receipt: occurrence.receipt }, null, 2))); card.append(details);
+        const details = create("details"); details.append(create("summary", "", "Raw source response"), create("pre", "", JSON.stringify({ transaction: occurrence.full, receipt: occurrence.receipt, communityRewardReceipt: occurrence.rewardEvidence }, null, 2))); card.append(details);
         elements.receiptResult.append(card);
       }
     }

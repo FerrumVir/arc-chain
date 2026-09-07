@@ -2,8 +2,8 @@ import type { Page } from "@playwright/test";
 
 // Seed the app into a "post-onboarding" state so dashboard tests don't need to
 // walk the wizard. Writes the same shape the zustand store persists.
-export async function seedOnboarded(page: Page) {
-  await page.addInitScript(() => {
+export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
+  await page.addInitScript((workerAddress) => {
     localStorage.setItem(
       "arc-desktop-state-v1",
       JSON.stringify({
@@ -12,7 +12,7 @@ export async function seedOnboarded(page: Page) {
           // No seedPhrase: the store no longer accepts one, and
           // scrubIdentity() would strip it on load anyway. See
           // seedOnboardedLegacy() for a fixture that still has it.
-          address: "99".repeat(32),
+          address: workerAddress,
           publicKey:
             "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
           createdAt: Date.now(),
@@ -31,7 +31,7 @@ export async function seedOnboarded(page: Page) {
         inferenceMode: "coordinator",
       }),
     );
-  });
+  }, address);
 }
 
 /**

@@ -1095,6 +1095,46 @@ fn parse_inference_settlement(v: &Value) -> Option<InferenceSettlement> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        model_id: settlement
+            .get("model_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        input_hash: settlement
+            .get("input_hash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        output_hash: settlement
+            .get("output_hash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        assignment_epoch: settlement
+            .get("assignment_epoch")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        transaction_domain: settlement
+            .get("transaction_domain")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        recovery_epoch: settlement.get("recovery_epoch").and_then(Value::as_u64),
+        validator_set_id: settlement.get("validator_set_id").and_then(Value::as_u64),
+        validator_set_commitment: settlement
+            .get("validator_set_commitment")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        validator_approvals: settlement
+            .get("validator_approvals")
+            .and_then(Value::as_u64),
+        evidence_source: settlement
+            .get("evidence_source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -1106,7 +1146,7 @@ fn is_canonical_hash32(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_community_receipt_expectation(
+pub(crate) fn validate_community_receipt_expectation(
     tx_hash: &str,
     job_id: &str,
     worker: &str,
@@ -1151,6 +1191,27 @@ fn parse_community_reward_receipt_value(
         expected_worker,
         expected_receipt_url,
     )?;
+    let object = value.as_object().ok_or_else(|| {
+        "reward receipt unavailable: canonical response was not an object".to_string()
+    })?;
+    let status = value.get("status").and_then(Value::as_str).ok_or_else(|| {
+        "reward receipt unavailable: canonical response omitted status".to_string()
+    })?;
+    let expected_fields: &[&str] = if status == "pending_mined_receipt" {
+        &arc_types::transaction::COMMUNITY_REWARD_PENDING_RECEIPT_FIELDS
+    } else {
+        &arc_types::transaction::COMMUNITY_REWARD_TERMINAL_RECEIPT_FIELDS
+    };
+    if object.len() != expected_fields.len()
+        || expected_fields
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(
+            "reward receipt unavailable: canonical response fields differ from the exact 0x25 contract"
+                .to_string(),
+        );
+    }
     let exact_string = |field: &str, expected: &str| -> Result<(), String> {
         if value.get(field).and_then(Value::as_str) == Some(expected) {
             Ok(())
@@ -1165,10 +1226,92 @@ fn parse_community_reward_receipt_value(
     exact_string("job_id", expected_job_id)?;
     exact_string("worker", expected_worker)?;
     exact_string("receipt_url", expected_receipt_url)?;
+    let expected_evidence_source = match status {
+        "pending_mined_receipt" => arc_types::transaction::COMMUNITY_REWARD_PENDING_EVIDENCE,
+        "mined_success" => arc_types::transaction::COMMUNITY_REWARD_SUCCESS_EVIDENCE,
+        "mined_failed" | "receipt_unavailable" => {
+            arc_types::transaction::COMMUNITY_REWARD_UNSUCCESSFUL_EVIDENCE
+        }
+        _ => {
+            return Err(format!(
+                "reward receipt unavailable: unsupported canonical status {status}"
+            ))
+        }
+    };
+    exact_string("evidence_source", expected_evidence_source)?;
 
-    let status = value.get("status").and_then(Value::as_str).ok_or_else(|| {
-        "reward receipt unavailable: canonical response omitted status".to_string()
-    })?;
+    let exact_hash = |field: &str| -> Result<String, String> {
+        let hash = value.get(field).and_then(Value::as_str).ok_or_else(|| {
+            format!("reward receipt unavailable: canonical response omitted {field}")
+        })?;
+        if !is_canonical_hash32(hash) {
+            return Err(format!(
+                "reward receipt unavailable: canonical response {field} was not canonical 32-byte hex"
+            ));
+        }
+        Ok(hash.to_string())
+    };
+    let (model_id, input_hash, output_hash) = if status == "pending_mined_receipt" {
+        (String::new(), String::new(), String::new())
+    } else {
+        (
+            exact_hash("model_id")?,
+            exact_hash("input_hash")?,
+            exact_hash("output_hash")?,
+        )
+    };
+    let assignment_epoch = match value.get("assignment_epoch") {
+        Some(Value::String(value)) if is_canonical_hash32(value) => value.clone(),
+        Some(Value::Null) if status == "pending_mined_receipt" => String::new(),
+        _ => {
+            return Err(
+                "reward receipt unavailable: canonical response assignment_epoch was malformed"
+                    .to_string(),
+            )
+        }
+    };
+    let transaction_domain = exact_hash("transaction_domain")?;
+    let validator_set_commitment = exact_hash("validator_set_commitment")?;
+    let recovery_epoch = value
+        .get("recovery_epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "reward receipt unavailable: canonical response recovery_epoch was not a nonnegative integer"
+                .to_string()
+        })?;
+    let validator_set_id = value
+        .get("validator_set_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "reward receipt unavailable: canonical response validator_set_id was not a nonnegative integer"
+                .to_string()
+        })?;
+    let validator_approvals = value
+        .get("validator_approvals")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "reward receipt unavailable: canonical response validator_approvals was not a nonnegative integer"
+                .to_string()
+        })?;
+    let approvals_required = arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED as u64;
+    if status == "pending_mined_receipt" {
+        if value
+            .get("required_validator_approvals")
+            .and_then(Value::as_u64)
+            != Some(approvals_required)
+            || validator_approvals > approvals_required
+        {
+            return Err(
+                "reward receipt unavailable: pending validator approval threshold differs from protocol"
+                    .to_string(),
+            );
+        }
+    } else if validator_approvals < approvals_required {
+        return Err(
+            "reward receipt unavailable: terminal receipt lacks the protocol validator approval threshold"
+                .to_string(),
+        );
+    }
     let submitted = value.get("submitted").and_then(Value::as_bool);
     let included = value.get("included").and_then(Value::as_bool);
     let confirmed = value.get("confirmed").and_then(Value::as_bool);
@@ -1282,6 +1425,16 @@ fn parse_community_reward_receipt_value(
         reward_base,
         reward_arc,
         receipt_url: expected_receipt_url.to_string(),
+        model_id,
+        input_hash,
+        output_hash,
+        assignment_epoch,
+        transaction_domain,
+        recovery_epoch: Some(recovery_epoch),
+        validator_set_id: Some(validator_set_id),
+        validator_set_commitment,
+        validator_approvals: Some(validator_approvals),
+        evidence_source: expected_evidence_source.to_string(),
     })
 }
 
@@ -1446,6 +1599,104 @@ fn parse_inference_run_value(
 /// (the tags then appear twice in the tokenized input). arc-node accepts
 /// `"chat_template": true` and applies the loaded model's own template,
 /// which is correct for whatever is actually loaded.
+pub async fn inference_readiness(
+    http: &reqwest::Client,
+    base_url: &str,
+) -> Result<bool, String> {
+    const SCHEMA: &str = "arc.inference.readiness.v1";
+    const PROFILE: &str = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+    const KEYS: [&str; 9] = [
+        "schema",
+        "safe_to_dispatch",
+        "community_dispatch_ready",
+        "local_model_ready",
+        "sharded_pipeline_ready",
+        "live_community_workers",
+        "model_id",
+        "required_community_execution_profile",
+        "mutation_free_observation",
+    ];
+
+    let base_url = base_url.trim_end_matches('/');
+    let response = http
+        .get(format!("{base_url}/inference/readiness"))
+        .send()
+        .await
+        .map_err(|error| format!("{base_url} readiness transport failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{base_url} readiness returned HTTP {}",
+            response.status()
+        ));
+    }
+    if response.content_length().is_some_and(|length| length > 8_192) {
+        return Err(format!("{base_url} readiness response exceeds 8192 bytes"));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("{base_url} readiness body failed: {error}"))?;
+    if bytes.len() > 8_192 {
+        return Err(format!("{base_url} readiness response exceeds 8192 bytes"));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{base_url} readiness JSON is invalid: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{base_url} readiness response is not an object"))?;
+    if object.len() != KEYS.len() || !KEYS.iter().all(|key| object.contains_key(*key)) {
+        return Err(format!(
+            "{base_url} readiness fields differ from the reviewed {SCHEMA} contract"
+        ));
+    }
+    if object.get("schema").and_then(Value::as_str) != Some(SCHEMA)
+        || object
+            .get("required_community_execution_profile")
+            .and_then(Value::as_str)
+            != Some(PROFILE)
+        || object
+            .get("mutation_free_observation")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(format!(
+            "{base_url} readiness provenance/profile is not the reviewed contract"
+        ));
+    }
+    let bool_field = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("{base_url} readiness {key} is not boolean"))
+    };
+    let safe = bool_field("safe_to_dispatch")?;
+    let community = bool_field("community_dispatch_ready")?;
+    let local = bool_field("local_model_ready")?;
+    let sharded = bool_field("sharded_pipeline_ready")?;
+    let workers = object
+        .get("live_community_workers")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{base_url} readiness worker count is not an integer"))?;
+    let model_id = match object.get("model_id") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) if is_canonical_hash32(value) => Some(value.as_str()),
+        _ => {
+            return Err(format!(
+                "{base_url} readiness model_id is neither null nor canonical hash"
+            ))
+        }
+    };
+    if safe != (community || local || sharded)
+        || community != (workers > 0)
+        || (safe && model_id.is_none())
+    {
+        return Err(format!(
+            "{base_url} readiness route facts are internally inconsistent"
+        ));
+    }
+    Ok(safe)
+}
+
 pub async fn run_inference(
     http: &reqwest::Client,
     base_url: &str,
@@ -2514,6 +2765,143 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
     }
 }
 
+/// Verify the exact model/profile advertised by one already selected
+/// production coordinator before acceptance performs its single paid POST.
+pub async fn fetch_production_model_identity(
+    http: &reqwest::Client,
+    base_url: &str,
+    expected_model_id: &str,
+) -> Result<String, String> {
+    match get_detailed(http, &format!("{base_url}/models")).await {
+        Fetched::Ok(value) => parse_production_model_identity(&value, expected_model_id),
+        other => Err(unavailable_reason(base_url, "/models", &other)),
+    }
+}
+
+fn parse_production_model_identity(
+    value: &Value,
+    expected_model_id: &str,
+) -> Result<String, String> {
+    const PROFILE: &str = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+    const TOP_KEYS: [&str; 4] = [
+        "fully_covered_models",
+        "models",
+        "total_models",
+        "total_shard_nodes",
+    ];
+    const MODEL_KEYS: [&str; 11] = [
+        "covered_layers",
+        "distinct_ranges",
+        "execution_profile",
+        "execution_profiles",
+        "full_model_mb",
+        "fully_covered",
+        "model_id",
+        "model_name",
+        "profile_bound",
+        "shard_count",
+        "total_layers",
+    ];
+    let expected = strip_0x(expected_model_id);
+    if expected_model_id != format!("0x{expected}") || !is_tx_hash(&expected) {
+        return Err("sealed production model ID is not canonical 0x-prefixed 32-byte hex".into());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "production /models response is not an object".to_string())?;
+    if object.len() != TOP_KEYS.len() || !TOP_KEYS.iter().all(|key| object.contains_key(*key)) {
+        return Err("production /models top-level fields differ from the reviewed contract".into());
+    }
+    let models = object
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "production /models omitted its model array".to_string())?;
+    let total_models = object
+        .get("total_models")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "production /models omitted total_models".to_string())?;
+    if total_models == 0 || total_models != models.len() as u64 {
+        return Err("production /models count does not match its model array".into());
+    }
+    let reported_fully_covered = object
+        .get("fully_covered_models")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "production /models omitted fully_covered_models".to_string())?;
+    let total_shard_nodes = object
+        .get("total_shard_nodes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "production /models omitted total_shard_nodes".to_string())?;
+    if total_shard_nodes == 0 {
+        return Err("production /models reports no shard nodes".into());
+    }
+
+    let mut model_ids = std::collections::HashSet::with_capacity(models.len());
+    let mut computed_fully_covered = 0u64;
+    let mut expected_matches = 0u32;
+    for model in models {
+        let row = model
+            .as_object()
+            .ok_or_else(|| "production /models contains a non-object row".to_string())?;
+        if row.len() != MODEL_KEYS.len() || !MODEL_KEYS.iter().all(|key| row.contains_key(*key)) {
+            return Err("production /models row fields differ from the reviewed contract".into());
+        }
+        let model_id = row
+            .get("model_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "production model row omitted model_id".to_string())?;
+        let normalized = strip_0x(model_id);
+        if model_id != format!("0x{normalized}")
+            || !is_tx_hash(&normalized)
+            || !model_ids.insert(model_id.to_string())
+        {
+            return Err("production /models contains a malformed or duplicate model ID".into());
+        }
+        let fully_covered = row.get("fully_covered").and_then(Value::as_bool) == Some(true);
+        if fully_covered {
+            computed_fully_covered += 1;
+        }
+        if model_id != expected_model_id {
+            continue;
+        }
+        expected_matches += 1;
+        let total_layers = row.get("total_layers").and_then(Value::as_u64).unwrap_or(0);
+        let covered_layers = row
+            .get("covered_layers")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let distinct_ranges = row
+            .get("distinct_ranges")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let shard_count = row.get("shard_count").and_then(Value::as_u64).unwrap_or(0);
+        let profiles = row
+            .get("execution_profiles")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "production model omitted execution_profiles".to_string())?;
+        if !fully_covered
+            || row.get("profile_bound").and_then(Value::as_bool) != Some(true)
+            || row.get("execution_profile").and_then(Value::as_str) != Some(PROFILE)
+            || profiles.len() != 1
+            || profiles[0].as_str() != Some(PROFILE)
+            || total_layers == 0
+            || covered_layers != total_layers
+            || distinct_ranges == 0
+            || shard_count < distinct_ranges
+        {
+            return Err(
+                "sealed production model is not a complete canonical-profile pipeline".into(),
+            );
+        }
+    }
+    if reported_fully_covered != computed_fully_covered {
+        return Err("production /models fully-covered count is inconsistent".into());
+    }
+    if expected_matches != 1 {
+        return Err("sealed production model is absent or ambiguous on the coordinator".into());
+    }
+    Ok(expected_model_id.to_string())
+}
+
 /// The `from`/`to` window covering the newest `limit` blocks at `tip`.
 ///
 /// Extracted so the off-by-one is testable. Getting it wrong is not a cosmetic
@@ -2732,6 +3120,53 @@ mod chain_read_tests {
     use super::*;
     use serde_json::json;
 
+    fn production_models(model_id: &str) -> Value {
+        let profile = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+        json!({
+            "fully_covered_models": 1,
+            "models": [{
+                "covered_layers": 32,
+                "distinct_ranges": 6,
+                "execution_profile": profile,
+                "execution_profiles": [profile],
+                "full_model_mb": 4096,
+                "fully_covered": true,
+                "model_id": model_id,
+                "model_name": "ARC production model",
+                "profile_bound": true,
+                "shard_count": 18,
+                "total_layers": 32
+            }],
+            "total_models": 1,
+            "total_shard_nodes": 6
+        })
+    }
+
+    #[test]
+    fn production_model_preflight_is_exact_and_profile_bound() {
+        let model_id = format!("0x{}", "ab".repeat(32));
+        let value = production_models(&model_id);
+        assert_eq!(
+            parse_production_model_identity(&value, &model_id).unwrap(),
+            model_id
+        );
+
+        for mutation in ["profile", "coverage", "identity", "schema"] {
+            let mut changed = value.clone();
+            match mutation {
+                "profile" => changed["models"][0]["execution_profile"] = json!("other"),
+                "coverage" => changed["models"][0]["covered_layers"] = json!(31),
+                "identity" => changed["models"][0]["model_id"] = json!(format!("0x{}", "cd".repeat(32))),
+                "schema" => changed["unexpected"] = json!(true),
+                _ => unreachable!(),
+            }
+            assert!(
+                parse_production_model_identity(&changed, &model_id).is_err(),
+                "{mutation} mutation must fail closed"
+            );
+        }
+    }
+
     #[test]
     fn community_inference_parser_preserves_top_level_proof_and_reward_state() {
         let reward_hash = format!("0x{}", "ab".repeat(32));
@@ -2802,12 +3237,26 @@ mod chain_read_tests {
             "receipt_unavailable" => (true, false, Value::Null, Value::Null, Value::Null),
             other => panic!("unsupported test status {other}"),
         };
-        json!({
+        let evidence_source = if status == "mined_success" {
+            "successful mined CommunityInferenceReward receipt"
+        } else if status == "pending_mined_receipt" {
+            "coordinator mempool submission only; no mined receipt"
+        } else {
+            "no successful mined receipt"
+        };
+        let mut value = json!({
+            "assignment_epoch": format!("0x{}", "88".repeat(32)),
             "status": status,
             "tx_type": "0x25",
             "tx_hash": format!("0x{}", "44".repeat(32)),
             "job_id": format!("0x{}", "55".repeat(32)),
             "worker": format!("0x{}", "11".repeat(32)),
+            "transaction_domain": format!("0x{}", "99".repeat(32)),
+            "recovery_epoch": 1,
+            "validator_set_id": 1,
+            "validator_set_commitment": format!("0x{}", "aa".repeat(32)),
+            "validator_approvals": 5,
+            "evidence_source": evidence_source,
             "submitted": true,
             "included": included,
             "confirmed": confirmed,
@@ -2818,7 +3267,16 @@ mod chain_read_tests {
             "reward_base": reward_base,
             "reward_arc": reward_arc,
             "receipt_url": format!("/community/reward_receipt/0x{}", "44".repeat(32)),
-        })
+        });
+        if status == "pending_mined_receipt" {
+            value["required_validator_approvals"] =
+                json!(arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED);
+        } else {
+            value["model_id"] = json!(format!("0x{}", "22".repeat(32)));
+            value["input_hash"] = json!(format!("0x{}", "33".repeat(32)));
+            value["output_hash"] = json!(format!("0x{}", "66".repeat(32)));
+        }
+        value
     }
 
     fn parse_test_reward_receipt(value: &Value) -> Result<InferenceSettlement, String> {
@@ -2857,6 +3315,26 @@ mod chain_read_tests {
     }
 
     #[test]
+    fn desktop_receipt_fixtures_track_the_real_node_serializer_contract() {
+        let server = include_str!("../../../crates/arc-node/src/rpc.rs");
+        for marker in [
+            "fn pending_mined_receipt_value(",
+            "\"required_validator_approvals\"",
+            "COMMUNITY_REWARD_PENDING_EVIDENCE",
+            "fn community_reward_receipt_value(",
+            "COMMUNITY_REWARD_SUCCESS_EVIDENCE",
+            "COMMUNITY_REWARD_UNSUCCESSFUL_EVIDENCE",
+            "COMMUNITY_REWARD_PENDING_RECEIPT_FIELDS",
+            "COMMUNITY_REWARD_TERMINAL_RECEIPT_FIELDS",
+        ] {
+            assert!(
+                server.contains(marker),
+                "server receipt serializer drifted: {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn canonical_reward_receipt_rejects_wrong_or_missing_worker_and_url_migration() {
         let mut wrong_worker = canonical_reward_receipt("mined_success");
         wrong_worker["worker"] = json!(format!("0x{}", "12".repeat(32)));
@@ -2868,7 +3346,7 @@ mod chain_read_tests {
         missing_worker.as_object_mut().unwrap().remove("worker");
         assert!(parse_test_reward_receipt(&missing_worker)
             .unwrap_err()
-            .contains("worker"));
+            .contains("fields differ"));
 
         let mut wrong_url = canonical_reward_receipt("mined_success");
         wrong_url["receipt_url"] =
@@ -2876,6 +3354,67 @@ mod chain_read_tests {
         assert!(parse_test_reward_receipt(&wrong_url)
             .unwrap_err()
             .contains("receipt_url"));
+    }
+
+    #[test]
+    fn canonical_reward_receipt_requires_the_complete_exact_provenance_schema() {
+        let mut missing = canonical_reward_receipt("mined_success");
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("transaction_domain");
+        assert!(parse_test_reward_receipt(&missing)
+            .unwrap_err()
+            .contains("fields differ"));
+
+        let mut extra = canonical_reward_receipt("mined_success");
+        extra["coordinator"] = json!("lax");
+        assert!(parse_test_reward_receipt(&extra)
+            .unwrap_err()
+            .contains("fields differ"));
+
+        for field in [
+            "model_id",
+            "input_hash",
+            "output_hash",
+            "assignment_epoch",
+            "transaction_domain",
+            "validator_set_commitment",
+        ] {
+            let mut malformed = canonical_reward_receipt("mined_success");
+            malformed[field] = json!(format!("0x{}", "g0".repeat(32)));
+            assert!(
+                parse_test_reward_receipt(&malformed).is_err(),
+                "malformed {field} must fail closed"
+            );
+        }
+
+        let pending = canonical_reward_receipt("pending_mined_receipt");
+        assert!(pending.get("model_id").is_none());
+        assert_eq!(
+            pending
+                .get("required_validator_approvals")
+                .and_then(Value::as_u64),
+            Some(arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED as u64)
+        );
+        parse_test_reward_receipt(&pending).expect("real pending serializer shape");
+
+        let mut too_few_approvals = canonical_reward_receipt("mined_success");
+        too_few_approvals["validator_approvals"] =
+            json!(arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED - 1);
+        assert!(parse_test_reward_receipt(&too_few_approvals)
+            .unwrap_err()
+            .contains("approval threshold"));
+
+        let parsed = parse_test_reward_receipt(&canonical_reward_receipt("mined_success"))
+            .expect("complete receipt");
+        assert_eq!(parsed.recovery_epoch, Some(1));
+        assert_eq!(parsed.validator_set_id, Some(1));
+        assert_eq!(parsed.validator_approvals, Some(5));
+        assert_eq!(
+            parsed.evidence_source,
+            "successful mined CommunityInferenceReward receipt"
+        );
     }
 
     #[test]

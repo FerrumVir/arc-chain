@@ -310,12 +310,160 @@ const canonicalRewardActivity = (overrides = {}) => ({
   ...overrides,
 });
 
+const canonicalRewardRpcReceipt = (overrides = {}) => ({
+  status: "mined_success",
+  tx_type: "0x25",
+  tx_hash: `0x${hex("d")}`,
+  job_id: `0x${hex("c")}`,
+  worker: `0x${hex("b")}`,
+  model_id: `0x${hex("1")}`,
+  input_hash: `0x${hex("2")}`,
+  output_hash: `0x${hex("3")}`,
+  assignment_epoch: `0x${hex("4")}`,
+  recovery_epoch: 1,
+  validator_set_id: 1,
+  validator_set_commitment: `0x${hex("5")}`,
+  transaction_domain: `0x${hex("6")}`,
+  validator_approvals: 5,
+  submitted: true,
+  included: true,
+  confirmed: true,
+  success: true,
+  block_height: H + 3,
+  block_hash: `0x${hex("a")}`,
+  index: 0,
+  reward_base: 2_500_000_000,
+  reward_arc: 2.5,
+  receipt_url: `/community/reward_receipt/0x${hex("d")}`,
+  evidence_source: "successful mined CommunityInferenceReward receipt",
+  ...overrides,
+});
+
+const canonicalPendingRewardRpcReceipt = (overrides = {}) => ({
+  status: "pending_mined_receipt",
+  tx_type: "0x25",
+  tx_hash: `0x${hex("d")}`,
+  job_id: `0x${hex("c")}`,
+  worker: `0x${hex("b")}`,
+  assignment_epoch: `0x${hex("4")}`,
+  recovery_epoch: 1,
+  validator_set_id: 1,
+  validator_set_commitment: `0x${hex("5")}`,
+  transaction_domain: `0x${hex("6")}`,
+  validator_approvals: 5,
+  required_validator_approvals: 5,
+  submitted: true,
+  included: false,
+  confirmed: false,
+  success: null,
+  block_height: null,
+  block_hash: null,
+  index: null,
+  reward_base: null,
+  reward_arc: null,
+  receipt_url: `/community/reward_receipt/0x${hex("d")}`,
+  evidence_source: "coordinator mempool submission only; no mined receipt",
+  ...overrides,
+});
+
 test("reward earnings require a successful mined receipt", () => {
   const result = network.classifyReceipt(canonicalRewardActivity());
   assert.equal(result.rewardEarned, true);
   assert.equal(result.category, "reward");
   assert.equal(result.inferenceConfirmed, true);
   assert.equal(result.paymentConfirmed, true);
+});
+
+test("the direct community-reward RPC shape proves an exactly bound mined payment", () => {
+  const result = network.classifyCommunityRewardReceipt(
+    canonicalRewardRpcReceipt(),
+    hex("d"),
+  );
+  assert.ok(result);
+  assert.equal(result.txHash, hex("d"));
+  assert.equal(result.rewardJob, hex("c"));
+  assert.equal(result.rewardWorker, hex("b"));
+  assert.equal(result.rewardEarned, true);
+  assert.equal(result.inferenceConfirmed, true);
+  assert.equal(result.paymentConfirmed, true);
+});
+
+test("the direct community-reward RPC parser rejects mismatches and partial state", () => {
+  const patches = [
+    { tx_type: "CommunityInferenceReward" },
+    { tx_hash: hex("d") },
+    { job_id: hex("c") },
+    { worker: hex("b") },
+    { receipt_url: `/community/reward_receipt/0x${hex("e")}` },
+    { recovery_epoch: -1 },
+    { validator_set_id: 1.5 },
+    { validator_set_commitment: hex("5") },
+    { validator_approvals: -1 },
+    { validator_approvals: 0 },
+    { validator_approvals: 7 },
+    { confirmed: false },
+    { block_hash: hex("a") },
+    { reward_base: 2_499_999_999 },
+    { reward_arc: 2.49 },
+    { evidence_source: "trust me" },
+    { model_id: null },
+    { unexpected: true },
+  ];
+  for (const patch of patches) {
+    assert.equal(
+      network.classifyCommunityRewardReceipt(canonicalRewardRpcReceipt(patch), hex("d")),
+      null,
+    );
+  }
+  assert.equal(
+    network.classifyCommunityRewardReceipt(canonicalRewardRpcReceipt(), hex("e")),
+    null,
+  );
+});
+
+test("non-success direct reward states retain identity but never prove earnings", () => {
+  const included = {
+    confirmed: false,
+    reward_base: null,
+    reward_arc: null,
+    evidence_source: "no successful mined receipt",
+  };
+  const failed = network.classifyCommunityRewardReceipt(canonicalRewardRpcReceipt({
+    ...included,
+    status: "mined_failed",
+    success: false,
+  }), hex("d"));
+  assert.ok(failed);
+  assert.equal(failed.failed, true);
+  assert.equal(failed.rewardEarned, false);
+  const unavailable = network.classifyCommunityRewardReceipt(canonicalRewardRpcReceipt({
+    ...included,
+    status: "receipt_unavailable",
+    success: null,
+  }), hex("d"));
+  assert.ok(unavailable);
+  assert.equal(unavailable.receiptBacked, false);
+  assert.equal(unavailable.rewardEarned, false);
+  const pending = network.classifyCommunityRewardReceipt(
+    canonicalPendingRewardRpcReceipt(),
+    hex("d"),
+  );
+  assert.ok(pending);
+  assert.equal(pending.height, null);
+  assert.equal(pending.rewardEarned, false);
+  for (const patch of [
+    { required_validator_approvals: 4 },
+    { model_id: `0x${hex("1")}` },
+    { transaction_domain: null },
+  ]) {
+    assert.equal(
+      network.classifyCommunityRewardReceipt(
+        canonicalPendingRewardRpcReceipt(patch),
+        hex("d"),
+      ),
+      null,
+    );
+  }
 });
 
 test("submitted rewards are not earnings", () => {

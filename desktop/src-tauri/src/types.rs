@@ -419,6 +419,30 @@ pub struct InferenceSettlement {
     pub reward_arc: Option<f64>,
     #[serde(default)]
     pub receipt_url: String,
+    /// The remaining fields are populated by the independently fetched
+    /// canonical receipt.  Keeping them in the native type lets both the UI
+    /// and the packaged-production acceptance path retain the complete 0x25
+    /// identity instead of reducing a receipt to only its display fields.
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub input_hash: String,
+    #[serde(default)]
+    pub output_hash: String,
+    #[serde(default)]
+    pub assignment_epoch: String,
+    #[serde(default)]
+    pub transaction_domain: String,
+    #[serde(default)]
+    pub recovery_epoch: Option<u64>,
+    #[serde(default)]
+    pub validator_set_id: Option<u64>,
+    #[serde(default)]
+    pub validator_set_commitment: String,
+    #[serde(default)]
+    pub validator_approvals: Option<u64>,
+    #[serde(default)]
+    pub evidence_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

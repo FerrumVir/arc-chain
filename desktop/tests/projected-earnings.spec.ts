@@ -35,7 +35,27 @@ test.describe("Projected earnings - populated", () => {
     page,
   }) => {
     await gotoEarnings(page);
-    await expect(page.getByTestId("projection-card")).toBeVisible();
+    const projection = page.getByTestId("projection-card");
+    await expect(projection).toBeVisible();
+    await expect(projection).toHaveAttribute("data-projection-state", "numeric");
+    await expect(projection).toHaveAttribute(
+      "data-source-host",
+      "http://140.82.16.112:9090",
+    );
+    await expect(projection).toHaveAttribute(
+      "data-economics-source-host",
+      "http://140.82.16.112:9090",
+    );
+    await expect(projection).toHaveAttribute("data-projected-daily-arc", "108");
+    await expect(projection).toHaveAttribute("data-unavailable-reason", "");
+    await expect(projection).toHaveAttribute("data-reward-per-attestation", "2.5");
+    await expect(projection).toHaveAttribute("data-reward-rate-source", "chain");
+    await expect(projection).toHaveAttribute(
+      "data-reward-policy-hash",
+      "0xpreview-policy",
+    );
+    await expect(projection).toHaveAttribute("data-community-rewards-enabled", "true");
+    await expect(projection).toHaveAttribute("data-issuance-ready-for-worker", "true");
     // Format only. Whether the number is large, small or zero is the
     // network's business, not this spec's.
     await expect(page.getByTestId("projection-per-day")).toHaveText(ARC_AMOUNT);
@@ -231,6 +251,13 @@ test.describe("Projected earnings - no measured rate", () => {
     page,
   }) => {
     await gotoEarnings(page);
+    const projection = page.getByTestId("projection-card");
+    await expect(projection).toHaveAttribute("data-projection-state", "no_rate");
+    await expect(projection).toHaveAttribute("data-projected-daily-arc", "");
+    await expect(projection).toHaveAttribute(
+      "data-unavailable-reason",
+      PROJECTION_NO_HISTORY.projectedDailyUnavailableReason,
+    );
     await expect(page.getByTestId("projection-no-rate")).toBeVisible();
     await expect(page.getByTestId("projection-per-attestation")).toHaveText(
       ARC_AMOUNT,
@@ -286,6 +313,13 @@ test.describe("Projected earnings - endpoint 404s", () => {
     // No figure is invented to fill the gap.
     await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
     await expect(page.getByTestId("projection-per-attestation")).toHaveCount(0);
+    const projection = page.getByTestId("projection-card");
+    await expect(projection).toHaveAttribute("data-projection-state", "unavailable");
+    await expect(projection).toHaveAttribute("data-projected-daily-arc", "");
+    await expect(projection).toHaveAttribute(
+      "data-unavailable-reason",
+      PROJECTION_404.unavailable,
+    );
   });
 
   test("a 404 from /economics/rewards hides the treasury but keeps the projection", async ({

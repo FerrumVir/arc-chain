@@ -10,6 +10,7 @@ import { useAppStore } from "../lib/store";
 
 export function Earnings() {
   const lookupHash = useAppStore((s) => s.lookupHash);
+  const identity = useAppStore((s) => s.identity);
   const { data: earnings } = useQuery({
     queryKey: ["earnings"],
     queryFn: api.fetchEarnings,
@@ -30,7 +31,7 @@ export function Earnings() {
   const rewardByTx = new Map(
     (earnings?.confirmedReceipts ?? []).map((receipt) => [
       receipt.txHash.toLowerCase(),
-      receipt.rewardArc,
+      receipt,
     ]),
   );
   // The legacy attestation feed is 0x16 computation claims. It must never
@@ -46,7 +47,16 @@ export function Earnings() {
       "complete canonical reward history since the v3 recovery boundary";
 
   return (
-    <div className="main-inner" data-testid="earnings-screen">
+    <div
+      className="main-inner"
+      data-testid="earnings-screen"
+      data-from-chain={earnings == null ? "" : String(earnings.fromChain)}
+      data-confirmed-receipt-count={earnings?.confirmedReceipts.length ?? ""}
+      data-attestation-count={earnings?.attestations ?? ""}
+      data-total-arc={earnings?.totalArc ?? ""}
+      data-unavailable-reason={earnings?.unavailableReason ?? ""}
+      data-receipt-source={earnings?.receiptSource ?? ""}
+    >
       <div className="page-header">
         <div>
           <h1 className="page-title">Earnings</h1>
@@ -218,6 +228,58 @@ export function Earnings() {
         </div>
       )}
 
+      {earnings?.fromChain === true && earnings.confirmedReceipts.length > 0 && (
+        <Card style={{ marginBottom: "var(--space-6)" }}>
+          <CardHeader
+            title="Confirmed reward receipts"
+            action={
+              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                exact mined 0x25 records
+              </span>
+            }
+          />
+          <div className="feed" data-testid="confirmed-reward-receipts">
+            {earnings.confirmedReceipts.map((receipt) => (
+              <div
+                key={receipt.txHash}
+                className="feed-item"
+                data-tx-hash={receipt.txHash}
+                data-worker={identity?.address
+                  ? `0x${identity.address.replace(/^0x/i, "").toLowerCase()}`
+                  : undefined}
+                data-job-id={receipt.jobId}
+                data-block-height={receipt.blockHeight}
+                data-block-hash={receipt.blockHash}
+                data-reward-base={receipt.rewardBase}
+                data-reward-arc={receipt.rewardArc}
+                data-receipt-url={receipt.receiptUrl}
+              >
+                <div className="feed-item-icon">
+                  <FileSignature />
+                </div>
+                <div className="feed-item-body">
+                  <div className="feed-item-title">
+                    +{formatArc(receipt.rewardArc)} ARC · COMPUTED + PAID
+                  </div>
+                  <div className="feed-item-meta">
+                    <span>{formatHash(receipt.txHash, 10)}</span>
+                    <span>block #{formatInt(receipt.blockHeight)}</span>
+                    <span>job {formatHash(receipt.jobId, 8)}</span>
+                  </div>
+                </div>
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => lookupHash(receipt.txHash)}
+                  aria-label="Look up confirmed reward on the pinned chain host"
+                >
+                  <Search size={13} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
       <Card>
         <CardHeader
           title="Inference activity"
@@ -241,8 +303,23 @@ export function Earnings() {
               description="Running a prompt can test the selected inference path, but it does not guarantee worker assignment or payment."
             />
           ) : (
-            activity.map((a) => (
-              <div key={a.txHash} className="feed-item">
+            activity.map((a) => {
+              const receipt = rewardByTx.get(a.txHash.toLowerCase());
+              return (
+              <div
+                key={a.txHash}
+                className="feed-item"
+                data-tx-hash={a.txHash}
+                data-worker={a.from
+                  ? `0x${a.from.replace(/^0x/i, "").toLowerCase()}`
+                  : undefined}
+                data-job-id={receipt?.jobId}
+                data-block-height={receipt?.blockHeight}
+                data-block-hash={receipt?.blockHash}
+                data-reward-base={receipt?.rewardBase}
+                data-reward-arc={receipt?.rewardArc}
+                data-receipt-url={receipt?.receiptUrl}
+              >
                 <div className="feed-item-icon">
                   <FileSignature />
                 </div>
@@ -283,8 +360,8 @@ export function Earnings() {
                     : "Successful computation claim; no payment receipt is represented by this row."}
                 >
                   {a.paid
-                    ? `${rewardByTx.has(a.txHash.toLowerCase())
-                      ? `+${formatArc(rewardByTx.get(a.txHash.toLowerCase())!)} ARC · `
+                    ? `${receipt
+                      ? `+${formatArc(receipt.rewardArc)} ARC · `
                       : ""}COMPUTED + PAID`
                     : `COMPUTED · NOT PAYMENT · ${a.mine ? "yours" : "network"}`}
                 </div>
@@ -301,7 +378,8 @@ export function Earnings() {
                   <Search size={13} />
                 </button>
               </div>
-            ))
+              );
+            })
           )}
         </div>
       </Card>

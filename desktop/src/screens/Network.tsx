@@ -444,7 +444,19 @@ function TxLookupCard({
       )}
 
       {result && (
-        <div style={{ marginTop: "var(--space-4)" }} data-testid="tx-lookup-result">
+        <div
+          style={{ marginTop: "var(--space-4)" }}
+          data-testid="tx-lookup-result"
+          data-tx-hash={`0x${result.hash}`}
+          data-lookup-status={result.status}
+          data-source-host={result.sourceHost}
+          data-block-height={result.blockHeight ?? ""}
+          data-block-hash={result.blockHash
+            ? `0x${result.blockHash.replace(/^0x/i, "").toLowerCase()}`
+            : ""}
+          data-tx-index={result.txIndex ?? ""}
+          data-success={result.success == null ? "" : String(result.success)}
+        >
           {result.status === "mined" && (
             <>
               <div
@@ -692,7 +704,12 @@ function RecentBlocksCard({ blocks }: { blocks: RecentBlocks | undefined }) {
         <div className="feed" data-testid="block-list">
           {blocks.blocks.map((b) => (
             <div key={b.height}>
-              <div className="feed-item">
+              <div
+                className="feed-item"
+                data-testid={`block-row-${b.height}`}
+                data-block-height={b.height}
+                data-block-hash={`0x${b.hash.replace(/^0x/i, "").toLowerCase()}`}
+              >
                 <div className="feed-item-icon">
                   <Blocks />
                 </div>
@@ -883,7 +900,7 @@ function RecentInferenceCard({
           />
         ) : (
           real.slice(0, 12).map((a) => (
-            <div key={a.txHash} className="feed-item">
+            <div key={a.txHash} className="feed-item" data-tx-hash={a.txHash}>
               <div className="feed-item-icon">
                 <FileSignature />
               </div>

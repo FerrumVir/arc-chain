@@ -1622,7 +1622,27 @@ fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError
                 rejected_tail: Some(LegacyWalRejectedTail::InvalidFrameLength(length_u32)),
             });
         }
-        let mut encoded = vec![0u8; length];
+        let declared_frame_end = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(length as u64))
+            .ok_or_else(|| {
+                StateError::PersistenceError("legacy WAL byte offset overflows u64".into())
+            })?;
+        if declared_frame_end > original_bytes {
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::TruncatedFramePayload),
+            });
+        }
+        let mut encoded = Vec::new();
+        encoded.try_reserve_exact(length).map_err(|error| {
+            StateError::PersistenceError(format!(
+                "cannot allocate bounded legacy WAL frame of {length} bytes: {error}"
+            ))
+        })?;
+        encoded.resize(length, 0);
         if let Err(error) = reader.read_exact(&mut encoded) {
             if error.kind() != std::io::ErrorKind::UnexpectedEof {
                 return Err(StateError::PersistenceError(format!(
@@ -1636,17 +1656,20 @@ fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError
                 rejected_tail: Some(LegacyWalRejectedTail::TruncatedFramePayload),
             });
         }
-        let entry: WalEntry = match bincode::deserialize(&encoded) {
-            Ok(entry) => entry,
-            Err(_) => {
-                return Ok(LegacyWalPrefixRead {
-                    entries,
-                    frame_end_offsets,
-                    original_bytes,
-                    rejected_tail: Some(LegacyWalRejectedTail::InvalidEntryEncoding),
-                });
-            }
-        };
+        let entry: WalEntry =
+            match bincode::deserialize_limited_exact::<WalEntry, ARCCHKPT_MAX_PAYLOAD_BYTES>(
+                &encoded,
+            ) {
+                Ok(entry) => entry,
+                Err(_) => {
+                    return Ok(LegacyWalPrefixRead {
+                        entries,
+                        frame_end_offsets,
+                        original_bytes,
+                        rejected_tail: Some(LegacyWalRejectedTail::InvalidEntryEncoding),
+                    });
+                }
+            };
         let checksum_payload =
             bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op)).map_err(
                 |error| {
@@ -1674,12 +1697,7 @@ fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError
                 }),
             });
         }
-        offset = offset
-            .checked_add(4)
-            .and_then(|value| value.checked_add(length as u64))
-            .ok_or_else(|| {
-                StateError::PersistenceError("legacy WAL byte offset overflows u64".into())
-            })?;
+        offset = declared_frame_end;
         expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
             StateError::PersistenceError("legacy WAL sequence overflows u64".into())
         })?;
@@ -3605,6 +3623,37 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn legacy_wal_report_reader_preflights_untrusted_frame_lengths() {
+        let directory = temp_dir("legacy-wal-frame-preflight");
+
+        let zero = directory.join("zero.wal");
+        fs::write(&zero, 0u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            read_legacy_wal_prefix(&zero).unwrap().rejected_tail,
+            Some(LegacyWalRejectedTail::InvalidFrameLength(0))
+        );
+
+        let oversized = directory.join("oversized.wal");
+        let oversized_length = (ARCCHKPT_MAX_PAYLOAD_BYTES as u32) + 1;
+        fs::write(&oversized, oversized_length.to_le_bytes()).unwrap();
+        assert_eq!(
+            read_legacy_wal_prefix(&oversized).unwrap().rejected_tail,
+            Some(LegacyWalRejectedTail::InvalidFrameLength(oversized_length))
+        );
+
+        let truncated = directory.join("truncated.wal");
+        let mut truncated_bytes = 16_000_000u32.to_le_bytes().to_vec();
+        truncated_bytes.push(0xaa);
+        fs::write(&truncated, truncated_bytes).unwrap();
+        assert_eq!(
+            read_legacy_wal_prefix(&truncated).unwrap().rejected_tail,
+            Some(LegacyWalRejectedTail::TruncatedFramePayload)
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

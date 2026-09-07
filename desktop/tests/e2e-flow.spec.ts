@@ -107,7 +107,20 @@ test.describe("Raw inference claims never become earnings", () => {
   }) => {
     await page.goto("/");
     await page.getByTestId("nav-earnings").click();
-    await expect(page.getByTestId("earnings-screen")).toBeVisible();
+    const earningsScreen = page.getByTestId("earnings-screen");
+    await expect(earningsScreen).toBeVisible();
+    await expect(earningsScreen).toHaveAttribute("data-from-chain", "true");
+    await expect(earningsScreen).toHaveAttribute(
+      "data-confirmed-receipt-count",
+      "2",
+    );
+    await expect(earningsScreen).toHaveAttribute("data-attestation-count", "2");
+    await expect(earningsScreen).toHaveAttribute("data-total-arc", "5");
+    await expect(earningsScreen).toHaveAttribute("data-unavailable-reason", "");
+    await expect(earningsScreen).toHaveAttribute(
+      "data-receipt-source",
+      "scan of this node's in-memory full_transactions map",
+    );
 
     // The mock carries dated raw inference claims. Those timestamps are not
     // mined 0x25 reward receipts, so no seven-day income chart may be built.
@@ -117,6 +130,28 @@ test.describe("Raw inference claims never become earnings", () => {
       feed.getByText("COMPUTED · NOT PAYMENT · yours", { exact: true }),
     ).toHaveCount(2);
     await expect(feed.getByText(/\+2\.50 ARC · COMPUTED \+ PAID/)).toHaveCount(2);
+
+    // A display prefix is not a receipt identity. The DOM contract used by
+    // the live product gate must retain every exact canonical binding.
+    const canaryTx = `0x${"aa".repeat(32)}`;
+    const paid = feed.locator(`[data-tx-hash="${canaryTx}"]`);
+    await expect(paid).toHaveCount(1);
+    await expect(paid).toHaveAttribute("data-worker", `0x${"99".repeat(32)}`);
+    await expect(paid).toHaveAttribute("data-job-id", `0x${"01".repeat(32)}`);
+    await expect(paid).toHaveAttribute("data-block-height", "123461");
+    await expect(paid).toHaveAttribute("data-block-hash", `0x${"10".repeat(32)}`);
+    await expect(paid).toHaveAttribute("data-reward-base", "2500000000");
+    await expect(paid).toHaveAttribute("data-reward-arc", "2.5");
+    await expect(paid).toHaveAttribute(
+      "data-receipt-url",
+      `/community/reward_receipt/${canaryTx}`,
+    );
+    const confirmed = page
+      .getByTestId("confirmed-reward-receipts")
+      .locator(`[data-tx-hash="${canaryTx}"]`);
+    await expect(confirmed).toHaveCount(1);
+    await expect(confirmed).toHaveAttribute("data-worker", `0x${"99".repeat(32)}`);
+    await expect(confirmed).toContainText("+2.50 ARC · COMPUTED + PAID");
   });
 
   test("another validator's attestation is not shown as the user's income", async ({

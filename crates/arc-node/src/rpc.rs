@@ -764,6 +764,23 @@ const COMMUNITY_WORKER_CAPABILITY_MAX_BYTES: usize = 32;
 /// doesn't prune a live shard.
 pub const SHARD_REGISTRY_TTL_SECS: u64 = 60;
 
+/// Observe only fresh shard entries without changing the registry. Read-only
+/// preflight endpoints use this view so an HTTP GET cannot perform TTL cleanup
+/// or race a concurrent signed shard refresh.
+fn fresh_shards_snapshot(
+    registry: &dashmap::DashMap<String, (ShardInfo, std::time::Instant)>,
+) -> Vec<ShardInfo> {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(SHARD_REGISTRY_TTL_SECS);
+    registry
+        .iter()
+        .filter_map(|entry| {
+            let (info, timestamp) = entry.value();
+            (now.duration_since(*timestamp) <= ttl).then(|| info.clone())
+        })
+        .collect()
+}
+
 /// Collect fresh shard entries, pruning stale ones that haven't been
 /// re-announced within SHARD_REGISTRY_TTL_SECS. Called by the pipeline walker
 /// and by the /shards GET endpoint so neither sees ghosts.
@@ -782,8 +799,12 @@ fn fresh_shards(
             expired_keys.push(entry.key().clone());
         }
     }
-    for k in expired_keys {
-        registry.remove(&k);
+    for key in expired_keys {
+        // A signed announcement can refresh an entry after the scan. Remove
+        // only if the value is still expired while its shard lock is held.
+        registry.remove_if(&key, |_, (_, timestamp)| {
+            now.duration_since(*timestamp) > ttl
+        });
     }
     keep
 }
@@ -2065,6 +2086,17 @@ pub async fn serve(
         .route("/sync/dag_state", get(sync_dag_state))
         // Inference - run model and record attestation on-chain
         .route("/inference/run", post(inference_run))
+        // A mutation-free admission snapshot used by clients before they
+        // choose an inference write origin.  Once a client begins the POST it
+        // must treat every transport/status/parse failure as ambiguous and
+        // must not fall through to another coordinator.  Keeping this route
+        // beside `/inference/run` and deriving it from the same routing facts
+        // prevents a known observer/no-model state from consuming that
+        // one-write budget.
+        .route(
+            "/inference/readiness",
+            get(inference_readiness).layer(DefaultBodyLimit::max(0)),
+        )
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
         // Per-worker earnings derived only from successful on-chain
@@ -6277,6 +6309,82 @@ async fn inference_onchain_result(
 ///
 /// Returns the query, response text, output hash, ms/token, attestation
 /// TX, and a `routed_via` field ("community:<worker_id>" | "local").
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InferenceReadinessResponse {
+    schema: &'static str,
+    safe_to_dispatch: bool,
+    community_dispatch_ready: bool,
+    local_model_ready: bool,
+    sharded_pipeline_ready: bool,
+    live_community_workers: usize,
+    model_id: Option<String>,
+    required_community_execution_profile: &'static str,
+    mutation_free_observation: bool,
+}
+
+fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse {
+    // `live_inference_worker_count` already requires the coordinator's exact
+    // artifact identity plus the canonical reward execution profile, and
+    // excludes expired/busy workers.  The sender handle is the other fact
+    // required before `/inference/run` can enqueue a community assignment.
+    let live_community_workers = live_inference_worker_count(node);
+    let exact_model = exact_model_identity(node)
+        .ok()
+        .map(|(_, model_id)| model_id);
+    let community_dispatch_ready =
+        live_community_workers > 0 && node.community_work_tx.is_some() && exact_model.is_some();
+
+    // These mirror the two non-community branches in `inference_run`: a
+    // complete local model, or a partial local model backed by an actually
+    // assemblable profile-bound shard pipeline.  Requiring exact_model keeps
+    // the read preflight from green-lighting a write that the handler must
+    // reject before execution for missing/mismatched artifact provenance.
+    let local_model_ready = exact_model.is_some()
+        && node.inference_model.as_ref().is_some_and(|model| {
+            (node.candle_engine.is_some() && node.candle_model_id == exact_model)
+                || model.has_all_transformer_layers()
+        });
+    let sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
+        node.inference_model.is_some()
+            && !local_model_ready
+            && assemble_profile_bound_pipeline_for_model(
+                fresh_shards_snapshot(&node.shard_registry),
+                model_id,
+                Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
+                &node.latency_stats,
+            )
+            .is_ok()
+    });
+    let safe_to_dispatch = community_dispatch_ready || local_model_ready || sharded_pipeline_ready;
+
+    InferenceReadinessResponse {
+        schema: "arc.inference.readiness.v1",
+        safe_to_dispatch,
+        community_dispatch_ready,
+        local_model_ready,
+        sharded_pipeline_ready,
+        live_community_workers,
+        model_id: exact_model.map(|model_id| format!("0x{}", model_id.to_hex())),
+        required_community_execution_profile:
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+        mutation_free_observation: true,
+    }
+}
+
+/// GET /inference/readiness
+///
+/// This endpoint is intentionally authentication-free and read-only.  It
+/// neither allocates a job ID nor touches the assignment registry, shard
+/// registry, mempool, or inference permit. Its only purpose is to let a client
+/// reject a known unavailable origin *before* spending its single inference
+/// POST.
+async fn inference_readiness(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<InferenceReadinessResponse> {
+    Json(inference_readiness_snapshot(&node))
+}
+
 async fn inference_run(
     AxumState(node): AxumState<NodeState>,
     body: Option<Json<Value>>,
@@ -6405,7 +6513,11 @@ async fn inference_run(
     // Community workers sign the exact model/input/output commitments. The
     // seed binds that certificate to its pending assignment and, after the
     // fleet-wide activation gate is enabled, submits a replay-marked reward.
-    let live_workers = live_inference_worker_count(&node);
+    // Use the same mutation-free snapshot served by GET
+    // `/inference/readiness`; this is the shared source of truth for the
+    // pre-dispatch client gate and the handler's routing facts.
+    let readiness = inference_readiness_snapshot(&node);
+    let live_workers = readiness.live_community_workers;
     let recovery_expected_job = if let Some(probe_id) = recovery_probe_id {
         let model_id = node.model_artifact_id.ok_or_else(|| {
             api_error(
@@ -6450,7 +6562,7 @@ async fn inference_run(
             "sealed recovery probe coordinator cannot dispatch to the exact accepted canary worker",
         ));
     }
-    if !force_local && live_workers > 0 && node.community_work_tx.is_some() {
+    if !force_local && readiness.community_dispatch_ready {
         let dispatched_at = std::time::Instant::now();
         let assigned_model_id = node
             .model_artifact_id
@@ -13937,7 +14049,7 @@ fn pending_mined_receipt_value(
         "reward_base": Value::Null,
         "reward_arc": Value::Null,
         "receipt_url": format!("/community/reward_receipt/0x{}", submission.tx_hash.to_hex()),
-        "evidence_source": "coordinator mempool submission only; no mined receipt",
+        "evidence_source": arc_types::transaction::COMMUNITY_REWARD_PENDING_EVIDENCE,
     })
 }
 
@@ -15208,7 +15320,11 @@ fn community_reward_receipt_value(node: &NodeState, tx_hash: Hash256) -> Result<
         "reward_base": if confirmed { Value::from(arc_types::economics::INFERENCE_ATTESTATION_REWARD) } else { Value::Null },
         "reward_arc": if confirmed { Value::from(REWARD_PER_ATTESTATION_ARC) } else { Value::Null },
         "receipt_url": format!("/community/reward_receipt/0x{}", tx_hash.to_hex()),
-        "evidence_source": if confirmed { "successful mined CommunityInferenceReward receipt" } else { "no successful mined receipt" },
+        "evidence_source": if confirmed {
+            arc_types::transaction::COMMUNITY_REWARD_SUCCESS_EVIDENCE
+        } else {
+            arc_types::transaction::COMMUNITY_REWARD_UNSUCCESSFUL_EVIDENCE
+        },
     }))
 }
 
@@ -19437,6 +19553,19 @@ mod tests {
         }
     }
 
+    fn assert_exact_reward_receipt_fields(value: &Value, expected: &[&str]) {
+        let mut actual = value
+            .as_object()
+            .expect("reward receipt must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "community reward RPC schema drifted");
+    }
+
     #[test]
     fn unsubmitted_reward_states_share_the_exact_no_transaction_matrix() {
         let job_id = format!("0x{}", Hash256([19; 32]).to_hex());
@@ -19507,6 +19636,10 @@ mod tests {
         let pending_from_retry = attempt_verified_community_reward(&node, job_id)
             .await
             .expect("an existing mempool submission is discoverable");
+        assert_exact_reward_receipt_fields(
+            &pending_from_retry,
+            &arc_types::transaction::COMMUNITY_REWARD_PENDING_RECEIPT_FIELDS,
+        );
         assert_eq!(pending_from_retry["status"], "pending_mined_receipt");
         assert_eq!(pending_from_retry["submitted"], true);
         assert_eq!(pending_from_retry["included"], false);
@@ -19650,6 +19783,10 @@ mod tests {
         let failed_receipt = node.state.get_receipt(&failed_hash.0).unwrap();
         let failed = community_reward_receipt_value(&node, failed_hash)
             .expect("a hash-bound failed receipt has a truthful terminal state");
+        assert_exact_reward_receipt_fields(
+            &failed,
+            &arc_types::transaction::COMMUNITY_REWARD_TERMINAL_RECEIPT_FIELDS,
+        );
         assert_eq!(failed["status"], "mined_failed");
         assert_eq!(failed["submitted"], true);
         assert_eq!(failed["included"], true);
@@ -19711,6 +19848,10 @@ mod tests {
         node.state.receipts.remove(&unavailable_hash.0);
         let unavailable = community_reward_receipt_value(&node, unavailable_hash)
             .expect("the retained block index proves inclusion without inventing a receipt");
+        assert_exact_reward_receipt_fields(
+            &unavailable,
+            &arc_types::transaction::COMMUNITY_REWARD_TERMINAL_RECEIPT_FIELDS,
+        );
         assert_eq!(unavailable["status"], "receipt_unavailable");
         assert_eq!(unavailable["submitted"], true);
         assert_eq!(unavailable["included"], true);
@@ -19774,6 +19915,10 @@ mod tests {
         let mined_from_retry = attempt_verified_community_reward(&race_node, race_job_id)
             .await
             .expect("retry resolves the mined index before stale mempool bookkeeping");
+        assert_exact_reward_receipt_fields(
+            &mined_from_retry,
+            &arc_types::transaction::COMMUNITY_REWARD_TERMINAL_RECEIPT_FIELDS,
+        );
         assert_eq!(mined_from_retry["status"], "mined_success");
         assert_eq!(mined_from_retry["success"], true);
         assert!(
@@ -20316,6 +20461,83 @@ mod tests {
             0,
             "busy workers are not dispatch capacity"
         );
+    }
+
+    #[test]
+    fn inference_readiness_is_exact_and_observes_without_allocating_or_mutating() {
+        let now = std::time::Instant::now();
+        let stale = now - std::time::Duration::from_secs(SHARD_REGISTRY_TTL_SECS + 5);
+        let mut node = fake_node_with_workers(vec![(worker("ready", &["inference"]), now)]);
+        // Make the local model deliberately partial so readiness must inspect
+        // the shard registry. The sole shard is expired and therefore cannot
+        // make a pipeline ready, but a read-only GET must not prune it.
+        let mut partial_model = test_reward_inference_model();
+        partial_model.layers.clear();
+        node.inference_model = Some(Arc::new(partial_model));
+        node.shard_registry.insert(
+            "expired-readiness-shard".to_string(),
+            (
+                ShardInfo {
+                    start_layer: 0,
+                    end_layer: 1,
+                    total_layers: 1,
+                    model_id: test_model_id(),
+                    model_name: "readiness-test-model".to_string(),
+                    execution_profile: canonical_profile(),
+                    memory_mb: 1,
+                    full_model_mb: 1,
+                    socket_addr: "127.0.0.1:19090".to_string(),
+                    node_name: "expired-readiness-shard".to_string(),
+                },
+                stale,
+            ),
+        );
+        let jobs_before = node.community_active_jobs.len();
+        let results_before = node.inference_results.len();
+        let mempool_before = node.mempool.len();
+        let shards_before = node.shard_registry.len();
+
+        let response = inference_readiness_snapshot(&node);
+        let value = serde_json::to_value(&response).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "community_dispatch_ready",
+                "live_community_workers",
+                "local_model_ready",
+                "model_id",
+                "mutation_free_observation",
+                "required_community_execution_profile",
+                "safe_to_dispatch",
+                "schema",
+                "sharded_pipeline_ready",
+            ]
+        );
+        assert_eq!(value["schema"], "arc.inference.readiness.v1");
+        assert_eq!(value["mutation_free_observation"], true);
+        assert_eq!(value["community_dispatch_ready"], true);
+        assert_eq!(value["safe_to_dispatch"], true);
+        assert_eq!(
+            value["required_community_execution_profile"],
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert_eq!(node.community_active_jobs.len(), jobs_before);
+        assert_eq!(node.inference_results.len(), results_before);
+        assert_eq!(node.mempool.len(), mempool_before);
+        assert_eq!(node.shard_registry.len(), shards_before);
+        assert!(node.shard_registry.contains_key("expired-readiness-shard"));
+
+        let mut unavailable = fake_node_with_workers(Vec::new());
+        unavailable.community_work_tx = None;
+        unavailable.inference_model = None;
+        let response = inference_readiness_snapshot(&unavailable);
+        assert!(!response.safe_to_dispatch);
+        assert!(!response.community_dispatch_ready);
+        assert!(!response.local_model_ready);
+        assert!(!response.sharded_pipeline_ready);
     }
 
     #[test]

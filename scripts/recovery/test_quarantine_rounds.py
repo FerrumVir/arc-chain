@@ -106,6 +106,7 @@ def live_source_capture(
     public_sha256: str,
     cross_sha256: str,
     completed_at: str,
+    normalized: bool = False,
 ) -> dict:
     index = [row[0] for row in qr.FLEET].index(target["node"]) + 1
     seed = 20_000 + index * 100
@@ -254,6 +255,41 @@ def live_source_capture(
         "network_quarantine_receipt_sha256": None,
         "owned_ruleset_stateless_sha256": None,
     }
+    if normalized:
+        plan_sha = f"{seed + 13:064x}"
+        source_root = f"{seed + 14:064x}"
+        rust_capture["allow_unbound_legacy_wal"] = True
+        rust_capture["source_wal_prefix"]["loader_tail_reason"] = "none"
+        value["schema"] = qr.NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA
+        normalization_receipt = {
+            "schema": qr.WAL_NORMALIZATION_SCHEMA,
+            "plan_sha256": plan_sha,
+            "node": target["node"],
+            "source_wal": regular(100, source_root),
+            "source_snapshot": copy.deepcopy(rust_capture["source_snapshot"]),
+            "partition": [
+                {
+                    "kind": "selected-frame-run",
+                    "source_start": 0,
+                    "source_end": 8,
+                    "sha256": source_root,
+                }
+            ],
+            "sequence_rewrites": [],
+            "derivative_wal": regular(110, wal_root),
+            "head": copy.deepcopy(head),
+            "selected_frame_count": 1,
+            "excluded_bytes": 0,
+            "semantic_stream_sha256": f"{seed + 15:064x}",
+            "transform": "copy-selected-runs-rewrite-sequence-and-crc32",
+            "source_unchanged": True,
+        }
+        value["wal_normalization"] = {
+            "normalizer_sha256": f"{seed + 16:064x}",
+            "plan_sha256": plan_sha,
+            "receipt": qr.wrap(normalization_receipt),
+        }
+        value["rust_capture"] = qr.wrap(rust_capture)
     return qr.wrap(value)
 
 
@@ -696,6 +732,55 @@ def ledger_for_first_successes(count: int) -> dict:
 
 
 class QuarantineRoundTests(unittest.TestCase):
+    def test_normalized_live_source_v2_binds_derivative_snapshot_and_head(self) -> None:
+        target = target_row("lax")
+        public = public_receipt(["lax"], 0)
+        cross = cross_receipt(["lax"], public, 0)
+        public_row = public["origins"][0]
+        cross_row = cross["nodes"][0]
+        wrapper = live_source_capture(
+            target,
+            public_row,
+            cross_row,
+            round_number=1,
+            public_sha256=qr.digest(public),
+            cross_sha256=qr.digest(cross),
+            completed_at=cross["completed_at"],
+            normalized=True,
+        )
+        completed, projection = qr.validate_live_source_capture(
+            wrapper["value"],
+            capture_id=CAPTURE,
+            freeze_sha256=FREEZE,
+            source_main_commit=SOURCE,
+            round_number=1,
+            target=target,
+            public_row=public_row,
+            cross_row=cross_row,
+            public_sha256=qr.digest(public),
+            cross_sha256=qr.digest(cross),
+        )
+        self.assertEqual(projection["head"], wrapper["value"]["head"])
+        self.assertEqual(completed.strftime("%Y-%m-%dT%H:%M:%SZ"), cross["completed_at"])
+
+        tampered = copy.deepcopy(wrapper["value"])
+        normalization = tampered["wal_normalization"]["receipt"]["value"]
+        normalization["head"]["state_root"] = "f" * 64
+        tampered["wal_normalization"]["receipt"] = qr.wrap(normalization)
+        with self.assertRaisesRegex(qr.QuarantineRoundError, "identity differs"):
+            qr.validate_live_source_capture(
+                tampered,
+                capture_id=CAPTURE,
+                freeze_sha256=FREEZE,
+                source_main_commit=SOURCE,
+                round_number=1,
+                target=target,
+                public_row=public_row,
+                cross_row=cross_row,
+                public_sha256=qr.digest(public),
+                cross_sha256=qr.digest(cross),
+            )
+
     def test_authorization_requires_exact_ordered_live_source_captures(self) -> None:
         names = [name for name, _host in qr.FLEET]
         valid = authorization(1, [], names, 0)

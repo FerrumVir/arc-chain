@@ -779,6 +779,27 @@ jobs:
           shared-key: pretag-headless-${{ matrix.target }}
           workspaces: . -> target
 
+      - name: Refuse pre-build headless source drift
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::The headless build checkout differs from the selected commit.' >&2
+            exit 1
+          fi
+
       - name: Build the real release node and CLI
         shell: bash
         run: |
@@ -877,6 +898,21 @@ jobs:
         run: |
           set -Eeuo pipefail
           [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::The headless build changed tracked or untracked source before packaging.' >&2
+            exit 1
+          fi
           version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
           stage="pretag-artifacts/headless-$PLATFORM"
           payload="$stage/payload"
@@ -1010,9 +1046,33 @@ jobs:
         shell: bash
         run: npm ci
 
+      - name: Refuse lifecycle changes before the desktop build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)desktop/node_modules/**' \
+            ':(exclude)desktop/src-tauri/target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::Desktop dependency installation changed tracked or untracked source.' >&2
+            exit 1
+          fi
+
       - name: Build the desktop binary without signing keys
         working-directory: desktop
         shell: bash
+        env:
+          ARC_BUILD_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}
         run: |
           set -Eeuo pipefail
           npm exec --offline -- tauri build --ci --no-bundle \
@@ -1038,11 +1098,26 @@ jobs:
         run: |
           set -Eeuo pipefail
           [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
-          git diff --exit-code -- \
-            Cargo.toml Cargo.lock \
-            desktop/package.json desktop/package-lock.json \
-            desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock \
-            desktop/src-tauri/tauri.conf.json
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)desktop/node_modules/**' \
+            ':(exclude)desktop/dist/**' \
+            ':(exclude)desktop/dist-ssr/**' \
+            ':(exclude)desktop/.vite/**' \
+            ':(exclude)desktop/src-tauri/gen/**' \
+            ':(exclude)desktop/src-tauri/target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::The desktop build changed tracked or untracked source before packaging.' >&2
+            exit 1
+          fi
           root="desktop/src-tauri/target/$TARGET/release/bundle"
           payload="unsigned-desktop-payload/$PLATFORM"
           mkdir -p "$payload"
@@ -1692,6 +1767,25 @@ jobs:
           TARGET: ${{ matrix.rust-target }}
         run: |
           set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all -- . \
+            ':(exclude)signer-handoff/**' \
+            ':(exclude)unsigned-materialized/**')"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)desktop/node_modules/**' \
+            ':(exclude)desktop/src-tauri/target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::The updater signer changed repository source before verification.' >&2
+            exit 1
+          fi
           version="$(awk -F' *= *' '/^version/ { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
           python3 scripts/release/unsigned-desktop-handoff.py verify-signed \
             --repository "$GITHUB_REPOSITORY" \
@@ -1734,6 +1828,24 @@ jobs:
         run: |
           set -Eeuo pipefail
           [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all -- . \
+            ':(exclude)signer-handoff/**' \
+            ':(exclude)unsigned-materialized/**')"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)desktop/node_modules/**' \
+            ':(exclude)desktop/src-tauri/target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::Desktop signature verification changed repository source before packaging.' >&2
+            exit 1
+          fi
           stage="pretag-artifacts/desktop-$PLATFORM"
           payload="$stage/payload"
           mkdir -p "$payload"

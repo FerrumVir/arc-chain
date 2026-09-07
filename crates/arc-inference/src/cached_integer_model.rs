@@ -427,7 +427,7 @@ pub struct CachedIntegerModel {
 /// work. The validator shard fleet and the worker must execute the same
 /// quantization path, not merely start from the same GGUF bytes.
 pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
-    "INT8 integer (per-row, cross-platform deterministic)";
+    arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
 pub const I16_INFERENCE_PROFILE: &str = "INT16 integer (per-row, cross-platform deterministic)";
 pub const BLOCK_I8_INFERENCE_PROFILE: &str =
     "block-INT8 integer (32-weight blocks, cross-platform deterministic)";

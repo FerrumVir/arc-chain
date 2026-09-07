@@ -192,7 +192,11 @@ artifact contains nine exact top-level/checksum members and an exact 36-file
 recursive evidence set, including the release publication ZIP itself. The
 builder re-aggregates that evidence with its exact sibling acceptance helper
 and immediately runs the exact sibling rollout verifier against all six live
-validators. It then creates exactly three root-only mode-`0400` outputs in a
+validators. It also requires the create-only native desktop live-gate receipt,
+which exists only after the four exact Playwright tests pass and binds the full
+canary transaction/worker/job, direct reward receipt, worker earnings, block
+receipt, frontend config, app source tree, suite files, package lock, and
+61-poll/180-second settlement budget. It then creates exactly three root-only mode-`0400` outputs in a
 new mode-`0700` directory: `arc.post-release-acceptance.v2`, the derived README,
 and `arc.public-production-status.v1`. Only the README and production-status
 paths are committed; the status embeds the full canonical v2 receipt and its

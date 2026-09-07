@@ -6,11 +6,13 @@ status=0
 
 for test_file in \
     "$TEST_DIR/static_contract_test.sh" \
+    "$TEST_DIR/workflow_source_cleanliness_test.sh" \
     "$TEST_DIR/public_site_contract_test.sh" \
     "$TEST_DIR/community_diagnostics_contract_test.sh" \
     "$TEST_DIR/recovery_archive_contract_test.sh" \
     "$TEST_DIR/production_manifest_builder_test.sh" \
     "$TEST_DIR/postrelease_public_truth_test.sh" \
+    "$TEST_DIR/postcutover_product_surfaces_test.sh" \
     "$TEST_DIR/owner_emergency_recovery_test.sh" \
     "$TEST_DIR/legacy_public_height_test.sh" \
     "$TEST_DIR/drive_prefreeze_gate_test.sh" \
@@ -42,5 +44,11 @@ do
     printf '# %s\n' "${test_file##*/}"
     /bin/bash "$test_file" || status=1
 done
+
+printf '# %s\n' "test_packaged_appimage_live_gate.py"
+python3 "$TEST_DIR/test_packaged_appimage_live_gate.py" || status=1
+
+printf '# %s\n' "test_build_macos_package_provenance.py"
+python3 "$TEST_DIR/../../scripts/recovery/test_build_macos_package_provenance.py" || status=1
 
 exit "$status"

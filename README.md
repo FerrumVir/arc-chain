@@ -1,5 +1,5 @@
-![Rust](https://img.shields.io/badge/Rust-196K%2B_LOC-orange)
-![Tests](https://img.shields.io/badge/Rust_tests-1%2C900%2B_defined-brightgreen)
+![Rust](https://img.shields.io/badge/Rust-220K%2B_LOC-orange)
+![Tests](https://img.shields.io/badge/Rust_tests-2%2C100%2B_defined-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
 ![Inference](https://img.shields.io/badge/inference-CPU_KAT--verified-purple)
 ![Testnet](https://img.shields.io/badge/public_fleet-forked-red)
@@ -655,11 +655,11 @@ Users / AI Agents
 
 ## Codebase
 
-The current checkout contains more than 196,000 physical lines of checked-in,
+The current checkout contains more than 220,000 physical lines of checked-in,
 non-vendored Rust across ARC's crates, agents, relayer, faucet, desktop backend,
 and integration tests: 17 ARC packages, plus one narrowly
 vendored `wasmer-derive` workspace member that is excluded from that line count.
-More than 1,900 Rust test functions are defined in the same non-vendored tree. These
+More than 2,100 Rust test functions are defined in the same non-vendored tree. These
 are source-tree counts, not test-pass claims; the commands below are the release
 evidence. Run the complete release gate from the repository root:
 
@@ -849,6 +849,7 @@ Public GET paths carried verbatim in the sealed rollout manifest:
 `/validators`
 `/block/latest`
 `/blocks`
+`/inference/readiness`
 `/inference/attestations`
 `/economics/rewards`
 `/faucet/status`
@@ -894,6 +895,10 @@ Public POST paths carried verbatim in the sealed rollout manifest:
 `/faucet/claim`
 <!-- ARC_PUBLIC_POST_END -->
 
+Clients may probe the mutation-free `/inference/readiness` contract at multiple
+origins, but one inference click selects one origin and sends at most one POST.
+Every timeout, reset, HTTP error, or malformed response after that POST is an
+ambiguous possibly-settled outcome and is never replayed on another route.
 `/inference/run*` has a 4,000-second upstream timeout, worker submission has a
 2,700-second timeout, and the validator-only approval path has a 1,500-second
 timeout. The faucet POST is only a submission; only a successful mined receipt confirms the 1 ARC credit.

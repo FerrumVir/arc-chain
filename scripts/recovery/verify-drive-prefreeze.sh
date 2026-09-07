@@ -148,7 +148,7 @@ python3() {
     [ "$(bootstrap_python_hash "$PINNED_PYTHON_PATH")" = "$PINNED_PYTHON_SHA256" ] || \
         die "pinned Python changed during Drive prefreeze"
     /usr/bin/env -i HOME="${TEMP_ROOT:-/var/empty}" PATH=/usr/bin:/bin LANG=C LC_ALL=C \
-        "$PINNED_PYTHON_PATH" -I "$@"
+        "$PINNED_PYTHON_PATH" -B -I "$@"
 }
 
 hash_file() {
