@@ -12340,6 +12340,10 @@ seal_phase() {
     maintenance_evidence_bundle_sha="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle.sha256)"
     maintenance_evidence_bundle_sidecar="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle_sidecar.path)"
     maintenance_evidence_bundle_sidecar_sha="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle_sidecar.sha256)"
+    canonical_source_preselection="$(manifest_field "$manifest" artifacts.canonical_source_preselection.path)"
+    canonical_source_preselection_sha="$(manifest_field "$manifest" artifacts.canonical_source_preselection.sha256)"
+    canonical_source_preselection_sidecar="$(manifest_field "$manifest" artifacts.canonical_source_preselection_sidecar.path)"
+    canonical_source_preselection_sidecar_sha="$(manifest_field "$manifest" artifacts.canonical_source_preselection_sidecar.sha256)"
     maintenance_boundary="$(manifest_field "$manifest" artifacts.legacy_maintenance_boundary.path)"
     maintenance_boundary_sha="$(manifest_field "$manifest" artifacts.legacy_maintenance_boundary.sha256)"
     maintenance_boundary_sidecar="$(manifest_field "$manifest" artifacts.legacy_maintenance_boundary_sidecar.path)"
@@ -12627,6 +12631,11 @@ PY
     register_shared_input "$maintenance_evidence_bundle_sidecar" \
         "$maintenance_evidence_bundle_sidecar_sha" \
         "$shared_root" legacy-maintenance-evidence-bundle.json.sha256
+    register_shared_input "$canonical_source_preselection" "$canonical_source_preselection_sha" \
+        "$shared_root" canonical-source-preselection.json
+    register_shared_input "$canonical_source_preselection_sidecar" \
+        "$canonical_source_preselection_sidecar_sha" "$shared_root" \
+        canonical-source-preselection.json.sha256
     register_shared_input "$maintenance_boundary" "$maintenance_boundary_sha" \
         "$shared_root" legacy-maintenance-boundary.json
     register_shared_input "$maintenance_boundary_sidecar" "$maintenance_boundary_sidecar_sha" \

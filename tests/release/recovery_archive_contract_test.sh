@@ -4030,8 +4030,8 @@ required_extractions = (
     'canonical_source_preselection_sidecar_sha="$(manifest_field "$manifest" artifacts.canonical_source_preselection_sidecar.sha256)"',
 )
 required_registrations = (
-    'register_shared_input "$canonical_source_preselection" "$canonical_source_preselection_sha" \\\n+        "$shared_root" canonical-source-preselection.json',
-    'register_shared_input "$canonical_source_preselection_sidecar" \\\n+        "$canonical_source_preselection_sidecar_sha" "$shared_root" \\\n+        canonical-source-preselection.json.sha256',
+    'register_shared_input "$canonical_source_preselection" "$canonical_source_preselection_sha" \\\n        "$shared_root" canonical-source-preselection.json',
+    'register_shared_input "$canonical_source_preselection_sidecar" \\\n        "$canonical_source_preselection_sidecar_sha" "$shared_root" \\\n        canonical-source-preselection.json.sha256',
 )
 for fragment in (*required_extractions, *required_registrations):
     assert text.count(fragment) == 1, fragment

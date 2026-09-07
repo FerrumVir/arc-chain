@@ -1708,35 +1708,6 @@ class RecoveryRolloutTests(unittest.TestCase):
             ("persisted_head", "persisted-head"),
         )
         for index, (node, host) in enumerate(rollout.PRODUCTION_FLEET):
-            dag_namespace = {
-                "schema": "arc.recovery.legacy-dag-wal-namespace.v1",
-                "segment_names": ["wal-00000000.bin"],
-                "inspected_tail": [
-                    {
-                        "name": "wal-00000000.bin",
-                        "sha256": f"{index + 5400:064x}",
-                        "size": 8,
-                    }
-                ],
-            }
-            dag_inspection = {
-                "schema": "arc.recovery.legacy-dag-round-inspection.v1",
-                "status": "VERIFIED_STOPPED_DAG_CURSOR",
-                "source_consensus_round": 9_999 + index,
-                "first_segment": 0,
-                "last_segment": 0,
-                "segment_count": 1,
-                "inspected_first_segment": 0,
-                "inspected_segment_count": 1,
-                "inspected_entry_count": 1,
-                "namespace_sha256": hashlib.sha256(
-                    json.dumps(
-                        dag_namespace, sort_keys=True, separators=(",", ":")
-                    ).encode()
-                ).hexdigest(),
-                "namespace": dag_namespace,
-                "read_only": True,
-            }
             identity = {
                 "capture_id": capture_id,
                 "node": node,
@@ -1889,12 +1860,6 @@ class RecoveryRolloutTests(unittest.TestCase):
                         "preserved_by": (
                             "complete-content-indexed-stopped-legacy-source-v4"
                         ),
-                    },
-                    "legacy_dag_round": {
-                        "source_consensus_round": 9_999 + index,
-                        "namespace_sha256": dag_inspection["namespace_sha256"],
-                        "inspection": dag_inspection,
-                        "inspection_sha256": sha_value(dag_inspection),
                     },
                     "writer_stopped": True,
                     "restart_barrier_active": True,
