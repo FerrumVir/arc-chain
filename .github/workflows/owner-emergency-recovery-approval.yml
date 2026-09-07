@@ -1,6 +1,6 @@
 name: Owner emergency recovery approval
 
-run-name: Owner recovery approval for ${{ inputs.expected_main_sha }} at ${{ inputs.checkpoint_manifest_hash }}
+run-name: Owner recovery approval for ${{ inputs.expected_main_sha }} H=${{ inputs.source_height }} at ${{ inputs.checkpoint_manifest_hash }}
 
 # This workflow is the authentication boundary for the one-person repository-
 # owner emergency decision. It has no secret, deployment, package, or write
@@ -15,6 +15,38 @@ on:
         type: string
       checkpoint_manifest_hash:
         description: Exact 0x-prefixed recovery checkpoint manifest hash
+        required: true
+        type: string
+      source_height:
+        description: Capture-derived canonical source height H (at or above reviewed anchor 137145)
+        required: true
+        type: string
+      transition_height:
+        description: Recovery transition height T (must equal H+1)
+        required: true
+        type: string
+      source_block_hash:
+        description: Strict-replayed source block hash at H
+        required: true
+        type: string
+      source_state_root:
+        description: Strict-replayed source state root at H
+        required: true
+        type: string
+      source_consensus_round:
+        description: Final frozen consensus round bound to the selected source
+        required: true
+        type: string
+      observed_cutoff_height:
+        description: Maximum frozen legacy head C across every fork
+        required: true
+        type: string
+      reopening_floor_height:
+        description: Public reopening floor F (must equal C+128)
+        required: true
+        type: string
+      legacy_maintenance_boundary_sha256:
+        description: SHA-256 of the canonical maintenance-boundary receipt
         required: true
         type: string
       validator_public_keys_sha256:
@@ -46,7 +78,7 @@ on:
         required: true
         type: string
       confirmation:
-        description: Type AUTHORIZE ARC OWNER EMERGENCY RECOVERY followed by one space and expected_main_sha
+        description: Type the exact H/T/source tuple/C/F, boundary, checkpoint, and protected-main authorization shown in the runbook
         required: true
         type: string
 
@@ -55,7 +87,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: owner-emergency-recovery-${{ inputs.expected_main_sha }}-${{ inputs.checkpoint_manifest_hash }}
+  group: owner-emergency-recovery-${{ inputs.expected_main_sha }}-${{ inputs.legacy_maintenance_boundary_sha256 }}-${{ inputs.checkpoint_manifest_hash }}
   cancel-in-progress: false
 
 jobs:
@@ -74,6 +106,14 @@ jobs:
           TRIGGERING_ACTOR_LOGIN: ${{ github.triggering_actor }}
           EXPECTED_MAIN_SHA: ${{ inputs.expected_main_sha }}
           CHECKPOINT_MANIFEST_HASH: ${{ inputs.checkpoint_manifest_hash }}
+          SOURCE_HEIGHT: ${{ inputs.source_height }}
+          TRANSITION_HEIGHT: ${{ inputs.transition_height }}
+          SOURCE_BLOCK_HASH: ${{ inputs.source_block_hash }}
+          SOURCE_STATE_ROOT: ${{ inputs.source_state_root }}
+          SOURCE_CONSENSUS_ROUND: ${{ inputs.source_consensus_round }}
+          OBSERVED_CUTOFF_HEIGHT: ${{ inputs.observed_cutoff_height }}
+          REOPENING_FLOOR_HEIGHT: ${{ inputs.reopening_floor_height }}
+          LEGACY_MAINTENANCE_BOUNDARY_SHA256: ${{ inputs.legacy_maintenance_boundary_sha256 }}
           VALIDATOR_PUBLIC_KEYS_SHA256: ${{ inputs.validator_public_keys_sha256 }}
           NYC_PUBLIC_KEY: ${{ inputs.nyc_public_key }}
           LAX_PUBLIC_KEY: ${{ inputs.lax_public_key }}
@@ -91,10 +131,26 @@ jobs:
           [ "$ACTOR_LOGIN" = FerrumVir ]
           [ "$ACTOR_ID" = 111036403 ]
           [ "$TRIGGERING_ACTOR_LOGIN" = FerrumVir ]
-          [ "$CONFIRMATION" = "AUTHORIZE ARC OWNER EMERGENCY RECOVERY $EXPECTED_MAIN_SHA" ]
           [[ "$EXPECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$CHECKPOINT_MANIFEST_HASH" =~ ^0x[0-9a-f]{64}$ ]]
+          for exact_integer in \
+            "$SOURCE_HEIGHT" "$TRANSITION_HEIGHT" "$SOURCE_CONSENSUS_ROUND" \
+            "$OBSERVED_CUTOFF_HEIGHT" "$REOPENING_FLOOR_HEIGHT"
+          do
+            [[ "$exact_integer" =~ ^[1-9][0-9]{0,15}$ ]]
+            [ "$((10#$exact_integer))" -le 9007199254740991 ]
+          done
+          [[ "$SOURCE_BLOCK_HASH" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_STATE_ROOT" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$LEGACY_MAINTENANCE_BOUNDARY_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$VALIDATOR_PUBLIC_KEYS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [ "$((10#$SOURCE_HEIGHT))" -ge 137145 ]
+          [ "$((10#$TRANSITION_HEIGHT))" -eq "$((10#$SOURCE_HEIGHT + 1))" ]
+          [ "$((10#$SOURCE_HEIGHT))" -le "$((10#$OBSERVED_CUTOFF_HEIGHT))" ]
+          [ "$((10#$REOPENING_FLOOR_HEIGHT))" -eq "$((10#$OBSERVED_CUTOFF_HEIGHT + 128))" ]
+          [ 137146 -le "$((10#$TRANSITION_HEIGHT))" ]
+          expected_confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY $EXPECTED_MAIN_SHA H=$SOURCE_HEIGHT T=$TRANSITION_HEIGHT HASH=$SOURCE_BLOCK_HASH STATE=$SOURCE_STATE_ROOT ROUND=$SOURCE_CONSENSUS_ROUND C=$OBSERVED_CUTOFF_HEIGHT F=$REOPENING_FLOOR_HEIGHT BOUNDARY=$LEGACY_MAINTENANCE_BOUNDARY_SHA256 CHECKPOINT=$CHECKPOINT_MANIFEST_HASH"
+          [ "$CONFIRMATION" = "$expected_confirmation" ]
           for public_key in \
             "$NYC_PUBLIC_KEY" "$LAX_PUBLIC_KEY" "$AMS_PUBLIC_KEY" \
             "$LHR_PUBLIC_KEY" "$NRT_PUBLIC_KEY" "$SGP_PUBLIC_KEY"
@@ -138,14 +194,22 @@ jobs:
             --arg approved_at "$approved_at" \
             --arg source "$EXPECTED_MAIN_SHA" \
             --arg checkpoint "$CHECKPOINT_MANIFEST_HASH" \
+            --arg source_block_hash "$SOURCE_BLOCK_HASH" \
+            --arg source_state_root "$SOURCE_STATE_ROOT" \
+            --arg boundary_sha "$LEGACY_MAINTENANCE_BOUNDARY_SHA256" \
             --arg public_keys_sha "$VALIDATOR_PUBLIC_KEYS_SHA256" \
             --arg nyc "$NYC_PUBLIC_KEY" --arg lax "$LAX_PUBLIC_KEY" \
             --arg ams "$AMS_PUBLIC_KEY" --arg lhr "$LHR_PUBLIC_KEY" \
             --arg nrt "$NRT_PUBLIC_KEY" --arg sgp "$SGP_PUBLIC_KEY" \
             --argjson run_id "$GITHUB_RUN_ID" \
-            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" '
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson source_height "$SOURCE_HEIGHT" \
+            --argjson transition_height "$TRANSITION_HEIGHT" \
+            --argjson source_consensus_round "$SOURCE_CONSENSUS_ROUND" \
+            --argjson observed_cutoff_height "$OBSERVED_CUTOFF_HEIGHT" \
+            --argjson reopening_floor_height "$REOPENING_FLOOR_HEIGHT" '
             {
-              schema:"arc.recovery.owner-emergency-recovery.v2",
+              schema:"arc.recovery.owner-emergency-recovery.v3",
               decision:{
                 authorization_kind:"owner_emergency_recovery",
                 authority_basis:"repository-owner emergency authorization authenticated by an exact GitHub Actions run; not approval by six independent humans",
@@ -153,7 +217,7 @@ jobs:
                 approved_at:$approved_at,
                 reason_code:"legacy_fleet_divergence_history_preserving_v080_cutover",
                 reason:"The divergent public validator fleet requires the reviewed, history-preserving ARC v0.8 emergency cutover.",
-                risk_acknowledgement:"I authorize five reviewed ARC validator identities to sign the recovery checkpoint rooted at preserved source block 137145 and transition block 137146. I understand that the six legacy forks remain preserved read-only, that rollback cannot rewrite signed history, and that this receipt does not represent approval by six independent humans."
+                risk_acknowledgement:"I authorize five reviewed ARC validator identities to sign the recovery checkpoint rooted at the capture-derived preserved source block and its immediate successor transition. I understand that the six legacy forks remain preserved read-only, that rollback cannot rewrite signed history, and that this receipt does not represent approval by six independent humans."
               },
               github_authentication:{
                 repository:"FerrumVir/arc-chain",
@@ -166,7 +230,12 @@ jobs:
               scope:{
                 repository:"FerrumVir/arc-chain",protected_branch:"main",
                 source_main_sha:$source,checkpoint_manifest_hash:$checkpoint,
-                source_height:137145,transition_height:137146,
+                source_height:$source_height,transition_height:$transition_height,
+                source_block_hash:$source_block_hash,source_state_root:$source_state_root,
+                source_consensus_round:$source_consensus_round,
+                observed_cutoff_height:$observed_cutoff_height,
+                reopening_floor_height:$reopening_floor_height,
+                legacy_maintenance_boundary_sha256:$boundary_sha,
                 recovery_epoch:1,validator_set_id:1,
                 validator_public_keys_sha256:$public_keys_sha
               },

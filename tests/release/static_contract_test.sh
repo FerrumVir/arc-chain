@@ -2974,14 +2974,18 @@ macos_pretag_community_canary_is_exact_private_and_fail_closed() {
 owner_emergency_recovery_authorization_is_durable_and_exact() {
     local required
     for required in \
-        'RECEIPT_SCHEMA = "arc.recovery.owner-emergency-recovery.v2"' \
+        'RECEIPT_SCHEMA = "arc.recovery.owner-emergency-recovery.v3"' \
         'REPOSITORY = "FerrumVir/arc-chain"' \
         'WORKFLOW_PATH = ".github/workflows/owner-emergency-recovery-approval.yml"' \
         'AUTHORIZATION_KIND = "owner_emergency_recovery"' \
         'authenticated by an exact GitHub' \
         'REASON_CODE = "legacy_fleet_divergence_history_preserving_v080_cutover"' \
-        'SOURCE_HEIGHT = 137_145' \
-        'TRANSITION_HEIGHT = 137_146' \
+        'TRUSTED_ANCHOR_HEIGHT = 137_145' \
+        'COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT = 137_146' \
+        'CONTINUITY_SAFETY_MARGIN = 128' \
+        'authorization transition height must equal source height plus one' \
+        'authorization source height exceeds the maximum observed legacy cutoff' \
+        'authorization reopening floor must equal observed cutoff plus 128' \
         'RECOVERY_EPOCH = 1' \
         'VALIDATOR_SET_ID = 1' \
         'SIGNATURES_REQUIRED = 5' \
@@ -3006,13 +3010,19 @@ owner_emergency_recovery_authorization_is_durable_and_exact() {
         }
     done
     for required in \
-        '"const": "arc.recovery.owner-emergency-recovery.v2"' \
+        '"const": "arc.recovery.owner-emergency-recovery.v3"' \
         '"const": ".github/workflows/owner-emergency-recovery-approval.yml"' \
         '"const": "workflow_dispatch"' \
         '"const": "owner_emergency_recovery"' \
         '"const": "legacy_fleet_divergence_history_preserving_v080_cutover"' \
-        '"const": 137145' \
-        '"const": 137146' \
+        '"minimum": 137145' \
+        '"minimum": 137146' \
+        '"source_block_hash"' \
+        '"source_state_root"' \
+        '"source_consensus_round"' \
+        '"observed_cutoff_height"' \
+        '"reopening_floor_height"' \
+        '"legacy_maintenance_boundary_sha256"' \
         '"const": 5' \
         '"const": 40000000' \
         '"const": "FerrumVir"' \
@@ -3033,6 +3043,15 @@ owner_emergency_recovery_authorization_is_durable_and_exact() {
         'actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT' \
         '.actor.login == "FerrumVir" and .actor.id == 111036403' \
         '.triggering_actor.login == "FerrumVir"' \
+        'SOURCE_HEIGHT: ${{ inputs.source_height }}' \
+        'TRANSITION_HEIGHT: ${{ inputs.transition_height }}' \
+        'SOURCE_BLOCK_HASH: ${{ inputs.source_block_hash }}' \
+        'SOURCE_STATE_ROOT: ${{ inputs.source_state_root }}' \
+        'SOURCE_CONSENSUS_ROUND: ${{ inputs.source_consensus_round }}' \
+        'OBSERVED_CUTOFF_HEIGHT: ${{ inputs.observed_cutoff_height }}' \
+        'REOPENING_FLOOR_HEIGHT: ${{ inputs.reopening_floor_height }}' \
+        'LEGACY_MAINTENANCE_BOUNDARY_SHA256: ${{ inputs.legacy_maintenance_boundary_sha256 }}' \
+        'HASH=$SOURCE_BLOCK_HASH STATE=$SOURCE_STATE_ROOT ROUND=$SOURCE_CONSENSUS_ROUND' \
         'overwrite: false' \
         'retention-days: 90'
     do
