@@ -1179,7 +1179,7 @@ impl WalWriter {
         sync_result.map_err(|error| std::io::Error::new(error.kind(), error))?;
 
         synchronized();
-        Self::delete_segments_before_in_dir(&self.wal_dir, wal_sequence, 2)
+        Self::delete_segments_before_live_writer_fenced(&self.wal_dir, wal_sequence, 2)
     }
 
     /// Offline-only static version: scan an inactive `wal_dir` for segment
@@ -1191,6 +1191,27 @@ impl WalWriter {
         wal_dir: &Path,
         wal_sequence: u64,
         min_retain: usize,
+    ) -> std::io::Result<u32> {
+        Self::delete_segments_before_in_dir_inner(wal_dir, wal_sequence, min_retain, false)
+    }
+
+    /// The admission lock and successful Sync acknowledgement must remain in
+    /// force for this complete call. On Windows only the final segment uses a
+    /// read-only opener compatible with the still-live append handle; every
+    /// offline/recovery reader retains its exclusive fail-closed open.
+    fn delete_segments_before_live_writer_fenced(
+        wal_dir: &Path,
+        wal_sequence: u64,
+        min_retain: usize,
+    ) -> std::io::Result<u32> {
+        Self::delete_segments_before_in_dir_inner(wal_dir, wal_sequence, min_retain, true)
+    }
+
+    fn delete_segments_before_in_dir_inner(
+        wal_dir: &Path,
+        wal_sequence: u64,
+        min_retain: usize,
+        live_writer_fenced: bool,
     ) -> std::io::Result<u32> {
         cleanup_removed_wal_tombstones(wal_dir)?;
         let min_retain = if min_retain < 2 { 2 } else { min_retain };
@@ -1214,7 +1235,16 @@ impl WalWriter {
         for (segment_index, seg_path) in segments.iter().enumerate() {
             // Pruning is destructive, so a corrupt frame or cross-segment
             // sequence gap must abort before any namespace entry is removed.
+            #[cfg(windows)]
+            let entries = if live_writer_fenced && segment_index + 1 == segments.len() {
+                read_wal_strict_live_writer_segment(seg_path, &mut expected_sequence)?
+            } else {
+                read_wal_strict_segment(seg_path, &mut expected_sequence)?
+            };
+            #[cfg(not(windows))]
             let entries = read_wal_strict_segment(seg_path, &mut expected_sequence)?;
+            #[cfg(not(windows))]
+            let _ = live_writer_fenced;
             if !entries.is_empty() {
                 last_nonempty_segment = Some(segment_index);
             }
@@ -2450,6 +2480,22 @@ fn read_wal_strict_segment(
     expected_sequence: &mut Option<u64>,
 ) -> std::io::Result<Vec<WalEntry>> {
     let file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+    read_wal_strict_segment_from_file(file, expected_sequence)
+}
+
+#[cfg(windows)]
+fn read_wal_strict_live_writer_segment(
+    path: &Path,
+    expected_sequence: &mut Option<u64>,
+) -> std::io::Result<Vec<WalEntry>> {
+    let file = arc_crypto::secret_file::open_owned_nofollow_shared_read(path)?;
+    read_wal_strict_segment_from_file(file, expected_sequence)
+}
+
+fn read_wal_strict_segment_from_file(
+    file: File,
+    expected_sequence: &mut Option<u64>,
+) -> std::io::Result<Vec<WalEntry>> {
     let original_bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -3443,18 +3489,32 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn live_wal_identity_probe_allows_reopen_but_keeps_writer_exclusive() {
-        let dir = tmp_dir("windows_live_identity_probe");
+    fn live_wal_shared_read_is_narrow_and_keeps_writer_exclusive() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let dir = tmp_dir("windows_live_shared_read");
         let path = dir.join("state.wal");
 
         let writer = WalWriter::new(&path).unwrap();
         writer.append(WalOp::Checkpoint(hash_bytes(b"first")), 1);
         writer.sync().unwrap();
 
+        let exclusive_error = read_wal_strict(&path).unwrap_err();
+        assert_eq!(
+            exclusive_error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+
+        let mut expected_sequence = Some(0);
+        let live_entries =
+            read_wal_strict_live_writer_segment(&path, &mut expected_sequence).unwrap();
+        assert_eq!(live_entries.len(), 1);
+        assert_eq!(live_entries[0].sequence, 0);
+
         let second = WalWriter::new(&path);
         assert!(
             second.is_err(),
-            "the compatible identity probe must not admit a second writer"
+            "the compatible shared reader must not admit a second writer"
         );
         drop(writer);
 

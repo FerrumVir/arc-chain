@@ -243,12 +243,23 @@ pub fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_read(path)
 }
 
+/// Open an owner-validated, non-reparse Windows file for a read-only inspection
+/// while an independently synchronized writer handle remains live.
+///
+/// The caller must exclude content mutation for the complete inspection. This
+/// opener requests no write access and its share flags grant no access; the
+/// already-open writer's own share mode continues to exclude a second writer.
+#[cfg(windows)]
+pub fn open_owned_nofollow_shared_read(path: &Path) -> io::Result<File> {
+    platform::open_owned_nofollow_shared_read(path)
+}
+
 /// Open an owner-validated, non-reparse Windows file only to compare its
 /// kernel identity with an already-open writer handle.
 ///
 /// The identity probe requests no write access but must share reads, writes,
 /// and deletes: the WAL append handle is intentionally live while its final
-/// pathname is rebound to the same file ID.  This narrowly scoped opener does
+/// pathname is rebound to the same file ID. This narrowly scoped opener does
 /// not weaken the append handle's own share mode, so a second writer remains
 /// excluded.
 #[cfg(windows)]
@@ -3828,7 +3839,7 @@ mod platform {
         Ok(file)
     }
 
-    pub(super) fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
+    pub(super) fn open_owned_nofollow_shared_read(path: &Path) -> io::Result<File> {
         let file = open_private_raw_with_access_and_share(
             path,
             GENERIC_READ | READ_CONTROL,
@@ -3837,12 +3848,16 @@ mod platform {
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(permission_error(format!(
-                "owner-controlled identity probe is not a non-reparse regular file: {}",
+                "owner-controlled shared reader is not a non-reparse regular file: {}",
                 path.display()
             )));
         }
         validate_private_owner(&file, path, "file")?;
         Ok(file)
+    }
+
+    pub(super) fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
+        open_owned_nofollow_shared_read(path)
     }
 
     pub(super) fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
