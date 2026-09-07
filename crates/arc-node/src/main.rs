@@ -1122,15 +1122,7 @@ fn build_legacy_dag_round_inspection(dag_wal_dir: &str) -> Result<serde_json::Va
         path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
         "legacy DAG WAL is not a regular no-follow directory"
     );
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    }
-    let handle = options
-        .open(requested)
+    let handle = arc_crypto::secret_file::open_owned_nofollow_directory(requested)
         .with_context(|| format!("failed to no-follow open legacy DAG WAL {dag_wal_dir}"))?;
     let open_metadata = handle
         .metadata()
@@ -3221,17 +3213,11 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 data_dir_metadata.is_dir() && !data_dir_metadata.file_type().is_symlink(),
                 "legacy data directory is not a regular no-follow directory"
             );
-            let mut directory_options = OpenOptions::new();
-            directory_options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                directory_options
-                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-            }
-            let data_dir_handle = directory_options
-                .open(data_dir_path)
-                .with_context(|| format!("failed to no-follow open data directory {data_dir}"))?;
+            let data_dir_handle =
+                arc_crypto::secret_file::open_owned_nofollow_directory(data_dir_path)
+                    .with_context(|| {
+                        format!("failed to no-follow open data directory {data_dir}")
+                    })?;
             let data_dir_open_metadata = data_dir_handle
                 .metadata()
                 .context("failed to inspect open legacy data directory")?;
@@ -3424,17 +3410,11 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 data_dir_metadata.is_dir() && !data_dir_metadata.file_type().is_symlink(),
                 "legacy data directory is not a regular no-follow directory"
             );
-            let mut directory_options = OpenOptions::new();
-            directory_options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                directory_options
-                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-            }
-            let data_dir_handle = directory_options
-                .open(data_dir_path)
-                .with_context(|| format!("failed to no-follow open data directory {data_dir}"))?;
+            let data_dir_handle =
+                arc_crypto::secret_file::open_owned_nofollow_directory(data_dir_path)
+                    .with_context(|| {
+                        format!("failed to no-follow open data directory {data_dir}")
+                    })?;
             let data_dir_open_metadata = data_dir_handle
                 .metadata()
                 .context("failed to inspect open legacy data directory")?;
