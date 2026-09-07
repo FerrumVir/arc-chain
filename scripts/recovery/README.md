@@ -6513,6 +6513,7 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
   | /usr/bin/cmp -s - "$acceptance_receipt"
 /usr/bin/jq -e --slurpfile receipt "$acceptance_receipt" \
   --slurpfile manifest "$final_manifest" \
+  --slurpfile config "$deployed_config" \
   --arg acceptance_sha "$public_truth_acceptance_sha" \
   --arg source "$protected_main_sha" --arg accepted_config "$frontend_main_sha" '
   .schema == "arc.public-production-status.v1" and .state == "recovered"
@@ -6526,7 +6527,11 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
   and .checkpoint.legacyPublicMaxHeight == $manifest[0].chain.legacy_public_max_height
   and .checkpoint.recoveryHeight == (.checkpoint.height + 1)
   and (.checkpoint.protocolVersion | test("^3\\.[0-9]+\\.[0-9]+$"))
-  and .fleet.validatorCount == 6 and .fleet.legacyForkCount == 6
+  and .fleet.validatorCount == 6
+  and .fleet.legacyForkCount ==
+    ([$config[0].sources[] | select(.kind == "legacy-fork")] | length)
+  and .fleet.legacyForkNodes ==
+    [$config[0].sources[] | select(.kind == "legacy-fork") | .archive.node]
   and .fleet.requiredHealthyValidators == 6
   and .rewards.canaryReceiptCount == 2
   and .rewards.rewardPerReceiptBase == 2500000000

@@ -13244,7 +13244,11 @@ else
   status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 15 --resolve "$hostname:443:127.0.0.1" "https://$hostname/health" || true)
   test "$status" = 503 || { printf 'maintenance edge health returned HTTP %s\n' "$status" >&2; exit 1; }
 fi
-receipt="$gate/${target}.json"
+# A maintenance reclose under the public-open intent and the subsequent
+# retirement-safe rollback use distinct, independently sealed intents. Keep
+# both create-only receipts instead of making those valid transitions contend
+# for one target-only filename.
+receipt="$gate/${target}.${intent_sha}.json"
 arc_semantic_python - "$receipt" "$rollout" "$target" "$source_sha" "$intent_sha" "$height" "$block_hash" "$state_root" "$node_name" "$hostname" <<'PY'
 import hashlib,json,os,pathlib,stat,sys
 path=pathlib.Path(sys.argv[1])

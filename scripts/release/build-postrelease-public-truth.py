@@ -49,7 +49,12 @@ PROTOCOL_VERSION_RE = re.compile(r"^3\.[0-9]+\.[0-9]+$")
 RECOVERY_EPOCH = 1
 VALIDATOR_SET_ID = 1
 LEGACY_CONTINUITY_SAFETY_MARGIN = 128
-RECOVERY_FRONTEND_PROJECTION_TIMEOUT_SECONDS = 30 * 60 * 60
+# The exact projection deliberately nests the complete archive verifier (up to
+# 24h), bounded per-object/per-fork provenance reads, and fresh all-six live,
+# convergence, and reward checks. Keep the outer watchdog beyond the sum of
+# every valid inner watchdog so it never kills a slow operation that remains
+# inside the reviewed contract.
+RECOVERY_FRONTEND_PROJECTION_TIMEOUT_SECONDS = 72 * 60 * 60
 REWARD_PER_RECEIPT_BASE = 2_500_000_000
 PUBLIC_CONSOLE = "https://ferrumvir.github.io/arc-chain/"
 PUBLIC_EXPLORER = PUBLIC_CONSOLE + "explorer/"
@@ -2183,6 +2188,9 @@ def validate_network(
     capture_ids: set[str] = set()
     fork_nodes: list[str] = []
     previous_fleet_index = -1
+    # Selection is only through H. The selected source node may itself retain
+    # a divergent post-H legacy tail, so archive classification—not node name—
+    # decides whether that capture receives a noncanonical history view.
     for index, row in enumerate(forks):
         exact_keys(
             row,
@@ -2213,7 +2221,6 @@ def validate_network(
         fleet_index = fleet_order[name]
         if (
             fleet_index <= previous_fleet_index
-            or name == canonical_node
             or row.get("id") != f"legacy-fork-{name}"
             or row.get("baseUrl") != f"https://{fleet_hosts[name]}/legacy/{name}"
             or row.get("enabled") is not True

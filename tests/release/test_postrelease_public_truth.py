@@ -185,7 +185,7 @@ class Fixture:
                     "bindingSha256": "2" * 64,
                     "checkpointSha256": format(index, "x") * 64,
                     "checkpointManifestHash": format(index + 5, "x") * 64,
-                    "checkpointPayloadHash": format(index + 10, "x") * 64,
+                    "checkpointPayloadHash": format(index + 9, "x") * 64,
                     "canonicalCheckpointHeight": 137145,
                     "sourceHeight": 141000,
                     "sourceBlockHash": "6" * 64,
@@ -193,7 +193,7 @@ class Fixture:
                     "provenancePath": "/provenance",
                 },
             }
-            for index, (name, host) in enumerate(TRUTH.PRODUCTION_FLEET[1:], 1)
+            for index, (name, host) in enumerate(TRUTH.PRODUCTION_FLEET, 1)
         )
         self.config = {
             "schema": TRUTH.NETWORK_SCHEMA,
@@ -1191,7 +1191,7 @@ class PublicTruthTests(unittest.TestCase):
                     [row["archive"]["node"] for row in forks[:count]],
                 )
 
-    def test_network_rejects_wrong_fork_order_or_canonical_capture_as_fork(self) -> None:
+    def test_network_rejects_wrong_fork_order(self) -> None:
         reordered = copy.deepcopy(self.fixture.config)
         reordered["sources"][6], reordered["sources"][7] = (
             reordered["sources"][7],
@@ -1202,18 +1202,6 @@ class PublicTruthTests(unittest.TestCase):
                 reordered, self.fixture.source_sha, self.fixture.manifest
             )
 
-        canonical_fork = copy.deepcopy(self.fixture.config)
-        row = canonical_fork["sources"][6]
-        row["id"] = "legacy-fork-nyc"
-        row["name"] = "Preserved legacy fork · NYC"
-        row["region"] = "NYC"
-        row["baseUrl"] = "https://149.28.32.76/legacy/nyc"
-        row["archive"]["node"] = "nyc"
-        with self.assertRaises(TRUTH.TruthError):
-            TRUTH.validate_network(
-                canonical_fork, self.fixture.source_sha, self.fixture.manifest
-            )
-
     def test_recovery_gate_uses_exact_frontend_projection_without_duplicate_verify(self) -> None:
         self.recovery_patch.stop()
         commands: list[list[str]] = []
@@ -1222,7 +1210,7 @@ class PublicTruthTests(unittest.TestCase):
             commands.append(command)
             self.assertIn("frontend-config", command)
             self.assertNotIn("verify", command)
-            self.assertGreaterEqual(kwargs["timeout"], 24 * 60 * 60)
+            self.assertEqual(kwargs["timeout"], 72 * 60 * 60)
             output = Path(command[command.index("--output") + 1])
             raw = TRUTH.canonical_json(self.fixture.config)
             output.write_bytes(raw)
@@ -1299,7 +1287,7 @@ class PublicTruthTests(unittest.TestCase):
         self.assertIn("F=C+128=**141,128**", readme)
         self.assertIn("recovery domain `" + "7" * 64 + "`", readme)
         self.assertIn("epoch **1**, validator set **1**", readme)
-        self.assertIn("**5** divergent captured history views are available", readme)
+        self.assertIn("**6** divergent captured history views are available", readme)
         acceptance_raw = acceptance_path.read_bytes()
         acceptance = json.loads(acceptance_raw)
         self.assertEqual(acceptance["schema"], "arc.post-release-acceptance.v2")
@@ -1333,10 +1321,10 @@ class PublicTruthTests(unittest.TestCase):
         self.assertEqual(status["checkpoint"]["validatorSetId"], 1)
         self.assertEqual(status["checkpoint"]["checkpointFileSha256"], "3" * 64)
         self.assertEqual(status["checkpoint"]["checkpointPayloadHash"], "e" * 64)
-        self.assertEqual(status["fleet"]["legacyForkCount"], 5)
+        self.assertEqual(status["fleet"]["legacyForkCount"], 6)
         self.assertEqual(
             status["fleet"]["legacyForkNodes"],
-            [name for name, _host in TRUTH.PRODUCTION_FLEET[1:]],
+            [name for name, _host in TRUTH.PRODUCTION_FLEET],
         )
         self.assertEqual(
             status["fleet"]["rolloutId"], self.fixture.manifest["rollout_id"]

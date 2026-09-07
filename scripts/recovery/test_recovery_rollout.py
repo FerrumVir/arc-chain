@@ -3494,6 +3494,9 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
         self.assertEqual(len(captured), 1)
         self.assertIn("arc_semantic_python -", captured[0])
         self.assertNotIn("python3 -", captured[0])
+        self.assertIn(
+            'receipt="$gate/${target}.${intent_sha}.json"', captured[0]
+        )
         self.assertIn("http://localhost/block/$height", captured[0])
         self.assertLess(
             captured[0].index("http://localhost/block/$height"),
@@ -3510,6 +3513,56 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
             check=False,
         )
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        marker = (
+            'arc_semantic_python - "$receipt" "$rollout" "$target" '
+            '"$source_sha" "$intent_sha" "$height" "$block_hash" '
+            '"$state_root" "$node_name" "$hostname" <<\'PY\'\n'
+        )
+        receipt_program = captured[0].split(marker, 1)[1].split("\nPY\n", 1)[0]
+        gate = self.root / "intent-scoped-public-gate"
+        gate.mkdir(mode=0o700)
+        maintenance_sha = hashlib.sha256(
+            harness.maintenance_caddyfile(node).encode("utf-8")
+        ).hexdigest()
+        outputs: dict[str, bytes] = {}
+        for intent in ("a" * 64, "b" * 64):
+            path = gate / f"maintenance.{intent}.json"
+            arguments = [
+                sys.executable,
+                "-I",
+                "-",
+                str(path),
+                harness.digest,
+                "maintenance",
+                maintenance_sha,
+                intent,
+                "0",
+                "0" * 64,
+                "0" * 64,
+                node["name"],
+                node["host"],
+            ]
+            first = rollout.subprocess.run(
+                arguments,
+                input=receipt_program.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            second = rollout.subprocess.run(
+                arguments,
+                input=receipt_program.encode("utf-8"),
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr.decode())
+            self.assertEqual(second.returncode, 0, second.stderr.decode())
+            self.assertEqual(first.stdout, second.stdout)
+            self.assertEqual(path.read_bytes(), first.stdout)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+            outputs[intent] = first.stdout
+        self.assertEqual(len(list(gate.iterdir())), 2)
+        self.assertNotEqual(outputs["a" * 64], outputs["b" * 64])
 
     def test_partial_public_gate_promotion_recloses_every_host_to_maintenance(self) -> None:
         value = self.fixture(production=True)
