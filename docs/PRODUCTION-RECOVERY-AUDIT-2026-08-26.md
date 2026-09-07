@@ -159,7 +159,8 @@ independent humans approved the cutover. Immediately before offline signing,
 the repository owner must manually dispatch the read-only, no-secret
 `owner-emergency-recovery-approval.yml` workflow on the exact protected-main
 commit with the inspected checkpoint manifest hash, public-key manifest hash,
-all six ordered public keys, and exact reviewed confirmation. The operator
+the sealed capture-derived H/T/source tuple/final round/C/F/maintenance-boundary
+root, all six ordered public keys, and exact reviewed confirmation. The operator
 API-selects one new exact workflow/path/event/branch/SHA run and attempt whose
 actor and triggering actor are both the pinned owner, waits for that attempt to
 succeed, and preserves the workflow, run, exact-attempt jobs, artifact metadata,
@@ -169,11 +170,13 @@ directory.
 `owner-emergency-recovery.py verify-github-artifact` receives no GitHub token.
 It authenticates those GitHub API facts, the single successful named job, and
 the one-member artifact, then materializes a fresh, create-only
-`arc.recovery.owner-emergency-recovery.v2` receipt owned by the operator at mode
+`arc.recovery.owner-emergency-recovery.v3` receipt owned by the operator at mode
 `0400` with an exact mode-`0400` SHA-256 sidecar. That receipt records the pinned
 repository owner's GitHub-authenticated `owner_emergency_recovery` decision and
 UTC time, fixed reason and risk acknowledgement, protected-main commit,
-checkpoint manifest, H=137145/H+1=137146, recovery epoch/set 1/1, ordered
+checkpoint manifest, capture-derived `H`, `T=H+1`, source block/state/final
+round, observed cutoff `C`, reopening floor `F=C+128`, maintenance-boundary
+SHA-256, recovery epoch/set 1/1, ordered
 validator public identities/stakes, exact five-signature order, unused sixth
 member, and strict stake-supermajority threshold. Matching locally authored
 text is not authorization. This owner emergency receipt is transparent about

@@ -114,6 +114,13 @@ MAX_MACOS_CANARY_ACCEPTANCE_AGE_SECONDS = 6 * 60 * 60
 # same bound from the immutable receipt/cross-proof timeline; the six official
 # HTTP origins no longer exist to resample at that point.
 MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS = 300
+TRUSTED_CHECKPOINT_MIN_HEIGHT = 137_145
+TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH = (
+    "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+)
+TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT = (
+    "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+)
 ZERO_HASH = "0" * 64
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_METADATA_BYTES = 64 * 1024
@@ -706,6 +713,7 @@ def stage_prearchive_inputs(args: argparse.Namespace) -> tuple[argparse.Namespac
     for path, label in (
         (args.freeze_plan, "freeze plan"),
         (args.legacy_maintenance_evidence_bundle, "legacy maintenance evidence bundle"),
+        (args.canonical_source_preselection, "canonical-source preselection"),
         (args.legacy_maintenance_boundary, "legacy maintenance boundary"),
         (args.legacy_late_fork_source_set, "legacy late-fork source set"),
         (args.offline_stop_evidence, "offline-stop evidence"),
@@ -798,6 +806,26 @@ def stage_prearchive_inputs(args: argparse.Namespace) -> tuple[argparse.Namespac
                     args.legacy_maintenance_evidence_bundle.name + ".sha256"
                 ),
                 "legacy-maintenance-evidence-bundle.json.sha256",
+                512,
+                0o400,
+                False,
+                "root",
+            ),
+            (
+                "canonical_source_preselection",
+                args.canonical_source_preselection,
+                "canonical-source-preselection.json",
+                4 * 1024 * 1024,
+                0o400,
+                False,
+                "root",
+            ),
+            (
+                "canonical_source_preselection_sidecar",
+                args.canonical_source_preselection.with_name(
+                    args.canonical_source_preselection.name + ".sha256"
+                ),
+                "canonical-source-preselection.json.sha256",
                 512,
                 0o400,
                 False,
@@ -2608,6 +2636,8 @@ def validate_legacy_maintenance_evidence_bundle(
         "snapshot_path",
         "state_wal_path",
         "export_contract",
+        "legacy_dag_round",
+        "trusted_anchor_ancestry",
         "completed_at",
         "rerun_reexecutes_export",
         "writer_stopped",
@@ -3236,15 +3266,15 @@ def validate_legacy_maintenance_evidence_bundle(
 
         persisted_schema = persisted_value.get("schema") if isinstance(persisted_value, dict) else None
         expected_persisted_fields = set(persisted_fields)
-        if persisted_schema == "arc.recovery.persisted-legacy-head.v2":
+        if persisted_schema == "arc.recovery.persisted-legacy-head.v4":
             expected_persisted_fields.add("wal_normalization")
         persisted_value = require_exact_object(
             persisted_value, expected_persisted_fields, f"{name} persisted-head value"
         )
         if (
             persisted_value.get("schema") not in {
-                "arc.recovery.persisted-legacy-head.v1",
-                "arc.recovery.persisted-legacy-head.v2",
+                "arc.recovery.persisted-legacy-head.v3",
+                "arc.recovery.persisted-legacy-head.v4",
             }
             or persisted_value.get("source_main_commit") != args.source_main_sha
             or (
@@ -3356,6 +3386,10 @@ def validate_legacy_maintenance_evidence_bundle(
             "read_only": True,
         }:
             fail(f"maintenance evidence persisted export contract differs at {name}")
+        validate_embedded_legacy_dag_round(
+            persisted_value.get("legacy_dag_round"),
+            f"{name} persisted legacy DAG round",
+        )
         _parse_utc_seconds(
             persisted_value.get("completed_at"), f"{name} persisted-head completed_at"
         )
@@ -3366,7 +3400,7 @@ def validate_legacy_maintenance_evidence_bundle(
         )
         if selected_source_head != persisted_head:
             fail(f"maintenance evidence selected final source head differs at {name}")
-        normalized_persisted = persisted_value["schema"] == "arc.recovery.persisted-legacy-head.v2"
+        normalized_persisted = persisted_value["schema"] == "arc.recovery.persisted-legacy-head.v4"
         archived_fields = {
             "path", "sha256", "size", "file_identity", "preserved_by",
         }
@@ -5359,6 +5393,7 @@ CHECKPOINT_COMPARE_FIELDS = (
     "source_validator_stake",
     "source_validator_set_hash",
     "community_reward_issuance_policy_hash",
+    "community_rewards_v1_activation_height",
 )
 
 
@@ -5390,6 +5425,7 @@ def validate_checkpoint_summary(value: dict[str, Any], label: str) -> None:
         "signature_count",
         "source_validator_count",
         "source_validator_stake",
+        "community_rewards_v1_activation_height",
     ):
         require_uint(value.get(field), f"{label}.{field}")
     if not isinstance(value.get("chain_id"), str) or not value["chain_id"]:
@@ -5404,6 +5440,8 @@ def validate_checkpoint_summary(value: dict[str, Any], label: str) -> None:
         fail(f"{label} does not bind the canonical eight-validator/40M source set")
     if value["transition_height"] != value["source_height"] + 1:
         fail(f"{label} transition height is not exactly source H+1")
+    if value["community_rewards_v1_activation_height"] > value["transition_height"]:
+        fail(f"{label} community reward activation height is after H+1")
 
 
 def inspect_signed_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
@@ -5416,6 +5454,756 @@ def inspect_signed_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
     if inspected.get("status") != "UNTRUSTED_INSPECTION":
         fail("signed checkpoint inspect returned an unexpected status")
     return inspected
+
+
+def validate_embedded_legacy_dag_round(raw: Any, label: str) -> dict[str, Any]:
+    value = require_exact_object(
+        raw,
+        {"source_consensus_round", "namespace_sha256", "inspection", "inspection_sha256"},
+        label,
+    )
+    source_round = require_uint(
+        value.get("source_consensus_round"), f"{label} source consensus round", positive=True
+    )
+    namespace_sha = require_hash(value.get("namespace_sha256"), f"{label} namespace root")
+    inspection = require_exact_object(
+        value.get("inspection"),
+        {
+            "schema", "status", "source_consensus_round", "first_segment",
+            "last_segment", "segment_count", "inspected_first_segment",
+            "inspected_segment_count", "inspected_entry_count", "namespace_sha256",
+            "namespace", "read_only",
+        },
+        f"{label} inspection",
+    )
+    if (
+        inspection.get("schema") != "arc.recovery.legacy-dag-round-inspection.v1"
+        or inspection.get("status") != "VERIFIED_STOPPED_DAG_CURSOR"
+        or inspection.get("read_only") is not True
+        or inspection.get("source_consensus_round") != source_round
+        or inspection.get("namespace_sha256") != namespace_sha
+    ):
+        fail(f"{label} inspection identity differs")
+    for field in (
+        "source_consensus_round", "segment_count", "inspected_segment_count",
+        "inspected_entry_count",
+    ):
+        require_uint(inspection.get(field), f"{label} inspection {field}", positive=True)
+    for field in ("first_segment", "last_segment", "inspected_first_segment"):
+        require_uint(inspection.get(field), f"{label} inspection {field}")
+    if (
+        inspection["last_segment"] < inspection["first_segment"]
+        or inspection["segment_count"]
+        != inspection["last_segment"] - inspection["first_segment"] + 1
+        or inspection["inspected_segment_count"]
+        != min(3, inspection["segment_count"])
+        or inspection["inspected_first_segment"]
+        != inspection["last_segment"] - inspection["inspected_segment_count"] + 1
+    ):
+        fail(f"{label} inspection segment bounds differ")
+    namespace = require_exact_object(
+        inspection.get("namespace"),
+        {"schema", "segment_names", "inspected_tail"},
+        f"{label} namespace",
+    )
+    names = namespace.get("segment_names")
+    tail = namespace.get("inspected_tail")
+    if (
+        namespace.get("schema") != "arc.recovery.legacy-dag-wal-namespace.v1"
+        or names
+        != [
+            f"wal-{index:08d}.bin"
+            for index in range(inspection["first_segment"], inspection["last_segment"] + 1)
+        ]
+        or not isinstance(tail, list)
+        or len(tail) != inspection["inspected_segment_count"]
+    ):
+        fail(f"{label} namespace inventory differs")
+    normalized_tail: list[dict[str, Any]] = []
+    for index, raw_row in enumerate(tail):
+        row = require_exact_object(
+            raw_row, {"name", "sha256", "size"}, f"{label} inspected tail {index}"
+        )
+        require_hash(row.get("sha256"), f"{label} inspected tail {index} hash")
+        require_uint(row.get("size"), f"{label} inspected tail {index} size")
+        normalized_tail.append(row)
+    if [row["name"] for row in normalized_tail] != names[-len(normalized_tail):]:
+        fail(f"{label} inspected tail does not match the namespace suffix")
+    namespace_preimage = {
+        "schema": namespace["schema"],
+        "segment_names": names,
+        "inspected_tail": normalized_tail,
+    }
+    encoded_namespace = json.dumps(
+        namespace_preimage, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if sha256_bytes(encoded_namespace) != namespace_sha:
+        fail(f"{label} namespace root is not reproducible")
+    inspection_sha = require_hash(
+        value.get("inspection_sha256"), f"{label} inspection root"
+    )
+    if inspection_sha != sha256_bytes(canonical_bytes(inspection)):
+        fail(f"{label} inspection root is not reproducible")
+    return value
+
+
+def persisted_source_pair(value: Mapping[str, Any], label: str) -> dict[str, Any]:
+    """Project the replay pair identically from active v3/v4 or stopped v2 receipts."""
+
+    if value.get("schema") in {
+        "arc.recovery.persisted-legacy-head.v3",
+        "arc.recovery.persisted-legacy-head.v4",
+    }:
+        raw = {
+            "wal_sha256": value.get("state_wal_sha256"),
+            "wal_size": value.get("state_wal_size"),
+            "snapshot_sha256": value.get("snapshot_sha256"),
+            "snapshot_size": value.get("snapshot_size"),
+        }
+    else:
+        source_inputs = value.get("source_inputs")
+        fixed_wal = (
+            source_inputs.get("fixed_state_wal")
+            if isinstance(source_inputs, dict)
+            else None
+        )
+        fixed_snapshot = (
+            source_inputs.get("fixed_snapshot")
+            if isinstance(source_inputs, dict)
+            else None
+        )
+        raw = {
+            "wal_sha256": fixed_wal.get("sha256") if isinstance(fixed_wal, dict) else None,
+            "wal_size": fixed_wal.get("size") if isinstance(fixed_wal, dict) else None,
+            "snapshot_sha256": (
+                fixed_snapshot.get("sha256") if isinstance(fixed_snapshot, dict) else None
+            ),
+            "snapshot_size": (
+                fixed_snapshot.get("size") if isinstance(fixed_snapshot, dict) else None
+            ),
+        }
+    return {
+        "state_wal": {
+            "sha256": require_hash(raw["wal_sha256"], f"{label} WAL hash"),
+            "size": require_uint(raw["wal_size"], f"{label} WAL size", positive=True),
+        },
+        "snapshot": {
+            "sha256": require_hash(raw["snapshot_sha256"], f"{label} snapshot hash"),
+            "size": require_uint(
+                raw["snapshot_size"], f"{label} snapshot size", positive=True
+            ),
+        },
+    }
+
+
+def select_canonical_source(
+    args: argparse.Namespace | None,
+    evidence_bundle: Mapping[str, Any],
+    inspected: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select the unique highest captured descendant and bind its replay pair."""
+
+    snapshot_sha: str | None = None
+    snapshot_size: int | None = None
+    wal_sha: str | None = None
+    wal_size: int | None = None
+    if args is not None:
+        snapshot_sha, snapshot_size = hash_secure(
+            args.source_snapshot, "canonical source snapshot"
+        )
+        wal_sha, wal_size = hash_secure(args.source_wal, "canonical source WAL")
+    candidates: list[dict[str, Any]] = []
+    valid_descendants: list[
+        tuple[
+            dict[str, Any], Mapping[str, Any], Mapping[str, Any],
+            tuple[str, int, str, int],
+        ]
+    ] = []
+    raw_nodes = evidence_bundle.get("nodes")
+    if not isinstance(raw_nodes, list) or len(raw_nodes) != len(FLEET):
+        fail("canonical-source selection requires exactly six captured node receipts")
+    for (expected_node, expected_host), row in zip(FLEET, raw_nodes, strict=True):
+        if (
+            not isinstance(row, dict)
+            or row.get("node") != expected_node
+            or row.get("host") != expected_host
+        ):
+            fail("canonical-source captured node receipts are missing or out of order")
+        persisted = require_exact_object(
+            row.get("persisted_head"),
+            {"value", "sha256"},
+            f"{expected_node} canonical-source persisted-head wrapper",
+        )
+        value = persisted.get("value")
+        if not isinstance(value, dict):
+            fail(f"{expected_node} canonical-source persisted-head value is missing")
+        persisted_sha = require_hash(
+            persisted.get("sha256"),
+            f"{expected_node} canonical-source persisted-head root",
+        )
+        if persisted_sha != sha256_bytes(canonical_bytes(value)):
+            fail(f"{expected_node} canonical-source persisted-head wrapper is not sealed")
+        if value.get("schema") not in {
+            "arc.recovery.persisted-legacy-head.v3",
+            "arc.recovery.persisted-legacy-head.v4",
+            quarantine_rounds.PERSISTED_STOPPED_SCHEMA,
+        }:
+            fail(f"{expected_node} canonical-source persisted-head schema is stale")
+        if value.get("node") != expected_node:
+            fail(f"{expected_node} canonical-source persisted-head node differs")
+        source_head = require_exact_object(
+            value.get("head"),
+            {"height", "block_hash", "state_root"},
+            f"{row['node']} canonical-source candidate head",
+        )
+        candidate_height = require_uint(
+            source_head.get("height"), f"{row['node']} candidate height"
+        )
+        candidate_block_hash = require_hash(
+            str(source_head.get("block_hash", "")).removeprefix("0x"),
+            f"{row['node']} candidate block hash",
+        )
+        candidate_state_root = require_hash(
+            str(source_head.get("state_root", "")).removeprefix("0x"),
+            f"{row['node']} candidate state root",
+        )
+        ancestry = require_exact_object(
+            value.get("trusted_anchor_ancestry"),
+            {
+                "anchor_height",
+                "anchor_block_hash",
+                "anchor_state_root",
+                "classification",
+                "inspection",
+                "inspection_sha256",
+            },
+            f"{row['node']} trusted-anchor ancestry",
+        )
+        if (
+            ancestry.get("anchor_height") != TRUSTED_CHECKPOINT_MIN_HEIGHT
+            or ancestry.get("anchor_block_hash")
+            != TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH
+            or ancestry.get("anchor_state_root")
+            != TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT
+        ):
+            fail(f"{row['node']} ancestry proof targets another trusted anchor")
+        ancestry_inspection = ancestry.get("inspection")
+        ancestry_inspection_sha = require_hash(
+            ancestry.get("inspection_sha256"),
+            f"{row['node']} ancestry inspection root",
+        )
+        if ancestry_inspection_sha != sha256_bytes(canonical_bytes(ancestry_inspection)):
+            fail(f"{row['node']} ancestry inspection root differs from its value")
+        classification = ancestry.get("classification")
+        if candidate_height < TRUSTED_CHECKPOINT_MIN_HEIGHT:
+            if classification != "below_trusted_anchor" or ancestry_inspection is not None:
+                fail(f"{row['node']} below-anchor candidate is misclassified")
+        else:
+            if classification not in {"valid_anchor_descendant", "conflicting_anchor"}:
+                fail(
+                    f"{row['node']} captured candidate lacks a conclusive anchor "
+                    "classification"
+                )
+            inspection = require_exact_object(
+                ancestry_inspection,
+                {"schema", "height", "block_hash", "state_root", "input_roots"},
+                f"{row['node']} trusted-anchor inspection",
+            )
+            if (
+                inspection.get("schema")
+                != "arc.recovery.legacy-block-inspection.v1"
+                or inspection.get("height") != TRUSTED_CHECKPOINT_MIN_HEIGHT
+            ):
+                fail(f"{row['node']} trusted-anchor inspection identity differs")
+            inspection_block_hash = require_hash(
+                str(inspection.get("block_hash", "")).removeprefix("0x"),
+                f"{row['node']} inspected anchor block hash",
+            )
+            inspection_state_root = require_hash(
+                str(inspection.get("state_root", "")).removeprefix("0x"),
+                f"{row['node']} inspected anchor state root",
+            )
+            input_roots = require_exact_object(
+                inspection.get("input_roots"),
+                {"data_dir", "state_wal", "snapshot", "genesis", "legacy_validator_set"},
+                f"{row['node']} trusted-anchor inspection input roots",
+            )
+            directory_root = require_exact_object(
+                input_roots.get("data_dir"),
+                {"device", "inode", "mode", "uid", "gid", "nlink", "mtime_ns", "ctime_ns"},
+                f"{row['node']} trusted-anchor data-directory identity",
+            )
+            for field in directory_root:
+                require_uint(
+                    directory_root.get(field),
+                    f"{row['node']} trusted-anchor data-directory {field}",
+                )
+            file_roots: dict[str, Mapping[str, Any]] = {}
+            for root_name in ("state_wal", "snapshot", "genesis", "legacy_validator_set"):
+                file_root = require_exact_object(
+                    input_roots.get(root_name),
+                    {
+                        "device", "inode", "mode", "uid", "gid", "nlink",
+                        "sha256", "size", "mtime_ns", "ctime_ns",
+                    },
+                    f"{row['node']} trusted-anchor {root_name} identity",
+                )
+                for field in (
+                    "device", "inode", "mode", "uid", "gid", "nlink", "size",
+                    "mtime_ns", "ctime_ns",
+                ):
+                    require_uint(
+                        file_root.get(field),
+                        f"{row['node']} trusted-anchor {root_name} {field}",
+                    )
+                require_hash(
+                    file_root.get("sha256"),
+                    f"{row['node']} trusted-anchor {root_name} hash",
+                )
+                file_roots[root_name] = file_root
+
+            if value.get("schema") in {
+                "arc.recovery.persisted-legacy-head.v3",
+                "arc.recovery.persisted-legacy-head.v4",
+            }:
+                staged_contract = value["staged_file_contract"]
+                expected_hashes = {
+                    "state_wal": value["state_wal_sha256"],
+                    "snapshot": value["snapshot_sha256"],
+                    "genesis": value["genesis_sha256"],
+                    "legacy_validator_set": value["legacy_validator_set_sha256"],
+                }
+                for root_name, expected_hash in expected_hashes.items():
+                    if file_roots[root_name]["sha256"] != expected_hash:
+                        fail(
+                            f"{row['node']} trusted-anchor {root_name} input is not "
+                            "the persisted source pair"
+                        )
+                for root_name in ("state_wal", "snapshot"):
+                    staged = staged_contract[root_name]
+                    if any(
+                        file_roots[root_name][field] != staged[field]
+                        for field in ("sha256", "size", "mode", "uid", "gid", "nlink")
+                    ):
+                        fail(
+                            f"{row['node']} trusted-anchor {root_name} identity differs "
+                            "from the staged persisted source pair"
+                        )
+            else:
+                source_inputs = value.get("source_inputs")
+                staged_inputs = value.get("staged_inputs")
+                if not isinstance(source_inputs, dict) or not isinstance(staged_inputs, dict):
+                    fail(f"{row['node']} stopped persisted source inputs are missing")
+                expected_inputs = {
+                    "data_dir": source_inputs.get("fixed_data_dir"),
+                    "state_wal": source_inputs.get("fixed_state_wal"),
+                    "snapshot": source_inputs.get("fixed_snapshot"),
+                    "genesis": staged_inputs.get("genesis"),
+                    "legacy_validator_set": staged_inputs.get("legacy_validator_set"),
+                }
+                if any(
+                    not isinstance(expected, dict) or input_roots[name] != expected
+                    for name, expected in expected_inputs.items()
+                ):
+                    fail(
+                        f"{row['node']} trusted-anchor inputs differ from the "
+                        "stopped persisted source pair"
+                    )
+            anchor_matches = (
+                inspection_block_hash == TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH
+                and inspection_state_root == TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT
+            )
+            if (classification == "valid_anchor_descendant") is not anchor_matches:
+                fail(f"{row['node']} trusted-anchor classification differs")
+        candidate = {
+            "node": row["node"],
+            "persisted_head_schema": value.get("schema"),
+            "persisted_head_sha256": persisted["sha256"],
+            "source_height": candidate_height,
+            "source_block_hash": candidate_block_hash,
+            "source_state_root": candidate_state_root,
+            "classification": classification,
+            "anchor_inspection_sha256": ancestry_inspection_sha,
+        }
+        candidates.append(candidate)
+        pair_projection = persisted_source_pair(
+            value, f"{row['node']} selected-pair"
+        )
+        pair = (
+            pair_projection["state_wal"]["sha256"],
+            pair_projection["state_wal"]["size"],
+            pair_projection["snapshot"]["sha256"],
+            pair_projection["snapshot"]["size"],
+        )
+        legacy_dag_round = validate_embedded_legacy_dag_round(
+            value.get("legacy_dag_round"),
+            f"{row['node']} canonical-source legacy DAG round",
+        )
+        if classification == "valid_anchor_descendant":
+            valid_descendants.append((candidate, persisted, value, pair))
+    if not valid_descendants:
+        fail("captured fleet has no valid descendant of the trusted recovery anchor")
+    maximum_height = max(candidate[0]["source_height"] for candidate in valid_descendants)
+    maximal = [
+        candidate
+        for candidate in valid_descendants
+        if candidate[0]["source_height"] == maximum_height
+    ]
+    maximal_tuples = {
+        (
+            candidate[0]["source_height"],
+            candidate[0]["source_block_hash"],
+            candidate[0]["source_state_root"],
+        )
+        for candidate in maximal
+    }
+    if len(maximal_tuples) != 1:
+        fail("highest valid anchor descendants disagree on their canonical tuple")
+    selected_candidate, persisted, value, selected_pair = maximal[0]
+    selected_wal_sha, selected_wal_size, selected_snapshot_sha, selected_snapshot_size = (
+        selected_pair
+    )
+    if args is not None and (
+        wal_sha != selected_wal_sha
+        or wal_size != selected_wal_size
+        or snapshot_sha != selected_snapshot_sha
+        or snapshot_size != selected_snapshot_size
+    ):
+        fail("supplied replay pair is not the deterministic highest valid anchor descendant")
+    head = value["head"]
+    legacy_dag_round = value["legacy_dag_round"]
+    if inspected is not None:
+        if (
+            head["height"] != inspected["source_height"]
+            or head["block_hash"].removeprefix("0x")
+            != str(inspected["source_block_hash"]).removeprefix("0x")
+            or head["state_root"].removeprefix("0x")
+            != str(inspected["source_state_root"]).removeprefix("0x")
+            or legacy_dag_round["source_consensus_round"]
+            != inspected["source_consensus_round"]
+        ):
+            fail(
+                "signed checkpoint source tuple/round differs from its captured "
+                "persisted head"
+            )
+    elif args is not None:
+        fail("canonical-source selection received source bytes without a checkpoint")
+    canonical_source = {
+        "node": selected_candidate["node"],
+        "source_height": selected_candidate["source_height"],
+        "source_block_hash": selected_candidate["source_block_hash"],
+        "source_state_root": selected_candidate["source_state_root"],
+        "source_consensus_round": legacy_dag_round["source_consensus_round"],
+        "snapshot_sha256": selected_snapshot_sha,
+        "wal_sha256": selected_wal_sha,
+        "persisted_head_sha256": persisted["sha256"],
+        "legacy_dag_round_inspection_sha256": legacy_dag_round[
+            "inspection_sha256"
+        ],
+        "legacy_dag_wal_namespace_sha256": legacy_dag_round["namespace_sha256"],
+    }
+    selection = {
+        "schema": "arc.recovery.canonical-source-selection.v1",
+        "selection_rule": "highest-valid-anchor-descendant-tuple",
+        "equivalent_maximal_pair_rule": (
+            "first-production-fleet-node-with-matching-source-pair"
+        ),
+        "trusted_anchor": {
+            "height": TRUSTED_CHECKPOINT_MIN_HEIGHT,
+            "block_hash": TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH,
+            "state_root": TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT,
+        },
+        "candidates": candidates,
+        "selected": {
+            "node": selected_candidate["node"],
+            "source_height": selected_candidate["source_height"],
+            "source_block_hash": selected_candidate["source_block_hash"],
+            "source_state_root": selected_candidate["source_state_root"],
+            "persisted_head_sha256": selected_candidate["persisted_head_sha256"],
+        },
+    }
+    return canonical_source, {
+        "value": selection,
+        "sha256": sha256_bytes(canonical_bytes(selection)),
+    }
+
+
+def select_source(args: argparse.Namespace) -> str:
+    """Seal the pre-sign canonical source decision from full maintenance evidence."""
+
+    validate_protected_main_commit(args.source_main_sha)
+    freeze, _freeze_payload, freeze_sha, _freeze_sidecar_sha, _freeze_sidecar = (
+        validate_freeze_inputs(args)
+    )
+    (
+        height_receipt,
+        _prequarantine_public_max_height,
+        height_receipt_sha,
+        _height_receipt_payload,
+    ) = load_intrinsic_legacy_public_height_receipt(args, freeze_sha=freeze_sha)
+    (
+        evidence_bundle_sha,
+        _evidence_bundle_size,
+        evidence_bundle,
+        _evidence_bundle_payload,
+        _evidence_bundle_sidecar,
+    ) = validate_legacy_maintenance_evidence_bundle(
+        args,
+        freeze,
+        freeze_sha,
+        height_receipt,
+        height_receipt_sha,
+    )
+    (
+        boundary_sha,
+        _boundary_size,
+        boundary,
+        _boundary_payload,
+        _boundary_sidecar,
+    ) = validate_legacy_maintenance_boundary(
+        args,
+        freeze,
+        freeze_sha,
+        height_receipt,
+        height_receipt_sha,
+        evidence_bundle,
+        evidence_bundle_sha,
+    )
+    canonical_source, selection = select_canonical_source(None, evidence_bundle, None)
+    source_height = canonical_source["source_height"]
+    observed_cutoff_height = boundary["observed_cutoff_height"]
+    reopening_floor_height = boundary["legacy_public_max_height"]
+    if (
+        source_height < TRUSTED_CHECKPOINT_MIN_HEIGHT
+        or observed_cutoff_height < source_height
+        or reopening_floor_height
+        != observed_cutoff_height + rollout.LEGACY_CONTINUITY_SAFETY_MARGIN
+    ):
+        fail("pre-sign source selection violates H<=C and F=C+128")
+    selected_rows = [
+        row
+        for row in evidence_bundle["nodes"]
+        if row.get("node") == canonical_source["node"]
+    ]
+    if len(selected_rows) != 1:
+        fail("pre-sign source selection does not identify one captured node")
+    persisted_wrapper = selected_rows[0]["persisted_head"]
+    pair = persisted_source_pair(
+        persisted_wrapper["value"], "pre-sign selected source pair"
+    )
+    receipt = {
+        "schema": "arc.recovery.canonical-source-preselection.v1",
+        "source_main_commit": args.source_main_sha,
+        "freeze_plan_sha256": freeze_sha,
+        "legacy_maintenance_evidence_bundle_sha256": evidence_bundle_sha,
+        "legacy_maintenance_boundary_sha256": boundary_sha,
+        "source_height": source_height,
+        "transition_height": source_height + 1,
+        "source_block_hash": canonical_source["source_block_hash"],
+        "source_state_root": canonical_source["source_state_root"],
+        "source_consensus_round": canonical_source["source_consensus_round"],
+        "observed_cutoff_height": observed_cutoff_height,
+        "reopening_floor_height": reopening_floor_height,
+        "selected_source_pair": {
+            "node": canonical_source["node"],
+            "persisted_head_schema": persisted_wrapper["value"]["schema"],
+            "persisted_head_sha256": persisted_wrapper["sha256"],
+            "state_wal": pair["state_wal"],
+            "snapshot": pair["snapshot"],
+        },
+        "canonical_source": canonical_source,
+        "canonical_source_selection": selection,
+    }
+    return create_private_seal(args.output, receipt)
+
+
+def validate_source_preselection(
+    path: Path,
+    *,
+    source_main_sha: str,
+    freeze_sha: str,
+    evidence_bundle_sha: str,
+    boundary_sha: str,
+    evidence_bundle: Mapping[str, Any],
+    canonical_source: Mapping[str, Any],
+    canonical_source_selection: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    value, _payload, digest = load_canonical_json(
+        path,
+        label="canonical-source preselection",
+        maximum_bytes=4 * 1024 * 1024,
+        exact_mode=0o400,
+        require_read_only=True,
+    )
+    sidecar, _details = read_secure(
+        path.with_name(path.name + ".sha256"),
+        label="canonical-source preselection checksum",
+        maximum_bytes=512,
+        exact_mode=0o400,
+        require_read_only=True,
+    )
+    if sidecar != f"{digest}  {path.name}\n".encode("ascii"):
+        fail("canonical-source preselection checksum differs")
+    value = require_exact_object(
+        value,
+        {
+            "schema", "source_main_commit", "freeze_plan_sha256",
+            "legacy_maintenance_evidence_bundle_sha256",
+            "legacy_maintenance_boundary_sha256", "source_height",
+            "transition_height", "source_block_hash", "source_state_root",
+            "source_consensus_round", "observed_cutoff_height",
+            "reopening_floor_height", "selected_source_pair",
+            "canonical_source", "canonical_source_selection",
+        },
+        "canonical-source preselection",
+    )
+    expected_scalars = {
+        "schema": "arc.recovery.canonical-source-preselection.v1",
+        "source_main_commit": source_main_sha,
+        "freeze_plan_sha256": freeze_sha,
+        "legacy_maintenance_evidence_bundle_sha256": evidence_bundle_sha,
+        "legacy_maintenance_boundary_sha256": boundary_sha,
+        "source_height": canonical_source["source_height"],
+        "transition_height": canonical_source["source_height"] + 1,
+        "source_block_hash": canonical_source["source_block_hash"],
+        "source_state_root": canonical_source["source_state_root"],
+        "source_consensus_round": canonical_source["source_consensus_round"],
+    }
+    if any(value.get(field) != expected for field, expected in expected_scalars.items()):
+        fail("canonical-source preselection differs from the revalidated capture")
+    if (
+        value.get("canonical_source") != canonical_source
+        or value.get("canonical_source_selection") != canonical_source_selection
+    ):
+        fail("canonical-source preselection proof differs from fresh selection")
+    pair = require_exact_object(
+        value.get("selected_source_pair"),
+        {"node", "persisted_head_schema", "persisted_head_sha256", "state_wal", "snapshot"},
+        "canonical-source preselection selected pair",
+    )
+    if (
+        pair.get("node") != canonical_source["node"]
+        or pair.get("persisted_head_sha256")
+        != canonical_source["persisted_head_sha256"]
+    ):
+        fail("canonical-source preselection selected pair differs")
+    selected_evidence = [
+        row
+        for row in evidence_bundle.get("nodes", [])
+        if isinstance(row, dict) and row.get("node") == canonical_source["node"]
+    ]
+    if len(selected_evidence) != 1:
+        fail("canonical-source preselection selected receipt is ambiguous")
+    persisted_wrapper = selected_evidence[0].get("persisted_head")
+    if not isinstance(persisted_wrapper, dict) or not isinstance(
+        persisted_wrapper.get("value"), dict
+    ):
+        fail("canonical-source preselection selected receipt is missing")
+    expected_pair = persisted_source_pair(
+        persisted_wrapper["value"], "canonical-source preselection fresh selected pair"
+    )
+    if (
+        pair.get("persisted_head_schema") != persisted_wrapper["value"].get("schema")
+        or pair.get("persisted_head_sha256") != persisted_wrapper.get("sha256")
+    ):
+        fail("canonical-source preselection selected receipt identity differs")
+    for field in ("state_wal", "snapshot"):
+        item = require_exact_object(
+            pair.get(field), {"sha256", "size"}, f"canonical-source {field}"
+        )
+        require_hash(item.get("sha256"), f"canonical-source {field} hash")
+        require_uint(item.get("size"), f"canonical-source {field} size", positive=True)
+    if (
+        pair["state_wal"] != expected_pair["state_wal"]
+        or pair["snapshot"] != expected_pair["snapshot"]
+        or pair["state_wal"]["sha256"] != canonical_source["wal_sha256"]
+        or pair["snapshot"]["sha256"] != canonical_source["snapshot_sha256"]
+    ):
+        fail("canonical-source preselection pair roots differ")
+    return value, digest
+
+
+def inspect_trusted_anchor(
+    args: argparse.Namespace,
+    canonical_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replay and seal the historical anchor independently of selected H."""
+
+    binary_sha, _binary_size = hash_secure(
+        args.binary, "trusted-anchor inspector binary", executable=True
+    )
+    genesis_sha, _genesis_size = hash_secure(args.genesis, "trusted-anchor genesis")
+    legacy_sha, _legacy_size = hash_secure(
+        args.legacy_validator_set, "trusted-anchor legacy validator set"
+    )
+    observed = run_exact_binary(
+        args.binary,
+        [
+            "recovery",
+            "inspect-legacy-block",
+            "--data-dir",
+            os.fspath(args.source_wal.parent),
+            "--snapshot",
+            os.fspath(args.source_snapshot),
+            "--genesis",
+            os.fspath(args.genesis),
+            "--legacy-validator-set",
+            os.fspath(args.legacy_validator_set),
+            "--height",
+            str(TRUSTED_CHECKPOINT_MIN_HEIGHT),
+            "--expected-state-wal-sha256",
+            canonical_source["wal_sha256"],
+            "--expected-snapshot-sha256",
+            canonical_source["snapshot_sha256"],
+            "--expected-genesis-sha256",
+            genesis_sha,
+            "--expected-legacy-validator-set-sha256",
+            legacy_sha,
+            "--allow-unbound-legacy-wal",
+        ],
+        "trusted-anchor legacy block inspection",
+        timeout=3600,
+    )
+    expected_fields = {"schema", "height", "block_hash", "state_root", "input_roots"}
+    if set(observed) != expected_fields:
+        fail("trusted-anchor inspection fields differ")
+    roots = require_exact_object(
+        observed["input_roots"],
+        {"data_dir", "state_wal", "snapshot", "genesis", "legacy_validator_set"},
+        "trusted-anchor inspection input roots",
+    )
+    expected_roots = {
+        "state_wal": canonical_source["wal_sha256"],
+        "snapshot": canonical_source["snapshot_sha256"],
+        "genesis": genesis_sha,
+        "legacy_validator_set": legacy_sha,
+    }
+    if any(
+        not isinstance(roots[name], dict) or roots[name].get("sha256") != expected
+        for name, expected in expected_roots.items()
+    ):
+        fail("trusted-anchor inspection input hashes differ from the selected pair")
+    if (
+        observed["schema"] != "arc.recovery.legacy-block-inspection.v1"
+        or observed["height"] != TRUSTED_CHECKPOINT_MIN_HEIGHT
+        or observed["block_hash"].removeprefix("0x")
+        != TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH
+        or observed["state_root"].removeprefix("0x")
+        != TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT
+    ):
+        fail("trusted-anchor inspection does not reproduce block 137145")
+    return {
+        "schema": "arc.recovery.trusted-anchor-proof.v1",
+        "height": TRUSTED_CHECKPOINT_MIN_HEIGHT,
+        "block_hash": TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH,
+        "state_root": TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT,
+        "inspection_sha256": sha256_bytes(canonical_bytes(observed)),
+        "inspector_binary_sha256": binary_sha,
+        "source_snapshot_sha256": canonical_source["snapshot_sha256"],
+        "source_wal_sha256": canonical_source["wal_sha256"],
+        "genesis_sha256": genesis_sha,
+        "legacy_validator_set_sha256": legacy_sha,
+    }
 
 
 def reproduce_checkpoint(args: argparse.Namespace, inspected: dict[str, Any]) -> None:
@@ -5472,6 +6260,9 @@ def chain_from_checkpoint(
     boundary_sha: str,
     evidence_bundle_sha: str,
     late_fork_source_set_sha: str,
+    canonical_source: Mapping[str, Any],
+    canonical_source_selection: Mapping[str, Any],
+    trusted_anchor: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         "chain_id": inspected["chain_id"],
@@ -5480,6 +6271,9 @@ def chain_from_checkpoint(
         "recovery_epoch": inspected["recovery_epoch"],
         "validator_set_id": inspected["validator_set_id"],
         "source_height": inspected["source_height"],
+        "canonical_source": copy.deepcopy(canonical_source),
+        "canonical_source_selection": copy.deepcopy(canonical_source_selection),
+        "trusted_anchor": copy.deepcopy(trusted_anchor),
         "legacy_maintenance_evidence_bundle_sha256": evidence_bundle_sha,
         "legacy_maintenance_boundary_sha256": boundary_sha,
         "legacy_late_fork_source_set_sha256": late_fork_source_set_sha,
@@ -5766,12 +6560,51 @@ def prearchive(args: argparse.Namespace) -> str:
     if metadata_sha != hash_secure(args.build_metadata, "pre-tag build metadata")[0]:
         fail("pre-tag build metadata changed after validation")
     inspected = inspect_signed_checkpoint(args)
-    if prequarantine_public_max_height < inspected["source_height"]:
-        fail("legacy public-height receipt is below the selected checkpoint height")
-    if maintenance_boundary["observed_cutoff_height"] < prequarantine_public_max_height:
-        fail("legacy maintenance cutoff is below a pre-quarantine public observation")
-    if genesis_info["activation_height"] != inspected["transition_height"]:
-        fail("genesis community reward activation is not the checkpoint H+1 transition")
+    source_height = inspected["source_height"]
+    transition_height = inspected["transition_height"]
+    if source_height < TRUSTED_CHECKPOINT_MIN_HEIGHT:
+        fail("signed checkpoint source height is below trusted anchor 137145")
+    if transition_height != source_height + 1:
+        fail("signed checkpoint transition height is not capture-derived H+1")
+    if (
+        maintenance_boundary["observed_cutoff_height"]
+        < source_height
+        or maintenance_boundary["legacy_public_max_height"]
+        != maintenance_boundary["observed_cutoff_height"]
+        + rollout.LEGACY_CONTINUITY_SAFETY_MARGIN
+    ):
+        fail(
+            "legacy maintenance boundary is below capture-derived checkpoint H "
+            "or does not bind reopening floor F=cutoff+128"
+        )
+    if (
+        genesis_info["activation_height"]
+        != inspected["community_rewards_v1_activation_height"]
+        or genesis_info["activation_height"] > transition_height
+    ):
+        fail("genesis community reward activation differs from or follows after H+1")
+
+    canonical_source, canonical_source_selection = select_canonical_source(
+        args, maintenance_evidence_bundle, inspected
+    )
+    source_preselection, source_preselection_sha = validate_source_preselection(
+        args.canonical_source_preselection,
+        source_main_sha=args.source_main_sha,
+        freeze_sha=freeze_sha,
+        evidence_bundle_sha=evidence_bundle_sha,
+        boundary_sha=boundary_sha,
+        evidence_bundle=maintenance_evidence_bundle,
+        canonical_source=canonical_source,
+        canonical_source_selection=canonical_source_selection,
+    )
+    if (
+        source_preselection["observed_cutoff_height"]
+        != maintenance_boundary["observed_cutoff_height"]
+        or source_preselection["reopening_floor_height"]
+        != maintenance_boundary["legacy_public_max_height"]
+    ):
+        fail("canonical-source preselection differs from the maintenance boundary")
+    trusted_anchor = inspect_trusted_anchor(args, canonical_source)
     reproduce_checkpoint(args, inspected)
 
     artifacts = {
@@ -5809,6 +6642,16 @@ def prearchive(args: argparse.Namespace) -> str:
                 args.legacy_maintenance_evidence_bundle.name + ".sha256"
             ),
             "legacy maintenance evidence bundle sidecar",
+        ),
+        "canonical_source_preselection": {
+            "path": os.fspath(args.canonical_source_preselection),
+            "sha256": source_preselection_sha,
+        },
+        "canonical_source_preselection_sidecar": artifact(
+            args.canonical_source_preselection.with_name(
+                args.canonical_source_preselection.name + ".sha256"
+            ),
+            "canonical-source preselection sidecar",
         ),
         "legacy_maintenance_boundary": {
             "path": os.fspath(args.legacy_maintenance_boundary),
@@ -5949,6 +6792,9 @@ def prearchive(args: argparse.Namespace) -> str:
             boundary_sha,
             evidence_bundle_sha,
             late_fork_source_set_sha,
+            canonical_source,
+            canonical_source_selection,
+            trusted_anchor,
         ),
         "artifacts": artifacts,
         "checks": {
@@ -6751,6 +7597,16 @@ def validate_archive_evidence(
             "legacy_maintenance_evidence_bundle_sidecar",
             "legacy-maintenance-evidence-bundle.json.sha256",
         ),
+        "canonical-source-preselection.json": _expected_artifact_object(
+            prearchive,
+            "canonical_source_preselection",
+            "canonical-source-preselection.json",
+        ),
+        "canonical-source-preselection.json.sha256": _expected_artifact_object(
+            prearchive,
+            "canonical_source_preselection_sidecar",
+            "canonical-source-preselection.json.sha256",
+        ),
         "legacy-maintenance-boundary.json": _expected_artifact_object(
             prearchive,
             "legacy_maintenance_boundary",
@@ -7153,6 +8009,24 @@ def absolute_path(value: str) -> Path:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
+    select = commands.add_parser(
+        "select-source",
+        help="validate stopped fleet evidence and seal the canonical source before signing",
+    )
+    select.add_argument("--source-main-sha", required=True)
+    select.add_argument("--freeze-plan", required=True, type=absolute_path)
+    select.add_argument("--freeze-plan-sha256", required=True)
+    select.add_argument("--legacy-public-height-receipt", required=True, type=absolute_path)
+    select.add_argument(
+        "--legacy-maintenance-evidence-bundle", required=True, type=absolute_path
+    )
+    select.add_argument("--legacy-maintenance-boundary", required=True, type=absolute_path)
+    select.add_argument("--binary", required=True, type=absolute_path)
+    select.add_argument("--genesis", required=True, type=absolute_path)
+    select.add_argument("--validator-public-keys", required=True, type=absolute_path)
+    select.add_argument("--legacy-validator-set", required=True, type=absolute_path)
+    select.add_argument("--output", required=True, type=absolute_path)
+
     prepare = commands.add_parser("prearchive", help="derive and seal the prearchive rollout")
     prepare.add_argument("--source-main-sha", required=True)
     prepare.add_argument("--pretag-run-id", required=True, type=int)
@@ -7166,6 +8040,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--freeze-plan-sha256", required=True)
     prepare.add_argument("--legacy-public-height-receipt", required=True, type=absolute_path)
     prepare.add_argument("--legacy-maintenance-evidence-bundle", required=True, type=absolute_path)
+    prepare.add_argument("--canonical-source-preselection", required=True, type=absolute_path)
     prepare.add_argument("--legacy-maintenance-boundary", required=True, type=absolute_path)
     prepare.add_argument("--legacy-late-fork-source-set", required=True, type=absolute_path)
     prepare.add_argument("--offline-stop-evidence", required=True, type=absolute_path)
@@ -7229,7 +8104,21 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        if args.command == "prearchive":
+        if args.command == "select-source":
+            digest = select_source(args)
+            print(
+                json.dumps(
+                    {
+                        "schema": "arc.recovery.production-manifest-build.v1",
+                        "phase": "select-source",
+                        "selection_sha256": digest,
+                        "output": os.fspath(args.output),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        elif args.command == "prearchive":
             digest = prearchive(args)
             print(
                 json.dumps(

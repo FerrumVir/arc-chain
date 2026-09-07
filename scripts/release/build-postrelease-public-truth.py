@@ -1974,7 +1974,9 @@ def validate_release(
     return published_at, dict(sorted(normalized.items()))
 
 
-def validate_network(config: dict[str, Any], source_sha: str) -> dict[str, Any]:
+def validate_network(
+    config: dict[str, Any], source_sha: str, manifest: Mapping[str, Any]
+) -> dict[str, Any]:
     exact_keys(
         config,
         {"schema", "state", "network", "checkpoint", "sources", "services", "notices"},
@@ -2004,18 +2006,36 @@ def validate_network(config: dict[str, Any], source_sha: str) -> dict[str, Any]:
     height = positive_int(checkpoint["height"], "checkpoint.height")
     recovery_height = positive_int(checkpoint["recoveryHeight"], "checkpoint.recoveryHeight")
     legacy_max = positive_int(checkpoint["legacyPublicMaxHeight"], "checkpoint.legacyPublicMaxHeight")
-    if height != 137_145 or recovery_height != height + 1 or legacy_max < recovery_height:
-        fail("frontend checkpoint does not preserve the reviewed H/H+1 recovery boundary")
+    if height < 137_145 or recovery_height != height + 1:
+        fail(
+            "frontend checkpoint does not preserve capture-derived H/H+1 "
+            "above trusted anchor 137145"
+        )
     if (
         not isinstance(checkpoint["protocolVersion"], str)
         or PROTOCOL_VERSION_RE.fullmatch(checkpoint["protocolVersion"]) is None
     ):
         fail("frontend checkpoint is not protocol v3")
+    chain = manifest.get("chain")
+    canonical_source = chain.get("canonical_source") if isinstance(chain, dict) else None
+    canonical_node = (
+        canonical_source.get("node") if isinstance(canonical_source, dict) else None
+    )
+    if canonical_node not in {name for name, _host in PRODUCTION_FLEET}:
+        fail("rollout manifest omits its captured canonical source node")
+    source_id = f"v3-{canonical_node}"
     if (
         checkpoint["recoveryEpoch"] != RECOVERY_EPOCH
         or checkpoint["validatorSetId"] != VALIDATOR_SET_ID
-        or checkpoint["legacySourceId"] != "v3-nyc"
-        or checkpoint["v3SourceId"] != "v3-nyc"
+        or checkpoint["legacySourceId"] != source_id
+        or checkpoint["v3SourceId"] != source_id
+        or height != chain.get("source_height")
+        or recovery_height != chain.get("transition_height")
+        or legacy_max != chain.get("legacy_public_max_height")
+        or chain_hash(checkpoint["blockHash"], "checkpoint.blockHash")
+        != chain_hash(chain.get("source_block_hash"), "manifest source block hash")
+        or chain_hash(checkpoint["stateRoot"], "checkpoint.stateRoot")
+        != chain_hash(chain.get("source_state_root"), "manifest source state root")
     ):
         fail("frontend checkpoint differs from the reviewed recovery identity")
     for field in (
@@ -2151,7 +2171,8 @@ def validate_network(config: dict[str, Any], source_sha: str) -> dict[str, Any]:
         or interlock.get("maxStalenessSeconds") != 90
         or isinstance(interlock.get("observedCutoffHeight"), bool)
         or not isinstance(interlock.get("observedCutoffHeight"), int)
-        or interlock["observedCutoffHeight"] < 1
+        or interlock["observedCutoffHeight"] < height
+        or legacy_max != interlock["observedCutoffHeight"] + 128
     ):
         fail("frontend live gate does not require all six validators")
     for field in ("sourceSetSha256", "boundarySha256", "toolSha256"):
@@ -2900,6 +2921,9 @@ def render_readme_block(
 > All six protocol-v3 validators serve the retained canonical chain through
 > block **{checkpoint['height']:,}**, continue at **{checkpoint['recoveryHeight']:,}**, and are
 > required to agree before the public console reports the network as healthy.
+> Checkpoint height H is distinct from maintenance reopening floor
+> F=**{checkpoint['legacyPublicMaxHeight']:,}**; every v3 validator must advance
+> strictly above F before canonical public surfaces reopen.
 > The six prior public histories remain available as explicit, immutable,
 > read-only noncanonical fork views; no legacy block was erased or renumbered.
 > The recovered network bytes were first accepted on Pages from verified config
@@ -3021,7 +3045,7 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
 
         pages, pages_hashes = validate_pages(args, config_raw)
         frontend_sha = pages["acceptedConfigCommit"]
-        checkpoint = validate_network(config, source_sha)
+        checkpoint = validate_network(config, source_sha, manifest)
         worker, reward_base, receipt_count = validate_reward(
             reward, manifest, source_sha
         )

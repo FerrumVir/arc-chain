@@ -77,7 +77,7 @@ Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
+ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -87,7 +87,7 @@ bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 
 The pinned installer SHA-256 is
-`4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151`.
+`0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242`.
 
 The protected source-tag installer resolves one exact semantic-versioned
 release and verifies the owner signature on `SHA256SUMS` before trusting any

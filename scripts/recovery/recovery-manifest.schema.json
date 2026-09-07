@@ -23,6 +23,9 @@
           "chain": {
             "required": [
               "legacy_maintenance_evidence_bundle_sha256",
+              "canonical_source",
+              "canonical_source_selection",
+              "trusted_anchor",
               "legacy_maintenance_boundary_sha256",
               "legacy_late_fork_source_set_sha256",
               "legacy_observed_cutoff_height",
@@ -46,6 +49,7 @@
               "pretag_raw_desktop_windows_x86_64", "genesis",
               "validator_public_keys", "legacy_public_height_receipt",
               "legacy_maintenance_evidence_bundle", "legacy_maintenance_evidence_bundle_sidecar",
+              "canonical_source_preselection", "canonical_source_preselection_sidecar",
               "legacy_maintenance_boundary", "legacy_maintenance_boundary_sidecar",
               "legacy_late_fork_source_set", "legacy_late_fork_source_set_sidecar",
               "legacy_late_fork_interlock_tool",
@@ -252,6 +256,146 @@
         "recovery_epoch": { "type": "integer", "minimum": 1 },
         "validator_set_id": { "type": "integer", "minimum": 1 },
         "source_height": { "type": "integer", "minimum": 0 },
+        "canonical_source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "node",
+            "source_height",
+            "source_block_hash",
+            "source_state_root",
+            "source_consensus_round",
+            "snapshot_sha256",
+            "wal_sha256",
+            "persisted_head_sha256",
+            "legacy_dag_round_inspection_sha256",
+            "legacy_dag_wal_namespace_sha256"
+          ],
+          "properties": {
+            "node": { "enum": ["nyc", "lax", "ams", "lhr", "nrt", "sgp"] },
+            "source_height": { "type": "integer", "minimum": 137145 },
+            "source_block_hash": { "$ref": "#/$defs/hash" },
+            "source_state_root": { "$ref": "#/$defs/hash" },
+            "source_consensus_round": { "type": "integer", "minimum": 1 },
+            "snapshot_sha256": { "$ref": "#/$defs/hash" },
+            "wal_sha256": { "$ref": "#/$defs/hash" },
+            "persisted_head_sha256": { "$ref": "#/$defs/hash" },
+            "legacy_dag_round_inspection_sha256": { "$ref": "#/$defs/hash" },
+            "legacy_dag_wal_namespace_sha256": { "$ref": "#/$defs/hash" }
+          }
+        },
+        "canonical_source_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value", "sha256"],
+          "properties": {
+            "sha256": { "$ref": "#/$defs/bareHash" },
+            "value": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "schema", "selection_rule", "equivalent_maximal_pair_rule",
+                "trusted_anchor", "candidates", "selected"
+              ],
+              "properties": {
+                "schema": { "const": "arc.recovery.canonical-source-selection.v1" },
+                "selection_rule": { "const": "highest-valid-anchor-descendant-tuple" },
+                "equivalent_maximal_pair_rule": {
+                  "const": "first-production-fleet-node-with-matching-source-pair"
+                },
+                "trusted_anchor": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["height", "block_hash", "state_root"],
+                  "properties": {
+                    "height": { "const": 137145 },
+                    "block_hash": {
+                      "const": "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+                    },
+                    "state_root": {
+                      "const": "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+                    }
+                  }
+                },
+                "candidates": {
+                  "type": "array",
+                  "minItems": 6,
+                  "maxItems": 6,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "node", "persisted_head_schema", "persisted_head_sha256",
+                      "source_height", "source_block_hash", "source_state_root",
+                      "classification", "anchor_inspection_sha256"
+                    ],
+                    "properties": {
+                      "node": { "enum": ["nyc", "lax", "ams", "lhr", "nrt", "sgp"] },
+                      "persisted_head_schema": { "type": "string", "minLength": 1 },
+                      "persisted_head_sha256": { "$ref": "#/$defs/bareHash" },
+                      "source_height": { "type": "integer", "minimum": 0 },
+                      "source_block_hash": { "$ref": "#/$defs/bareHash" },
+                      "source_state_root": { "$ref": "#/$defs/bareHash" },
+                      "classification": {
+                        "enum": [
+                          "below_trusted_anchor", "valid_anchor_descendant", "conflicting_anchor"
+                        ]
+                      },
+                      "anchor_inspection_sha256": { "$ref": "#/$defs/bareHash" }
+                    }
+                  }
+                },
+                "selected": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "node", "source_height", "source_block_hash", "source_state_root",
+                    "persisted_head_sha256"
+                  ],
+                  "properties": {
+                    "node": { "enum": ["nyc", "lax", "ams", "lhr", "nrt", "sgp"] },
+                    "source_height": { "type": "integer", "minimum": 137145 },
+                    "source_block_hash": { "$ref": "#/$defs/bareHash" },
+                    "source_state_root": { "$ref": "#/$defs/bareHash" },
+                    "persisted_head_sha256": { "$ref": "#/$defs/bareHash" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "trusted_anchor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema",
+            "height",
+            "block_hash",
+            "state_root",
+            "inspection_sha256",
+            "inspector_binary_sha256",
+            "source_snapshot_sha256",
+            "source_wal_sha256",
+            "genesis_sha256",
+            "legacy_validator_set_sha256"
+          ],
+          "properties": {
+            "schema": { "const": "arc.recovery.trusted-anchor-proof.v1" },
+            "height": { "const": 137145 },
+            "block_hash": {
+              "const": "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+            },
+            "state_root": {
+              "const": "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+            },
+            "inspection_sha256": { "$ref": "#/$defs/hash" },
+            "inspector_binary_sha256": { "$ref": "#/$defs/hash" },
+            "source_snapshot_sha256": { "$ref": "#/$defs/hash" },
+            "source_wal_sha256": { "$ref": "#/$defs/hash" },
+            "genesis_sha256": { "$ref": "#/$defs/hash" },
+            "legacy_validator_set_sha256": { "$ref": "#/$defs/hash" }
+          }
+        },
         "legacy_maintenance_evidence_bundle_sha256": { "$ref": "#/$defs/hash" },
         "legacy_maintenance_boundary_sha256": { "$ref": "#/$defs/hash" },
         "legacy_late_fork_source_set_sha256": { "$ref": "#/$defs/hash" },
@@ -330,6 +474,8 @@
         "legacy_public_height_receipt": { "$ref": "#/$defs/artifact" },
         "legacy_maintenance_evidence_bundle": { "$ref": "#/$defs/artifact" },
         "legacy_maintenance_evidence_bundle_sidecar": { "$ref": "#/$defs/artifact" },
+        "canonical_source_preselection": { "$ref": "#/$defs/artifact" },
+        "canonical_source_preselection_sidecar": { "$ref": "#/$defs/artifact" },
         "legacy_maintenance_boundary": { "$ref": "#/$defs/artifact" },
         "legacy_maintenance_boundary_sidecar": { "$ref": "#/$defs/artifact" },
         "legacy_late_fork_source_set": { "$ref": "#/$defs/artifact" },
@@ -467,6 +613,7 @@
   },
   "$defs": {
     "hash": { "type": "string", "pattern": "^(0x)?[0-9a-f]{64}$" },
+    "bareHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "protectedPretagResponse": {
       "type": "object",
       "additionalProperties": false,

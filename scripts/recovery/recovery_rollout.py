@@ -393,6 +393,89 @@ def require_keys(value: Any, field: str, required: Iterable[str], optional: Iter
     return value
 
 
+def validate_embedded_legacy_dag_round(value: Any, label: str) -> dict[str, Any]:
+    """Validate the self-contained durable DAG cursor proof."""
+
+    proof = require_keys(
+        value,
+        label,
+        ("source_consensus_round", "namespace_sha256", "inspection", "inspection_sha256"),
+    )
+    source_round = required_int(
+        proof["source_consensus_round"], f"{label} source consensus round", minimum=1
+    )
+    namespace_sha = bare_hash(proof["namespace_sha256"], f"{label} namespace root")
+    inspection_sha = bare_hash(proof["inspection_sha256"], f"{label} inspection root")
+    inspection = require_keys(
+        proof["inspection"],
+        f"{label} inspection",
+        (
+            "schema", "status", "source_consensus_round", "first_segment",
+            "last_segment", "segment_count", "inspected_first_segment",
+            "inspected_segment_count", "inspected_entry_count", "namespace_sha256",
+            "namespace", "read_only",
+        ),
+    )
+    if (
+        inspection["schema"] != "arc.recovery.legacy-dag-round-inspection.v1"
+        or inspection["status"] != "VERIFIED_STOPPED_DAG_CURSOR"
+        or inspection["read_only"] is not True
+        or inspection["source_consensus_round"] != source_round
+        or inspection["namespace_sha256"] != namespace_sha
+        or sha256_bytes(canonical_bytes(inspection)) != inspection_sha
+    ):
+        fail(f"{label} inspection identity differs")
+    first = required_int(inspection["first_segment"], f"{label} first segment")
+    last = required_int(inspection["last_segment"], f"{label} last segment")
+    segment_count = required_int(
+        inspection["segment_count"], f"{label} segment count", minimum=1
+    )
+    inspected_first = required_int(
+        inspection["inspected_first_segment"], f"{label} inspected first segment"
+    )
+    inspected_count = required_int(
+        inspection["inspected_segment_count"], f"{label} inspected segment count", minimum=1
+    )
+    required_int(
+        inspection["inspected_entry_count"], f"{label} inspected entry count", minimum=1
+    )
+    if (
+        last < first
+        or segment_count != last - first + 1
+        or inspected_count != min(3, segment_count)
+        or inspected_first != last - inspected_count + 1
+    ):
+        fail(f"{label} segment arithmetic differs")
+    namespace = require_keys(
+        inspection["namespace"],
+        f"{label} namespace",
+        ("schema", "segment_names", "inspected_tail"),
+    )
+    expected_names = [f"wal-{index:08d}.bin" for index in range(first, last + 1)]
+    tail = namespace["inspected_tail"]
+    if (
+        namespace["schema"] != "arc.recovery.legacy-dag-wal-namespace.v1"
+        or namespace["segment_names"] != expected_names
+        or not isinstance(tail, list)
+        or len(tail) != inspected_count
+    ):
+        fail(f"{label} namespace differs")
+    for index, row in enumerate(tail):
+        tail_row = require_keys(
+            row, f"{label} inspected tail {index}", ("name", "sha256", "size")
+        )
+        if tail_row["name"] != expected_names[-inspected_count + index]:
+            fail(f"{label} inspected tail order differs")
+        bare_hash(tail_row["sha256"], f"{label} inspected tail {index} root")
+        required_int(tail_row["size"], f"{label} inspected tail {index} size")
+    namespace_bytes = json.dumps(
+        namespace, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if sha256_bytes(namespace_bytes) != namespace_sha:
+        fail(f"{label} namespace root is not reproducible")
+    return proof
+
+
 def validate_live_observation_selection(
     value: Any,
     *,
@@ -1327,6 +1410,9 @@ def validate_manifest(
         "approved_checkpoint_manifest_hash",
     )
     production_legacy_fields = (
+        "canonical_source",
+        "canonical_source_selection",
+        "trusted_anchor",
         "legacy_maintenance_evidence_bundle_sha256",
         "legacy_maintenance_boundary_sha256",
         "legacy_late_fork_source_set_sha256",
@@ -1357,6 +1443,252 @@ def validate_manifest(
     if legacy_public_max_height < source_height:
         fail("manifest.chain.legacy_public_max_height must be at least source_height")
     if mode == "production":
+        if source_height < 137_145:
+            fail("manifest.chain.source_height predates trusted anchor 137145")
+        canonical_source = require_keys(
+            chain["canonical_source"],
+            "manifest.chain.canonical_source",
+            (
+                "node",
+                "source_height",
+                "source_block_hash",
+                "source_state_root",
+                "source_consensus_round",
+                "snapshot_sha256",
+                "wal_sha256",
+                "persisted_head_sha256",
+                "legacy_dag_round_inspection_sha256",
+                "legacy_dag_wal_namespace_sha256",
+            ),
+        )
+        if canonical_source["node"] not in {name for name, _host in PRODUCTION_FLEET}:
+            fail("manifest.chain.canonical_source.node is not a production validator")
+        for field in (
+            "source_height",
+            "source_consensus_round",
+        ):
+            required_int(
+                canonical_source[field], f"manifest.chain.canonical_source.{field}"
+            )
+        for field in (
+            "source_block_hash",
+            "source_state_root",
+            "snapshot_sha256",
+            "wal_sha256",
+            "persisted_head_sha256",
+            "legacy_dag_round_inspection_sha256",
+            "legacy_dag_wal_namespace_sha256",
+        ):
+            bare_hash(
+                canonical_source[field], f"manifest.chain.canonical_source.{field}"
+            )
+        if (
+            canonical_source["source_height"] != chain["source_height"]
+            or canonical_source["source_consensus_round"]
+            != chain["source_consensus_round"]
+            or bare_hash(
+                canonical_source["source_block_hash"],
+                "manifest.chain.canonical_source.source_block_hash",
+            )
+            != bare_hash(chain["source_block_hash"], "manifest.chain.source_block_hash")
+            or bare_hash(
+                canonical_source["source_state_root"],
+                "manifest.chain.canonical_source.source_state_root",
+            )
+            != bare_hash(chain["source_state_root"], "manifest.chain.source_state_root")
+        ):
+            fail("manifest.chain.canonical_source differs from checkpoint source identity")
+
+        selection_wrapper = require_keys(
+            chain["canonical_source_selection"],
+            "manifest.chain.canonical_source_selection",
+            ("value", "sha256"),
+        )
+        selection_sha = bare_hash(
+            selection_wrapper["sha256"],
+            "manifest.chain.canonical_source_selection.sha256",
+        )
+        selection = require_keys(
+            selection_wrapper["value"],
+            "manifest.chain.canonical_source_selection.value",
+            (
+                "schema",
+                "selection_rule",
+                "equivalent_maximal_pair_rule",
+                "trusted_anchor",
+                "candidates",
+                "selected",
+            ),
+        )
+        if sha256_bytes(canonical_bytes(selection)) != selection_sha:
+            fail("manifest canonical-source selection wrapper is not reproducible")
+        selection_anchor = require_keys(
+            selection["trusted_anchor"],
+            "manifest canonical-source selection trusted anchor",
+            ("height", "block_hash", "state_root"),
+        )
+        if (
+            selection["schema"] != "arc.recovery.canonical-source-selection.v1"
+            or selection["selection_rule"]
+            != "highest-valid-anchor-descendant-tuple"
+            or selection["equivalent_maximal_pair_rule"]
+            != "first-production-fleet-node-with-matching-source-pair"
+            or selection_anchor
+            != {
+                "height": 137_145,
+                "block_hash": "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+                "state_root": "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+            }
+        ):
+            fail("manifest canonical-source selection targets another trust policy")
+        candidates = selection["candidates"]
+        if not isinstance(candidates, list) or len(candidates) != len(PRODUCTION_FLEET):
+            fail("manifest canonical-source selection does not classify all six captures")
+        valid_candidates: list[dict[str, Any]] = []
+        for (expected_node, _host), raw_candidate in zip(
+            PRODUCTION_FLEET, candidates, strict=True
+        ):
+            candidate = require_keys(
+                raw_candidate,
+                f"manifest canonical-source candidate {expected_node}",
+                (
+                    "node",
+                    "persisted_head_schema",
+                    "persisted_head_sha256",
+                    "source_height",
+                    "source_block_hash",
+                    "source_state_root",
+                    "classification",
+                    "anchor_inspection_sha256",
+                ),
+            )
+            candidate_height = required_int(
+                candidate["source_height"],
+                f"manifest canonical-source candidate {expected_node} height",
+            )
+            if candidate["node"] != expected_node or not isinstance(
+                candidate["persisted_head_schema"], str
+            ):
+                fail("manifest canonical-source candidate identity/order differs")
+            for field in (
+                "persisted_head_sha256",
+                "source_block_hash",
+                "source_state_root",
+                "anchor_inspection_sha256",
+            ):
+                bare_hash(
+                    candidate[field],
+                    f"manifest canonical-source candidate {expected_node}.{field}",
+                )
+            classification = candidate["classification"]
+            if candidate_height < 137_145:
+                if classification != "below_trusted_anchor":
+                    fail("manifest below-anchor canonical-source candidate is misclassified")
+            elif classification not in {"valid_anchor_descendant", "conflicting_anchor"}:
+                fail("manifest canonical-source candidate lacks conclusive ancestry")
+            if classification == "valid_anchor_descendant":
+                valid_candidates.append(candidate)
+        if not valid_candidates:
+            fail("manifest canonical-source selection has no valid anchor descendant")
+        highest = max(candidate["source_height"] for candidate in valid_candidates)
+        maximal = [
+            candidate for candidate in valid_candidates
+            if candidate["source_height"] == highest
+        ]
+        maximal_tuples = {
+            (
+                bare_hash(
+                    candidate["source_block_hash"],
+                    "manifest maximal canonical-source candidate block hash",
+                ),
+                bare_hash(
+                    candidate["source_state_root"],
+                    "manifest maximal canonical-source candidate state root",
+                ),
+            )
+            for candidate in maximal
+        }
+        if len(maximal_tuples) != 1:
+            fail("manifest highest valid anchor descendants disagree on their tuple")
+        selected = require_keys(
+            selection["selected"],
+            "manifest canonical-source selection selected candidate",
+            (
+                "node",
+                "source_height",
+                "source_block_hash",
+                "source_state_root",
+                "persisted_head_sha256",
+            ),
+        )
+        canonical_selected = {
+            "node": canonical_source["node"],
+            "source_height": canonical_source["source_height"],
+            "source_block_hash": bare_hash(
+                canonical_source["source_block_hash"],
+                "manifest canonical source selected block hash",
+            ),
+            "source_state_root": bare_hash(
+                canonical_source["source_state_root"],
+                "manifest canonical source selected state root",
+            ),
+            "persisted_head_sha256": canonical_source["persisted_head_sha256"],
+        }
+        maximal_selected = [
+            {
+                field: candidate[field]
+                for field in (
+                    "node",
+                    "source_height",
+                    "source_block_hash",
+                    "source_state_root",
+                    "persisted_head_sha256",
+                )
+            }
+            for candidate in maximal
+        ]
+        if selected not in maximal_selected or selected != canonical_selected:
+            fail("manifest canonical source is not a highest valid descendant pair")
+
+        trusted_anchor = require_keys(
+            chain["trusted_anchor"],
+            "manifest.chain.trusted_anchor",
+            (
+                "schema",
+                "height",
+                "block_hash",
+                "state_root",
+                "inspection_sha256",
+                "inspector_binary_sha256",
+                "source_snapshot_sha256",
+                "source_wal_sha256",
+                "genesis_sha256",
+                "legacy_validator_set_sha256",
+            ),
+        )
+        if (
+            trusted_anchor["schema"] != "arc.recovery.trusted-anchor-proof.v1"
+            or trusted_anchor["height"] != 137_145
+            or trusted_anchor["block_hash"]
+            != "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+            or trusted_anchor["state_root"]
+            != "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+        ):
+            fail("manifest.chain.trusted_anchor differs from block 137145")
+        for field in (
+            "inspection_sha256",
+            "inspector_binary_sha256",
+            "source_snapshot_sha256",
+            "source_wal_sha256",
+            "genesis_sha256",
+            "legacy_validator_set_sha256",
+        ):
+            bare_hash(trusted_anchor[field], f"manifest.chain.trusted_anchor.{field}")
+        if (
+            trusted_anchor["source_snapshot_sha256"] != canonical_source["snapshot_sha256"]
+            or trusted_anchor["source_wal_sha256"] != canonical_source["wal_sha256"]
+        ):
+            fail("manifest.chain.trusted_anchor is not bound to canonical source inputs")
         bare_hash(
             chain["legacy_maintenance_evidence_bundle_sha256"],
             "manifest.chain.legacy_maintenance_evidence_bundle_sha256",
@@ -1373,6 +1705,8 @@ def validate_manifest(
             chain["legacy_observed_cutoff_height"],
             "manifest.chain.legacy_observed_cutoff_height",
         )
+        if observed_cutoff < source_height:
+            fail("manifest.chain legacy observed cutoff is below checkpoint source H")
         if chain["legacy_continuity_safety_margin"] != LEGACY_CONTINUITY_SAFETY_MARGIN:
             fail(
                 "manifest.chain.legacy_continuity_safety_margin must be exactly "
@@ -1429,6 +1763,8 @@ def validate_manifest(
                 "legacy_public_height_receipt",
                 "legacy_maintenance_evidence_bundle",
                 "legacy_maintenance_evidence_bundle_sidecar",
+                "canonical_source_preselection",
+                "canonical_source_preselection_sidecar",
                 "legacy_maintenance_boundary",
                 "legacy_maintenance_boundary_sidecar",
                 "legacy_late_fork_source_set",
@@ -1460,6 +1796,18 @@ def validate_manifest(
     for key in artifacts:
         validate_artifact(artifacts[key], f"manifest.artifacts.{key}")
     if mode == "production":
+        if (
+            canonical_source["snapshot_sha256"] != artifacts["source_snapshot"]["sha256"]
+            or canonical_source["wal_sha256"] != artifacts["source_wal"]["sha256"]
+            or trusted_anchor["inspector_binary_sha256"] != artifacts["binary"]["sha256"]
+            or trusted_anchor["source_snapshot_sha256"]
+            != artifacts["source_snapshot"]["sha256"]
+            or trusted_anchor["source_wal_sha256"] != artifacts["source_wal"]["sha256"]
+            or trusted_anchor["genesis_sha256"] != artifacts["genesis"]["sha256"]
+            or trusted_anchor["legacy_validator_set_sha256"]
+            != artifacts["legacy_validator_set"]["sha256"]
+        ):
+            fail("canonical source or trusted anchor differs from manifest artifacts")
         validate_protected_pretag_window_set(
             provenance["protected_pretag_artifact"], provenance, artifacts
         )
@@ -3116,6 +3464,10 @@ def verify_legacy_maintenance_stage_payloads(
             )
         if selected_source_head != persisted_head:
             fail(f"legacy maintenance {node} selected final source head differs")
+        validate_embedded_legacy_dag_round(
+            persisted_value.get("legacy_dag_round"),
+            f"legacy maintenance {node} DAG round proof",
+        )
         normalized_persisted = persisted_value.get("schema") \
             == "arc.recovery.persisted-legacy-head.v4"
         archived_required = ["path", "sha256", "size", "file_identity", "preserved_by"]
@@ -6541,8 +6893,21 @@ class RecoveryRollout:
             for node in self.validators
         ]
         sources.extend(self._legacy_archive_sources(archived_forks))
-        primary = sources[0]["id"]
         chain = self.chain
+        canonical_source = chain.get("canonical_source")
+        canonical_node = (
+            canonical_source.get("node") if isinstance(canonical_source, dict) else None
+        )
+        primary_matches = [
+            source
+            for source in sources
+            if source.get("id") == f"v3-{canonical_node}"
+            and source.get("kind") == "v3"
+            and source.get("enabled") is True
+        ]
+        if len(primary_matches) != 1:
+            fail("captured canonical source does not identify exactly one enabled v3 source")
+        primary = primary_matches[0]["id"]
         return {
             "schema": "arc.frontend.network.v1",
             "state": "recovered",

@@ -4017,6 +4017,45 @@ assert 'arc.recovery.shared-input-source.v1' in t
 PY
 )
 
+canonical_source_preselection_is_an_exact_shared_input() {
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+required_extractions = (
+    'canonical_source_preselection="$(manifest_field "$manifest" artifacts.canonical_source_preselection.path)"',
+    'canonical_source_preselection_sha="$(manifest_field "$manifest" artifacts.canonical_source_preselection.sha256)"',
+    'canonical_source_preselection_sidecar="$(manifest_field "$manifest" artifacts.canonical_source_preselection_sidecar.path)"',
+    'canonical_source_preselection_sidecar_sha="$(manifest_field "$manifest" artifacts.canonical_source_preselection_sidecar.sha256)"',
+)
+required_registrations = (
+    'register_shared_input "$canonical_source_preselection" "$canonical_source_preselection_sha" \\\n+        "$shared_root" canonical-source-preselection.json',
+    'register_shared_input "$canonical_source_preselection_sidecar" \\\n+        "$canonical_source_preselection_sidecar_sha" "$shared_root" \\\n+        canonical-source-preselection.json.sha256',
+)
+for fragment in (*required_extractions, *required_registrations):
+    assert text.count(fragment) == 1, fragment
+
+extraction_start = text.index(required_extractions[0])
+evidence = text.index(
+    'maintenance_evidence_bundle_sidecar="$(manifest_field "$manifest" artifacts.legacy_maintenance_evidence_bundle_sidecar.path)"'
+)
+boundary = text.index(
+    'maintenance_boundary="$(manifest_field "$manifest" artifacts.legacy_maintenance_boundary.path)"'
+)
+assert evidence < extraction_start < boundary
+
+registration_start = text.index(required_registrations[0])
+evidence_registration = text.index(
+    'register_shared_input "$maintenance_evidence_bundle_sidecar"'
+)
+boundary_registration = text.index(
+    'register_shared_input "$maintenance_boundary" "$maintenance_boundary_sha"'
+)
+assert evidence_registration < registration_start < boundary_registration
+PY
+}
+
 archive_scripts_are_lintable() {
     [ -x "$REPO_ROOT/scripts/recovery/normalize-legacy-wal.py" ] &&
         bash -n "$NODE_HELPER" "$ORCHESTRATOR" &&
@@ -4096,5 +4135,6 @@ run_test 'persisted-head truncated partials resume at every completed-at offset'
 run_test 'stateful fake nft/systemctl quarantine crash matrix is fail-closed' stateful_fake_nft_systemctl_quarantine_contract
 run_test 'quarantine retirement is exact, one-way, read-only on status, and crash-resumable' quarantine_retirement_is_one_way_resumable_and_exact
 run_test 'shared archive inputs stream without work-root materialization' shared_inputs_stream_without_work_root_materialization
+run_test 'canonical source preselection is an exact shared input' canonical_source_preselection_is_an_exact_shared_input
 run_test 'archive scripts pass syntax, lint, and embedded runtime suites' archive_scripts_are_lintable
 finish_tests

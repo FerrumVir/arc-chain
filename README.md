@@ -38,7 +38,7 @@ SSH/EC2/VPS operator can run:
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
+ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -49,7 +49,7 @@ bash install.sh --version 0.8.0
 ```
 
 Expected `install.sh` SHA-256 for this candidate:
-`4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151`.
+`0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
@@ -259,7 +259,7 @@ never used by the initial install command.
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
+ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -269,7 +269,7 @@ bash install.sh --version 0.8.0
 ```
 
 Expected `install.sh` SHA-256:
-`4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151`.
+`0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242`.
 
 The bootstrap installer comes from the owner-created protected source tag.
 It resolves an exact immutable, non-draft release, requires GitHub to identify
@@ -349,11 +349,13 @@ data lock nor its sibling namespace lock. The first upgrade must therefore stop
 the exact old node and updater and prove they are absent before any v0.8 node
 starts. A timeout is not a v0.7 drain: released v0.7 exits directly from its
 signal handler and has no admission-close/task-join barrier. The signed cutover
-policy therefore closes legacy admission at canonical height 137145, classifies
+policy therefore closes legacy admission at the capture-derived canonical
+height `H` (the highest strictly replayed captured descendant of the trusted
+137145 anchor), classifies
 unfinished legacy jobs as `expired_noncanonical_at_cutover`, and explicitly
 sets `legacy_exit_clean_claimed=false`. The installer authenticates that policy,
 the maintenance boundary, and the quorum recovery checkpoint; verifies all six
-exact v3 validators at height 137146 or later and the old claim/submit ports
+exact v3 validators at `H+1` or later and the old claim/submit ports
 closed; writes a create-only retirement intent; sends TERM but never KILL; and
 requires a matching offline-retirement receipt before v0.8 starts. The old
 `data/` tree remains untouched for forensics, while canonical block-level

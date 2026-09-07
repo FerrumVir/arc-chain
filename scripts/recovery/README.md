@@ -1556,58 +1556,150 @@ test "$("$caddy_binary" version | /usr/bin/awk '{print $1}')" = v2.11.4
 ```
 
 
-The sealed prearchive production manifest carries the independently preserved
-block-height-137145 source snapshot and its paired reference WAL as
-SHA-256-bound artifacts. Source consensus round `9774808` is distinct recovery
-checkpoint metadata; it is not the block height. Before export, prove the exact
-root-owned pair, its two metadata records, and the complete four-row
-`SHA256SUMS` mapping. Then build the unsigned candidate with the exact recovery
-exporter; successful export decodes the snapshot, recomputes its
-account/storage/code root, and requires it to equal the complete WAL
-block/checkpoint boundary:
+The sealed prearchive production manifest carries the capture-derived
+canonical source snapshot and its paired WAL as SHA-256-bound artifacts. The
+trusted block at height 137145 is only the minimum ancestry anchor. The
+canonical checkpoint height `H` is the highest strictly replayed captured
+descendant of that anchor; `T=H+1`. A taller conflicting fork can make the
+observed cutoff `C` greater than `H`, and public reopening is held until
+`F=C+128`. The final durable consensus round is derived from the selected
+node's stopped DAG-WAL proof; it is never copied from a moving `/stats` value.
+
+Seal that decision before downloading, exporting, approving, or signing a
+checkpoint. `select-source` revalidates the complete six-node evidence bundle,
+every embedded anchor inspection and DAG-WAL inspection, the generation ledger,
+and the standalone maintenance boundary. It emits a create-only mode-0400
+receipt plus sidecar. A retry may reuse only the exact sealed receipt.
 
 ```bash
-reference_pair=/secure/operator/reference-pair
-reference_source_consensus_round=9774808
-reference_block_height=137145
+canonical_source_preselection=/secure/operator/canonical-source-preselection.json
+test ! -e "$canonical_source_preselection" \
+  && test ! -L "$canonical_source_preselection"
+"$ARC_RECOVERY_PYTHON_PATH" -I \
+  scripts/recovery/build-production-manifest.py select-source \
+  --source-main-sha "$protected_main_sha" \
+  --freeze-plan /secure/operator/arc-freeze.lock.json \
+  --freeze-plan-sha256 "$freeze_sha256" \
+  --legacy-public-height-receipt "$legacy_public_height_receipt" \
+  --legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle" \
+  --legacy-maintenance-boundary "$legacy_maintenance_boundary" \
+  --binary "$arc_node_linux" \
+  --genesis "$operator_genesis" \
+  --validator-public-keys "$validator_public_keys" \
+  --legacy-validator-set "$legacy_validator_set" \
+  --output "$canonical_source_preselection"
+
+test -f "$canonical_source_preselection" \
+  && test ! -L "$canonical_source_preselection"
+test -f "$canonical_source_preselection.sha256" \
+  && test ! -L "$canonical_source_preselection.sha256"
+test "$(/usr/bin/stat --format='%U:%G:%a:%h' \
+  "$canonical_source_preselection")" = root:root:400:1
+test "$(/usr/bin/stat --format='%U:%G:%a:%h' \
+  "$canonical_source_preselection.sha256")" = root:root:400:1
+printf '%s  %s\n' "$(arc_sha256 "$canonical_source_preselection")" \
+  "${canonical_source_preselection##*/}" \
+  | /usr/bin/cmp --silent - "$canonical_source_preselection.sha256"
+trusted_anchor_block_hash=8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90
+trusted_anchor_state_root=d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d
+test "$(/usr/bin/jq -er '.canonical_source_selection.value.trusted_anchor.block_hash' \
+  "$canonical_source_preselection")" = "$trusted_anchor_block_hash"
+test "$(/usr/bin/jq -er '.canonical_source_selection.value.trusted_anchor.state_root' \
+  "$canonical_source_preselection")" = "$trusted_anchor_state_root"
+
+reference_source_node="$(/usr/bin/jq -er '.selected_source_pair.node' \
+  "$canonical_source_preselection")"
+reference_source_consensus_round="$(/usr/bin/jq -er \
+  '.source_consensus_round | select(type == "number" and . > 0)' \
+  "$canonical_source_preselection")"
+reference_block_height="$(/usr/bin/jq -er \
+  '.source_height | select(type == "number" and . >= 137145)' \
+  "$canonical_source_preselection")"
+transition_height="$(/usr/bin/jq -er '.transition_height' \
+  "$canonical_source_preselection")"
+source_block_hash="$(/usr/bin/jq -er '.source_block_hash' \
+  "$canonical_source_preselection")"
+source_state_root="$(/usr/bin/jq -er '.source_state_root' \
+  "$canonical_source_preselection")"
+observed_cutoff_height="$(/usr/bin/jq -er '.observed_cutoff_height' \
+  "$canonical_source_preselection")"
+reopening_floor_height="$(/usr/bin/jq -er '.reopening_floor_height' \
+  "$canonical_source_preselection")"
+test "$transition_height" -eq "$((reference_block_height + 1))"
+test "$reference_block_height" -le "$observed_cutoff_height"
+test "$reopening_floor_height" -eq "$((observed_cutoff_height + 128))"
+[[ "$source_block_hash" =~ ^[0-9a-f]{64}$ ]]
+[[ "$source_state_root" =~ ^[0-9a-f]{64}$ ]]
+
+reference_source_host=''
+case "$reference_source_node" in
+  nyc) reference_source_host=149.28.32.76 ;;
+  lax) reference_source_host=140.82.16.112 ;;
+  ams) reference_source_host=136.244.109.1 ;;
+  lhr) reference_source_host=104.238.171.11 ;;
+  nrt) reference_source_host=202.182.107.41 ;;
+  sgp) reference_source_host=149.28.153.31 ;;
+  *) printf 'unsupported selected source node: %s\n' "$reference_source_node" >&2; exit 1 ;;
+esac
+reference_remote_wal_path="$(
+  /usr/bin/jq -er --arg node "$reference_source_node" '
+    .nodes[] | select(.node == $node) | .persisted_head.value |
+    if (.schema == "arc.recovery.persisted-legacy-head.v3"
+        or .schema == "arc.recovery.persisted-legacy-head.v4")
+    then .state_wal_path else .source_inputs.fixed_state_wal.path end' \
+    "$legacy_maintenance_evidence_bundle"
+)"
+reference_remote_snapshot_path="$(
+  /usr/bin/jq -er --arg node "$reference_source_node" '
+    .nodes[] | select(.node == $node) | .persisted_head.value |
+    if (.schema == "arc.recovery.persisted-legacy-head.v3"
+        or .schema == "arc.recovery.persisted-legacy-head.v4")
+    then .snapshot_path else .source_inputs.fixed_snapshot.path end' \
+    "$legacy_maintenance_evidence_bundle"
+)"
+for reference_remote_path in \
+  "$reference_remote_wal_path" "$reference_remote_snapshot_path"
+do
+  [[ "$reference_remote_path" =~ ^/[A-Za-z0-9._/-]+$ ]]
+  [[ "$reference_remote_path" != *'/../'* ]]
+done
+
+reference_wal_sha256="$(/usr/bin/jq -er \
+  '.selected_source_pair.state_wal.sha256' "$canonical_source_preselection")"
+reference_wal_size="$(/usr/bin/jq -er \
+  '.selected_source_pair.state_wal.size' "$canonical_source_preselection")"
+reference_snapshot_sha256="$(/usr/bin/jq -er \
+  '.selected_source_pair.snapshot.sha256' "$canonical_source_preselection")"
+reference_snapshot_size="$(/usr/bin/jq -er \
+  '.selected_source_pair.snapshot.size' "$canonical_source_preselection")"
+reference_pair="$(/usr/bin/mktemp -d \
+  /secure/operator/canonical-source-pair.XXXXXXXX)"
+scp_tool=/secure/operator/tools/scp
+printf '%s  %s\n' "$ARC_RESTORE_SCP_SHA256" "$scp_tool" \
+  | /usr/bin/sha256sum --check --strict
+"$scp_tool" -q -B -i "$ssh_identity" \
+  -o UserKnownHostsFile="$known_hosts" -o StrictHostKeyChecking=yes \
+  -- "root@${reference_source_host}:${reference_remote_wal_path}" \
+  "$reference_pair/state.wal"
+"$scp_tool" -q -B -i "$ssh_identity" \
+  -o UserKnownHostsFile="$known_hosts" -o StrictHostKeyChecking=yes \
+  -- "root@${reference_source_host}:${reference_remote_snapshot_path}" \
+  "$reference_pair/state.snapshot.lz4"
+chmod 0400 "$reference_pair/state.wal" "$reference_pair/state.snapshot.lz4"
 "$ARC_RECOVERY_PYTHON_PATH" -I - \
-  "$reference_pair" "$reference_block_height" <<'PY'
+  "$reference_pair" "$reference_wal_size" "$reference_wal_sha256" \
+  "$reference_snapshot_size" "$reference_snapshot_sha256" <<'PY'
 import hashlib
-import json
 import os
 import pathlib
-import re
 import stat
 import sys
 
 root = pathlib.Path(sys.argv[1])
-expected_height = int(sys.argv[2])
 expected_files = {
-    "state.snapshot.lz4": (
-        1_160_246,
-        "ecb4e39d45e6711cffcd78183851587e4deb37ad63163f541ef6c1f821a4ce47",
-    ),
-    "state.wal": (
-        83_385_625,
-        "3820e112af1684567f0336abe73ae9aafc4228d0e02a5fccb1ff32f64dfed44c",
-    ),
-    "latest.json": (
-        687,
-        "0c9bcafd99375de7e3167c271350279c4d267dd9cf91de37aa830a2b817f80af",
-    ),
-    "snapshot-info.json": (
-        138,
-        "98f327fb9c4405cd0f6e7c31052d571a024738df5bf6987ad78d9b1ba5856b49",
-    ),
+    "state.wal": (int(sys.argv[2]), sys.argv[3]),
+    "state.snapshot.lz4": (int(sys.argv[4]), sys.argv[5]),
 }
-
-def reject_duplicates(pairs):
-    value = {}
-    for key, child in pairs:
-        if key in value:
-            raise SystemExit(f"reference metadata duplicates key {key!r}")
-        value[key] = child
-    return value
 
 def identity(value):
     return (
@@ -1662,47 +1754,10 @@ try:
         or stat.S_IMODE(root_metadata.st_mode) & 0o022
     ):
         raise SystemExit("reference-pair directory is not protected root storage")
-    payloads = {
-        name: read_locked(root_fd, name, size, digest)
-        for name, (size, digest) in expected_files.items()
-    }
-    sums = read_locked(root_fd, "SHA256SUMS", 324)
+    for name, (size, digest) in expected_files.items():
+        read_locked(root_fd, name, size, digest)
 finally:
     os.close(root_fd)
-
-if not sums.endswith(b"\n") or b"\r" in sums:
-    raise SystemExit("reference-pair SHA256SUMS is not canonical LF text")
-rows = {}
-for line in sums.decode("ascii").splitlines():
-    match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
-    if match is None or match.group(2) in rows:
-        raise SystemExit("reference-pair SHA256SUMS has malformed or duplicate rows")
-    rows[match.group(2)] = match.group(1)
-if rows != {name: digest for name, (_size, digest) in expected_files.items()}:
-    raise SystemExit("reference-pair SHA256SUMS differs from the reviewed four-file map")
-
-latest = json.loads(payloads["latest.json"], object_pairs_hook=reject_duplicates)
-snapshot = json.loads(
-    payloads["snapshot-info.json"], object_pairs_hook=reject_duplicates
-)
-header = latest.get("header") if isinstance(latest, dict) else None
-expected_state_root = "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
-if (
-    set(latest) != {"header", "tx_hashes", "hash"}
-    or not isinstance(header, dict)
-    or header.get("height") != expected_height
-    or header.get("state_root") != expected_state_root
-    or latest.get("hash")
-    != "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
-):
-    raise SystemExit("reference latest metadata differs at the recovery boundary")
-if snapshot != {
-    "account_count": 78_025,
-    "available": True,
-    "height": expected_height,
-    "state_root": "0x" + expected_state_root,
-}:
-    raise SystemExit("reference snapshot metadata differs at the recovery boundary")
 PY
 
 candidate_checkpoint=/secure/operator/candidate.arcchkpt
@@ -1768,9 +1823,10 @@ use. This emergency cutover instead records one explicit
 owner's GitHub actor and triggering-actor identities. The no-secret, read-only
 `owner-emergency-recovery-approval.yml` workflow must be manually dispatched by
 `FerrumVir` on the exact protected `main` commit with the checkpoint manifest
-hash, public-key manifest hash, and all six public keys. The workflow accepts
-only the exact reviewed confirmation and emits a short-lived
-`arc.recovery.owner-emergency-recovery.v2` artifact; matching text created
+hash, the sealed H/T/source tuple/final round/C/F/boundary root, public-key
+manifest hash, and all six public keys. The workflow accepts only the exact
+reviewed confirmation and emits a short-lived
+`arc.recovery.owner-emergency-recovery.v3` artifact; matching text created
 locally is not authorization.
 
 The operator snapshots the matching run set before dispatch, selects exactly
@@ -1778,10 +1834,11 @@ one new workflow/path/event/branch/SHA/owner run and attempt, waits for that
 attempt, and downloads the workflow, run, exact-attempt jobs, artifact metadata,
 and digest-bound ZIP into a new root-owned mode-0700 attempt directory. Every
 input file becomes root-owned mode 0400. The protected-main helper then verifies
-those API facts and the one-member ZIP, binds H=137145/H+1=137146, recovery
-epoch/set 1/1, all six ordered validator address/public-key/stake identities,
-the exact five signers, the unused recovery member, and the strict-stake
-threshold, checks a maximum age of 900 seconds, and creates the canonical
+those API facts and the one-member ZIP, binds the preselected
+`H/T=H+1/hash/state/final-round/C/F/boundary/checkpoint` tuple, recovery
+epoch/set 1/1, all six ordered validator address/public-key/stake identities, the exact
+five signers, the unused recovery member, and the strict-stake threshold,
+checks a maximum age of 900 seconds, and creates the canonical
 mode-0400 receipt plus sidecar. It receives no GitHub token. The wrapper permits
 only root/mode/link checks and explicit receipt/sidecar/directory durability
 syncs after `verify-github-artifact`; the wrapper call is immediately followed
@@ -1912,7 +1969,7 @@ owner_recovery_run_candidates() {
     'repos/FerrumVir/arc-chain/actions/workflows/owner-emergency-recovery-approval.yml/runs?event=workflow_dispatch&branch=main&per_page=100' \
     --jq '.workflow_runs[]' \
     | /usr/bin/jq -cs --arg sha "$protected_main_sha" \
-        --arg title "Owner recovery approval for $protected_main_sha at $checkpoint_manifest_hash" \
+        --arg title "Owner recovery approval for $protected_main_sha H=$reference_block_height at $checkpoint_manifest_hash" \
         --argjson workflow_id "$owner_recovery_workflow_id" '
         [.[] | select(.workflow_id == $workflow_id and .head_sha == $sha
           and .head_branch == "main"
@@ -1930,6 +1987,14 @@ arc_scoped_gh "$owner_recovery_gh_token" workflow run \
   --repo FerrumVir/arc-chain --ref main \
   -f expected_main_sha="$protected_main_sha" \
   -f checkpoint_manifest_hash="$checkpoint_manifest_hash" \
+  -f source_height="$reference_block_height" \
+  -f transition_height="$transition_height" \
+  -f source_block_hash="$source_block_hash" \
+  -f source_state_root="$source_state_root" \
+  -f source_consensus_round="$reference_source_consensus_round" \
+  -f observed_cutoff_height="$observed_cutoff_height" \
+  -f reopening_floor_height="$reopening_floor_height" \
+  -f legacy_maintenance_boundary_sha256="$legacy_maintenance_boundary_sha256" \
   -f validator_public_keys_sha256="$validator_public_keys_sha256" \
   -f nyc_public_key="$owner_recovery_nyc_public_key" \
   -f lax_public_key="$owner_recovery_lax_public_key" \
@@ -1937,7 +2002,7 @@ arc_scoped_gh "$owner_recovery_gh_token" workflow run \
   -f lhr_public_key="$owner_recovery_lhr_public_key" \
   -f nrt_public_key="$owner_recovery_nrt_public_key" \
   -f sgp_public_key="$owner_recovery_sgp_public_key" \
-  -f confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY $protected_main_sha"
+  -f confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY $protected_main_sha H=$reference_block_height T=$transition_height HASH=$source_block_hash STATE=$source_state_root ROUND=$reference_source_consensus_round C=$observed_cutoff_height F=$reopening_floor_height BOUNDARY=$legacy_maintenance_boundary_sha256 CHECKPOINT=$checkpoint_manifest_hash"
 owner_recovery_new_runs='[]'
 for _ in {1..30}; do
   /usr/bin/sleep 2
@@ -2046,6 +2111,14 @@ verify_owner_recovery_authorization() {
     --artifact-digest "$owner_recovery_artifact_digest" \
     --source-main-sha "$protected_main_sha" \
     --checkpoint-manifest-hash "$checkpoint_manifest_hash" \
+    --source-height "$reference_block_height" \
+    --transition-height "$transition_height" \
+    --source-block-hash "$source_block_hash" \
+    --source-state-root "$source_state_root" \
+    --source-consensus-round "$reference_source_consensus_round" \
+    --observed-cutoff-height "$observed_cutoff_height" \
+    --reopening-floor-height "$reopening_floor_height" \
+    --legacy-maintenance-boundary-sha256 "$legacy_maintenance_boundary_sha256" \
     --validator-public-keys "$validator_public_keys" \
     --validator-public-keys-sha256 "$validator_public_keys_sha256" \
     --output "$owner_recovery_receipt" \
@@ -3134,6 +3207,7 @@ if [ "$prearchive_existing" = 0 ]; then
       --freeze-plan-sha256 "$freeze_sha256" \
       --legacy-public-height-receipt "$legacy_public_height_receipt" \
       --legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle" \
+      --canonical-source-preselection "$canonical_source_preselection" \
       --legacy-maintenance-boundary "$legacy_maintenance_boundary" \
       --legacy-late-fork-source-set "$offline_stop_output.legacy-late-fork-source-set.json" \
       --offline-stop-evidence "$offline_stop_evidence" \
@@ -6438,6 +6512,7 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
 /usr/bin/jq -cS . "$acceptance_receipt" \
   | /usr/bin/cmp -s - "$acceptance_receipt"
 /usr/bin/jq -e --slurpfile receipt "$acceptance_receipt" \
+  --slurpfile manifest "$final_manifest" \
   --arg acceptance_sha "$public_truth_acceptance_sha" \
   --arg source "$protected_main_sha" --arg accepted_config "$frontend_main_sha" '
   .schema == "arc.public-production-status.v1" and .state == "recovered"
@@ -6446,7 +6521,10 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
   and .release.sourceCommit == $source and .release.tag == "v0.8.0"
   and .release.immutable == true
   and .pages.acceptedConfigCommit == $accepted_config
-  and .checkpoint.height == 137145 and .checkpoint.recoveryHeight == 137146
+  and .checkpoint.height == $manifest[0].chain.source_height
+  and .checkpoint.recoveryHeight == $manifest[0].chain.transition_height
+  and .checkpoint.legacyPublicMaxHeight == $manifest[0].chain.legacy_public_max_height
+  and .checkpoint.recoveryHeight == (.checkpoint.height + 1)
   and (.checkpoint.protocolVersion | test("^3\\.[0-9]+\\.[0-9]+$"))
   and .fleet.validatorCount == 6 and .fleet.legacyForkCount == 6
   and .fleet.requiredHealthyValidators == 6

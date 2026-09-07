@@ -239,7 +239,7 @@ class Fixture:
         write(self.summary_path, canonical(self.summary), 0o444)
         self.binary = root / "arc-node-linux-x86_64"
         fake = f"""#!{sys.executable}
-import json,pathlib,sys
+import hashlib,json,pathlib,sys
 root=pathlib.Path({str(root)!r})
 value=json.loads((root/'checkpoint-summary.json').read_text())
 argv=sys.argv[1:]
@@ -254,6 +254,22 @@ elif action=='verify':
     value['status']='VERIFIED_QUORUM'; value['signature_count']=5
 elif action=='inspect':
     value['status']='UNTRUSTED_INSPECTION'; value['signature_count']=5
+elif action=='inspect-legacy-block':
+    def file_sha(flag):
+        return hashlib.sha256(pathlib.Path(argv[argv.index(flag)+1]).read_bytes()).hexdigest()
+    value={{
+        'schema':'arc.recovery.legacy-block-inspection.v1',
+        'height':137145,
+        'block_hash':'8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90',
+        'state_root':'d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d',
+        'input_roots':{{
+            'data_dir':{{'sha256':'f'*64}},
+            'state_wal':{{'sha256':argv[argv.index('--expected-state-wal-sha256')+1]}},
+            'snapshot':{{'sha256':file_sha('--snapshot')}},
+            'genesis':{{'sha256':file_sha('--genesis')}},
+            'legacy_validator_set':{{'sha256':file_sha('--legacy-validator-set')}},
+        }},
+    }}
 else:
     print('unsupported fake command',file=sys.stderr); raise SystemExit(8)
 print(json.dumps(value,sort_keys=True))
@@ -423,6 +439,8 @@ print(json.dumps(value,sort_keys=True))
         self.write_offline_stop()
         self.late_fork_source_set = root / "legacy-late-fork-source-set.json"
         self.rebuild_late_fork_source_set()
+        self.source_preselection = root / "canonical-source-preselection.json"
+        self.write_source_preselection()
         self.known_hosts = root / "known_hosts"
         known_lines = []
         for index, (_name, host) in enumerate(builder.FLEET):
@@ -449,12 +467,12 @@ print(json.dumps(value,sort_keys=True))
             "full_state_root": "0x" + "3" * 64,
             "chain_id": "0x415243",
             "genesis_hash": "0x" + "0" * 64,
-            "source_height": 137145,
-            "source_block_hash": "0x" + "1" * 64,
-            "source_state_root": "0x" + "5" * 64,
-            "source_consensus_round": 9_774_808,
+            "source_height": 141_062,
+            "source_block_hash": "0x" + f"{190:064x}",
+            "source_state_root": "0x" + f"{200:064x}",
+            "source_consensus_round": 10_000_001,
             "created_at_unix_ms": 1_787_857_623_000,
-            "transition_height": 137146,
+            "transition_height": 141_063,
             "transition_block_hash": "0x" + "2" * 64,
             "recovery_domain": "0x" + "6" * 64,
             "recovery_epoch": 1,
@@ -466,6 +484,7 @@ print(json.dumps(value,sort_keys=True))
             "source_validator_stake": 40_000_000,
             "source_validator_set_hash": "0x" + "8" * 64,
             "community_reward_issuance_policy_hash": "0x" + "9" * 64,
+            "community_rewards_v1_activation_height": 137_146,
         }
 
     def write_freeze(self, mutate=None) -> str:
@@ -517,7 +536,7 @@ print(json.dumps(value,sort_keys=True))
         timestamp = now.isoformat().replace("+00:00", "Z")
         rows = []
         for index, (name, _host, origin) in enumerate(builder.legacy_height.FLEET):
-            height = 137500 + index
+            height = 141_060 + index
             rows.append(
                 {
                     "name": name,
@@ -1322,8 +1341,98 @@ print(json.dumps(value,sort_keys=True))
             stability_heads.append(
                 {"node": name, "host": host, "head": copy.deepcopy(later_tuple)}
             )
+            wal_hash = (
+                sha(self.wal.read_bytes()) if index == 0 else f"{index + 248:064x}"
+            )
+            snapshot_hash = (
+                sha(self.snapshot.read_bytes()) if index == 0 else f"{index + 249:064x}"
+            )
+            def inspection_file_identity(
+                digest: str, size: int, identity_index: int
+            ) -> dict[str, int | str]:
+                return {
+                    "device": 10_000 + identity_index,
+                    "inode": 20_000 + identity_index,
+                    "mode": 0o100400,
+                    "uid": 0,
+                    "gid": 0,
+                    "nlink": 1,
+                    "sha256": digest,
+                    "size": size,
+                    "mtime_ns": 30_000 + identity_index,
+                    "ctime_ns": 40_000 + identity_index,
+                }
+
+            anchor_inspection = {
+                "schema": "arc.recovery.legacy-block-inspection.v1",
+                "height": 137_145,
+                "block_hash": (
+                    "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+                    if index == 0
+                    else f"{index + 700:064x}"
+                ),
+                "state_root": (
+                    "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+                    if index == 0
+                    else f"{index + 710:064x}"
+                ),
+                "input_roots": {
+                    "data_dir": {
+                        "device": 1_000 + index,
+                        "inode": 2_000 + index,
+                        "mode": 0o40700,
+                        "uid": 0,
+                        "gid": 0,
+                        "nlink": 2,
+                        "mtime_ns": 3_000 + index,
+                        "ctime_ns": 4_000 + index,
+                    },
+                    "state_wal": inspection_file_identity(wal_hash, 3, index * 10),
+                    "snapshot": inspection_file_identity(
+                        snapshot_hash, 8, index * 10 + 1
+                    ),
+                    "genesis": inspection_file_identity(
+                        sha(self.genesis.read_bytes()), len(self.genesis.read_bytes()),
+                        index * 10 + 2,
+                    ),
+                    "legacy_validator_set": inspection_file_identity(
+                        sha(self.legacy.read_bytes()), len(self.legacy.read_bytes()),
+                        index * 10 + 3,
+                    ),
+                },
+            }
+            dag_namespace = {
+                "schema": "arc.recovery.legacy-dag-wal-namespace.v1",
+                "segment_names": ["wal-00000001.bin"],
+                "inspected_tail": [
+                    {
+                        "name": "wal-00000001.bin",
+                        "sha256": f"{index + 720:064x}",
+                        "size": 64 + index,
+                    }
+                ],
+            }
+            dag_namespace_sha = sha(
+                json.dumps(
+                    dag_namespace, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            dag_inspection = {
+                "schema": "arc.recovery.legacy-dag-round-inspection.v1",
+                "status": "VERIFIED_STOPPED_DAG_CURSOR",
+                "source_consensus_round": 10_000_001 + index,
+                "first_segment": 1,
+                "last_segment": 1,
+                "segment_count": 1,
+                "inspected_first_segment": 1,
+                "inspected_segment_count": 1,
+                "inspected_entry_count": 1,
+                "namespace_sha256": dag_namespace_sha,
+                "namespace": dag_namespace,
+                "read_only": True,
+            }
             persisted = {
-                "schema": "arc.recovery.persisted-legacy-head.v1",
+                "schema": "arc.recovery.persisted-legacy-head.v3",
                 "source_main_commit": self.commit,
                 "capture_id": capture,
                 "node": name,
@@ -1344,9 +1453,9 @@ print(json.dumps(value,sort_keys=True))
                 "capture_files_sha256": f"{index + 245:064x}",
                 "capture_source_sha256": f"{index + 246:064x}",
                 "source_data_index_sha256": f"{index + 247:064x}",
-                "state_wal_sha256": f"{index + 248:064x}",
+                "state_wal_sha256": wal_hash,
                 "state_wal_size": 3,
-                "snapshot_sha256": f"{index + 249:064x}",
+                "snapshot_sha256": snapshot_hash,
                 "snapshot_size": 8,
                 "source_file_identity": {"state_wal": {}, "snapshot": {}},
                 "archived_final_wal": {
@@ -1360,7 +1469,9 @@ print(json.dumps(value,sort_keys=True))
                         "mode": 0o100600,
                     },
                     "selected_prefix_bytes": 3,
-                    "selected_prefix_sha256": f"{index + 248:064x}",
+                    "selected_prefix_sha256": (
+                        sha(self.wal.read_bytes()) if index == 0 else f"{index + 248:064x}"
+                    ),
                     "post_capture_suffix_bytes": 0,
                     "post_capture_suffix_sha256": None,
                     "post_capture_suffix_classification": "none",
@@ -1370,7 +1481,7 @@ print(json.dumps(value,sort_keys=True))
                 },
                 "staged_file_contract": {
                     "state_wal": {
-                        "sha256": f"{index + 248:064x}",
+                        "sha256": wal_hash,
                         "size": 3,
                         "mode": 0o100400,
                         "uid": 0,
@@ -1378,7 +1489,7 @@ print(json.dumps(value,sort_keys=True))
                         "nlink": 1,
                     },
                     "snapshot": {
-                        "sha256": f"{index + 249:064x}",
+                        "sha256": snapshot_hash,
                         "size": 8,
                         "mode": 0o100400,
                         "uid": 0,
@@ -1405,6 +1516,26 @@ print(json.dumps(value,sort_keys=True))
                     "validator_set_id": 1,
                     "allow_unbound_legacy_wal": True,
                     "read_only": True,
+                },
+                "legacy_dag_round": {
+                    "source_consensus_round": 10_000_001 + index,
+                    "namespace_sha256": dag_namespace_sha,
+                    "inspection": dag_inspection,
+                    "inspection_sha256": sha(canonical(dag_inspection)),
+                },
+                "trusted_anchor_ancestry": {
+                    "anchor_height": 137_145,
+                    "anchor_block_hash": (
+                        "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+                    ),
+                    "anchor_state_root": (
+                        "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+                    ),
+                    "classification": (
+                        "valid_anchor_descendant" if index == 0 else "conflicting_anchor"
+                    ),
+                    "inspection": anchor_inspection,
+                    "inspection_sha256": sha(canonical(anchor_inspection)),
                 },
                 "completed_at": all_stopped,
                 "rerun_reexecutes_export": True,
@@ -2071,6 +2202,47 @@ print(json.dumps(value,sort_keys=True))
                 0o400,
             )
 
+    def write_source_preselection(self) -> None:
+        bundle = json.loads(self.bundle.read_text())
+        boundary = json.loads(self.boundary.read_text())
+        canonical_source, selection = builder.select_canonical_source(None, bundle, None)
+        selected = next(
+            row for row in bundle["nodes"] if row["node"] == canonical_source["node"]
+        )["persisted_head"]
+        pair = builder.persisted_source_pair(
+            selected["value"], "fixture selected source pair"
+        )
+        value = {
+            "schema": "arc.recovery.canonical-source-preselection.v1",
+            "source_main_commit": self.commit,
+            "freeze_plan_sha256": self.freeze_sha,
+            "legacy_maintenance_evidence_bundle_sha256": sha(self.bundle.read_bytes()),
+            "legacy_maintenance_boundary_sha256": sha(self.boundary.read_bytes()),
+            "source_height": canonical_source["source_height"],
+            "transition_height": canonical_source["source_height"] + 1,
+            "source_block_hash": canonical_source["source_block_hash"],
+            "source_state_root": canonical_source["source_state_root"],
+            "source_consensus_round": canonical_source["source_consensus_round"],
+            "observed_cutoff_height": boundary["observed_cutoff_height"],
+            "reopening_floor_height": boundary["legacy_public_max_height"],
+            "selected_source_pair": {
+                "node": canonical_source["node"],
+                "persisted_head_schema": selected["value"]["schema"],
+                "persisted_head_sha256": selected["sha256"],
+                "state_wal": pair["state_wal"],
+                "snapshot": pair["snapshot"],
+            },
+            "canonical_source": canonical_source,
+            "canonical_source_selection": selection,
+        }
+        payload = canonical(value)
+        write(self.source_preselection, payload, 0o400)
+        write(
+            self.source_preselection.with_name(self.source_preselection.name + ".sha256"),
+            f"{sha(payload)}  {self.source_preselection.name}\n".encode(),
+            0o400,
+        )
+
     def write_union_maintenance(self, stopped_names: set[str]) -> None:
         """Rewrite the canonical active fixture as an exact mixed-state union."""
 
@@ -2084,7 +2256,17 @@ print(json.dumps(value,sort_keys=True))
             name = active_transition["node"]
             if name not in stopped_names:
                 continue
+            active_persisted = next(
+                row["persisted_head"]["value"]
+                for row in bundle["nodes"]
+                if row["node"] == name
+            )
             stable_head = copy.deepcopy(active_transition["stable_head"])
+            stable_head = {
+                "height": 137_000 - index,
+                "block_hash": f"{index + 6400:064x}",
+                "state_root": f"{index + 6500:064x}",
+            }
             fence = builder.quarantine_rounds.wrap(
                 {
                     "schema": "arc.recovery.fixture-persistent-restart-fence.v1",
@@ -2103,6 +2285,27 @@ print(json.dumps(value,sort_keys=True))
                 "source_inputs": {
                     "source_pair_role": "preauthorization-boundary",
                     "live_source_capture_sha256": live_capture_sha,
+                    "fixed_state_wal": {
+                        "sha256": active_persisted["state_wal_sha256"],
+                        "size": active_persisted["state_wal_size"],
+                    },
+                    "fixed_snapshot": {
+                        "sha256": active_persisted["snapshot_sha256"],
+                        "size": active_persisted["snapshot_size"],
+                    },
+                },
+                "legacy_dag_round": copy.deepcopy(active_persisted["legacy_dag_round"]),
+                "trusted_anchor_ancestry": {
+                    "anchor_height": 137_145,
+                    "anchor_block_hash": (
+                        "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+                    ),
+                    "anchor_state_root": (
+                        "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+                    ),
+                    "classification": "below_trusted_anchor",
+                    "inspection": None,
+                    "inspection_sha256": sha(canonical(None)),
                 },
             }
             persisted_wrapper = builder.quarantine_rounds.wrap(persisted)
@@ -2366,6 +2569,7 @@ print(json.dumps(value,sort_keys=True))
             0o400,
         )
         self.write_validator_receipts()
+        self.write_source_preselection()
 
     def remote_verification(
         self,
@@ -2527,6 +2731,7 @@ print(json.dumps(value,sort_keys=True))
             freeze_plan_sha256=self.freeze_sha,
             legacy_public_height_receipt=self.height,
             legacy_maintenance_evidence_bundle=self.bundle,
+            canonical_source_preselection=self.source_preselection,
             legacy_maintenance_boundary=self.boundary,
             legacy_late_fork_source_set=self.late_fork_source_set,
             offline_stop_evidence=self.offline_stop,
@@ -2841,6 +3046,14 @@ print(json.dumps(value,sort_keys=True))
             "legacy-maintenance-evidence-bundle.json.sha256": art(
                 "legacy_maintenance_evidence_bundle_sidecar",
                 "legacy-maintenance-evidence-bundle.json.sha256",
+            ),
+            "canonical-source-preselection.json": art(
+                "canonical_source_preselection",
+                "canonical-source-preselection.json",
+            ),
+            "canonical-source-preselection.json.sha256": art(
+                "canonical_source_preselection_sidecar",
+                "canonical-source-preselection.json.sha256",
             ),
             "legacy-maintenance-boundary.json": art(
                 "legacy_maintenance_boundary", "legacy-maintenance-boundary.json"
@@ -3219,15 +3432,26 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             stat.S_IMODE(self.fixture.output.with_name(self.fixture.output.name + ".sha256").stat().st_mode),
             0o400,
         )
-        self.assertEqual(value["chain"]["legacy_observed_cutoff_height"], 137507)
+        self.assertEqual(value["chain"]["legacy_observed_cutoff_height"], 141_067)
         self.assertEqual(value["chain"]["legacy_continuity_safety_margin"], 128)
-        self.assertEqual(value["chain"]["legacy_public_max_height"], 137635)
+        self.assertEqual(value["chain"]["legacy_public_max_height"], 141_195)
         self.assertFalse(value["chain"]["legacy_global_absence_claimed"])
         self.assertEqual(
             value["chain"]["legacy_maintenance_boundary_sha256"],
             value["artifacts"]["legacy_maintenance_boundary"]["sha256"],
         )
-        self.assertEqual(value["chain"]["source_height"], 137145)
+        self.assertEqual(value["chain"]["source_height"], 141_062)
+        selection = value["chain"]["canonical_source_selection"]
+        self.assertEqual(selection["sha256"], sha(canonical(selection["value"])))
+        self.assertEqual(selection["value"]["selected"]["node"], "nyc")
+        self.assertEqual(
+            [row["classification"] for row in selection["value"]["candidates"]],
+            ["valid_anchor_descendant", *("conflicting_anchor" for _ in range(5))],
+        )
+        self.assertEqual(
+            value["artifacts"]["canonical_source_preselection"]["sha256"],
+            sha(self.fixture.source_preselection.read_bytes()),
+        )
         self.assertEqual(value["provenance"]["source_main_commit"], self.fixture.commit)
         installed = value["provenance"]["validator_installed_key_proof"]
         self.assertEqual(installed["schema"], "arc.recovery.validator-installed-key-proof.v1")
@@ -3351,10 +3575,12 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             sha(self.fixture.bundle.read_bytes()),
         )
 
-    def test_prearchive_accepts_exact_all_stopped_zero_sample_union(self) -> None:
-        value, _digest = self.build_union_fixture(
-            {name for name, _host in builder.FLEET}
-        )
+    def test_prearchive_rejects_all_stopped_union_without_a_replay_pair(self) -> None:
+        with self.assertRaisesRegex(
+            builder.BuilderError,
+            "captured fleet has no valid descendant",
+        ):
+            self.build_union_fixture({name for name, _host in builder.FLEET})
         bundle = json.loads(self.fixture.bundle.read_text())
         stability = bundle["quarantine_stability_proof"]["value"]
         self.assertEqual(stability["nodes"], [])
@@ -3368,10 +3594,118 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             ),
             (0, 0, 0),
         )
+
+    def test_select_source_seals_full_presign_decision_before_checkpoint_exists(self) -> None:
+        args = self.fixture.args()
+        args.output = self.fixture.root / "fresh-source-preselection.json"
+        digest = builder.select_source(args)
+        value = json.loads(args.output.read_text())
+        self.assertEqual(digest, sha(args.output.read_bytes()))
+        self.assertEqual(value["schema"], "arc.recovery.canonical-source-preselection.v1")
+        self.assertEqual(value["source_height"], 141_062)
+        self.assertEqual(value["transition_height"], 141_063)
+        self.assertEqual(value["selected_source_pair"]["node"], "nyc")
+        self.assertEqual(value["source_consensus_round"], 10_000_001)
+        self.assertEqual(value["observed_cutoff_height"], 141_067)
+        self.assertEqual(value["reopening_floor_height"], 141_195)
         self.assertEqual(
-            value["chain"]["legacy_maintenance_evidence_bundle_sha256"],
-            sha(self.fixture.bundle.read_bytes()),
+            value["canonical_source_selection"]["sha256"],
+            sha(canonical(value["canonical_source_selection"]["value"])),
         )
+
+    def test_canonical_selection_rejects_a_lower_supplied_descendant(self) -> None:
+        bundle = json.loads(self.fixture.bundle.read_text())
+        lax = bundle["nodes"][1]["persisted_head"]
+        lax["value"]["trusted_anchor_ancestry"]["classification"] = (
+            "valid_anchor_descendant"
+        )
+        inspection = lax["value"]["trusted_anchor_ancestry"]["inspection"]
+        inspection["block_hash"] = builder.TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH
+        inspection["state_root"] = builder.TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT
+        lax["value"]["trusted_anchor_ancestry"]["inspection_sha256"] = sha(
+            canonical(inspection)
+        )
+        lax["sha256"] = sha(canonical(lax["value"]))
+        with self.assertRaisesRegex(
+            builder.BuilderError, "not the deterministic highest valid anchor descendant"
+        ):
+            builder.select_canonical_source(
+                self.fixture.args(), bundle, self.fixture.summary
+            )
+
+    def test_canonical_selection_allows_identical_maximal_replicas(self) -> None:
+        bundle = json.loads(self.fixture.bundle.read_text())
+        nyc_value = bundle["nodes"][0]["persisted_head"]["value"]
+        lax = bundle["nodes"][1]["persisted_head"]
+        lax_value = lax["value"]
+        lax_value["head"] = copy.deepcopy(nyc_value["head"])
+        lax_value["selected_source_head"] = copy.deepcopy(nyc_value["head"])
+        lax_value["state_wal_sha256"] = nyc_value["state_wal_sha256"]
+        lax_value["state_wal_size"] = nyc_value["state_wal_size"]
+        lax_value["snapshot_sha256"] = nyc_value["snapshot_sha256"]
+        lax_value["snapshot_size"] = nyc_value["snapshot_size"]
+        for field in ("state_wal", "snapshot"):
+            lax_value["staged_file_contract"][field] = copy.deepcopy(
+                nyc_value["staged_file_contract"][field]
+            )
+        ancestry = lax_value["trusted_anchor_ancestry"]
+        ancestry["classification"] = "valid_anchor_descendant"
+        ancestry["inspection"]["block_hash"] = builder.TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH
+        ancestry["inspection"]["state_root"] = builder.TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT
+        ancestry["inspection"]["input_roots"]["state_wal"].update(
+            nyc_value["trusted_anchor_ancestry"]["inspection"]["input_roots"]["state_wal"]
+        )
+        ancestry["inspection"]["input_roots"]["snapshot"].update(
+            nyc_value["trusted_anchor_ancestry"]["inspection"]["input_roots"]["snapshot"]
+        )
+        ancestry["inspection_sha256"] = sha(canonical(ancestry["inspection"]))
+        lax["sha256"] = sha(canonical(lax_value))
+        source, selection = builder.select_canonical_source(
+            self.fixture.args(), bundle, self.fixture.summary
+        )
+        self.assertEqual(source["node"], "nyc")
+        self.assertEqual(
+            [
+                row["node"]
+                for row in selection["value"]["candidates"]
+                if row["classification"] == "valid_anchor_descendant"
+            ],
+            ["nyc", "lax"],
+        )
+
+    def test_canonical_selection_rejects_conflicting_equal_height_tuples(self) -> None:
+        bundle = json.loads(self.fixture.bundle.read_text())
+        lax = bundle["nodes"][1]["persisted_head"]
+        lax["value"]["head"]["height"] = 141_062
+        ancestry = lax["value"]["trusted_anchor_ancestry"]
+        ancestry["classification"] = "valid_anchor_descendant"
+        ancestry["inspection"]["block_hash"] = builder.TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH
+        ancestry["inspection"]["state_root"] = builder.TRUSTED_CHECKPOINT_ANCHOR_STATE_ROOT
+        ancestry["inspection_sha256"] = sha(canonical(ancestry["inspection"]))
+        lax["sha256"] = sha(canonical(lax["value"]))
+        with self.assertRaisesRegex(builder.BuilderError, "disagree on their canonical tuple"):
+            builder.select_canonical_source(None, bundle, None)
+
+    def test_canonical_selection_accepts_a_stopped_highest_pair_projection(self) -> None:
+        bundle = json.loads(self.fixture.bundle.read_text())
+        nyc = bundle["nodes"][0]["persisted_head"]
+        value = nyc["value"]
+        roots = value["trusted_anchor_ancestry"]["inspection"]["input_roots"]
+        value["schema"] = builder.quarantine_rounds.PERSISTED_STOPPED_SCHEMA
+        value["source_inputs"] = {
+            "fixed_data_dir": copy.deepcopy(roots["data_dir"]),
+            "fixed_state_wal": copy.deepcopy(roots["state_wal"]),
+            "fixed_snapshot": copy.deepcopy(roots["snapshot"]),
+        }
+        value["staged_inputs"] = {
+            "genesis": copy.deepcopy(roots["genesis"]),
+            "legacy_validator_set": copy.deepcopy(roots["legacy_validator_set"]),
+        }
+        nyc["sha256"] = sha(canonical(value))
+        source, _selection = builder.select_canonical_source(
+            self.fixture.args(), bundle, self.fixture.summary
+        )
+        self.assertEqual(source["node"], "nyc")
 
     def test_private_input_stage_is_create_only_and_breaks_caller_path_replacement(self) -> None:
         args = self.fixture.args()
@@ -3696,10 +4030,11 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         )
         self.fixture.rebuild_late_fork_source_set()
         self.fixture.write_validator_receipts()
+        self.fixture.write_source_preselection()
 
         value, _digest = self.fixture.build()
         self.assertEqual(
-            value["chain"]["legacy_public_max_height"], 137635
+            value["chain"]["legacy_public_max_height"], 141_195
         )
 
     def test_post_freeze_builder_does_not_cross_order_remote_utc_at_301_seconds(self) -> None:
@@ -3719,9 +4054,10 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         )
         self.fixture.rebuild_late_fork_source_set()
         self.fixture.write_validator_receipts()
+        self.fixture.write_source_preselection()
 
         value, _digest = self.fixture.build()
-        self.assertEqual(value["chain"]["legacy_public_max_height"], 137635)
+        self.assertEqual(value["chain"]["legacy_public_max_height"], 141_195)
 
     def test_post_freeze_builder_rejects_after_quarantine_and_reordered_brackets(self) -> None:
         base = (

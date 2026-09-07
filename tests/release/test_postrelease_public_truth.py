@@ -79,6 +79,16 @@ class Fixture:
                     "expected_worker": "0x" + "c" * 64,
                 }
             },
+            "chain": {
+                "source_height": 137_145,
+                "transition_height": 137_146,
+                "legacy_public_max_height": 141_128,
+                "source_block_hash": "2" * 64,
+                "source_state_root": "3" * 64,
+                "canonical_source": {
+                    "node": "nyc",
+                },
+            },
         }
         self.manifest_path = root / "manifest.json"
         manifest_raw = write_json(self.manifest_path, self.manifest)
@@ -169,7 +179,7 @@ class Fixture:
             "checkpoint": {
                 "height": 137145,
                 "recoveryHeight": 137146,
-                "legacyPublicMaxHeight": 141000,
+                "legacyPublicMaxHeight": 141128,
                 "blockHash": "2" * 64,
                 "stateRoot": "3" * 64,
                 "manifestHash": "4" * 64,
@@ -977,6 +987,22 @@ class PublicTruthTests(unittest.TestCase):
         self.product_patch.stop()
         self.recovery_patch.stop()
         self.temporary.cleanup()
+
+    def test_network_accepts_prefixed_manifest_hashes_and_non_nyc_canonical_source(self) -> None:
+        manifest = copy.deepcopy(self.fixture.manifest)
+        config = copy.deepcopy(self.fixture.config)
+        manifest["chain"]["source_block_hash"] = "0x" + manifest["chain"][
+            "source_block_hash"
+        ]
+        manifest["chain"]["source_state_root"] = "0x" + manifest["chain"][
+            "source_state_root"
+        ]
+        manifest["chain"]["canonical_source"]["node"] = "lax"
+        config["checkpoint"]["legacySourceId"] = "v3-lax"
+        config["checkpoint"]["v3SourceId"] = "v3-lax"
+
+        checkpoint = TRUTH.validate_network(config, self.fixture.source_sha, manifest)
+        self.assertEqual(checkpoint["legacySourceId"], "v3-lax")
 
     def test_builds_v2_receipt_and_claims_from_raw_evidence(self) -> None:
         output = self.root / "output"

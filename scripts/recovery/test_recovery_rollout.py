@@ -48,6 +48,8 @@ class ManifestFixture:
                 "legacy_public_height_receipt",
                 "legacy_maintenance_evidence_bundle",
                 "legacy_maintenance_evidence_bundle_sidecar",
+                "canonical_source_preselection",
+                "canonical_source_preselection_sidecar",
                 "legacy_maintenance_boundary",
                 "legacy_maintenance_boundary_sidecar",
                 "legacy_late_fork_source_set",
@@ -454,6 +456,71 @@ class ManifestFixture:
                     for index, row in enumerate(validator_key_receipt_chain["validators"])
                 ],
             }
+        source_height = 141_062 if production else 100
+        observed_cutoff_height = 141_070 if production else 110
+        canonical_source_selection = None
+        if production:
+            selection_candidates = []
+            for index, (name, _host) in enumerate(rollout.PRODUCTION_FLEET):
+                if index == 0:
+                    candidate_height = source_height
+                    block_hash = "1" * 64
+                    state_root = "5" * 64
+                    classification = "valid_anchor_descendant"
+                    persisted_sha = "1" * 64
+                elif index == 1:
+                    candidate_height = observed_cutoff_height
+                    block_hash = "8" * 64
+                    state_root = "9" * 64
+                    classification = "conflicting_anchor"
+                    persisted_sha = "a" * 64
+                else:
+                    candidate_height = 137_145 - index
+                    block_hash = f"{index + 2:x}" * 64
+                    state_root = f"{index + 3:x}" * 64
+                    classification = "below_trusted_anchor"
+                    persisted_sha = f"{index + 4:x}" * 64
+                selection_candidates.append(
+                    {
+                        "node": name,
+                        "persisted_head_schema": "arc.recovery.persisted-legacy-head.v3",
+                        "persisted_head_sha256": persisted_sha,
+                        "source_height": candidate_height,
+                        "source_block_hash": block_hash,
+                        "source_state_root": state_root,
+                        "classification": classification,
+                        "anchor_inspection_sha256": f"{index + 10:x}" * 64,
+                    }
+                )
+            selection_value = {
+                "schema": "arc.recovery.canonical-source-selection.v1",
+                "selection_rule": "highest-valid-anchor-descendant-tuple",
+                "equivalent_maximal_pair_rule": (
+                    "first-production-fleet-node-with-matching-source-pair"
+                ),
+                "trusted_anchor": {
+                    "height": 137_145,
+                    "block_hash": "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+                    "state_root": "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+                },
+                "candidates": selection_candidates,
+                "selected": {
+                    key: selection_candidates[0][key]
+                    for key in (
+                        "node",
+                        "source_height",
+                        "source_block_hash",
+                        "source_state_root",
+                        "persisted_head_sha256",
+                    )
+                },
+            }
+            canonical_source_selection = {
+                "value": selection_value,
+                "sha256": hashlib.sha256(
+                    rollout.canonical_bytes(selection_value)
+                ).hexdigest(),
+            }
         self.value = {
             "schema": rollout.SCHEMA,
             "rollout_id": "recovery-v3-test",
@@ -500,8 +567,10 @@ class ManifestFixture:
                 "protocol_version": "3.0.0",
                 "recovery_epoch": 7,
                 "validator_set_id": 9,
-                "source_height": 100,
-                "legacy_public_max_height": 238 if production else 110,
+                "source_height": source_height,
+                "legacy_public_max_height": (
+                    observed_cutoff_height + 128 if production else 110
+                ),
                 **(
                     {
                         "legacy_maintenance_evidence_bundle_sha256": artifacts[
@@ -513,7 +582,7 @@ class ManifestFixture:
                         "legacy_late_fork_source_set_sha256": artifacts[
                             "legacy_late_fork_source_set"
                         ]["sha256"],
-                        "legacy_observed_cutoff_height": 110,
+                        "legacy_observed_cutoff_height": observed_cutoff_height,
                         "legacy_continuity_safety_margin": 128,
                         "legacy_global_absence_claimed": False,
                         "legacy_official_origins": [
@@ -528,6 +597,33 @@ class ManifestFixture:
                         "legacy_quarantine_threat_model": copy.deepcopy(
                             rollout.LEGACY_QUARANTINE_THREAT_MODEL
                         ),
+                        "canonical_source": {
+                            "node": "nyc",
+                            "source_height": source_height,
+                            "source_block_hash": "1" * 64,
+                            "source_state_root": "5" * 64,
+                            "source_consensus_round": 9876,
+                            "snapshot_sha256": artifacts["source_snapshot"]["sha256"],
+                            "wal_sha256": artifacts["source_wal"]["sha256"],
+                            "persisted_head_sha256": "1" * 64,
+                            "legacy_dag_round_inspection_sha256": "2" * 64,
+                            "legacy_dag_wal_namespace_sha256": "3" * 64,
+                        },
+                        "canonical_source_selection": canonical_source_selection,
+                        "trusted_anchor": {
+                            "schema": "arc.recovery.trusted-anchor-proof.v1",
+                            "height": 137_145,
+                            "block_hash": "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+                            "state_root": "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+                            "inspection_sha256": "4" * 64,
+                            "inspector_binary_sha256": artifacts["binary"]["sha256"],
+                            "source_snapshot_sha256": artifacts["source_snapshot"]["sha256"],
+                            "source_wal_sha256": artifacts["source_wal"]["sha256"],
+                            "genesis_sha256": artifacts["genesis"]["sha256"],
+                            "legacy_validator_set_sha256": artifacts[
+                                "legacy_validator_set"
+                            ]["sha256"],
+                        },
                     }
                     if production
                     else {}
@@ -536,7 +632,7 @@ class ManifestFixture:
                 "created_at_unix_ms": 1_787_857_623_000,
                 "source_block_hash": "0x" + "1" * 64,
                 "source_state_root": "0x" + "5" * 64,
-                "transition_height": 101,
+                "transition_height": source_height + 1,
                 "transition_block_hash": "0x" + "2" * 64,
                 "full_state_root": "0x" + "3" * 64,
                 "recovery_domain": "0x" + "6" * 64,
@@ -1650,6 +1746,36 @@ class RecoveryRolloutTests(unittest.TestCase):
             persisted_head = tuple_at(
                 public_origins[index]["info_after_height"] + 6, index + 60
             )
+            dag_namespace = {
+                "schema": "arc.recovery.legacy-dag-wal-namespace.v1",
+                "segment_names": ["wal-00000001.bin"],
+                "inspected_tail": [
+                    {
+                        "name": "wal-00000001.bin",
+                        "sha256": f"{index + 5400:064x}",
+                        "size": 64 + index,
+                    }
+                ],
+            }
+            dag_namespace_sha = hashlib.sha256(
+                json.dumps(
+                    dag_namespace, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            dag_inspection = {
+                "schema": "arc.recovery.legacy-dag-round-inspection.v1",
+                "status": "VERIFIED_STOPPED_DAG_CURSOR",
+                "source_consensus_round": 10_000_001 + index,
+                "first_segment": 1,
+                "last_segment": 1,
+                "segment_count": 1,
+                "inspected_first_segment": 1,
+                "inspected_segment_count": 1,
+                "inspected_entry_count": 1,
+                "namespace_sha256": dag_namespace_sha,
+                "namespace": dag_namespace,
+                "read_only": True,
+            }
             objects = {
                 "stopped_status": {
                     "schema": "arc.recovery.offline-stop-status.v1",
@@ -1739,6 +1865,12 @@ class RecoveryRolloutTests(unittest.TestCase):
                     "state_wal_sha256": f"{index + 5200:064x}",
                     "state_wal_size": 8,
                     "head": persisted_head,
+                    "legacy_dag_round": {
+                        "source_consensus_round": 10_000_001 + index,
+                        "namespace_sha256": dag_namespace_sha,
+                        "inspection": dag_inspection,
+                        "inspection_sha256": sha_value(dag_inspection),
+                    },
                     "archived_final_wal": {
                         "path": f"/private/archive/{node}/state.wal",
                         "sha256": f"{index + 5300:064x}",
@@ -2627,12 +2759,17 @@ class RecoveryRolloutTests(unittest.TestCase):
                 "legacy_reopening_policy",
                 "legacy_late_fork_circuit",
                 "legacy_quarantine_threat_model",
+                "canonical_source",
+                "canonical_source_selection",
+                "trusted_anchor",
             },
         )
         self.assertTrue(
             {
                 "legacy_maintenance_evidence_bundle",
                 "legacy_maintenance_evidence_bundle_sidecar",
+                "canonical_source_preselection",
+                "canonical_source_preselection_sidecar",
                 "legacy_maintenance_boundary",
                 "legacy_maintenance_boundary_sidecar",
                 "legacy_late_fork_source_set",
@@ -3405,10 +3542,11 @@ assert_exact_filter_group arc-caddy arc-rpc-filter 4242
             }
 
         harness._set_public_gate_config = mock.Mock(side_effect=transition)
+        public_floor = value["chain"]["legacy_public_max_height"]
         with self.assertRaisesRegex(rollout.RolloutError, "PUBLIC_GATE_OPEN_INCOMPLETE"):
             harness.open_public_gate(
-                (239, "1" * 64, "2" * 64),
-                (240, "3" * 64, "4" * 64),
+                (public_floor + 1, "1" * 64, "2" * 64),
+                (public_floor + 2, "3" * 64, "4" * 64),
             )
         self.assertFalse(harness.production_public_gate_open)
         maintenance_names = [name for target, name in calls if target == "maintenance"]
@@ -4476,6 +4614,37 @@ sha256sum() {{ printf '%s  %s\\n' "{'b' * 64}" "$1"; }}
                 "maxStalenessSeconds": 90,
             },
         )
+
+        lax_value = copy.deepcopy(value)
+        selection = lax_value["chain"]["canonical_source_selection"]["value"]
+        selection["candidates"][0]["classification"] = "conflicting_anchor"
+        lax_candidate = selection["candidates"][1]
+        lax_candidate.update(
+            {
+                "source_height": lax_value["chain"]["source_height"],
+                "source_block_hash": lax_value["chain"]["source_block_hash"].removeprefix("0x"),
+                "source_state_root": lax_value["chain"]["source_state_root"].removeprefix("0x"),
+                "classification": "valid_anchor_descendant",
+            }
+        )
+        selection["selected"] = {
+            field: lax_candidate[field]
+            for field in (
+                "node", "source_height", "source_block_hash", "source_state_root",
+                "persisted_head_sha256",
+            )
+        }
+        lax_value["chain"]["canonical_source"].update(
+            {"node": "lax", "persisted_head_sha256": lax_candidate["persisted_head_sha256"]}
+        )
+        lax_value["chain"]["canonical_source_selection"]["sha256"] = hashlib.sha256(
+            rollout.canonical_bytes(selection)
+        ).hexdigest()
+        lax_config = rollout.RecoveryRollout(
+            lax_value, "d" * 64, output=io.StringIO()
+        ).frontend_config()
+        self.assertEqual(lax_config["checkpoint"]["legacySourceId"], "v3-lax")
+        self.assertEqual(lax_config["checkpoint"]["v3SourceId"], "v3-lax")
 
         fork_value = copy.deepcopy(value)
         fork_value["archive"].update(

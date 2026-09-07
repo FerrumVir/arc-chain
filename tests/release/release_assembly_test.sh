@@ -227,7 +227,7 @@ assert set(descriptor) == {
     "approved_validators", "canonical_inspection", "capture_id", "checkpoint_file",
     "checkpoint_certificate", "freeze_plan_sha256", "inspector_binary_sha256",
     "recovery_manifest_sha256", "release_commit", "release_tag", "repository",
-    "schema_version", "verified_quorum",
+    "schema_version", "verified_quorum", "canonical_source",
 }
 
 assert descriptor["schema_version"] == "arc-recovery-checkpoint-descriptor/v1"
@@ -252,12 +252,30 @@ assert identity["format_version"] == 1
 assert identity["chain_id"] == "0x415243"
 assert re.fullmatch(r"[0-9a-f]{64}", identity["payload_hash"])
 assert identity["community_rewards_v1_activation_height"] == 137146
-assert identity["source_height"] == 137145
-assert identity["transition_height"] == 137146
+assert identity["source_height"] >= 137145
+assert identity["transition_height"] == identity["source_height"] + 1
 assert identity["recovery_epoch"] == 1
 assert identity["validator_set_id"] == 1
 assert identity["validator_count"] == 6
 assert identity["protocol_version"] == "3.0.0"
+canonical_source = descriptor["canonical_source"]
+assert set(canonical_source) == {
+    "node", "source_height", "source_block_hash", "source_state_root",
+    "source_consensus_round", "snapshot_sha256", "wal_sha256",
+    "persisted_head_sha256", "legacy_dag_round_inspection_sha256",
+    "legacy_dag_wal_namespace_sha256",
+}
+assert canonical_source["node"] in {"nyc", "lax", "ams", "lhr", "nrt", "sgp"}
+for field in (
+    "source_height", "source_block_hash", "source_state_root", "source_consensus_round"
+):
+    assert canonical_source[field] == identity[field]
+for field in (
+    "source_block_hash", "source_state_root", "snapshot_sha256", "wal_sha256",
+    "persisted_head_sha256", "legacy_dag_round_inspection_sha256",
+    "legacy_dag_wal_namespace_sha256",
+):
+    assert re.fullmatch(r"[0-9a-f]{64}", canonical_source[field])
 certificate = descriptor["checkpoint_certificate"]
 assert set(certificate) == {"signatures", "signing_hash", "validators"}
 assert re.fullmatch(r"[0-9a-f]{64}", certificate["signing_hash"])
@@ -292,8 +310,11 @@ assert policy["release_tag"] == "v0.8.0"
 assert policy["release_commit"] == "9" * 40
 assert policy["recovery_checkpoint_descriptor_sha256"] == hashlib.sha256(descriptor_raw).hexdigest()
 assert policy["recovery_checkpoint_file_sha256"] == descriptor["checkpoint_file"]["sha256"]
-assert policy["canonical_boundary_height"] == identity["source_height"] == 137145
-assert policy["required_post_cutover_min_height"] == identity["transition_height"] == 137146
+assert policy["canonical_boundary_height"] == identity["source_height"]
+assert policy["required_post_cutover_min_height"] == identity["transition_height"]
+assert policy["legacy_observed_cutoff_height"] >= identity["source_height"]
+assert policy["legacy_continuity_safety_margin"] == 128
+assert policy["legacy_public_max_height"] == policy["legacy_observed_cutoff_height"] + 128
 assert policy["required_recovery_epoch"] == identity["recovery_epoch"] == 1
 assert policy["required_validator_set_id"] == identity["validator_set_id"] == 1
 assert policy["required_validator_count"] == identity["validator_count"] == 6
