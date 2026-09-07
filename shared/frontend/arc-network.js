@@ -860,6 +860,139 @@
     });
   }
 
+  // `/community/reward_receipt/0x{tx}` does not return the activity-feed
+  // envelope consumed by classifyReceipt(). It returns a direct settlement
+  // record whose identity and state matrix must be checked as one unit. Keep
+  // this parser separate so an arbitrary transaction response cannot acquire
+  // reward semantics merely by resembling one field from the settlement RPC.
+  function classifyCommunityRewardReceipt(payload, expectedTxHash) {
+    if (!isObject(payload)) return null;
+    const MINED_FIELDS = [
+      "assignment_epoch", "block_hash", "block_height", "confirmed",
+      "evidence_source", "included", "index", "input_hash", "job_id",
+      "model_id", "output_hash", "receipt_url", "recovery_epoch", "reward_arc",
+      "reward_base", "status", "submitted", "success", "transaction_domain",
+      "tx_hash", "tx_type", "validator_approvals", "validator_set_commitment",
+      "validator_set_id", "worker",
+    ];
+    const PENDING_FIELDS = [
+      "assignment_epoch", "block_hash", "block_height", "confirmed",
+      "evidence_source", "included", "index", "job_id", "receipt_url",
+      "recovery_epoch", "required_validator_approvals", "reward_arc",
+      "reward_base", "status", "submitted", "success", "transaction_domain",
+      "tx_hash", "tx_type", "validator_approvals", "validator_set_commitment",
+      "validator_set_id", "worker",
+    ];
+    const exactFields = (expectedFields) => {
+      const actual = Object.keys(payload);
+      return actual.length === expectedFields.length
+        && expectedFields.every((field) => Object.prototype.hasOwnProperty.call(payload, field));
+    };
+    const canonicalWireHash = (value) => {
+      const normalized = normalizeHex(value, 32);
+      return normalized !== null && value === `0x${normalized}` ? normalized : null;
+    };
+    const safeNonNegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+    const txHash = canonicalWireHash(payload.tx_hash);
+    const jobId = canonicalWireHash(payload.job_id);
+    const worker = canonicalWireHash(payload.worker);
+    const expected = expectedTxHash === undefined || expectedTxHash === null
+      ? null
+      : normalizeHex(expectedTxHash, 32);
+    const status = payload.status;
+    const pendingShape = status === "pending_mined_receipt";
+    if (!(pendingShape ? exactFields(PENDING_FIELDS) : exactFields(MINED_FIELDS))
+      || payload.tx_type !== "0x25"
+      || txHash === null
+      || jobId === null
+      || worker === null
+      || (expectedTxHash !== undefined && expectedTxHash !== null && (expected === null || txHash !== expected))
+      || payload.receipt_url !== `/community/reward_receipt/0x${txHash}`
+      || !safeNonNegativeInteger(payload.recovery_epoch)
+      || !safeNonNegativeInteger(payload.validator_set_id)
+      || canonicalWireHash(payload.validator_set_commitment) === null
+      || !safeNonNegativeInteger(payload.validator_approvals)
+      || payload.validator_approvals < 5
+      || payload.validator_approvals > 6) return null;
+
+    const hasInclusion = safeNonNegativeInteger(payload.block_height)
+      && canonicalWireHash(payload.block_hash) !== null
+      && safeNonNegativeInteger(payload.index);
+    const hasNoInclusion = payload.block_height === null
+      && payload.block_hash === null
+      && payload.index === null;
+    const hasCanonicalRewardBody = canonicalWireHash(payload.model_id) !== null
+      && canonicalWireHash(payload.input_hash) !== null
+      && canonicalWireHash(payload.output_hash) !== null
+      && canonicalWireHash(payload.assignment_epoch) !== null
+      && canonicalWireHash(payload.transaction_domain) !== null;
+    const hasCanonicalPendingBody = canonicalWireHash(payload.assignment_epoch) !== null
+      && canonicalWireHash(payload.transaction_domain) !== null
+      && payload.required_validator_approvals === 5;
+    const minedSuccess = status === "mined_success"
+      && payload.submitted === true
+      && payload.included === true
+      && payload.confirmed === true
+      && payload.success === true
+      && payload.reward_base === 2_500_000_000
+      && payload.reward_arc === 2.5
+      && payload.evidence_source === "successful mined CommunityInferenceReward receipt"
+      && hasInclusion
+      && hasCanonicalRewardBody;
+    const minedFailed = status === "mined_failed"
+      && payload.submitted === true
+      && payload.included === true
+      && payload.confirmed === false
+      && payload.success === false
+      && payload.reward_base === null
+      && payload.reward_arc === null
+      && payload.evidence_source === "no successful mined receipt"
+      && hasInclusion
+      && hasCanonicalRewardBody;
+    const receiptUnavailable = status === "receipt_unavailable"
+      && payload.submitted === true
+      && payload.included === true
+      && payload.confirmed === false
+      && payload.success === null
+      && payload.reward_base === null
+      && payload.reward_arc === null
+      && payload.evidence_source === "no successful mined receipt"
+      && hasInclusion
+      && hasCanonicalRewardBody;
+    const pending = status === "pending_mined_receipt"
+      && payload.submitted === true
+      && payload.included === false
+      && payload.confirmed === false
+      && payload.success === null
+      && payload.reward_base === null
+      && payload.reward_arc === null
+      && payload.evidence_source === "coordinator mempool submission only; no mined receipt"
+      && hasNoInclusion
+      && hasCanonicalPendingBody;
+    if (!minedSuccess && !minedFailed && !receiptUnavailable && !pending) return null;
+
+    const blockHash = hasInclusion ? normalizeHex(payload.block_hash, 32) : null;
+    return Object.freeze({
+      category: "reward",
+      type: "0x25",
+      status,
+      receiptBacked: minedSuccess || minedFailed,
+      success: minedSuccess,
+      failed: minedFailed,
+      mined: minedSuccess || minedFailed,
+      height: hasInclusion ? payload.block_height : null,
+      txHash,
+      blockHash,
+      index: hasInclusion ? payload.index : null,
+      rewardWorker: worker,
+      rewardJob: jobId,
+      rewardEarned: minedSuccess,
+      inferenceConfirmed: minedSuccess,
+      computationConfirmed: minedSuccess,
+      paymentConfirmed: minedSuccess,
+    });
+  }
+
   function checkpointVerification(block, checkpoint) {
     if (!checkpoint) return { state: "unknown", reason: "checkpoint-unavailable" };
     const actual = {
@@ -1041,6 +1174,7 @@
     evaluateLiveness,
     auditCommonHeight,
     classifyReceipt,
+    classifyCommunityRewardReceipt,
     checkpointVerification,
     boundaryVerification,
     networkInfoVerification,

@@ -867,6 +867,74 @@ pub const MAX_COMMUNITY_REWARD_APPROVALS: usize = 64;
 pub const COMMUNITY_REWARD_VALIDATOR_SET_SIZE: usize = 6;
 /// Five independently recomputing validators must approve one receipt.
 pub const COMMUNITY_REWARD_APPROVALS_REQUIRED: usize = 5;
+/// Exact public RPC fields for a mined community-reward receipt. Keeping this
+/// list in the shared protocol crate lets the node serializer and every
+/// first-party client enforce one fail-closed wire contract.
+pub const COMMUNITY_REWARD_TERMINAL_RECEIPT_FIELDS: [&str; 25] = [
+    "assignment_epoch",
+    "block_hash",
+    "block_height",
+    "confirmed",
+    "evidence_source",
+    "included",
+    "index",
+    "input_hash",
+    "job_id",
+    "model_id",
+    "output_hash",
+    "receipt_url",
+    "recovery_epoch",
+    "reward_arc",
+    "reward_base",
+    "status",
+    "submitted",
+    "success",
+    "transaction_domain",
+    "tx_hash",
+    "tx_type",
+    "validator_approvals",
+    "validator_set_commitment",
+    "validator_set_id",
+    "worker",
+];
+/// Exact public RPC fields while an accepted community reward remains in the
+/// coordinator mempool and has no canonical block receipt yet.
+pub const COMMUNITY_REWARD_PENDING_RECEIPT_FIELDS: [&str; 23] = [
+    "assignment_epoch",
+    "block_hash",
+    "block_height",
+    "confirmed",
+    "evidence_source",
+    "included",
+    "index",
+    "job_id",
+    "receipt_url",
+    "recovery_epoch",
+    "required_validator_approvals",
+    "reward_arc",
+    "reward_base",
+    "status",
+    "submitted",
+    "success",
+    "transaction_domain",
+    "tx_hash",
+    "tx_type",
+    "validator_approvals",
+    "validator_set_commitment",
+    "validator_set_id",
+    "worker",
+];
+pub const COMMUNITY_REWARD_PENDING_EVIDENCE: &str =
+    "coordinator mempool submission only; no mined receipt";
+pub const COMMUNITY_REWARD_SUCCESS_EVIDENCE: &str =
+    "successful mined CommunityInferenceReward receipt";
+pub const COMMUNITY_REWARD_UNSUCCESSFUL_EVIDENCE: &str = "no successful mined receipt";
+
+/// Exact protocol-v3 execution profile required for reward-bearing community
+/// work. Kept in `arc-types` so validators, workers, and shipped clients bind
+/// the same wire identity without duplicating a display string.
+pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
+    "INT8 integer (per-row, cross-platform deterministic)";
 /// Community compute is stake-zero eligible. This explicit consensus
 /// constant is the single code-level policy switch; raising it requires a
 /// coordinated protocol release rather than an unsafe per-node flag.

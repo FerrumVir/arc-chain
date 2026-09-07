@@ -42,7 +42,9 @@ LEDGER_SCHEMA = "arc.recovery.quarantine-generation-ledger.v2"
 TARGET_HEIGHT_SCHEMA = "arc.recovery.legacy-public-height-targets.v1"
 TARGET_CROSS_SCHEMA = "arc.recovery.authenticated-legacy-height-targets.v1"
 LIVE_SOURCE_CAPTURE_SCHEMA = "arc.recovery.quarantine-live-source-capture.v1"
+NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA = "arc.recovery.quarantine-live-source-capture.v2"
 RUST_SOURCE_CAPTURE_SCHEMA = "arc.recovery.live-legacy-source-capture.v1"
+WAL_NORMALIZATION_SCHEMA = "arc.recovery.legacy-wal-normalization.v1"
 PRIOR_STATUS_SCHEMA = "arc.recovery.quarantine-prior-fenced-status.v1"
 STOPPED_STATUS_SCHEMA = "arc.recovery.quarantine-prior-persistently-stopped-status.v1"
 NFT_GATE_SCHEMA = "arc.recovery.quarantine-nft-deadline-gate.v1"
@@ -213,11 +215,15 @@ def validate_live_source_capture(
         "boundary_proof_sha256", "network_quarantine_receipt_sha256",
         "owned_ruleset_stateless_sha256",
     }
+    schema = value.get("schema") if isinstance(value, dict) else None
+    normalized = schema == NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA
+    if normalized:
+        fields.add("wal_normalization")
     if not isinstance(value, dict) or set(value) != fields:
         fail("live source capture fields differ")
     node = target.get("node")
     if (
-        value.get("schema") != LIVE_SOURCE_CAPTURE_SCHEMA
+        schema not in {LIVE_SOURCE_CAPTURE_SCHEMA, NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA}
         or (
             value.get("capture_id"), value.get("freeze_plan_sha256"),
             value.get("source_main_commit"), value.get("round_number"),
@@ -347,6 +353,8 @@ def validate_live_source_capture(
         fail("Rust live source capture fields differ")
     if rust.get("schema") != RUST_SOURCE_CAPTURE_SCHEMA or rust.get("head") != head:
         fail("Rust live source capture head/schema differs")
+    if normalized and rust.get("allow_unbound_legacy_wal") is not True:
+        fail("normalized Rust live source did not use the explicit unbound-WAL policy")
     require_uint(rust.get("captured_at_unix_ms"), "Rust live capture timestamp", positive=True)
     validate_rust_input_identity(rust.get("source_data_dir"), "Rust source directory", directory=True)
     source_wal = rust.get("source_wal_prefix")
@@ -406,6 +414,75 @@ def validate_live_source_capture(
         or fixed_snapshot["sha256"] != source_snapshot["sha256"]
     ):
         fail("Rust fixed pair is not the exact replayed source prefix/snapshot")
+    if normalized:
+        normalization = value.get("wal_normalization")
+        if not isinstance(normalization, dict) or set(normalization) != {
+            "normalizer_sha256", "plan_sha256", "receipt",
+        }:
+            fail("legacy WAL normalization wrapper fields differ")
+        require_hash(
+            normalization.get("normalizer_sha256"), "legacy WAL normalizer"
+        )
+        plan_sha = require_hash(
+            normalization.get("plan_sha256"), "legacy WAL normalization plan"
+        )
+        normalization_receipt, _normalization_sha = validate_wrapper(
+            normalization.get("receipt"), "legacy WAL normalization receipt"
+        )
+        normalization_fields = {
+            "schema", "plan_sha256", "node", "source_wal", "source_snapshot",
+            "partition", "sequence_rewrites", "derivative_wal", "head",
+            "selected_frame_count", "excluded_bytes", "semantic_stream_sha256",
+            "transform", "source_unchanged",
+        }
+        if (
+            not isinstance(normalization_receipt, dict)
+            or set(normalization_receipt) != normalization_fields
+            or normalization_receipt.get("schema") != WAL_NORMALIZATION_SCHEMA
+            or normalization_receipt.get("plan_sha256") != plan_sha
+            or normalization_receipt.get("node") != node
+            or normalization_receipt.get("head") != head
+            or normalization_receipt.get("transform")
+                != "copy-selected-runs-rewrite-sequence-and-crc32"
+            or normalization_receipt.get("source_unchanged") is not True
+            or not isinstance(normalization_receipt.get("partition"), list)
+            or not normalization_receipt.get("partition")
+            or not isinstance(normalization_receipt.get("sequence_rewrites"), list)
+        ):
+            fail("legacy WAL normalization receipt identity differs")
+        normalization_source = validate_rust_input_identity(
+            normalization_receipt.get("source_wal"),
+            "legacy WAL normalization source",
+        )
+        normalization_snapshot = validate_rust_input_identity(
+            normalization_receipt.get("source_snapshot"),
+            "legacy WAL normalization snapshot",
+        )
+        derivative = validate_rust_input_identity(
+            normalization_receipt.get("derivative_wal"),
+            "legacy WAL normalization derivative",
+        )
+        if (
+            normalization_snapshot["sha256"] != source_snapshot["sha256"]
+            or derivative["sha256"] != source_wal["accepted_prefix_sha256"]
+            or derivative["size"] != source_wal["accepted_prefix_bytes"]
+            or source_wal["quarantined_suffix_bytes_at_loader"] != 0
+            or source_wal["loader_tail_reason"] != "none"
+            or require_uint(
+                normalization_receipt.get("selected_frame_count"),
+                "legacy WAL selected frame count",
+                positive=True,
+            ) == 0
+            or require_uint(
+                normalization_receipt.get("excluded_bytes"),
+                "legacy WAL excluded bytes",
+            ) < 0
+        ):
+            fail("normalized derivative is not the exact strict Rust capture source")
+        require_hash(
+            normalization_receipt.get("semantic_stream_sha256"),
+            "legacy WAL semantic stream",
+        )
     del rust_sha
     started = parse_utc(value.get("capture_started_at"), "live source capture start")
     completed = parse_utc(value.get("capture_completed_at"), "live source capture completion")

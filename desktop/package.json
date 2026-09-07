@@ -12,6 +12,7 @@
     "tauri:build": "tauri build",
     "test:unit": "playwright test tests/update-controller.spec.ts",
     "test": "playwright test",
+    "test:live": "playwright test --config playwright.live.config.ts && node ../scripts/release/build-desktop-live-product-receipt.mjs",
     "test:ui": "playwright test --ui",
     "test:install": "playwright install chromium"
   },

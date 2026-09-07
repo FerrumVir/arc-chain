@@ -2861,6 +2861,15 @@ print(json.dumps(value,sort_keys=True))
                 "legacy_late_fork_interlock_tool",
                 "legacy-late-fork-interlock.py",
             ),
+            "normalize-legacy-wal.py": art(
+                "legacy_wal_normalizer", "normalize-legacy-wal.py"
+            ),
+            "legacy-wal-normalization-lax.json": art(
+                "legacy_wal_normalization_lax", "legacy-wal-normalization-lax.json"
+            ),
+            "legacy-wal-normalization-ams.json": art(
+                "legacy_wal_normalization_ams", "legacy-wal-normalization-ams.json"
+            ),
             "offline-stop-evidence.json": art("offline_stop_evidence", "offline-stop-evidence.json"),
             "offline-stop-evidence.json.sha256": art(
                 "offline_stop_evidence_sidecar", "offline-stop-evidence.json.sha256"

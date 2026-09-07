@@ -136,6 +136,7 @@ LEGACY_QUARANTINE_THREAT_MODEL = {
     "hostile_root_containment_claimed": False,
 }
 CANONICAL_MODEL_SHA256 = "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+CANONICAL_MODEL_BLAKE3 = "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67"
 CANONICAL_MODEL_SIZE_BYTES = 4_081_004_224
 CANONICAL_MODEL_LAYERS = 32
 CANONICAL_EXECUTION_PROFILE = "INT8 integer (per-row, cross-platform deterministic)"
@@ -150,6 +151,7 @@ DEFAULT_PUBLIC_GET_PATHS = (
     "/validators",
     "/block/latest",
     "/blocks",
+    "/inference/readiness",
     "/inference/attestations",
     "/economics/rewards",
     "/faucet/status",
@@ -1446,8 +1448,16 @@ def validate_manifest(
             else ()
         ),
     )
-    artifacts = require_keys(manifest["artifacts"], "manifest.artifacts", artifact_names)
-    for key in artifact_names:
+    optional_artifact_names = (
+        "legacy_wal_normalizer",
+        "legacy_wal_normalization_lax",
+        "legacy_wal_normalization_ams",
+    ) if mode == "production" else ()
+    artifacts = require_keys(
+        manifest["artifacts"], "manifest.artifacts", artifact_names,
+        optional_artifact_names,
+    )
+    for key in artifacts:
         validate_artifact(artifacts[key], f"manifest.artifacts.{key}")
     if mode == "production":
         validate_protected_pretag_window_set(
@@ -1976,6 +1986,9 @@ def verify_production_input_stage(
         "legacy_maintenance_boundary_sidecar",
         "legacy_late_fork_source_set",
         "legacy_late_fork_source_set_sidecar",
+        "legacy_wal_normalizer",
+        "legacy_wal_normalization_lax",
+        "legacy_wal_normalization_ams",
         "offline_stop_evidence",
         "pretag_artifact_input_set", "pretag_initial_live_provenance_set",
         "build_metadata", "validator_vault_restore_receipt",
@@ -3046,7 +3059,10 @@ def verify_legacy_maintenance_stage_payloads(
             != "arc.recovery.legacy-network-quarantine-external-proof.v1"
             or cross_value.get("schema")
             != "arc.recovery.legacy-network-quarantine-public-cross-proof.v1"
-            or persisted_value.get("schema") != "arc.recovery.persisted-legacy-head.v1"
+            or persisted_value.get("schema") not in {
+                "arc.recovery.persisted-legacy-head.v1",
+                "arc.recovery.persisted-legacy-head.v2",
+            }
             or persisted_value.get("source_main_commit") != source_commit
             or persisted_value.get("source_pair_role")
             != "post-quarantine-final-export"
@@ -3093,15 +3109,20 @@ def verify_legacy_maintenance_stage_payloads(
             )
         if selected_source_head != persisted_head:
             fail(f"legacy maintenance {node} selected final source head differs")
+        normalized_persisted = persisted_value.get("schema") \
+            == "arc.recovery.persisted-legacy-head.v2"
+        archived_required = ["path", "sha256", "size", "file_identity", "preserved_by"]
+        if normalized_persisted:
+            archived_required += ["source_relation", "normalization_receipt_sha256",
+                                  "derivative_sha256", "derivative_size"]
+        else:
+            archived_required += ["selected_prefix_bytes", "selected_prefix_sha256",
+                                  "post_capture_suffix_bytes", "post_capture_suffix_sha256",
+                                  "post_capture_suffix_classification"]
         archived_wal = require_keys(
             persisted_value.get("archived_final_wal"),
             f"legacy maintenance {node} archived final WAL",
-            (
-                "path", "sha256", "size", "file_identity",
-                "selected_prefix_bytes", "selected_prefix_sha256",
-                "post_capture_suffix_bytes", "post_capture_suffix_sha256",
-                "post_capture_suffix_classification", "preserved_by",
-            ),
+            archived_required,
         )
         archived_path = archived_wal["path"]
         if (
@@ -3130,15 +3151,6 @@ def verify_legacy_maintenance_stage_payloads(
             archive_identity["mode"],
             f"legacy maintenance {node} archived final WAL identity mode",
         )
-        selected_bytes = required_int(
-            archived_wal["selected_prefix_bytes"],
-            f"legacy maintenance {node} archived final WAL selected prefix bytes",
-            minimum=1,
-        )
-        suffix_bytes = required_int(
-            archived_wal["post_capture_suffix_bytes"],
-            f"legacy maintenance {node} archived final WAL suffix bytes",
-        )
         if (
             exact_hash(
                 archived_wal["sha256"],
@@ -3146,38 +3158,133 @@ def verify_legacy_maintenance_stage_payloads(
             )
             != archived_wal["sha256"]
             or archive_identity["size"] != archive_size
-            or selected_bytes
-            != required_int(
-                persisted_value.get("state_wal_size"),
-                f"legacy maintenance {node} selected WAL size",
-                minimum=1,
-            )
-            or archived_wal["selected_prefix_sha256"]
-            != exact_hash(
-                persisted_value.get("state_wal_sha256"),
-                f"legacy maintenance {node} selected WAL root",
-            )
-            or archive_size != selected_bytes + suffix_bytes
             or archived_wal["preserved_by"]
             != "complete-content-indexed-stopped-legacy-source-v4"
         ):
             fail(f"legacy maintenance {node} archived final WAL binding differs")
-        if suffix_bytes == 0:
-            if (
-                archived_wal["post_capture_suffix_sha256"] is not None
-                or archived_wal["post_capture_suffix_classification"] != "none"
-            ):
-                fail(f"legacy maintenance {node} empty archived WAL suffix differs")
-        elif (
-            exact_hash(
-                archived_wal["post_capture_suffix_sha256"],
-                f"legacy maintenance {node} archived final WAL suffix root",
+        selected_wal_size = required_int(
+            persisted_value.get("state_wal_size"),
+            f"legacy maintenance {node} selected WAL size", minimum=1,
+        )
+        selected_wal_sha = exact_hash(
+            persisted_value.get("state_wal_sha256"),
+            f"legacy maintenance {node} selected WAL root",
+        )
+        if normalized_persisted:
+            plan_artifact_name = f"legacy_wal_normalization_{node}"
+            if plan_artifact_name not in {
+                    "legacy_wal_normalization_lax", "legacy_wal_normalization_ams"}:
+                fail(f"legacy maintenance {node} unexpectedly requires WAL normalization")
+            required_normalization_artifacts = {
+                "legacy_wal_normalizer", plan_artifact_name,
+            }
+            missing_normalization_artifacts = sorted(
+                required_normalization_artifacts.difference(stage_rows)
             )
-            != archived_wal["post_capture_suffix_sha256"]
-            or archived_wal["post_capture_suffix_classification"]
-            != "archived_noncanonical_post_capture_suffix"
-        ):
-            fail(f"legacy maintenance {node} archived final WAL suffix policy differs")
+            if missing_normalization_artifacts:
+                fail(
+                    f"legacy maintenance {node} normalization stage is missing "
+                    + ", ".join(missing_normalization_artifacts)
+                )
+            normalization_wrapper = require_keys(
+                persisted_value.get("wal_normalization"),
+                f"legacy maintenance {node} normalization wrapper",
+                ("normalizer_sha256", "plan_sha256", "receipt"),
+            )
+            exact_hash(normalization_wrapper["normalizer_sha256"],
+                       f"legacy maintenance {node} normalizer root")
+            plan_sha = exact_hash(normalization_wrapper["plan_sha256"],
+                                  f"legacy maintenance {node} normalization plan root")
+            if (normalization_wrapper["normalizer_sha256"]
+                    != stage_rows["legacy_wal_normalizer"]["sha256"]
+                    or plan_sha != stage_rows[plan_artifact_name]["sha256"]):
+                fail(f"legacy maintenance {node} normalization tool/plan stage root differs")
+            normalization_plan = canonical_object(
+                plan_artifact_name, f"legacy maintenance {node} normalization plan"
+            )
+            if (normalization_plan.get("schema")
+                    != "arc.recovery.legacy-wal-normalization-plan.v1"
+                    or normalization_plan.get("node") != node
+                    or sha256_bytes(canonical_bytes(normalization_plan)) != plan_sha):
+                fail(f"legacy maintenance {node} staged normalization plan differs")
+            receipt_wrapper = require_keys(
+                normalization_wrapper["receipt"],
+                f"legacy maintenance {node} normalization receipt wrapper",
+                ("value", "sha256"),
+            )
+            normalization = require_keys(
+                receipt_wrapper["value"], f"legacy maintenance {node} normalization receipt",
+                ("schema", "plan_sha256", "node", "source_wal", "source_snapshot",
+                 "partition", "sequence_rewrites", "derivative_wal", "head",
+                 "selected_frame_count", "excluded_bytes", "semantic_stream_sha256",
+                 "transform", "source_unchanged"),
+            )
+            normalization_sha = exact_hash(
+                receipt_wrapper["sha256"],
+                f"legacy maintenance {node} normalization receipt root",
+            )
+            if sha256_bytes(canonical_bytes(normalization)) != normalization_sha:
+                fail(f"legacy maintenance {node} normalization wrapper root differs")
+            source_wal = normalization["source_wal"]
+            source_snapshot = normalization["source_snapshot"]
+            derivative = normalization["derivative_wal"]
+            if (normalization["schema"] != "arc.recovery.legacy-wal-normalization.v1"
+                    or normalization["plan_sha256"] != plan_sha
+                    or normalization["node"] != node
+                    or normalization["head"] != persisted_head
+                    or normalization["source_unchanged"] is not True
+                    or normalization["partition"] != normalization_plan.get("partition")
+                    or normalization["sequence_rewrites"]
+                        != normalization_plan.get("sequence_rewrites")
+                    or source_wal.get("sha256") != archived_wal["sha256"]
+                    or source_wal.get("size") != archive_size
+                    or source_wal.get("sha256")
+                        != normalization_plan.get("source_wal", {}).get("sha256")
+                    or source_wal.get("size")
+                        != normalization_plan.get("source_wal", {}).get("size")
+                    or source_snapshot.get("sha256") != persisted_value.get("snapshot_sha256")
+                    or source_snapshot.get("size") != persisted_value.get("snapshot_size")
+                    or source_snapshot.get("sha256")
+                        != normalization_plan.get("source_snapshot", {}).get("sha256")
+                    or source_snapshot.get("size")
+                        != normalization_plan.get("source_snapshot", {}).get("size")
+                    or derivative.get("sha256") != selected_wal_sha
+                    or derivative.get("size") != selected_wal_size
+                    or derivative.get("sha256")
+                        != normalization_plan.get("derivative_wal", {}).get("sha256")
+                    or derivative.get("size")
+                        != normalization_plan.get("derivative_wal", {}).get("size")
+                    or archived_wal["source_relation"]
+                        != "exact-content-pinned-normalization-source"
+                    or archived_wal["normalization_receipt_sha256"] != normalization_sha
+                    or archived_wal["derivative_sha256"] != selected_wal_sha
+                    or archived_wal["derivative_size"] != selected_wal_size):
+                fail(f"legacy maintenance {node} normalized WAL provenance differs")
+        else:
+            selected_bytes = required_int(
+                archived_wal["selected_prefix_bytes"],
+                f"legacy maintenance {node} archived final WAL selected prefix bytes",
+                minimum=1,
+            )
+            suffix_bytes = required_int(
+                archived_wal["post_capture_suffix_bytes"],
+                f"legacy maintenance {node} archived final WAL suffix bytes",
+            )
+            if (selected_bytes != selected_wal_size
+                    or archived_wal["selected_prefix_sha256"] != selected_wal_sha
+                    or archive_size != selected_bytes + suffix_bytes):
+                fail(f"legacy maintenance {node} archived WAL prefix binding differs")
+            if suffix_bytes == 0:
+                if (archived_wal["post_capture_suffix_sha256"] is not None
+                        or archived_wal["post_capture_suffix_classification"] != "none"):
+                    fail(f"legacy maintenance {node} empty archived WAL suffix differs")
+            elif (exact_hash(
+                    archived_wal["post_capture_suffix_sha256"],
+                    f"legacy maintenance {node} archived final WAL suffix root",
+                ) != archived_wal["post_capture_suffix_sha256"]
+                    or archived_wal["post_capture_suffix_classification"]
+                        != "archived_noncanonical_post_capture_suffix"):
+                fail(f"legacy maintenance {node} archived final WAL suffix policy differs")
         receipt_sha = exact_hash(
             status_value.get("receipt_sha256"),
             f"legacy maintenance {node} quarantine receipt root",
@@ -10091,7 +10198,7 @@ http {{
             proxy_pass_request_body off;
             proxy_set_header Content-Length "";
         }}
-        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|faucet/status|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
+        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/readiness|inference/attestations|economics/rewards|faucet/status|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
             auth_request /__arc_interlock_gate;
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;
@@ -12842,6 +12949,61 @@ test -z "$(ss -H -ltnp | awk -v port="$retired_rpc_port" '$4 ~ (":" port "$") {p
         require_allowed(status, headers, 204)
         status, headers, _ = request("GET", "/network/info", origin=PUBLIC_BROWSER_ORIGIN)
         require_allowed(status, headers, 200)
+
+        # Readiness is the mutation-free pre-dispatch contract used by every
+        # v0.8.0 client before it spends its one inference POST.  Prove the
+        # route traverses both gateway layers and is the exact reviewed shape;
+        # otherwise a seemingly healthy edge would make all clients fail
+        # closed before submitting useful work.
+        status, headers, response_body = request(
+            "GET", "/inference/readiness", origin=PUBLIC_BROWSER_ORIGIN
+        )
+        require_allowed(status, headers, 200)
+        try:
+            readiness = json.loads(response_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RolloutError(
+                f"{node['name']} inference readiness route returned invalid JSON"
+            ) from error
+        readiness_keys = {
+            "schema",
+            "safe_to_dispatch",
+            "community_dispatch_ready",
+            "local_model_ready",
+            "sharded_pipeline_ready",
+            "live_community_workers",
+            "model_id",
+            "required_community_execution_profile",
+            "mutation_free_observation",
+        }
+        if not isinstance(readiness, dict) or set(readiness) != readiness_keys:
+            fail(f"{node['name']} inference readiness route differs from the reviewed contract")
+        if (
+            readiness.get("schema") != "arc.inference.readiness.v1"
+            or readiness.get("mutation_free_observation") is not True
+            or not isinstance(readiness.get("safe_to_dispatch"), bool)
+            or not isinstance(readiness.get("community_dispatch_ready"), bool)
+            or not isinstance(readiness.get("local_model_ready"), bool)
+            or not isinstance(readiness.get("sharded_pipeline_ready"), bool)
+            or not isinstance(readiness.get("live_community_workers"), int)
+            or isinstance(readiness.get("live_community_workers"), bool)
+            or readiness["live_community_workers"] < 0
+            or readiness.get("required_community_execution_profile")
+            != CANONICAL_EXECUTION_PROFILE
+        ):
+            fail(f"{node['name']} inference readiness route failed semantic validation")
+        expected_safe = (
+            readiness["community_dispatch_ready"]
+            or readiness["local_model_ready"]
+            or readiness["sharded_pipeline_ready"]
+        )
+        if readiness["safe_to_dispatch"] is not expected_safe:
+            fail(f"{node['name']} inference readiness route is internally inconsistent")
+        if readiness["safe_to_dispatch"] is not True:
+            fail(f"{node['name']} inference readiness route is not ready for one-submit clients")
+        model_id = readiness["model_id"]
+        if model_id != f"0x{CANONICAL_MODEL_BLAKE3}":
+            fail(f"{node['name']} inference readiness route has the wrong canonical model identity")
 
         # The SDKs use the flat /tx/submit and /tx/submit_batch wire contracts.
         # Exercise both through the public TLS gateway with an intentionally

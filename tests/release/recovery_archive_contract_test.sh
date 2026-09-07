@@ -187,7 +187,7 @@ PY
     ln "$output" "$fixture/hardlink.json"
     if ( trap - EXIT; validate_legacy_public_height_sample_output "$output" \
             >/dev/null 2>&1 ); then return 1; fi
-    rm "$fixture/hardlink.json"
+    rm -f -- "$fixture/hardlink.json"
     ln -s "$output" "$fixture/symlink.json"
     if ( trap - EXIT; validate_legacy_public_height_sample_output \
             "$fixture/symlink.json" >/dev/null 2>&1 ); then return 1; fi
@@ -682,7 +682,7 @@ partial_retry_ownership_rejects_symlink_and_foreign_marker() (
     . "$NODE_HELPER" >/dev/null
     local f p; f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT; p="$f/partial"
     ln -s "$f" "$p"; ( prepare_owned_partial_directory "$p" exact ) >/dev/null 2>&1 && return 1
-    rm "$p"; mkdir "$p"; printf 'foreign\n' > "$p/.arc-recovery-partial-owner"
+    rm -f -- "$p"; mkdir "$p"; printf 'foreign\n' > "$p/.arc-recovery-partial-owner"
     ( prepare_owned_partial_directory "$p" exact ) >/dev/null 2>&1 && return 1
     printf 'exact\n' > "$p/.arc-recovery-partial-owner"; printf x > "$p/stale"
     prepare_owned_partial_directory "$p" exact || return 1
@@ -1391,13 +1391,13 @@ readiness_without_dispatch_does_not_bind_stale_selection() (
     chmod 400 "$attempt/mutation-dispatch.json"
     quarantine_attempt_binds_live_observation_selection "$attempt" \
         "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" || return 1
-    rm "$attempt/mutation-dispatch.json"
+    rm -f -- "$attempt/mutation-dispatch.json"
 
     printf '{}\n' > "$attempt/result.json"
     chmod 400 "$attempt/result.json"
     quarantine_attempt_binds_live_observation_selection "$attempt" \
         "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" || return 1
-    rm "$attempt/result.json"
+    rm -f -- "$attempt/result.json"
 
     printf '{}\n' > "$attempt/node-transitions/nyc.json"
     chmod 400 "$attempt/node-transitions/nyc.json"
@@ -2381,6 +2381,7 @@ PY
         --validator-public-keys-sha256 "$artifact_digest" \
         --legacy-validator-set "$fixture/capture-legacy.json" \
         --legacy-validator-set-sha256 "$artifact_digest" \
+        --allow-unbound-legacy-wal \
         --offline-stop-evidence-output "$fixture/offline-stop.json" \
         --plan > "$fixture/capture-plan.out" || return 1
     grep -Fq -- \
@@ -3119,13 +3120,15 @@ ordered=[
     'verify_stop_journal_semantics', 'verify_legacy_restart_fence',
     'verify_legacy_network_quarantine', 'verify_capture_source',
     'exec 8<"$binary"', '/proc/self/fd/8 recovery export',
+    '--validator-set-id 1 --allow-unbound-legacy-wal',
     '[ "$(hash_file /proc/self/fd/14)" = "$wal_before" ]',
 ]
 positions=[body.index(item) for item in ordered]
 assert positions==sorted(positions)
 assert body.index('verify_capture_source "$capture_root"', positions[-1]) > positions[-1]
 for exact in (
-    'schema":"arc.recovery.persisted-legacy-head.v1',
+    'arc.recovery.persisted-legacy-head.v1',
+    'arc.recovery.persisted-legacy-head.v2',
     'source_main_commit', 'inspector_binary_sha256',
     'network_quarantine_receipt_sha256', 'capture_source_sha256',
     'source_data_index_sha256', 'state_wal_size', 'snapshot_size',
@@ -3135,6 +3138,7 @@ for exact in (
     'details.st_nlink!=1', 'stat.S_IMODE(details.st_mode)!=0o400',
     'openat/O_NOFOLLOW FD identity differs', 'export-source/state.wal',
     'candidate.inspect.json', 'inspect_summary_sha256', 'wal_boundary_sha256',
+    '"allow_unbound_legacy_wal":True,"read_only":True',
     'os.dup(13)', 'os.dup(12)', 'export summary exact key set differs',
     'snapshot pathname changed after held-FD open',
     'offline-wal-recovery.v2', 'source_file_identity', 'staged_file_contract',
@@ -3181,7 +3185,7 @@ else:
     raise SystemExit("Linux unexpectedly allowed the unsafe proc-fd O_NOFOLLOW reopen")
 PY
     printf 'replacement' > "$root/replacement"
-    rm "$root/state.snapshot.lz4"
+    rm -f -- "$root/state.snapshot.lz4"
     ln -s "$root/replacement" "$root/state.snapshot.lz4"
     if python3 - "$root/state.snapshot.lz4" 2>/dev/null <<'PY'
 import os,pathlib,sys
@@ -3192,7 +3196,7 @@ PY
     then
         return 1
     fi
-    rm "$root/state.snapshot.lz4"
+    rm -f -- "$root/state.snapshot.lz4"
     cp "$root/replacement" "$root/state.snapshot.lz4"
     if python3 - "$root/state.snapshot.lz4" 2>/dev/null <<'PY'
 import os,pathlib,sys
@@ -3513,9 +3517,11 @@ PY
 )
 
 archive_scripts_are_lintable() {
-    bash -n "$NODE_HELPER" "$ORCHESTRATOR" &&
+    [ -x "$REPO_ROOT/scripts/recovery/normalize-legacy-wal.py" ] &&
+        bash -n "$NODE_HELPER" "$ORCHESTRATOR" &&
         PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
-            "$ROLLOUT" "$FREEZE_MODULE" "$FREEZE_MODULE_TEST" &&
+            "$ROLLOUT" "$FREEZE_MODULE" "$FREEZE_MODULE_TEST" \
+            "$REPO_ROOT/scripts/recovery/normalize-legacy-wal.py" &&
         PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
             "$REPO_ROOT/scripts/recovery/test_recovery_rollout.py" >/dev/null &&
         PYTHONDONTWRITEBYTECODE=1 python3 "$FREEZE_MODULE_TEST" >/dev/null &&
@@ -3527,6 +3533,8 @@ archive_scripts_are_lintable() {
             >/dev/null &&
         PYTHONDONTWRITEBYTECODE=1 python3 \
             "$REPO_ROOT/scripts/recovery/test_quarantine_rounds.py" >/dev/null &&
+        PYTHONDONTWRITEBYTECODE=1 python3 \
+            "$REPO_ROOT/scripts/recovery/test_normalize_legacy_wal.py" >/dev/null &&
         PYTHONDONTWRITEBYTECODE=1 python3 \
             "$REPO_ROOT/scripts/recovery/test_community_reward_probe.py" >/dev/null &&
         python3 -m json.tool "$SCHEMA" >/dev/null &&

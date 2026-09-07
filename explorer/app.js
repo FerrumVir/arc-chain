@@ -215,23 +215,33 @@
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
       const archiveVerification = await requireLegacyArchiveProvenance(source, fetchImpl, signal);
-      const [full, receipt, occurrence] = await Promise.all([
+      const [full, receipt, rewardEvidence, occurrence] = await Promise.all([
         optionalRequest(fetchImpl, source, `/tx/${txHash}/full`, { signal }),
         optionalRequest(fetchImpl, source, `/tx/${txHash}`, { signal }),
+        source.kind === "v3"
+          ? optionalRequest(fetchImpl, source, `/community/reward_receipt/0x${txHash}`, { signal })
+          : Promise.resolve({ ok: false, error: null }),
         source.kind === "legacy-fork"
           ? optionalRequest(fetchImpl, source, `/tx/${txHash}/occurrences`, { signal })
           : Promise.resolve({ ok: false, error: null }),
       ]);
-      if (!full.ok && !receipt.ok && !occurrence.ok) {
-        return { source, found: false, errors: [full.error, receipt.error, occurrence.error].filter(Boolean) };
+      if (!full.ok && !receipt.ok && !rewardEvidence.ok && !occurrence.ok) {
+        return { source, found: false, errors: [full.error, receipt.error, rewardEvidence.error, occurrence.error].filter(Boolean) };
       }
       const fullValue = full.ok ? full.value : null;
       const receiptValue = receipt.ok ? receipt.value : null;
+      const rewardValue = rewardEvidence.ok ? rewardEvidence.value : null;
       const occurrenceValue = occurrence.ok ? occurrence.value : null;
-      const classification = network.classifyReceipt({
-        tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue,
-        receipt: receiptValue?.receipt ?? receiptValue,
-      });
+      const rewardClassification = rewardValue
+        ? network.classifyCommunityRewardReceipt(rewardValue, txHash)
+        : null;
+      const rewardEvidenceBound = rewardClassification !== null;
+      const classification = rewardEvidenceBound
+        ? rewardClassification
+        : network.classifyReceipt({
+          tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue,
+          receipt: receiptValue?.receipt ?? receiptValue,
+        });
       const occurrenceRows = Array.isArray(occurrenceValue?.occurrences) ? occurrenceValue.occurrences : [];
       const occurrenceHeight = occurrenceValue?.unique_occurrence === true && occurrenceRows.length === 1
         ? integerOrNull(occurrenceRows[0]?.block_height)
@@ -246,6 +256,8 @@
         found: true,
         full: fullValue,
         receipt: receiptValue,
+        rewardEvidence: rewardValue,
+        rewardEvidenceBound,
         occurrence: occurrenceValue,
         classification,
         provenance,
@@ -706,6 +718,7 @@
       ]));
       if (occurrence.full) card.append(rawSection("Transaction", occurrence.full));
       if (occurrence.receipt) card.append(rawSection("Receipt", occurrence.receipt));
+      if (occurrence.rewardEvidence) card.append(rawSection("Community reward receipt", occurrence.rewardEvidence));
       if (occurrence.occurrence) card.append(rawSection("Preserved block occurrence", occurrence.occurrence));
       return card;
     }

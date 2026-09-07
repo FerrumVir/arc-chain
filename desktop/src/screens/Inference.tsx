@@ -29,8 +29,16 @@ const EXAMPLES = [
 
 const ARC_HASH_RE = /^0x[0-9a-f]{64}$/;
 const COMMUNITY_REWARD_ARC = 2.5;
-const MAX_RECEIPT_POLLS = 20;
-const MAX_RECEIPT_POLL_MS = 60_000;
+// This exact native/browser sentinel is the only proof that no inference POST
+// was sent. Every other error may be an ambiguous accepted write and is
+// terminal for this click.
+const INFERENCE_PRE_DISPATCH_UNAVAILABLE =
+  "ARC_INFERENCE_PRE_DISPATCH_UNAVAILABLE:";
+// Match the operator walkthrough's 180-second settlement budget. A healthy
+// inference must not look failed merely because block inclusion took longer
+// than the old one-minute UI window.
+const MAX_RECEIPT_POLLS = 61;
+const MAX_RECEIPT_POLL_MS = 180_000;
 
 /// Local execution stays first. If this machine cannot serve, call a seed's
 /// `/inference/run` before the standalone consensus route: that endpoint gives
@@ -48,17 +56,13 @@ async function runInferenceSmart(
       const message = String(
         directErr instanceof Error ? directErr.message : directErr,
       );
-      // The direct command retries every coordinator for service/topology
-      // failures. Reaching this aggregate error means no community assignment
-      // completed, so a sharded-consensus fallback cannot duplicate a reward.
-      if (
-        message.includes("all coordinators failed (direct path)") ||
-        message.includes("no coordinator answered /health")
-      ) {
+      // The native/browser direct path may inspect multiple read-only
+      // readiness endpoints, but emits this typed sentinel only if it sent no
+      // POST at all. Never infer write safety from 503 text, connection
+      // errors, or a timeout: any of those can arrive after acceptance.
+      if (message.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE)) {
         return await api.runInferenceViaCoordinator(prompt, maxTokens);
       }
-      // In particular, never fall back after a 504 that says a claimed
-      // community assignment may still settle.
       throw directErr;
     }
   };
@@ -70,17 +74,10 @@ async function runInferenceSmart(
     return r;
   } catch (err) {
     const msg = String(err instanceof Error ? err.message : err);
-    // Local node returned 503 (observer / no model), or wasn't reachable,
-    // or disagreed about the request shape. Try the coordinator path.
-    if (
-      msg.includes("503") ||
-      msg.includes("SERVICE") ||
-      msg.includes("fetch") ||
-      msg.includes("error sending request") ||
-      msg.toLowerCase().includes("connection") ||
-      msg.includes("No shards") ||
-      msg.includes("No model loaded")
-    ) {
+    // A mutation-free readiness failure is the only safe reason to migrate
+    // the click. Any response/parse/reset/timeout after a local POST is
+    // terminal even when its text happens to mention 503 or "connection".
+    if (msg.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE)) {
       return await fallbackToCoordinator();
     }
     throw err;
@@ -94,12 +91,25 @@ export function Inference() {
   const [copied, setCopied] = useState<string | null>(null);
   const [receiptPollingExhausted, setReceiptPollingExhausted] = useState(false);
   const receiptPollBudget = useRef({ key: "", attempts: 0, startedAt: 0 });
+  // React's disabled prop is applied only after the next render. Two click or
+  // keyboard activations in the same event turn can otherwise enqueue two
+  // mutations—and therefore two reward-capable POSTs. This synchronous latch
+  // closes before mutate() returns and reopens only after the attempt settles.
+  const inferenceRunInFlight = useRef(false);
   const run = useMutation<InferenceResult, Error, void>({
     mutationFn: async () => {
       if (!prompt.trim()) throw new Error("Prompt is empty");
       return await runInferenceSmart(prompt.trim(), maxTokens);
     },
+    onSettled: () => {
+      inferenceRunInFlight.current = false;
+    },
   });
+  const submitInference = () => {
+    if (inferenceRunInFlight.current || !prompt.trim()) return;
+    inferenceRunInFlight.current = true;
+    run.mutate();
+  };
   const copy = async (key: string, value: string) => {
     await navigator.clipboard.writeText(value);
     setCopied(key);
@@ -301,6 +311,15 @@ export function Inference() {
   ) {
     displayedReceiptStatus = "receipt_unavailable";
   }
+  const recheckCommunityReward = () => {
+    receiptPollBudget.current = {
+      key: receiptPollKey,
+      attempts: 0,
+      startedAt: Date.now(),
+    };
+    setReceiptPollingExhausted(false);
+    void rewardReceipt.refetch();
+  };
 
   return (
     <div className="main-inner" data-testid="inference-screen">
@@ -473,7 +492,7 @@ export function Inference() {
           <div style={{ flex: 1, minWidth: "var(--space-3)" }} />
           <button
             className="btn btn-primary btn-lg"
-            onClick={() => run.mutate()}
+            onClick={submitInference}
             disabled={run.isPending || !prompt.trim()}
             data-testid="btn-run-inference"
           >
@@ -512,7 +531,13 @@ export function Inference() {
       </Card>
 
       {run.isSuccess && run.data && (
-        <Card data-testid="inference-result">
+        <Card
+          data-testid="inference-result"
+          data-output-hash={run.data.outputHash}
+          data-model-id={run.data.modelHash}
+          data-routed-via={run.data.routedVia ?? ""}
+          data-coordinator={run.data.coordinator ?? ""}
+        >
           <CardHeader
             title={
               <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
@@ -615,10 +640,16 @@ export function Inference() {
             </span>
           </div>
 
-          {run.data.settlement && (
+          {settlement && (
             <div
               data-testid="community-settlement"
               data-receipt-status={displayedReceiptStatus}
+              data-tx-type={settlement.txType}
+              data-tx-hash={settlement.txHash}
+              data-job-id={settlement.jobId}
+              data-worker={settlement.worker}
+              data-receipt-url={settlement.receiptUrl}
+              data-submitted={String(settlement.submitted)}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -642,6 +673,20 @@ export function Inference() {
                 <strong>Community reward:</strong>{" "}
                 {communitySettlementMessage}
               </span>
+              {receiptExpectation &&
+                (receiptPollingExhausted ||
+                  canonicalReceiptUnavailable ||
+                  rewardReceipt.isError) && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={recheckCommunityReward}
+                    data-testid="btn-recheck-community-reward"
+                    style={{ marginLeft: "auto", flexShrink: 0 }}
+                  >
+                    Recheck receipt
+                  </button>
+                )}
             </div>
           )}
 

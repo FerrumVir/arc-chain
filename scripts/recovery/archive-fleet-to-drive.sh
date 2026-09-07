@@ -16,6 +16,9 @@ RECOVERY_FREEZE_MODULE="$SCRIPT_DIR/recovery_freeze.py"
 QUARANTINE_ROUND_DRIVER="$SCRIPT_DIR/quarantine_round_driver.py"
 QUARANTINE_ROUND_MODULE="$SCRIPT_DIR/quarantine_rounds.py"
 LATE_FORK_INTERLOCK_TOOL="$SCRIPT_DIR/legacy-late-fork-interlock.py"
+LEGACY_WAL_NORMALIZER="$SCRIPT_DIR/normalize-legacy-wal.py"
+LEGACY_WAL_NORMALIZATION_LAX="$SCRIPT_DIR/legacy-wal-normalization-lax.json"
+LEGACY_WAL_NORMALIZATION_AMS="$SCRIPT_DIR/legacy-wal-normalization-ams.json"
 DRIVE_REMOTE="${ARC_RECOVERY_DRIVE_REMOTE:-arc-drive-arc:ARC Chain Recovery v0.8}"
 SSH_USER="${ARC_RECOVERY_SSH_USER:-root}"
 
@@ -196,13 +199,13 @@ PY
 
 python3() {
     if [ "$ARC_OPERATOR_PYTHON_READY" != true ]; then
-        command python3 "$@"
+        command python3 -B "$@"
         return
     fi
     [ "$(bootstrap_hash_file "$ARC_OPERATOR_PYTHON_BIN")" = "$ARC_OPERATOR_PYTHON_SHA256" ] || \
         die "pinned Python executable changed during the operator transaction"
     /usr/bin/env -i HOME="$ARCHIVE_FLEET_PINNED_PYTHON_ROOT" PATH=/usr/bin:/bin \
-        LANG=C LC_ALL=C "$ARC_OPERATOR_PYTHON_BIN" -I "$@"
+        LANG=C LC_ALL=C "$ARC_OPERATOR_PYTHON_BIN" -B -I "$@"
 }
 
 assert_github_anchor_tool() {
@@ -6155,7 +6158,8 @@ for node,host in fleet:
             or cross.get("challenge")!=challenge
             or cross.get("quarantine_status_sha256")!=digest(canonical(cross.get("quarantine_status")))):
         raise SystemExit(f"maintenance evidence bundle public cross proof differs: {node}")
-    if (persisted.get("schema")!="arc.recovery.persisted-legacy-head.v1"
+    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v1",
+                                        "arc.recovery.persisted-legacy-head.v2"}
             or (persisted.get("capture_id"),persisted.get("node"),persisted.get("freeze_plan_sha256"))!=identity
             or persisted.get("source_main_commit")!=source_commit
             or persisted.get("writer_stopped") is not True
@@ -6603,7 +6607,8 @@ for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows
             or public_latest["block_hash"]!=origin.get("latest_block_hash")
             or fenced_tuple["height"]<public_tuple["height"]):
         raise SystemExit(f"maintenance-boundary public/post-quarantine tuple differs: {node}")
-    if (persisted.get("schema")!="arc.recovery.persisted-legacy-head.v1"
+    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v1",
+                                        "arc.recovery.persisted-legacy-head.v2"}
             or (persisted.get("capture_id"),persisted.get("node"),persisted.get("freeze_plan_sha256"))!=identity
             or persisted.get("source_main_commit")!=source_commit
             or persisted.get("boot_id")!=next(row["boot_id"] for row in plan["nodes"] if row["name"]==node)
@@ -7358,7 +7363,7 @@ PY
 
 quarantine_round_prefix_ref() {
     local round_root="$1" through="$2" node="$3"
-    python3 -I "$QUARANTINE_ROUND_DRIVER" prefix-ref \
+    python3 -B -I "$QUARANTINE_ROUND_DRIVER" prefix-ref \
         --round-root "$round_root" --through "$through" --node "$node"
 }
 
@@ -7452,7 +7457,7 @@ PY
     done
     [ "$failed" -eq 0 ] || die \
         "one or more still-live targets failed the authenticated quarantine-round bracket"
-    python3 -I "$QUARANTINE_ROUND_DRIVER" build-cross \
+    python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-cross \
         --freeze-plan "$freeze_plan" --freeze-plan-sha256 "$freeze_sha" \
         --capture-id "$capture_id" --targets "$targets" --public "$public_receipt" \
         --bracket-root "$bracket_root" --output "$cross" >/dev/null
@@ -7493,7 +7498,21 @@ capture_quarantine_round_live_sources() {
             else
                 minimum_height="$authenticated_after"
             fi
-            run_remote "$node" capture-live-source "$capture_id" "$node" "$freeze_sha" \
+            local capture_action="capture-live-source"
+            local normalization_args=()
+            case "$node" in
+                lax)
+                    capture_action="capture-normalized-live-source"
+                    normalization_args=("$(hash_file "$LEGACY_WAL_NORMALIZER")" \
+                        "$(hash_file "$LEGACY_WAL_NORMALIZATION_LAX")")
+                    ;;
+                ams)
+                    capture_action="capture-normalized-live-source"
+                    normalization_args=("$(hash_file "$LEGACY_WAL_NORMALIZER")" \
+                        "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")")
+                    ;;
+            esac
+            run_remote "$node" "$capture_action" "$capture_id" "$node" "$freeze_sha" \
                 "$round_number" \
                 "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
                 "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
@@ -7510,7 +7529,8 @@ capture_quarantine_round_live_sources() {
                 "$(quarantine_cross_node_field "$cross" "$node" loopback_latest_height)" \
                 "$(quarantine_cross_node_field "$cross" "$node" loopback_latest_block_hash)" \
                 "$public_sha" "$cross_sha" preauthorization-boundary \
-                "$minimum_height" - - - "$cross_sha" - - > "$temporary"
+                "$minimum_height" - - - "$cross_sha" - - \
+                "${normalization_args[@]}" > "$temporary"
             chmod 400 "$temporary"
             publish_canonical_maintenance_input "$temporary" "$output_root/$node.json"
         ) > "$attempt_root/$node-live-source.log" 2>&1 &
@@ -7699,7 +7719,21 @@ print(" ".join(map(str,values)))
 PY
             )
             temporary="$log_root/$node-final-source.new.json"
-            run_remote "$node" capture-live-source "$capture_id" "$node" "$freeze_sha" \
+            local capture_action="capture-live-source"
+            local normalization_args=()
+            case "$node" in
+                lax)
+                    capture_action="capture-normalized-live-source"
+                    normalization_args=("$(hash_file "$LEGACY_WAL_NORMALIZER")" \
+                        "$(hash_file "$LEGACY_WAL_NORMALIZATION_LAX")")
+                    ;;
+                ams)
+                    capture_action="capture-normalized-live-source"
+                    normalization_args=("$(hash_file "$LEGACY_WAL_NORMALIZER")" \
+                        "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")")
+                    ;;
+            esac
+            run_remote "$node" "$capture_action" "$capture_id" "$node" "$freeze_sha" \
                 "$round" \
                 "$(freeze_node_field "$freeze_plan" "$node" writer_pid)" \
                 "$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)" \
@@ -7715,7 +7749,8 @@ PY
                 "$authenticated_hash" "$public_sha" "$cross_sha" \
                 post-quarantine-final-export "$minimum_height" "$expected_height" \
                 "$expected_hash" "$expected_state" "$stability_sha" \
-                "$network_receipt_sha" "$owned_ruleset_sha" > "$temporary"
+                "$network_receipt_sha" "$owned_ruleset_sha" \
+                "${normalization_args[@]}" > "$temporary"
             chmod 400 "$temporary"
             python3 - "$temporary" "$node" "$expected_height" "$expected_hash" \
                 "$expected_state" "$stability_sha" <<'PY'
@@ -8008,7 +8043,7 @@ PY
     # with its own crash-resume closure.  Validate the exact existing bytes,
     # finish the prefix copy, and let a later round own every remaining node.
     if [ -f "$result" ] && [ ! -L "$result" ]; then
-        python3 -I "$QUARANTINE_ROUND_DRIVER" build-result \
+        python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-result \
             --round-number "$round_number" --round-root "$round_root" \
             --authorization "$authorization" --readiness "$readiness" \
             --dispatch "$mutation_dispatch" --applied-root "$applied_root" \
@@ -8112,7 +8147,7 @@ PY
                 "not every still-live target accepted the exact quarantine-round authorization"
             if [ ! -f "$readiness" ]; then
                 if [ "$round_number" -eq 1 ]; then
-                    python3 -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
+                    python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
                         --round-number "$round_number" --round-root "$round_root" \
                         --authorization "$authorization" --acceptance-root "$acceptance_root" \
                         --operator-selection-monotonic-ns \
@@ -8121,7 +8156,7 @@ PY
                             "$operator_selection_realtime_ns" \
                         --output "$readiness" >/dev/null
                 else
-                    python3 -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
+                    python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-readiness \
                         --round-number "$round_number" --round-root "$round_root" \
                         --authorization "$authorization" --acceptance-root "$acceptance_root" \
                         --output "$readiness" >/dev/null
@@ -8229,7 +8264,7 @@ PY
     if [ -n "$remaining_proof_root" ]; then
         result_args+=(--remaining-proof-root "$remaining_proof_root")
     fi
-    python3 -I "$QUARANTINE_ROUND_DRIVER" "${result_args[@]}" >/dev/null
+    python3 -B -I "$QUARANTINE_ROUND_DRIVER" "${result_args[@]}" >/dev/null
     final_round_root="$round_root/round-$round_number"
     if [ ! -e "$final_round_root" ]; then
         mkdir -m 700 -- "$final_round_root"
@@ -8339,7 +8374,7 @@ run_quarantine_generation_rounds() {
             "$attempt_root/authenticated-target-cross.json" "$attempt_root" \
             "$inspector_binary_sha" "$inspector_genesis_sha" \
             "$inspector_legacy_validators_sha" "$allow_unbound_legacy_wal"
-        python3 -I "$QUARANTINE_ROUND_DRIVER" build-authorization \
+        python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-authorization \
             --freeze-plan "$freeze_plan" --freeze-plan-sha256 "$freeze_sha" \
             --capture-id "$capture_id" --round-number "$round_number" \
             --round-root "$round_root" --public "$public_receipt" \
@@ -8372,7 +8407,7 @@ run_quarantine_generation_rounds() {
                 "$round_number"
         fi
     done
-    python3 -I "$QUARANTINE_ROUND_DRIVER" build-ledger \
+    python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-ledger \
         --round-root "$round_root" --freeze-plan-sha256 "$freeze_sha" \
         --capture-id "$capture_id" --output "$output" >/dev/null
     hash_file "$output"
@@ -8637,6 +8672,12 @@ capture_phase() {
         "$inspector_validators_sha" "$inspector_legacy_validators_sha"; do
         require_hash "$inspector_expected" "capture recovery-export input hash"
     done
+    for inspector_path in "$LEGACY_WAL_NORMALIZER" \
+        "$LEGACY_WAL_NORMALIZATION_LAX" "$LEGACY_WAL_NORMALIZATION_AMS"; do
+        require_absolute_file "$inspector_path" "content-pinned legacy WAL normalization input"
+    done
+    [ "$allow_unbound_legacy_wal" = true ] || die \
+        "LAX/AMS content-pinned normalization requires --allow-unbound-legacy-wal"
     [ "$(hash_file "$inspector_binary")" = "$inspector_binary_sha" ] || \
         die "capture inspector binary differs from its explicit hash"
     [ "$(hash_file "$inspector_genesis")" = "$inspector_genesis_sha" ] || \
@@ -8944,7 +8985,7 @@ PY
     require_hash "$quarantine_generation_ledger_sha" "quarantine generation ledger root"
     local active_quarantine_nodes=() stopped_quarantine_nodes=() transition_kind
     for quarantine_node in nyc lax ams lhr nrt sgp; do
-        transition_kind="$(python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+        transition_kind="$(python3 -B -I "$QUARANTINE_ROUND_DRIVER" extract \
             --ledger "$quarantine_generation_ledger" --node "$quarantine_node" \
             --kind transition-kind)"
         if [ "$transition_kind" = network-quarantine-active ]; then
@@ -8955,7 +8996,7 @@ PY
             die "unknown quarantine transition kind for $quarantine_node: $transition_kind"
         fi
     done
-    python3 -I "$QUARANTINE_ROUND_DRIVER" build-first-boundary \
+    python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-first-boundary \
         --ledger "$quarantine_generation_ledger" \
         --live-observation-selection "$observation_selection" \
         --live-observation-selection-sha256 "$observation_selection_sha" \
@@ -8968,7 +9009,7 @@ PY
     local quarantine_node quarantine_index quarantine_failed=0
     local quarantine_pids=() quarantine_nodes=()
     for quarantine_node in "${active_quarantine_nodes[@]}"; do
-        python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+        python3 -B -I "$QUARANTINE_ROUND_DRIVER" extract \
             --ledger "$quarantine_generation_ledger" --node "$quarantine_node" \
             --kind network > "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
         chmod 400 "$log_root/$quarantine_node-network-quarantine-receipt.new.json"
@@ -9168,7 +9209,7 @@ PY
         (
             local node_round node_authorization_sha node_readiness_sha node_transition_sha
             read -r node_round node_authorization_sha node_readiness_sha node_transition_sha < <(
-                python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+                python3 -B -I "$QUARANTINE_ROUND_DRIVER" extract \
                     --ledger "$quarantine_generation_ledger" --node "$node" --kind refs
             )
             stop_after_quarantine_round_exact "$capture_id" "$freeze_sha" "$node" \
@@ -9197,7 +9238,7 @@ PY
     done
     for node in "${stopped_quarantine_nodes[@]}"; do
         read -r node_round node_authorization_sha node_readiness_sha node_transition_sha < <(
-            python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+            python3 -B -I "$QUARANTINE_ROUND_DRIVER" extract \
                 --ledger "$quarantine_generation_ledger" --node "$node" --kind refs
         )
         run_remote "$node" quarantine-round-status "$capture_id" "$node" "$freeze_sha" \
@@ -9250,7 +9291,7 @@ PY
         fi
         (
             local node_kind
-            node_kind="$(python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+            node_kind="$(python3 -B -I "$QUARANTINE_ROUND_DRIVER" extract \
                 --ledger "$quarantine_generation_ledger" --node "$node" \
                 --kind transition-kind)"
             if [ "$node_kind" = network-quarantine-active ]; then
@@ -9259,7 +9300,7 @@ PY
                     "$inspector_validators_sha" "$inspector_legacy_validators_sha" \
                     > "$log_root/$node-persisted-head.new.json"
             elif [ "$node_kind" = persistently-stopped-precommit ]; then
-                python3 -I "$QUARANTINE_ROUND_DRIVER" extract \
+                python3 -B -I "$QUARANTINE_ROUND_DRIVER" extract \
                     --ledger "$quarantine_generation_ledger" --node "$node" \
                     --kind transition | python3 -c \
                     'import hashlib,json,sys; value=json.load(sys.stdin); persisted=value["persisted_head"]; raw=(json.dumps(persisted["value"],sort_keys=True,separators=(",",":"))+"\n").encode(); assert hashlib.sha256(raw).hexdigest()==persisted["sha256"] and persisted["value"]["source_pair_role"]=="preauthorization-boundary"; sys.stdout.buffer.write(raw)' \
@@ -9565,6 +9606,22 @@ stage_capture_inspector_inputs() {
     stage_file "$node" "$freeze_sha" validators "$validators" "$validators_sha"
     stage_file "$node" "$freeze_sha" legacy-validators \
         "$legacy_validators" "$legacy_validators_sha"
+    case "$node" in
+        lax)
+            stage_file "$node" "$freeze_sha" wal-normalizer \
+                "$LEGACY_WAL_NORMALIZER" "$(hash_file "$LEGACY_WAL_NORMALIZER")"
+            stage_file "$node" "$freeze_sha" wal-normalization-plan \
+                "$LEGACY_WAL_NORMALIZATION_LAX" \
+                "$(hash_file "$LEGACY_WAL_NORMALIZATION_LAX")"
+            ;;
+        ams)
+            stage_file "$node" "$freeze_sha" wal-normalizer \
+                "$LEGACY_WAL_NORMALIZER" "$(hash_file "$LEGACY_WAL_NORMALIZER")"
+            stage_file "$node" "$freeze_sha" wal-normalization-plan \
+                "$LEGACY_WAL_NORMALIZATION_AMS" \
+                "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")"
+            ;;
+    esac
 }
 
 verify_remote_validator_key_identity() {
@@ -12360,6 +12417,14 @@ PY
         "$shared_root" freeze-plan.json.sha256
     register_shared_input "$ORCHESTRATOR" "$orchestrator_sha" "$shared_root" archive-fleet-to-drive.sh
     register_shared_input "$REMOTE_HELPER" "$helper_sha" "$shared_root" archive-node.sh
+    register_shared_input "$LEGACY_WAL_NORMALIZER" \
+        "$(hash_file "$LEGACY_WAL_NORMALIZER")" "$shared_root" normalize-legacy-wal.py
+    register_shared_input "$LEGACY_WAL_NORMALIZATION_LAX" \
+        "$(hash_file "$LEGACY_WAL_NORMALIZATION_LAX")" "$shared_root" \
+        legacy-wal-normalization-lax.json
+    register_shared_input "$LEGACY_WAL_NORMALIZATION_AMS" \
+        "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")" "$shared_root" \
+        legacy-wal-normalization-ams.json
     register_shared_input "$ROLLOUT_TOOL" "$rollout_tool_sha" "$shared_root" recovery_rollout.py
     register_shared_input "$SCRIPT_DIR/recovery-manifest.schema.json" "$schema_sha" \
         "$shared_root" recovery-manifest.schema.json

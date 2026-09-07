@@ -3,6 +3,7 @@ mod hardware;
 mod identity;
 mod node_manager;
 mod paths;
+mod production_acceptance;
 mod rpc_client;
 mod store;
 mod tray;
@@ -44,10 +45,18 @@ pub struct AppState {
     /// inference response. Receipt polling must match this entry; an IPC caller
     /// cannot select a different allowlisted seed after the fact.
     pub community_receipt_routes: Arc<Mutex<HashMap<String, CommunityReceiptRoute>>>,
-    /// The seed currently elected for chain reads, plus when it was elected.
-    /// Re-probed on a TTL rather than per request — `node_status` polls every
-    /// 1.5s and probing six seeds that often would be pointless load on a
-    /// live production network.
+    /// Once a community inference returns a settlement identity, all chain
+    /// reads in this process stay on that exact coordinator.  Production
+    /// validators are intentionally independent chains; electing a different,
+    /// merely fresher seed for Earnings or Explorer can make a just-confirmed
+    /// payment disappear or cross-bind it to unrelated block history.
+    pub community_chain_host: Arc<Mutex<Option<String>>>,
+    /// Serializes community inference writes so two IPC requests cannot race
+    /// the session's first immutable receipt-origin selection.
+    pub community_inference_write: Arc<Mutex<()>>,
+    /// The immutable seed elected by the first session chain read, plus when
+    /// it was elected. An unavailable source remains unavailable rather than
+    /// silently switching wallets or reward history to an independent chain.
     pub chain_host: Arc<Mutex<Option<(commands::ChainHostChoice, std::time::Instant)>>>,
     /// Serializes wallet writes so two UI clicks cannot sign the same account
     /// nonce concurrently. This lock never contains the recovery phrase.
@@ -71,8 +80,35 @@ pub struct CommunityReceiptRoute {
     pub receipt_url: String,
 }
 
+fn configured_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        // A signed transaction is bound to the elected origin. Never allow a
+        // gateway redirect to move that POST to another scheme or host.
+        .redirect(reqwest::redirect::Policy::none())
+        // Interactive launches may use an explicitly configured proxy, but
+        // reqwest must never replay a wallet or inference write by itself.
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|error| format!("build redirect-fenced desktop HTTP client: {error}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let production_acceptance = match production_acceptance::request_from_args(std::env::args_os())
+    {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("ARC packaged production acceptance refused: {error}");
+            std::process::exit(64);
+        }
+    };
+    if production_acceptance.is_some() {
+        if let Err(error) = production_acceptance::reject_ambient_network_authority() {
+            eprintln!("ARC packaged production acceptance refused before Tauri setup: {error}");
+            std::process::exit(64);
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -80,18 +116,51 @@ pub fn run() {
         )
         .init();
 
+    // Acceptance is a shipped-executable native-core proof, not a UI test.
+    // Branch before constructing Tauri so no WebView page, plugin, tray,
+    // updater, autostart hook, or IPC handler can run alongside its one-shot
+    // inference. The separately sealed AppImage gate covers real UI → IPC.
+    if let Some(request) = production_acceptance {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("ARC packaged production acceptance could not start its isolated async runtime: {error}");
+                std::process::exit(70);
+            }
+        };
+        match runtime.block_on(production_acceptance::run_standalone(&request)) {
+            Ok(()) => {
+                println!(
+                    "VERIFIED ARC packaged native production acceptance {}",
+                    request.output.display()
+                );
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("ARC packaged native production acceptance failed: {error}");
+                std::process::exit(70);
+            }
+        }
+    }
+
     let node = Arc::new(Mutex::new(node_manager::NodeManager::new()));
     // Store starts empty; `setup()` resolves the per-platform writable
     // data dir via Tauri's PathResolver and loads from there.
     let store = Arc::new(Mutex::new(store::Store::default()));
     let data_dir = Arc::new(Mutex::new(PathBuf::new()));
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        // A signed transaction is bound to the elected origin. Never allow a
-        // gateway redirect to move that POST to another scheme or host.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_default();
+    let http = match configured_http_client() {
+        Ok(http) => http,
+        Err(error) => {
+            // Falling back to a default client here would silently re-enable
+            // redirects for wallet and inference traffic. If the constrained
+            // transport cannot be constructed, refuse to start instead.
+            eprintln!("ARC desktop refused an unconstrained HTTP fallback: {error}");
+            std::process::exit(70);
+        }
+    };
 
     let has_tray = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data_migration_error = Arc::new(Mutex::new(None));
@@ -102,6 +171,8 @@ pub fn run() {
         http,
         tier1_routes: Arc::new(Mutex::new(HashMap::new())),
         community_receipt_routes: Arc::new(Mutex::new(HashMap::new())),
+        community_chain_host: Arc::new(Mutex::new(None)),
+        community_inference_write: Arc::new(Mutex::new(())),
         chain_host: Arc::new(Mutex::new(None)),
         wallet_write: Arc::new(Mutex::new(())),
         has_tray: has_tray.clone(),

@@ -303,6 +303,19 @@ test.describe("Network screen - transaction lookup", () => {
     await page.getByTestId("tx-lookup-submit").click();
     await expect(page.getByTestId("tx-status-mined")).toBeVisible();
     const result = page.getByTestId("tx-lookup-result");
+    await expect(result).toHaveAttribute("data-tx-hash", MINED);
+    await expect(result).toHaveAttribute("data-lookup-status", "mined");
+    await expect(result).toHaveAttribute(
+      "data-source-host",
+      "http://140.82.16.112:9090",
+    );
+    await expect(result).toHaveAttribute("data-block-height", "123462");
+    await expect(result).toHaveAttribute(
+      "data-block-hash",
+      "0x9f2c41ab77e0d5c3b8a16e94f20d7a5589cc31be4470a2e6d1f8039b5ca7e412",
+    );
+    await expect(result).toHaveAttribute("data-tx-index", "0");
+    await expect(result).toHaveAttribute("data-success", "true");
     await expect(result).toContainText("In a block");
     await expect(result).toContainText("Position in block");
     await expect(result).toContainText("does not expose transaction type");
@@ -370,6 +383,12 @@ test.describe("Network screen - blocks and attestations", () => {
     const nums = heights.map((h) => Number(h.replace(/[^\d]/g, "")));
     const sorted = [...nums].sort((a, b) => b - a);
     expect(nums).toEqual(sorted);
+    const first = page.getByTestId("block-row-123469");
+    await expect(first).toHaveAttribute("data-block-height", "123469");
+    const expectedHash = `0x${`${(123_469).toString(16)}c41ab77e0d5c3b8a16e94f20d7a5589cc31be4470a2e6d1f8039b5ca7e4`
+      .padEnd(64, "0")
+      .slice(0, 64)}`;
+    await expect(first).toHaveAttribute("data-block-hash", expectedHash);
   });
 
   test("a block expands to its transactions on demand", async ({ page }) => {
@@ -424,14 +443,20 @@ test.describe("Network screen - reached from elsewhere", () => {
   }) => {
     await page.goto("/");
     await page.getByTestId("nav-earnings").click();
-    const lookupBtn = page
-      .getByTestId(/^btn-lookup-earnings-/)
-      .first();
+    const expectedTx = `0x${"aa".repeat(32)}`;
+    const exactRow = page
+      .getByTestId("all-attestations")
+      .locator(`[data-tx-hash="${expectedTx}"]`);
+    await expect(exactRow).toHaveCount(1);
+    const lookupBtn = exactRow.getByRole("button", {
+      name: "Look up on the pinned chain host",
+    });
     await expect(lookupBtn).toBeVisible();
     await lookupBtn.click();
     // Navigates to Network AND runs the lookup, prefilled.
     await expect(page.getByTestId("network-screen")).toBeVisible();
-    await expect(page.getByTestId("tx-lookup-input")).not.toHaveValue("");
-    await expect(page.getByTestId("tx-lookup-result")).toBeVisible();
+    await expect(page.getByTestId("tx-lookup-input")).toHaveValue(expectedTx);
+    await expect(page.getByTestId("tx-lookup-result"))
+      .toHaveAttribute("data-tx-hash", expectedTx);
   });
 });

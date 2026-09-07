@@ -92,7 +92,7 @@ python3() {
     [ "$current_sha" = "$ARC_RECOVERY_PYTHON_SHA256" ] || \
         die "pinned Python content hash changed"
     /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C TZ=UTC PYTHONHASHSEED=0 \
-        "$ARC_RECOVERY_PYTHON_PATH" -I "$@"
+        "$ARC_RECOVERY_PYTHON_PATH" -B -I "$@"
 }
 
 cleanup_temporary_path() {
@@ -202,6 +202,16 @@ Usage (operator orchestration only):
     MINIMUM_HEIGHT EXPECTED_HEIGHT_OR_DASH EXPECTED_BLOCK_HASH_OR_DASH \
     EXPECTED_STATE_ROOT_OR_DASH BOUNDARY_PROOF_SHA256 \
     NETWORK_QUARANTINE_RECEIPT_SHA256_OR_DASH OWNED_RULESET_SHA256_OR_DASH
+  archive-node.sh capture-normalized-live-source CAPTURE_SHA256 NODE FREEZE_SHA256 ROUND \
+    WRITER_PID WRITER_START_TICKS BOOT_ID WRITER_CGROUP_SHA256 EXECUTABLE_PATH \
+    EXECUTABLE_SHA256 ARGV_SHA256 DATA_DIR RPC_ORIGIN INSPECTOR_SHA256 \
+    GENESIS_SHA256 LEGACY_VALIDATOR_SET_SHA256 ALLOW_UNBOUND_LEGACY_WAL \
+    PUBLIC_HEIGHT PUBLIC_BLOCK_HASH AUTHENTICATED_HEIGHT AUTHENTICATED_BLOCK_HASH \
+    PUBLIC_HEIGHT_RECEIPT_SHA256 AUTHENTICATED_HEIGHT_CROSS_SHA256 SOURCE_PAIR_ROLE \
+    MINIMUM_HEIGHT EXPECTED_HEIGHT_OR_DASH EXPECTED_BLOCK_HASH_OR_DASH \
+    EXPECTED_STATE_ROOT_OR_DASH BOUNDARY_PROOF_SHA256 \
+    NETWORK_QUARANTINE_RECEIPT_SHA256_OR_DASH OWNED_RULESET_SHA256_OR_DASH \
+    WAL_NORMALIZER_SHA256 WAL_NORMALIZATION_PLAN_SHA256
   archive-node.sh quarantine-round-apply CAPTURE_SHA256 NODE FREEZE_SHA256 \
     ROUND AUTHORIZATION_SHA256 READINESS_SHA256
   archive-node.sh quarantine-round-applied-status CAPTURE_SHA256 NODE FREEZE_SHA256 \
@@ -4436,7 +4446,8 @@ PY
 # a pair that the pinned recovery binary strictly replays byte-for-byte can be
 # selected for a quarantine authorization.
 capture_live_legacy_source() {
-    [ "$#" -eq 31 ] || die "capture-live-source requires the exact writer, height, role, and inspector boundary"
+    { [ "$#" -eq 31 ] || [ "$#" -eq 33 ]; } || \
+        die "live-source capture requires the exact writer, height, role, inspector, and optional normalization boundary"
     local capture_id="$1" node="$2" freeze_sha="$3" round="$4"
     local writer_pid="$5" writer_start="$6" boot_id="$7" writer_cgroup_sha="$8"
     local executable_path="$9" executable_sha="${10}" argv_sha="${11}"
@@ -4449,6 +4460,7 @@ capture_live_legacy_source() {
     local expected_block_hash="${27}" expected_state_root="${28}"
     local boundary_proof_sha="${29}" network_receipt_sha="${30}"
     local owned_ruleset_sha="${31}"
+    local wal_normalizer_sha="${32:--}" wal_normalization_plan_sha="${33:--}"
     require_hash "$capture_id" "capture id"; require_node "$node"
     require_hash "$freeze_sha" "freeze plan hash"; require_uint "$round" "round"
     require_uint "$writer_pid" "writer pid"; require_uint "$writer_start" "writer start ticks"
@@ -4486,6 +4498,13 @@ capture_live_legacy_source() {
     esac
     require_uint "$minimum_height" "source-pair minimum height"
     require_hash "$boundary_proof_sha" "source-pair boundary proof"
+    if [ "$wal_normalizer_sha" != - ] || [ "$wal_normalization_plan_sha" != - ]; then
+        require_hash "$wal_normalizer_sha" "legacy WAL normalizer hash"
+        require_hash "$wal_normalization_plan_sha" "legacy WAL normalization plan hash"
+        case "$node" in lax|ams) ;; *) die "legacy WAL normalization is limited to lax/ams" ;; esac
+        [ "$allow_unbound" = true ] || \
+            die "normalized legacy source requires the explicit unbound-WAL policy"
+    fi
     require_commands python3
     python3 - "$LIVE_SOURCE_CAPTURE_BASE" "$SEAL_BASE" "$capture_id" "$node" \
         "$freeze_sha" "$round" "$writer_pid" "$writer_start" "$boot_id" \
@@ -4495,7 +4514,8 @@ capture_live_legacy_source() {
         "$authenticated_height" "$authenticated_hash" "$public_receipt_sha" "$cross_sha" \
         "$source_pair_role" "$minimum_height" "$expected_height" "$expected_block_hash" \
         "$expected_state_root" "$boundary_proof_sha" "$network_receipt_sha" \
-        "$owned_ruleset_sha" "$0" <<'PY'
+        "$owned_ruleset_sha" "$wal_normalizer_sha" "$wal_normalization_plan_sha" \
+        "$0" <<'PY'
 import datetime
 import fcntl
 import hashlib
@@ -4517,7 +4537,8 @@ import uuid
  public_height_raw, public_hash, authenticated_height_raw, authenticated_hash,
  public_receipt_sha, cross_sha, source_pair_role, minimum_height_raw,
  expected_height_raw, expected_block_hash, expected_state_root,
- boundary_proof_sha, network_receipt_sha, owned_ruleset_sha, helper_raw) = sys.argv[1:]
+ boundary_proof_sha, network_receipt_sha, owned_ruleset_sha, wal_normalizer_sha,
+ wal_normalization_plan_sha, helper_raw) = sys.argv[1:]
 base = pathlib.Path(base_raw); seal = pathlib.Path(seal_raw)
 round_number = int(round_raw); pid = int(pid_raw); start_ticks = int(start_raw)
 public_height = int(public_height_raw); authenticated_height = int(authenticated_height_raw)
@@ -4525,6 +4546,7 @@ minimum_height = int(minimum_height_raw)
 expected_height = None if expected_height_raw == "-" else int(expected_height_raw)
 data_dir = pathlib.Path(data_raw); allow_unbound = allow_raw == "true"
 helper = pathlib.Path(helper_raw)
+normalization_enabled = wal_normalizer_sha != "-"
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MAX_SNAPSHOT = 256 * 1024 * 1024
@@ -4707,6 +4729,16 @@ if (digest_file(inspector,0o500,512*1024*1024)!=inspector_sha
         or digest_file(genesis,0o400,16*1024*1024)!=genesis_sha
         or digest_file(legacy,0o400,16*1024*1024)!=legacy_sha):
     fail("staged live-source inspector inputs differ")
+normalizer=stage/"normalize-legacy-wal.py"
+normalization_plan=stage/"legacy-wal-normalization-plan.json"
+normalization_binding=None
+if normalization_enabled:
+    if (digest_file(normalizer,0o500,4*1024*1024)!=wal_normalizer_sha
+            or digest_file(normalization_plan,0o400,4*1024*1024)
+                !=wal_normalization_plan_sha):
+        fail("staged legacy WAL normalization inputs differ")
+    normalization_binding={"normalizer_sha256":wal_normalizer_sha,
+        "plan_sha256":wal_normalization_plan_sha}
 data_details=data_dir.lstat()
 if (data_dir.is_symlink() or not stat.S_ISDIR(data_details.st_mode) or data_details.st_uid!=0
         or data_details.st_gid!=0 or data_details.st_mode&0o022):
@@ -4738,6 +4770,9 @@ request_binding={"schema":"arc.recovery.quarantine-live-source-request.v1",
  "boundary_proof_sha256":boundary_proof_sha,
  "network_quarantine_receipt_sha256":None if network_receipt_sha=="-" else network_receipt_sha,
  "owned_ruleset_stateless_sha256":None if owned_ruleset_sha=="-" else owned_ruleset_sha}
+if normalization_enabled:
+    request_binding["schema"]="arc.recovery.quarantine-live-source-request.v2"
+    request_binding["wal_normalization"]=normalization_binding
 request_key=sha(canonical(request_binding));generation=round_root/request_key
 ensure_dir(generation);attempts=generation/"attempts";ensure_dir(attempts)
 lock_path=generation/"capture.lock"
@@ -4758,6 +4793,7 @@ receipt_fields={"schema","capture_id","freeze_plan_sha256","source_main_commit",
     "legacy_validator_set_sha256","fixed_pair_path","snapshot_source",
     "existing_source_snapshot_used","rust_capture","head","ancestry_checks",
     "content_sealed","strict_offline_replay"}
+if normalization_enabled:receipt_fields.add("wal_normalization")
 def current_identity(path,expected,label,directory=False):
     path=pathlib.Path(path);details=path.lstat()
     if (path.is_symlink() or (not stat.S_ISDIR(details.st_mode) if directory
@@ -4769,10 +4805,74 @@ def current_identity(path,expected,label,directory=False):
     if not directory:
         observed.update({"sha256":file_sha(path),"size":details.st_size})
     if observed!=expected:fail(f"selected live-source {label} identity changed")
+def validate_normalization(value,attempt,rust):
+    wrapper=value.get("wal_normalization")
+    if (not isinstance(wrapper,dict)
+            or set(wrapper)!={"normalizer_sha256","plan_sha256","receipt"}
+            or wrapper.get("normalizer_sha256")!=wal_normalizer_sha
+            or wrapper.get("plan_sha256")!=wal_normalization_plan_sha):
+        fail("selected legacy WAL normalization wrapper differs")
+    receipt_wrapper=wrapper.get("receipt")
+    if not isinstance(receipt_wrapper,dict) or set(receipt_wrapper)!={"value","sha256"}:
+        fail("selected legacy WAL normalization receipt wrapper differs")
+    receipt=receipt_wrapper["value"];receipt_raw=canonical(receipt)
+    if (sha(receipt_raw)!=receipt_wrapper["sha256"]
+            or secure_raw(attempt/"wal-normalization.json",0o400,32*1024*1024)
+                !=receipt_raw):
+        fail("selected legacy WAL normalization receipt differs")
+    fields={"schema","plan_sha256","node","source_wal","source_snapshot",
+        "partition","sequence_rewrites","derivative_wal","head",
+        "selected_frame_count","excluded_bytes","semantic_stream_sha256",
+        "transform","source_unchanged"}
+    if (not isinstance(receipt,dict) or set(receipt)!=fields
+            or receipt.get("schema")!="arc.recovery.legacy-wal-normalization.v1"
+            or receipt.get("plan_sha256")!=wal_normalization_plan_sha
+            or receipt.get("node")!=node or receipt.get("head")!=value.get("head")
+            or receipt.get("transform")
+                !="copy-selected-runs-rewrite-sequence-and-crc32"
+            or receipt.get("source_unchanged") is not True
+            or HASH_RE.fullmatch(str(receipt.get("semantic_stream_sha256"))) is None
+            or not isinstance(receipt.get("selected_frame_count"),int)
+            or receipt.get("selected_frame_count",0)<=0
+            or not isinstance(receipt.get("excluded_bytes"),int)
+            or receipt.get("excluded_bytes",-1)<0):
+        fail("selected legacy WAL normalization fields differ")
+    plan_raw=secure_raw(normalization_plan,0o400,4*1024*1024)
+    plan_value=parse_canonical(plan_raw,"selected legacy WAL normalization plan")
+    if (sha(plan_raw)!=wal_normalization_plan_sha
+            or plan_value.get("schema")
+                !="arc.recovery.legacy-wal-normalization-plan.v1"
+            or plan_value.get("node")!=node
+            or plan_value.get("head")!=value.get("head")
+            or receipt.get("partition")!=plan_value.get("partition")
+            or receipt.get("sequence_rewrites")!=plan_value.get("sequence_rewrites")):
+        fail("selected legacy WAL normalization plan binding differs")
+    if digest_file(normalizer,0o500,4*1024*1024)!=wal_normalizer_sha:
+        fail("selected legacy WAL normalizer changed")
+    current_identity(data_dir/"state.wal",receipt.get("source_wal"),"normalization source WAL")
+    current_identity(attempt/"live.snapshot.lz4",receipt.get("source_snapshot"),
+        "normalization source snapshot")
+    normalized=attempt/"normalized-source"
+    current_identity(normalized,rust.get("source_data_dir"),"normalized source directory",True)
+    current_identity(normalized/"state.wal",receipt.get("derivative_wal"),
+        "normalized derivative WAL")
+    source_prefix=rust.get("source_wal_prefix",{})
+    derivative=receipt.get("derivative_wal",{})
+    if (derivative.get("sha256")!=plan_value.get("derivative_wal",{}).get("sha256")
+            or derivative.get("size")!=plan_value.get("derivative_wal",{}).get("size")
+            or derivative.get("sha256")!=source_prefix.get("accepted_prefix_sha256")
+            or derivative.get("size")!=source_prefix.get("accepted_prefix_bytes")
+            or source_prefix.get("quarantined_suffix_bytes_at_loader")!=0
+            or source_prefix.get("loader_tail_reason")!="none"
+            or rust.get("source_snapshot",{}).get("sha256")
+                !=receipt.get("source_snapshot",{}).get("sha256")):
+        fail("normalized derivative is not the exact strict Rust capture source")
+    return receipt
 def validate_selected_capture(raw,label):
     value=parse_canonical(raw,label)
     if (set(value)!=receipt_fields
-            or value.get("schema")!="arc.recovery.quarantine-live-source-capture.v1"
+            or value.get("schema")!=("arc.recovery.quarantine-live-source-capture.v2"
+                if normalization_enabled else "arc.recovery.quarantine-live-source-capture.v1")
             or (value.get("capture_id"),value.get("freeze_plan_sha256"),
                 value.get("source_main_commit"),value.get("round_number"),value.get("node"),
                 value.get("host"))!=(capture,freeze,plan["source_commit"],round_number,node,FLEET[node])
@@ -4794,6 +4894,9 @@ def validate_selected_capture(raw,label):
             or value.get("content_sealed") is not True
             or value.get("strict_offline_replay") is not True):
         fail("selected live source capture request binding differs")
+    if normalization_enabled and value.get("wal_normalization",{}).get("plan_sha256") \
+            !=wal_normalization_plan_sha:
+        fail("selected live source normalization plan differs")
     attempt_id=value.get("capture_attempt_id")
     try:parsed_attempt_id=uuid.UUID(str(attempt_id))
     except (ValueError,TypeError) as error:raise RuntimeError("selected live source attempt id differs") from error
@@ -4819,7 +4922,8 @@ def validate_selected_capture(raw,label):
     if (not isinstance(fixed,dict) or set(fixed)!={"data_dir","state_wal","snapshot",
             "genesis_binding","strict_replay"} or fixed.get("strict_replay") is not True):
         fail("selected fixed live-source pair fields differ")
-    current_identity(data_dir,rust.get("source_data_dir"),"source directory",True)
+    rust_source_dir=attempt/"normalized-source" if normalization_enabled else data_dir
+    current_identity(rust_source_dir,rust.get("source_data_dir"),"source directory",True)
     current_identity(attempt/"live.snapshot.lz4",rust.get("source_snapshot"),"captured snapshot")
     current_identity(genesis,rust.get("genesis"),"staged genesis")
     current_identity(legacy,rust.get("legacy_validator_set"),"staged legacy validator set")
@@ -4834,6 +4938,9 @@ def validate_selected_capture(raw,label):
             or fixed.get("snapshot",{}).get("sha256")
                 !=rust.get("source_snapshot",{}).get("sha256")):
         fail("selected fixed live-source pair is not the exact WAL prefix/snapshot")
+    normalization_receipt=None
+    if normalization_enabled:
+        normalization_receipt=validate_normalization(value,attempt,rust)
     verify_writer()
     if listener_owner()!=value.get("snapshot_listener"):
         fail("selected live-source listener no longer belongs to the sealed writer")
@@ -4853,6 +4960,9 @@ def validate_selected_capture(raw,label):
     if ({"height":observed.get("height"),"block_hash":observed.get("block_hash"),
             "state_root":observed.get("state_root")}!=head):
         fail("selected fixed live-source head changed")
+    if normalization_receipt is not None and observed.get("state_root") \
+            !=normalization_receipt["head"]["state_root"]:
+        fail("strict inspector state root differs from the normalization plan")
     return value
 
 if selected.exists() or selected.is_symlink():
@@ -4919,9 +5029,40 @@ for _attempt_number in range(MAX_ATTEMPTS):
         snapshot_sha=hasher.hexdigest()
         verify_writer()
         if listener_owner()!=listener:fail("sealed writer snapshot listener changed during request")
+        capture_data_dir=data_dir
+        normalization_wrapper=None
+        if normalization_enabled:
+            normalized_source=attempt/"normalized-source"
+            normalize_command=[sys.executable,"-I",str(normalizer),"--plan",
+                str(normalization_plan),"--plan-sha256",wal_normalization_plan_sha,
+                "--source-wal",str(data_dir/"state.wal"),"--snapshot",str(snapshot),
+                "--output-data-dir",str(normalized_source)]
+            normalized=subprocess.run(normalize_command,env=command_env,stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,timeout=600,check=False)
+            if normalized.returncode!=0:
+                fail("content-pinned legacy WAL normalization rejected the source/snapshot")
+            normalization_value=parse_canonical(
+                normalized.stdout,"legacy WAL normalization receipt")
+            if (normalization_value.get("schema")
+                    !="arc.recovery.legacy-wal-normalization.v1"
+                    or normalization_value.get("plan_sha256")
+                        !=wal_normalization_plan_sha
+                    or normalization_value.get("node")!=node
+                    or normalization_value.get("source_wal",{}).get("sha256")
+                        !=file_sha(data_dir/"state.wal")
+                    or normalization_value.get("source_snapshot",{}).get("sha256")
+                        !=snapshot_sha
+                    or normalization_value.get("source_unchanged") is not True):
+                fail("legacy WAL normalization receipt identity differs")
+            normalization_raw=canonical(normalization_value)
+            create(attempt/"wal-normalization.json",normalization_raw)
+            normalization_wrapper={"normalizer_sha256":wal_normalizer_sha,
+                "plan_sha256":wal_normalization_plan_sha,
+                "receipt":{"value":normalization_value,"sha256":sha(normalization_raw)}}
+            capture_data_dir=normalized_source
         fixed=attempt/"fixed-source"
         capture_command=[str(inspector),"recovery","capture-legacy-source",
-            "--data-dir",str(data_dir),"--snapshot",str(snapshot),"--genesis",str(genesis),
+            "--data-dir",str(capture_data_dir),"--snapshot",str(snapshot),"--genesis",str(genesis),
             "--legacy-validator-set",str(legacy),"--output-data-dir",str(fixed),
             "--expected-snapshot-sha256",snapshot_sha,"--expected-genesis-sha256",genesis_sha,
             "--expected-legacy-validator-set-sha256",legacy_sha]
@@ -4991,7 +5132,14 @@ for _attempt_number in range(MAX_ATTEMPTS):
             "existing_source_snapshot_used":False,
             "rust_capture":{"value":rust,"sha256":sha(rust_raw)},"head":rust["head"],
             "ancestry_checks":checks,"content_sealed":True,"strict_offline_replay":True}
-        raw=canonical(value);create(attempt/"receipt.json",raw);create(selected,raw)
+        if normalization_enabled:
+            value["schema"]="arc.recovery.quarantine-live-source-capture.v2"
+            value["wal_normalization"]=normalization_wrapper
+            if value["head"]!=normalization_value.get("head"):
+                fail("strict Rust capture head differs from the normalization plan")
+        raw=canonical(value);create(attempt/"receipt.json",raw)
+        if normalization_enabled:validate_selected_capture(raw,"new normalized live source capture")
+        create(selected,raw)
         sys.stdout.buffer.write(raw);raise SystemExit(0)
     except Exception as error:
         last_error=f"{type(error).__name__}:{str(error)}"[:512]
@@ -5640,6 +5788,12 @@ def validate_authorization(raw):
             "boundary_proof_sha256", "network_quarantine_receipt_sha256",
             "owned_ruleset_stateless_sha256",
         }
+        capture_schema = capture_value.get("schema") \
+            if isinstance(capture_value, dict) else None
+        normalized_capture = capture_schema \
+            == "arc.recovery.quarantine-live-source-capture.v2"
+        if normalized_capture:
+            capture_fields.add("wal_normalization")
         expected_target = next(row for row in targets if row["node"] == expected_name)
         expected_writer = {
             "boot_id": expected_target["boot_id"],
@@ -5651,8 +5805,10 @@ def validate_authorization(raw):
         head = capture_value.get("head")
         fixed_path = capture_value.get("fixed_pair_path")
         if (set(capture_value) != capture_fields
-                or capture_value.get("schema")
-                    != "arc.recovery.quarantine-live-source-capture.v1"
+                or capture_schema not in {
+                    "arc.recovery.quarantine-live-source-capture.v1",
+                    "arc.recovery.quarantine-live-source-capture.v2",
+                }
                 or (capture_value.get("capture_id"),
                     capture_value.get("freeze_plan_sha256"),
                     capture_value.get("source_main_commit"),
@@ -5723,6 +5879,56 @@ def validate_authorization(raw):
                 or rust_capture.get("head") != head
                 or not isinstance(fixed, dict) or fixed.get("strict_replay") is not True):
             fail("quarantine-round Rust fixed-pair proof differs")
+        if normalized_capture:
+            normalization = capture_value.get("wal_normalization")
+            if (not isinstance(normalization, dict) or set(normalization) != {
+                    "normalizer_sha256", "plan_sha256", "receipt"
+                } or HASH_RE.fullmatch(str(normalization.get("normalizer_sha256"))) is None
+                    or HASH_RE.fullmatch(str(normalization.get("plan_sha256"))) is None):
+                fail("quarantine-round normalization wrapper differs")
+            normalization_receipt, _normalization_root = unwrap(
+                normalization.get("receipt"),
+                f"{expected_name} legacy WAL normalization receipt",
+            )
+            normalization_fields = {
+                "schema", "plan_sha256", "node", "source_wal", "source_snapshot",
+                "partition", "sequence_rewrites", "derivative_wal", "head",
+                "selected_frame_count", "excluded_bytes", "semantic_stream_sha256",
+                "transform", "source_unchanged",
+            }
+            derivative = normalization_receipt.get("derivative_wal", {}) \
+                if isinstance(normalization_receipt, dict) else {}
+            source_prefix = rust_capture.get("source_wal_prefix", {})
+            if (not isinstance(normalization_receipt, dict)
+                    or set(normalization_receipt) != normalization_fields
+                    or normalization_receipt.get("schema")
+                        != "arc.recovery.legacy-wal-normalization.v1"
+                    or normalization_receipt.get("plan_sha256")
+                        != normalization.get("plan_sha256")
+                    or normalization_receipt.get("node") != expected_name
+                    or normalization_receipt.get("head") != head
+                    or normalization_receipt.get("source_unchanged") is not True
+                    or normalization_receipt.get("transform")
+                        != "copy-selected-runs-rewrite-sequence-and-crc32"
+                    or HASH_RE.fullmatch(str(
+                        normalization_receipt.get("semantic_stream_sha256"))) is None
+                    or not isinstance(normalization_receipt.get("partition"), list)
+                    or not normalization_receipt.get("partition")
+                    or not isinstance(normalization_receipt.get("sequence_rewrites"), list)
+                    or not isinstance(normalization_receipt.get("selected_frame_count"), int)
+                    or normalization_receipt.get("selected_frame_count", 0) <= 0
+                    or not isinstance(normalization_receipt.get("excluded_bytes"), int)
+                    or normalization_receipt.get("excluded_bytes", -1) < 0
+                    or rust_capture.get("allow_unbound_legacy_wal") is not True
+                    or derivative.get("sha256")
+                        != source_prefix.get("accepted_prefix_sha256")
+                    or derivative.get("size")
+                        != source_prefix.get("accepted_prefix_bytes")
+                    or source_prefix.get("quarantined_suffix_bytes_at_loader") != 0
+                    or source_prefix.get("loader_tail_reason") != "none"
+                    or normalization_receipt.get("source_snapshot", {}).get("sha256")
+                        != rust_capture.get("source_snapshot", {}).get("sha256")):
+                fail("quarantine-round normalized derivative proof differs")
         source_captures.append((capture_value, capture_root))
     local_capture_rows = [row for row in source_captures if row[0].get("node") == node]
     if len(local_capture_rows) != 1:
@@ -5807,7 +6013,7 @@ def validate_authorization(raw):
         "fixed live-source genesis binding",
     )
     staged_root = seal_base / freeze_sha / node
-    for staged_path, expected_root, expected_mode, label in (
+    staged_inputs = [
         (staged_root / "arc-node", local_capture["inspector_binary_sha256"], 0o500,
          "live-source inspector"),
         (staged_root / "genesis.toml", local_capture["genesis_sha256"], 0o400,
@@ -5815,7 +6021,47 @@ def validate_authorization(raw):
         (staged_root / "legacy-validator-set-40m.json",
          local_capture["legacy_validator_set_sha256"], 0o400,
          "live-source legacy validator set"),
-    ):
+    ]
+    if local_capture.get("schema") == "arc.recovery.quarantine-live-source-capture.v2":
+        normalization = local_capture["wal_normalization"]
+        normalization_receipt = normalization["receipt"]["value"]
+        normalized_root = fixed_root.parent / "normalized-source"
+        normalized_details = normalized_root.lstat()
+        normalized_observed = {
+            "device": normalized_details.st_dev, "inode": normalized_details.st_ino,
+            "mode": normalized_details.st_mode, "uid": normalized_details.st_uid,
+            "gid": normalized_details.st_gid, "nlink": normalized_details.st_nlink,
+            "mtime_ns": normalized_details.st_mtime_ns,
+            "ctime_ns": normalized_details.st_ctime_ns,
+        }
+        if (normalized_root.is_symlink() or not stat.S_ISDIR(normalized_details.st_mode)
+                or stat.S_IMODE(normalized_details.st_mode) != 0o500
+                or normalized_observed != local_rust.get("source_data_dir")):
+            fail("normalized live-source directory changed before authorization")
+        reprove_capture_file(
+            normalized_root / "state.wal", normalization_receipt.get("derivative_wal"),
+            0o400, "normalized derivative WAL",
+        )
+        original_data = pathlib.Path(freeze_by_name[node]["data_dir"])
+        original_mode = stat.S_IMODE(normalization_receipt["source_wal"]["mode"])
+        reprove_capture_file(
+            original_data / "state.wal", normalization_receipt.get("source_wal"),
+            original_mode, "original normalized-source WAL",
+        )
+        reprove_capture_file(
+            fixed_root.parent / "live.snapshot.lz4",
+            normalization_receipt.get("source_snapshot"), 0o400,
+            "normalization source snapshot",
+        )
+        staged_inputs.extend((
+            (staged_root / "normalize-legacy-wal.py",
+             normalization["normalizer_sha256"], 0o500,
+             "legacy WAL normalizer"),
+            (staged_root / "legacy-wal-normalization-plan.json",
+             normalization["plan_sha256"], 0o400,
+             "legacy WAL normalization plan"),
+        ))
+    for staged_path, expected_root, expected_mode, label in staged_inputs:
         descriptor = os.open(staged_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
             details = os.fstat(descriptor); digest = hashlib.sha256()
@@ -6645,10 +6891,16 @@ WantedBy=multi-user.target
             rust_capture, rust_capture_sha = unwrap(
                 live_capture.get("rust_capture"), "stopped Rust live-source capture"
             )
-            if (rust_capture.get("schema")
+            normalized_capture = live_capture.get("schema") \
+                == "arc.recovery.quarantine-live-source-capture.v2"
+            if (live_capture.get("schema") not in {
+                    "arc.recovery.quarantine-live-source-capture.v1",
+                    "arc.recovery.quarantine-live-source-capture.v2",
+                } or rust_capture.get("schema")
                     != "arc.recovery.live-legacy-source-capture.v1"
                     or rust_capture.get("head") != live_capture.get("head")
-                    or rust_capture.get("allow_unbound_legacy_wal") is not allow_unbound):
+                    or rust_capture.get("allow_unbound_legacy_wal") is not allow_unbound
+                    or (normalized_capture and allow_unbound is not True)):
                 fail("stopped-precommit Rust live-source capture differs")
             fixed_proof = rust_capture.get("fixed_pair")
             if not isinstance(fixed_proof, dict) or fixed_proof.get("strict_replay") is not True:
@@ -6704,6 +6956,94 @@ WantedBy=multi-user.target
             held["fixed_genesis_binding"] = (
                 binding_path, binding_fd, binding_identity, False,
             )
+            normalization_evidence = None
+            if normalized_capture:
+                normalization = live_capture.get("wal_normalization")
+                if (not isinstance(normalization, dict) or set(normalization) != {
+                        "normalizer_sha256", "plan_sha256", "receipt"
+                    }):
+                    fail("stopped-precommit normalization wrapper differs")
+                normalization_receipt, normalization_receipt_sha = unwrap(
+                    normalization.get("receipt"),
+                    "stopped legacy WAL normalization receipt",
+                )
+                normalization_fields = {
+                    "schema", "plan_sha256", "node", "source_wal",
+                    "source_snapshot", "partition", "sequence_rewrites",
+                    "derivative_wal", "head", "selected_frame_count",
+                    "excluded_bytes", "semantic_stream_sha256", "transform",
+                    "source_unchanged",
+                }
+                if (not isinstance(normalization_receipt, dict)
+                        or set(normalization_receipt) != normalization_fields
+                        or normalization_receipt.get("schema")
+                            != "arc.recovery.legacy-wal-normalization.v1"
+                        or normalization_receipt.get("plan_sha256")
+                            != normalization.get("plan_sha256")
+                        or normalization_receipt.get("node") != node
+                        or normalization_receipt.get("head") != live_capture.get("head")
+                        or normalization_receipt.get("source_unchanged") is not True):
+                    fail("stopped-precommit normalization receipt differs")
+                require_rust_identity(
+                    final_wal_identity, normalization_receipt.get("source_wal"),
+                    "original normalization source WAL",
+                )
+                normalized_dir = fixed_dir.parent / "normalized-source"
+                normalized_dir_fd, normalized_dir_identity = open_held(
+                    normalized_dir, mode_value=0o500, directory=True
+                )
+                require_rust_identity(
+                    normalized_dir_identity, rust_capture.get("source_data_dir"),
+                    "normalized source directory", directory=True,
+                )
+                held["normalized_data_dir"] = (
+                    normalized_dir, normalized_dir_fd, normalized_dir_identity, True,
+                )
+                normalized_wal_path = normalized_dir / "state.wal"
+                normalized_wal_fd, normalized_wal_identity = open_held(
+                    normalized_wal_path, mode_value=0o400
+                )
+                require_rust_identity(
+                    normalized_wal_identity, normalization_receipt.get("derivative_wal"),
+                    "normalized derivative WAL",
+                )
+                held["normalized_state_wal"] = (
+                    normalized_wal_path, normalized_wal_fd, normalized_wal_identity, False,
+                )
+                live_snapshot_path = fixed_dir.parent / "live.snapshot.lz4"
+                live_snapshot_fd, live_snapshot_identity = open_held(
+                    live_snapshot_path, mode_value=0o400
+                )
+                require_rust_identity(
+                    live_snapshot_identity, normalization_receipt.get("source_snapshot"),
+                    "normalization source snapshot",
+                )
+                held["normalization_source_snapshot"] = (
+                    live_snapshot_path, live_snapshot_fd, live_snapshot_identity, False,
+                )
+                for label, path, expected, expected_mode in (
+                    ("wal_normalizer", stage / "normalize-legacy-wal.py",
+                     normalization.get("normalizer_sha256"), 0o500),
+                    ("wal_normalization_plan",
+                     stage / "legacy-wal-normalization-plan.json",
+                     normalization.get("plan_sha256"), 0o400),
+                ):
+                    descriptor, input_identity = open_held(
+                        path, mode_value=expected_mode, expected_sha=expected
+                    )
+                    held[label] = (path, descriptor, input_identity, False)
+                    staged_inputs[label] = input_identity
+                normalization_evidence = {
+                    "normalizer_sha256": normalization["normalizer_sha256"],
+                    "plan_sha256": normalization["plan_sha256"],
+                    "receipt_sha256": normalization_receipt_sha,
+                    "normalized_data_dir": normalized_dir_identity,
+                    "normalized_state_wal": normalized_wal_identity,
+                    "source_snapshot": live_snapshot_identity,
+                    "semantic_stream_sha256": normalization_receipt[
+                        "semantic_stream_sha256"
+                    ],
+                }
             source_inputs = {
                 "original_data_dir": data_identity,
                 "final_state_wal": final_wal_identity,
@@ -6715,6 +7055,8 @@ WantedBy=multi-user.target
                 "rust_live_source_capture_sha256": rust_capture_sha,
                 "source_pair_role": "preauthorization-boundary",
             }
+            if normalization_evidence is not None:
+                source_inputs["wal_normalization"] = normalization_evidence
             if writer_set():
                 fail("writer appeared before stopped-precommit offline inspection")
             current_inspection_boot = pathlib.Path(
@@ -7279,14 +7621,29 @@ WantedBy=multi-user.target
                 "live_source_capture_sha256", "rust_live_source_capture_sha256",
                 "source_pair_role",
             }
+            normalized = isinstance(sealed, dict) and "wal_normalization" in sealed
+            if normalized:
+                expected_labels.add("wal_normalization")
             if not isinstance(sealed, dict) or set(sealed) != expected_labels:
                 fail("fresh stopped source-input inventory differs")
             result = {}
-            for label in (
+            file_labels = [
                 "final_state_wal", "fixed_state_wal", "fixed_snapshot",
                 "fixed_genesis_binding",
-            ):
-                row = sealed.get(label)
+            ]
+            if normalized:
+                normalization = sealed.get("wal_normalization")
+                if not isinstance(normalization, dict) or set(normalization) != {
+                        "normalizer_sha256", "plan_sha256", "receipt_sha256",
+                        "normalized_data_dir", "normalized_state_wal",
+                        "source_snapshot", "semantic_stream_sha256",
+                    }:
+                    fail("fresh stopped normalization evidence differs")
+                file_labels.extend(("normalized_state_wal", "source_snapshot"))
+            for label in file_labels:
+                row = (normalization.get(label) if normalized and label in {
+                    "normalized_state_wal", "source_snapshot"
+                } else sealed.get(label))
                 if not isinstance(row, dict) or "path" not in row:
                     fail("fresh stopped source-input row differs")
                 path = pathlib.Path(row["path"])
@@ -7312,9 +7669,15 @@ WantedBy=multi-user.target
                     os.close(descriptor)
                 if observed_row != row:
                     fail("fresh stopped source input changed")
-                result[label] = observed_row
-            for label in ("original_data_dir", "fixed_data_dir"):
-                data_row = sealed.get(label)
+                if normalized and label in {"normalized_state_wal", "source_snapshot"}:
+                    normalization[label] = observed_row
+                else:
+                    result[label] = observed_row
+            directory_labels = ["original_data_dir", "fixed_data_dir"]
+            if normalized:directory_labels.append("normalized_data_dir")
+            for label in directory_labels:
+                data_row = (normalization.get(label)
+                    if normalized and label == "normalized_data_dir" else sealed.get(label))
                 data_path = pathlib.Path(data_row.get("path", "")) \
                     if isinstance(data_row, dict) else pathlib.Path("")
                 descriptor = os.open(
@@ -7340,7 +7703,10 @@ WantedBy=multi-user.target
                             != (data_details.st_dev, data_details.st_ino)
                         or observed_data != data_row):
                     fail("fresh stopped data directory changed")
-                result[label] = observed_data
+                if normalized and label == "normalized_data_dir":
+                    normalization[label] = observed_data
+                else:
+                    result[label] = observed_data
             for label in (
                 "live_source_capture_sha256", "rust_live_source_capture_sha256",
             ):
@@ -7350,6 +7716,14 @@ WantedBy=multi-user.target
             if sealed.get("source_pair_role") != "preauthorization-boundary":
                 fail("fresh stopped source-pair role differs")
             result["source_pair_role"] = "preauthorization-boundary"
+            if normalized:
+                for label in (
+                    "normalizer_sha256", "plan_sha256", "receipt_sha256",
+                    "semantic_stream_sha256",
+                ):
+                    if HASH_RE.fullmatch(str(normalization.get(label))) is None:
+                        fail("fresh stopped normalization root differs")
+                result["wal_normalization"] = normalization
             return result
 
         fresh_sources = current_source_projection(persisted.get("source_inputs"))
@@ -7548,6 +7922,10 @@ WantedBy=multi-user.target
             if isinstance(final_rust, dict) else None
         final_head = final_capture.get("head")
         if (final_capture_sha != inspector_sha
+                or final_capture.get("schema") not in {
+                    "arc.recovery.quarantine-live-source-capture.v1",
+                    "arc.recovery.quarantine-live-source-capture.v2",
+                }
                 or final_capture.get("source_pair_role")
                     != "post-quarantine-final-export"
                 or (final_capture.get("capture_id"), final_capture.get("node"),
@@ -7640,6 +8018,71 @@ WantedBy=multi-user.target
             final_fixed_root / "genesis.network-hash",
             final_fixed.get("genesis_binding"), "fixed genesis binding",
         )
+        if final_capture.get("schema") \
+                == "arc.recovery.quarantine-live-source-capture.v2":
+            normalization = final_capture.get("wal_normalization")
+            if (not isinstance(normalization, dict) or set(normalization) != {
+                    "normalizer_sha256", "plan_sha256", "receipt"
+                } or HASH_RE.fullmatch(str(normalization.get("normalizer_sha256"))) is None
+                    or HASH_RE.fullmatch(str(normalization.get("plan_sha256"))) is None):
+                fail("post-quarantine normalization wrapper differs")
+            normalization_receipt, _normalization_sha = unwrap(
+                normalization.get("receipt"),
+                "post-quarantine legacy WAL normalization receipt",
+            )
+            normalization_fields = {
+                "schema", "plan_sha256", "node", "source_wal",
+                "source_snapshot", "partition", "sequence_rewrites",
+                "derivative_wal", "head", "selected_frame_count",
+                "excluded_bytes", "semantic_stream_sha256", "transform",
+                "source_unchanged",
+            }
+            source_prefix = final_rust.get("source_wal_prefix", {})
+            derivative = normalization_receipt.get("derivative_wal", {}) \
+                if isinstance(normalization_receipt, dict) else {}
+            if (not isinstance(normalization_receipt, dict)
+                    or set(normalization_receipt) != normalization_fields
+                    or normalization_receipt.get("schema")
+                        != "arc.recovery.legacy-wal-normalization.v1"
+                    or normalization_receipt.get("plan_sha256")
+                        != normalization.get("plan_sha256")
+                    or normalization_receipt.get("node") != node
+                    or normalization_receipt.get("head") != final_head
+                    or normalization_receipt.get("source_unchanged") is not True
+                    or final_rust.get("allow_unbound_legacy_wal") is not True
+                    or derivative.get("sha256")
+                        != source_prefix.get("accepted_prefix_sha256")
+                    or derivative.get("size")
+                        != source_prefix.get("accepted_prefix_bytes")
+                    or source_prefix.get("quarantined_suffix_bytes_at_loader") != 0
+                    or source_prefix.get("loader_tail_reason") != "none"):
+                fail("post-quarantine normalized derivative binding differs")
+            normalized_root = final_fixed_root.parent / "normalized-source"
+            reprove_final_fixed(
+                normalized_root, final_rust.get("source_data_dir"),
+                "normalized source directory", directory=True,
+            )
+            reprove_final_fixed(
+                normalized_root / "state.wal", derivative,
+                "normalized derivative WAL",
+            )
+            reprove_final_fixed(
+                pathlib.Path(frozen["data_dir"]) / "state.wal",
+                normalization_receipt.get("source_wal"),
+                "original normalization source WAL",
+            )
+            reprove_final_fixed(
+                final_fixed_root.parent / "live.snapshot.lz4",
+                normalization_receipt.get("source_snapshot"),
+                "normalization source snapshot",
+            )
+            staged_root = seal_base / freeze_sha / node
+            if (sha(secure_read(staged_root / "normalize-legacy-wal.py", 0o500,
+                    maximum=4 * 1024 * 1024)) != normalization["normalizer_sha256"]
+                    or sha(secure_read(
+                        staged_root / "legacy-wal-normalization-plan.json", 0o400,
+                        maximum=4 * 1024 * 1024)) != normalization["plan_sha256"]):
+                fail("post-quarantine normalization inputs changed before stop")
 
         stop_path = attempt / "stop-after-round.json"
         stop_intent_path = state / "stop-after-round.intent.json"
@@ -18140,9 +18583,12 @@ persisted_head() {
     verify_capture_source "$capture_root" "$capture_id" "$node"
     pgrep -x arc-node >/dev/null 2>&1 && die "persisted-head exporter requires the exact legacy writer to remain stopped"
     local data_dir snapshot final_source_capture_sha selected_head_height
-    local selected_head_hash selected_head_state stop_after_round_path
+    local selected_head_hash selected_head_state stop_after_round_path selected_source_schema
+    local selected_normalization_receipt_sha selected_original_wal_sha selected_original_wal_size
     read -r data_dir snapshot final_source_capture_sha selected_head_height \
-        selected_head_hash selected_head_state stop_after_round_path < <(
+        selected_head_hash selected_head_state stop_after_round_path selected_source_schema \
+        selected_normalization_receipt_sha selected_original_wal_sha \
+        selected_original_wal_size < <(
         python3 - "$QUARANTINE_ROUND_BASE" "$capture_id" "$node" <<'PY'
 import hashlib,json,pathlib,stat,sys
 base=pathlib.Path(sys.argv[1]);capture,node=sys.argv[2:]
@@ -18161,6 +18607,7 @@ _stop_path,stopped,_stop_raw=candidates[0]
 wrapper=stopped.get("final_source_capture",{});source=wrapper.get("value",{})
 source_raw=canonical(source);root=wrapper.get("sha256");head=source.get("head",{})
 fixed=source.get("fixed_pair_path");fixed_path=pathlib.Path(fixed or "")
+source_schema=source.get("schema")
 if (hashlib.sha256(source_raw).hexdigest()!=root
         or root!=stopped.get("final_source_capture_sha256")
         or source.get("source_pair_role")!="post-quarantine-final-export"
@@ -18168,15 +18615,61 @@ if (hashlib.sha256(source_raw).hexdigest()!=root
         or stopped.get("selected_source_head")!=head or source.get("expected_head")!=head
         or source.get("capture_id")!=capture or source.get("node")!=node
         or not isinstance(fixed,str) or not fixed.endswith("/fixed-source") or ".." in fixed
-        or not fixed_path.is_dir() or fixed_path.is_symlink()):
+        or not fixed_path.is_dir() or fixed_path.is_symlink()
+        or source_schema not in {"arc.recovery.quarantine-live-source-capture.v1",
+                                 "arc.recovery.quarantine-live-source-capture.v2"}):
     raise SystemExit("persisted-head selected final source capture differs")
+normalization_sha=original_sha=original_size="-"
+if source_schema=="arc.recovery.quarantine-live-source-capture.v2":
+    normalization=source.get("wal_normalization")
+    if (not isinstance(normalization,dict)
+            or set(normalization)!={"normalizer_sha256","plan_sha256","receipt"}
+            or not all(isinstance(normalization.get(key),str)
+                       and len(normalization[key])==64
+                       for key in ("normalizer_sha256","plan_sha256"))):
+        raise SystemExit("persisted-head normalization wrapper differs")
+    sealed=normalization.get("receipt")
+    if not isinstance(sealed,dict) or set(sealed)!={"value","sha256"}:
+        raise SystemExit("persisted-head normalization receipt wrapper differs")
+    normalization_receipt=sealed.get("value");normalization_raw=canonical(normalization_receipt)
+    source_wal=normalization_receipt.get("source_wal",{}) \
+        if isinstance(normalization_receipt,dict) else {}
+    if (hashlib.sha256(normalization_raw).hexdigest()!=sealed.get("sha256")
+            or normalization_receipt.get("schema")
+                !="arc.recovery.legacy-wal-normalization.v1"
+            or normalization_receipt.get("head")!=head
+            or not isinstance(source_wal,dict)
+            or not isinstance(source_wal.get("sha256"),str)
+            or len(source_wal["sha256"])!=64
+            or isinstance(source_wal.get("size"),bool)
+            or not isinstance(source_wal.get("size"),int)
+            or source_wal["size"]<=0):
+        raise SystemExit("persisted-head normalization receipt differs")
+    normalization_sha=sealed["sha256"]
+    original_sha=source_wal["sha256"]
+    original_size=str(source_wal["size"])
 print(fixed, fixed+"/state.snapshot.lz4", root, head.get("height"),
-      head.get("block_hash"), head.get("state_root"), str(_stop_path))
+      head.get("block_hash"), head.get("state_root"), str(_stop_path), source_schema,
+      normalization_sha, original_sha, original_size)
 PY
     ) || die "cannot select exact post-quarantine final source pair"
     require_safe_absolute_path "$data_dir" "persisted-head stopped data directory"
     require_safe_absolute_path "$snapshot" "persisted-head stopped snapshot"
     require_safe_absolute_path "$stop_after_round_path" "persisted-head stop-after-round receipt"
+    case "$selected_source_schema" in
+        arc.recovery.quarantine-live-source-capture.v1)
+            [ "$selected_normalization_receipt_sha" = - ] || die "v1 final source unexpectedly binds normalization"
+            [ "$selected_original_wal_sha" = - ] || die "v1 final source unexpectedly binds an original WAL"
+            [ "$selected_original_wal_size" = - ] || die "v1 final source unexpectedly binds an original WAL size"
+            ;;
+        arc.recovery.quarantine-live-source-capture.v2)
+            require_hash "$selected_normalization_receipt_sha" "persisted-head normalization receipt hash"
+            require_hash "$selected_original_wal_sha" "persisted-head original WAL hash"
+            printf '%s\n' "$selected_original_wal_size" | grep -Eq '^[1-9][0-9]*$' || \
+                die "persisted-head original WAL size is malformed"
+            ;;
+        *) die "persisted-head selected final source schema differs" ;;
+    esac
     local stop_after_round_sha archive_data_dir archive_wal
     stop_after_round_sha="$(hash_file "$stop_after_round_path")"
     require_hash "$stop_after_round_sha" "persisted-head stop-after-round receipt hash"
@@ -18251,9 +18744,11 @@ PY
     archive_wal_identity="$(stat -Lc %d:%i:%s:%f /proc/self/fd/15)"
     read -r archive_wal_suffix_bytes archive_wal_suffix_sha \
         archive_wal_suffix_classification < <(python3 - "$wal_size" "$wal_before" \
-            "$archive_wal" <<'PY'
+            "$archive_wal" "$selected_source_schema" "$selected_original_wal_sha" \
+            "$selected_original_wal_size" <<'PY'
 import hashlib,os,stat,sys
 prefix_size=int(sys.argv[1]);prefix_sha=sys.argv[2];complete_path=sys.argv[3]
+source_schema=sys.argv[4];original_sha=sys.argv[5];original_size=sys.argv[6]
 prefix=os.dup(14);complete=os.dup(15)
 try:
     fresh=os.open(complete_path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
@@ -18264,31 +18759,52 @@ try:
                 or held.st_nlink!=1 or held.st_mode&0o022):
             raise SystemExit("archived final WAL held/path identity is unsafe")
     finally:os.close(fresh)
-    os.lseek(prefix,0,os.SEEK_SET);os.lseek(complete,0,os.SEEK_SET)
-    observed=hashlib.sha256();remaining=prefix_size
-    while remaining:
-        wanted=min(1024*1024,remaining)
-        left=os.read(prefix,wanted);right=os.read(complete,wanted)
-        if not left or len(left)!=len(right) or left!=right:
-            raise SystemExit("archived final WAL does not preserve the selected fixed prefix")
-        observed.update(left);remaining-=len(left)
-    if os.read(prefix,1):
-        raise SystemExit("selected fixed WAL exceeds its sealed size")
-    if observed.hexdigest()!=prefix_sha:
-        raise SystemExit("selected fixed WAL prefix hash differs")
-    suffix=hashlib.sha256();suffix_bytes=0
-    while True:
-        chunk=os.read(complete,1024*1024)
-        if not chunk:break
-        suffix.update(chunk);suffix_bytes+=len(chunk)
-    if suffix_bytes:
-        print(suffix_bytes,suffix.hexdigest(),"archived_noncanonical_post_capture_suffix")
+    if source_schema=="arc.recovery.quarantine-live-source-capture.v1":
+        os.lseek(prefix,0,os.SEEK_SET);os.lseek(complete,0,os.SEEK_SET)
+        observed=hashlib.sha256();remaining=prefix_size
+        while remaining:
+            wanted=min(1024*1024,remaining)
+            left=os.read(prefix,wanted);right=os.read(complete,wanted)
+            if not left or len(left)!=len(right) or left!=right:
+                raise SystemExit("archived final WAL does not preserve the selected fixed prefix")
+            observed.update(left);remaining-=len(left)
+        if os.read(prefix,1):
+            raise SystemExit("selected fixed WAL exceeds its sealed size")
+        if observed.hexdigest()!=prefix_sha:
+            raise SystemExit("selected fixed WAL prefix hash differs")
+        suffix=hashlib.sha256();suffix_bytes=0
+        while True:
+            chunk=os.read(complete,1024*1024)
+            if not chunk:break
+            suffix.update(chunk);suffix_bytes+=len(chunk)
+        if suffix_bytes:
+            print(suffix_bytes,suffix.hexdigest(),"archived_noncanonical_post_capture_suffix")
+        else:
+            print(0,"-","none")
+    elif source_schema=="arc.recovery.quarantine-live-source-capture.v2":
+        if not original_size.isdigit() or int(original_size)!=os.fstat(complete).st_size:
+            raise SystemExit("archived original WAL size differs from normalization receipt")
+        os.lseek(complete,0,os.SEEK_SET);observed=hashlib.sha256()
+        while True:
+            chunk=os.read(complete,1024*1024)
+            if not chunk:break
+            observed.update(chunk)
+        if observed.hexdigest()!=original_sha:
+            raise SystemExit("archived original WAL hash differs from normalization receipt")
+        os.lseek(prefix,0,os.SEEK_SET);derivative=hashlib.sha256();derivative_size=0
+        while True:
+            chunk=os.read(prefix,1024*1024)
+            if not chunk:break
+            derivative.update(chunk);derivative_size+=len(chunk)
+        if derivative_size!=prefix_size or derivative.hexdigest()!=prefix_sha:
+            raise SystemExit("selected normalized derivative differs from its sealed identity")
+        print(0,"-","normalized_derivative_from_content_pinned_archived_original")
     else:
-        print(0,"-","none")
+        raise SystemExit("unsupported selected live-source schema")
 finally:
     os.close(prefix);os.close(complete)
 PY
-    ) || die "archived final WAL is not an append-only extension of the post-quarantine fixed pair"
+    ) || die "archived final WAL relation to the post-quarantine fixed pair differs"
     python3 - "$wal_identity" "$snapshot_identity" "$temporary" "$snapshot" <<'PY'
 import hashlib,os,pathlib,stat,sys
 directory=os.dup(13)
@@ -18354,7 +18870,7 @@ PY
         --genesis /proc/self/fd/9 --validator-public-keys /proc/self/fd/10 \
         --legacy-validator-set /proc/self/fd/11 --output "$temporary/candidate.arcchkpt" \
         --source-consensus-round 0 --created-at-unix-ms 0 --recovery-epoch 1 \
-        --validator-set-id 1 \
+        --validator-set-id 1 --allow-unbound-legacy-wal \
         > "$temporary/export-summary.json" 2> "$temporary/export.stderr"; then
         export_exit=0
     else
@@ -18403,7 +18919,8 @@ PY
         "$selected_head_state" "$stop_after_round_path" "$stop_after_round_sha" \
         "$archive_wal" "$archive_wal_sha" "$archive_wal_size" \
         "$archive_wal_identity" "$archive_wal_suffix_bytes" \
-        "$archive_wal_suffix_sha" "$archive_wal_suffix_classification" <<'PY'
+        "$archive_wal_suffix_sha" "$archive_wal_suffix_classification" \
+        "$selected_source_schema" "$selected_normalization_receipt_sha" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
 (summary_raw,inspect_raw,boundary_raw,candidate_raw,output_raw,capture,node,freeze,boot,binary_sha,genesis_sha,
  validators_sha,legacy_sha,snapshot_raw,snapshot_sha,snapshot_size_raw,wal_raw,wal_sha,
@@ -18411,7 +18928,8 @@ import datetime,hashlib,json,os,pathlib,re,stat,sys
  staged_wal_identity_raw,staged_snapshot_identity_raw,final_capture_sha,
  selected_height_raw,selected_hash,selected_state,stop_after_raw,stop_after_sha,
  archive_wal_raw,archive_wal_sha,archive_wal_size_raw,archive_wal_identity_raw,
- archive_suffix_bytes_raw,archive_suffix_sha,archive_suffix_classification)=sys.argv[1:]
+ archive_suffix_bytes_raw,archive_suffix_sha,archive_suffix_classification,
+ selected_source_schema,selected_normalization_receipt_sha)=sys.argv[1:]
 summary_path=pathlib.Path(summary_raw); inspect_path=pathlib.Path(inspect_raw)
 boundary_path=pathlib.Path(boundary_raw); candidate=pathlib.Path(candidate_raw); output=pathlib.Path(output_raw)
 capture_root=pathlib.Path(capture_raw); stop_root=pathlib.Path(stop_raw)
@@ -18539,18 +19057,8 @@ if (boundary.get("accepted_prefix_bytes")!=int(wal_size_raw)
     raise SystemExit("post-quarantine fixed WAL was not accepted in full")
 archive_size=int(archive_wal_size_raw);archive_suffix_bytes=int(archive_suffix_bytes_raw)
 if (archive_wal_identity["size"]!=archive_size
-        or archive_size!=int(wal_size_raw)+archive_suffix_bytes
         or not re.fullmatch(r"[0-9a-f]{64}",archive_wal_sha)):
     raise SystemExit("archived final WAL size/identity differs")
-if archive_suffix_bytes==0:
-    if archive_suffix_sha!="-" or archive_suffix_classification!="none":
-        raise SystemExit("empty archived final WAL suffix policy differs")
-    archived_suffix_sha=None
-else:
-    if (not re.fullmatch(r"[0-9a-f]{64}",archive_suffix_sha)
-            or archive_suffix_classification!="archived_noncanonical_post_capture_suffix"):
-        raise SystemExit("archived final WAL suffix classification differs")
-    archived_suffix_sha=archive_suffix_sha
 stop_after_path=pathlib.Path(stop_after_raw)
 stop_after_bytes=stop_after_path.read_bytes();stop_after=json.loads(stop_after_bytes)
 if (stop_after_bytes!=canonical(stop_after) or hashlib.sha256(stop_after_bytes).hexdigest()!=stop_after_sha
@@ -18559,6 +19067,80 @@ if (stop_after_bytes!=canonical(stop_after) or hashlib.sha256(stop_after_bytes).
         or stop_after.get("selected_source_head")!={"height":selected_height,
             "block_hash":selected_hash,"state_root":selected_state}):
     raise SystemExit("persisted-head stop-after-round final source binding differs")
+final_wrapper=stop_after.get("final_source_capture",{})
+final_source=final_wrapper.get("value",{}) if isinstance(final_wrapper,dict) else {}
+if (not isinstance(final_wrapper,dict) or set(final_wrapper)!={"value","sha256"}
+        or hashlib.sha256(canonical(final_source)).hexdigest()!=final_wrapper.get("sha256")
+        or final_wrapper.get("sha256")!=final_capture_sha
+        or final_source.get("schema")!=selected_source_schema):
+    raise SystemExit("persisted-head final source capture wrapper differs")
+normalization_wrapper=None
+if selected_source_schema=="arc.recovery.quarantine-live-source-capture.v1":
+    if (selected_normalization_receipt_sha!="-"
+            or archive_size!=int(wal_size_raw)+archive_suffix_bytes):
+        raise SystemExit("v1 archived final WAL prefix accounting differs")
+    if archive_suffix_bytes==0:
+        if archive_suffix_sha!="-" or archive_suffix_classification!="none":
+            raise SystemExit("empty archived final WAL suffix policy differs")
+        archived_suffix_sha=None
+    else:
+        if (not re.fullmatch(r"[0-9a-f]{64}",archive_suffix_sha)
+                or archive_suffix_classification!="archived_noncanonical_post_capture_suffix"):
+            raise SystemExit("archived final WAL suffix classification differs")
+        archived_suffix_sha=archive_suffix_sha
+elif selected_source_schema=="arc.recovery.quarantine-live-source-capture.v2":
+    normalization_wrapper=final_source.get("wal_normalization")
+    if (not isinstance(normalization_wrapper,dict)
+            or set(normalization_wrapper)!={"normalizer_sha256","plan_sha256","receipt"}
+            or any(re.fullmatch(r"[0-9a-f]{64}",str(normalization_wrapper.get(field))) is None
+                   for field in ("normalizer_sha256","plan_sha256"))):
+        raise SystemExit("persisted-head normalization wrapper differs")
+    sealed_normalization=normalization_wrapper.get("receipt")
+    normalization=sealed_normalization.get("value",{}) \
+        if isinstance(sealed_normalization,dict) else {}
+    normalization_raw=canonical(normalization)
+    normalization_fields={"schema","plan_sha256","node","source_wal","source_snapshot",
+        "partition","sequence_rewrites","derivative_wal","head","selected_frame_count",
+        "excluded_bytes","semantic_stream_sha256","transform","source_unchanged"}
+    rust_wrapper=final_source.get("rust_capture",{})
+    rust=rust_wrapper.get("value",{}) if isinstance(rust_wrapper,dict) else {}
+    source_prefix=rust.get("source_wal_prefix",{}) if isinstance(rust,dict) else {}
+    source_wal=normalization.get("source_wal",{}) if isinstance(normalization,dict) else {}
+    source_snapshot=normalization.get("source_snapshot",{}) \
+        if isinstance(normalization,dict) else {}
+    derivative=normalization.get("derivative_wal",{}) \
+        if isinstance(normalization,dict) else {}
+    if (not isinstance(sealed_normalization,dict)
+            or set(sealed_normalization)!={"value","sha256"}
+            or set(normalization)!=normalization_fields
+            or normalization.get("schema")!="arc.recovery.legacy-wal-normalization.v1"
+            or hashlib.sha256(normalization_raw).hexdigest()!=sealed_normalization.get("sha256")
+            or sealed_normalization.get("sha256")!=selected_normalization_receipt_sha
+            or normalization.get("plan_sha256")!=normalization_wrapper.get("plan_sha256")
+            or normalization.get("node")!=node
+            or normalization.get("head")!={"height":selected_height,"block_hash":selected_hash,
+                                             "state_root":selected_state}
+            or normalization.get("source_unchanged") is not True
+            or normalization.get("transform")
+                !="copy-selected-runs-rewrite-sequence-and-crc32"
+            or not isinstance(source_wal,dict) or source_wal.get("sha256")!=archive_wal_sha
+            or source_wal.get("size")!=archive_size
+            or not isinstance(source_snapshot,dict) or source_snapshot.get("sha256")!=snapshot_sha
+            or source_snapshot.get("size")!=int(snapshot_size_raw)
+            or not isinstance(derivative,dict) or derivative.get("sha256")!=wal_sha
+            or derivative.get("size")!=int(wal_size_raw)
+            or rust.get("allow_unbound_legacy_wal") is not True
+            or derivative.get("sha256")!=source_prefix.get("accepted_prefix_sha256")
+            or derivative.get("size")!=source_prefix.get("accepted_prefix_bytes")
+            or source_prefix.get("quarantined_suffix_bytes_at_loader")!=0
+            or source_prefix.get("loader_tail_reason")!="none"
+            or archive_suffix_bytes!=0 or archive_suffix_sha!="-"
+            or archive_suffix_classification
+                !="normalized_derivative_from_content_pinned_archived_original"):
+        raise SystemExit("persisted-head normalized derivative/original WAL binding differs")
+    archived_suffix_sha=None
+else:
+    raise SystemExit("persisted-head selected source schema differs")
 quarantine=stop_root/"08-network-quarantine.json"
 plan_path=pathlib.Path(f"/root/.arc-recovery-plans/{freeze}/freeze.lock.json")
 plan_raw=plan_path.read_bytes(); plan=json.loads(plan_raw)
@@ -18576,7 +19158,9 @@ elif partial.exists() and not partial.is_symlink():
         raise SystemExit("persisted-head publication partial inode is unsafe")
     try:
         parsed=json.loads(partial.read_text(encoding="utf-8"))
-        if isinstance(parsed,dict) and parsed.get("schema")=="arc.recovery.persisted-legacy-head.v1":
+        if (isinstance(parsed,dict) and parsed.get("schema") in {
+                "arc.recovery.persisted-legacy-head.v1",
+                "arc.recovery.persisted-legacy-head.v2"}):
             prior_source=partial
     except (UnicodeError,json.JSONDecodeError): pass
 if prior_source is not None:
@@ -18585,7 +19169,9 @@ else: completed_at=datetime.datetime.now(datetime.timezone.utc).replace(microsec
 if not isinstance(completed_at,str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",completed_at):
     raise SystemExit("persisted-head completion timestamp is malformed")
 receipt={
- "schema":"arc.recovery.persisted-legacy-head.v1","source_main_commit":plan["source_commit"],
+ "schema":("arc.recovery.persisted-legacy-head.v2" if normalization_wrapper is not None
+           else "arc.recovery.persisted-legacy-head.v1"),
+ "source_main_commit":plan["source_commit"],
  "capture_id":capture,"node":node,"freeze_plan_sha256":freeze,"boot_id":boot,
  "inspector_binary_sha256":binary_sha,"genesis_sha256":genesis_sha,
  "validator_public_keys_sha256":validators_sha,"legacy_validator_set_sha256":legacy_sha,
@@ -18606,14 +19192,6 @@ receipt={
  "source_file_identity":{
    "state_wal":source_wal_identity,"snapshot":source_snapshot_identity,
  },
- "archived_final_wal":{
-   "path":archive_wal_raw,"sha256":archive_wal_sha,"size":archive_size,
-   "file_identity":archive_wal_identity,"selected_prefix_bytes":int(wal_size_raw),
-   "selected_prefix_sha256":wal_sha,"post_capture_suffix_bytes":archive_suffix_bytes,
-   "post_capture_suffix_sha256":archived_suffix_sha,
-   "post_capture_suffix_classification":archive_suffix_classification,
-   "preserved_by":"complete-content-indexed-stopped-legacy-source-v4",
- },
  "staged_file_contract":{
    "state_wal":{"sha256":wal_sha,"size":int(wal_size_raw),"mode":0o100400,"uid":0,"gid":0,"nlink":1},
    "snapshot":{"sha256":snapshot_sha,"size":int(snapshot_size_raw),"mode":0o100400,"uid":0,"gid":0,"nlink":1},
@@ -18629,11 +19207,30 @@ receipt={
  "export_contract":{"binary_path":"/proc/self/fd/8","exit_code":0,
                     "source_consensus_round":0,"created_at_unix_ms":0,
                     "recovery_epoch":1,"validator_set_id":1,
-                    "allow_unbound_legacy_wal":False,"read_only":True},
+                    "allow_unbound_legacy_wal":True,"read_only":True},
  "completed_at":completed_at,"rerun_reexecutes_export":True,
  "writer_stopped":True,"restart_barrier_active":True,"network_quarantine_active":True,
  "global_absence_claimed":False,
 }
+if normalization_wrapper is None:
+    receipt["archived_final_wal"]={
+       "path":archive_wal_raw,"sha256":archive_wal_sha,"size":archive_size,
+       "file_identity":archive_wal_identity,"selected_prefix_bytes":int(wal_size_raw),
+       "selected_prefix_sha256":wal_sha,"post_capture_suffix_bytes":archive_suffix_bytes,
+       "post_capture_suffix_sha256":archived_suffix_sha,
+       "post_capture_suffix_classification":archive_suffix_classification,
+       "preserved_by":"complete-content-indexed-stopped-legacy-source-v4",
+    }
+else:
+    receipt["wal_normalization"]=normalization_wrapper
+    receipt["archived_final_wal"]={
+       "path":archive_wal_raw,"sha256":archive_wal_sha,"size":archive_size,
+       "file_identity":archive_wal_identity,
+       "source_relation":"exact-content-pinned-normalization-source",
+       "normalization_receipt_sha256":selected_normalization_receipt_sha,
+       "derivative_sha256":wal_sha,"derivative_size":int(wal_size_raw),
+       "preserved_by":"complete-content-indexed-stopped-legacy-source-v4",
+    }
 payload=canonical(receipt)
 if output.exists() or output.is_symlink():
     details=output.lstat()
@@ -18706,6 +19303,8 @@ stage_input() {
         validators) filename='validator-public-keys.json'; mode=400 ;;
         legacy-validators) filename=legacy-validator-set-40m.json; mode=400 ;;
         source-snapshot) filename=source.snapshot.lz4; mode=400 ;;
+        wal-normalizer) filename=normalize-legacy-wal.py; mode=500 ;;
+        wal-normalization-plan) filename=legacy-wal-normalization-plan.json; mode=400 ;;
         checkpoint) filename=recovery.arcchkpt; mode=400 ;;
         rollout-manifest) filename=rollout-manifest.json; mode=400 ;;
         *) die "invalid staged input role: $role" ;;
@@ -20025,6 +20624,10 @@ case "$ACTION" in
         ;;
     capture-live-source)
         [ "$#" -eq 32 ] || { usage >&2; exit 2; }
+        capture_live_legacy_source "${@:2}"
+        ;;
+    capture-normalized-live-source)
+        [ "$#" -eq 34 ] || { usage >&2; exit 2; }
         capture_live_legacy_source "${@:2}"
         ;;
     quarantine-round-authorize)

@@ -110,12 +110,73 @@ and a pending adoption cannot authorize purge.
 ## 0:35–1:00 — prove the process is running and inspect health
 
 ```bash
-"$HOME/.arc/bin/arc-node" --version
-curl -fsS http://127.0.0.1:9944/health | jq
-ARC_SERVICE_SCOPE=$(sed -n 's/^service_scope=//p' "$HOME/.arc/install.conf")
+ARC_USER_CONFIG="$HOME/.arc/install.conf"
+ARC_SYSTEM_ROOT=/var/lib/arc-chain
+ARC_SYSTEM_CONFIG="$ARC_SYSTEM_ROOT/install.conf"
+ARC_INSTALL_CONFIG=
+if [ -e "$ARC_USER_CONFIG" ] || [ -L "$ARC_USER_CONFIG" ]; then
+  test -f "$ARC_USER_CONFIG" && test ! -L "$ARC_USER_CONFIG" \
+    && test -r "$ARC_USER_CONFIG" || {
+    echo "unsafe or unreadable ARC config: $ARC_USER_CONFIG" >&2
+    exit 1
+  }
+  ARC_INSTALL_CONFIG="$ARC_USER_CONFIG"
+fi
+if [ "$(uname -s)" = Linux ] \
+  && { [ -e "$ARC_SYSTEM_ROOT" ] || [ -L "$ARC_SYSTEM_ROOT" ]; }; then
+  ARC_SYSTEM_STATE="$(sudo /bin/sh -c '
+    test -d "$1" && test ! -L "$1" || exit 2
+    if [ -e "$2" ] || [ -L "$2" ]; then
+      test -f "$2" && test ! -L "$2" && test -r "$2" || exit 2
+      printf present
+    else
+      printf absent
+    fi
+  ' arc-system-config-probe "$ARC_SYSTEM_ROOT" "$ARC_SYSTEM_CONFIG")" || {
+    echo "could not safely inspect ARC system config: $ARC_SYSTEM_CONFIG" >&2
+    exit 1
+  }
+else
+  ARC_SYSTEM_STATE=absent
+fi
+case "$ARC_SYSTEM_STATE" in
+  present)
+    test -z "$ARC_INSTALL_CONFIG" || {
+      echo "ambiguous user and system ARC installations" >&2
+      exit 1
+    }
+    ARC_INSTALL_CONFIG="$ARC_SYSTEM_CONFIG"
+    ;;
+  absent) ;;
+  *) echo "invalid ARC system config probe result" >&2; exit 1 ;;
+esac
+test -n "$ARC_INSTALL_CONFIG" || {
+  echo "no ARC installation found in the supported user or system root" >&2
+  exit 1
+}
+
+if [ "$ARC_INSTALL_CONFIG" = "$ARC_SYSTEM_CONFIG" ]; then
+  ARC_INSTALL_ROOT="$ARC_SYSTEM_ROOT"
+  arc_read_config() { sudo sed -n "$1" "$ARC_INSTALL_CONFIG"; }
+else
+  ARC_INSTALL_ROOT="$HOME/.arc"
+  arc_read_config() { sed -n "$1" "$ARC_INSTALL_CONFIG"; }
+fi
+test "$(arc_read_config '1p')" = '# ARC installer state v1'
+ARC_RPC_PORT="$(arc_read_config 's/^rpc_port=//p')"
+ARC_SERVICE_SCOPE="$(arc_read_config 's/^service_scope=//p')"
+case "$ARC_RPC_PORT" in ''|*[!0-9]*) echo "invalid ARC rpc_port" >&2; exit 1 ;; esac
+test "$ARC_RPC_PORT" -ge 1024 && test "$ARC_RPC_PORT" -le 65535
+case "$ARC_SERVICE_SCOPE" in user|system-user|system|launchd|none) ;; *)
+  echo "invalid ARC service_scope: $ARC_SERVICE_SCOPE" >&2; exit 1 ;;
+esac
+
+"$ARC_INSTALL_ROOT/bin/arc-node" --version
+curl -fsS "http://127.0.0.1:$ARC_RPC_PORT/health" | jq
 case "$ARC_SERVICE_SCOPE" in
   user) systemctl --user --no-pager status arc-node ;;
   system-user) sudo systemctl --no-pager status arc-node ;;
+  system) sudo systemctl --no-pager status arc-node ;;
   launchd) launchctl print "user/$(id -u)/network.arc.node" \
     || launchctl print "gui/$(id -u)/network.arc.node" ;;
   none) printf '%s\n' 'install-only mode: no service manager was configured' ;;
@@ -135,7 +196,7 @@ install rooted at `/var/lib/arc-chain`, use `sudo systemctl status arc-node`.
 ## 1:00–1:25 — show this node's registration and real capacity
 
 ```bash
-export ARC_WORKER=$(curl -fsS http://127.0.0.1:9944/node/info | jq -er '.validator')
+export ARC_WORKER=$(curl -fsS "http://127.0.0.1:$ARC_RPC_PORT/node/info" | jq -er '.validator')
 curl -fsS "$ARC_RPC/workers/scoreboard?limit=50" \
   | jq --arg worker "$ARC_WORKER" \
       '{count_visible,eligible_inference_workers,coordinator_model,

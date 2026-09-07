@@ -375,21 +375,25 @@ activation_and_archived_guides_fail_closed_in_copy() {
 
 readme_counts_and_desktop_secret_copy_match_the_tree() {
     local rust_lines rust_tests
-    rust_lines="$(cd "$REPO_ROOT" && git ls-files -z -- '*.rs' ':(exclude)vendor/**' | \
+    rust_lines="$(cd "$REPO_ROOT" && git ls-files -z --cached --others \
+        --exclude-standard -- '*.rs' ':(exclude)vendor/**' | \
         xargs -0 wc -l | awk 'END { print $1 }')"
-    rust_tests="$(cd "$REPO_ROOT" && git ls-files -z -- '*.rs' ':(exclude)vendor/**' | \
+    rust_tests="$(cd "$REPO_ROOT" && git ls-files -z --cached --others \
+        --exclude-standard -- '*.rs' ':(exclude)vendor/**' | \
         xargs -0 grep -Eh '^[[:space:]]*#\[(tokio::)?test' | wc -l | tr -d ' ')"
-    [ "$rust_lines" -ge 196000 ] || {
-        printf 'README 196K+ Rust badge exceeds current measured non-vendored source lines: %s\n' "$rust_lines"
+    [ "$rust_lines" -ge 220000 ] || {
+        printf 'README 220K+ Rust badge exceeds current measured non-vendored source lines: %s\n' "$rust_lines"
         return 1
     }
-    [ "$rust_tests" -ge 1900 ] || {
-        printf 'README 1,900+ Rust-test badge exceeds current non-vendored defined tests: %s\n' "$rust_tests"
+    [ "$rust_tests" -ge 2100 ] || {
+        printf 'README 2,100+ Rust-test badge exceeds current non-vendored defined tests: %s\n' "$rust_tests"
         return 1
     }
     for literal in \
-        'more than 196,000 physical lines of checked-in,' \
-        'More than 1,900 Rust test functions' \
+        '![Rust](https://img.shields.io/badge/Rust-220K%2B_LOC-orange)' \
+        '![Tests](https://img.shields.io/badge/Rust_tests-2%2C100%2B_defined-brightgreen)' \
+        'more than 220,000 physical lines of checked-in,' \
+        'More than 2,100 Rust test functions' \
         'non-vendored Rust across ARC' \
         'plus one narrowly' \
         'vendored `wasmer-derive` workspace member'
@@ -425,6 +429,33 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
         'walkthrough hard-codes the wrong service manager for adopted v0.7 nodes' || return 1
     require_literal "$WALKTHROUGH" 'system-user) sudo systemctl' \
         'walkthrough omits the migrated Linux global-service scope' || return 1
+    for literal in \
+        'ARC_USER_CONFIG="$HOME/.arc/install.conf"' \
+        'ARC_SYSTEM_ROOT=/var/lib/arc-chain' \
+        'ARC_SYSTEM_CONFIG="$ARC_SYSTEM_ROOT/install.conf"' \
+        'if [ "$(uname -s)" = Linux ]' \
+        'ARC_SYSTEM_STATE="$(sudo /bin/sh -c ' \
+        'printf present' \
+        'printf absent' \
+        'ARC_SYSTEM_STATE=absent' \
+        'could not safely inspect ARC system config' \
+        'ambiguous user and system ARC installations' \
+        'ARC_INSTALL_ROOT="$ARC_SYSTEM_ROOT"' \
+        'ARC_INSTALL_ROOT="$HOME/.arc"' \
+        'ARC_RPC_PORT="$(arc_read_config '\''s/^rpc_port=//p'\'')"' \
+        'ARC_SERVICE_SCOPE="$(arc_read_config '\''s/^service_scope=//p'\'')"' \
+        '"$ARC_INSTALL_ROOT/bin/arc-node" --version' \
+        'http://127.0.0.1:$ARC_RPC_PORT/health' \
+        'http://127.0.0.1:$ARC_RPC_PORT/node/info' \
+        'system) sudo systemctl --no-pager status arc-node ;;'
+    do
+        require_literal "$WALKTHROUGH" "$literal" \
+            'walkthrough does not select and inspect the installed root/config fail-closed' || return 1
+    done
+    if grep -Fq 'http://127.0.0.1:9944' "$WALKTHROUGH"; then
+        printf 'walkthrough bypasses the installer-derived RPC port\n'
+        return 1
+    fi
     require_literal "$README" 'bind RPC to `127.0.0.1` only' \
         'README does not disclose the managed loopback-only RPC default' || return 1
     require_literal "$HEADLESS" 'bound only to `127.0.0.1`' \
@@ -515,7 +546,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
         -name '*.spec.ts' | wc -l | tr -d ' ')"
     assert_equals 20 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '225 tests in' \
+    require_literal "$DESKTOP_README" '228 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
     require_literal "$DESKTOP_README" '20 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
@@ -532,7 +563,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '225 tests in 20 files' "$playwright_inventory" \
+        assert_equals '228 tests in 20 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 
@@ -897,8 +928,46 @@ for block_index, block in enumerate(blocks):
             embedded_python += 1
             cursor = end_cursor
         cursor += 1
-if embedded_python != 8:
-    raise SystemExit(f"expected eight compiled embedded Python programs, got {embedded_python}")
+required_embedded_python = {
+    "create-only canonical installer":
+        '"$ARC_RECOVERY_PYTHON_PATH" -I - "$completed_path" "$canonical_path" <<\'PY\'',
+    "CMS rewrap verifier":
+        '"$protected_main_sha" "$cms_path" "$rewrap_receipt" <<\'PY\'',
+    "legacy validator-set installer":
+        '"$legacy_source" "$legacy_validator_set" <<\'PY\'',
+    "reference snapshot/WAL verifier":
+        '"$reference_pair" "$reference_block_height" <<\'PY\'',
+    "final macOS artifact handoff builder":
+        '"$pretag_run_attempt" <<\'PY\'',
+    "native macOS handoff extractor":
+        '"$ARC_MACOS_PROTECTED_MAIN_SHA" <<\'PY\'',
+    "historical macOS canary root verifier":
+        '"$ARC_MACOS_OLD_CANARY_SHA" <<\'PY\'',
+    "final macOS acceptance verifier":
+        '"$ARC_MACOS_FINAL_ARCHIVE_SHA256" <<\'PY\'',
+    "Lima macOS receipt importer":
+        '"$macos_canary_acceptance" <<\'PY\'',
+    "prearchive source-lock verifier":
+        '"$prearchive_output" "$PWD/scripts/recovery" "$protected_main_sha" <<\'PY\'',
+    "legacy WAL policy reader":
+        '/usr/bin/python3.12 -I - "$final_manifest" <<\'PY\'',
+    "published-acceptance artifact extractor":
+        '"$published_acceptance_root" <<\'PY\'',
+    "native release-asset metadata reader":
+        '"$ARC_DESKTOP_RELEASE_BINDING" "$asset_name" <<\'PY\'',
+    "packaged evidence durability sealer":
+        '"$packaged_appimage_evidence" "$macos_package_evidence" <<\'PY\'',
+}
+for purpose, marker in required_embedded_python.items():
+    if region.count(marker) != 1:
+        raise SystemExit(
+            f"embedded Python for {purpose} is absent or duplicated: {marker}"
+        )
+if embedded_python != len(required_embedded_python):
+    raise SystemExit(
+        "compiled embedded Python inventory contains an unreviewed or missing program: "
+        f"expected {len(required_embedded_python)}, got {embedded_python}"
+    )
 pathlib.Path(sys.argv[2]).write_text(
     "#!/usr/bin/env bash\n" + "\n".join(blocks), encoding="utf-8"
 )
@@ -1032,6 +1101,7 @@ install = one("scripts/release/restore-validator-vault.py install")
 export = one('"$arc_node_linux" recovery export')
 sign = one('offline_signer "$signing_binary" recovery sign')
 verify = one('offline_signer "$arc_node_linux" recovery verify')
+macos_handoff = one("# BEGIN LIMA FINAL MACOS CANARY HANDOFF STAGE")
 prearchive = one("scripts/recovery/build-production-manifest.py prearchive")
 archive = one("scripts/recovery/archive-fleet-to-drive.sh seal \\")
 downloads = one('\ndownload_root="$(\n')
@@ -1042,8 +1112,9 @@ lima_canary_import = one(
     "# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT"
 )
 ordered = [initial[0], restore[0], capture[0], install[0], export[0], sign[0],
-           verify[0], macos_transfer[0], lima_canary_import[0], prearchive[0],
-           archive[0], downloads[0], finalize[0], frontend[0]]
+           verify[0], macos_handoff[0], macos_transfer[0],
+           lima_canary_import[0], prearchive[0], archive[0], downloads[0],
+           finalize[0], frontend[0]]
 if ordered != sorted(ordered) or len(set(ordered)) != len(ordered):
     raise SystemExit("executable production bash blocks are absent or out of mandatory order")
 
@@ -1124,21 +1195,65 @@ require(
     'arc_install_or_reuse_exact "$incoming_checkpoint" "$recovery_checkpoint"',
 )
 require(
+    macos_handoff[1], "# BEGIN LIMA FINAL MACOS CANARY HANDOFF STAGE",
+    'macos_final_handoff_source="$pretag_raw_root/headless-macos-arm64/actions.zip"',
+    'macos_final_handoff_root="/var/tmp/arc-macos-final-canary-v0.8.0-$protected_main_sha"',
+    '"schema": "arc.recovery.macos-final-canary-handoff.v1"',
+    'selection["artifacts"]["macos-arm64"]["headless"]',
+    'os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow',
+    'os.fchmod(destination_fd, 0o755)',
+    'root:root:755:1', 'root:root:444:1',
+    'FINAL-CANARY-HANDOFF.json', 'SHA256SUMS',
+)
+require(
     macos_transfer[1], "# BEGIN NATIVE MACOS CANARY TRANSFER",
     "set -Eeuo pipefail", 'test "$(/usr/bin/uname -s)" = Darwin',
     'test "$(/usr/bin/uname -m)" = arm64', 'test "$(/usr/bin/id -u)" -ne 0',
     "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'",
     'case "$ARC_MACOS_PROTECTED_CHECKOUT" in /*)',
+    "ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'",
+    'ARC_MACOS_FINAL_INPUT_ROOT="$HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'ARC_MACOS_OLD_CANARY_ROOT="$HOME/.arc-pretag-community-canary"',
+    'ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'macos_final_handoff_guest="/var/tmp/arc-macos-final-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    '"$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/headless-macos-arm64-actions.zip"',
+    '"schema", "repository", "commit", "run_id", "run_attempt"',
+    'ARC_MACOS_FINAL_ARTIFACT_DIGEST ARC_MACOS_FINAL_ARCHIVE_SHA256',
+    '"$macos_canary_helper" status --root "$ARC_MACOS_OLD_CANARY_ROOT"',
+    '"$macos_canary_helper" stop --root "$ARC_MACOS_OLD_CANARY_ROOT"',
+    '"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"',
+    'test "$old_canary_status_rc" -eq 3',
+    '/usr/sbin/lsof -nP -a -iTCP:19944 -sTCP:LISTEN',
+    '"$macos_canary_helper" plan',
+    '"$macos_canary_helper" install',
+    '"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    '"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    '"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"',
+    '"artifact_digest": artifact_digest', '"archive_sha256": archive_sha256',
+    'final macOS acceptance does not bind the exact root/artifact tuple',
     'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"',
     'ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
-    '"$macos_canary_helper" status', '"$macos_canary_helper" accept',
     'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
     '"$ARC_LIMACTL" copy --backend=scp',
 )
 require_order(
-    macos_transfer[1], '"$macos_canary_helper" status',
-    '"$macos_canary_helper" accept', '"$ARC_LIMACTL" copy --backend=scp',
+    macos_transfer[1],
+    '"$ARC_LIMACTL" copy --backend=scp',
+    '"$macos_canary_helper" status --root "$ARC_MACOS_OLD_CANARY_ROOT"',
+    '"$macos_canary_helper" stop --root "$ARC_MACOS_OLD_CANARY_ROOT"',
+    '"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"',
+    'test "$old_canary_status_rc" -eq 3',
+    '"$macos_canary_helper" plan',
+    '"$macos_canary_helper" install',
+    '"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    '"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    '"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"',
+    'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
 )
+if 'macos_canary_acceptance_source="$HOME/.arc-pretag-community-canary/' in macos_transfer[1]:
+    raise SystemExit("final canary acceptance still reads the historical default root")
 require(
     lima_canary_import[1],
     "# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT",
@@ -1346,7 +1461,15 @@ PY
                 'operator runbook omits an exact Ubuntu path, hash, or materialized input' \
                 || return 1
         done
-        if grep -Eq '/private/etc/ssl/cert[.]pem|/opt/homebrew/' "$file"; then
+        # The recovery README deliberately contains two separately marked
+        # native-macOS handoff/gate blocks. Apply the Ubuntu-path prohibition
+        # to every other executable/documented line, while the dedicated
+        # native-block contracts below validate those macOS paths exactly.
+        if awk '
+            /# BEGIN NATIVE MACOS / { native=1; next }
+            /# END NATIVE MACOS / { native=0; next }
+            !native { print }
+        ' "$file" | grep -Eq '/private/etc/ssl/cert[.]pem|/opt/homebrew/'; then
             printf 'Ubuntu operator runbook retains a macOS proof/runtime path: %s\n' "$file"
             return 1
         fi
@@ -1417,20 +1540,23 @@ PY
         --pages-api --pages-deployments --pages-statuses --frontend-config \
         --deployed-commit --deployed-sha256sums --published-workflow \
         --published-run --published-jobs --published-artifact-metadata \
-        --published-artifact-zip --reward-evidence --rollout-manifest --output-dir
+        --published-artifact-zip --reward-evidence --rollout-manifest \
+        --desktop-live-receipt --packaged-appimage-receipt \
+        --macos-package-evidence-dir \
+        --node --node-sha256 --output-dir
     do
         printf '%s\n' "$public_truth_help" | grep -Fq -- "$option" || {
             printf 'public-truth helper omits final required option: %s\n' "$option"
             return 1
         }
-        printf '%s\n' "$public_truth_section" | grep -Fq -- "$option" || {
+        grep -Fq -- "$option" <<< "$public_truth_section" || {
             printf 'recovery README omits final public-truth option: %s\n' "$option"
             return 1
         }
     done
     for obsolete in '--acceptance ' '--installer '
     do
-        if printf '%s\n' "$public_truth_section" | grep -Fq -- "$obsolete"; then
+        if grep -Fq -- "$obsolete" <<< "$public_truth_section"; then
             printf 'recovery README retains obsolete public-truth option: %s\n' "$obsolete"
             return 1
         fi
@@ -1442,6 +1568,73 @@ PY
         '--evidence-root "$published_acceptance_root/evidence"' \
         'POST-RELEASE-ACCEPTANCE.json | /usr/bin/sort' \
         '.schema == "arc.post-release-acceptance.v2"' \
+        'ARC_RECOVERY_NODE_PATH=/secure/operator/tools/node-v24.20.0' \
+        '2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2' \
+        '89af8424dd53e560b1933f87ba650d8bf57c83ca5a04600eefb31f416aabbae7' \
+        '--node "$ARC_RECOVERY_NODE_PATH"' \
+        '--node-sha256 "$ARC_RECOVERY_NODE_SHA256"' \
+        '# BEGIN NATIVE MACOS DESKTOP LIVE PRODUCT GATE' \
+        'ARC_LIVE_PORT=19090' \
+        'DESKTOP-LIVE-INPUT.json' \
+        'https://ferrumvir.github.io/arc-chain' \
+        'arc-network.json?commit=$ARC_LIVE_FRONTEND_COMMIT' \
+        'ARC_LIVE_CONFIG_SHA256=' \
+        'ARC_LIVE_PLAYWRIGHT_REPORT=' \
+        '/opt/homebrew/Cellar/lima/2.1.1/bin/limactl' \
+        '83cbe5c60bcea3e4a500aeb577b5f104c2db489b0cba4a6e81cf4098bd2ee199' \
+        'node-v24.20.0-darwin-arm64.tar.xz' \
+        'b7bf7707070b950ba1ec5f1af3bb6de0f2b1962c5033973d94068ab021ef3014' \
+        '9d050fd455b56426e25d4d603c7c501cbb2630348e836cf221dcce748e90588a' \
+        '8e5f6f3429f8cdbe693cdc29904e9d5a7b127a494bd15c804bd54c7403bfcbe7' \
+        '09dfcf187178ce1ab3ea6194c80d3ae082ad2a86dc1269ac963f94429e718122' \
+        '"$ARC_LIVE_NODE_PATH" "$ARC_LIVE_NPM_CLI" ci --ignore-scripts' \
+        'node_modules/@playwright/test/cli.js' \
+        'playwright.live.config.ts' \
+        'ARC_LIVE_VALIDATOR_HOST" = 140.82.16.112' \
+        '/run/arc-v3-rpc-lax-${ARC_LIVE_ROLLOUT_MANIFEST_SHA256:0:16}/rpc.sock' \
+        '97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d' \
+        '9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a' \
+        '75ae4b414b57e0c52ad1cb24a9d7dae2496071fdf153c7fc8e94db3c9c4b0faa' \
+        'StrictHostKeyChecking=yes' \
+        'ExitOnForwardFailure=yes' \
+        '-L "127.0.0.1:$ARC_LIVE_PORT:$ARC_LIVE_VALIDATOR_RPC_SOCKET"' \
+        'diff-index --quiet HEAD --' \
+        'update-index --really-refresh' \
+        "substr(\$0,1,1) ~ /[a-zS]/" \
+        'status --porcelain=v1 --untracked-files=all' \
+        'ls-files --others --ignored --exclude-standard -- .' \
+        'desktop/.env.local' \
+        "':(exclude)desktop/node_modules/**'" \
+        "':(exclude)desktop/dist/**'" \
+        "':(exclude)desktop/test-results/**'" \
+        'DESKTOP-LIVE-PRODUCT.json' \
+        '# BEGIN LIMA DESKTOP LIVE RECEIPT IMPORT' \
+        '--desktop-live-receipt "$desktop_live_receipt"' \
+        '--packaged-appimage-receipt "$packaged_appimage_receipt"' \
+        '--macos-package-evidence-dir "$macos_package_evidence"' \
+        'scripts/release/packaged-appimage-live-gate.py' \
+        'scripts/recovery/build-macos-package-provenance.py' \
+        'ARC_LIVE_APPIMAGE_RECEIPT=' \
+        'ARC_LIVE_APP_ARCHIVE=' \
+        'ARC_LIVE_APP_ARCHIVE_SIGNATURE=' \
+        'ARC_LIVE_DMG=' \
+        'ARC_LIVE_MACOS_CONTROLLER_ATTEMPT=' \
+        'ARC_LIVE_MACOS_PACKAGE_INSPECTION=' \
+        'ARC_LIVE_MACOS_PACKAGE_PROVENANCE=' \
+        'ARC_LIVE_MACOS_PACKAGE_PROVENANCE_VERIFICATION=' \
+        'ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT=' \
+        'ARC_LIVE_NATIVE_ATTEMPT=' \
+        'ARC_LIVE_NATIVE_HOME=' \
+        'ARC_LIVE_NATIVE_INPUT=' \
+        'ARC_LIVE_NATIVE_RECEIPT=' \
+        'host-run' \
+        'lima-verify' \
+        'build-input' \
+        'MACOS-PACKAGE-PROVENANCE-VERIFICATION.json' \
+        '.productSurfaces.desktopLive.receipt == $desktop_live[0]' \
+        '"scripts/release/verify-postcutover-product-surfaces.mjs"' \
+        '.productSurfaces.nodeVersion == "v24.20.0"' \
+        '.productSurfaces.readerSha256 == {' \
         '--slurpfile receipt "$acceptance_receipt"' \
         '.acceptance.receipt == $receipt[0]' \
         '/usr/bin/jq -cS '\''.acceptance.receipt'\'' "$public_truth_status"'
@@ -1450,6 +1643,10 @@ PY
             'recovery README is stale against the final public-truth evidence contract' \
             || return 1
     done
+    if grep -Fq -- "':(exclude)desktop/.env" "$RECOVERY_README"; then
+        printf 'recovery README allows an ignored Vite environment input into the live gate\n'
+        return 1
+    fi
     for literal in \
         'exact 36-file' \
         '`build-postrelease-public-truth.py`' \
@@ -1544,6 +1741,8 @@ PY
         'frontend-push.XXXXXXXX' \
         '-c http.sslVerify=true' \
         'FRONTEND-MAIN-RULESET-BASELINE.json' \
+        "frontend_branch='arc-recovery/frontend-v0.8.0'" \
+        'repos/FerrumVir/arc-chain/git/matching-refs/heads/$frontend_branch' \
         '.parameters.required_approving_review_count = 0' \
         '.parameters.require_last_push_approval = false' \
         'trap frontend_restore_on_exit EXIT' \
@@ -1560,7 +1759,15 @@ PY
         'POST-RELEASE-ACCEPTANCE.json' \
         'scripts/release/build-postrelease-public-truth.py' \
         "public_truth_branch='arc-recovery/public-truth-v0.8.0'" \
-        'and .reviewDecision == "APPROVED"' \
+        'repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch' \
+        'PUBLIC-TRUTH-RULESETS-BASELINE.json' \
+        'PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json' \
+        'repository-owner-emergency' \
+        'trap public_truth_restore_on_exit EXIT' \
+        'PUBLIC-TRUTH-CHECKS-IMMEDIATELY-BEFORE-MERGE.json' \
+        'PUBLIC-TRUTH-MERGE-TRANSPORT.json' \
+        'PUBLIC-TRUTH-MERGE.json' \
+        'public_truth_merge_receipt_sha256' \
         'PUBLIC-TRUTH-PAGES-RUN-SELECTION.json' \
         'actions/runs/$public_truth_pages_run_id/attempts/$public_truth_pages_run_attempt' \
         './shared/frontend/production-status.json' \
@@ -1570,12 +1777,57 @@ PY
             'recovery README omits an executable release or post-release receipt gate' \
             || return 1
     done
+    if [ "$(grep -Fc 'git/matching-refs/heads/$frontend_branch' \
+        "$RECOVERY_README")" -ne 2 ] \
+        || [ "$(grep -Fc 'git/matching-refs/heads/$public_truth_branch' \
+        "$RECOVERY_README")" -ne 2 ]; then
+        printf 'branch probes do not use each exact branch variable twice\n'
+        return 1
+    fi
+    if grep -Fq 'git/matching-refs/heads/arc-recovery/frontend/v0.8.0' \
+        "$RECOVERY_README" \
+        || grep -Fq 'git/matching-refs/heads/arc-recovery/public-truth/v0.8.0' \
+        "$RECOVERY_README"; then
+        printf 'branch probes retain a path that differs from the pushed branch\n'
+        return 1
+    fi
     for literal in \
-        'only **native macOS shell** block' \
+        'required_approving_review_count = 0' \
+        'require_last_push_approval = false' \
+        '(.statusCheckRollup | length) == 33' \
+        'all_required_checks_must_succeed:true' \
+        'and .independent_review == false' \
+        'Restore before parsing, accepting, or recording the merge response.' \
+        'ruleset_restored_exactly:true'
+    do
+        grep -Fq -- "$literal" <<< "$public_truth_section" || {
+            printf 'public-truth owner-emergency contract omits: %s\n' "$literal"
+            return 1
+        }
+    done
+    if [ "$(grep -Fc '.parameters.required_approving_review_count = 0' \
+        <<< "$public_truth_section")" -ne 1 ] \
+        || [ "$(grep -Fc '.parameters.require_last_push_approval = false' \
+        <<< "$public_truth_section")" -ne 1 ]; then
+        printf 'public-truth exception does not change exactly the two review fields once\n'
+        return 1
+    fi
+    if grep -Eq '\.bypass_actors[[:space:]]*=[[:space:]]*\[|\.strict_required_status_checks_policy[[:space:]]*=[[:space:]]*false|\.parameters\.required_status_checks[[:space:]]*=[[:space:]]*\[\]' \
+        <<< "$public_truth_section"; then
+        printf 'public-truth owner-emergency path weakens checks or bypass policy\n'
+        return 1
+    fi
+    for literal in \
+        'first of two **native macOS shell** blocks' \
         'Lima root shell open and untouched' \
         '$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>' \
+        '# BEGIN LIMA FINAL MACOS CANARY HANDOFF STAGE' \
+        'arc.recovery.macos-final-canary-handoff.v1' \
         '# BEGIN NATIVE MACOS CANARY TRANSFER' \
         "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'" \
+        "ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'" \
+        'ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"' \
+        'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"' \
         'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"' \
         '"$ARC_LIMACTL" copy --backend=scp' \
         '# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT' \

@@ -21,6 +21,9 @@ import unittest
 
 
 SCRIPT = pathlib.Path(__file__).with_name("archive-node.sh")
+FLEET_SCRIPT = SCRIPT.with_name("archive-fleet-to-drive.sh")
+MANIFEST_BUILDER = SCRIPT.with_name("build-production-manifest.py")
+ROLLOUT = SCRIPT.with_name("recovery_rollout.py")
 
 
 def round_source() -> str:
@@ -223,11 +226,63 @@ class EmbeddedProgramTests(unittest.TestCase):
         cls.outer = round_source()
         cls.helper = helper_source(cls.outer)
         cls.live_capture = live_capture_source()
+        cls.fleet = FLEET_SCRIPT.read_text(encoding="utf-8")
 
     def test_embedded_programs_compile(self) -> None:
         compile(self.outer, "archive-node-quarantine-round", "exec")
         compile(self.helper, "archive-node-pinned-helper", "exec")
         compile(self.live_capture, "archive-node-live-source-capture", "exec")
+
+    def test_normalized_capture_precedes_rust_inspection_and_binds_both_wals(self) -> None:
+        source = self.live_capture
+        normalize_at = source.index("normalized=subprocess.run(normalize_command")
+        rust_capture_at = source.index("result=subprocess.run(capture_command", normalize_at)
+        seal_at = source.index('create(attempt/"receipt.json",raw)', rust_capture_at)
+        self.assertLess(normalize_at, rust_capture_at)
+        self.assertLess(rust_capture_at, seal_at)
+        for required in (
+            'capture_data_dir=normalized_source',
+            'current_identity(data_dir/"state.wal",receipt.get("source_wal")',
+            'current_identity(normalized/"state.wal",receipt.get("derivative_wal")',
+            'source_prefix.get("quarantined_suffix_bytes_at_loader")!=0',
+            '!=normalization_receipt["head"]["state_root"]',
+        ):
+            self.assertIn(required, source)
+
+    def test_v1_and_v2_dispatch_are_additive(self) -> None:
+        self.assertIn("capture-live-source)", self.shell)
+        self.assertIn("capture-normalized-live-source)", self.shell)
+        self.assertIn("wal-normalizer) filename=normalize-legacy-wal.py; mode=500", self.shell)
+        self.assertIn(
+            "wal-normalization-plan) filename=legacy-wal-normalization-plan.json; mode=400",
+            self.shell,
+        )
+        self.assertIn("arc.recovery.persisted-legacy-head.v2", self.shell)
+        self.assertIn("exact-content-pinned-normalization-source", self.shell)
+
+    def test_fleet_stages_normalization_only_for_lax_and_ams(self) -> None:
+        self.assertIn('case "$node" in\n        lax)', self.fleet)
+        self.assertIn('case "$node" in\n                lax)', self.fleet)
+        self.assertEqual(self.fleet.count('capture_action="capture-normalized-live-source"'), 4)
+        self.assertEqual(self.fleet.count('stage_file "$node" "$freeze_sha" wal-normalizer'), 2)
+        self.assertEqual(
+            self.fleet.count('stage_file "$node" "$freeze_sha" wal-normalization-plan'), 2
+        )
+        self.assertIn('"${normalization_args[@]}" > "$temporary"', self.fleet)
+
+    def test_normalization_inputs_are_retained_by_manifest_and_archive(self) -> None:
+        builder = MANIFEST_BUILDER.read_text(encoding="utf-8")
+        rollout = ROLLOUT.read_text(encoding="utf-8")
+        for name in (
+            "legacy_wal_normalizer",
+            "legacy_wal_normalization_lax",
+            "legacy_wal_normalization_ams",
+        ):
+            self.assertIn(name, builder)
+            self.assertIn(name, rollout)
+        self.assertIn("normalize-legacy-wal.py", self.fleet)
+        self.assertIn("legacy-wal-normalization-lax.json", self.fleet)
+        self.assertIn("legacy-wal-normalization-ams.json", self.fleet)
 
     def test_live_capture_accepts_only_loopback_reachable_ipv4_listeners(self) -> None:
         tree = ast.parse(self.live_capture)

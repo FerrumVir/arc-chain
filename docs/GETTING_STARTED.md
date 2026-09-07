@@ -81,9 +81,9 @@ chmod +x ./arc-desktop-linux-x86_64.AppImage
 
 ---
 
-## 2. First-launch onboarding (3 clicks)
+## 2. First-launch onboarding (4 short screens)
 
-When ARC Node opens for the first time, you'll see a 3-screen welcome flow.
+When ARC Node opens for the first time, you'll see a four-screen welcome flow.
 
 ### Screen 1: Welcome
 
@@ -110,7 +110,7 @@ offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.
 
-### Screen 3: Configure this node
+### Screen 3: Pick a model or observer mode
 
 Choose whether to download a model:
 
@@ -120,9 +120,16 @@ Choose whether to download a model:
 - **Observer/router**: no local model execution. It can still query the selected
   coordinator and follow whatever chain services the approved rollout enables.
 
-Click **Set up this node**. The app downloads the chosen model and node build,
-starts the process, attempts a configured coordinator connection, and requests
-testnet faucet credit. Each result is reported separately.
+Click **Continue** after choosing the exact network model or observer/router
+mode.
+
+### Screen 4: Launch
+
+Review the role and ports, then click **Set up this node**. The app downloads
+the chosen model and node build, starts the process, and attempts a configured
+coordinator connection. It does **not** silently request faucet credit; use the
+Wallet screen's explicit **Claim from faucet** action after onboarding if you
+want testnet ARC. Startup and connectivity are reported separately.
 
 ---
 
@@ -158,6 +165,12 @@ The result states which host says it served the request and exactly what
 agreement evidence came back. A raw `InferenceAttestation` (`0x16`) is only a
 computation claim; even a successful mined `0x16` receipt is not a worker
 payment.
+
+One click may perform body-free readiness checks against more than one origin,
+but it selects one coordinator and sends at most one inference POST. If that
+POST times out, resets, returns an error, or has a malformed response, the app
+reports an ambiguous possibly-settled outcome and does not replay the prompt on
+another route. Check the job or transaction evidence before trying again.
 
 4. If the selected path succeeds, the response can include output, input/output
    commitments, route metadata, and a claim transaction hash. Each field is

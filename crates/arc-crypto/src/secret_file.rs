@@ -243,6 +243,19 @@ pub fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_read(path)
 }
 
+/// Open an owner-validated, non-reparse Windows file only to compare its
+/// kernel identity with an already-open writer handle.
+///
+/// The identity probe requests no write access but must share reads, writes,
+/// and deletes: the WAL append handle is intentionally live while its final
+/// pathname is rebound to the same file ID.  This narrowly scoped opener does
+/// not weaken the append handle's own share mode, so a second writer remains
+/// excluded.
+#[cfg(windows)]
+pub fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
+    platform::open_owned_nofollow_identity_probe(path)
+}
+
 /// Tighten an already-open, owner-verified regular file to ARC's private
 /// permission boundary. The handle is revalidated before any mutation.
 pub fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
@@ -3808,6 +3821,23 @@ mod platform {
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(permission_error(format!(
                 "owner-controlled file is not a non-reparse regular file: {}",
+                path.display()
+            )));
+        }
+        validate_private_owner(&file, path, "file")?;
+        Ok(file)
+    }
+
+    pub(super) fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
+        let file = open_private_raw_with_access_and_share(
+            path,
+            GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "owner-controlled identity probe is not a non-reparse regular file: {}",
                 path.display()
             )));
         }

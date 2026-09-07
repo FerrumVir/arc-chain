@@ -8,11 +8,11 @@ use crate::recovery::RecoveryContext;
 use arc_crypto::Hash256;
 use arc_types::{Account, Address, Block, EventLog, Identity, Transaction, TxReceipt};
 use crossbeam::channel::{self, Receiver, Sender};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -491,13 +491,21 @@ pub enum WalOp {
     SetRecoveryContext(RecoveryContext, Option<u64>),
 }
 
+/// An admitted append whose sequence is already linearized with every WAL
+/// barrier, but whose checksum and final encoding are left to the sole writer.
+struct PendingWalEntry {
+    block_height: u64,
+    sequence: u64,
+    op: WalOp,
+}
+
 /// Internal command for the WAL background thread.
 enum WalCommand {
-    /// Append an entry to the WAL. Boxed: a `WalEntry` dwarfs the other
+    /// Append an entry to the WAL. Boxed: a pending entry dwarfs the other
     /// variants, and every message through the channel would otherwise be
-    /// sized for it. `Box<WalEntry>` serialises identically to `WalEntry`,
-    /// so the on-disk format is unchanged.
-    Append(Box<WalEntry>),
+    /// sized for it. The writer seals the ordinary `WalEntry`, so the on-disk
+    /// format is unchanged.
+    Append(Box<PendingWalEntry>),
     /// Flush all pending writes and fsync.
     Sync(channel::Sender<Result<(), WalError>>),
     /// Rotate: close the current segment, open a new one.
@@ -506,6 +514,93 @@ enum WalCommand {
     Shutdown(channel::Sender<Result<(), WalError>>),
     #[cfg(test)]
     Disconnect,
+}
+
+/// Serializes sequence assignment and command admission. A stronger atomic
+/// ordering cannot make a sequence reservation and a later channel send one
+/// operation; this short gate makes their order identical without doing WAL
+/// serialization on execution threads.
+struct WalAdmission {
+    next_sequence: u64,
+    accepting: bool,
+}
+
+/// Stable file identity captured around startup validation. Size alone cannot
+/// detect an in-place same-length rewrite or a pathname swap to another inode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WalFileIdentity {
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+    #[cfg(not(any(unix, windows)))]
+    modified: Option<std::time::SystemTime>,
+    #[cfg(not(any(unix, windows)))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl WalFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt as _;
+
+        Self {
+            len: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+            #[cfg(windows)]
+            creation_time: metadata.creation_time(),
+            #[cfg(windows)]
+            last_write_time: metadata.last_write_time(),
+            #[cfg(not(any(unix, windows)))]
+            modified: metadata.modified().ok(),
+            #[cfg(not(any(unix, windows)))]
+            created: metadata.created().ok(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_wal_file_identity(file: &File) -> std::io::Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live handle and `information` is a correctly
+    // sized writable output buffer for this synchronous identity query.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
 }
 
 /// A fatal WAL writer failure. The first failure is retained for the lifetime
@@ -600,7 +695,12 @@ impl WalFaultInjector {
         #[cfg(test)]
         if self
             .next
-            .compare_exchange(point as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                point as u8,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
             .is_ok()
         {
             return Err(std::io::Error::other(format!(
@@ -616,7 +716,8 @@ impl WalFaultInjector {
 
     #[cfg(test)]
     fn inject(&self, point: WalFaultPoint) {
-        self.next.store(point as u8, Ordering::Release);
+        self.next
+            .store(point as u8, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -626,10 +727,10 @@ impl WalFaultInjector {
 /// and flushes writes. Execution threads are never blocked by I/O.
 pub struct WalWriter {
     sender: Sender<WalCommand>,
-    sequence: AtomicU64,
+    admission: Mutex<WalAdmission>,
     handle: Option<thread::JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
     failure: Arc<OnceLock<WalError>>,
+    #[cfg(test)]
     faults: Arc<WalFaultInjector>,
     is_null: bool,
     /// Directory containing WAL segment files.
@@ -642,10 +743,16 @@ impl WalWriter {
     pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = open_or_create_append_file_durably(&path)?;
+        // Derive the sequence from the exact append handle retained by the
+        // writer. Validating through a second pathname open would permit a
+        // same-owner replacement to make startup validate one file while
+        // durable acknowledgements later target an unlinked or different one.
+        let mut expected_sequence = Some(0u64);
+        Self::validate_existing_segment_handle(&path, &file, &mut expected_sequence)?;
+        let seq = expected_sequence.unwrap_or(0);
         let mut writer = BufWriter::with_capacity(256 * 1024, file); // 256KB buffer
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
-        let shutdown = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(OnceLock::new());
         let failure_clone = failure.clone();
         let faults = Arc::new(WalFaultInjector::new());
@@ -656,9 +763,6 @@ impl WalWriter {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-
-        // Determine starting sequence by reading existing entries (before path is moved)
-        let seq = Self::count_entries(&path);
 
         let writer_path = path.clone();
         let handle = thread::Builder::new()
@@ -677,10 +781,13 @@ impl WalWriter {
 
         Ok(Self {
             sender,
-            sequence: AtomicU64::new(seq),
+            admission: Mutex::new(WalAdmission {
+                next_sequence: seq,
+                accepting: true,
+            }),
             handle: Some(handle),
-            shutdown,
             failure,
+            #[cfg(test)]
             faults,
             is_null: false,
             wal_dir,
@@ -745,13 +852,16 @@ impl WalWriter {
         restore_interrupted_wal_namespace_rebarriers(&wal_dir)?;
         cleanup_removed_wal_tombstones(&wal_dir)?;
 
-        // Find the latest segment or create segment 0
-        let (segment_number, seg_path) = Self::find_latest_segment(&wal_dir);
+        // Open the selected tail while the directory namespace lock is held,
+        // then validate the complete namespace with that exact retained
+        // append handle. This binds both the sequence watermark and the path
+        // identity to the file that the writer thread will actually use.
+        let (segment_number, seg_path) = Self::find_latest_segment(&wal_dir)?;
         let file = open_or_create_append_file_durably(&seg_path)?;
+        let seq = Self::count_entries_in_dir_with_append_handle(&wal_dir, &seg_path, &file)?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
-        let shutdown = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(OnceLock::new());
         let failure_clone = failure.clone();
         let faults = Arc::new(WalFaultInjector::new());
@@ -772,15 +882,15 @@ impl WalWriter {
                 );
             })?;
 
-        // Count entries across all segments for sequence recovery
-        let seq = Self::count_entries_in_dir(&wal_dir);
-
         Ok(Self {
             sender,
-            sequence: AtomicU64::new(seq),
+            admission: Mutex::new(WalAdmission {
+                next_sequence: seq,
+                accepting: true,
+            }),
             handle: Some(handle),
-            shutdown,
             failure,
+            #[cfg(test)]
             faults,
             is_null: false,
             wal_dir,
@@ -793,23 +903,29 @@ impl WalWriter {
         let (sender, _receiver) = channel::unbounded();
         Self {
             sender,
-            sequence: AtomicU64::new(0),
+            admission: Mutex::new(WalAdmission {
+                next_sequence: 0,
+                accepting: false,
+            }),
             handle: None,
-            shutdown: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(OnceLock::new()),
+            #[cfg(test)]
             faults: Arc::new(WalFaultInjector::new()),
             is_null: true,
             wal_dir: PathBuf::new(),
         }
     }
 
-    /// Returns true if this WAL writer is active (not null).
-    #[inline]
-    /// Current WAL sequence number (monotonically increasing entry counter).
+    /// Next successfully admitted WAL sequence number.
+    ///
+    /// This is an enqueue watermark, not a durability watermark. Call `sync`
+    /// before relying on the corresponding entries being fsynced.
     pub fn sequence(&self) -> u64 {
-        self.sequence.load(std::sync::atomic::Ordering::Relaxed)
+        self.admission.lock().next_sequence
     }
 
+    /// Returns true if this WAL writer is active (not null).
+    #[inline]
     pub fn is_active(&self) -> bool {
         self.handle.is_some()
     }
@@ -831,10 +947,15 @@ impl WalWriter {
         if self.is_null {
             return Ok(());
         }
+        let admission = self.admission.lock();
+        self.check_admission(&admission)
+    }
+
+    fn check_admission(&self, admission: &WalAdmission) -> Result<(), WalError> {
         if let Some(error) = self.failure() {
             return Err(error);
         }
-        if self.shutdown.load(Ordering::Acquire) {
+        if !admission.accepting {
             return Err(WalError::message(
                 "health check",
                 std::io::ErrorKind::BrokenPipe,
@@ -846,43 +967,42 @@ impl WalWriter {
 
     /// Non-blocking. Sends an entry to the background writer.
     pub fn append(&self, op: WalOp, block_height: u64) {
+        self.append_with_admission_hook(op, block_height, || {});
+    }
+
+    fn append_with_admission_hook<F>(&self, op: WalOp, block_height: u64, admitted: F)
+    where
+        F: FnOnce(),
+    {
         // Null WAL: no writer thread, no handle → skip serialize/send entirely
         if self.is_null {
             return;
         }
 
-        if self.check_health().is_err() {
+        let mut admission = self.admission.lock();
+        if self.check_admission(&admission).is_err() {
             return;
         }
 
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self.faults.check(WalFaultPoint::ChecksumSerialization) {
-            self.latch(WalError::io("checksum serialization", &error));
+        let sequence = admission.next_sequence;
+        let Some(next_sequence) = sequence.checked_add(1) else {
+            self.latch(WalError::message(
+                "sequence assignment",
+                std::io::ErrorKind::InvalidData,
+                "WAL sequence overflow",
+            ));
             return;
-        }
-        let payload = match bincode::serialize(&(&block_height, &seq, &op)) {
-            Ok(payload) => payload,
-            Err(error) => {
-                self.latch(WalError::message(
-                    "checksum serialization",
-                    std::io::ErrorKind::InvalidData,
-                    error.to_string(),
-                ));
-                return;
-            }
         };
-        let checksum = crc32fast::hash(&payload);
-
-        let entry = WalEntry {
+        admitted();
+        let pending = PendingWalEntry {
             block_height,
-            sequence: seq,
+            sequence,
             op,
-            checksum,
         };
 
         if self
             .sender
-            .send(WalCommand::Append(Box::new(entry)))
+            .send(WalCommand::Append(Box::new(pending)))
             .is_err()
         {
             self.latch(WalError::message(
@@ -890,6 +1010,8 @@ impl WalWriter {
                 std::io::ErrorKind::BrokenPipe,
                 "writer channel disconnected",
             ));
+        } else {
+            admission.next_sequence = next_sequence;
         }
     }
 
@@ -899,9 +1021,13 @@ impl WalWriter {
         if self.is_null {
             return Ok(());
         }
-        self.check_health()?;
         let (done_tx, done_rx) = channel::bounded(1);
-        self.sender.send(WalCommand::Sync(done_tx)).map_err(|_| {
+        let send_result = {
+            let admission = self.admission.lock();
+            self.check_admission(&admission)?;
+            self.sender.send(WalCommand::Sync(done_tx))
+        };
+        send_result.map_err(|_| {
             self.latch(WalError::message(
                 "sync channel send",
                 std::io::ErrorKind::BrokenPipe,
@@ -925,9 +1051,13 @@ impl WalWriter {
         if self.is_null {
             return Ok(());
         }
-        self.check_health()?;
         let (done_tx, done_rx) = channel::bounded(1);
-        self.sender.send(WalCommand::Rotate(done_tx)).map_err(|_| {
+        let send_result = {
+            let admission = self.admission.lock();
+            self.check_admission(&admission)?;
+            self.sender.send(WalCommand::Rotate(done_tx))
+        };
+        send_result.map_err(|_| {
             self.latch(WalError::message(
                 "rotation channel send",
                 std::io::ErrorKind::BrokenPipe,
@@ -948,12 +1078,60 @@ impl WalWriter {
     /// Delete WAL segment files whose entries are all before the given sequence number.
     /// Keeps at least `min_retain` segments for safety (defaults to 2 if 0 is given).
     pub fn delete_segments_before(&self, wal_sequence: u64) -> std::io::Result<u32> {
+        self.delete_segments_before_with_admission_hook(wal_sequence, || {})
+    }
+
+    fn delete_segments_before_with_admission_hook<F>(
+        &self,
+        wal_sequence: u64,
+        synchronized: F,
+    ) -> std::io::Result<u32>
+    where
+        F: FnOnce(),
+    {
+        if self.is_null {
+            return Ok(0);
+        }
+
+        // Keep the admission gate from the durability barrier through the
+        // namespace mutation. Every earlier append/rotation is complete when
+        // Sync acknowledges, and no later command can be enqueued until the
+        // complete validated prefix has been retired durably. Releasing this
+        // lock before the scan would let an append-triggered auto-rotation
+        // create a new segment while namespace validation/deletion is active.
+        let admission = self.admission.lock();
+        self.check_admission(&admission)
+            .map_err(|error| std::io::Error::new(error.kind(), error))?;
+        let (done_tx, done_rx) = channel::bounded(1);
+        self.sender.send(WalCommand::Sync(done_tx)).map_err(|_| {
+            let error = self.latch(WalError::message(
+                "pruning sync channel send",
+                std::io::ErrorKind::BrokenPipe,
+                "writer channel disconnected",
+            ));
+            std::io::Error::new(error.kind(), error)
+        })?;
+        let sync_result = done_rx.recv().map_err(|_| {
+            let error = self.failure().unwrap_or_else(|| {
+                self.latch(WalError::message(
+                    "pruning sync acknowledgement",
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer exited before acknowledging pruning fsync",
+                ))
+            });
+            std::io::Error::new(error.kind(), error)
+        })?;
+        sync_result.map_err(|error| std::io::Error::new(error.kind(), error))?;
+
+        synchronized();
         Self::delete_segments_before_in_dir(&self.wal_dir, wal_sequence, 2)
     }
 
-    /// Static version: scan `wal_dir` for segment files, read each segment's
-    /// last entry sequence, and delete segments whose entries are all before
-    /// `wal_sequence`. Keeps at least `min_retain` segments.
+    /// Offline-only static version: scan an inactive `wal_dir` for segment
+    /// files, read each segment's last entry sequence, and delete segments
+    /// whose entries are all before `wal_sequence`. Keeps at least
+    /// `min_retain` segments. Live writers must use `delete_segments_before`
+    /// so append and rotation admission is fenced for the complete operation.
     pub fn delete_segments_before_in_dir(
         wal_dir: &Path,
         wal_sequence: u64,
@@ -961,8 +1139,8 @@ impl WalWriter {
     ) -> std::io::Result<u32> {
         cleanup_removed_wal_tombstones(wal_dir)?;
         let min_retain = if min_retain < 2 { 2 } else { min_retain };
-        let mut segments = Self::list_segments(wal_dir);
-        segments.sort(); // sort by name (ascending segment number)
+        let segments = Self::list_segments_strict(wal_dir)?;
+        Self::validate_segment_namespace(&segments)?;
 
         if segments.len() <= min_retain {
             return Ok(0);
@@ -971,17 +1149,44 @@ impl WalWriter {
         // For each segment, find the last entry's sequence number.
         // A segment is deletable if its last entry sequence < wal_sequence.
         let mut deletable: Vec<PathBuf> = Vec::new();
-        for seg_path in &segments {
-            let entries = read_wal(seg_path);
-            if let Some(last) = entries.last() {
-                if last.sequence < wal_sequence {
-                    deletable.push(seg_path.clone());
-                }
+        let mut last_nonempty_segment = None;
+        let first_segment = segments
+            .first()
+            .and_then(|segment| Self::parse_segment_number(segment))
+            .unwrap_or(0);
+        let mut expected_sequence = (first_segment == 0).then_some(0);
+        let mut within_deletable_prefix = true;
+        for (segment_index, seg_path) in segments.iter().enumerate() {
+            // Pruning is destructive, so a corrupt frame or cross-segment
+            // sequence gap must abort before any namespace entry is removed.
+            let entries = read_wal_strict_segment(seg_path, &mut expected_sequence)?;
+            if !entries.is_empty() {
+                last_nonempty_segment = Some(segment_index);
             }
-            // Empty segments are also candidates for deletion
-            else {
+            let segment_is_before_cutoff = entries
+                .last()
+                .is_none_or(|last| last.sequence < wal_sequence);
+            if within_deletable_prefix && segment_is_before_cutoff {
                 deletable.push(seg_path.clone());
+            } else {
+                // Segment names are a contiguous namespace. Once one retained
+                // segment reaches the cutoff, deleting a later empty segment
+                // would punch a gap into that namespace and make restart fail.
+                within_deletable_prefix = false;
             }
+        }
+
+        // A retained non-empty entry is the only durable source of the next
+        // global sequence after prefix pruning. If every sequence-bearing
+        // segment were removed while two later empty rotations happened to be
+        // retained, restart would have no watermark and could reuse sequence
+        // zero. Keep the final non-empty segment whenever it is still part of
+        // the otherwise-deletable prefix; later empty segments remain
+        // contiguous and can receive the next append safely.
+        if let Some(last_nonempty_segment) = last_nonempty_segment
+            && last_nonempty_segment < deletable.len()
+        {
+            deletable.truncate(last_nonempty_segment);
         }
 
         // Never delete so many that fewer than min_retain segments remain.
@@ -1002,9 +1207,12 @@ impl WalWriter {
             return self.failure().map_or(Ok(()), Err);
         }
 
-        self.shutdown.store(true, Ordering::Release);
         let (done_tx, done_rx) = channel::bounded(1);
-        let send_result = self.sender.send(WalCommand::Shutdown(done_tx));
+        let send_result = {
+            let mut admission = self.admission.lock();
+            admission.accepting = false;
+            self.sender.send(WalCommand::Shutdown(done_tx))
+        };
         let acknowledgement = if send_result.is_ok() {
             done_rx.recv().ok()
         } else {
@@ -1076,8 +1284,8 @@ impl WalWriter {
             };
 
             match command {
-                WalCommand::Append(entry) => {
-                    match Self::write_entry(writer, &entry, faults) {
+                WalCommand::Append(pending) => {
+                    match Self::write_pending_entry(writer, *pending, faults) {
                         Ok(entry_size) => bytes_written += entry_size,
                         Err(error) => {
                             Self::latch_shared(failure, error);
@@ -1089,8 +1297,8 @@ impl WalWriter {
                     // preserve command ordering by deferring the first barrier.
                     loop {
                         match receiver.try_recv() {
-                            Ok(WalCommand::Append(entry)) => {
-                                match Self::write_entry(writer, &entry, faults) {
+                            Ok(WalCommand::Append(pending)) => {
+                                match Self::write_pending_entry(writer, *pending, faults) {
                                     Ok(entry_size) => bytes_written += entry_size,
                                     Err(error) => {
                                         Self::latch_shared(failure, error);
@@ -1176,6 +1384,33 @@ impl WalWriter {
         }
     }
 
+    fn write_pending_entry(
+        writer: &mut BufWriter<File>,
+        pending: PendingWalEntry,
+        faults: &WalFaultInjector,
+    ) -> Result<u64, WalError> {
+        faults
+            .check(WalFaultPoint::ChecksumSerialization)
+            .map_err(|error| WalError::io("checksum serialization", &error))?;
+        let payload = bincode::serialize(&(&pending.block_height, &pending.sequence, &pending.op))
+            .map_err(|error| {
+                WalError::message(
+                    "checksum serialization",
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                )
+            })?;
+        let checksum = crc32fast::hash(&payload);
+        drop(payload);
+        let entry = WalEntry {
+            block_height: pending.block_height,
+            sequence: pending.sequence,
+            op: pending.op,
+            checksum,
+        };
+        Self::write_entry(writer, &entry, faults)
+    }
+
     fn write_entry(
         writer: &mut BufWriter<File>,
         entry: &WalEntry,
@@ -1191,6 +1426,16 @@ impl WalWriter {
                 error.to_string(),
             )
         })?;
+        if data.len() > MAX_WAL_ENTRY_BYTES {
+            return Err(WalError::message(
+                "entry framing",
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "serialized entry is too large: {} bytes (maximum {MAX_WAL_ENTRY_BYTES})",
+                    data.len()
+                ),
+            ));
+        }
         let length = u32::try_from(data.len()).map_err(|_| {
             WalError::message(
                 "entry framing",
@@ -1256,6 +1501,13 @@ impl WalWriter {
                 "segment number overflow",
             )
         })?;
+        if next_segment > MAX_WAL_SEGMENT_NUMBER {
+            return Err(WalError::message(
+                "rotation",
+                std::io::ErrorKind::InvalidInput,
+                "WAL exhausted its canonical eight-digit segment namespace",
+            ));
+        }
         let new_path = if is_dir {
             wal_path.join(format!("wal-{next_segment:08}.bin"))
         } else {
@@ -1311,49 +1563,248 @@ impl WalWriter {
         }
     }
 
-    /// Count existing entries in a WAL file (for sequence recovery).
-    fn count_entries(path: &Path) -> u64 {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(_) => return 0,
+    /// Derive the next sequence across a complete, contiguous segment set.
+    #[cfg(all(test, windows))]
+    fn count_entries_in_dir(dir: &Path) -> std::io::Result<u64> {
+        Self::count_entries_in_dir_inner(dir, None)
+    }
+
+    fn count_entries_in_dir_with_append_handle(
+        dir: &Path,
+        append_path: &Path,
+        append_file: &File,
+    ) -> std::io::Result<u64> {
+        Self::count_entries_in_dir_inner(dir, Some((append_path, append_file)))
+    }
+
+    fn count_entries_in_dir_inner(
+        dir: &Path,
+        append: Option<(&Path, &File)>,
+    ) -> std::io::Result<u64> {
+        let segments = Self::list_segments_strict(dir)?;
+        let first_segment = Self::validate_segment_namespace(&segments)?;
+        if let Some((append_path, _)) = append
+            && segments.last().map(PathBuf::as_path) != Some(append_path)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL append target is not the final canonical segment: {append_path:?}"),
+            ));
+        }
+        // Prefix pruning intentionally leaves the first retained entry with a
+        // non-zero sequence only when segment zero is itself absent. If segment
+        // zero exists, it remains the genesis of the stream and must start at
+        // sequence zero.
+        let mut expected_sequence = (first_segment == 0).then_some(0);
+        for segment in segments {
+            if let Some((append_path, append_file)) = append
+                && segment == append_path
+            {
+                Self::validate_existing_segment_handle(
+                    &segment,
+                    append_file,
+                    &mut expected_sequence,
+                )?;
+            } else {
+                Self::validate_existing_segment(&segment, &mut expected_sequence)?;
+            }
+        }
+        Ok(expected_sequence.unwrap_or(0))
+    }
+
+    fn validate_segment_namespace(segments: &[PathBuf]) -> std::io::Result<u64> {
+        let first_segment = match segments.first() {
+            Some(segment) => Self::parse_segment_number(segment).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid WAL segment name: {}", segment.display()),
+                )
+            })?,
+            None => return Ok(0),
         };
-        let mut reader = BufReader::new(file);
-        let mut count = 0u64;
-        let mut len_buf = [0u8; 4];
-
-        loop {
-            if reader.read_exact(&mut len_buf).is_err() {
-                break;
+        let mut expected_segment = first_segment;
+        for segment in segments {
+            let actual_segment = Self::parse_segment_number(segment).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid WAL segment name: {}", segment.display()),
+                )
+            })?;
+            if actual_segment != expected_segment {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL segment gap: expected {expected_segment:08}, got {actual_segment:08}"
+                    ),
+                ));
             }
+            expected_segment = expected_segment.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL segment number overflow",
+                )
+            })?;
+        }
+        Ok(first_segment)
+    }
+
+    fn validate_existing_segment(
+        path: &Path,
+        expected_sequence: &mut Option<u64>,
+    ) -> std::io::Result<()> {
+        let file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+        Self::validate_existing_segment_handle(path, &file, expected_sequence)
+    }
+
+    fn validate_existing_segment_handle(
+        path: &Path,
+        file: &File,
+        expected_sequence: &mut Option<u64>,
+    ) -> std::io::Result<()> {
+        let path_metadata = fs::symlink_metadata(path)?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL segment is not a regular non-symlink file: {path:?}"),
+            ));
+        }
+        let original_identity = WalFileIdentity::from_metadata(&file.metadata()?);
+        #[cfg(windows)]
+        let original_file_identity = windows_wal_file_identity(file)?;
+        if WalFileIdentity::from_metadata(&path_metadata) != original_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL segment changed while being opened: {path:?}"),
+            ));
+        }
+        let original_bytes = original_identity.len;
+        let mut reader = BufReader::new(file.try_clone()?);
+        reader.seek(SeekFrom::Start(0))?;
+        let mut offset = 0u64;
+
+        while offset < original_bytes {
+            let remaining = original_bytes.checked_sub(offset).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL byte offset exceeds file size",
+                )
+            })?;
+            if remaining < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("truncated WAL frame length at byte {offset}"),
+                ));
+            }
+
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf)?;
             let len = u32::from_le_bytes(len_buf) as usize;
-            let mut data = vec![0u8; len];
-            if reader.read_exact(&mut data).is_err() {
-                break;
+            if len == 0 || len > MAX_WAL_ENTRY_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid WAL frame length {len} at byte {offset}"),
+                ));
             }
-            count += 1;
+            let frame_end = offset
+                .checked_add(4)
+                .and_then(|value| value.checked_add(len as u64))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL byte offset overflow")
+                })?;
+            if frame_end > original_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("truncated WAL frame payload at byte {offset}"),
+                ));
+            }
+
+            let mut data = allocate_wal_frame(len)?;
+            reader.read_exact(&mut data)?;
+
+            let entry = bincode::deserialize_limited_exact::<WalEntry, MAX_WAL_ENTRY_BYTES>(&data)
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid WAL entry encoding at byte {offset}: {error}"),
+                    )
+                })?;
+            drop(data);
+            let payload = bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op))
+                .map_err(std::io::Error::other)?;
+            if entry.checksum != crc32fast::hash(&payload) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("WAL checksum mismatch at sequence {}", entry.sequence),
+                ));
+            }
+            let expected = expected_sequence.get_or_insert(entry.sequence);
+            if entry.sequence != *expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL sequence gap: expected {}, got {}",
+                        *expected, entry.sequence
+                    ),
+                ));
+            }
+            *expected = expected.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL sequence overflow")
+            })?;
+            offset = frame_end;
         }
-        count
+
+        let final_handle_identity = WalFileIdentity::from_metadata(&reader.get_ref().metadata()?);
+        let retained_handle_identity = WalFileIdentity::from_metadata(&file.metadata()?);
+        let final_path_metadata = fs::symlink_metadata(path)?;
+        if final_path_metadata.file_type().is_symlink() || !final_path_metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL segment changed type while validating: {path:?}"),
+            ));
+        }
+        let final_path_identity = WalFileIdentity::from_metadata(&final_path_metadata);
+        if final_handle_identity != original_identity
+            || retained_handle_identity != original_identity
+            || final_path_identity != original_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL segment changed while validating: {path:?}"),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            // Rebind the final pathname while the exclusive append handle is
+            // deliberately live.  The identity-only probe shares writes so
+            // Windows can open it alongside that handle; the writer itself
+            // still omits FILE_SHARE_WRITE and therefore excludes a second
+            // writer.
+            let final_path_file =
+                arc_crypto::secret_file::open_owned_nofollow_identity_probe(path)?;
+            if windows_wal_file_identity(file)? != original_file_identity
+                || windows_wal_file_identity(reader.get_ref())? != original_file_identity
+                || windows_wal_file_identity(&final_path_file)? != original_file_identity
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("WAL segment identity changed while validating: {path:?}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
-    /// Count entries across all segment files in a directory.
-    fn count_entries_in_dir(dir: &Path) -> u64 {
-        let mut total = 0u64;
-        for seg_path in Self::list_segments(dir) {
-            total += Self::count_entries(&seg_path);
-        }
-        total
-    }
-
-    /// Find the latest segment file in a directory, returning (segment_number, path).
+    /// Find the latest valid segment file in a directory, returning (segment_number, path).
     /// If no segments exist, returns (0, dir/wal-00000000.bin).
-    fn find_latest_segment(dir: &Path) -> (u64, PathBuf) {
-        let segments = Self::list_segments(dir);
+    fn find_latest_segment(dir: &Path) -> std::io::Result<(u64, PathBuf)> {
+        let segments = Self::list_segments_strict(dir)?;
+        Self::validate_segment_namespace(&segments)?;
         if let Some(last) = segments.last()
             && let Some(num) = Self::parse_segment_number(last)
         {
-            return (num, last.clone());
+            return Ok((num, last.clone()));
         }
-        (0, dir.join("wal-00000000.bin"))
+        Ok((0, dir.join("wal-00000000.bin")))
     }
 
     /// List all WAL segment files in a directory, sorted by name.
@@ -1374,10 +1825,39 @@ impl WalWriter {
         segments
     }
 
+    /// Fallible segment discovery for startup and strict replay. Every
+    /// directory-open and per-entry error is part of the durability result;
+    /// silently treating a partial enumeration as a complete WAL namespace
+    /// could derive a false sequence watermark.
+    fn list_segments_strict(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut segments = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name = file_name.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL directory contains a non-UTF-8 entry: {}",
+                        dir.display()
+                    ),
+                )
+            })?;
+            if name.starts_with("wal-") && name.ends_with(".bin") {
+                segments.push(entry.path());
+            }
+        }
+        segments.sort();
+        Ok(segments)
+    }
+
     /// Parse the segment number from a segment file path like `wal-00000003.bin`.
     fn parse_segment_number(path: &Path) -> Option<u64> {
         let name = path.file_name()?.to_str()?;
         let stripped = name.strip_prefix("wal-")?.strip_suffix(".bin")?;
+        if stripped.len() != 8 || !stripped.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
         stripped.parse::<u64>().ok()
     }
 }
@@ -1392,7 +1872,28 @@ impl Drop for WalWriter {
 
 // ── WAL Reader (for crash recovery) ─────────────────────────────────────────
 
-const MAX_WAL_ENTRY_BYTES: usize = 1024 * 1024 * 1024;
+// Matches arc-bincode's compatibility ceiling. Length headers are rejected
+// before allocation, so a corrupt u32 cannot request an unbounded buffer.
+const MAX_WAL_ENTRY_BYTES: usize = 256 * 1024 * 1024;
+const MAX_WAL_SEGMENT_NUMBER: u64 = 99_999_999;
+
+fn allocate_wal_frame(len: usize) -> std::io::Result<Vec<u8>> {
+    if len == 0 || len > MAX_WAL_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid WAL frame length {len}"),
+        ));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            format!("cannot allocate bounded WAL frame of {len} bytes: {error}"),
+        )
+    })?;
+    data.resize(len, 0);
+    Ok(data)
+}
 
 fn finish_repairable_read(
     reader: &BufReader<File>,
@@ -1511,7 +2012,7 @@ pub(crate) fn read_repairable_wal_prefix(
                 Some(RepairableWalTail::TruncatedFramePayload),
             );
         }
-        let mut data = vec![0u8; len];
+        let mut data = allocate_wal_frame(len)?;
         if let Err(error) = reader.read_exact(&mut data) {
             if error.kind() != std::io::ErrorKind::UnexpectedEof {
                 return Err(error);
@@ -1526,7 +2027,10 @@ pub(crate) fn read_repairable_wal_prefix(
             );
         }
 
-        let entry: WalEntry = bincode::deserialize(&data).map_err(|error| {
+        let entry: WalEntry = bincode::deserialize_limited_exact::<WalEntry, MAX_WAL_ENTRY_BYTES>(
+            &data,
+        )
+        .map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid WAL entry encoding: {error}"),
@@ -1804,21 +2308,53 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    let original_bytes = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Vec::new(),
+    };
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
-    let mut len_buf = [0u8; 4];
+    let mut offset = 0u64;
 
-    loop {
+    while offset < original_bytes {
+        let remaining = original_bytes.saturating_sub(offset);
+        if remaining < 4 {
+            tracing::warn!(offset, "Truncated WAL frame length, stopping replay");
+            break;
+        }
+        let mut len_buf = [0u8; 4];
         if reader.read_exact(&mut len_buf).is_err() {
             break;
         }
         let len = u32::from_le_bytes(len_buf) as usize;
-        let mut data = vec![0u8; len];
+        if len == 0 || len > MAX_WAL_ENTRY_BYTES {
+            tracing::warn!(len, offset, "Invalid WAL frame length, stopping replay");
+            break;
+        }
+        let Some(frame_end) = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(len as u64))
+        else {
+            tracing::warn!(offset, "WAL frame offset overflow, stopping replay");
+            break;
+        };
+        if frame_end > original_bytes {
+            tracing::warn!(offset, len, "Truncated WAL frame payload, stopping replay");
+            break;
+        }
+        let mut data = match allocate_wal_frame(len) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(%error, offset, "Cannot allocate WAL frame, stopping replay");
+                break;
+            }
+        };
         if reader.read_exact(&mut data).is_err() {
             break; // Truncated entry - stop here (crash mid-write)
         }
+        offset = frame_end;
 
-        match bincode::deserialize::<WalEntry>(&data) {
+        match bincode::deserialize_limited_exact::<WalEntry, MAX_WAL_ENTRY_BYTES>(&data) {
             Ok(entry) => {
                 // Verify checksum
                 let payload =
@@ -1850,30 +2386,35 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
 /// a successful prefix. ARCCHKPT nodes fail closed so a restart cannot expose
 /// partially replayed consensus state as canonical.
 pub fn read_wal_strict(path: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
-    let mut expected_sequence = 0u64;
+    let mut expected_sequence = Some(0u64);
     read_wal_strict_segment(path.as_ref(), &mut expected_sequence)
 }
 
 fn read_wal_strict_segment(
     path: &Path,
-    expected_sequence: &mut u64,
+    expected_sequence: &mut Option<u64>,
 ) -> std::io::Result<Vec<WalEntry>> {
     let file = File::open(path)?;
+    let original_bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
+    let mut offset = 0u64;
 
-    loop {
-        let mut len_buf = [0u8; 4];
-        let first = reader.read(&mut len_buf[..1])?;
-        if first == 0 {
-            break;
-        }
-        reader.read_exact(&mut len_buf[1..]).map_err(|error| {
+    while offset < original_bytes {
+        let remaining = original_bytes.checked_sub(offset).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("truncated WAL frame length: {error}"),
+                "WAL byte offset exceeds file size",
             )
         })?;
+        if remaining < 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("truncated WAL frame length at byte {offset}"),
+            ));
+        }
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
         let len = u32::from_le_bytes(len_buf) as usize;
         if len == 0 || len > MAX_WAL_ENTRY_BYTES {
             return Err(std::io::Error::new(
@@ -1881,14 +2422,29 @@ fn read_wal_strict_segment(
                 format!("invalid WAL frame length {len}"),
             ));
         }
-        let mut data = vec![0u8; len];
+        let frame_end = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(len as u64))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL byte offset overflow")
+            })?;
+        if frame_end > original_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("truncated WAL frame payload at byte {offset}"),
+            ));
+        }
+        let mut data = allocate_wal_frame(len)?;
         reader.read_exact(&mut data).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("truncated WAL frame payload: {error}"),
             )
         })?;
-        let entry: WalEntry = bincode::deserialize(&data).map_err(|error| {
+        let entry: WalEntry = bincode::deserialize_limited_exact::<WalEntry, MAX_WAL_ENTRY_BYTES>(
+            &data,
+        )
+        .map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid WAL entry encoding: {error}"),
@@ -1902,19 +2458,21 @@ fn read_wal_strict_segment(
                 format!("WAL checksum mismatch at sequence {}", entry.sequence),
             ));
         }
-        if entry.sequence != *expected_sequence {
+        let expected = expected_sequence.get_or_insert(entry.sequence);
+        if entry.sequence != *expected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "WAL sequence gap: expected {}, got {}",
-                    *expected_sequence, entry.sequence
+                    *expected, entry.sequence
                 ),
             ));
         }
-        *expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+        *expected = expected.checked_add(1).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL sequence overflow")
         })?;
         entries.push(entry);
+        offset = frame_end;
     }
     Ok(entries)
 }
@@ -1935,10 +2493,34 @@ pub fn read_wal_dir(dir: impl AsRef<Path>) -> Vec<WalEntry> {
 /// corrupt/torn frame, a missing segment, or a cross-segment sequence gap
 /// aborts startup rather than silently accepting a valid-looking prefix.
 pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
-    let segments = WalWriter::list_segments(dir.as_ref());
-    let mut expected_sequence = 0u64;
+    let segments = WalWriter::list_segments_strict(dir.as_ref())?;
+    WalWriter::validate_segment_namespace(&segments)?;
+    let first_segment = segments
+        .first()
+        .and_then(|segment| WalWriter::parse_segment_number(segment))
+        .unwrap_or(0);
+    let mut expected_segment = first_segment;
+    let mut expected_sequence = (first_segment == 0).then_some(0);
     let mut all_entries = Vec::new();
     for segment in segments {
+        let actual_segment = WalWriter::parse_segment_number(&segment).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL segment name: {}", segment.display()),
+            )
+        })?;
+        if actual_segment != expected_segment {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL segment gap: expected {expected_segment:08}, got {actual_segment:08}"),
+            ));
+        }
+        expected_segment = expected_segment.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL segment number overflow",
+            )
+        })?;
         all_entries.extend(read_wal_strict_segment(&segment, &mut expected_sequence)?);
     }
     Ok(all_entries)
@@ -2106,6 +2688,44 @@ mod tests {
         hash_bytes(&[n])
     }
 
+    fn checkpoint_entry(sequence: u64) -> WalEntry {
+        let block_height = sequence;
+        let op = WalOp::Checkpoint(hash_bytes(&sequence.to_le_bytes()));
+        let payload = bincode::serialize(&(&block_height, &sequence, &op)).unwrap();
+        WalEntry {
+            block_height,
+            sequence,
+            op,
+            checksum: crc32fast::hash(&payload),
+        }
+    }
+
+    fn append_encoded_entry(path: &Path, entry: &WalEntry) {
+        let data = bincode::serialize(entry).unwrap();
+        let length = u32::try_from(data.len()).unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&length.to_le_bytes()).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    fn assert_new_rejects_without_changing_bytes(path: &Path, expected: &str) {
+        let before = fs::read(path).unwrap();
+        let error = match WalWriter::new(path) {
+            Ok(_) => panic!("corrupt WAL unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
     #[test]
     fn wal_write_and_read() {
         let path = tmp_path("wal_rw.bin");
@@ -2134,6 +2754,489 @@ mod tests {
         assert_eq!(entries[2].sequence, 2);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn concurrent_append_sequences_match_physical_order() {
+        const THREADS: usize = 12;
+        const ENTRIES_PER_THREAD: usize = 128;
+
+        let path = tmp_path("wal_concurrent_sequence_order.bin");
+        let _ = fs::remove_file(&path);
+        let writer = Arc::new(WalWriter::new(&path).unwrap());
+        let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let mut handles = Vec::new();
+        for worker in 0..THREADS {
+            let writer = Arc::clone(&writer);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for item in 0..ENTRIES_PER_THREAD {
+                    let mut identity = Vec::with_capacity(16);
+                    identity.extend_from_slice(&(worker as u64).to_le_bytes());
+                    identity.extend_from_slice(&(item as u64).to_le_bytes());
+                    writer.append(WalOp::Checkpoint(hash_bytes(&identity)), item as u64);
+                }
+            }));
+        }
+        start.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        writer.sync().unwrap();
+        assert_eq!(writer.sequence(), (THREADS * ENTRIES_PER_THREAD) as u64);
+        drop(writer);
+
+        let entries = read_wal_strict(&path).unwrap();
+        assert_eq!(entries.len(), THREADS * ENTRIES_PER_THREAD);
+        for (physical_index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.sequence, physical_index as u64);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sync_cannot_overtake_an_admitted_append() {
+        let path = tmp_path("wal_sync_admission_barrier.bin");
+        let _ = fs::remove_file(&path);
+        let writer = Arc::new(WalWriter::new(&path).unwrap());
+        let (admitted_tx, admitted_rx) = channel::bounded(1);
+        let (release_tx, release_rx) = channel::bounded(1);
+
+        let append_writer = Arc::clone(&writer);
+        let append = thread::spawn(move || {
+            append_writer.append_with_admission_hook(
+                WalOp::Checkpoint(hash_bytes(b"admitted-before-sync")),
+                1,
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+        });
+        admitted_rx.recv().unwrap();
+
+        let (sync_started_tx, sync_started_rx) = channel::bounded(1);
+        let (sync_done_tx, sync_done_rx) = channel::bounded(1);
+        let sync_writer = Arc::clone(&writer);
+        let sync = thread::spawn(move || {
+            sync_started_tx.send(()).unwrap();
+            sync_done_tx.send(sync_writer.sync()).unwrap();
+        });
+        sync_started_rx.recv().unwrap();
+        assert!(
+            sync_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "sync passed an append holding the admission gate"
+        );
+
+        release_tx.send(()).unwrap();
+        append.join().unwrap();
+        sync_done_rx.recv().unwrap().unwrap();
+        sync.join().unwrap();
+        drop(writer);
+
+        let entries = read_wal_strict(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopen_continues_at_last_valid_sequence() {
+        let path = tmp_path("wal_reopen_sequence.bin");
+        let _ = fs::remove_file(&path);
+        {
+            let writer = WalWriter::new(&path).unwrap();
+            writer.append(WalOp::Checkpoint(hash_bytes(b"zero")), 0);
+            writer.append(WalOp::Checkpoint(hash_bytes(b"one")), 1);
+            writer.sync().unwrap();
+        }
+        {
+            let writer = WalWriter::new(&path).unwrap();
+            assert_eq!(writer.sequence(), 2);
+            writer.append(WalOp::Checkpoint(hash_bytes(b"two")), 2);
+            writer.sync().unwrap();
+        }
+
+        let entries = read_wal_strict(&path).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_append_handle_rejects_a_same_owner_path_replacement() {
+        let dir = tmp_dir("wal_append_handle_path_replacement");
+        let path = dir.join("state.wal");
+        append_encoded_entry(&path, &checkpoint_entry(0));
+        let append_file = open_or_create_append_file_durably(&path).unwrap();
+
+        let displaced = dir.join("displaced.wal");
+        fs::rename(&path, &displaced).unwrap();
+        append_encoded_entry(&path, &checkpoint_entry(0));
+
+        let mut expected_sequence = Some(0);
+        let error = WalWriter::validate_existing_segment_handle(
+            &path,
+            &append_file,
+            &mut expected_sequence,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed while being opened"));
+        drop(append_file);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reopen_rejects_zero_length_frame_without_mutating_wal() {
+        let path = tmp_path("wal_reopen_zero_length.bin");
+        let _ = fs::remove_file(&path);
+        append_encoded_entry(&path, &checkpoint_entry(0));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&0u32.to_le_bytes())
+            .unwrap();
+
+        assert_eq!(read_wal(&path).len(), 1);
+        assert_new_rejects_without_changing_bytes(&path, "invalid WAL frame length 0");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopen_rejects_oversized_length_before_payload_allocation() {
+        let path = tmp_path("wal_reopen_oversized_length.bin");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, u32::MAX.to_le_bytes()).unwrap();
+
+        assert!(read_wal(&path).is_empty());
+        assert_new_rejects_without_changing_bytes(&path, "invalid WAL frame length");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopen_rejects_truncated_payload_before_declared_allocation() {
+        let path = tmp_path("wal_reopen_truncated_payload.bin");
+        let _ = fs::remove_file(&path);
+        let mut bytes = 16_000_000u32.to_le_bytes().to_vec();
+        bytes.push(0xaa);
+        fs::write(&path, bytes).unwrap();
+
+        assert!(read_wal(&path).is_empty());
+        assert_new_rejects_without_changing_bytes(&path, "truncated WAL frame payload");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopen_rejects_checksum_corruption_without_mutating_wal() {
+        let path = tmp_path("wal_reopen_bad_checksum.bin");
+        let _ = fs::remove_file(&path);
+        append_encoded_entry(&path, &checkpoint_entry(0));
+        let mut bytes = fs::read(&path).unwrap();
+        let final_byte = bytes.last_mut().unwrap();
+        *final_byte ^= 0x80;
+        fs::write(&path, bytes).unwrap();
+
+        assert_new_rejects_without_changing_bytes(&path, "WAL checksum mismatch");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reopen_rejects_swapped_sequences_without_mutating_wal() {
+        let path = tmp_path("wal_reopen_swapped_sequences.bin");
+        let _ = fs::remove_file(&path);
+        append_encoded_entry(&path, &checkpoint_entry(0));
+        append_encoded_entry(&path, &checkpoint_entry(2));
+        append_encoded_entry(&path, &checkpoint_entry(1));
+
+        assert_new_rejects_without_changing_bytes(&path, "expected 1, got 2");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn segmented_reopen_rejects_a_missing_segment() {
+        let dir = tmp_dir("wal_reopen_missing_segment");
+        append_encoded_entry(&dir.join("wal-00000000.bin"), &checkpoint_entry(0));
+        append_encoded_entry(&dir.join("wal-00000002.bin"), &checkpoint_entry(1));
+        let before_zero = fs::read(dir.join("wal-00000000.bin")).unwrap();
+        let before_two = fs::read(dir.join("wal-00000002.bin")).unwrap();
+
+        let error = match WalWriter::with_segments(&dir, u64::MAX) {
+            Ok(_) => panic!("segmented WAL gap unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("WAL segment gap"));
+        let read_error = read_wal_dir_strict(&dir).unwrap_err();
+        assert_eq!(read_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(read_error.to_string().contains("WAL segment gap"));
+        assert_eq!(fs::read(dir.join("wal-00000000.bin")).unwrap(), before_zero);
+        assert_eq!(fs::read(dir.join("wal-00000002.bin")).unwrap(), before_two);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn segment_zero_cannot_claim_a_prefix_pruned_sequence() {
+        let dir = tmp_dir("wal_segment_zero_nonzero_sequence");
+        let segment = dir.join("wal-00000000.bin");
+        append_encoded_entry(&segment, &checkpoint_entry(10));
+        let before = fs::read(&segment).unwrap();
+
+        let read_error = read_wal_dir_strict(&dir).unwrap_err();
+        assert_eq!(read_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(read_error.to_string().contains("expected 0, got 10"));
+
+        let open_error = match WalWriter::with_segments(&dir, u64::MAX) {
+            Ok(_) => panic!("segment zero with nonzero first sequence unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(open_error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(open_error.to_string().contains("expected 0, got 10"));
+        assert_eq!(fs::read(&segment).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn segmented_reopen_rejects_noncanonical_segment_names() {
+        for (case, name) in ["wal-1.bin", "wal-100000000.bin"].into_iter().enumerate() {
+            let dir = tmp_dir(&format!("wal_noncanonical_segment_name_{case}"));
+            let segment = dir.join(name);
+            append_encoded_entry(&segment, &checkpoint_entry(0));
+
+            let read_error = read_wal_dir_strict(&dir).unwrap_err();
+            assert_eq!(read_error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(read_error.to_string().contains("invalid WAL segment name"));
+
+            let open_error = match WalWriter::with_segments(&dir, u64::MAX) {
+                Ok(_) => panic!("noncanonical WAL segment name unexpectedly opened"),
+                Err(error) => error,
+            };
+            assert_eq!(open_error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(open_error.to_string().contains("invalid WAL segment name"));
+            assert_eq!(WalWriter::list_segments(&dir), vec![segment]);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn strict_segment_discovery_propagates_directory_open_errors() {
+        let not_a_directory = tmp_path("wal_segment_listing_not_a_directory");
+        fs::write(&not_a_directory, b"not a WAL directory").unwrap();
+
+        let error = read_wal_dir_strict(&not_a_directory).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::NotADirectory | std::io::ErrorKind::Other
+        ));
+
+        fs::remove_file(not_a_directory).unwrap();
+    }
+
+    #[test]
+    fn rotate_cannot_overtake_an_admitted_append() {
+        let dir = tmp_dir("wal_rotate_admission_barrier");
+        let writer = Arc::new(WalWriter::with_segments(&dir, u64::MAX).unwrap());
+        let (admitted_tx, admitted_rx) = channel::bounded(1);
+        let (release_tx, release_rx) = channel::bounded(1);
+
+        let append_writer = Arc::clone(&writer);
+        let append = thread::spawn(move || {
+            append_writer.append_with_admission_hook(
+                WalOp::Checkpoint(hash_bytes(b"before-rotation")),
+                1,
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+        });
+        admitted_rx.recv().unwrap();
+
+        let (rotate_started_tx, rotate_started_rx) = channel::bounded(1);
+        let (rotate_done_tx, rotate_done_rx) = channel::bounded(1);
+        let rotate_writer = Arc::clone(&writer);
+        let rotate = thread::spawn(move || {
+            rotate_started_tx.send(()).unwrap();
+            rotate_done_tx.send(rotate_writer.rotate()).unwrap();
+        });
+        rotate_started_rx.recv().unwrap();
+        assert!(
+            rotate_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "rotation passed an append holding the admission gate"
+        );
+
+        release_tx.send(()).unwrap();
+        append.join().unwrap();
+        rotate_done_rx.recv().unwrap().unwrap();
+        rotate.join().unwrap();
+        writer.append(WalOp::Checkpoint(hash_bytes(b"after-rotation")), 2);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let first = read_wal(dir.join("wal-00000000.bin"));
+        let second = read_wal(dir.join("wal-00000001.bin"));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].sequence, 0);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].sequence, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn live_segment_pruning_fences_append_and_rotation() {
+        let dir = tmp_dir("wal_live_pruning_admission_barrier");
+        let writer = Arc::new(WalWriter::with_segments(&dir, u64::MAX).unwrap());
+        for segment in 0..4u64 {
+            for item in 0..5u64 {
+                let sequence = segment * 5 + item;
+                writer.append(
+                    WalOp::Checkpoint(hash_bytes(&sequence.to_le_bytes())),
+                    segment,
+                );
+            }
+            writer.sync().unwrap();
+            if segment != 3 {
+                writer.rotate().unwrap();
+            }
+        }
+
+        let (prune_synchronized_tx, prune_synchronized_rx) = channel::bounded(1);
+        let (release_prune_tx, release_prune_rx) = channel::bounded(1);
+        let prune_writer = Arc::clone(&writer);
+        let prune = thread::spawn(move || {
+            prune_writer.delete_segments_before_with_admission_hook(10, || {
+                prune_synchronized_tx.send(()).unwrap();
+                release_prune_rx.recv().unwrap();
+            })
+        });
+        prune_synchronized_rx.recv().unwrap();
+
+        let (append_started_tx, append_started_rx) = channel::bounded(1);
+        let (append_done_tx, append_done_rx) = channel::bounded(1);
+        let append_writer = Arc::clone(&writer);
+        let append = thread::spawn(move || {
+            append_started_tx.send(()).unwrap();
+            append_writer.append(WalOp::Checkpoint(hash_bytes(b"after-pruning")), 4);
+            append_done_tx.send(()).unwrap();
+        });
+
+        let (rotate_started_tx, rotate_started_rx) = channel::bounded(1);
+        let (rotate_done_tx, rotate_done_rx) = channel::bounded(1);
+        let rotate_writer = Arc::clone(&writer);
+        let rotate = thread::spawn(move || {
+            rotate_started_tx.send(()).unwrap();
+            rotate_done_tx.send(rotate_writer.rotate()).unwrap();
+        });
+
+        append_started_rx.recv().unwrap();
+        rotate_started_rx.recv().unwrap();
+        assert!(
+            append_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "append passed live pruning while it held the admission gate"
+        );
+        assert!(
+            rotate_done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "rotation passed live pruning while it held the admission gate"
+        );
+
+        release_prune_tx.send(()).unwrap();
+        assert_eq!(prune.join().unwrap().unwrap(), 2);
+        append_done_rx.recv().unwrap();
+        rotate_done_rx.recv().unwrap().unwrap();
+        append.join().unwrap();
+        rotate.join().unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let entries = read_wal_dir_strict(&dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            (10..=20).collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_drains_admitted_entries_and_closes_admission() {
+        let path = tmp_path("wal_shutdown_admission.bin");
+        let _ = fs::remove_file(&path);
+        let mut writer = WalWriter::new(&path).unwrap();
+        for sequence in 0..128u64 {
+            writer.append(
+                WalOp::Checkpoint(hash_bytes(&sequence.to_le_bytes())),
+                sequence,
+            );
+        }
+        writer.shutdown().unwrap();
+        let sequence_after_shutdown = writer.sequence();
+        let bytes_after_shutdown = fs::read(&path).unwrap();
+
+        writer.append(WalOp::Checkpoint(hash_bytes(b"must-not-append")), 129);
+        assert_eq!(writer.sequence(), sequence_after_shutdown);
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_shutdown);
+        assert!(writer.check_health().is_err());
+
+        let entries = read_wal_strict(&path).unwrap();
+        assert_eq!(entries.len(), 128);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn segmented_reopen_preserves_sequence_after_prefix_pruning() {
+        let dir = tmp_dir("wal_reopen_after_prefix_pruning");
+        {
+            let writer = WalWriter::with_segments(&dir, u64::MAX).unwrap();
+            for segment in 0..4u64 {
+                for item in 0..5u64 {
+                    let sequence = segment * 5 + item;
+                    writer.append(
+                        WalOp::Checkpoint(hash_bytes(&sequence.to_le_bytes())),
+                        segment,
+                    );
+                }
+                writer.sync().unwrap();
+                if segment != 3 {
+                    writer.rotate().unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            WalWriter::delete_segments_before_in_dir(&dir, 10, 2).unwrap(),
+            2
+        );
+        assert!(!dir.join("wal-00000000.bin").exists());
+        assert!(!dir.join("wal-00000001.bin").exists());
+
+        {
+            let writer = WalWriter::with_segments(&dir, u64::MAX).unwrap();
+            assert_eq!(writer.sequence(), 20);
+            writer.append(WalOp::Checkpoint(hash_bytes(b"continued")), 4);
+            writer.sync().unwrap();
+        }
+        let entries = read_wal_dir_strict(&dir).unwrap();
+        assert_eq!(entries.len(), 11);
+        assert_eq!(entries.first().unwrap().sequence, 10);
+        assert_eq!(entries.last().unwrap().sequence, 20);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2167,6 +3270,74 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_wal_identity_probe_allows_reopen_but_keeps_writer_exclusive() {
+        let dir = tmp_dir("windows_live_identity_probe");
+        let path = dir.join("state.wal");
+
+        let writer = WalWriter::new(&path).unwrap();
+        writer.append(WalOp::Checkpoint(hash_bytes(b"first")), 1);
+        writer.sync().unwrap();
+
+        let second = WalWriter::new(&path);
+        assert!(
+            second.is_err(),
+            "the compatible identity probe must not admit a second writer"
+        );
+        drop(writer);
+
+        let reopened = WalWriter::new(&path).unwrap();
+        assert_eq!(reopened.sequence(), 1);
+        reopened.append(WalOp::Checkpoint(hash_bytes(b"second")), 2);
+        reopened.sync().unwrap();
+        drop(reopened);
+
+        let entries = read_wal_strict(&path).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn segmented_wal_identity_probe_preserves_strict_sequence_on_reopen() {
+        let dir = tmp_dir("windows_segmented_identity_probe");
+
+        let writer = WalWriter::with_segments(&dir, u64::MAX).unwrap();
+        writer.append(WalOp::Checkpoint(hash_bytes(b"first")), 1);
+        writer.sync().unwrap();
+        writer.rotate().unwrap();
+        writer.append(WalOp::Checkpoint(hash_bytes(b"second")), 2);
+        writer.sync().unwrap();
+        assert!(
+            WalWriter::with_segments(&dir, u64::MAX).is_err(),
+            "the compatible identity probe must not admit a second segmented writer"
+        );
+        drop(writer);
+
+        let reopened = WalWriter::with_segments(&dir, u64::MAX).unwrap();
+        assert_eq!(reopened.sequence(), 2);
+        reopened.append(WalOp::Checkpoint(hash_bytes(b"third")), 3);
+        reopened.sync().unwrap();
+        drop(reopened);
+
+        let entries = read_wal_dir_strict(&dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2706,6 +3877,79 @@ mod tests {
     }
 
     #[test]
+    fn segment_pruning_rejects_corruption_before_deleting_any_file() {
+        let dir = tmp_dir("wal_delete_rejects_corruption");
+        for sequence in 0..4 {
+            append_encoded_entry(
+                &dir.join(format!("wal-{sequence:08}.bin")),
+                &checkpoint_entry(sequence),
+            );
+        }
+        let corrupt = dir.join("wal-00000001.bin");
+        let mut corrupt_bytes = fs::read(&corrupt).unwrap();
+        *corrupt_bytes.last_mut().unwrap() ^= 0x80;
+        fs::write(&corrupt, corrupt_bytes).unwrap();
+        let before = WalWriter::list_segments(&dir);
+
+        let error = WalWriter::delete_segments_before_in_dir(&dir, 4, 2).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert_eq!(WalWriter::list_segments(&dir), before);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn segment_pruning_never_deletes_an_empty_segment_after_retained_data() {
+        let dir = tmp_dir("wal_delete_keeps_contiguous_namespace");
+        append_encoded_entry(&dir.join("wal-00000000.bin"), &checkpoint_entry(0));
+        File::create(dir.join("wal-00000001.bin")).unwrap();
+        append_encoded_entry(&dir.join("wal-00000002.bin"), &checkpoint_entry(1));
+
+        assert_eq!(
+            WalWriter::delete_segments_before_in_dir(&dir, 0, 2).unwrap(),
+            0
+        );
+        assert_eq!(WalWriter::list_segments_strict(&dir).unwrap().len(), 3);
+        assert_eq!(read_wal_dir_strict(&dir).unwrap().len(), 2);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn segment_pruning_retains_a_sequence_watermark_before_empty_tail_segments() {
+        let dir = tmp_dir("wal_delete_retains_sequence_watermark");
+        append_encoded_entry(&dir.join("wal-00000000.bin"), &checkpoint_entry(0));
+        append_encoded_entry(&dir.join("wal-00000001.bin"), &checkpoint_entry(1));
+        File::create(dir.join("wal-00000002.bin")).unwrap();
+
+        assert_eq!(
+            WalWriter::delete_segments_before_in_dir(&dir, 2, 2).unwrap(),
+            1
+        );
+        assert!(!dir.join("wal-00000000.bin").exists());
+        assert!(dir.join("wal-00000001.bin").exists());
+        assert!(dir.join("wal-00000002.bin").exists());
+
+        {
+            let writer = WalWriter::with_segments(&dir, u64::MAX).unwrap();
+            assert_eq!(writer.sequence(), 2);
+            writer.append(WalOp::Checkpoint(hash_bytes(b"after-empty-tail")), 2);
+            writer.sync().unwrap();
+        }
+        let entries = read_wal_dir_strict(&dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn segmented_wal_startup_reclaims_only_exact_removal_tombstones() {
         let dir = tmp_dir("wal_stale_removal_tombstone");
         let tombstone = dir.join(format!(
@@ -2751,7 +3995,7 @@ mod tests {
         writer.sync().unwrap();
         drop(writer);
 
-        assert_eq!(WalWriter::count_entries_in_dir(&dir), 2);
+        assert_eq!(WalWriter::count_entries_in_dir(&dir).unwrap(), 2);
         fs::remove_dir_all(parent).unwrap();
     }
 

@@ -151,6 +151,9 @@ PROTECTED_MAIN_EXECUTION_FILES = (
     SCRIPT_DIR / "recovery-manifest.schema.json",
     SCRIPT_DIR / "archive-fleet-to-drive.sh",
     SCRIPT_DIR / "archive-node.sh",
+    SCRIPT_DIR / "normalize-legacy-wal.py",
+    SCRIPT_DIR / "legacy-wal-normalization-lax.json",
+    SCRIPT_DIR / "legacy-wal-normalization-ams.json",
     SCRIPT_DIR / "community-reward-probe.py",
     SCRIPT_DIR / "legacy-late-fork-interlock.py",
     RELEASE_SCRIPT_DIR / "protected_pretag_artifact.py",
@@ -847,6 +850,33 @@ def stage_prearchive_inputs(args: argparse.Namespace) -> tuple[argparse.Namespac
                 4 * 1024 * 1024,
                 0o500,
                 True,
+                "root",
+            ),
+            (
+                "legacy_wal_normalizer",
+                SCRIPT_DIR / "normalize-legacy-wal.py",
+                "normalize-legacy-wal.py",
+                4 * 1024 * 1024,
+                0o500,
+                False,
+                "root",
+            ),
+            (
+                "legacy_wal_normalization_lax",
+                SCRIPT_DIR / "legacy-wal-normalization-lax.json",
+                "legacy-wal-normalization-lax.json",
+                4 * 1024 * 1024,
+                0o400,
+                False,
+                "root",
+            ),
+            (
+                "legacy_wal_normalization_ams",
+                SCRIPT_DIR / "legacy-wal-normalization-ams.json",
+                "legacy-wal-normalization-ams.json",
+                4 * 1024 * 1024,
+                0o400,
+                False,
                 "root",
             ),
             (
@@ -3204,11 +3234,18 @@ def validate_legacy_maintenance_evidence_bundle(
         ):
             fail(f"maintenance evidence public tuple binding differs at {name}")
 
+        persisted_schema = persisted_value.get("schema") if isinstance(persisted_value, dict) else None
+        expected_persisted_fields = set(persisted_fields)
+        if persisted_schema == "arc.recovery.persisted-legacy-head.v2":
+            expected_persisted_fields.add("wal_normalization")
         persisted_value = require_exact_object(
-            persisted_value, persisted_fields, f"{name} persisted-head value"
+            persisted_value, expected_persisted_fields, f"{name} persisted-head value"
         )
         if (
-            persisted_value.get("schema") != "arc.recovery.persisted-legacy-head.v1"
+            persisted_value.get("schema") not in {
+                "arc.recovery.persisted-legacy-head.v1",
+                "arc.recovery.persisted-legacy-head.v2",
+            }
             or persisted_value.get("source_main_commit") != args.source_main_sha
             or (
                 persisted_value.get("capture_id"),
@@ -3329,14 +3366,23 @@ def validate_legacy_maintenance_evidence_bundle(
         )
         if selected_source_head != persisted_head:
             fail(f"maintenance evidence selected final source head differs at {name}")
-        archived_wal = require_exact_object(
-            persisted_value.get("archived_final_wal"),
-            {
-                "path", "sha256", "size", "file_identity",
+        normalized_persisted = persisted_value["schema"] == "arc.recovery.persisted-legacy-head.v2"
+        archived_fields = {
+            "path", "sha256", "size", "file_identity", "preserved_by",
+        }
+        if normalized_persisted:
+            archived_fields |= {
+                "source_relation", "normalization_receipt_sha256",
+                "derivative_sha256", "derivative_size",
+            }
+        else:
+            archived_fields |= {
                 "selected_prefix_bytes", "selected_prefix_sha256",
                 "post_capture_suffix_bytes", "post_capture_suffix_sha256",
-                "post_capture_suffix_classification", "preserved_by",
-            },
+                "post_capture_suffix_classification",
+            }
+        archived_wal = require_exact_object(
+            persisted_value.get("archived_final_wal"), archived_fields,
             f"{name} persisted archived final WAL",
         )
         archived_path = archived_wal.get("path")
@@ -3358,46 +3404,97 @@ def validate_legacy_maintenance_evidence_bundle(
                 f"{name} persisted archived final WAL identity {field}",
                 positive=field in {"device", "inode", "size"},
             )
-        selected_bytes = require_uint(
-            archived_wal.get("selected_prefix_bytes"),
-            f"{name} persisted archived final WAL selected prefix bytes",
-            positive=True,
-        )
-        suffix_bytes = require_uint(
-            archived_wal.get("post_capture_suffix_bytes"),
-            f"{name} persisted archived final WAL suffix bytes",
-        )
-        if (
-            require_hash(
-                archived_wal.get("sha256"),
-                f"{name} persisted archived final WAL root",
-            )
-            != archived_wal["sha256"]
-            or archived_identity["size"] != archive_size
-            or selected_bytes != persisted_value["state_wal_size"]
-            or archived_wal.get("selected_prefix_sha256")
-            != persisted_value["state_wal_sha256"]
-            or archive_size != selected_bytes + suffix_bytes
-            or archived_wal.get("preserved_by")
-            != "complete-content-indexed-stopped-legacy-source-v4"
-        ):
+        if (require_hash(archived_wal.get("sha256"),
+                f"{name} persisted archived final WAL root") != archived_wal["sha256"]
+                or archived_identity["size"] != archive_size
+                or archived_wal.get("preserved_by")
+                    != "complete-content-indexed-stopped-legacy-source-v4"):
             fail(f"maintenance evidence archived final WAL binding differs at {name}")
-        if suffix_bytes == 0:
-            if (
-                archived_wal.get("post_capture_suffix_sha256") is not None
-                or archived_wal.get("post_capture_suffix_classification") != "none"
-            ):
-                fail(f"maintenance evidence empty archived WAL suffix differs at {name}")
-        elif (
-            require_hash(
-                archived_wal.get("post_capture_suffix_sha256"),
-                f"{name} persisted archived final WAL suffix root",
+        if normalized_persisted:
+            normalization_wrapper = require_exact_object(
+                persisted_value.get("wal_normalization"),
+                {"normalizer_sha256", "plan_sha256", "receipt"},
+                f"{name} persisted WAL normalization wrapper",
             )
-            != archived_wal["post_capture_suffix_sha256"]
-            or archived_wal.get("post_capture_suffix_classification")
-            != "archived_noncanonical_post_capture_suffix"
-        ):
-            fail(f"maintenance evidence archived WAL suffix policy differs at {name}")
+            require_hash(normalization_wrapper.get("normalizer_sha256"),
+                         f"{name} WAL normalizer root")
+            require_hash(normalization_wrapper.get("plan_sha256"),
+                         f"{name} WAL normalization plan root")
+            sealed_normalization = require_exact_object(
+                normalization_wrapper.get("receipt"), {"value", "sha256"},
+                f"{name} WAL normalization receipt",
+            )
+            normalization_receipt = sealed_normalization.get("value")
+            normalization_sha = require_hash(
+                sealed_normalization.get("sha256"),
+                f"{name} WAL normalization receipt root",
+            )
+            if sha256_bytes(canonical_bytes(normalization_receipt)) != normalization_sha:
+                fail(f"{name} WAL normalization receipt wrapper differs")
+            normalization_receipt = require_exact_object(
+                normalization_receipt,
+                {"schema", "plan_sha256", "node", "source_wal", "source_snapshot",
+                 "partition", "sequence_rewrites", "derivative_wal", "head",
+                 "selected_frame_count", "excluded_bytes", "semantic_stream_sha256",
+                 "transform", "source_unchanged"},
+                f"{name} WAL normalization receipt",
+            )
+            source_wal = normalization_receipt.get("source_wal", {})
+            source_snapshot = normalization_receipt.get("source_snapshot", {})
+            derivative = normalization_receipt.get("derivative_wal", {})
+            if (normalization_receipt.get("schema")
+                    != "arc.recovery.legacy-wal-normalization.v1"
+                    or normalization_receipt.get("plan_sha256")
+                        != normalization_wrapper["plan_sha256"]
+                    or normalization_receipt.get("node") != name
+                    or normalization_receipt.get("head") != persisted_head
+                    or normalization_receipt.get("source_unchanged") is not True
+                    or require_hash(normalization_receipt.get("semantic_stream_sha256"),
+                                    f"{name} normalization semantic stream root")
+                        != normalization_receipt["semantic_stream_sha256"]
+                    or source_wal.get("sha256") != archived_wal["sha256"]
+                    or source_wal.get("size") != archive_size
+                    or source_snapshot.get("sha256") != persisted_value["snapshot_sha256"]
+                    or source_snapshot.get("size") != persisted_value["snapshot_size"]
+                    or derivative.get("sha256") != persisted_value["state_wal_sha256"]
+                    or derivative.get("size") != persisted_value["state_wal_size"]
+                    or archived_wal.get("source_relation")
+                        != "exact-content-pinned-normalization-source"
+                    or archived_wal.get("normalization_receipt_sha256") != normalization_sha
+                    or archived_wal.get("derivative_sha256") != derivative.get("sha256")
+                    or archived_wal.get("derivative_size") != derivative.get("size")):
+                fail(f"maintenance evidence normalized WAL provenance differs at {name}")
+        else:
+            selected_bytes = require_uint(
+                archived_wal.get("selected_prefix_bytes"),
+                f"{name} persisted archived final WAL selected prefix bytes",
+                positive=True,
+            )
+            suffix_bytes = require_uint(
+                archived_wal.get("post_capture_suffix_bytes"),
+                f"{name} persisted archived final WAL suffix bytes",
+            )
+            if (selected_bytes != persisted_value["state_wal_size"]
+                    or archived_wal.get("selected_prefix_sha256")
+                        != persisted_value["state_wal_sha256"]
+                    or archive_size != selected_bytes + suffix_bytes):
+                fail(f"maintenance evidence archived final WAL prefix differs at {name}")
+            if suffix_bytes == 0:
+                if (
+                    archived_wal.get("post_capture_suffix_sha256") is not None
+                    or archived_wal.get("post_capture_suffix_classification") != "none"
+                ):
+                    fail(f"maintenance evidence empty archived WAL suffix differs at {name}")
+            elif (
+                require_hash(
+                    archived_wal.get("post_capture_suffix_sha256"),
+                    f"{name} persisted archived final WAL suffix root",
+                )
+                != archived_wal["post_capture_suffix_sha256"]
+                or archived_wal.get("post_capture_suffix_classification")
+                != "archived_noncanonical_post_capture_suffix"
+            ):
+                fail(f"maintenance evidence archived WAL suffix policy differs at {name}")
         if persisted_head["height"] < fenced_head["height"]:
             fail(f"maintenance evidence persisted head precedes fenced head at {name}")
         normalized_nodes.append(
@@ -5737,6 +5834,15 @@ def prearchive(args: argparse.Namespace) -> str:
             "path": os.fspath(args.legacy_late_fork_interlock_tool),
             "sha256": late_fork_interlock_tool_sha,
         },
+        "legacy_wal_normalizer": artifact(
+            args.legacy_wal_normalizer, "legacy WAL normalizer", executable=True
+        ),
+        "legacy_wal_normalization_lax": artifact(
+            args.legacy_wal_normalization_lax, "LAX legacy WAL normalization plan"
+        ),
+        "legacy_wal_normalization_ams": artifact(
+            args.legacy_wal_normalization_ams, "AMS legacy WAL normalization plan"
+        ),
         "offline_stop_evidence": {
             "path": os.fspath(args.offline_stop_evidence),
             "sha256": offline_stop_sha,
@@ -6744,6 +6850,22 @@ def validate_archive_evidence(
             gist_canary_sha,
         ),
     }
+    optional_normalization_shared = {
+        "normalize-legacy-wal.py": (
+            "legacy_wal_normalizer", "normalize-legacy-wal.py"
+        ),
+        "legacy-wal-normalization-lax.json": (
+            "legacy_wal_normalization_lax", "legacy-wal-normalization-lax.json"
+        ),
+        "legacy-wal-normalization-ams.json": (
+            "legacy_wal_normalization_ams", "legacy-wal-normalization-ams.json"
+        ),
+    }
+    for archive_name, (artifact_name, expected_name) in optional_normalization_shared.items():
+        if artifact_name in prearchive["artifacts"]:
+            expected_shared[archive_name] = _expected_artifact_object(
+                prearchive, artifact_name, expected_name
+            )
     for kind, platform in PRETAG_GROUPS:
         archive_name = f"pretag-{kind}-{platform}.actions.zip"
         expected_shared[archive_name] = _expected_artifact_object(

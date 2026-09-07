@@ -6180,6 +6180,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.assertIn(f"proxy_read_timeout {rollout.VALIDATOR_APPROVAL_TIMEOUT_SECONDS}s", nginx)
         self.assertNotIn("proxy_read_timeout 3700s", nginx)
         self.assertIn("health|info|network/info", nginx)
+        self.assertIn("inference/readiness|inference/attestations", nginx)
         self.assertIn("account/(?:0x)?[0-9a-fA-F]{64}(?:/txs)?", nginx)
         internal = caddy[caddy.index("@validatorApproval"):]
         self.assertNotIn("Access-Control-Allow-Origin", internal)
@@ -6216,6 +6217,7 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         seen_flat_submit = []
         seen_batch_submit = []
         seen_oversized_batch = []
+        seen_readiness = []
 
         class Response:
             def __init__(self, status: int, headers=None, body: bytes = b"") -> None:
@@ -6236,6 +6238,26 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
             method = request.get_method()
             path = request.full_url.removeprefix(node["rpc_url"])
             origin = request.get_header("Origin")
+            if method == "GET" and path == "/inference/readiness":
+                seen_readiness.append(path)
+                return Response(
+                    200,
+                    allowed_headers,
+                    json.dumps(
+                        {
+                            "schema": "arc.inference.readiness.v1",
+                            "safe_to_dispatch": True,
+                            "community_dispatch_ready": True,
+                            "local_model_ready": False,
+                            "sharded_pipeline_ready": False,
+                            "live_community_workers": 2,
+                            "model_id": "0x" + rollout.CANONICAL_MODEL_BLAKE3,
+                            "required_community_execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                            "mutation_free_observation": True,
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                )
             if method == "POST" and path == "/tx/submit":
                 payload = json.loads(request.data)
                 self.assertEqual(request.get_header("Content-type"), "application/json")
@@ -6297,10 +6319,18 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.assertEqual(len(seen_flat_submit), 1)
         self.assertEqual(len(seen_batch_submit), 1)
         self.assertEqual(len(seen_oversized_batch), 1)
+        self.assertEqual(seen_readiness, ["/inference/readiness"])
 
-        for missing_path, expected_status in (("/tx/submit", 400), ("/tx/submit_batch", 200)):
+        for missing_path, expected_method, expected_status in (
+            ("/inference/readiness", "GET", 200),
+            ("/tx/submit", "POST", 400),
+            ("/tx/submit_batch", "POST", 200),
+        ):
             def gateway_404(request, **kwargs):
-                if request.get_method() == "POST" and request.full_url.endswith(missing_path):
+                if (
+                    request.get_method() == expected_method
+                    and request.full_url.endswith(missing_path)
+                ):
                     raise rollout.urllib.error.HTTPError(
                         request.full_url,
                         404,
@@ -6321,6 +6351,111 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
                         f"public browser preflight returned HTTP 404, expected {expected_status}",
                     ):
                         harness._prove_public_browser_contract(node)
+
+        def inconsistent_readiness(request, **kwargs):
+            if request.get_method() == "GET" and request.full_url.endswith(
+                "/inference/readiness"
+            ):
+                return Response(
+                    200,
+                    allowed_headers,
+                    json.dumps(
+                        {
+                            "schema": "arc.inference.readiness.v1",
+                            "safe_to_dispatch": False,
+                            "community_dispatch_ready": True,
+                            "local_model_ready": False,
+                            "sharded_pipeline_ready": False,
+                            "live_community_workers": 2,
+                            "model_id": "0x" + rollout.CANONICAL_MODEL_BLAKE3,
+                            "required_community_execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                            "mutation_free_observation": True,
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+            return urlopen(request, **kwargs)
+
+        with mock.patch.object(
+            rollout.urllib.request,
+            "urlopen",
+            side_effect=inconsistent_readiness,
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError,
+                "inference readiness route is internally inconsistent",
+            ):
+                harness._prove_public_browser_contract(node)
+
+        def unavailable_readiness(request, **kwargs):
+            if request.get_method() == "GET" and request.full_url.endswith(
+                "/inference/readiness"
+            ):
+                return Response(
+                    200,
+                    allowed_headers,
+                    json.dumps(
+                        {
+                            "schema": "arc.inference.readiness.v1",
+                            "safe_to_dispatch": False,
+                            "community_dispatch_ready": False,
+                            "local_model_ready": False,
+                            "sharded_pipeline_ready": False,
+                            "live_community_workers": 0,
+                            "model_id": "0x" + rollout.CANONICAL_MODEL_BLAKE3,
+                            "required_community_execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                            "mutation_free_observation": True,
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+            return urlopen(request, **kwargs)
+
+        with mock.patch.object(
+            rollout.urllib.request,
+            "urlopen",
+            side_effect=unavailable_readiness,
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError,
+                "inference readiness route is not ready for one-submit clients",
+            ):
+                harness._prove_public_browser_contract(node)
+
+        def wrong_model_readiness(request, **kwargs):
+            if request.get_method() == "GET" and request.full_url.endswith(
+                "/inference/readiness"
+            ):
+                return Response(
+                    200,
+                    allowed_headers,
+                    json.dumps(
+                        {
+                            "schema": "arc.inference.readiness.v1",
+                            "safe_to_dispatch": True,
+                            "community_dispatch_ready": True,
+                            "local_model_ready": False,
+                            "sharded_pipeline_ready": False,
+                            "live_community_workers": 2,
+                            "model_id": "0x" + "a" * 64,
+                            "required_community_execution_profile": rollout.CANONICAL_EXECUTION_PROFILE,
+                            "mutation_free_observation": True,
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+            return urlopen(request, **kwargs)
+
+        with mock.patch.object(
+            rollout.urllib.request,
+            "urlopen",
+            side_effect=wrong_model_readiness,
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError,
+                "inference readiness route has the wrong canonical model identity",
+            ):
+                harness._prove_public_browser_contract(node)
 
         def accepts_unsigned_batch(request, **kwargs):
             if request.get_method() == "POST" and request.full_url.endswith("/tx/submit_batch"):

@@ -352,8 +352,66 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
+      - name: Refuse lifecycle changes before release authorization
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)target/**' \
+            ':(exclude)desktop/node_modules/**' \
+            ':(exclude)desktop/src-tauri/target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::Release dependencies changed tracked or untracked source.' >&2
+            exit 1
+          fi
+
       - name: Run every blocking local release gate
-        run: ./scripts/ci_check.sh --full
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -Eeuo pipefail
+          ./scripts/ci_check.sh --full
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)target/**' \
+            ':(exclude)dashboard/node_modules/**' \
+            ':(exclude)desktop/node_modules/**' \
+            ':(exclude)desktop/dist/**' \
+            ':(exclude)desktop/dist-ssr/**' \
+            ':(exclude)desktop/.vite/**' \
+            ':(exclude)desktop/playwright/.cache/**' \
+            ':(exclude)desktop/playwright-report/**' \
+            ':(exclude)desktop/src-tauri/gen/**' \
+            ':(exclude)desktop/src-tauri/target/**' \
+            ':(exclude)desktop/test-results/**' \
+            ':(exclude)explorer/node_modules/**' \
+            ':(exclude)sdk/node_modules/**' \
+            ':(exclude)sdk/typescript/node_modules/**' \
+            ':(exclude)sdks/typescript/node_modules/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::The release gate changed tracked or untracked source.' >&2
+            exit 1
+          fi
 
   # Release publication fails closed on the reviewed Cargo.lock and deny.toml.
   # Branch CI audits these same three Rust graphs; this gate repeats the policy
@@ -756,6 +814,9 @@ jobs:
     env:
       # The isolated updater verifier is a stable-toolchain release utility.
       RUSTUP_TOOLCHAIN: stable
+      # Repository helpers must not leave ignored bytecode that could become a
+      # later helper input while the checkout still appears conventionally clean.
+      PYTHONDONTWRITEBYTECODE: "1"
     permissions:
       actions: read
       contents: read
@@ -783,6 +844,27 @@ jobs:
             "${{ needs.validate.outputs.pretag_run_id }}" \
             "${{ needs.validate.outputs.pretag_run_attempt }}" \
             "$PRETAG_SELECTION"
+
+      - name: Refuse source drift before release materialization
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all)"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::Release pre-tag validation changed tracked or untracked source.' >&2
+            exit 1
+          fi
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -861,6 +943,27 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all -- . \
+            ':(exclude)pretag-downloads/**' \
+            ':(exclude)artifacts/**' \
+            ':(exclude)cutover-handoff-download/**' \
+            ':(exclude)cutover-handoff/**' \
+            ':(exclude)release-files/**')"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+            ':(exclude)target/**')"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::Release assembly changed source outside its exact materialized inputs.' >&2
+            exit 1
+          fi
           python3 scripts/release/release-manifest-handoff.py stage \
             --repository "$GITHUB_REPOSITORY" \
             --commit "${{ needs.validate.outputs.sha }}" \
@@ -1063,6 +1166,23 @@ jobs:
           EXPECTED_METADATA_SHA: ${{ needs.assemble-release.outputs.metadata_sha }}
         run: |
           set -Eeuo pipefail
+          [ "$(git rev-parse HEAD)" = "${{ needs.validate.outputs.sha }}" ]
+          git update-index --really-refresh
+          index_flags="$(git ls-files -v)"
+          if grep -Eq '^[a-zS] ' <<< "$index_flags"; then
+            echo '::error::The checkout contains assume-unchanged or skip-worktree index entries.' >&2
+            exit 1
+          fi
+          source_state="$(git status --porcelain=v1 --untracked-files=all -- . \
+            ':(exclude)unsigned-release-handoff/**' \
+            ':(exclude)sealed-release-handoff/**')"
+          ignored_source_state="$(git ls-files --others --ignored --exclude-standard)"
+          if [ -n "$source_state" ] || [ -n "$ignored_source_state" ]; then
+            printf '%s\n' "$source_state" >&2
+            printf '%s\n' "$ignored_source_state" >&2
+            echo '::error::The manifest signer changed repository source before sealed staging.' >&2
+            exit 1
+          fi
           /usr/bin/python3 -I - unsigned-release-handoff "$EXPECTED_METADATA_SHA" <<'PY'
           import hashlib, json, pathlib, stat, sys
           def sha256(path):

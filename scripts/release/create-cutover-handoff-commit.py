@@ -413,7 +413,7 @@ def run_isolated_python(
     safe_home: Path,
 ) -> None:
     run_checked(
-        [sys.executable, "-I", os.fspath(script), *arguments],
+        [sys.executable, "-B", "-I", os.fspath(script), *arguments],
         label,
         environment=isolated_tool_environment(safe_home),
     )

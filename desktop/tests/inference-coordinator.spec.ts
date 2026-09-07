@@ -9,7 +9,7 @@
 //      verification/settlement or, if every direct seed safely fails, the
 //      sharded-consensus fallback.
 
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
 const COMMUNITY_WORKER = `0x${"11".repeat(32)}`;
@@ -17,6 +17,41 @@ const REWARD_TX = `0x${"44".repeat(32)}`;
 const REWARD_JOB = `0x${"55".repeat(32)}`;
 const RECEIPT_URL = `/community/reward_receipt/${REWARD_TX}`;
 const BLOCK_HASH = `0x${"77".repeat(32)}`;
+const MODEL_HASH = `0x${"88".repeat(32)}`;
+const INPUT_HASH = `0x${"99".repeat(32)}`;
+const OUTPUT_HASH = `0x${"aa".repeat(32)}`;
+const ASSIGNMENT_EPOCH = `0x${"bb".repeat(32)}`;
+const VALIDATOR_SET_COMMITMENT = `0x${"cc".repeat(32)}`;
+const TRANSACTION_DOMAIN = `0x${"dd".repeat(32)}`;
+
+function readinessPayload(safe: boolean) {
+  return {
+    schema: "arc.inference.readiness.v1",
+    safe_to_dispatch: safe,
+    community_dispatch_ready: safe,
+    local_model_ready: false,
+    sharded_pipeline_ready: false,
+    live_community_workers: safe ? 1 : 0,
+    model_id: safe ? MODEL_HASH : null,
+    required_community_execution_profile:
+      "INT8 integer (per-row, cross-platform deterministic)",
+    mutation_free_observation: true,
+  };
+}
+
+async function installReadiness(
+  page: Page,
+  ready: (url: URL) => boolean,
+) {
+  await page.unroute("**/inference/readiness");
+  await page.route("**/inference/readiness", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(readinessPayload(ready(new URL(route.request().url())))),
+    }),
+  );
+}
 
 function canonicalReceipt(
   status:
@@ -26,29 +61,64 @@ function canonicalReceipt(
     | "receipt_unavailable",
   patch: Record<string, unknown> = {},
 ) {
-  const included = status !== "pending_mined_receipt";
+  if (status === "pending_mined_receipt") {
+    return {
+      assignment_epoch: ASSIGNMENT_EPOCH,
+      block_hash: null,
+      block_height: null,
+      confirmed: false,
+      evidence_source: "coordinator mempool submission only; no mined receipt",
+      included: false,
+      index: null,
+      job_id: REWARD_JOB,
+      receipt_url: RECEIPT_URL,
+      recovery_epoch: 1,
+      required_validator_approvals: 5,
+      reward_arc: null,
+      reward_base: null,
+      status,
+      submitted: true,
+      success: null,
+      transaction_domain: TRANSACTION_DOMAIN,
+      tx_hash: REWARD_TX,
+      tx_type: "0x25",
+      validator_approvals: 5,
+      validator_set_commitment: VALIDATOR_SET_COMMITMENT,
+      validator_set_id: 1,
+      worker: COMMUNITY_WORKER,
+      ...patch,
+    };
+  }
+  const included = true;
   const successful = status === "mined_success";
   return {
-    status,
-    tx_type: "0x25",
-    tx_hash: REWARD_TX,
-    job_id: REWARD_JOB,
-    worker: COMMUNITY_WORKER,
-    submitted: true,
-    included,
+    assignment_epoch: ASSIGNMENT_EPOCH,
+    block_hash: BLOCK_HASH,
+    block_height: 123_470,
     confirmed: successful,
-    success:
-      status === "mined_success"
-        ? true
-        : status === "mined_failed"
-          ? false
-          : null,
-    block_height: included ? 123_470 : null,
-    block_hash: included ? BLOCK_HASH : null,
-    index: included ? 0 : null,
+    evidence_source: successful
+      ? "successful mined CommunityInferenceReward receipt"
+      : "no successful mined receipt",
+    included,
+    index: 0,
+    input_hash: INPUT_HASH,
+    job_id: REWARD_JOB,
+    model_id: MODEL_HASH,
+    output_hash: OUTPUT_HASH,
+    receipt_url: RECEIPT_URL,
+    recovery_epoch: 1,
     reward_base: successful ? 2_500_000_000 : null,
     reward_arc: successful ? 2.5 : null,
-    receipt_url: RECEIPT_URL,
+    status,
+    submitted: true,
+    success: status === "mined_success" ? true : status === "mined_failed" ? false : null,
+    transaction_domain: TRANSACTION_DOMAIN,
+    tx_hash: REWARD_TX,
+    tx_type: "0x25",
+    validator_approvals: 5,
+    validator_set_commitment: VALIDATOR_SET_COMMITMENT,
+    validator_set_id: 1,
+    worker: COMMUNITY_WORKER,
     ...patch,
   };
 }
@@ -109,26 +179,55 @@ const COMMUNITY_PAYLOAD = {
     signatures_required_per_quorum: 2,
     replicas_contacted_per_quorum: 3,
   },
-  settlement: {
-    status: "pending_mined_receipt",
-    tx_type: "0x25",
-    tx_hash: REWARD_TX,
-    job_id: REWARD_JOB,
-    worker: COMMUNITY_WORKER,
-    submitted: true,
-    included: false,
-    confirmed: false,
-    success: null,
-    block_height: null,
-    block_hash: null,
-    index: null,
-    reward_base: null,
-    reward_arc: null,
-    receipt_url: RECEIPT_URL,
-  },
+  settlement: canonicalReceipt("pending_mined_receipt"),
 };
 
 test.describe("Inference - community-first coordinator routing", () => {
+  test.beforeEach(async ({ page }) => {
+    await installReadiness(page, () => true);
+  });
+
+  test("same-turn double activation dispatches exactly one inference POST", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    let inferencePosts = 0;
+    await page.route("**/inference/run", async (route) => {
+      inferencePosts += 1;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          inference: {
+            input: "one dispatch",
+            output: "one result",
+            output_hash: `0x${"12".repeat(32)}`,
+            model_hash: `0x${"13".repeat(32)}`,
+            tokens_generated: 2,
+            inference_ms: 10,
+            deterministic: true,
+            engine: "local-int16",
+          },
+          attestation: { tx_hash: "" },
+        }),
+      });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("one dispatch");
+    await page.getByTestId("btn-run-inference").evaluate((button) => {
+      (button as HTMLButtonElement).click();
+      (button as HTMLButtonElement).click();
+    });
+    await expect(page.getByTestId("inference-output")).toHaveText("one result");
+    expect(inferencePosts).toBe(1);
+  });
+
   test("free prompts explain requester escrow separately from receipt-backed worker rewards", async ({
     page,
   }) => {
@@ -229,6 +328,10 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.addInitScript(() => {
       (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
     });
+    await installReadiness(
+      page,
+      (url) => url.hostname !== "127.0.0.1",
+    );
 
     const inferencePosts: string[] = [];
     await page.route("**/inference/run", (route) => {
@@ -291,7 +394,24 @@ test.describe("Inference - community-first coordinator routing", () => {
     );
     await expect(evidence).toContainText("exact execution profile bound");
     await expect(evidence).toContainText("authenticated quorum verified");
+    const result = page.getByTestId("inference-result");
+    await expect(result).toHaveAttribute("data-output-hash", `0x${"22".repeat(32)}`);
+    await expect(result).toHaveAttribute("data-model-id", `0x${"33".repeat(32)}`);
+    await expect(result).toHaveAttribute(
+      "data-routed-via",
+      `community:${COMMUNITY_WORKER}`,
+    );
+    await expect(result).toHaveAttribute(
+      "data-coordinator",
+      "https://149.28.32.76",
+    );
     const settlement = page.getByTestId("community-settlement");
+    await expect(settlement).toHaveAttribute("data-tx-type", "0x25");
+    await expect(settlement).toHaveAttribute("data-tx-hash", REWARD_TX);
+    await expect(settlement).toHaveAttribute("data-job-id", REWARD_JOB);
+    await expect(settlement).toHaveAttribute("data-worker", COMMUNITY_WORKER);
+    await expect(settlement).toHaveAttribute("data-receipt-url", RECEIPT_URL);
+    await expect(settlement).toHaveAttribute("data-submitted", "true");
     await expect(settlement).toContainText(
       "0x25 submitted; waiting for an independently fetched mined receipt",
     );
@@ -307,10 +427,9 @@ test.describe("Inference - community-first coordinator routing", () => {
     await expect(page.getByTestId("btn-lookup-tx")).toHaveCount(0);
 
     expect(consensusHits).toBe(0);
-    expect(inferencePosts).toHaveLength(2);
-    expect(new URL(inferencePosts[0]).hostname).toBe("127.0.0.1");
-    expect(new URL(inferencePosts[1]).pathname).toBe("/inference/run");
-    expect(new URL(inferencePosts[1]).hostname).not.toBe("127.0.0.1");
+    expect(inferencePosts).toHaveLength(1);
+    expect(new URL(inferencePosts[0]).pathname).toBe("/inference/run");
+    expect(new URL(inferencePosts[0]).hostname).not.toBe("127.0.0.1");
 
     await page.getByTestId("btn-lookup-reward").click();
     await expect(page.getByTestId("network-screen")).toBeVisible();
@@ -333,12 +452,8 @@ test.describe("Inference - community-first coordinator routing", () => {
         body: JSON.stringify({
           ...COMMUNITY_PAYLOAD,
           settlement: {
-            ...COMMUNITY_PAYLOAD.settlement,
-            status: "mined_success",
+            ...canonicalReceipt("mined_success"),
             tx_type: "0x16",
-            included: true,
-            confirmed: true,
-            success: true,
           },
         }),
       }),
@@ -424,15 +539,7 @@ test.describe("Inference - community-first coordinator routing", () => {
         contentType: "application/json",
         body: JSON.stringify({
           ...COMMUNITY_PAYLOAD,
-          settlement: {
-            ...COMMUNITY_PAYLOAD.settlement,
-            status: "mined_success",
-            included: true,
-            confirmed: true,
-            success: true,
-            reward_base: 2_500_000_000,
-            reward_arc: 2.5,
-          },
+          settlement: canonicalReceipt("mined_success"),
         }),
       }),
     );
@@ -614,6 +721,10 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.addInitScript(() => {
       (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
     });
+    await installReadiness(
+      page,
+      (url) => url.hostname !== "127.0.0.1",
+    );
 
     let remoteDirectHits = 0;
     let consensusHits = 0;
@@ -660,15 +771,97 @@ test.describe("Inference - community-first coordinator routing", () => {
     expect(consensusHits).toBe(0);
   });
 
-  test("standalone consensus runs only after every direct coordinator safely returns 503", async ({
+  test("a reset after the local POST is terminal and never dispatches direct or consensus", async ({
     page,
   }) => {
     await seedOnboarded(page);
     await page.addInitScript(() => {
       (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
     });
+    await installReadiness(page, () => true);
 
-    // Local node rejects inference (observer role, no model loaded).
+    let localPosts = 0;
+    let remotePosts = 0;
+    let consensusPosts = 0;
+    await page.route("**/inference/run", (route) => {
+      if (new URL(route.request().url()).hostname === "127.0.0.1") {
+        localPosts += 1;
+        return route.abort("connectionreset");
+      }
+      remotePosts += 1;
+      return route.fulfill({ status: 500, body: "must not be called" });
+    });
+    await page.route("**/inference/run_consensus", (route) => {
+      consensusPosts += 1;
+      return route.fulfill({ status: 500, body: "must not be called" });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("exactly one local post");
+    await page.getByTestId("btn-run-inference").click();
+
+    await expect(page.getByTestId("inference-error")).toContainText(
+      "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS",
+    );
+    expect(localPosts).toBe(1);
+    expect(remotePosts).toBe(0);
+    expect(consensusPosts).toBe(0);
+  });
+
+  test("a timeout after the direct POST is terminal and never starts consensus", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await installReadiness(
+      page,
+      (url) => url.hostname !== "127.0.0.1",
+    );
+
+    let localPosts = 0;
+    let remotePosts = 0;
+    let consensusPosts = 0;
+    await page.route("**/inference/run", (route) => {
+      if (new URL(route.request().url()).hostname === "127.0.0.1") {
+        localPosts += 1;
+        return route.fulfill({ status: 500, body: "must not be called" });
+      }
+      remotePosts += 1;
+      return route.abort("timedout");
+    });
+    await page.route("**/inference/run_consensus", (route) => {
+      consensusPosts += 1;
+      return route.fulfill({ status: 500, body: "must not be called" });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("exactly one direct post");
+    await page.getByTestId("btn-run-inference").click();
+
+    await expect(page.getByTestId("inference-error")).toContainText(
+      "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS",
+    );
+    expect(localPosts).toBe(0);
+    expect(remotePosts).toBe(1);
+    expect(consensusPosts).toBe(0);
+  });
+
+  test("standalone consensus runs only after mutation-free readiness rejects every direct coordinator", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    await installReadiness(page, () => false);
+
+    // No `/inference/run` POST is safe merely because its HTTP response says
+    // 503: the server may have accepted an assignment before emitting it.
+    // All local/direct origins are rejected by the mutation-free GET instead.
     let remoteDirectFailures = 0;
     await page.route("**/inference/run", (route) => {
       if (new URL(route.request().url()).hostname !== "127.0.0.1") {
@@ -683,8 +876,8 @@ test.describe("Inference - community-first coordinator routing", () => {
       });
     });
 
-    // Only after direct /inference/run has failed safely on every configured
-    // seed may the first seed answer via standalone sharded consensus.
+    // Only after every direct origin declines before a POST may the first seed
+    // answer via one standalone sharded-consensus POST.
     let coordHitCount = 0;
     await page.route("**/inference/run_consensus", (route) => {
       coordHitCount++;
@@ -745,7 +938,7 @@ test.describe("Inference - community-first coordinator routing", () => {
 
     // Only one coordinator was hit (NYC succeeded first - no retry).
     expect(coordHitCount).toBe(1);
-    expect(remoteDirectFailures).toBe(6);
+    expect(remoteDirectFailures).toBe(0);
   });
 
   test("local node healthy (returns real output) - no coordinator fallback", async ({

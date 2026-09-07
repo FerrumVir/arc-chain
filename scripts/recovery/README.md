@@ -1123,6 +1123,7 @@ scripts/recovery/archive-fleet-to-drive.sh capture \
   --validator-public-keys-sha256 "$validator_public_keys_sha256" \
   --legacy-validator-set "$legacy_validator_set" \
   --legacy-validator-set-sha256 "$legacy_validator_set_sha256" \
+  --allow-unbound-legacy-wal \
   --offline-stop-evidence-output "$offline_stop_output"
 
 ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
@@ -1137,6 +1138,7 @@ ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
     --validator-public-keys-sha256 "$validator_public_keys_sha256" \
     --legacy-validator-set "$legacy_validator_set" \
     --legacy-validator-set-sha256 "$legacy_validator_set_sha256" \
+    --allow-unbound-legacy-wal \
     --offline-stop-evidence-output "$offline_stop_output" \
     --execute
 
@@ -1365,6 +1367,43 @@ attempt and a new request. A crash after the complete attempt receipt is
 fsynced but before `selected.json` reuses that exact receipt without another
 snapshot request; a complete selector is also revalidated byte-for-byte.
 Authorization heights may never exceed the selected capture head.
+
+LAX and AMS use the additive normalized-source v2 gate because their retained
+WALs contain interior sequence/byte discontinuities even though later complete
+block/checkpoint boundaries remain replayable. The fleet driver stages only
+these three reviewed inputs under
+`/root/.arc-recovery-seals/<freeze-sha>/<node>/`: `normalize-legacy-wal.py`
+(mode 0500), plus the node-specific `legacy-wal-normalization-plan.json`
+(mode 0400). At this source revision their SHA-256 roots are:
+
+```text
+normalizer  fdb1c0dc5cd00a965d4180e5e4f5cd04937faac07096615e6821d67ad289222c
+LAX plan    b44b19bf920e81dee7a5d6ce5629269428463e7d1c66bde20693131518a1b26b
+AMS plan    4aa43f037380ae6de2aef878a2fb3e5ef01318cad22a84418a31636ed795d17c
+```
+
+The exact operator-side preflight is:
+
+```bash
+arc_sha256() { shasum -a 256 -- "$1" | awk '{print $1}'; }
+test "$(arc_sha256 scripts/recovery/normalize-legacy-wal.py)" = \
+  fdb1c0dc5cd00a965d4180e5e4f5cd04937faac07096615e6821d67ad289222c
+test "$(arc_sha256 scripts/recovery/legacy-wal-normalization-lax.json)" = \
+  b44b19bf920e81dee7a5d6ce5629269428463e7d1c66bde20693131518a1b26b
+test "$(arc_sha256 scripts/recovery/legacy-wal-normalization-ams.json)" = \
+  4aa43f037380ae6de2aef878a2fb3e5ef01318cad22a84418a31636ed795d17c
+```
+
+For those two nodes the driver invokes `capture-normalized-live-source` with
+the normalizer and plan hashes as the final two arguments; NYC, LHR, NRT, and
+SGP retain the byte-identical `capture-live-source` v1 invocation. The helper
+copies selected runs into a new attempt-owned directory, rewrites only declared
+sequence fields and their CRCs, and sends that derivative to the pinned Rust
+inspector. It never edits or replaces the production WAL. `selected.json`, the
+final-source receipt, persisted-head v2 receipt, production input-stage
+manifest, and archive shared-input catalog bind the original WAL, snapshot,
+derivative, transform receipt, semantic replay head/state root, normalizer, and
+node plan. A source/snapshot/hash/partition mismatch fails before selection.
 
 For a node that remains active behind the full-host quarantine, two stable
 post-quarantine samples precede a second exact capture with immutable role
@@ -2060,23 +2099,300 @@ test "$(arc_sha256 "$recovery_checkpoint")" = \
   "$(arc_sha256 "$incoming_checkpoint")"
 ```
 
-On the Apple Silicon canary host, keep the exact installed pre-tag worker
-running and seal its identity only after `start` and `status` pass. This is the
-only **native macOS shell** block in the production procedure. Run it in a
-separate `/bin/bash` terminal as the logged-in non-root canary user; leave the
-Lima root shell open and untouched. The protected checkout is an absolute host
-path. The transfer uses the concrete absolute local-disk convention
-`$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>`: the private parent is
-owned by the logged-in user and mode 0700, and the per-release directory must be
-new. The home directory must be on the FileVault-protected local Mac disk—not a
-Lima shared mount, cloud-synchronized directory, `/tmp`, or removable FAT/exFAT
-volume. Changing the transfer copy to mode 0400 must not change the create-only
-mode-0600 source.
+Before leaving the Lima root shell, stage the exact final-SHA macOS arm64
+headless Actions ZIP for a one-way native handoff. The protected selection
+receipt below binds the repository, final commit, run, attempt, immutable
+artifact ID, GitHub server digest and size, archive digest, and transferred ZIP
+bytes. The source under `/secure/pretag` remains mode 0400 and unchanged. The
+create-only `/var/tmp` handoff is root-owned and non-writable; its public read
+bits expose only already-public release artifacts to the Lima login user that
+performs the authenticated SCP transport:
 
-The block creates one guest-native, create-only drop directory and uses
-`limactl copy --backend=scp` for the two bounded files. `ARC_OPERATOR_LIMA_INSTANCE`
-is the exact reviewed instance name shown by `limactl list`; the literal
-placeholder fails its allowlist and cannot accidentally select `default`:
+```bash
+# BEGIN LIMA FINAL MACOS CANARY HANDOFF STAGE
+set -Eeuo pipefail
+set +x
+test "$(/usr/bin/uname -s)" = Linux
+test "$(/usr/bin/uname -m)" = x86_64
+test "$(/usr/bin/id -u)" = 0
+: "${protected_main_sha:?protected-main identity is unavailable}"
+: "${pretag_run_id:?pre-tag run identity is unavailable}"
+: "${pretag_run_attempt:?pre-tag attempt identity is unavailable}"
+: "${pretag_raw_root:?pre-tag raw root is unavailable}"
+: "${pretag_selection_json:?pre-tag selection is unavailable}"
+: "${ARC_RECOVERY_PYTHON_PATH:?reviewed Python is unavailable}"
+macos_final_handoff_source="$pretag_raw_root/headless-macos-arm64/actions.zip"
+macos_final_handoff_root="/var/tmp/arc-macos-final-canary-v0.8.0-$protected_main_sha"
+test -f "$macos_final_handoff_source" \
+  && test ! -L "$macos_final_handoff_source"
+test -f "$pretag_selection_json" && test ! -L "$pretag_selection_json"
+test ! -e "$macos_final_handoff_root" \
+  && test ! -L "$macos_final_handoff_root"
+"$ARC_RECOVERY_PYTHON_PATH" -I - \
+  "$macos_final_handoff_source" \
+  "$pretag_selection_json" \
+  "$macos_final_handoff_root" \
+  "$protected_main_sha" \
+  "$pretag_run_id" \
+  "$pretag_run_attempt" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+selection_path = pathlib.Path(sys.argv[2])
+destination = pathlib.Path(sys.argv[3])
+commit = sys.argv[4]
+run_id = int(sys.argv[5])
+run_attempt = int(sys.argv[6])
+if (
+    not source.is_absolute()
+    or not selection_path.is_absolute()
+    or destination.parent != pathlib.Path("/var/tmp")
+    or destination.name != f"arc-macos-final-canary-v0.8.0-{commit}"
+    or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+    or run_id <= 0
+    or run_attempt <= 0
+):
+    raise SystemExit("final macOS canary handoff scalar/path identity differs")
+
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+
+def open_root_input(path, maximum, label):
+    before_path = path.lstat()
+    descriptor = os.open(path, os.O_RDONLY | nofollow)
+    before = os.fstat(descriptor)
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or (before.st_dev, before.st_ino) != (before_path.st_dev, before_path.st_ino)
+        or (before.st_uid, before.st_gid) != (0, 0)
+        or stat.S_IMODE(before.st_mode) != 0o400
+        or before.st_nlink != 1
+        or before.st_size < 1
+        or before.st_size > maximum
+    ):
+        os.close(descriptor)
+        raise SystemExit(f"{label} is not one bounded root-owned mode-0400 file")
+    return descriptor, before
+
+def read_all(descriptor, size, label):
+    payload = bytearray()
+    while len(payload) < size:
+        chunk = os.read(descriptor, min(1024 * 1024, size - len(payload)))
+        if not chunk:
+            raise SystemExit(f"{label} ended early")
+        payload.extend(chunk)
+    return bytes(payload)
+
+def stable(before, after):
+    return (
+        before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+        before.st_gid, before.st_nlink, before.st_size, before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) == (
+        after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+        after.st_gid, after.st_nlink, after.st_size, after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+
+selection_fd, selection_stat = open_root_input(
+    selection_path, 4 * 1024 * 1024, "pre-tag selection"
+)
+try:
+    selection_raw = read_all(selection_fd, selection_stat.st_size, "pre-tag selection")
+    if not stable(selection_stat, os.fstat(selection_fd)):
+        raise SystemExit("pre-tag selection changed while read")
+finally:
+    os.close(selection_fd)
+try:
+    selection = json.loads(selection_raw)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit("pre-tag selection is not valid JSON") from error
+if (
+    not isinstance(selection, dict)
+    or set(selection) != {
+        "schema", "repository", "commit", "run_id", "run_attempt", "artifacts"
+    }
+    or selection.get("schema") != "arc.pretag.selection.v1"
+    or selection.get("repository") != "FerrumVir/arc-chain"
+    or selection.get("commit") != commit
+    or selection.get("run_id") != run_id
+    or selection.get("run_attempt") != run_attempt
+    or not isinstance(selection.get("artifacts"), dict)
+):
+    raise SystemExit("pre-tag selection does not bind the exact final run")
+try:
+    artifact = selection["artifacts"]["macos-arm64"]["headless"]
+except (KeyError, TypeError) as error:
+    raise SystemExit("macOS arm64 headless selection is absent") from error
+if not isinstance(artifact, dict) or set(artifact) != {
+    "id", "name", "digest", "archive_sha256", "size_in_bytes"
+}:
+    raise SystemExit("macOS arm64 headless selection fields differ")
+artifact_id = artifact.get("id")
+artifact_size = artifact.get("size_in_bytes")
+artifact_digest = artifact.get("digest")
+archive_sha256 = artifact.get("archive_sha256")
+expected_name = (
+    f"arc-pretag-headless-macos-arm64-{commit}-{run_id}-{run_attempt}-"
+    f"{archive_sha256}"
+)
+if (
+    isinstance(artifact_id, bool)
+    or not isinstance(artifact_id, int)
+    or artifact_id <= 0
+    or isinstance(artifact_size, bool)
+    or not isinstance(artifact_size, int)
+    or artifact_size <= 0
+    or artifact_size > 4 * 1024 * 1024 * 1024
+    or not isinstance(artifact_digest, str)
+    or re.fullmatch(r"sha256:[0-9a-f]{64}", artifact_digest) is None
+    or not isinstance(archive_sha256, str)
+    or re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None
+    or artifact.get("name") != expected_name
+):
+    raise SystemExit("macOS arm64 headless selection tuple is malformed")
+
+source_fd, source_stat = open_root_input(
+    source, 4 * 1024 * 1024 * 1024, "raw macOS Actions ZIP"
+)
+try:
+    if source_stat.st_size != artifact_size:
+        raise SystemExit("raw macOS Actions ZIP size differs from selection")
+    os.mkdir(destination, 0o755)
+    destination_fd = os.open(
+        destination, os.O_RDONLY | os.O_DIRECTORY | nofollow
+    )
+    try:
+        os.fchmod(destination_fd, 0o755)
+        output_name = "headless-macos-arm64-actions.zip"
+        output_fd = os.open(
+            output_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+            0o444,
+            dir_fd=destination_fd,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            while copied < source_stat.st_size:
+                chunk = os.read(source_fd, min(1024 * 1024, source_stat.st_size - copied))
+                if not chunk:
+                    raise SystemExit("raw macOS Actions ZIP ended while staging")
+                digest.update(chunk)
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(output_fd, chunk[offset:])
+                copied += len(chunk)
+            os.fchmod(output_fd, 0o444)
+            os.fsync(output_fd)
+        finally:
+            os.close(output_fd)
+        zip_sha256 = digest.hexdigest()
+        if zip_sha256 != artifact_digest.removeprefix("sha256:"):
+            raise SystemExit("raw macOS Actions ZIP digest differs from selection")
+        if not stable(source_stat, os.fstat(source_fd)):
+            raise SystemExit("raw macOS Actions ZIP changed while staged")
+        source_after_path = source.lstat()
+        if (source_after_path.st_dev, source_after_path.st_ino) != (
+            source_stat.st_dev, source_stat.st_ino
+        ):
+            raise SystemExit("raw macOS Actions ZIP path identity changed")
+        receipt = {
+            "schema": "arc.recovery.macos-final-canary-handoff.v1",
+            "repository": "FerrumVir/arc-chain",
+            "commit": commit,
+            "run_id": run_id,
+            "run_attempt": run_attempt,
+            "source_selection_sha256": hashlib.sha256(selection_raw).hexdigest(),
+            "artifact": artifact,
+            "raw_actions_zip": {
+                "name": output_name,
+                "sha256": zip_sha256,
+                "size_bytes": copied,
+            },
+        }
+        receipt_raw = (
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+
+        def publish(name, payload):
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o444,
+                dir_fd=destination_fd,
+            )
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(descriptor, payload[written:])
+                os.fchmod(descriptor, 0o444)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        publish("FINAL-CANARY-HANDOFF.json", receipt_raw)
+        receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+        publish(
+            "SHA256SUMS",
+            (
+                f"{zip_sha256}  {output_name}\n"
+                f"{receipt_sha256}  FINAL-CANARY-HANDOFF.json\n"
+            ).encode("ascii"),
+        )
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+    parent_fd = os.open("/var/tmp", os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+finally:
+    os.close(source_fd)
+PY
+test "$(/usr/bin/stat --format='%U:%G:%a:%h' "$macos_final_handoff_root")" = \
+  root:root:755:1
+for macos_final_handoff_file in \
+  "$macos_final_handoff_root/headless-macos-arm64-actions.zip" \
+  "$macos_final_handoff_root/FINAL-CANARY-HANDOFF.json" \
+  "$macos_final_handoff_root/SHA256SUMS"
+do
+  test -f "$macos_final_handoff_file" && test ! -L "$macos_final_handoff_file"
+  test "$(/usr/bin/stat --format='%U:%G:%a:%h' "$macos_final_handoff_file")" = \
+    root:root:444:1
+done
+# END LIMA FINAL MACOS CANARY HANDOFF STAGE
+```
+
+On the Apple Silicon host, replace the stale c5ca pre-tag worker with this
+exact final-SHA artifact. The helper has one fixed launchd label and loopback
+port, so this is deliberately a sequential handoff rather than two concurrent
+workers. The old root remains on local disk with its key, chain data, model,
+logs, and append-only evidence; only its gracefully stopped launchd
+registration is cleaned. The final root is a new content-addressed direct child
+of `HOME`, so no prior bytes can be mistaken for the release candidate.
+
+This is the first of two **native macOS shell** blocks in the production
+procedure; the second is the post-cutover desktop live-product gate. Run this
+block in a separate `/bin/bash` terminal as the logged-in non-root canary user;
+leave the Lima root shell open and untouched. The protected checkout is an
+absolute host path. Both input and evidence transfers remain on the
+FileVault-protected local Mac disk—not a Lima shared mount, cloud-synchronized
+directory, `/tmp`, or removable FAT/exFAT volume. The final acceptance transfer
+uses `$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>`: its private
+parent is mode 0700 and the per-release directory must be new. Changing the
+acceptance copy to mode 0400 must not change the create-only mode-0600 source.
+
+`ARC_OPERATOR_LIMA_INSTANCE` is the exact reviewed instance name shown by
+`limactl list`; the literal placeholder fails its allowlist and cannot
+accidentally select `default`:
 
 ```bash
 # BEGIN NATIVE MACOS CANARY TRANSFER
@@ -2090,21 +2406,12 @@ umask 077
 ARC_MACOS_PROTECTED_MAIN_SHA='<exact 40-character protected-main SHA after merge>'
 ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'
 ARC_OPERATOR_LIMA_INSTANCE='<exact reviewed Lima instance name>'
+ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'
 [[ "$ARC_MACOS_PROTECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$ARC_OPERATOR_LIMA_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]
 case "$ARC_MACOS_PROTECTED_CHECKOUT" in /*) ;; *) exit 1 ;; esac
 case "$HOME" in /*) ;; *) exit 1 ;; esac
 test -d "$HOME" && test ! -L "$HOME"
-ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"
-if [ ! -e "$ARC_CANARY_TRANSFER_PARENT" ]; then
-  /bin/mkdir -m 0700 "$ARC_CANARY_TRANSFER_PARENT"
-fi
-test -d "$ARC_CANARY_TRANSFER_PARENT" \
-  && test ! -L "$ARC_CANARY_TRANSFER_PARENT"
-test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_CANARY_TRANSFER_PARENT")" = \
-  "700:1:$(/usr/bin/id -u)"
-ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
-case "$ARC_CANARY_TRANSFER_ROOT" in "$HOME"/*) ;; *) exit 1 ;; esac
 test -d "$ARC_MACOS_PROTECTED_CHECKOUT" \
   && test ! -L "$ARC_MACOS_PROTECTED_CHECKOUT"
 test "$(/usr/bin/git -C "$ARC_MACOS_PROTECTED_CHECKOUT" rev-parse HEAD)" = \
@@ -2119,9 +2426,417 @@ test "$(/usr/bin/git -C "$ARC_MACOS_PROTECTED_CHECKOUT" hash-object \
   "$(/usr/bin/git -C "$ARC_MACOS_PROTECTED_CHECKOUT" rev-parse \
     "$ARC_MACOS_PROTECTED_MAIN_SHA:scripts/release/macos-community-canary.py")"
 
-"$macos_canary_helper" status
-"$macos_canary_helper" accept
-macos_canary_acceptance_source="$HOME/.arc-pretag-community-canary/evidence/ACCEPTED.json"
+ARC_LIMACTL_COMMAND="$(command -v limactl)"
+case "$ARC_LIMACTL_COMMAND" in /*) ;; *) exit 1 ;; esac
+ARC_LIMACTL="$(/usr/bin/python3 -I -c \
+  'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+  "$ARC_LIMACTL_COMMAND")"
+case "$ARC_LIMACTL" in /*) ;; *) exit 1 ;; esac
+test -x "$ARC_LIMACTL" && test ! -L "$ARC_LIMACTL"
+ARC_LIMACTL_SHA256="$(/usr/bin/shasum -a 256 "$ARC_LIMACTL" \
+  | /usr/bin/cut -d ' ' -f 1)"
+[[ "$ARC_LIMACTL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/uname -s)" = Linux
+test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/uname -m)" = x86_64
+
+ARC_MACOS_FINAL_INPUT_ROOT="$HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+ARC_MACOS_OLD_CANARY_ROOT="$HOME/.arc-pretag-community-canary"
+ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+for macos_canary_direct_child in \
+  "$ARC_MACOS_FINAL_INPUT_ROOT" \
+  "$ARC_MACOS_OLD_CANARY_ROOT" \
+  "$ARC_MACOS_FINAL_CANARY_ROOT"
+do
+  test "$(/usr/bin/dirname "$macos_canary_direct_child")" = "$HOME"
+done
+test -d "$ARC_MACOS_OLD_CANARY_ROOT" \
+  && test ! -L "$ARC_MACOS_OLD_CANARY_ROOT"
+test ! -e "$ARC_MACOS_FINAL_INPUT_ROOT" \
+  && test ! -L "$ARC_MACOS_FINAL_INPUT_ROOT"
+test ! -e "$ARC_MACOS_FINAL_CANARY_ROOT" \
+  && test ! -L "$ARC_MACOS_FINAL_CANARY_ROOT"
+/bin/mkdir -m 0700 "$ARC_MACOS_FINAL_INPUT_ROOT"
+test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_MACOS_FINAL_INPUT_ROOT")" = \
+  "700:1:$(/usr/bin/id -u)"
+macos_final_handoff_guest="/var/tmp/arc-macos-final-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+macos_final_actions_zip="$ARC_MACOS_FINAL_INPUT_ROOT/headless-macos-arm64-actions.zip"
+macos_final_handoff_receipt="$ARC_MACOS_FINAL_INPUT_ROOT/FINAL-CANARY-HANDOFF.json"
+macos_final_handoff_sums="$ARC_MACOS_FINAL_INPUT_ROOT/SHA256SUMS"
+"$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/test -d "$macos_final_handoff_guest"
+test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/stat --format='%U:%G:%a:%h' "$macos_final_handoff_guest")" = \
+  root:root:755:1
+for macos_final_handoff_name in \
+  headless-macos-arm64-actions.zip \
+  FINAL-CANARY-HANDOFF.json \
+  SHA256SUMS
+do
+  test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+    /usr/bin/stat --format='%U:%G:%a:%h' \
+      "$macos_final_handoff_guest/$macos_final_handoff_name")" = \
+    root:root:444:1
+done
+"$ARC_LIMACTL" copy --backend=scp \
+  "$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/headless-macos-arm64-actions.zip" \
+  "$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/FINAL-CANARY-HANDOFF.json" \
+  "$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/SHA256SUMS" \
+  "$ARC_MACOS_FINAL_INPUT_ROOT/"
+for macos_final_input in \
+  "$macos_final_actions_zip" \
+  "$macos_final_handoff_receipt" \
+  "$macos_final_handoff_sums"
+do
+  test -f "$macos_final_input" && test ! -L "$macos_final_input"
+  /bin/chmod 0400 "$macos_final_input"
+  test "$(/usr/bin/stat -f '%Lp:%l:%u' "$macos_final_input")" = \
+    "400:1:$(/usr/bin/id -u)"
+done
+IFS=$'\t' read -r ARC_MACOS_FINAL_RUN_ID ARC_MACOS_FINAL_RUN_ATTEMPT ARC_MACOS_FINAL_ARTIFACT_ID ARC_MACOS_FINAL_ARTIFACT_DIGEST ARC_MACOS_FINAL_ARCHIVE_SHA256 < <(
+  /usr/bin/python3 -I - \
+    "$macos_final_actions_zip" \
+    "$macos_final_handoff_receipt" \
+    "$macos_final_handoff_sums" \
+    "$ARC_MACOS_PROTECTED_MAIN_SHA" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+zip_path, receipt_path, sums_path = map(pathlib.Path, sys.argv[1:4])
+commit = sys.argv[4]
+uid = os.geteuid()
+
+def read_stable(path, maximum, label):
+    before_path = path.lstat()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (before_path.st_dev, before_path.st_ino)
+            or before.st_uid != uid
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_nlink != 1
+            or before.st_size < 1
+            or before.st_size > maximum
+        ):
+            raise SystemExit(f"{label} is not one bounded private regular file")
+        payload = bytearray()
+        while len(payload) < before.st_size:
+            chunk = os.read(descriptor, min(1024 * 1024, before.st_size - len(payload)))
+            if not chunk:
+                raise SystemExit(f"{label} ended early")
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+        identity = lambda row: (
+            row.st_dev, row.st_ino, row.st_mode, row.st_uid, row.st_gid,
+            row.st_nlink, row.st_size, row.st_mtime_ns, row.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise SystemExit(f"{label} changed while read")
+        after_path = path.lstat()
+        if (after_path.st_dev, after_path.st_ino) != (before.st_dev, before.st_ino):
+            raise SystemExit(f"{label} path identity changed while read")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+def hash_stable(path, maximum, label):
+    before_path = path.lstat()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (before_path.st_dev, before_path.st_ino)
+            or before.st_uid != uid
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_nlink != 1
+            or before.st_size < 1
+            or before.st_size > maximum
+        ):
+            raise SystemExit(f"{label} is not one bounded private regular file")
+        digest = hashlib.sha256()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"{label} ended early")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        identity = lambda row: (
+            row.st_dev, row.st_ino, row.st_mode, row.st_uid, row.st_gid,
+            row.st_nlink, row.st_size, row.st_mtime_ns, row.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise SystemExit(f"{label} changed while read")
+        after_path = path.lstat()
+        if (after_path.st_dev, after_path.st_ino) != (before.st_dev, before.st_ino):
+            raise SystemExit(f"{label} path identity changed while read")
+        return digest.hexdigest(), before.st_size
+    finally:
+        os.close(descriptor)
+
+zip_sha256, zip_size = hash_stable(
+    zip_path, 4 * 1024 * 1024 * 1024, "final Actions ZIP"
+)
+receipt_raw = read_stable(receipt_path, 64 * 1024, "final handoff receipt")
+sums_raw = read_stable(sums_path, 256, "final handoff sidecar")
+receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+expected_sums = (
+    f"{zip_sha256}  headless-macos-arm64-actions.zip\n"
+    f"{receipt_sha256}  FINAL-CANARY-HANDOFF.json\n"
+).encode("ascii")
+if sums_raw != expected_sums:
+    raise SystemExit("final handoff sidecar does not bind the transferred pair")
+try:
+    receipt = json.loads(receipt_raw)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit("final handoff receipt is invalid JSON") from error
+canonical = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+if receipt_raw != canonical or not isinstance(receipt, dict) or set(receipt) != {
+    "schema", "repository", "commit", "run_id", "run_attempt",
+    "source_selection_sha256", "artifact", "raw_actions_zip",
+}:
+    raise SystemExit("final handoff receipt encoding/fields differ")
+run_id = receipt.get("run_id")
+run_attempt = receipt.get("run_attempt")
+selection_sha = receipt.get("source_selection_sha256")
+artifact = receipt.get("artifact")
+raw_zip = receipt.get("raw_actions_zip")
+if (
+    receipt.get("schema") != "arc.recovery.macos-final-canary-handoff.v1"
+    or receipt.get("repository") != "FerrumVir/arc-chain"
+    or receipt.get("commit") != commit
+    or isinstance(run_id, bool)
+    or not isinstance(run_id, int)
+    or run_id <= 0
+    or isinstance(run_attempt, bool)
+    or not isinstance(run_attempt, int)
+    or run_attempt <= 0
+    or not isinstance(selection_sha, str)
+    or re.fullmatch(r"[0-9a-f]{64}", selection_sha) is None
+    or not isinstance(artifact, dict)
+    or set(artifact) != {"id", "name", "digest", "archive_sha256", "size_in_bytes"}
+    or not isinstance(raw_zip, dict)
+    or set(raw_zip) != {"name", "sha256", "size_bytes"}
+):
+    raise SystemExit("final handoff tuple is malformed")
+artifact_id = artifact.get("id")
+artifact_size = artifact.get("size_in_bytes")
+archive_sha = artifact.get("archive_sha256")
+if (
+    isinstance(artifact_id, bool)
+    or not isinstance(artifact_id, int)
+    or artifact_id <= 0
+    or isinstance(artifact_size, bool)
+    or not isinstance(artifact_size, int)
+    or artifact_size != zip_size
+    or not isinstance(archive_sha, str)
+    or re.fullmatch(r"[0-9a-f]{64}", archive_sha) is None
+    or artifact.get("name") !=
+        f"arc-pretag-headless-macos-arm64-{commit}-{run_id}-{run_attempt}-{archive_sha}"
+    or artifact.get("digest") != f"sha256:{zip_sha256}"
+    or raw_zip != {
+        "name": "headless-macos-arm64-actions.zip",
+        "sha256": zip_sha256,
+        "size_bytes": zip_size,
+    }
+):
+    raise SystemExit("final Actions ZIP differs from its exact selected artifact")
+print(
+    f"{run_id}\t{run_attempt}\t{artifact_id}\t"
+    f"{artifact['digest']}\t{archive_sha}"
+)
+PY
+)
+[[ "$ARC_MACOS_FINAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+[[ "$ARC_MACOS_FINAL_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+[[ "$ARC_MACOS_FINAL_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+[[ "$ARC_MACOS_FINAL_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+[[ "$ARC_MACOS_FINAL_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+macos_old_config="$ARC_MACOS_OLD_CANARY_ROOT/config/canary.json"
+macos_old_model="$ARC_MACOS_OLD_CANARY_ROOT/model/llama-2-7b-chat.Q4_K_M.gguf"
+"$macos_canary_helper" status --root "$ARC_MACOS_OLD_CANARY_ROOT"
+/usr/bin/python3 -I - \
+  "$macos_old_config" \
+  "$ARC_MACOS_OLD_CANARY_ROOT" \
+  "$ARC_MACOS_OLD_CANARY_SHA" <<'PY'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+expected_root = sys.argv[2]
+expected_commit = sys.argv[3]
+config = json.loads(config_path.read_bytes())
+if (
+    config.get("pretag", {}).get("commit") != expected_commit
+    or config.get("managed", {}).get("root") != expected_root
+    or config.get("runtime", {}).get("rpc") != "127.0.0.1:19944"
+):
+    raise SystemExit("running historical canary is not the exact c5ca root")
+PY
+old_canary_service="gui/$(/usr/bin/id -u)/network.arc.pretag-community-canary"
+old_canary_pid_rows="$(
+  /bin/launchctl print "$old_canary_service" \
+    | /usr/bin/awk '$1 == "pid" && $2 == "=" && $3 ~ /^[1-9][0-9]*$/ && NF == 3 { print $3 }'
+)"
+[[ "$old_canary_pid_rows" =~ ^[1-9][0-9]*$ ]]
+old_canary_pid="$old_canary_pid_rows"
+old_canary_root_identity="$(/usr/bin/stat -f '%d:%i:%Lp:%u' \
+  "$ARC_MACOS_OLD_CANARY_ROOT")"
+old_canary_config_identity="$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
+  "$macos_old_config")"
+old_canary_model_identity="$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
+  "$macos_old_model")"
+"$macos_canary_helper" stop --root "$ARC_MACOS_OLD_CANARY_ROOT"
+"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"
+if "$macos_canary_helper" status --root "$ARC_MACOS_OLD_CANARY_ROOT"; then
+  /usr/bin/printf 'historical canary unexpectedly remains live after cleanup\n' >&2
+  exit 1
+else
+  old_canary_status_rc=$?
+fi
+test "$old_canary_status_rc" -eq 3
+test ! -e "$HOME/Library/LaunchAgents/network.arc.pretag-community-canary.plist" \
+  && test ! -L "$HOME/Library/LaunchAgents/network.arc.pretag-community-canary.plist"
+old_canary_ps_rows=''
+old_canary_ps_rc=0
+if old_canary_ps_rows="$(/bin/ps -p "$old_canary_pid" -o pid= 2>&1)"; then
+  /usr/bin/printf 'historical canary PID is still live: %s\n' "$old_canary_pid" >&2
+  exit 1
+else
+  old_canary_ps_rc=$?
+fi
+test "$old_canary_ps_rc" -eq 1
+test -z "$old_canary_ps_rows"
+macos_canary_port_rows=''
+macos_canary_lsof_rc=0
+if macos_canary_port_rows="$(
+  /usr/sbin/lsof -nP -a -iTCP:19944 -sTCP:LISTEN 2>&1
+)"; then
+  /usr/bin/printf 'fixed canary RPC port is still owned:\n%s\n' \
+    "$macos_canary_port_rows" >&2
+  exit 1
+else
+  macos_canary_lsof_rc=$?
+fi
+test "$macos_canary_lsof_rc" -eq 1
+test -z "$macos_canary_port_rows"
+test "$(/usr/bin/stat -f '%d:%i:%Lp:%u' \
+  "$ARC_MACOS_OLD_CANARY_ROOT")" = "$old_canary_root_identity"
+test "$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
+  "$macos_old_config")" = "$old_canary_config_identity"
+test "$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
+  "$macos_old_model")" = "$old_canary_model_identity"
+
+ARC_MACOS_CANARY_CURL=/usr/bin/curl
+ARC_MACOS_CANARY_CA_BUNDLE=/private/etc/ssl/cert.pem
+test -x "$ARC_MACOS_CANARY_CURL" && test ! -L "$ARC_MACOS_CANARY_CURL"
+test -f "$ARC_MACOS_CANARY_CA_BUNDLE" \
+  && test ! -L "$ARC_MACOS_CANARY_CA_BUNDLE"
+ARC_MACOS_CANARY_CURL_SHA256="$(/usr/bin/shasum -a 256 \
+  "$ARC_MACOS_CANARY_CURL" | /usr/bin/cut -d ' ' -f 1)"
+ARC_MACOS_CANARY_CA_BUNDLE_SHA256="$(/usr/bin/shasum -a 256 \
+  "$ARC_MACOS_CANARY_CA_BUNDLE" | /usr/bin/cut -d ' ' -f 1)"
+[[ "$ARC_MACOS_CANARY_CURL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$ARC_MACOS_CANARY_CA_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+"$macos_canary_helper" plan \
+  --root "$ARC_MACOS_FINAL_CANARY_ROOT" \
+  --raw-actions-zip "$macos_final_actions_zip" \
+  --model "$macos_old_model" \
+  --expected-commit "$ARC_MACOS_PROTECTED_MAIN_SHA" \
+  --expected-run-id "$ARC_MACOS_FINAL_RUN_ID" \
+  --expected-run-attempt "$ARC_MACOS_FINAL_RUN_ATTEMPT" \
+  --expected-artifact-id "$ARC_MACOS_FINAL_ARTIFACT_ID" \
+  --curl "$ARC_MACOS_CANARY_CURL" \
+  --curl-sha256 "$ARC_MACOS_CANARY_CURL_SHA256" \
+  --ca-bundle "$ARC_MACOS_CANARY_CA_BUNDLE" \
+  --ca-bundle-sha256 "$ARC_MACOS_CANARY_CA_BUNDLE_SHA256"
+test ! -e "$ARC_MACOS_FINAL_CANARY_ROOT" \
+  && test ! -L "$ARC_MACOS_FINAL_CANARY_ROOT"
+"$macos_canary_helper" install \
+  --root "$ARC_MACOS_FINAL_CANARY_ROOT" \
+  --raw-actions-zip "$macos_final_actions_zip" \
+  --model "$macos_old_model" \
+  --expected-commit "$ARC_MACOS_PROTECTED_MAIN_SHA" \
+  --expected-run-id "$ARC_MACOS_FINAL_RUN_ID" \
+  --expected-run-attempt "$ARC_MACOS_FINAL_RUN_ATTEMPT" \
+  --expected-artifact-id "$ARC_MACOS_FINAL_ARTIFACT_ID" \
+  --curl "$ARC_MACOS_CANARY_CURL" \
+  --curl-sha256 "$ARC_MACOS_CANARY_CURL_SHA256" \
+  --ca-bundle "$ARC_MACOS_CANARY_CA_BUNDLE" \
+  --ca-bundle-sha256 "$ARC_MACOS_CANARY_CA_BUNDLE_SHA256"
+"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"
+"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"
+"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"
+macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"
+/usr/bin/python3 -I - \
+  "$ARC_MACOS_FINAL_CANARY_ROOT/config/canary.json" \
+  "$macos_canary_acceptance_source" \
+  "$ARC_MACOS_FINAL_CANARY_ROOT" \
+  "$ARC_MACOS_PROTECTED_MAIN_SHA" \
+  "$ARC_MACOS_FINAL_RUN_ID" \
+  "$ARC_MACOS_FINAL_RUN_ATTEMPT" \
+  "$ARC_MACOS_FINAL_ARTIFACT_ID" \
+  "$ARC_MACOS_FINAL_ARTIFACT_DIGEST" \
+  "$ARC_MACOS_FINAL_ARCHIVE_SHA256" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+acceptance_path = pathlib.Path(sys.argv[2])
+expected_root, commit = sys.argv[3:5]
+run_id, run_attempt, artifact_id = map(int, sys.argv[5:8])
+artifact_digest, archive_sha256 = sys.argv[8:10]
+config_raw = config_path.read_bytes()
+acceptance_raw = acceptance_path.read_bytes()
+config = json.loads(config_raw)
+acceptance = json.loads(acceptance_raw)
+pretag = config.get("pretag", {})
+accepted_pretag = acceptance.get("pretag", {})
+tuple_fields = {
+    "repository": "FerrumVir/arc-chain",
+    "commit": commit,
+    "run_id": run_id,
+    "run_attempt": run_attempt,
+    "artifact_id": artifact_id,
+    "artifact_digest": artifact_digest,
+    "archive_sha256": archive_sha256,
+}
+if (
+    config.get("managed", {}).get("root") != expected_root
+    or any(pretag.get(key) != value for key, value in tuple_fields.items())
+    or any(accepted_pretag.get(key) != value for key, value in tuple_fields.items())
+    or acceptance.get("accepted") is not True
+    or acceptance.get("config_sha256") != hashlib.sha256(config_raw).hexdigest()
+):
+    raise SystemExit("final macOS acceptance does not bind the exact root/artifact tuple")
+PY
+
+ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"
+if [ ! -e "$ARC_CANARY_TRANSFER_PARENT" ]; then
+  /bin/mkdir -m 0700 "$ARC_CANARY_TRANSFER_PARENT"
+fi
+test -d "$ARC_CANARY_TRANSFER_PARENT" \
+  && test ! -L "$ARC_CANARY_TRANSFER_PARENT"
+test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_CANARY_TRANSFER_PARENT")" = \
+  "700:1:$(/usr/bin/id -u)"
+ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+case "$ARC_CANARY_TRANSFER_ROOT" in "$HOME"/*) ;; *) exit 1 ;; esac
 macos_canary_acceptance_transfer_root="$ARC_CANARY_TRANSFER_ROOT"
 macos_canary_acceptance_transfer="$macos_canary_acceptance_transfer_root/MACOS-CANARY-ACCEPTANCE.json"
 test -f "$macos_canary_acceptance_source" && test ! -L "$macos_canary_acceptance_source"
@@ -2155,13 +2870,6 @@ test "$(/usr/bin/stat -f '%Lp:%l:%u' "$macos_canary_acceptance_transfer")" = \
 test "$(/usr/bin/stat -f '%Lp:%l:%u' "$macos_canary_acceptance_transfer.sha256")" = \
   "400:1:$(/usr/bin/id -u)"
 
-ARC_LIMACTL="$(command -v limactl)"
-case "$ARC_LIMACTL" in /*) ;; *) exit 1 ;; esac
-test -x "$ARC_LIMACTL"
-test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
-  /usr/bin/uname -s)" = Linux
-test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
-  /usr/bin/uname -m)" = x86_64
 lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0
 "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
   /usr/bin/test '!' -e "$lima_canary_drop_root"
@@ -2171,6 +2879,8 @@ lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0
   "$macos_canary_acceptance_transfer" \
   "$macos_canary_acceptance_transfer.sha256" \
   "$ARC_OPERATOR_LIMA_INSTANCE:$lima_canary_drop_root/"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIMACTL" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIMACTL_SHA256"
 /usr/bin/printf 'Copied the canary receipt into %s:%s; return to the open Lima root shell.\n' \
   "$ARC_OPERATOR_LIMA_INSTANCE" "$lima_canary_drop_root"
 # END NATIVE MACOS CANARY TRANSFER
@@ -2862,7 +3572,7 @@ before mutation and again after cutover.
 
 The public GET allowlist carried verbatim in the manifest is `/health`,
 `/info`, `/network/info`, `/stats`, `/validators`, `/block/latest`, `/blocks`,
-`/inference/attestations`, `/economics/rewards`, `/faucet/status`,
+`/inference/readiness`, `/inference/attestations`, `/economics/rewards`, `/faucet/status`,
 `/community/reward_policy`, `/workers/scoreboard`, `/shards`,
 `/models`, and `/models/shards`. Strict parameterized public reads cover only
 blocks, transactions, accounts, worker earnings, reward receipts, and reward
@@ -2878,6 +3588,9 @@ the atomic 10 tx/s per-sender admission policy with single submissions. The
 node still rejects every request item that omits either `signature` or
 `public_key`. Inference has a 4,000-second upstream timeout, worker result
 submission 2,700 seconds, and validator approval 1,500 seconds.
+The readiness route is a body-free, mutation-free observation. Clients may
+probe it across candidates, then select one origin; they never replay the same
+inference click after its single POST has begun.
 
 `/internal/community/reward/approve`, `/shards/announce`,
 `/inference/forward_shard`, and `/inference/cleanup_shard` are validator-IP-only.
@@ -3761,7 +4474,7 @@ arc_git -C "$operator_checkout" show \
   | /usr/bin/cmp -s - "$frontend_config"
 
 frontend_remote_refs="$(arc_scoped_gh "$frontend_gh_token" api \
-  'repos/FerrumVir/arc-chain/git/matching-refs/heads/arc-recovery/frontend/v0.8.0' \
+  "repos/FerrumVir/arc-chain/git/matching-refs/heads/$frontend_branch" \
   --jq .)"
 frontend_remote_state="$(printf '%s' "$frontend_remote_refs" | /usr/bin/jq -er \
   --arg sha "$frontend_commit_sha" --arg ref "refs/heads/$frontend_branch" '
@@ -3800,7 +4513,7 @@ case "$frontend_remote_state" in
   *) printf 'frontend branch exists at another identity; preserve and stop\n' >&2; exit 1 ;;
 esac
 frontend_remote_after="$(arc_scoped_gh "$frontend_gh_token" api \
-  'repos/FerrumVir/arc-chain/git/matching-refs/heads/arc-recovery/frontend/v0.8.0' \
+  "repos/FerrumVir/arc-chain/git/matching-refs/heads/$frontend_branch" \
   --jq .)"
 printf '%s' "$frontend_remote_after" | /usr/bin/jq -e \
   --arg sha "$frontend_commit_sha" --arg ref "refs/heads/$frontend_branch" '
@@ -4739,9 +5452,712 @@ test -s "$live_acceptance"
 /usr/bin/chmod 0400 "$live_acceptance"
 (cd /secure/operator && \
   /usr/bin/sha256sum --check --strict recovery-v3.reward-evidence.json.sha256)
+# Seal every native desktop input while the authenticated Lima evidence and
+# shell variables are still in scope. The native phase imports this one fixed,
+# root-owned receipt; it does not ask the operator to transcribe a worker,
+# transaction, Pages commit, config hash, rollout hash, host, or socket.
+desktop_live_worker="$(/usr/bin/jq -er '.receipts[0].worker' "$reward_evidence")"
+desktop_live_tx="$(/usr/bin/jq -er '.receipts[0].tx_hash' "$reward_evidence")"
+[[ "$desktop_live_worker" =~ ^0x[0-9a-f]{64}$ ]]
+[[ "$desktop_live_tx" =~ ^0x[0-9a-f]{64}$ ]]
+desktop_live_rollout_sha256="$(arc_sha256 "$final_manifest")"
+desktop_live_validator_name=lax
+desktop_live_validator_host=140.82.16.112
+desktop_live_validator_socket="/run/arc-v3-rpc-$desktop_live_validator_name-${desktop_live_rollout_sha256:0:16}/rpc.sock"
+desktop_live_input="$post_release_attempt_root/DESKTOP-LIVE-BROWSER-INPUT.json"
+/usr/bin/jq -cnS \
+  --arg source "$protected_main_sha" \
+  --arg frontend "$frontend_main_sha" \
+  --arg pages "$pages_url" \
+  --arg config_sha "$(arc_sha256 "$deployed_config")" \
+  --arg rollout_sha "$desktop_live_rollout_sha256" \
+  --arg worker "$desktop_live_worker" --arg tx "$desktop_live_tx" \
+  --arg validator "$desktop_live_validator_name" \
+  --arg host "$desktop_live_validator_host" \
+  --arg socket "$desktop_live_validator_socket" \
+  --arg known_hosts_sha "$ARC_RECOVERY_SSH_KNOWN_HOSTS_SHA256" \
+  --arg identity_sha "$ARC_RECOVERY_SSH_IDENTITY_SHA256" '
+  {schema:"arc.desktop-live-input.v1",sourceCommit:$source,
+   frontendCommit:$frontend,pagesOrigin:$pages,
+   frontendConfigSha256:$config_sha,rolloutManifestSha256:$rollout_sha,
+   worker:$worker,rewardTx:$tx,validatorName:$validator,
+   validatorHost:$host,validatorRpcSocket:$socket,
+   sshKnownHostsSha256:$known_hosts_sha,sshIdentitySha256:$identity_sha}' \
+  | write_once_or_compare "$desktop_live_input"
+desktop_live_input_fixed=/secure/operator/DESKTOP-LIVE-BROWSER-INPUT.json
+arc_install_or_reuse_exact "$desktop_live_input" "$desktop_live_input_fixed"
+test "$(/usr/bin/stat --format='%a:%h' "$desktop_live_input_fixed")" = 400:1
+desktop_live_release_binding_fixed=/secure/operator/DESKTOP-LIVE-RELEASE-BINDING.json
+arc_install_or_reuse_exact \
+  "$published_acceptance_root/release-binding.json" \
+  "$desktop_live_release_binding_fixed"
+test "$(/usr/bin/stat --format='%a:%h' \
+  "$desktop_live_release_binding_fixed")" = 400:1
 # The public-truth builder below performs the final protected-helper rebuild and
 # live all-six verification, then creates the canonical v2 acceptance receipt.
 unset post_release_gh_token
+```
+
+### Run the exact desktop live gate on the native Mac and import its receipt
+
+The protected Lima image remains free of npm and Chromium. In a separate
+native macOS terminal, run the exact protected-main desktop suite through a
+host-key-pinned SSH local forward from loopback to the exact LAX validator's
+private Unix RPC socket. The fixed Lima receipt above supplies the complete
+sealed worker/transaction identities and every source/forward binding, so no
+display prefix or ambient local node can enter the gate. The live config disables preview-server
+reuse, rejects focused/skipped/retried tests, and runs one Chromium worker. Only
+after all four tests pass does the exact Node invocation call the create-only receipt
+helper, which independently re-reads and cross-binds the direct reward,
+worker-earnings, and block receipts. It also binds the protected suite, complete
+desktop `src/` tree, package lock, Pages config, authenticated forward, official
+Node/npm distribution, and the UI's 61-poll/180-second settlement budget.
+
+Use a fresh local-disk transfer directory. The cache-busted Pages config is
+hash-matched before dependency hydration. The official Node v24.20.0 Darwin
+archive is staged create-only and hash-checked; npm lifecycle scripts are
+disabled. npm, Node, and the Playwright browser never enter the protected VM:
+
+```bash
+# BEGIN NATIVE MACOS DESKTOP LIVE PRODUCT GATE
+set -Eeuo pipefail
+test "$(/usr/bin/id -u)" -ne 0
+test "$(/usr/bin/uname -s)" = Darwin
+test "$(/usr/bin/uname -m)" = arm64
+umask 077
+
+ARC_DESKTOP_PROTECTED_MAIN_SHA='<exact 40-character protected-main SHA>'
+ARC_DESKTOP_PROTECTED_CHECKOUT='<absolute clean protected-main checkout>'
+ARC_OPERATOR_LIMA_INSTANCE='<exact reviewed Lima instance name>'
+export ARC_LIVE_PORT=19090
+[[ "$ARC_DESKTOP_PROTECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
+[[ "$ARC_OPERATOR_LIMA_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]
+case "$ARC_DESKTOP_PROTECTED_CHECKOUT" in /*) ;; *) exit 1 ;; esac
+test -d "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  && test ! -L "$ARC_DESKTOP_PROTECTED_CHECKOUT"
+test "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" rev-parse HEAD)" = \
+  "$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" update-index --really-refresh
+test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" ls-files -v \
+  | /usr/bin/awk 'substr($0,1,1) ~ /[a-zS]/ { print; exit }')"
+/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" diff-index --quiet HEAD --
+test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  status --porcelain=v1 --untracked-files=all)"
+# This first ignored-file check intentionally has no exclusions. In
+# particular, an ignored desktop/.env.local is a Vite build input and must
+# never influence a live receipt that claims the protected commit.
+test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  ls-files --others --ignored --exclude-standard -- .)"
+
+ARC_DESKTOP_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"
+test -d "$ARC_DESKTOP_TRANSFER_PARENT" \
+  && test ! -L "$ARC_DESKTOP_TRANSFER_PARENT"
+ARC_DESKTOP_TRANSFER_ROOT="$ARC_DESKTOP_TRANSFER_PARENT/desktop-live-v0.8.0-$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+test ! -e "$ARC_DESKTOP_TRANSFER_ROOT" && test ! -L "$ARC_DESKTOP_TRANSFER_ROOT"
+/bin/mkdir -m 0700 "$ARC_DESKTOP_TRANSFER_ROOT"
+ARC_LIMACTL=/opt/homebrew/Cellar/lima/2.1.1/bin/limactl
+ARC_LIMACTL_SHA256=83cbe5c60bcea3e4a500aeb577b5f104c2db489b0cba4a6e81cf4098bd2ee199
+test -f "$ARC_LIMACTL" && test ! -L "$ARC_LIMACTL" && test -x "$ARC_LIMACTL"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIMACTL" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIMACTL_SHA256"
+test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/uname -s)" = Linux
+
+# Import the fixed, root-owned Lima input receipt and exact public known-hosts
+# bytes without exporting the private maintenance key from the Mac.
+ARC_DESKTOP_INPUT="$ARC_DESKTOP_TRANSFER_ROOT/DESKTOP-LIVE-BROWSER-INPUT.json"
+(
+  set -o noclobber
+  "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+    /usr/bin/sudo --non-interactive /usr/bin/cat \
+    /secure/operator/DESKTOP-LIVE-BROWSER-INPUT.json > "$ARC_DESKTOP_INPUT"
+)
+/bin/chmod 0400 "$ARC_DESKTOP_INPUT"
+/usr/bin/plutil -lint "$ARC_DESKTOP_INPUT" >/dev/null
+arc_desktop_input() {
+  /usr/bin/plutil -extract "$1" raw -o - "$ARC_DESKTOP_INPUT"
+}
+test "$(arc_desktop_input schema)" = arc.desktop-live-input.v1
+test "$(arc_desktop_input sourceCommit)" = "$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+ARC_DESKTOP_RELEASE_BINDING="$ARC_DESKTOP_TRANSFER_ROOT/release-binding.json"
+(
+  set -o noclobber
+  "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+    /usr/bin/sudo --non-interactive /usr/bin/cat \
+    /secure/operator/DESKTOP-LIVE-RELEASE-BINDING.json \
+    > "$ARC_DESKTOP_RELEASE_BINDING"
+)
+/bin/chmod 0400 "$ARC_DESKTOP_RELEASE_BINDING"
+/usr/bin/plutil -lint "$ARC_DESKTOP_RELEASE_BINDING" >/dev/null
+test "$(/usr/bin/plutil -extract schema raw -o - \
+  "$ARC_DESKTOP_RELEASE_BINDING")" = arc.published-release-binding.v1
+test "$(/usr/bin/plutil -extract commit raw -o - \
+  "$ARC_DESKTOP_RELEASE_BINDING")" = "$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+export ARC_LIVE_SOURCE_COMMIT="$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+ARC_LIVE_FRONTEND_COMMIT="$(arc_desktop_input frontendCommit)"
+ARC_LIVE_PAGES_ORIGIN="$(arc_desktop_input pagesOrigin)"
+export ARC_LIVE_CONFIG_SHA256="$(arc_desktop_input frontendConfigSha256)"
+export ARC_LIVE_ROLLOUT_MANIFEST_SHA256="$(arc_desktop_input rolloutManifestSha256)"
+export ARC_LIVE_WORKER="$(arc_desktop_input worker)"
+export ARC_LIVE_REWARD_TX="$(arc_desktop_input rewardTx)"
+export ARC_LIVE_VALIDATOR_NAME="$(arc_desktop_input validatorName)"
+export ARC_LIVE_VALIDATOR_HOST="$(arc_desktop_input validatorHost)"
+export ARC_LIVE_VALIDATOR_RPC_SOCKET="$(arc_desktop_input validatorRpcSocket)"
+export ARC_LIVE_SSH_KNOWN_HOSTS_SHA256="$(arc_desktop_input sshKnownHostsSha256)"
+export ARC_LIVE_SSH_IDENTITY_SHA256="$(arc_desktop_input sshIdentitySha256)"
+[[ "$ARC_LIVE_FRONTEND_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+test "$ARC_LIVE_PAGES_ORIGIN" = https://ferrumvir.github.io/arc-chain
+[[ "$ARC_LIVE_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$ARC_LIVE_ROLLOUT_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$ARC_LIVE_WORKER" =~ ^0x[0-9a-f]{64}$ ]]
+[[ "$ARC_LIVE_REWARD_TX" =~ ^0x[0-9a-f]{64}$ ]]
+test "$ARC_LIVE_VALIDATOR_NAME" = lax
+test "$ARC_LIVE_VALIDATOR_HOST" = 140.82.16.112
+test "$ARC_LIVE_VALIDATOR_RPC_SOCKET" = \
+  "/run/arc-v3-rpc-lax-${ARC_LIVE_ROLLOUT_MANIFEST_SHA256:0:16}/rpc.sock"
+
+export ARC_LIVE_SSH_KNOWN_HOSTS="$ARC_DESKTOP_TRANSFER_ROOT/validator-known-hosts"
+(
+  set -o noclobber
+  "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+    /usr/bin/sudo --non-interactive /usr/bin/cat \
+    /secure/operator/arc-validator-known-hosts > "$ARC_LIVE_SSH_KNOWN_HOSTS"
+)
+/bin/chmod 0400 "$ARC_LIVE_SSH_KNOWN_HOSTS"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_SSH_KNOWN_HOSTS" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIVE_SSH_KNOWN_HOSTS_SHA256"
+test "$ARC_LIVE_SSH_KNOWN_HOSTS_SHA256" = \
+  97c826f7e1a3940f6d18095ccdb0eaeebb5d66ec16fe60b9c5c47690e707485d
+
+ARC_DESKTOP_SSH_IDENTITY="$HOME/.ssh/id_ed25519"
+test -f "$ARC_DESKTOP_SSH_IDENTITY" && test ! -L "$ARC_DESKTOP_SSH_IDENTITY"
+test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_DESKTOP_SSH_IDENTITY")" = \
+  "600:1:$(/usr/bin/id -u)"
+test "$(/usr/bin/shasum -a 256 "$ARC_DESKTOP_SSH_IDENTITY" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIVE_SSH_IDENTITY_SHA256"
+test "$ARC_LIVE_SSH_IDENTITY_SHA256" = \
+  9a7b57700dc7acf0faeca152fc341f237704e81965b5a9656fe8ccee4931444a
+
+export ARC_LIVE_CONFIG="$ARC_DESKTOP_TRANSFER_ROOT/arc-network.json"
+export ARC_LIVE_PLAYWRIGHT_REPORT="$ARC_DESKTOP_TRANSFER_ROOT/playwright-live.json"
+export ARC_LIVE_RECEIPT_OUTPUT="$ARC_DESKTOP_TRANSFER_ROOT/DESKTOP-LIVE-PRODUCT.json"
+(
+  set -o noclobber
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 60 \
+    --max-filesize 1048576 \
+    "$ARC_LIVE_PAGES_ORIGIN/shared/frontend/arc-network.json?commit=$ARC_LIVE_FRONTEND_COMMIT" \
+    > "$ARC_LIVE_CONFIG"
+)
+test -f "$ARC_LIVE_CONFIG" && test ! -L "$ARC_LIVE_CONFIG"
+/bin/chmod 0400 "$ARC_LIVE_CONFIG"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_CONFIG" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIVE_CONFIG_SHA256"
+
+# Stage the reviewed official Node distribution create-only. The package
+# manager and Playwright are always invoked through this extracted Node.
+export ARC_LIVE_NODE_ARCHIVE="$ARC_DESKTOP_TRANSFER_ROOT/node-v24.20.0-darwin-arm64.tar.xz"
+export ARC_LIVE_NODE_ARCHIVE_SHA256=b7bf7707070b950ba1ec5f1af3bb6de0f2b1962c5033973d94068ab021ef3014
+(
+  set -o noclobber
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 300 \
+    --max-filesize 67108864 \
+    https://nodejs.org/dist/v24.20.0/node-v24.20.0-darwin-arm64.tar.xz \
+    > "$ARC_LIVE_NODE_ARCHIVE"
+)
+test -f "$ARC_LIVE_NODE_ARCHIVE" && test ! -L "$ARC_LIVE_NODE_ARCHIVE"
+/bin/chmod 0400 "$ARC_LIVE_NODE_ARCHIVE"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_NODE_ARCHIVE" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIVE_NODE_ARCHIVE_SHA256"
+/usr/bin/tar -tf "$ARC_LIVE_NODE_ARCHIVE" | /usr/bin/awk '
+  BEGIN { seen=0 }
+  $0 !~ /^node-v24[.]20[.]0-darwin-arm64\// { exit 1 }
+  $0 ~ /(^|\/)\.\.($|\/)/ || substr($0,1,1) == "/" { exit 1 }
+  { seen=1 }
+  END { if (!seen) exit 1 }'
+ARC_DESKTOP_NODE_ROOT="$ARC_DESKTOP_TRANSFER_ROOT/node-v24.20.0-darwin-arm64"
+test ! -e "$ARC_DESKTOP_NODE_ROOT" && test ! -L "$ARC_DESKTOP_NODE_ROOT"
+/usr/bin/tar -xf "$ARC_LIVE_NODE_ARCHIVE" -C "$ARC_DESKTOP_TRANSFER_ROOT"
+export ARC_LIVE_NODE_PATH="$ARC_DESKTOP_NODE_ROOT/bin/node"
+export ARC_LIVE_NODE_SHA256=9d050fd455b56426e25d4d603c7c501cbb2630348e836cf221dcce748e90588a
+export ARC_LIVE_NPM_CLI="$ARC_DESKTOP_NODE_ROOT/lib/node_modules/npm/bin/npm-cli.js"
+export ARC_LIVE_NPM_CLI_SHA256=8e5f6f3429f8cdbe693cdc29904e9d5a7b127a494bd15c804bd54c7403bfcbe7
+export ARC_LIVE_NPM_PACKAGE="$ARC_DESKTOP_NODE_ROOT/lib/node_modules/npm/package.json"
+export ARC_LIVE_NPM_PACKAGE_SHA256=09dfcf187178ce1ab3ea6194c80d3ae082ad2a86dc1269ac963f94429e718122
+for exact_file in "$ARC_LIVE_NODE_PATH" "$ARC_LIVE_NPM_CLI" "$ARC_LIVE_NPM_PACKAGE"; do
+  test -f "$exact_file" && test ! -L "$exact_file"
+done
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_NODE_PATH" | /usr/bin/cut -d ' ' -f 1)" = \
+  "$ARC_LIVE_NODE_SHA256"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_NPM_CLI" | /usr/bin/cut -d ' ' -f 1)" = \
+  "$ARC_LIVE_NPM_CLI_SHA256"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_NPM_PACKAGE" | /usr/bin/cut -d ' ' -f 1)" = \
+  "$ARC_LIVE_NPM_PACKAGE_SHA256"
+test "$("$ARC_LIVE_NODE_PATH" --version)" = v24.20.0
+test "$("$ARC_LIVE_NODE_PATH" "$ARC_LIVE_NPM_CLI" --version)" = 11.19.0
+export PATH="$ARC_DESKTOP_NODE_ROOT/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+export ARC_LIVE_SSH_PATH=/usr/bin/ssh
+export ARC_LIVE_SSH_SHA256=75ae4b414b57e0c52ad1cb24a9d7dae2496071fdf153c7fc8e94db3c9c4b0faa
+test "$(/usr/bin/shasum -a 256 "$ARC_LIVE_SSH_PATH" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIVE_SSH_SHA256"
+if /usr/sbin/lsof -nP -iTCP:"$ARC_LIVE_PORT" -sTCP:LISTEN \
+  | /usr/bin/grep -q .; then
+  /usr/bin/printf 'desktop live loopback port is already occupied\n' >&2
+  exit 1
+fi
+
+# Download the exact immutable release assets into one private, create-only
+# directory. Both package controllers independently re-read the release
+# binding and re-hash the bytes before any executable is admitted.
+ARC_DESKTOP_ASSET_DIR="$ARC_DESKTOP_TRANSFER_ROOT/release-assets"
+/bin/mkdir -m 0700 "$ARC_DESKTOP_ASSET_DIR"
+for asset_name in \
+  arc-desktop-linux-x86_64.AppImage \
+  arc-desktop-linux-x86_64.AppImage.sig \
+  arc-node-linux-x86_64 \
+  arc-desktop-macos-arm64.app.tar.gz \
+  arc-desktop-macos-arm64.app.tar.gz.sig \
+  arc-desktop-macos-arm64.dmg
+do
+  asset_metadata="$(/usr/bin/python3 -I - \
+    "$ARC_DESKTOP_RELEASE_BINDING" "$asset_name" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    binding = json.load(stream)
+asset = binding["assets"][sys.argv[2]]
+if set(asset) != {"id", "sha256", "size"}:
+    raise SystemExit("release asset fields differ")
+if type(asset["id"]) is not int or asset["id"] <= 0:
+    raise SystemExit("release asset ID is invalid")
+if type(asset["size"]) is not int or not 0 < asset["size"] <= 2_147_483_648:
+    raise SystemExit("release asset size is invalid")
+if re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]) is None:
+    raise SystemExit("release asset digest is invalid")
+print(f'{asset["id"]}\t{asset["size"]}\t{asset["sha256"]}')
+PY
+  )"
+  IFS=$'\t' read -r asset_id asset_size asset_sha256 <<< "$asset_metadata"
+  test "$asset_id" -gt 0 && test "$asset_size" -gt 0
+  asset_path="$ARC_DESKTOP_ASSET_DIR/$asset_name"
+  (
+    set -o noclobber
+    /usr/bin/curl --fail --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time 1800 \
+      --max-filesize 2147483648 \
+      "https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/$asset_name" \
+      > "$asset_path"
+  )
+  /bin/chmod 0400 "$asset_path"
+  test "$(/usr/bin/stat -f '%z:%Lp:%l:%u' "$asset_path")" = \
+    "$asset_size:400:1:$(/usr/bin/id -u)"
+  test "$(/usr/bin/shasum -a 256 "$asset_path" \
+    | /usr/bin/cut -d ' ' -f 1)" = "$asset_sha256"
+done
+
+for package_helper in \
+  scripts/release/packaged-appimage-live-gate.py \
+  scripts/recovery/build-macos-package-provenance.py
+do
+  test -f "$ARC_DESKTOP_PROTECTED_CHECKOUT/$package_helper" \
+    && test ! -L "$ARC_DESKTOP_PROTECTED_CHECKOUT/$package_helper"
+  test "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+    hash-object "$package_helper")" = \
+    "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+      rev-parse "$ARC_DESKTOP_PROTECTED_MAIN_SHA:$package_helper")"
+done
+
+# First prove the exact published Linux x86_64 AppImage through its normal
+# WebKitGTK UI -> Tauri IPC -> Rust path in a new mount-free, firewalled Lima
+# VM. The helper durably arms one challenge before the UI submit; after that
+# marker exists, any failure is terminal and this output root must be kept.
+ARC_DESKTOP_APPIMAGE_ROOT="$ARC_DESKTOP_TRANSFER_ROOT/packaged-appimage-evidence"
+/usr/bin/python3 -I \
+  "$ARC_DESKTOP_PROTECTED_CHECKOUT/scripts/release/packaged-appimage-live-gate.py" \
+  host-run \
+  --binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --asset-directory "$ARC_DESKTOP_ASSET_DIR" \
+  --known-hosts "$ARC_LIVE_SSH_KNOWN_HOSTS" \
+  --identity "$ARC_DESKTOP_SSH_IDENTITY" \
+  --output "$ARC_DESKTOP_APPIMAGE_ROOT" \
+  --limactl "$ARC_LIMACTL" \
+  --ssh "$ARC_LIVE_SSH_PATH"
+export ARC_LIVE_APPIMAGE_RECEIPT="$ARC_DESKTOP_APPIMAGE_ROOT/receipt.json"
+/usr/bin/python3 -I \
+  "$ARC_DESKTOP_PROTECTED_CHECKOUT/scripts/release/packaged-appimage-live-gate.py" \
+  verify --binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --receipt "$ARC_LIVE_APPIMAGE_RECEIPT"
+
+# Next prove the exact arm64 updater archive and read-only mounted DMG, then
+# execute the mounted shipped binary's isolated native-core acceptance mode.
+# The normal UI/IPC path is covered independently by the AppImage gate above;
+# this macOS receipt truthfully claims an ad-hoc code seal, not Developer ID or
+# notarization. The updater minisign check runs inside another fresh pinned VM.
+ARC_DESKTOP_MACOS_ROOT="$ARC_DESKTOP_TRANSFER_ROOT/macos-package"
+/bin/mkdir -m 0700 "$ARC_DESKTOP_MACOS_ROOT"
+for private_dir in controller-home controller-home/tmp lima-home \
+  lima-host-home lima-host-tmpdir
+do
+  /bin/mkdir -m 0700 "$ARC_DESKTOP_MACOS_ROOT/$private_dir"
+done
+ARC_MACOS_CONTROLLER="$ARC_DESKTOP_PROTECTED_CHECKOUT/scripts/recovery/build-macos-package-provenance.py"
+export ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT="$ARC_DESKTOP_MACOS_ROOT/MACOS-UPDATER-SIGNATURE.json"
+export ARC_LIVE_MACOS_PACKAGE_INSPECTION="$ARC_DESKTOP_MACOS_ROOT/MACOS-PACKAGE-INSPECTION.json"
+export ARC_LIVE_NATIVE_INPUT="$ARC_DESKTOP_MACOS_ROOT/DESKTOP-LIVE-INPUT.json"
+export ARC_LIVE_NATIVE_ATTEMPT="$ARC_DESKTOP_MACOS_ROOT/PACKAGED-NATIVE-DISPATCH-ATTEMPT.json"
+export ARC_LIVE_NATIVE_RECEIPT="$ARC_DESKTOP_MACOS_ROOT/PACKAGED-NATIVE-ACCEPTANCE.json"
+export ARC_LIVE_MACOS_CONTROLLER_ATTEMPT="$ARC_DESKTOP_MACOS_ROOT/MACOS-NATIVE-CONTROLLER-ATTEMPT.json"
+export ARC_LIVE_MACOS_PACKAGE_PROVENANCE="$ARC_DESKTOP_MACOS_ROOT/MACOS-PACKAGE-PROVENANCE.json"
+export ARC_LIVE_MACOS_PACKAGE_PROVENANCE_VERIFICATION="$ARC_DESKTOP_MACOS_ROOT/MACOS-PACKAGE-PROVENANCE-VERIFICATION.json"
+export ARC_LIVE_NATIVE_HOME="$ARC_DESKTOP_MACOS_ROOT/isolated-home"
+export ARC_LIVE_APP_ARCHIVE="$ARC_DESKTOP_ASSET_DIR/arc-desktop-macos-arm64.app.tar.gz"
+export ARC_LIVE_APP_ARCHIVE_SIGNATURE="$ARC_DESKTOP_ASSET_DIR/arc-desktop-macos-arm64.app.tar.gz.sig"
+export ARC_LIVE_DMG="$ARC_DESKTOP_ASSET_DIR/arc-desktop-macos-arm64.dmg"
+
+/usr/bin/python3 -I "$ARC_MACOS_CONTROLLER" lima-verify \
+  --repository-root "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  --release-binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --asset-directory "$ARC_DESKTOP_ASSET_DIR" \
+  --limactl "$ARC_LIMACTL" --limactl-sha256 "$ARC_LIMACTL_SHA256" \
+  --lima-home "$ARC_DESKTOP_MACOS_ROOT/lima-home" \
+  --host-home "$ARC_DESKTOP_MACOS_ROOT/lima-host-home" \
+  --host-tmpdir "$ARC_DESKTOP_MACOS_ROOT/lima-host-tmpdir" \
+  --output "$ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT"
+/usr/bin/python3 -I "$ARC_MACOS_CONTROLLER" inspect \
+  --repository-root "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  --release-binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --asset-directory "$ARC_DESKTOP_ASSET_DIR" \
+  --signature-receipt "$ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT" \
+  --controller-home "$ARC_DESKTOP_MACOS_ROOT/controller-home" \
+  --controller-tmpdir "$ARC_DESKTOP_MACOS_ROOT/controller-home/tmp" \
+  --extraction-root "$ARC_DESKTOP_MACOS_ROOT/macos-app-extraction" \
+  --mount-point "$ARC_DESKTOP_MACOS_ROOT/inspect-dmg-mount" \
+  --output "$ARC_LIVE_MACOS_PACKAGE_INSPECTION"
+
+# Derive the current model and reward-domain values from read-only public LAX
+# endpoints. The mounted binary independently repeats these network checks
+# before it durably arms or sends its one inference POST.
+ARC_MACOS_READINESS="$ARC_DESKTOP_MACOS_ROOT/LAX-INFERENCE-READINESS.json"
+ARC_MACOS_REWARD_POLICY="$ARC_DESKTOP_MACOS_ROOT/LAX-REWARD-POLICY.json"
+for endpoint_target in \
+  "inference/readiness:$ARC_MACOS_READINESS" \
+  "community/reward_policy:$ARC_MACOS_REWARD_POLICY"
+do
+  endpoint="${endpoint_target%%:*}"
+  target="${endpoint_target#*:}"
+  (
+    set -o noclobber
+    /usr/bin/curl --fail --silent --show-error --max-time 30 \
+      --proto '=https' --tlsv1.2 --max-filesize 65536 \
+      "https://140.82.16.112/$endpoint" > "$target"
+  )
+  /bin/chmod 0400 "$target"
+  /usr/bin/plutil -lint "$target" >/dev/null
+done
+test "$(/usr/bin/plutil -extract schema raw -o - \
+  "$ARC_MACOS_READINESS")" = arc.inference.readiness.v1
+test "$(/usr/bin/plutil -extract safe_to_dispatch raw -o - \
+  "$ARC_MACOS_READINESS")" = true
+ARC_MACOS_EXPECTED_MODEL_ID="$(/usr/bin/plutil -extract model_id raw -o - \
+  "$ARC_MACOS_READINESS")"
+test "$(/usr/bin/plutil -extract schema raw -o - \
+  "$ARC_MACOS_REWARD_POLICY")" = arc.community.reward-policy.v1
+test "$(/usr/bin/plutil -extract issuance_ready raw -o - \
+  "$ARC_MACOS_REWARD_POLICY")" = true
+test "$(/usr/bin/plutil -extract validator_approvals_required raw -o - \
+  "$ARC_MACOS_REWARD_POLICY")" = 5
+ARC_MACOS_RECOVERY_EPOCH="$(/usr/bin/plutil -extract recovery_epoch raw -o - \
+  "$ARC_MACOS_REWARD_POLICY")"
+ARC_MACOS_VALIDATOR_SET_ID="$(/usr/bin/plutil -extract validator_set_id raw -o - \
+  "$ARC_MACOS_REWARD_POLICY")"
+ARC_MACOS_VALIDATOR_SET_COMMITMENT="$(/usr/bin/plutil \
+  -extract validator_set_commitment raw -o - "$ARC_MACOS_REWARD_POLICY")"
+ARC_MACOS_TRANSACTION_DOMAIN="$(/usr/bin/plutil -extract transaction_domain raw -o - \
+  "$ARC_MACOS_REWARD_POLICY")"
+[[ "$ARC_MACOS_EXPECTED_MODEL_ID" =~ ^0x[0-9a-f]{64}$ ]]
+[[ "$ARC_MACOS_RECOVERY_EPOCH" =~ ^[1-9][0-9]*$ ]]
+[[ "$ARC_MACOS_VALIDATOR_SET_ID" =~ ^[1-9][0-9]*$ ]]
+[[ "$ARC_MACOS_VALIDATOR_SET_COMMITMENT" =~ ^0x[0-9a-f]{64}$ ]]
+[[ "$ARC_MACOS_TRANSACTION_DOMAIN" =~ ^0x[0-9a-f]{64}$ ]]
+
+/usr/bin/python3 -I "$ARC_MACOS_CONTROLLER" build-input \
+  --repository-root "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  --release-binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --asset-directory "$ARC_DESKTOP_ASSET_DIR" \
+  --signature-receipt "$ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT" \
+  --inspection "$ARC_LIVE_MACOS_PACKAGE_INSPECTION" \
+  --frontend-commit "$ARC_LIVE_FRONTEND_COMMIT" \
+  --frontend-config-sha256 "$ARC_LIVE_CONFIG_SHA256" \
+  --rollout-manifest-sha256 "$ARC_LIVE_ROLLOUT_MANIFEST_SHA256" \
+  --expected-model-id "$ARC_MACOS_EXPECTED_MODEL_ID" \
+  --recovery-epoch "$ARC_MACOS_RECOVERY_EPOCH" \
+  --validator-set-id "$ARC_MACOS_VALIDATOR_SET_ID" \
+  --validator-set-commitment "$ARC_MACOS_VALIDATOR_SET_COMMITMENT" \
+  --transaction-domain "$ARC_MACOS_TRANSACTION_DOMAIN" \
+  --output "$ARC_LIVE_NATIVE_INPUT"
+/usr/bin/python3 -I "$ARC_MACOS_CONTROLLER" run \
+  --repository-root "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  --release-binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --asset-directory "$ARC_DESKTOP_ASSET_DIR" \
+  --signature-receipt "$ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT" \
+  --inspection "$ARC_LIVE_MACOS_PACKAGE_INSPECTION" \
+  --extraction-root "$ARC_DESKTOP_MACOS_ROOT/macos-app-extraction" \
+  --controller-home "$ARC_DESKTOP_MACOS_ROOT/controller-home" \
+  --controller-tmpdir "$ARC_DESKTOP_MACOS_ROOT/controller-home/tmp" \
+  --mount-point "$ARC_DESKTOP_MACOS_ROOT/native-dmg-mount" \
+  --native-home "$ARC_LIVE_NATIVE_HOME" \
+  --native-input "$ARC_LIVE_NATIVE_INPUT" \
+  --native-output "$ARC_LIVE_NATIVE_RECEIPT" \
+  --output "$ARC_LIVE_MACOS_PACKAGE_PROVENANCE"
+/usr/bin/python3 -I "$ARC_MACOS_CONTROLLER" verify \
+  --repository-root "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  --release-binding "$ARC_DESKTOP_RELEASE_BINDING" \
+  --asset-directory "$ARC_DESKTOP_ASSET_DIR" \
+  --signature-receipt "$ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT" \
+  --inspection "$ARC_LIVE_MACOS_PACKAGE_INSPECTION" \
+  --extraction-root "$ARC_DESKTOP_MACOS_ROOT/macos-app-extraction" \
+  --native-home "$ARC_LIVE_NATIVE_HOME" \
+  --native-input "$ARC_LIVE_NATIVE_INPUT" \
+  --native-output "$ARC_LIVE_NATIVE_RECEIPT" \
+  --receipt "$ARC_LIVE_MACOS_PACKAGE_PROVENANCE" \
+  --output "$ARC_LIVE_MACOS_PACKAGE_PROVENANCE_VERIFICATION"
+
+(
+  cd "$ARC_DESKTOP_PROTECTED_CHECKOUT/desktop"
+  test ! -L "$PWD/node_modules"
+  "$ARC_LIVE_NODE_PATH" "$ARC_LIVE_NPM_CLI" ci --ignore-scripts
+  ARC_DESKTOP_PLAYWRIGHT_CLI="$PWD/node_modules/@playwright/test/cli.js"
+  test -f "$ARC_DESKTOP_PLAYWRIGHT_CLI" \
+    && test ! -L "$ARC_DESKTOP_PLAYWRIGHT_CLI"
+  "$ARC_LIVE_NODE_PATH" "$ARC_DESKTOP_PLAYWRIGHT_CLI" install chromium
+)
+
+ARC_DESKTOP_FORWARD_PID=''
+arc_desktop_stop_forward() {
+  if [ -n "${ARC_DESKTOP_FORWARD_PID:-}" ]; then
+    /bin/kill "$ARC_DESKTOP_FORWARD_PID" 2>/dev/null || true
+    wait "$ARC_DESKTOP_FORWARD_PID" 2>/dev/null || true
+    ARC_DESKTOP_FORWARD_PID=
+  fi
+}
+trap arc_desktop_stop_forward EXIT
+trap 'exit 130' HUP INT TERM
+/usr/bin/env -i HOME="$HOME" LANG=C LC_ALL=C PATH=/usr/bin:/bin \
+  "$ARC_LIVE_SSH_PATH" -F /dev/null -N -T \
+  -o BatchMode=yes -o PasswordAuthentication=no \
+  -o KbdInteractiveAuthentication=no -o ChallengeResponseAuthentication=no \
+  -o PubkeyAuthentication=yes -o PreferredAuthentications=publickey \
+  -o IdentitiesOnly=yes -o IdentityAgent=none -o AddKeysToAgent=no \
+  -o ForwardAgent=no -o ForwardX11=no -o GatewayPorts=no \
+  -o ProxyCommand=none -o ProxyJump=none -o CanonicalizeHostname=no \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$ARC_LIVE_SSH_KNOWN_HOSTS" \
+  -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no \
+  -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no \
+  -o ExitOnForwardFailure=yes -o ConnectionAttempts=1 -o ConnectTimeout=15 \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR \
+  -i "$ARC_DESKTOP_SSH_IDENTITY" \
+  -L "127.0.0.1:$ARC_LIVE_PORT:$ARC_LIVE_VALIDATOR_RPC_SOCKET" \
+  "root@$ARC_LIVE_VALIDATOR_HOST" &
+ARC_DESKTOP_FORWARD_PID=$!
+desktop_forward_ready=false
+for _ in {1..30}; do
+  /bin/kill -0 "$ARC_DESKTOP_FORWARD_PID"
+  if /usr/bin/curl --fail --silent --show-error --max-time 2 \
+    "http://127.0.0.1:$ARC_LIVE_PORT/health" >/dev/null; then
+    desktop_forward_ready=true
+    break
+  fi
+  /bin/sleep 1
+done
+test "$desktop_forward_ready" = true
+
+(
+  cd "$ARC_DESKTOP_PROTECTED_CHECKOUT/desktop"
+  ARC_DESKTOP_PLAYWRIGHT_CLI="$PWD/node_modules/@playwright/test/cli.js"
+  "$ARC_LIVE_NODE_PATH" "$ARC_DESKTOP_PLAYWRIGHT_CLI" test \
+    --config playwright.live.config.ts
+  "$ARC_LIVE_NODE_PATH" \
+    "$ARC_DESKTOP_PROTECTED_CHECKOUT/scripts/release/build-desktop-live-product-receipt.mjs"
+)
+arc_desktop_stop_forward
+trap - EXIT HUP INT TERM
+# Lifecycle hooks are disabled above. Still prove that dependency hydration,
+# browser execution, and receipt generation did not alter or add repository
+# inputs before any receipt leaves this machine.
+test "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" rev-parse HEAD)" = \
+  "$ARC_DESKTOP_PROTECTED_MAIN_SHA"
+/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" update-index --really-refresh
+test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" ls-files -v \
+  | /usr/bin/awk 'substr($0,1,1) ~ /[a-zS]/ { print; exit }')"
+/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" diff-index --quiet HEAD --
+test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  status --porcelain=v1 --untracked-files=all)"
+test -z "$(/usr/bin/git -C "$ARC_DESKTOP_PROTECTED_CHECKOUT" \
+  ls-files --others --ignored --exclude-standard -- . \
+    ':(exclude)desktop/node_modules/**' \
+    ':(exclude)desktop/dist/**' \
+    ':(exclude)desktop/test-results/**')"
+test -f "$ARC_LIVE_RECEIPT_OUTPUT" && test ! -L "$ARC_LIVE_RECEIPT_OUTPUT"
+test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_LIVE_RECEIPT_OUTPUT")" = \
+  "400:1:$(/usr/bin/id -u)"
+desktop_live_sha256="$(/usr/bin/shasum -a 256 "$ARC_LIVE_RECEIPT_OUTPUT" \
+  | /usr/bin/cut -d ' ' -f 1)"
+(
+  set -o noclobber
+  /usr/bin/printf '%s  %s\n' "$desktop_live_sha256" \
+    DESKTOP-LIVE-PRODUCT.json \
+    > "$ARC_LIVE_RECEIPT_OUTPUT.sha256"
+)
+/bin/chmod 0400 "$ARC_LIVE_RECEIPT_OUTPUT.sha256"
+
+desktop_live_drop=/var/tmp/arc-desktop-live-import-v0.8.0
+"$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/test '!' -e "$desktop_live_drop"
+"$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/install -d -m 0700 "$desktop_live_drop"
+"$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
+  /usr/bin/install -d -m 0700 "$desktop_live_drop/macos-package"
+"$ARC_LIMACTL" copy --backend=scp \
+  "$ARC_LIVE_RECEIPT_OUTPUT" "$ARC_LIVE_RECEIPT_OUTPUT.sha256" \
+  "$ARC_OPERATOR_LIMA_INSTANCE:$desktop_live_drop/"
+"$ARC_LIMACTL" copy --backend=scp --recursive \
+  "$ARC_DESKTOP_APPIMAGE_ROOT" \
+  "$ARC_OPERATOR_LIMA_INSTANCE:$desktop_live_drop/"
+"$ARC_LIMACTL" copy --backend=scp \
+  "$ARC_LIVE_MACOS_CONTROLLER_ATTEMPT" \
+  "$ARC_LIVE_MACOS_PACKAGE_INSPECTION" \
+  "$ARC_LIVE_MACOS_PACKAGE_PROVENANCE" \
+  "$ARC_LIVE_MACOS_PACKAGE_PROVENANCE_VERIFICATION" \
+  "$ARC_LIVE_MACOS_UPDATER_SIGNATURE_RECEIPT" \
+  "$ARC_LIVE_NATIVE_ATTEMPT" "$ARC_LIVE_NATIVE_INPUT" \
+  "$ARC_LIVE_NATIVE_RECEIPT" \
+  "$ARC_OPERATOR_LIMA_INSTANCE:$desktop_live_drop/macos-package/"
+test "$(/usr/bin/shasum -a 256 "$ARC_LIMACTL" \
+  | /usr/bin/cut -d ' ' -f 1)" = "$ARC_LIMACTL_SHA256"
+/usr/bin/printf 'Desktop live receipt copied; return to the open Lima root shell.\n'
+# END NATIVE MACOS DESKTOP LIVE PRODUCT GATE
+```
+
+Back in the already-open Lima root shell, import the stable receipt create-only
+under the active post-release attempt. `write_once_or_compare` permits only an
+identical resume and never replaces different evidence:
+
+```bash
+# BEGIN LIMA DESKTOP LIVE RECEIPT IMPORT
+set -Eeuo pipefail
+test "$(/usr/bin/id -u)" = 0
+: "${post_release_attempt_root:?post-release attempt state was lost}"
+: "${protected_main_sha:?protected-main identity was lost}"
+desktop_live_drop=/var/tmp/arc-desktop-live-import-v0.8.0
+test -d "$desktop_live_drop" && test ! -L "$desktop_live_drop"
+test -f "$desktop_live_drop/DESKTOP-LIVE-PRODUCT.json"
+test ! -L "$desktop_live_drop/DESKTOP-LIVE-PRODUCT.json"
+(cd "$desktop_live_drop" && /usr/bin/sha256sum --check --strict \
+  DESKTOP-LIVE-PRODUCT.json.sha256)
+desktop_live_receipt="$post_release_attempt_root/DESKTOP-LIVE-PRODUCT.json"
+/usr/bin/cat "$desktop_live_drop/DESKTOP-LIVE-PRODUCT.json" \
+  | write_once_or_compare "$desktop_live_receipt"
+test "$(/usr/bin/stat --format='%a:%h' "$desktop_live_receipt")" = 400:1
+test ! -L "$desktop_live_receipt"
+
+# Seal the complete AppImage evidence tree under the active attempt. Only
+# regular files/directories are admitted; partial copies are terminal and are
+# never silently replaced on resume.
+packaged_appimage_drop="$desktop_live_drop/packaged-appimage-evidence"
+test -d "$packaged_appimage_drop" && test ! -L "$packaged_appimage_drop"
+test -f "$packaged_appimage_drop/receipt.json" \
+  && test ! -L "$packaged_appimage_drop/receipt.json"
+test -z "$(/usr/bin/find "$packaged_appimage_drop" -mindepth 1 \
+  ! -type d ! -type f -print -quit)"
+test "$(/usr/bin/find "$packaged_appimage_drop" -mindepth 1 | /usr/bin/wc -l)" \
+  -le 512
+packaged_appimage_evidence="$post_release_attempt_root/packaged-appimage-evidence"
+test ! -e "$packaged_appimage_evidence" \
+  && test ! -L "$packaged_appimage_evidence"
+/usr/bin/cp --archive --no-preserve=ownership -- \
+  "$packaged_appimage_drop" "$packaged_appimage_evidence"
+/usr/bin/chown -R root:root "$packaged_appimage_evidence"
+/usr/bin/find "$packaged_appimage_evidence" -type d -exec /usr/bin/chmod 0700 {} +
+/usr/bin/find "$packaged_appimage_evidence" -type f -exec /usr/bin/chmod 0400 {} +
+test -z "$(/usr/bin/find "$packaged_appimage_evidence" -mindepth 1 \
+  ! -type d ! -type f -print -quit)"
+packaged_appimage_receipt="$packaged_appimage_evidence/receipt.json"
+"$ARC_RECOVERY_PYTHON_PATH" -I \
+  scripts/release/packaged-appimage-live-gate.py verify \
+  --binding "$published_acceptance_root/release-binding.json" \
+  --receipt "$packaged_appimage_receipt"
+
+# Seal exactly the eight portable macOS package/native receipts. The isolated
+# HOME and extracted app stay on the Mac; the controller's canonical
+# verification receipt binds those same-Mac read-only checks.
+macos_package_drop="$desktop_live_drop/macos-package"
+test -d "$macos_package_drop" && test ! -L "$macos_package_drop"
+macos_package_evidence="$post_release_attempt_root/macos-package-evidence"
+test ! -e "$macos_package_evidence" && test ! -L "$macos_package_evidence"
+/usr/bin/mkdir -m 0700 "$macos_package_evidence"
+for macos_evidence_name in \
+  MACOS-NATIVE-CONTROLLER-ATTEMPT.json \
+  MACOS-PACKAGE-INSPECTION.json \
+  PACKAGED-NATIVE-DISPATCH-ATTEMPT.json \
+  DESKTOP-LIVE-INPUT.json \
+  PACKAGED-NATIVE-ACCEPTANCE.json \
+  MACOS-PACKAGE-PROVENANCE.json \
+  MACOS-UPDATER-SIGNATURE.json \
+  MACOS-PACKAGE-PROVENANCE-VERIFICATION.json
+do
+  test -f "$macos_package_drop/$macos_evidence_name" \
+    && test ! -L "$macos_package_drop/$macos_evidence_name"
+  /usr/bin/cat "$macos_package_drop/$macos_evidence_name" \
+    | write_once_or_compare "$macos_package_evidence/$macos_evidence_name"
+done
+test "$(/usr/bin/find "$macos_package_evidence" -mindepth 1 -maxdepth 1 \
+  -type f -printf '%f\n' | /usr/bin/sort)" = \
+  "$(/usr/bin/printf '%s\n' DESKTOP-LIVE-INPUT.json \
+    MACOS-NATIVE-CONTROLLER-ATTEMPT.json MACOS-PACKAGE-INSPECTION.json \
+    MACOS-PACKAGE-PROVENANCE-VERIFICATION.json \
+    MACOS-PACKAGE-PROVENANCE.json MACOS-UPDATER-SIGNATURE.json \
+    PACKAGED-NATIVE-ACCEPTANCE.json \
+    PACKAGED-NATIVE-DISPATCH-ATTEMPT.json | /usr/bin/sort)"
+test -z "$(/usr/bin/find "$macos_package_evidence" -mindepth 1 \
+  \( ! -type f -o ! -perm 0400 -o ! -links 1 \) -print -quit)"
+"$ARC_RECOVERY_PYTHON_PATH" -I - \
+  "$packaged_appimage_evidence" "$macos_package_evidence" <<'PY'
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+for raw_root in sys.argv[1:]:
+    root = os.path.abspath(raw_root)
+    for directory, names, files in os.walk(root, topdown=False, followlinks=False):
+        for name in files:
+            path = os.path.join(directory, name)
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                raise SystemExit(f"non-regular imported evidence: {path}")
+            descriptor = os.open(path, flags)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        descriptor = os.open(directory, directory_flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    parent = os.open(os.path.dirname(root), directory_flags)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+PY
+# END LIMA DESKTOP LIVE RECEIPT IMPORT
 ```
 
 ### Publish the sealed public truth through a second reviewed PR
@@ -4751,16 +6167,25 @@ live claims; the release-source README remains an immutable pre-release
 snapshot. In one create-only invocation it authenticates the preserved Pages
 workflow/run/jobs/deployment/CDN facts and the exact published-acceptance
 workflow/run/jobs/artifact, rebuilds that artifact with the exact sibling
-helper, and performs one final live all-six verification with the exact sibling
-recovery verifier. It creates exactly three root-only local files: the
+helper, performs one final live all-six verification with the exact sibling
+recovery verifier, and proves the sealed canary receipts through the exact
+dashboard/explorer readers plus the imported exact desktop live-suite receipt.
+It creates exactly three root-only local files: the
 canonical `arc.post-release-acceptance.v2` receipt, the replacement README, and
 `arc.public-production-status.v1`, whose receipt hash binds that exact v2
 receipt and whose `acceptance.receipt` embeds the complete canonical receipt for
 public verification. Retain the standalone receipt as the root-only audit copy;
 publish only the README and status paths through a second, single-parent PR.
-This PR requires an exact-head
-`arisarcmarket` approval and every required check; unlike the earlier recovered
-config PR, there is no owner ruleset-exception path for public claims.
+This PR must pass the exact 33 protected checks. Prefer an exact-head
+`arisarcmarket` approval. If that reviewer is unavailable, the repository owner
+may use the explicitly authorized owner-emergency path below. It truthfully
+records `independent_review: false`, changes only approval count one to zero and
+last-push approval true to false for this exact head, and retains the PR
+requirement, all 33 strict checks, resolved-thread requirement, linear history,
+allowed merge methods, no-bypass policy, and every tag rule. The full ruleset
+collection is sealed before mutation and restored before the merge response is
+interpreted. This is a documented owner authorization, never a forged
+`arisarcmarket` review.
 
 The accepted config commit is named inside the generated bytes. The subsequent
 squash-merge SHA cannot safely name itself, so the second Pages deployment is
@@ -4768,6 +6193,49 @@ bound separately by its exact run/attempt, deployment, `deployed-commit.txt`,
 and CDN byte hashes below.
 
 ```bash
+# The protected Lima image deliberately has no ambient Node.js. Stage the
+# reviewed Node 24 runtime create-only from the official versioned archive,
+# then bind its extracted executable bytes into the acceptance receipt.
+export ARC_RECOVERY_NODE_PATH=/secure/operator/tools/node-v24.20.0
+export ARC_RECOVERY_NODE_SHA256=89af8424dd53e560b1933f87ba650d8bf57c83ca5a04600eefb31f416aabbae7
+node_archive_sha256=2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2
+node_stage=/secure/operator/node-v24.20.0-linux-x64-stage
+node_archive="$node_stage/node-v24.20.0-linux-x64.tar.xz"
+if [ ! -e "$ARC_RECOVERY_NODE_PATH" ]; then
+  if [ -e "$node_stage" ]; then
+    printf 'partial Node.js runtime stage exists; preserve and stop: %s\n' \
+      "$node_stage" >&2
+    exit 1
+  fi
+  /usr/bin/install -d -m 0700 -o root -g root "$node_stage"
+  /usr/bin/curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --max-time 300 --max-filesize 67108864 \
+    https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-x64.tar.xz \
+    -o "$node_archive"
+  /usr/bin/chown root:root "$node_archive"
+  /usr/bin/chmod 0400 "$node_archive"
+  printf '%s  %s\n' "$node_archive_sha256" "$node_archive" \
+    | /usr/bin/sha256sum --check --strict
+  /usr/bin/tar --extract --xz --file "$node_archive" \
+    --directory "$node_stage" --strip-components=2 \
+    node-v24.20.0-linux-x64/bin/node
+  test -f "$node_stage/node" && test ! -L "$node_stage/node"
+  /usr/bin/chown root:root "$node_stage/node"
+  /usr/bin/chmod 0500 "$node_stage/node"
+  printf '%s  %s\n' "$ARC_RECOVERY_NODE_SHA256" "$node_stage/node" \
+    | /usr/bin/sha256sum --check --strict
+  # A same-filesystem hard link makes publication atomic and refuses an
+  # existing destination instead of replacing reviewed tool bytes.
+  /usr/bin/ln -- "$node_stage/node" "$ARC_RECOVERY_NODE_PATH"
+fi
+test -f "$ARC_RECOVERY_NODE_PATH" && test ! -L "$ARC_RECOVERY_NODE_PATH"
+test "$(/usr/bin/stat --format='%U:%G:%a' "$ARC_RECOVERY_NODE_PATH")" = \
+  root:root:500
+printf '%s  %s\n' "$ARC_RECOVERY_NODE_SHA256" "$ARC_RECOVERY_NODE_PATH" \
+  | /usr/bin/sha256sum --check --strict
+test "$("$ARC_RECOVERY_NODE_PATH" --version)" = v24.20.0
+
 public_truth_gh_token="$(
   "$ARC_RECOVERY_GH_PATH" auth token --hostname github.com \
     --user "$ARC_RECOVERY_GITHUB_LOGIN"
@@ -4784,6 +6252,30 @@ test -f "$public_truth_helper" && test ! -L "$public_truth_helper"
 test "$(arc_git hash-object "$public_truth_helper")" = \
   "$(arc_git rev-parse \
     "$protected_main_sha:scripts/release/build-postrelease-public-truth.py")"
+product_surface_verifier="$PWD/scripts/release/verify-postcutover-product-surfaces.mjs"
+test -f "$product_surface_verifier" && test ! -L "$product_surface_verifier"
+test "$(arc_git hash-object "$product_surface_verifier")" = \
+  "$(arc_git rev-parse \
+    "$protected_main_sha:scripts/release/verify-postcutover-product-surfaces.mjs")"
+for product_reader in \
+  dashboard/app.js explorer/app.js shared/frontend/arc-network.js
+do
+  test -f "$product_reader" && test ! -L "$product_reader"
+  test "$(arc_git hash-object "$product_reader")" = \
+    "$(arc_git rev-parse "$protected_main_sha:$product_reader")"
+done
+for desktop_live_reader in \
+  scripts/release/build-desktop-live-product-receipt.mjs \
+  scripts/release/packaged-appimage-live-gate.py \
+  scripts/recovery/build-macos-package-provenance.py \
+  desktop/package-lock.json desktop/playwright.config.ts \
+  desktop/playwright.live.config.ts desktop/tests/helpers.ts \
+  desktop/tests/live.spec.ts desktop/src/screens/Inference.tsx
+do
+  test -f "$desktop_live_reader" && test ! -L "$desktop_live_reader"
+  test "$(arc_git hash-object "$desktop_live_reader")" = \
+    "$(arc_git rev-parse "$protected_main_sha:$desktop_live_reader")"
+done
 
 public_truth_base_readme="$post_release_attempt_root/README.before-public-truth.md"
 public_truth_release_api="$post_release_attempt_root/public-truth-release-api.json"
@@ -4812,6 +6304,11 @@ test ! -e "$public_truth_output" && test ! -L "$public_truth_output"
   --published-artifact-zip "$published_acceptance_zip" \
   --reward-evidence "$reward_evidence" \
   --rollout-manifest "$final_manifest" \
+  --desktop-live-receipt "$desktop_live_receipt" \
+  --packaged-appimage-receipt "$packaged_appimage_receipt" \
+  --macos-package-evidence-dir "$macos_package_evidence" \
+  --node "$ARC_RECOVERY_NODE_PATH" \
+  --node-sha256 "$ARC_RECOVERY_NODE_SHA256" \
   --output-dir "$public_truth_output"
 public_truth_readme="$public_truth_output/README.md"
 public_truth_status="$public_truth_output/production-status.json"
@@ -4848,9 +6345,23 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
   --arg published_artifact_digest "$published_acceptance_artifact_digest" \
   --arg published_receipt_sha "$published_acceptance_receipt_sha" \
   --arg manifest_sha "$(arc_sha256 "$final_manifest")" \
-  --arg reward_sha "$(arc_sha256 "$reward_evidence")" '
-  (keys | sort) == (["pages","publishedAcceptance","recovery","release",
-                     "repository","schema"] | sort)
+  --arg reward_sha "$(arc_sha256 "$reward_evidence")" \
+  --arg config_sha "$(arc_sha256 "$deployed_config")" \
+  --arg node_sha "$ARC_RECOVERY_NODE_SHA256" \
+  --arg product_verifier_sha "$(arc_sha256 "$product_surface_verifier")" \
+  --arg dashboard_reader_sha "$(arc_sha256 dashboard/app.js)" \
+  --arg explorer_reader_sha "$(arc_sha256 explorer/app.js)" \
+  --arg network_reader_sha "$(arc_sha256 shared/frontend/arc-network.js)" \
+  --slurpfile desktop_live "$desktop_live_receipt" \
+  --arg desktop_live_sha "$(arc_sha256 "$desktop_live_receipt")" \
+  --slurpfile packaged_appimage "$packaged_appimage_receipt" \
+  --arg packaged_appimage_sha "$(arc_sha256 "$packaged_appimage_receipt")" \
+  --arg macos_verification_sha \
+    "$(arc_sha256 "$macos_package_evidence/MACOS-PACKAGE-PROVENANCE-VERIFICATION.json")" \
+  --arg desktop_generator_sha \
+    "$(arc_sha256 scripts/release/build-desktop-live-product-receipt.mjs)" '
+  (keys | sort) == (["pages","productSurfaces","publishedAcceptance",
+                     "recovery","release","repository","schema"] | sort)
   and .schema == "arc.post-release-acceptance.v2"
   and .repository == "FerrumVir/arc-chain"
   and .release.id == $release_id and .release.tag == "v0.8.0"
@@ -4872,7 +6383,52 @@ public_truth_status_sha="$(arc_sha256 "$public_truth_status")"
     "scripts/release/published-artifact-acceptance.py"
   and .recovery.manifestSha256 == $manifest_sha
   and .recovery.rewardEvidenceSha256 == $reward_sha
-  and .recovery.verifierPath == "scripts/recovery/recovery_rollout.py"' \
+  and .recovery.verifierPath == "scripts/recovery/recovery_rollout.py"
+  and .productSurfaces.configSha256 == $config_sha
+  and .productSurfaces.rewardEvidenceSha256 == $reward_sha
+  and .productSurfaces.nodeSha256 == $node_sha
+  and .productSurfaces.nodeVersion == "v24.20.0"
+  and .productSurfaces.verifierPath ==
+    "scripts/release/verify-postcutover-product-surfaces.mjs"
+  and .productSurfaces.verifierSha256 == $product_verifier_sha
+  and .productSurfaces.readerSha256 == {
+    "dashboard/app.js": $dashboard_reader_sha,
+    "explorer/app.js": $explorer_reader_sha,
+    "shared/frontend/arc-network.js": $network_reader_sha
+  }
+  and (.productSurfaces.stdoutSha256 | test("^[0-9a-f]{64}$"))
+  and .productSurfaces.desktopLive.receipt == $desktop_live[0]
+  and .productSurfaces.desktopLive.receiptSha256 == $desktop_live_sha
+  and .productSurfaces.desktopLive.receipt.schema ==
+    "arc.desktop-live-product-gate.v2"
+  and .productSurfaces.desktopLive.receipt.packagedAppImage.receipt ==
+    $packaged_appimage[0]
+  and .productSurfaces.desktopLive.receipt.packagedAppImage.receiptSha256 ==
+    $packaged_appimage_sha
+  and .productSurfaces.desktopLive.receipt.packagedAppImage.scope ==
+    "linux-x86_64-packaged-ui-tauri-ipc"
+  and .productSurfaces.desktopLive.receipt.packagedNative.scope ==
+    "macos-arm64-packaged-native-core"
+  and .productSurfaces.desktopLive.receipt.packagedNative.receipt.runtime ==
+    {appDataRelativePath:"Library/Application Support/network.arc.desktop",
+     appVersion:"0.8.0",architecture:"aarch64",
+     buildSourceCommit:$source,
+     environmentNames:["HOME","LANG","LC_ALL","PATH","TMPDIR"],
+     environmentSha256:.productSurfaces.desktopLive.receipt.packagedNative.receipt.runtime.environmentSha256,
+     ipcHandlersRegistered:false,isolatedHomeBasename:"isolated-home",
+     operatingSystem:"macos",pluginsLoaded:false,
+     tauriBuilderStarted:false,webviewsCreated:0}
+  and .productSurfaces.desktopLive.macosPackageVerification.verificationReceiptSha256 ==
+    $macos_verification_sha
+  and .productSurfaces.desktopLive.macosPackageVerification.truthScope ==
+    {appleDeveloperIdSigned:false,exactMountedDmgExecutableRan:true,
+     gatekeeperAssessed:false,nativeCoreOnly:true,
+     notarizationAssessed:false,shippedDebugOrWebdriverSurfaceAdded:false,
+     uiToIpcCoveredByThisReceipt:false,
+     updaterArchiveMinisignVerified:true}
+  and .productSurfaces.desktopLive.generatorPath ==
+    "scripts/release/build-desktop-live-product-receipt.mjs"
+  and .productSurfaces.desktopLive.generatorSha256 == $desktop_generator_sha' \
   "$acceptance_receipt" >/dev/null
 /usr/bin/jq -cS . "$acceptance_receipt" \
   | /usr/bin/cmp -s - "$acceptance_receipt"
@@ -4950,7 +6506,7 @@ arc_git -C "$operator_checkout" show \
   | /usr/bin/cmp -s - "$frontend_config"
 
 public_truth_remote_refs="$(arc_scoped_gh "$public_truth_gh_token" api \
-  'repos/FerrumVir/arc-chain/git/matching-refs/heads/arc-recovery/public-truth/v0.8.0' \
+  "repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch" \
   --jq .)"
 public_truth_remote_state="$(printf '%s' "$public_truth_remote_refs" \
   | /usr/bin/jq -er --arg sha "$public_truth_commit_sha" \
@@ -4988,7 +6544,7 @@ case "$public_truth_remote_state" in
   *) printf 'public-truth branch has another identity; preserve and stop\n' >&2; exit 1 ;;
 esac
 public_truth_remote_after="$(arc_scoped_gh "$public_truth_gh_token" api \
-  'repos/FerrumVir/arc-chain/git/matching-refs/heads/arc-recovery/public-truth/v0.8.0' \
+  "repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch" \
   --jq .)"
 printf '%s' "$public_truth_remote_after" | /usr/bin/jq -e \
   --arg sha "$public_truth_commit_sha" --arg ref "refs/heads/$public_truth_branch" '
@@ -5031,55 +6587,399 @@ public_truth_prs="$(arc_scoped_gh "$public_truth_gh_token" api --method GET \
 test "$(printf '%s' "$public_truth_prs" | /usr/bin/jq -er length)" -eq 1
 public_truth_pr_number="$(printf '%s' "$public_truth_prs" | /usr/bin/jq -er '.[0].number')"
 [[ "$public_truth_pr_number" =~ ^[1-9][0-9]*$ ]]
-public_truth_pr_state="$(printf '%s' "$public_truth_prs" | /usr/bin/jq -er '.[0].state')"
-arc_scoped_gh "$public_truth_gh_token" pr checks "$public_truth_pr_number" \
-  --repo FerrumVir/arc-chain --required --watch --interval 10
+public_truth_rulesets_baseline_receipt="$release_control_root/PUBLIC-TRUTH-RULESETS-BASELINE.json"
+if [ ! -e "$public_truth_rulesets_baseline_receipt" ]; then
+  printf '%s' "$rulesets_before_frontend" \
+    | write_once_or_compare "$public_truth_rulesets_baseline_receipt"
+fi
+test -f "$public_truth_rulesets_baseline_receipt" \
+  && test ! -L "$public_truth_rulesets_baseline_receipt"
+test "$(/usr/bin/stat --format='%a:%h' \
+  "$public_truth_rulesets_baseline_receipt")" = 400:1
+public_truth_rulesets_baseline="$(/usr/bin/jq -cS . \
+  "$public_truth_rulesets_baseline_receipt")"
+test "$public_truth_rulesets_baseline" = "$rulesets_before_frontend"
+public_truth_rulesets_baseline_sha="$(arc_sha256 \
+  "$public_truth_rulesets_baseline_receipt")"
+[[ "$public_truth_rulesets_baseline_sha" =~ ^[0-9a-f]{64}$ ]]
+test "$(printf '%s' "$public_truth_rulesets_baseline" | /usr/bin/jq -cS \
+  --argjson id "$frontend_main_ruleset_id" '.[] | select(.id == $id)')" = \
+  "$frontend_ruleset_baseline"
+printf '%s' "$frontend_ruleset_baseline" | /usr/bin/jq -e '
+  .id == 21689753 and .target == "branch" and .enforcement == "active"
+  and .bypass_actors == []
+  and .conditions == {"ref_name":{"exclude":[],"include":["refs/heads/main"]}}
+  and ([.rules[] | select(.type == "deletion")] | length) == 1
+  and ([.rules[] | select(.type == "non_fast_forward")] | length) == 1
+  and ([.rules[] | select(.type == "required_linear_history")] | length) == 1
+  and ([.rules[] | select(.type == "pull_request"
+    and .parameters.required_approving_review_count == 1
+    and .parameters.require_last_push_approval == true
+    and .parameters.dismiss_stale_reviews_on_push == true
+    and .parameters.require_extra_approval_for_unattributed_changes == true
+    and .parameters.required_review_thread_resolution == true
+    and (.parameters.allowed_merge_methods | sort) == ["rebase","squash"])]
+    | length) == 1
+  and ([.rules[] | select(.type == "required_status_checks"
+    and .parameters.strict_required_status_checks_policy == true
+    and (.parameters.required_status_checks | length) == 33
+    and all(.parameters.required_status_checks[]; .integration_id == 15368))]
+    | length) == 1' >/dev/null
+public_truth_expected_checks="$(printf '%s' "$frontend_ruleset_baseline" \
+  | /usr/bin/jq -cS '[.rules[] | select(.type == "required_status_checks")
+      | .parameters.required_status_checks[].context] | sort')"
+test "$(printf '%s' "$public_truth_expected_checks" | /usr/bin/jq -er length)" = 33
+test "$(printf '%s' "$public_truth_expected_checks" | /usr/bin/jq -cS unique)" = \
+  "$public_truth_expected_checks"
+public_truth_ruleset_exception="$(printf '%s' "$frontend_ruleset_baseline" \
+  | /usr/bin/jq -cS '
+      .rules |= map(if .type == "pull_request" then
+        .parameters.required_approving_review_count = 0
+        | .parameters.require_last_push_approval = false
+      else . end)')"
+printf '%s' "$public_truth_ruleset_exception" | /usr/bin/jq -e \
+  --argjson baseline "$frontend_ruleset_baseline" '
+  ((.rules |= map(if .type == "pull_request" then
+      .parameters.required_approving_review_count = 1
+      | .parameters.require_last_push_approval = true
+    else . end)) == $baseline)' >/dev/null
+public_truth_rulesets_exception="$(printf '%s' "$public_truth_rulesets_baseline" \
+  | /usr/bin/jq -cS --argjson id "$frontend_main_ruleset_id" \
+      --argjson replacement "$public_truth_ruleset_exception" '
+      map(if .id == $id then $replacement else . end) | sort_by(.id)')"
+
+public_truth_pr_snapshot() {
+  arc_scoped_gh "$public_truth_gh_token" pr view "$public_truth_pr_number" \
+    --repo FerrumVir/arc-chain \
+    --json number,state,isDraft,headRefOid,baseRefOid,mergeable,reviewDecision,statusCheckRollup \
+    | /usr/bin/jq -cS \
+        '.statusCheckRollup |= sort_by((.name // .context), (.workflowName // ""))'
+}
+verify_public_truth_open_pr_and_checks() {
+  printf '%s' "$1" | /usr/bin/jq -e \
+    --arg head "$public_truth_commit_sha" --arg base "$frontend_main_sha" \
+    --argjson pr "$public_truth_pr_number" \
+    --argjson expected "$public_truth_expected_checks" '
+    .number == $pr and .state == "OPEN" and .isDraft == false
+    and .headRefOid == $head and .baseRefOid == $base
+    and .mergeable == "MERGEABLE" and .reviewDecision != "CHANGES_REQUESTED"
+    and (.statusCheckRollup | length) == 33
+    and ([.statusCheckRollup[].name] | sort) == $expected
+    and ([.statusCheckRollup[].name] | unique | length) == 33
+    and all(.statusCheckRollup[];
+      .__typename == "CheckRun" and .status == "COMPLETED"
+      and .conclusion == "SUCCESS")' >/dev/null
+}
+public_truth_pr_files_snapshot() {
+  arc_scoped_gh "$public_truth_gh_token" api --paginate \
+    "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/files?per_page=100" \
+    --jq '.[]' | /usr/bin/jq -csS \
+      '[.[] | {filename,status,sha,additions,deletions,changes}] | sort_by(.filename)'
+}
+public_truth_ruleset_exception_active=false
+restore_public_truth_main_ruleset_once() {
+  local current
+  current="$(frontend_main_ruleset_policy "$public_truth_gh_token")" || return 1
+  case "$current" in
+    "$frontend_ruleset_baseline") ;;
+    "$public_truth_ruleset_exception")
+      frontend_main_ruleset_put "$public_truth_gh_token" \
+        "$frontend_ruleset_baseline" || return 1
+      test "$(frontend_main_ruleset_policy "$public_truth_gh_token")" = \
+        "$frontend_ruleset_baseline" || return 1
+      ;;
+    *)
+      printf 'main ruleset changed concurrently; refusing to overwrite a third state\n' >&2
+      return 2
+      ;;
+  esac
+  public_truth_ruleset_exception_active=false
+}
+restore_public_truth_main_ruleset() {
+  local restore_try restore_status
+  for restore_try in 1 2 3; do
+    if restore_public_truth_main_ruleset_once; then
+      return 0
+    else
+      restore_status=$?
+    fi
+    [ "$restore_status" -ne 2 ] || return 1
+    /usr/bin/sleep 1
+  done
+  # If every read failed during the known exception window, prefer attempting
+  # the sealed secure baseline over knowingly leaving the review exception live.
+  frontend_main_ruleset_put "$public_truth_gh_token" \
+    "$frontend_ruleset_baseline" || return 1
+  test "$(frontend_main_ruleset_policy "$public_truth_gh_token")" = \
+    "$frontend_ruleset_baseline" || return 1
+  public_truth_ruleset_exception_active=false
+}
+public_truth_restore_on_exit() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$public_truth_ruleset_exception_active" = true ]; then
+    restore_public_truth_main_ruleset || status=1
+  fi
+  exit "$status"
+}
+trap public_truth_restore_on_exit EXIT
+trap 'exit 130' HUP INT TERM
+public_truth_ruleset_current="$(frontend_main_ruleset_policy "$public_truth_gh_token")"
+case "$public_truth_ruleset_current" in
+  "$frontend_ruleset_baseline") ;;
+  "$public_truth_ruleset_exception")
+    printf 'restoring an exact interrupted public-truth exception before retry\n' >&2
+    public_truth_ruleset_exception_active=true
+    restore_public_truth_main_ruleset
+    ;;
+  *)
+    printf 'main ruleset is neither the sealed baseline nor exact exception; preserve and stop\n' >&2
+    exit 1
+    ;;
+esac
+test "$(repository_ruleset_snapshot "$public_truth_gh_token")" = \
+  "$public_truth_rulesets_baseline"
+
+public_truth_pr_api_before="$(arc_scoped_gh "$public_truth_gh_token" api \
+  "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number")"
+printf '%s' "$public_truth_pr_api_before" | /usr/bin/jq -e \
+  --arg head "$public_truth_commit_sha" --arg base "$frontend_main_sha" \
+  --argjson pr "$public_truth_pr_number" '
+  .number == $pr and .draft == false and (.state == "open" or .state == "closed")
+  and .head.sha == $head and .base.ref == "main" and .base.sha == $base
+  and .commits == 1 and .changed_files == 2' >/dev/null
+public_truth_pr_state="$(printf '%s' "$public_truth_pr_api_before" \
+  | /usr/bin/jq -er .state)"
+public_truth_review_authorization="$release_control_root/PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json"
+public_truth_checks_before_receipt="$release_control_root/PUBLIC-TRUTH-CHECKS-BEFORE.json"
+public_truth_checks_immediate_receipt="$release_control_root/PUBLIC-TRUTH-CHECKS-IMMEDIATELY-BEFORE-MERGE.json"
+public_truth_files_before_receipt="$release_control_root/PUBLIC-TRUTH-FILES-BEFORE.json"
+public_truth_files_immediate_receipt="$release_control_root/PUBLIC-TRUTH-FILES-IMMEDIATELY-BEFORE-MERGE.json"
+public_truth_merge_transport_status=0
 case "$public_truth_pr_state" in
   open)
-    public_truth_pr_view="$(arc_scoped_gh "$public_truth_gh_token" pr view \
-      "$public_truth_pr_number" \
-      --repo FerrumVir/arc-chain --json state,headRefOid,baseRefOid,reviewDecision)"
-    printf '%s' "$public_truth_pr_view" | /usr/bin/jq -e \
-      --arg head "$public_truth_commit_sha" --arg base "$frontend_main_sha" '
-      .state == "OPEN" and .headRefOid == $head and .baseRefOid == $base
-      and .reviewDecision == "APPROVED"' >/dev/null
-    public_truth_approval_count="$(arc_scoped_gh "$public_truth_gh_token" api --paginate \
+    arc_scoped_gh "$public_truth_gh_token" pr checks "$public_truth_pr_number" \
+      --repo FerrumVir/arc-chain --required --watch --interval 10
+    public_truth_checks_ready=false
+    for _ in {1..30}; do
+      public_truth_pr_before="$(public_truth_pr_snapshot)"
+      if verify_public_truth_open_pr_and_checks "$public_truth_pr_before"; then
+        public_truth_checks_ready=true
+        break
+      fi
+      /usr/bin/sleep 2
+    done
+    test "$public_truth_checks_ready" = true
+    public_truth_checks_before="$(printf '%s' "$public_truth_pr_before" \
+      | /usr/bin/jq -cS .statusCheckRollup)"
+    public_truth_files_before="$(public_truth_pr_files_snapshot)"
+    printf '%s' "$public_truth_files_before" | /usr/bin/jq -e '
+      length == 2
+      and ([.[].filename] | sort) ==
+        (["README.md","shared/frontend/production-status.json"] | sort)' >/dev/null
+    printf '%s' "$public_truth_pr_before" \
+      | write_once_or_compare "$release_control_root/PUBLIC-TRUTH-PR-BEFORE.json"
+    printf '%s' "$public_truth_checks_before" \
+      | write_once_or_compare "$public_truth_checks_before_receipt"
+    printf '%s' "$public_truth_files_before" \
+      | write_once_or_compare "$public_truth_files_before_receipt"
+
+    public_truth_aris_approval_count="$(arc_scoped_gh "$public_truth_gh_token" api --paginate \
       "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/reviews?per_page=100" \
       --jq '.[]' | /usr/bin/jq -cs --arg head "$public_truth_commit_sha" '
         [.[] | select(.user.login == "arisarcmarket" and .state == "APPROVED"
           and .commit_id == $head)] | length')"
-    test "$public_truth_approval_count" -ge 1
-    test "$(frontend_main_ruleset_policy "$public_truth_gh_token")" = \
-      "$frontend_ruleset_baseline"
+    if [ ! -e "$public_truth_review_authorization" ]; then
+      if [ "$(printf '%s' "$public_truth_pr_before" \
+          | /usr/bin/jq -r .reviewDecision)" = APPROVED ] \
+          && [ "$public_truth_aris_approval_count" -ge 1 ]; then
+        public_truth_review_mode=arisarcmarket-approval
+        public_truth_independent_review=true
+      else
+        public_truth_review_mode=repository-owner-emergency
+        public_truth_independent_review=false
+      fi
+      /usr/bin/jq -cnS --argjson pr "$public_truth_pr_number" \
+        --arg head "$public_truth_commit_sha" --arg base "$frontend_main_sha" \
+        --arg acceptance_sha "$public_truth_acceptance_sha" \
+        --arg mode "$public_truth_review_mode" \
+        --argjson independent "$public_truth_independent_review" \
+        --arg main_ruleset_sha "$frontend_ruleset_baseline_sha" \
+        --arg rulesets_sha "$public_truth_rulesets_baseline_sha" '
+        {schema:"arc.public-truth-review-authorization.v1",
+         repository:"FerrumVir/arc-chain",pull_request:$pr,
+         head_commit:$head,base_commit:$base,
+         post_release_acceptance_sha256:$acceptance_sha,
+         mode:$mode,independent_review:$independent,
+         reviewer:(if $mode == "arisarcmarket-approval" then
+           {login:"arisarcmarket",id:101665656} else null end),
+         owner:{login:"FerrumVir",id:111036403},
+         authorization_basis:(if $mode == "repository-owner-emergency" then
+           "repository owner explicitly authorized completion through this documented owner-emergency path in the production deployment session; this is not independent review"
+           else "exact-head approval by the independent write collaborator" end),
+         main_ruleset_id:21689753,
+         main_ruleset_baseline_sha256:$main_ruleset_sha,
+         ruleset_collection_baseline_sha256:$rulesets_sha,
+         required_check_count:33,all_required_checks_must_succeed:true,
+         changed_policy_fields:(if $mode == "repository-owner-emergency" then [
+           "rules[3].parameters.require_last_push_approval",
+           "rules[3].parameters.required_approving_review_count"] else [] end)}' \
+        | write_once_or_compare "$public_truth_review_authorization"
+    fi
+    public_truth_review_mode="$(/usr/bin/jq -er \
+      --argjson pr "$public_truth_pr_number" --arg head "$public_truth_commit_sha" \
+      --arg base "$frontend_main_sha" --arg acceptance_sha "$public_truth_acceptance_sha" \
+      --arg main_ruleset_sha "$frontend_ruleset_baseline_sha" \
+      --arg rulesets_sha "$public_truth_rulesets_baseline_sha" '
+      select(.schema == "arc.public-truth-review-authorization.v1"
+        and .repository == "FerrumVir/arc-chain" and .pull_request == $pr
+        and .head_commit == $head and .base_commit == $base
+        and .post_release_acceptance_sha256 == $acceptance_sha
+        and .owner == {login:"FerrumVir",id:111036403}
+        and .main_ruleset_id == 21689753
+        and .main_ruleset_baseline_sha256 == $main_ruleset_sha
+        and .ruleset_collection_baseline_sha256 == $rulesets_sha
+        and .required_check_count == 33 and .all_required_checks_must_succeed == true
+        and ((.mode == "arisarcmarket-approval" and .independent_review == true
+              and .reviewer == {login:"arisarcmarket",id:101665656}
+              and .changed_policy_fields == [])
+          or (.mode == "repository-owner-emergency" and .independent_review == false
+              and .reviewer == null
+              and .authorization_basis ==
+                "repository owner explicitly authorized completion through this documented owner-emergency path in the production deployment session; this is not independent review"
+              and (.changed_policy_fields | sort) == ([
+                "rules[3].parameters.require_last_push_approval",
+                "rules[3].parameters.required_approving_review_count"] | sort))))
+      | .mode' "$public_truth_review_authorization")"
+    case "$public_truth_review_mode" in
+      arisarcmarket-approval)
+        test "$(printf '%s' "$public_truth_pr_before" \
+          | /usr/bin/jq -r .reviewDecision)" = APPROVED
+        test "$public_truth_aris_approval_count" -ge 1
+        ;;
+      repository-owner-emergency)
+        public_truth_ruleset_exception_active=true
+        frontend_main_ruleset_put "$public_truth_gh_token" \
+          "$public_truth_ruleset_exception"
+        test "$(frontend_main_ruleset_policy "$public_truth_gh_token")" = \
+          "$public_truth_ruleset_exception"
+        test "$(repository_ruleset_snapshot "$public_truth_gh_token")" = \
+          "$public_truth_rulesets_exception"
+        ;;
+      *) exit 1 ;;
+    esac
+
     test "$(arc_scoped_gh "$public_truth_gh_token" api \
-      repos/FerrumVir/arc-chain/branches/main \
-      --jq .commit.sha)" = "$frontend_main_sha"
-    arc_scoped_gh "$public_truth_gh_token" api --method PUT \
-      "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/merge" \
-      -f commit_title="$public_truth_pr_title" -f merge_method=squash \
-      -f sha="$public_truth_commit_sha" \
-      | /usr/bin/jq -e '.merged == true
-          and (.sha | test("^[0-9a-f]{40}$"))' >/dev/null
+      repos/FerrumVir/arc-chain/branches/main --jq .commit.sha)" = "$frontend_main_sha"
+    public_truth_pr_immediate="$(public_truth_pr_snapshot)"
+    verify_public_truth_open_pr_and_checks "$public_truth_pr_immediate"
+    public_truth_checks_immediate="$(printf '%s' "$public_truth_pr_immediate" \
+      | /usr/bin/jq -cS .statusCheckRollup)"
+    test "$public_truth_checks_immediate" = "$public_truth_checks_before"
+    public_truth_files_immediate="$(public_truth_pr_files_snapshot)"
+    test "$public_truth_files_immediate" = "$public_truth_files_before"
+    if [ "$public_truth_review_mode" = arisarcmarket-approval ]; then
+      test "$(arc_scoped_gh "$public_truth_gh_token" api --paginate \
+        "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/reviews?per_page=100" \
+        --jq '.[]' | /usr/bin/jq -cs --arg head "$public_truth_commit_sha" '
+          [.[] | select(.user.login == "arisarcmarket" and .state == "APPROVED"
+            and .commit_id == $head)] | length')" -ge 1
+    fi
+    printf '%s' "$public_truth_pr_immediate" | write_once_or_compare \
+      "$release_control_root/PUBLIC-TRUTH-PR-IMMEDIATELY-BEFORE-MERGE.json"
+    printf '%s' "$public_truth_checks_immediate" \
+      | write_once_or_compare "$public_truth_checks_immediate_receipt"
+    printf '%s' "$public_truth_files_immediate" \
+      | write_once_or_compare "$public_truth_files_immediate_receipt"
+    public_truth_merge_request="$(/usr/bin/jq -cnS \
+      --arg title "$public_truth_pr_title" --arg sha "$public_truth_commit_sha" \
+      '{commit_title:$title,merge_method:"squash",sha:$sha}')"
+    printf '%s' "$public_truth_merge_request" | write_once_or_compare \
+      "$release_control_root/PUBLIC-TRUTH-MERGE-REQUEST.json"
+    public_truth_merge_response="$(printf '%s' "$public_truth_merge_request" \
+      | arc_scoped_gh "$public_truth_gh_token" api --method PUT \
+          "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/merge" --input -)" \
+      || public_truth_merge_transport_status=$?
+
+    # Restore before parsing, accepting, or recording the merge response.
+    restore_public_truth_main_ruleset
+    test "$(repository_ruleset_snapshot "$public_truth_gh_token")" = \
+      "$public_truth_rulesets_baseline"
+    /usr/bin/jq -cnS --argjson status "$public_truth_merge_transport_status" \
+      --arg stdout "$public_truth_merge_response" \
+      '{schema:"arc.public-truth-merge-transport.v1",
+        exit_status:$status,stdout:$stdout,ruleset_restored_before_interpretation:true}' \
+      | write_once_or_compare "$release_control_root/PUBLIC-TRUTH-MERGE-TRANSPORT.json"
+    if [ "$public_truth_merge_transport_status" -eq 0 ]; then
+      printf '%s' "$public_truth_merge_response" | /usr/bin/jq -e '
+        .merged == true and (.sha | test("^[0-9a-f]{40}$"))' >/dev/null
+    fi
     ;;
   closed)
-    printf '%s' "$public_truth_prs" \
-      | /usr/bin/jq -e '.[0].merged_at != null' >/dev/null
-    public_truth_approval_count="$(arc_scoped_gh "$public_truth_gh_token" api --paginate \
-      "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/reviews?per_page=100" \
-      --jq '.[]' | /usr/bin/jq -cs --arg head "$public_truth_commit_sha" '
-        [.[] | select(.user.login == "arisarcmarket" and .state == "APPROVED"
-          and .commit_id == $head)] | length')"
-    test "$public_truth_approval_count" -ge 1
+    printf '%s' "$public_truth_pr_api_before" \
+      | /usr/bin/jq -e '.merged == true and .merged_at != null' >/dev/null
+    test -f "$public_truth_review_authorization" \
+      && test ! -L "$public_truth_review_authorization"
+    public_truth_review_mode="$(/usr/bin/jq -er \
+      --argjson pr "$public_truth_pr_number" --arg head "$public_truth_commit_sha" \
+      --arg base "$frontend_main_sha" --arg acceptance_sha "$public_truth_acceptance_sha" \
+      --arg main_ruleset_sha "$frontend_ruleset_baseline_sha" \
+      --arg rulesets_sha "$public_truth_rulesets_baseline_sha" '
+      select(.schema == "arc.public-truth-review-authorization.v1"
+        and .repository == "FerrumVir/arc-chain" and .pull_request == $pr
+        and .head_commit == $head and .base_commit == $base
+        and .post_release_acceptance_sha256 == $acceptance_sha
+        and .owner == {login:"FerrumVir",id:111036403}
+        and .main_ruleset_id == 21689753
+        and .main_ruleset_baseline_sha256 == $main_ruleset_sha
+        and .ruleset_collection_baseline_sha256 == $rulesets_sha
+        and .required_check_count == 33 and .all_required_checks_must_succeed == true
+        and ((.mode == "arisarcmarket-approval" and .independent_review == true
+              and .reviewer == {login:"arisarcmarket",id:101665656}
+              and .changed_policy_fields == [])
+          or (.mode == "repository-owner-emergency" and .independent_review == false
+              and .reviewer == null
+              and .authorization_basis ==
+                "repository owner explicitly authorized completion through this documented owner-emergency path in the production deployment session; this is not independent review"
+              and (.changed_policy_fields | sort) == ([
+                "rules[3].parameters.require_last_push_approval",
+                "rules[3].parameters.required_approving_review_count"] | sort))))
+      | .mode' \
+      "$public_truth_review_authorization")"
+    for sealed_premerge in "$public_truth_checks_before_receipt" \
+      "$public_truth_checks_immediate_receipt" "$public_truth_files_before_receipt" \
+      "$public_truth_files_immediate_receipt"; do
+      test -f "$sealed_premerge" && test ! -L "$sealed_premerge"
+      test "$(/usr/bin/stat --format='%a:%h' "$sealed_premerge")" = 400:1
+    done
+    test "$(arc_sha256 "$public_truth_checks_before_receipt")" = \
+      "$(arc_sha256 "$public_truth_checks_immediate_receipt")"
+    test "$(arc_sha256 "$public_truth_files_before_receipt")" = \
+      "$(arc_sha256 "$public_truth_files_immediate_receipt")"
+    if [ "$public_truth_review_mode" = arisarcmarket-approval ]; then
+      test "$(arc_scoped_gh "$public_truth_gh_token" api --paginate \
+        "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number/reviews?per_page=100" \
+        --jq '.[]' | /usr/bin/jq -cs --arg head "$public_truth_commit_sha" '
+          [.[] | select(.user.login == "arisarcmarket" and .state == "APPROVED"
+            and .commit_id == $head)] | length')" -ge 1
+    fi
     ;;
   *) exit 1 ;;
 esac
+restore_public_truth_main_ruleset
+trap - EXIT HUP INT TERM
 public_truth_pr_live="$(arc_scoped_gh "$public_truth_gh_token" api \
   "repos/FerrumVir/arc-chain/pulls/$public_truth_pr_number")"
 printf '%s' "$public_truth_pr_live" | /usr/bin/jq -e \
-  --arg head "$public_truth_commit_sha" '
+  --arg head "$public_truth_commit_sha" --arg base "$frontend_main_sha" '
   .state == "closed" and .merged == true and .head.sha == $head
-  and .base.ref == "main" and (.merge_commit_sha | test("^[0-9a-f]{40}$"))' \
+  and .base.ref == "main" and .base.sha == $base
+  and (.merge_commit_sha | test("^[0-9a-f]{40}$"))' \
   >/dev/null
+if [ "$public_truth_merge_transport_status" -ne 0 ]; then
+  printf 'merge transport returned %s, but the exact merged PR was independently proved\n' \
+    "$public_truth_merge_transport_status" >&2
+fi
 public_truth_main_sha="$(printf '%s' "$public_truth_pr_live" \
   | /usr/bin/jq -er .merge_commit_sha)"
 arc_git -C "$operator_checkout" fetch --no-tags origin "$public_truth_main_sha"
@@ -5102,10 +7002,71 @@ test "$(arc_scoped_gh "$public_truth_gh_token" api \
 test "$(arc_scoped_gh "$public_truth_gh_token" api \
   repos/FerrumVir/arc-chain/git/ref/tags/v0.8.0 --jq .object.sha)" = \
   "$protected_main_sha"
-test "$(repository_ruleset_snapshot "$public_truth_gh_token")" = \
-  "$rulesets_before_frontend"
+public_truth_rulesets_after="$(repository_ruleset_snapshot "$public_truth_gh_token")"
+test "$public_truth_rulesets_after" = "$public_truth_rulesets_baseline"
+printf '%s' "$public_truth_rulesets_after" \
+  | write_once_or_compare "$release_control_root/PUBLIC-TRUTH-RULESETS-AFTER.json"
+test "$(arc_sha256 "$release_control_root/PUBLIC-TRUTH-RULESETS-AFTER.json")" = \
+  "$public_truth_rulesets_baseline_sha"
 test "$(frontend_main_ruleset_policy "$public_truth_gh_token")" = \
   "$frontend_ruleset_baseline"
+case "$public_truth_review_mode" in
+  arisarcmarket-approval)
+    public_truth_independent_review=true
+    public_truth_ruleset_exception_used=false
+    ;;
+  repository-owner-emergency)
+    public_truth_independent_review=false
+    public_truth_ruleset_exception_used=true
+    ;;
+  *) exit 1 ;;
+esac
+public_truth_merge_receipt="$release_control_root/PUBLIC-TRUTH-MERGE.json"
+/usr/bin/jq -cnS --arg source "$protected_main_sha" \
+  --arg base "$frontend_main_sha" --arg head "$public_truth_commit_sha" \
+  --arg merge "$public_truth_main_sha" --argjson pr "$public_truth_pr_number" \
+  --arg acceptance_sha "$public_truth_acceptance_sha" \
+  --arg review_mode "$public_truth_review_mode" \
+  --argjson independent "$public_truth_independent_review" \
+  --argjson exception_used "$public_truth_ruleset_exception_used" \
+  --arg main_ruleset_sha "$frontend_ruleset_baseline_sha" \
+  --arg rulesets_sha "$public_truth_rulesets_baseline_sha" \
+  --arg checks_before "$(arc_sha256 "$public_truth_checks_before_receipt")" \
+  --arg checks_immediate "$(arc_sha256 "$public_truth_checks_immediate_receipt")" '
+  {schema:"arc.public-truth-merge.v1",repository:"FerrumVir/arc-chain",
+   release_source_sha:$source,accepted_config_main_sha:$base,
+   public_truth_head_sha:$head,public_truth_main_sha:$merge,pull_request:$pr,
+   merge_method:"squash",changed_paths:["README.md","shared/frontend/production-status.json"],
+   post_release_acceptance_sha256:$acceptance_sha,
+   review_authorization:$review_mode,independent_review:$independent,
+   owner_authorization_basis:(if $review_mode == "repository-owner-emergency" then
+     "repository owner explicitly authorized completion through this documented owner-emergency path in the production deployment session; this is not independent review"
+     else null end),
+   temporary_ruleset_exception_used:$exception_used,
+   changed_policy_fields:(if $exception_used then [
+     "rules[3].parameters.require_last_push_approval",
+     "rules[3].parameters.required_approving_review_count"] else [] end),
+   required_check_count:33,all_required_checks_success:true,
+   checks_unchanged_immediately_before_merge:($checks_before == $checks_immediate),
+   main_ruleset_id:21689753,main_ruleset_baseline_sha256:$main_ruleset_sha,
+   ruleset_collection_before_sha256:$rulesets_sha,
+   ruleset_collection_after_sha256:$rulesets_sha,ruleset_restored_exactly:true}' \
+  | write_once_or_compare "$public_truth_merge_receipt"
+/usr/bin/jq -e '
+  .required_check_count == 33 and .all_required_checks_success == true
+  and .checks_unchanged_immediately_before_merge == true
+  and .ruleset_restored_exactly == true
+  and ((.review_authorization == "arisarcmarket-approval"
+        and .independent_review == true
+        and .temporary_ruleset_exception_used == false
+        and .changed_policy_fields == [])
+    or (.review_authorization == "repository-owner-emergency"
+        and .independent_review == false
+        and .temporary_ruleset_exception_used == true
+        and (.changed_policy_fields | sort) == ([
+          "rules[3].parameters.require_last_push_approval",
+          "rules[3].parameters.required_approving_review_count"] | sort)))' \
+  "$public_truth_merge_receipt" >/dev/null
 ```
 
 ### Prove the exact second Pages run and public bytes
@@ -5257,11 +7218,18 @@ test "$(/usr/bin/awk '$2 == "./deployed-commit.txt" {print $1}' \
   --argjson run_id "$public_truth_pages_run_id" \
   --argjson run_attempt "$public_truth_pages_run_attempt" \
   --argjson deployment_id "$public_truth_deployment_id" \
+  --arg review_mode "$public_truth_review_mode" \
+  --argjson independent "$public_truth_independent_review" \
+  --argjson exception_used "$public_truth_ruleset_exception_used" \
+  --arg merge_receipt_sha "$(arc_sha256 "$public_truth_merge_receipt")" \
   --arg sums_sha "$(arc_sha256 "$public_truth_deployed_sums")" '
   {schema:"arc.post-release-public-truth-acceptance.v1",
    release_source_sha:$source,accepted_config_main_sha:$accepted_config,
    public_truth_commit:$commit,public_truth_pull_request:$pr,
    public_truth_main_sha:$main,post_release_acceptance_sha256:$acceptance_sha,
+   review_authorization:$review_mode,independent_review:$independent,
+   temporary_ruleset_exception_used:$exception_used,
+   public_truth_merge_receipt_sha256:$merge_receipt_sha,
    readme_sha256:$readme_sha,production_status_sha256:$status_sha,
    pages_run_id:$run_id,pages_run_attempt:$run_attempt,
    pages_deployment_id:$deployment_id,deployed_sums_sha256:$sums_sha,

@@ -53,6 +53,33 @@ interface Derived {
   perWeek: number | null;
 }
 
+function projectionEvidenceAttributes(
+  projection: EarningsProjection,
+  econ: RewardEconomics | undefined,
+  state: "numeric" | "unavailable" | "rollout_inactive" | "no_rate",
+  unavailableReason: string,
+) {
+  return {
+    "data-projection-state": state,
+    "data-source-host": projection.sourceHost,
+    "data-economics-source-host": econ?.sourceHost ?? "",
+    "data-projected-daily-arc": projection.projectedDailyArc ?? "",
+    "data-unavailable-reason": unavailableReason,
+    "data-reward-per-attestation": projection.rewardPerAttestation ?? "",
+    "data-reward-rate-source": projection.rewardRateSource,
+    "data-reward-policy-hash": projection.rewardPolicyHash ?? "",
+    "data-community-rewards-enabled":
+      projection.communityRewardsEnabled == null
+        ? ""
+        : String(projection.communityRewardsEnabled),
+    "data-issuance-ready-for-worker":
+      projection.issuanceReadyForWorker == null
+        ? ""
+        : String(projection.issuanceReadyForWorker),
+    "data-reward-program": projection.rewardProgram ?? "",
+  };
+}
+
 /**
  * Combine the two reads into the figures shown.
  *
@@ -381,7 +408,15 @@ export function ProjectedEarnings({
   // ── The earnings read failed ───────────────────────────────────────────
   if (projection.unavailable) {
     return (
-      <Card data-testid="projection-card">
+      <Card
+        data-testid="projection-card"
+        {...projectionEvidenceAttributes(
+          projection,
+          econ,
+          "unavailable",
+          projection.unavailable,
+        )}
+      >
         <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
         <NotAvailable
           reason={projection.unavailable}
@@ -398,15 +433,22 @@ export function ProjectedEarnings({
   // that it can actually settle community reward transactions.
   if (projection.communityRewardsEnabled !== true) {
     const inactive = projection.communityRewardsEnabled === false;
+    const rolloutReason = inactive
+      ? `Community reward settlement is inactive on ${hostLabelVerbose(projection.sourceHost)}. Work may still run, but this coordinator reports that protocol activation and/or validator-approval collection is not ready, so it cannot create a payable 0x25 transaction.`
+      : "This host did not confirm both community-reward protocol activation and validator-approval collection. No future reward figure is shown.";
     return (
-      <Card data-testid="projection-card">
+      <Card
+        data-testid="projection-card"
+        {...projectionEvidenceAttributes(
+          projection,
+          econ,
+          "rollout_inactive",
+          rolloutReason,
+        )}
+      >
         <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
         <NotAvailable
-          reason={
-            inactive
-              ? `Community reward settlement is inactive on ${hostLabelVerbose(projection.sourceHost)}. Work may still run, but this coordinator reports that protocol activation and/or validator-approval collection is not ready, so it cannot create a payable 0x25 transaction.`
-              : `This host did not confirm both community-reward protocol activation and validator-approval collection. No future reward figure is shown.`
-          }
+          reason={rolloutReason}
           testId="projection-rollout-inactive"
         />
         <TreasuryLine econ={econ} compact={compact} />
@@ -417,8 +459,19 @@ export function ProjectedEarnings({
 
   // ── No measured rate: show the rate card, project nothing ──────────────
   if (d.perDay === null) {
+    const noRateReason =
+      projection.projectedDailyUnavailableReason ??
+      "This host withheld an authoritative daily reward projection.";
     return (
-      <Card data-testid="projection-card">
+      <Card
+        data-testid="projection-card"
+        {...projectionEvidenceAttributes(
+          projection,
+          econ,
+          "no_rate",
+          noRateReason,
+        )}
+      >
         <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
         <div data-testid="projection-no-rate">
           <div
@@ -440,8 +493,7 @@ export function ProjectedEarnings({
               margin: 0,
             }}
           >
-            {projection.projectedDailyUnavailableReason ??
-              "This host withheld an authoritative daily reward projection."}{" "}
+            {noRateReason}{" "}
             <strong>
               No per-day figure is shown unless the coordinator explicitly
               supplies one after applying readiness and reward-budget policy.
@@ -470,7 +522,11 @@ export function ProjectedEarnings({
 
   // ── Full projection: every input is real ───────────────────────────────
   return (
-    <Card data-testid="projection-card" featured={!compact}>
+    <Card
+      data-testid="projection-card"
+      featured={!compact}
+      {...projectionEvidenceAttributes(projection, econ, "numeric", "")}
+    >
       <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
       <div data-testid="projection-figures">
         <div

@@ -33,6 +33,12 @@ CHECK_INDEX=0
 RESULTS=()
 LOG_DIR="${ARC_CI_LOG_DIR:-$REPO_ROOT/target/ci-check}"
 mkdir -p "$LOG_DIR"
+# Ordinary imports must never write beside reviewed source. `python -m
+# py_compile` deliberately writes bytecode even when PYTHONDONTWRITEBYTECODE is
+# set, so route those explicit compilation outputs into the already ignored gate
+# output root as a second boundary.
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPYCACHEPREFIX="$LOG_DIR/python-pycache"
 
 run_check() {
     local name="$1"
@@ -175,6 +181,33 @@ python_sdk() {
     )
 }
 
+source_cleanliness() {
+    local ignored_source_state
+    ignored_source_state="$(git ls-files --others --ignored --exclude-standard -- . \
+        ':(exclude)target/**' \
+        ':(exclude)dashboard/node_modules/**' \
+        ':(exclude)desktop/node_modules/**' \
+        ':(exclude)desktop/dist/**' \
+        ':(exclude)desktop/dist-ssr/**' \
+        ':(exclude)desktop/.vite/**' \
+        ':(exclude)desktop/playwright/.cache/**' \
+        ':(exclude)desktop/playwright-report/**' \
+        ':(exclude)desktop/src-tauri/gen/**' \
+        ':(exclude)desktop/src-tauri/target/**' \
+        ':(exclude)desktop/test-results/**' \
+        ':(exclude)explorer/node_modules/**' \
+        ':(exclude)explorer/.next/**' \
+        ':(exclude)explorer/dist/**' \
+        ':(exclude)sdk/node_modules/**' \
+        ':(exclude)sdk/typescript/node_modules/**' \
+        ':(exclude)sdks/typescript/node_modules/**')"
+    if [ -n "$ignored_source_state" ]; then
+        printf '%s\n' "$ignored_source_state" >&2
+        printf '%s\n' 'ignored files remain outside exact build-output roots' >&2
+        return 1
+    fi
+}
+
 printf '================================================================\n'
 printf ' ARC Chain quality gate (%s)\n' "$PROFILE"
 printf ' Logs: %s\n' "$LOG_DIR"
@@ -215,6 +248,7 @@ if [ "$PROFILE" = full ]; then
     run_check "TypeScript SDK package" sdk_package
     run_check "Compatibility TypeScript SDK" compatibility_typescript_sdk
     run_check "Python SDK" python_sdk
+    run_check "Releasable-worktree source cleanliness" source_cleanliness
 fi
 
 printf '\n================================================================\n'

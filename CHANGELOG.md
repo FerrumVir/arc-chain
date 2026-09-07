@@ -74,6 +74,12 @@ All notable changes to ARC Chain are tracked here. This project follows
   projections fail closed unless policy, receipt history, and treasury support
   them. Stake-zero worker eligibility is explicit policy, not an installer
   promise.
+- Prevents automatic inference fallback from replaying one UI click across
+  local, direct-coordinator, and consensus write routes. Clients may probe the
+  exact read-only `/inference/readiness` contract in parallel, but select one
+  origin and issue at most one inference POST. Every timeout, connection reset,
+  HTTP error, or malformed response after that POST is treated as an ambiguous
+  possibly-settled outcome and is never retried on another coordinator.
 - Separates RPC from P2P discovery and configures all six reviewed literal-IPv4
   HTTPS origins explicitly. The locked SHA-pinned Caddy 2.11.4 gateway requests
   publicly trusted Let's Encrypt IP certificates with the `shortlived` profile
