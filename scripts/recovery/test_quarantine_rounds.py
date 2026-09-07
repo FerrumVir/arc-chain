@@ -680,6 +680,98 @@ def authorized_height(auth: dict, name: str) -> int:
     return next(row["loopback_info_after_height"] for row in nodes if row["node"] == name) + 1
 
 
+def zero_progress_release(auth: dict, readiness: dict, dispatch: dict) -> dict:
+    challenge = H["96"]
+    return {
+        "schema": qr.ZERO_PROGRESS_RELEASE_SCHEMA,
+        "capture_id": CAPTURE,
+        "freeze_plan_sha256": FREEZE,
+        "round_number": auth["round_number"],
+        "round_authorization_sha256": qr.digest(auth),
+        "round_readiness_sha256": qr.digest(readiness),
+        "mutation_dispatch_sha256": qr.digest(dispatch),
+        "live_observation_selection_sha256": auth[
+            "live_observation_selection_sha256"
+        ],
+        "live_observation_generation": auth["live_observation_generation"],
+        "observation_generation_receipt_sha256": auth[
+            "observation_generation_receipt_sha256"
+        ],
+        "drive_prefreeze_receipt_sha256": auth[
+            "drive_prefreeze_receipt_sha256"
+        ],
+        "challenge": challenge,
+        "released_at": utc(4000),
+        "nodes": [
+            qr.wrap(
+                remaining_target_inert_proof(
+                    auth, readiness, dispatch, target["node"], challenge=challenge
+                )
+            )
+            for target in auth["targets"]
+        ],
+    }
+
+
+def zero_progress_fixture(
+    round_number: int,
+    *,
+    transition_choices: list[str] | None = None,
+) -> dict:
+    if not 1 <= round_number <= len(qr.FLEET):
+        raise ValueError("round_number must fit the fixed fleet")
+    if transition_choices is None:
+        transition_choices = [
+            qr.FLEET[index][0] for index in range(round_number - 1)
+        ]
+    if len(transition_choices) != round_number - 1:
+        raise ValueError("one positive transition is required for each prefix round")
+
+    remaining = [name for name, _host in qr.FLEET]
+    prior_authorizations: list[dict] = []
+    prior_results: list[dict] = []
+    for number, chosen in enumerate(transition_choices, start=1):
+        if chosen not in remaining:
+            raise ValueError(f"{chosen} is not available in prefix round {number}")
+        offset = (number - 1) * 400
+        auth = authorization(number, prior_results, remaining, offset)
+        item = applied(auth, chosen, offset + 20, authorized_height(auth, chosen))
+        round_result = result(auth, [item], offset + 330)
+        prior_authorizations.append(auth)
+        prior_results.append(round_result)
+        remaining = [name for name in remaining if name != chosen]
+
+    offset = (round_number - 1) * 400
+    auth = authorization(round_number, prior_results, remaining, offset)
+    readiness = target_readiness(auth)
+    dispatch = mutation_dispatch(auth, readiness)
+    return {
+        "authorization": auth,
+        "readiness": readiness,
+        "dispatch": dispatch,
+        "result": result(auth, [], offset + 303),
+        "release": zero_progress_release(auth, readiness, dispatch),
+        "prior_authorizations": prior_authorizations,
+        "prior_results": prior_results,
+    }
+
+
+def zero_progress_validation_args(fixture: dict) -> dict:
+    return {
+        "authorization": fixture["authorization"],
+        "readiness": fixture["readiness"],
+        "dispatch": fixture["dispatch"],
+        "prior_authorizations": fixture["prior_authorizations"],
+        "prior_results": fixture["prior_results"],
+        "result": fixture["result"],
+        "expected_capture_id": CAPTURE,
+        "expected_freeze_sha256": FREEZE,
+        "containing_round_name": (
+            f"round-{fixture['authorization']['round_number']}"
+        ),
+    }
+
+
 def ledger_for_first_successes(count: int) -> dict:
     names = [name for name, _host in qr.FLEET]
     results: list[dict] = [];round_rows = []
@@ -831,6 +923,188 @@ class QuarantineRoundTests(unittest.TestCase):
         ledger["rounds"][0] = {"authorization": qr.wrap(auth), "result": qr.wrap(empty)}
         with self.assertRaisesRegex(qr.QuarantineRoundError, "zero-progress"):
             qr.validate_generation_ledger(ledger)
+
+    def test_shared_zero_progress_contract_accepts_rounds_one_through_six(self) -> None:
+        names = [name for name, _host in qr.FLEET]
+        for round_number in range(1, len(names) + 1):
+            with self.subTest(round_number=round_number):
+                fixture = zero_progress_fixture(round_number)
+                args = zero_progress_validation_args(fixture)
+                expected_targets = names[round_number - 1:]
+
+                attempt_state = qr.validate_zero_progress_attempt(**args)
+                release_state = qr.validate_zero_progress_release(
+                    fixture["release"], **args
+                )
+
+                self.assertEqual(attempt_state["round_number"], round_number)
+                self.assertEqual(attempt_state["target_names"], expected_targets)
+                self.assertEqual(release_state["target_names"], expected_targets)
+                self.assertEqual(len(expected_targets), len(names) + 1 - round_number)
+                self.assertEqual(
+                    [wrapper["value"]["node"] for wrapper in fixture["release"]["nodes"]],
+                    expected_targets,
+                )
+
+    def test_shared_zero_progress_contract_accepts_noncontiguous_remaining_subset(self) -> None:
+        fixture = zero_progress_fixture(
+            3, transition_choices=["lax", "sgp"]
+        )
+        expected_targets = [
+            name for name, _host in qr.FLEET if name not in {"lax", "sgp"}
+        ]
+        args = zero_progress_validation_args(fixture)
+
+        self.assertEqual(
+            qr.validate_zero_progress_attempt(**args)["target_names"],
+            expected_targets,
+        )
+        self.assertEqual(
+            qr.validate_zero_progress_release(fixture["release"], **args)[
+                "target_names"
+            ],
+            expected_targets,
+        )
+
+    def test_zero_progress_release_requires_exact_ordered_proof_set(self) -> None:
+        fixture = zero_progress_fixture(3)
+        args = zero_progress_validation_args(fixture)
+
+        missing = copy.deepcopy(fixture["release"])
+        missing["nodes"].pop()
+        reordered = copy.deepcopy(fixture["release"])
+        reordered["nodes"][0], reordered["nodes"][1] = (
+            reordered["nodes"][1], reordered["nodes"][0]
+        )
+        extra = copy.deepcopy(fixture["release"])
+        extra["nodes"].append(copy.deepcopy(extra["nodes"][0]))
+
+        for label, release, message in (
+            ("missing", missing, "proof count"),
+            ("reordered", reordered, "proof differs"),
+            ("extra", extra, "proof count"),
+        ):
+            with self.subTest(case=label), self.assertRaisesRegex(
+                qr.QuarantineRoundError, message
+            ):
+                qr.validate_zero_progress_release(release, **args)
+
+    def test_zero_progress_release_rejects_wrong_or_unexpired_boottime(self) -> None:
+        fixture = zero_progress_fixture(4)
+        args = zero_progress_validation_args(fixture)
+
+        wrong_acceptance = copy.deepcopy(fixture["release"])
+        proof = wrong_acceptance["nodes"][0]["value"]
+        proof["accepted_boottime_ns"] += 1
+        proof["observed_boottime_ns"] += 1
+        wrong_acceptance["nodes"][0] = qr.wrap(proof)
+
+        not_expired = copy.deepcopy(fixture["release"])
+        proof = not_expired["nodes"][0]["value"]
+        proof["elapsed_since_acceptance_ns"] = (
+            qr.MAX_WINDOW_SECONDS * 1_000_000_000
+        )
+        proof["observed_boottime_ns"] = (
+            proof["accepted_boottime_ns"] + proof["elapsed_since_acceptance_ns"]
+        )
+        not_expired["nodes"][0] = qr.wrap(proof)
+
+        for label, release in (
+            ("wrong accepted BOOTTIME", wrong_acceptance),
+            ("elapsed at the 300-second boundary", not_expired),
+        ):
+            with self.subTest(case=label), self.assertRaisesRegex(
+                qr.QuarantineRoundError, "proof differs"
+            ):
+                qr.validate_zero_progress_release(release, **args)
+
+    def test_zero_progress_attempt_rejects_missing_reordered_or_tampered_prefix(self) -> None:
+        fixture = zero_progress_fixture(4)
+        args = zero_progress_validation_args(fixture)
+
+        missing_authorization = {
+            **args,
+            "prior_authorizations": args["prior_authorizations"][:-1],
+        }
+        missing_pair = {
+            **args,
+            "prior_authorizations": args["prior_authorizations"][:-1],
+            "prior_results": args["prior_results"][:-1],
+        }
+        reordered = {
+            **args,
+            "prior_authorizations": [
+                args["prior_authorizations"][1],
+                args["prior_authorizations"][0],
+                *args["prior_authorizations"][2:],
+            ],
+            "prior_results": [
+                args["prior_results"][1],
+                args["prior_results"][0],
+                *args["prior_results"][2:],
+            ],
+        }
+        tampered_results = copy.deepcopy(args["prior_results"])
+        tampered_results[0]["completed_at"] = utc(331)
+        tampered = {**args, "prior_results": tampered_results}
+
+        for label, invalid_args in (
+            ("missing authorization", missing_authorization),
+            ("missing pair", missing_pair),
+            ("reordered", reordered),
+            ("tampered", tampered),
+        ):
+            with self.subTest(case=label), self.assertRaises(qr.QuarantineRoundError):
+                qr.validate_zero_progress_attempt(**invalid_args)
+
+    def test_zero_progress_attempt_rejects_zero_progress_prefix(self) -> None:
+        names = [name for name, _host in qr.FLEET]
+        prefix_auth = authorization(1, [], names, 0)
+        zero_prefix = result(prefix_auth, [], 303)
+        auth = authorization(2, [zero_prefix], names, 400)
+        readiness = target_readiness(auth)
+        dispatch = mutation_dispatch(auth, readiness)
+
+        with self.assertRaisesRegex(
+            qr.QuarantineRoundError, "prior quarantine-round prefix differs"
+        ):
+            qr.validate_zero_progress_attempt(
+                authorization=auth,
+                readiness=readiness,
+                dispatch=dispatch,
+                prior_authorizations=[prefix_auth],
+                prior_results=[zero_prefix],
+                expected_capture_id=CAPTURE,
+                expected_freeze_sha256=FREEZE,
+                containing_round_name="round-2",
+            )
+
+    def test_zero_progress_attempt_rejects_observation_identity_change(self) -> None:
+        fixture = zero_progress_fixture(3)
+        for field in (
+            "live_observation_selection_sha256",
+            "live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
+        ):
+            auth = copy.deepcopy(fixture["authorization"])
+            auth[field] = H["95"]
+            readiness = target_readiness(auth)
+            dispatch = mutation_dispatch(auth, readiness)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                qr.QuarantineRoundError,
+                "prior quarantine-round identity differs",
+            ):
+                qr.validate_zero_progress_attempt(
+                    authorization=auth,
+                    readiness=readiness,
+                    dispatch=dispatch,
+                    prior_authorizations=fixture["prior_authorizations"],
+                    prior_results=fixture["prior_results"],
+                    expected_capture_id=CAPTURE,
+                    expected_freeze_sha256=FREEZE,
+                    containing_round_name="round-3",
+                )
 
     def test_reordered_transition_receipts_rejected(self) -> None:
         value = ledger_for_first_successes(3)

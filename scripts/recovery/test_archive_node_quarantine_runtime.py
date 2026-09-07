@@ -427,6 +427,109 @@ class EmbeddedProgramTests(unittest.TestCase):
         self.assertIn("len(rows) != len(auth_target_names)", self.outer)
         self.assertNotIn("len(targets) != 1", self.outer)
 
+    def test_supervisor_writer_topology_matches_each_sealed_production_shape(self) -> None:
+        tree = ast.parse(self.outer)
+        topology_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "verify_supervisor_writer_topology"
+        )
+
+        class TopologyError(RuntimeError):
+            pass
+
+        def fail(message: str) -> None:
+            raise TopologyError(message)
+
+        namespace: dict[str, object] = {"fail": fail}
+        exec(
+            compile(
+                ast.Module(body=[topology_function], type_ignores=[]),
+                "supervisor-writer-topology",
+                "exec",
+            ),
+            namespace,
+        )
+        verify = namespace["verify_supervisor_writer_topology"]
+        systemd_cgroup = ["/system.slice/arc-self-heal.service"]
+        writer_stat = ["S", "1", "200", "200"]
+
+        # The five production self-heal units own an exact writer child in the
+        # same sealed systemd cgroup; their MainPID is intentionally distinct.
+        verify(
+            {"mode": "systemd-unit", "unit": "arc-self-heal.service"},
+            100,
+            systemd_cgroup,
+            200,
+            systemd_cgroup,
+            writer_stat,
+        )
+        with self.assertRaisesRegex(TopologyError, "systemd writer topology"):
+            verify(
+                {"mode": "systemd-unit", "unit": "arc-self-heal.service"},
+                100,
+                systemd_cgroup,
+                200,
+                ["/user.slice/user-0.slice/session-1.scope"],
+                writer_stat,
+            )
+
+        # A direct arc-node.service remains stricter: its sealed MainPID must
+        # be the writer as well as sharing the exact cgroup.
+        direct = ["/system.slice/arc-node.service"]
+        with self.assertRaisesRegex(TopologyError, "systemd writer topology"):
+            verify(
+                {"mode": "systemd-unit", "unit": "arc-node.service"},
+                100,
+                direct,
+                200,
+                direct,
+                writer_stat,
+            )
+        verify(
+            {"mode": "systemd-unit", "unit": "arc-node.service"},
+            100,
+            direct,
+            100,
+            direct,
+            ["S", "1", "100", "100"],
+        )
+
+        # The detached production shape remains a disjoint PID-1 child and
+        # session leader supervised by arc-self-heal.service.
+        verify(
+            {"mode": "detached-root-session", "unit": "arc-self-heal.service"},
+            100,
+            systemd_cgroup,
+            200,
+            ["/user.slice/user-0.slice/session-1.scope"],
+            writer_stat,
+        )
+        for invalid in (
+            ({"mode": "detached-root-session", "unit": "arc-node.service"}, 200, writer_stat),
+            ({"mode": "detached-root-session", "unit": "arc-self-heal.service"}, 100, writer_stat),
+            ({"mode": "detached-root-session", "unit": "arc-self-heal.service"}, 200, ["S", "9", "200", "200"]),
+            ({"mode": "detached-root-session", "unit": "arc-self-heal.service"}, 200, ["S", "1", "200", "201"]),
+        ):
+            sealed, writer_pid, fields = invalid
+            with self.assertRaisesRegex(TopologyError, "detached root-session"):
+                verify(
+                    sealed,
+                    100,
+                    systemd_cgroup,
+                    writer_pid,
+                    ["/user.slice/user-0.slice/session-1.scope"],
+                    fields,
+                )
+
+        self.assertIn(
+            "verify_supervisor_writer_topology(\n"
+            "        sealed, pid, unified, writer_pid, writer_unified, fields,\n"
+            "    )",
+            self.outer,
+        )
+
     def test_no_runtime_mutation_precedes_readiness(self) -> None:
         ready = self.outer.index("readiness = validate_readiness(readiness_raw")
         for token in (

@@ -5510,6 +5510,23 @@ def supervisor_contract(frozen):
         fail("sealed quarantine-round supervisor context differs")
     return value
 
+def verify_supervisor_writer_topology(
+        sealed, supervisor_pid, supervisor_unified,
+        writer_pid, writer_unified, writer_stat_fields):
+    """Fail closed unless the sealed supervisor owns the exact writer shape."""
+    if sealed["mode"] == "systemd-unit":
+        if (writer_unified != supervisor_unified
+                or (sealed["unit"] == "arc-node.service"
+                    and writer_pid != supervisor_pid)):
+            fail("sealed systemd writer topology changed")
+    elif (sealed["unit"] != "arc-self-heal.service"
+            or writer_pid == supervisor_pid
+            or len(writer_stat_fields) < 4
+            or writer_stat_fields[1] != "1"
+            or writer_stat_fields[3] != str(writer_pid)):
+        fail("sealed detached root-session writer topology changed")
+
+
 def verify_supervisor(frozen, target):
     """Prove the exact live supervisor plus detached/direct writer topology."""
     verify_writer(target)
@@ -5545,12 +5562,9 @@ def verify_supervisor(frozen, target):
         fail("sealed quarantine-round writer cgroup path changed")
     stat_raw = (writer_proc / "stat").read_text(encoding="ascii")
     fields = stat_raw[stat_raw.rfind(")") + 2:].split()
-    if sealed["mode"] == "systemd-unit":
-        if writer_pid != pid or writer_unified != unified:
-            fail("sealed systemd writer topology changed")
-    elif (sealed["unit"] != "arc-self-heal.service" or writer_pid == pid
-            or len(fields) < 4 or fields[1] != "1" or fields[3] != str(writer_pid)):
-        fail("sealed detached root-session writer topology changed")
+    verify_supervisor_writer_topology(
+        sealed, pid, unified, writer_pid, writer_unified, fields,
+    )
 
 def validate_authorization(raw):
     if sha(raw) != authorization_sha:

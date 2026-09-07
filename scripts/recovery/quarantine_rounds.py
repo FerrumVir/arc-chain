@@ -38,6 +38,7 @@ NODE_STOPPED_PRECOMMIT_SCHEMA = (
 )
 ROUND_RESULT_SCHEMA = "arc.recovery.quarantine-round-result.v3"
 INERT_NODE_PROOF_SCHEMA = "arc.recovery.quarantine-round-zero-progress-node-proof.v1"
+ZERO_PROGRESS_RELEASE_SCHEMA = "arc.recovery.quarantine-round-zero-progress-release.v1"
 LEDGER_SCHEMA = "arc.recovery.quarantine-generation-ledger.v2"
 TARGET_HEIGHT_SCHEMA = "arc.recovery.legacy-public-height-targets.v1"
 TARGET_CROSS_SCHEMA = "arc.recovery.authenticated-legacy-height-targets.v1"
@@ -2465,6 +2466,263 @@ def validate_round_result(
         "transitioned_names": transitioned_names,
         "remaining_names": remaining,
     }
+
+
+def validate_zero_progress_attempt(
+    *,
+    authorization: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+    dispatch: Mapping[str, Any],
+    prior_authorizations: Sequence[Mapping[str, Any]] = (),
+    prior_results: Sequence[Mapping[str, Any]] = (),
+    result: Mapping[str, Any] | None = None,
+    expected_capture_id: str | None = None,
+    expected_freeze_sha256: str | None = None,
+    containing_round_name: str | None = None,
+) -> dict[str, Any]:
+    """Validate an inert dispatched attempt and its complete positive prefix.
+
+    A current authorization hash transitively binds the immutable result roots,
+    but that is useful only after every prefix result has been validated in
+    order.  This shared contract is used before issuing remote challenges and
+    by every consumer of a zero-progress release receipt.
+    """
+    if len(prior_authorizations) != len(prior_results):
+        fail("zero-progress prior quarantine-round pair count differs")
+    validated_results: list[Mapping[str, Any]] = []
+    prefix_states: list[dict[str, Any]] = []
+    for number, (prior_authorization, prior_result) in enumerate(
+        zip(prior_authorizations, prior_results), start=1
+    ):
+        wrappers = prior_result.get("transitions")
+        if not isinstance(wrappers, list):
+            fail("zero-progress prior quarantine-round transition set differs")
+        transitions = [
+            validate_wrapper(wrapper, "zero-progress prefix transition")[0]
+            for wrapper in wrappers
+        ]
+        state = validate_round_result(
+            prior_result,
+            authorization=prior_authorization,
+            prior_results=validated_results,
+            transition_receipts=transitions,
+        )
+        if state["round_number"] != number or not state["transitioned_names"]:
+            fail("zero-progress prior quarantine-round prefix differs")
+        prefix_states.append(state)
+        validated_results.append(prior_result)
+
+    state = validate_round_authorization(
+        authorization, prior_results=validated_results
+    )
+    number = state["round_number"]
+    if number != len(validated_results) + 1:
+        fail("zero-progress current quarantine round is not contiguous")
+    if containing_round_name is not None and containing_round_name != f"round-{number}":
+        fail("zero-progress attempt directory round differs")
+    if expected_capture_id is not None and state["capture_id"] != expected_capture_id:
+        fail("zero-progress attempt capture differs")
+    if (
+        expected_freeze_sha256 is not None
+        and state["freeze_plan_sha256"] != expected_freeze_sha256
+    ):
+        fail("zero-progress attempt freeze root differs")
+    observation_identity = (
+        state["live_observation_selection_sha256"],
+        state["live_observation_generation"],
+        state["observation_generation_receipt_sha256"],
+        state["drive_prefreeze_receipt_sha256"],
+    )
+    for prefix in prefix_states:
+        if (
+            prefix["capture_id"] != state["capture_id"]
+            or prefix["freeze_plan_sha256"] != state["freeze_plan_sha256"]
+            or prefix["source_main_commit"] != state["source_main_commit"]
+            or (
+                prefix["live_observation_selection_sha256"],
+                prefix["live_observation_generation"],
+                prefix["observation_generation_receipt_sha256"],
+                prefix["drive_prefreeze_receipt_sha256"],
+            )
+            != observation_identity
+        ):
+            fail("zero-progress prior quarantine-round identity differs")
+
+    auth_sha = digest(authorization)
+    readiness_sha = digest(readiness)
+    dispatch_sha = digest(dispatch)
+    probe = {
+        "schema": ROUND_RESULT_SCHEMA,
+        "capture_id": state["capture_id"],
+        "freeze_plan_sha256": state["freeze_plan_sha256"],
+        "round_number": number,
+        "round_authorization_sha256": auth_sha,
+        "target_readiness": wrap(readiness),
+        "transitions": [],
+        "mutation_dispatch": wrap(dispatch),
+        "remaining_target_inert_proofs": [],
+        "remaining_targets": state["target_names"],
+        "completed_at": authorization["authorization_deadline"],
+    }
+    validate_round_result(
+        probe,
+        authorization=authorization,
+        prior_results=validated_results,
+        transition_receipts=[],
+    )
+    if result is not None:
+        if result.get("transitions") != []:
+            fail("zero-progress attempt result transitioned")
+        validate_round_result(
+            result,
+            authorization=authorization,
+            prior_results=validated_results,
+            transition_receipts=[],
+        )
+    return {
+        **state,
+        "authorization_sha256": auth_sha,
+        "readiness_sha256": readiness_sha,
+        "dispatch_sha256": dispatch_sha,
+        "readiness_acceptances": {
+            row["node"]: row["authorization_acceptance"]["value"]
+            for row in readiness["targets"]
+        },
+    }
+
+
+def validate_zero_progress_release(
+    value: Any,
+    *,
+    authorization: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+    dispatch: Mapping[str, Any],
+    prior_authorizations: Sequence[Mapping[str, Any]] = (),
+    prior_results: Sequence[Mapping[str, Any]] = (),
+    result: Mapping[str, Any] | None = None,
+    expected_capture_id: str | None = None,
+    expected_freeze_sha256: str | None = None,
+    containing_round_name: str | None = None,
+) -> dict[str, Any]:
+    """Validate a challenged release for an expired zero-progress dispatch."""
+    state = validate_zero_progress_attempt(
+        authorization=authorization,
+        readiness=readiness,
+        dispatch=dispatch,
+        prior_authorizations=prior_authorizations,
+        prior_results=prior_results,
+        result=result,
+        expected_capture_id=expected_capture_id,
+        expected_freeze_sha256=expected_freeze_sha256,
+        containing_round_name=containing_round_name,
+    )
+    fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "round_number",
+        "round_authorization_sha256", "round_readiness_sha256",
+        "mutation_dispatch_sha256", "live_observation_selection_sha256",
+        "live_observation_generation", "observation_generation_receipt_sha256",
+        "drive_prefreeze_receipt_sha256", "challenge", "released_at", "nodes",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        fail("zero-progress release fields differ")
+    challenge = require_hash(value.get("challenge"), "zero-progress release challenge")
+    parse_utc(value.get("released_at"), "zero-progress release time")
+    if (
+        value.get("schema") != ZERO_PROGRESS_RELEASE_SCHEMA
+        or (
+            value.get("capture_id"),
+            value.get("freeze_plan_sha256"),
+            value.get("round_number"),
+            value.get("round_authorization_sha256"),
+            value.get("round_readiness_sha256"),
+            value.get("mutation_dispatch_sha256"),
+            value.get("live_observation_selection_sha256"),
+            value.get("live_observation_generation"),
+            value.get("observation_generation_receipt_sha256"),
+            value.get("drive_prefreeze_receipt_sha256"),
+        )
+        != (
+            state["capture_id"],
+            state["freeze_plan_sha256"],
+            state["round_number"],
+            state["authorization_sha256"],
+            state["readiness_sha256"],
+            state["dispatch_sha256"],
+            state["live_observation_selection_sha256"],
+            state["live_observation_generation"],
+            state["observation_generation_receipt_sha256"],
+            state["drive_prefreeze_receipt_sha256"],
+        )
+    ):
+        fail("zero-progress release identity differs")
+    wrappers = value.get("nodes")
+    if not isinstance(wrappers, list) or len(wrappers) != len(state["target_names"]):
+        fail("zero-progress release node proof count differs")
+    proof_fields = {
+        "schema", "capture_id", "freeze_plan_sha256", "observation_generation",
+        "round_number", "round_authorization_sha256", "round_readiness_sha256",
+        "mutation_dispatch_sha256", "challenge", "node", "boot_id",
+        "writer_live_unfenced", "apply_state_present",
+        "restart_effective_mutation_absent", "active_selector_absent",
+        "quarantine_nft_absent", "authorization_accepted", "readiness_present",
+        "accepted_boottime_ns", "elapsed_since_acceptance_ns",
+        "observed_boottime_ns", "observed_at",
+    }
+    for wrapper, name in zip(wrappers, state["target_names"]):
+        proof, _proof_sha = validate_wrapper(
+            wrapper, f"{name} zero-progress release proof"
+        )
+        accepted = proof.get("accepted_boottime_ns")
+        elapsed = proof.get("elapsed_since_acceptance_ns")
+        observed = proof.get("observed_boottime_ns")
+        acceptance = state["readiness_acceptances"][name]
+        target = state["target_rows"][name]
+        if (
+            set(proof) != proof_fields
+            or proof.get("schema") != INERT_NODE_PROOF_SCHEMA
+            or (
+                proof.get("capture_id"),
+                proof.get("freeze_plan_sha256"),
+                proof.get("observation_generation"),
+                proof.get("round_number"),
+                proof.get("round_authorization_sha256"),
+                proof.get("round_readiness_sha256"),
+                proof.get("mutation_dispatch_sha256"),
+                proof.get("challenge"),
+                proof.get("node"),
+                proof.get("boot_id"),
+            )
+            != (
+                state["capture_id"],
+                state["freeze_plan_sha256"],
+                state["live_observation_generation"],
+                state["round_number"],
+                state["authorization_sha256"],
+                state["readiness_sha256"],
+                state["dispatch_sha256"],
+                challenge,
+                name,
+                target["boot_id"],
+            )
+            or proof.get("writer_live_unfenced") is not True
+            or proof.get("restart_effective_mutation_absent") is not True
+            or proof.get("active_selector_absent") is not True
+            or proof.get("quarantine_nft_absent") is not True
+            or proof.get("authorization_accepted") is not True
+            or not isinstance(proof.get("apply_state_present"), bool)
+            or not isinstance(proof.get("readiness_present"), bool)
+            or any(
+                isinstance(number, bool) or not isinstance(number, int) or number <= 0
+                for number in (accepted, elapsed, observed)
+            )
+            or accepted != acceptance.get("accepted_monotonic_ns")
+            or proof.get("boot_id") != acceptance.get("accepted_boot_id")
+            or observed - accepted != elapsed
+            or elapsed <= MAX_WINDOW_SECONDS * 1_000_000_000
+        ):
+            fail(f"{name} zero-progress release proof differs")
+        parse_utc(proof.get("observed_at"), f"{name} zero-progress proof time")
+    return state
 
 
 def validate_generation_ledger(value: Any) -> dict[str, Any]:

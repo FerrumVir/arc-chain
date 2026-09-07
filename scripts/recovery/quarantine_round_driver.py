@@ -425,7 +425,11 @@ def build_authorization(args: argparse.Namespace) -> dict[str, Any]:
     ):
         fail("quarantine authorization live-observation selection differs")
     authorized_at = utc_now()
-    deadline = public_completed + dt.timedelta(seconds=rounds.MAX_WINDOW_SECONDS)
+    authorization_now = rounds.parse_utc(authorized_at, "authorization now")
+    public_deadline = public_completed + dt.timedelta(seconds=rounds.MAX_WINDOW_SECONDS)
+    if authorization_now > public_deadline:
+        fail("target public receipt expired before round authorization")
+    deadline = public_deadline
     if args.round_number == 1:
         try:
             selected_at = dt.datetime.strptime(
@@ -434,11 +438,12 @@ def build_authorization(args: argparse.Namespace) -> dict[str, Any]:
         except (KeyError, TypeError, ValueError) as error:
             raise DriverError("live-observation selection timestamp differs") from error
         selection_deadline = selected_at + dt.timedelta(seconds=rounds.MAX_WINDOW_SECONDS)
-        deadline = min(deadline, selection_deadline.replace(microsecond=0))
-        if rounds.parse_utc(authorized_at, "authorization now") < selected_at:
+        selection_deadline = selection_deadline.replace(microsecond=0)
+        if authorization_now < selected_at:
             fail("quarantine authorization predates live-observation selection")
-    if rounds.parse_utc(authorized_at, "authorization now") > deadline:
-        fail("target public receipt expired before round authorization")
+        if authorization_now > selection_deadline:
+            fail("live-observation selection expired before round authorization")
+        deadline = min(deadline, selection_deadline)
     value = {
         "schema": rounds.ROUND_AUTH_SCHEMA,
         "capture_id": args.capture_id,
