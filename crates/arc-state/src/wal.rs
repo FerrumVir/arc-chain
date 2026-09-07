@@ -375,6 +375,61 @@ fn cleanup_removed_wal_tombstones(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+const WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS: usize = 400;
+#[cfg(windows)]
+const WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(5);
+
+#[cfg(windows)]
+fn retry_windows_wal_retirement_move<Move, Sleep>(
+    mut move_once: Move,
+    mut sleep: Sleep,
+) -> std::io::Result<()>
+where
+    Move: FnMut() -> std::io::Result<()>,
+    Sleep: FnMut(std::time::Duration),
+{
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    // Antivirus, backup, and indexing software can briefly open a just-closed
+    // WAL segment without FILE_SHARE_DELETE. Retry only those two transient
+    // Windows errors. Namespace conflicts, permission errors, and every other
+    // failure remain fail-closed.
+    let mut last_transient = None;
+    for attempt in 0..WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS {
+        match move_once() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == ERROR_SHARING_VIOLATION as i32
+                            || code == ERROR_LOCK_VIOLATION as i32
+                ) =>
+            {
+                last_transient = Some(error);
+                if attempt + 1 < WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS {
+                    sleep(WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_transient.expect("a bounded WAL retirement retry always records its transient error"))
+}
+
+#[cfg(windows)]
+fn move_wal_segment_to_tombstone_create_only_with_retry(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    retry_windows_wal_retirement_move(
+        || move_file_create_only_write_through(source, destination),
+        std::thread::sleep,
+    )
+}
+
 fn durably_remove_wal_segment(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -384,7 +439,7 @@ fn durably_remove_wal_segment(path: &Path) -> std::io::Result<()> {
             .and_then(|name| name.to_str())
             .unwrap_or("wal");
         let tombstone = parent.join(format!(".{file_name}.removed-{}.tmp", uuid::Uuid::new_v4()));
-        move_file_create_only_write_through(path, &tombstone)?;
+        move_wal_segment_to_tombstone_create_only_with_retry(path, &tombstone)?;
         remove_wal_tombstone_best_effort(&tombstone);
         Ok(())
     }
@@ -4079,6 +4134,119 @@ mod tests {
         drop(writer);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_retry_accepts_only_sharing_and_lock_violations() {
+        use std::collections::VecDeque;
+
+        let mut outcomes = VecDeque::from([
+            Err(std::io::Error::from_raw_os_error(32)),
+            Err(std::io::Error::from_raw_os_error(33)),
+            Ok(()),
+        ]);
+        let mut sleeps = Vec::new();
+        retry_windows_wal_retirement_move(
+            || outcomes.pop_front().expect("one configured move outcome"),
+            |duration| sleeps.push(duration),
+        )
+        .unwrap();
+        assert!(outcomes.is_empty());
+        assert_eq!(
+            sleeps,
+            vec![
+                WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY,
+                WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY,
+            ]
+        );
+
+        let mut move_attempts = 0;
+        let mut sleep_attempts = 0;
+        let error = retry_windows_wal_retirement_move(
+            || {
+                move_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(5))
+            },
+            |_| sleep_attempts += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(move_attempts, 1);
+        assert_eq!(sleep_attempts, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_retry_is_bounded() {
+        let mut move_attempts = 0;
+        let mut sleep_attempts = 0;
+        let error = retry_windows_wal_retirement_move(
+            || {
+                move_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(32))
+            },
+            |_| sleep_attempts += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(move_attempts, WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS);
+        assert_eq!(sleep_attempts, WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS - 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_move_retries_a_real_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let dir = tmp_dir("wal_create_only_move_sharing_violation");
+        let source = dir.join("wal-00000000.bin");
+        let destination = dir.join(".wal-00000000.bin.removed-test.tmp");
+        fs::write(&source, b"immutable WAL segment").unwrap();
+
+        // Deliberately omit FILE_SHARE_DELETE so MoveFileExW must return a
+        // sharing violation until this independently owned handle closes.
+        let mut blocker = Some(
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&source)
+                .unwrap(),
+        );
+        let mut sleep_attempts = 0;
+
+        retry_windows_wal_retirement_move(
+            || move_file_create_only_write_through(&source, &destination),
+            |_| {
+                sleep_attempts += 1;
+                drop(blocker.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(sleep_attempts, 1);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"immutable WAL segment");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_move_never_replaces_a_destination() {
+        let dir = tmp_dir("wal_create_only_move_existing_destination");
+        let source = dir.join("wal-00000000.bin");
+        let destination = dir.join(".wal-00000000.bin.removed-existing.tmp");
+        fs::write(&source, b"live WAL segment").unwrap();
+        fs::write(&destination, b"existing tombstone").unwrap();
+
+        let error = move_wal_segment_to_tombstone_create_only_with_retry(&source, &destination)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_ne!(error.raw_os_error(), Some(32));
+        assert_ne!(error.raw_os_error(), Some(33));
+        assert_eq!(fs::read(&source).unwrap(), b"live WAL segment");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing tombstone");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]

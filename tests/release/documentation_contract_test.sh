@@ -674,6 +674,17 @@ hardened_canary_and_vault_commands_match_current_parsers() {
             'signing-key backup runbook omits its encrypted-at-rest staging boundary' \
             || return 1
     done
+    for literal in \
+        'commands below assume that `HOME` is protected by FileVault' \
+        'FileVault-disabled operator host' \
+        'dedicated encrypted APFS sparsebundle boundary' \
+        '`HOME`, `TMPDIR`, and' \
+        '`RUNNER_TEMP`'
+    do
+        require_literal "$CANARY_RUNBOOK" "$literal" \
+            'macOS canary runbook omits its encrypted-at-rest boundary' \
+            || return 1
+    done
     help="$(python3 "$CANARY_HELPER" plan --help)" || return 1
     for option in \
         --raw-actions-zip --model --expected-commit --expected-run-id \
@@ -940,6 +951,8 @@ required_embedded_python = {
         '"$reference_snapshot_size" "$reference_snapshot_sha256" <<\'PY\'',
     "final macOS artifact handoff builder":
         '"$pretag_run_attempt" <<\'PY\'',
+    "native macOS encrypted mount verifier":
+        '"$(/usr/bin/id -u)" <<\'PY\'',
     "native macOS handoff extractor":
         '"$ARC_MACOS_PROTECTED_MAIN_SHA" <<\'PY\'',
     "historical macOS canary root verifier":
@@ -1219,9 +1232,19 @@ require(
     "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'",
     'case "$ARC_MACOS_PROTECTED_CHECKOUT" in /*)',
     "ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'",
-    'ARC_MACOS_FINAL_INPUT_ROOT="$HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
-    'ARC_MACOS_OLD_CANARY_ROOT="$HOME/.arc-pretag-community-canary"',
-    'ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    "ARC_MACOS_SECURE_IMAGE='<absolute pre-provisioned encrypted APFS sparsebundle path>'",
+    "ARC_MACOS_SECURE_HOME='<absolute mounted APFS canary home path>'",
+    'arc_require_macos_secure_canary_mount() {',
+    'image.get("image-encrypted") is not True',
+    'image.get("image-type") != "sparse bundle disk image"',
+    'disk.get("FilesystemType") != "apfs"',
+    'disk.get("DeviceNode") != mounts[0].get("dev-entry")',
+    'ARC_MACOS_FINAL_INPUT_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'ARC_MACOS_OLD_CANARY_ROOT="$ARC_MACOS_USER_HOME/.arc-pretag-community-canary"',
+    'ARC_MACOS_FINAL_CANARY_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'ARC_MACOS_PRIVATE_TMP="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-tmp-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'HOME="$ARC_MACOS_SECURE_HOME"', 'TMPDIR="$ARC_MACOS_PRIVATE_TMP"',
+    'RUNNER_TEMP="$ARC_MACOS_PRIVATE_TMP"',
     'macos_final_handoff_guest="/var/tmp/arc-macos-final-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
     '"$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/headless-macos-arm64-actions.zip"',
     '"schema", "repository", "commit", "run_id", "run_attempt"',
@@ -1231,19 +1254,28 @@ require(
     '"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"',
     'test "$old_canary_status_rc" -eq 3',
     '/usr/sbin/lsof -nP -a -iTCP:19944 -sTCP:LISTEN',
-    '"$macos_canary_helper" plan',
-    '"$macos_canary_helper" install',
-    '"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'macos_final_model="$ARC_MACOS_FINAL_INPUT_ROOT/llama-2-7b-chat.Q4_K_M.gguf"',
+    '/bin/cp -p "$macos_old_model" "$macos_final_model"',
+    'macos_final_model_destination="$ARC_MACOS_FINAL_CANARY_ROOT/model/llama-2-7b-chat.Q4_K_M.gguf"',
+    '/bin/mv "$macos_final_model" "$macos_final_model_destination"',
+    'macos_final_model="$macos_final_model_destination"',
+    'arc_macos_secure_canary plan',
+    'arc_macos_secure_canary install',
+    'arc_macos_secure_canary start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
     'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"',
     '"artifact_digest": artifact_digest', '"archive_sha256": archive_sha256',
     'final macOS acceptance does not bind the exact root/artifact tuple',
-    'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"',
+    'ARC_CANARY_TRANSFER_PARENT="$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer"',
     'ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
     'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
     '"$ARC_LIMACTL" copy --backend=scp',
 )
+if macos_transfer[1].count('--model "$macos_final_model"') != 2:
+    raise SystemExit("final canary does not use its encrypted model input exactly twice")
+if '--model "$macos_old_model"' in macos_transfer[1]:
+    raise SystemExit("final canary still consumes the model directly from unencrypted real HOME")
 require_order(
     macos_transfer[1],
     '"$ARC_LIMACTL" copy --backend=scp',
@@ -1251,11 +1283,13 @@ require_order(
     '"$macos_canary_helper" stop --root "$ARC_MACOS_OLD_CANARY_ROOT"',
     '"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"',
     'test "$old_canary_status_rc" -eq 3',
-    '"$macos_canary_helper" plan',
-    '"$macos_canary_helper" install',
-    '"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    '/bin/cp -p "$macos_old_model" "$macos_final_model"',
+    'arc_macos_secure_canary plan',
+    '/bin/mv "$macos_final_model" "$macos_final_model_destination"',
+    'arc_macos_secure_canary install',
+    'arc_macos_secure_canary start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
     'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"',
     'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
 )
@@ -1828,15 +1862,15 @@ PY
     for literal in \
         'first of two **native macOS shell** blocks' \
         'Lima root shell open and untouched' \
-        '$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>' \
+        '$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>' \
         '# BEGIN LIMA FINAL MACOS CANARY HANDOFF STAGE' \
         'arc.recovery.macos-final-canary-handoff.v1' \
         '# BEGIN NATIVE MACOS CANARY TRANSFER' \
         "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'" \
         "ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'" \
-        'ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"' \
+        'ARC_MACOS_FINAL_CANARY_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"' \
         'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"' \
-        'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"' \
+        'ARC_CANARY_TRANSFER_PARENT="$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer"' \
         '"$ARC_LIMACTL" copy --backend=scp' \
         '# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT' \
         ': "${operator_checkout:?the original Lima root shell was lost}"' \

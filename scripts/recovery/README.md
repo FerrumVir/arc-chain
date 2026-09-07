@@ -2455,18 +2455,30 @@ port, so this is deliberately a sequential handoff rather than two concurrent
 workers. The old root remains on local disk with its key, chain data, model,
 logs, and append-only evidence; only its gracefully stopped launchd
 registration is cleaned. The final root is a new content-addressed direct child
-of `HOME`, so no prior bytes can be mistaken for the release candidate.
+of a dedicated encrypted canary home, so no prior bytes can be mistaken for
+the release candidate.
 
 This is the first of two **native macOS shell** blocks in the production
 procedure; the second is the post-cutover desktop live-product gate. Run this
 block in a separate `/bin/bash` terminal as the logged-in non-root canary user;
 leave the Lima root shell open and untouched. The protected checkout is an
-absolute host path. Both input and evidence transfers remain on the
-FileVault-protected local Mac disk—not a Lima shared mount, cloud-synchronized
-directory, `/tmp`, or removable FAT/exFAT volume. The final acceptance transfer
-uses `$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>`: its private
-parent is mode 0700 and the per-release directory must be new. Changing the
-acceptance copy to mode 0400 must not change the create-only mode-0600 source.
+absolute host path. Both input and evidence transfers remain on a dedicated,
+pre-provisioned encrypted APFS sparsebundle—not a Lima shared mount,
+cloud-synchronized directory, `/tmp`, or removable FAT/exFAT volume. This is
+required even when host FileVault is disabled. The mount is re-proved against
+its exact backing image before every helper action. That live proof establishes
+that encryption is active and the mount/image/device mapping is exact; cipher
+selection is an independently reviewed image-provisioning prerequisite, not a
+property exposed by `hdiutil info`. `HOME`, `TMPDIR`, the selected final model,
+generated key, runtime data, and evidence are scoped into that mount. The old
+canary remains under the real user home and is retired before the encrypted
+helper namespace is activated because both roots share one launchd label but
+not one lock.
+The final acceptance transfer uses
+`$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>`:
+its private parent is mode 0700 and the per-release directory must be new.
+Changing the acceptance copy to mode 0400 must not change the create-only
+mode-0600 source.
 
 `ARC_OPERATOR_LIMA_INSTANCE` is the exact reviewed instance name shown by
 `limactl list`; the literal placeholder fails its allowlist and cannot
@@ -2485,11 +2497,17 @@ ARC_MACOS_PROTECTED_MAIN_SHA='<exact 40-character protected-main SHA after merge
 ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'
 ARC_OPERATOR_LIMA_INSTANCE='<exact reviewed Lima instance name>'
 ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'
+ARC_MACOS_USER_HOME="$HOME"
+ARC_MACOS_SECURE_IMAGE='<absolute pre-provisioned encrypted APFS sparsebundle path>'
+ARC_MACOS_SECURE_HOME='<absolute mounted APFS canary home path>'
 [[ "$ARC_MACOS_PROTECTED_MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$ARC_OPERATOR_LIMA_INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]
 case "$ARC_MACOS_PROTECTED_CHECKOUT" in /*) ;; *) exit 1 ;; esac
-case "$HOME" in /*) ;; *) exit 1 ;; esac
-test -d "$HOME" && test ! -L "$HOME"
+case "$ARC_MACOS_USER_HOME" in /*) ;; *) exit 1 ;; esac
+case "$ARC_MACOS_SECURE_IMAGE" in /*) ;; *) exit 1 ;; esac
+case "$ARC_MACOS_SECURE_HOME" in /*) ;; *) exit 1 ;; esac
+[[ "$ARC_MACOS_SECURE_HOME" =~ ^/[A-Za-z0-9._/+@:-]+$ ]]
+test -d "$ARC_MACOS_USER_HOME" && test ! -L "$ARC_MACOS_USER_HOME"
 test -d "$ARC_MACOS_PROTECTED_CHECKOUT" \
   && test ! -L "$ARC_MACOS_PROTECTED_CHECKOUT"
 test "$(/usr/bin/git -C "$ARC_MACOS_PROTECTED_CHECKOUT" rev-parse HEAD)" = \
@@ -2503,6 +2521,89 @@ test "$(/usr/bin/git -C "$ARC_MACOS_PROTECTED_CHECKOUT" hash-object \
   "$macos_canary_helper")" = \
   "$(/usr/bin/git -C "$ARC_MACOS_PROTECTED_CHECKOUT" rev-parse \
     "$ARC_MACOS_PROTECTED_MAIN_SHA:scripts/release/macos-community-canary.py")"
+
+arc_require_macos_secure_canary_mount() {
+  /usr/bin/python3 -I - \
+    "$ARC_MACOS_SECURE_IMAGE" \
+    "$ARC_MACOS_SECURE_HOME" \
+    "$ARC_MACOS_USER_HOME" \
+    "$(/usr/bin/id -u)" <<'PY'
+import os
+import pathlib
+import plistlib
+import stat
+import subprocess
+import sys
+
+image_path, mount_path, user_home = map(pathlib.Path, sys.argv[1:4])
+uid = int(sys.argv[4])
+blocked_parts = (
+    "/Library/CloudStorage/",
+    "/Library/Mobile Documents/",
+    "/Dropbox/",
+    "/Google Drive/",
+    "/OneDrive/",
+)
+for path, label in ((image_path, "encrypted image"), (mount_path, "encrypted mount")):
+    raw = str(path)
+    if not path.is_absolute() or any(part in raw for part in blocked_parts):
+        raise SystemExit(f"{label} is not one absolute non-cloud path")
+    metadata = path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != uid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise SystemExit(f"{label} is not one private operator-owned directory")
+if mount_path.parent != user_home or mount_path.stat().st_dev == user_home.stat().st_dev:
+    raise SystemExit("encrypted canary home is not a separate direct-child filesystem")
+
+hdiutil = plistlib.loads(
+    subprocess.run(
+        ["/usr/bin/hdiutil", "info", "-plist"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+)
+images = [row for row in hdiutil.get("images", []) if row.get("image-path") == str(image_path)]
+if len(images) != 1:
+    raise SystemExit("encrypted canary image is not mounted exactly once")
+image = images[0]
+mounts = [
+    row
+    for row in image.get("system-entities", [])
+    if row.get("mount-point") == str(mount_path)
+]
+if (
+    image.get("image-encrypted") is not True
+    or image.get("writeable") is not True
+    or image.get("image-type") != "sparse bundle disk image"
+    or image.get("owner-uid") != uid
+    or len(mounts) != 1
+    or mounts[0].get("content-hint") != "41504653-0000-11AA-AA11-00306543ECAC"
+):
+    raise SystemExit("mounted canary image is not the exact encrypted APFS sparsebundle")
+
+disk = plistlib.loads(
+    subprocess.run(
+        ["/usr/sbin/diskutil", "info", "-plist", str(mount_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+)
+if (
+    disk.get("FilesystemType") != "apfs"
+    or disk.get("BusProtocol") != "Disk Image"
+    or disk.get("MountPoint") != str(mount_path)
+    or disk.get("DeviceNode") != mounts[0].get("dev-entry")
+    or disk.get("Writable") is not True
+    or disk.get("GlobalPermissionsEnabled") is not True
+):
+    raise SystemExit("APFS volume identity does not match the encrypted image mount")
+PY
+}
+arc_require_macos_secure_canary_mount
 
 ARC_LIMACTL_COMMAND="$(command -v limactl)"
 case "$ARC_LIMACTL_COMMAND" in /*) ;; *) exit 1 ;; esac
@@ -2519,15 +2620,17 @@ test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
 test "$("$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
   /usr/bin/uname -m)" = x86_64
 
-ARC_MACOS_FINAL_INPUT_ROOT="$HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
-ARC_MACOS_OLD_CANARY_ROOT="$HOME/.arc-pretag-community-canary"
-ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+ARC_MACOS_FINAL_INPUT_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+ARC_MACOS_OLD_CANARY_ROOT="$ARC_MACOS_USER_HOME/.arc-pretag-community-canary"
+ARC_MACOS_FINAL_CANARY_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+ARC_MACOS_PRIVATE_TMP="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-tmp-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
+test "$(/usr/bin/dirname "$ARC_MACOS_OLD_CANARY_ROOT")" = "$ARC_MACOS_USER_HOME"
 for macos_canary_direct_child in \
   "$ARC_MACOS_FINAL_INPUT_ROOT" \
-  "$ARC_MACOS_OLD_CANARY_ROOT" \
-  "$ARC_MACOS_FINAL_CANARY_ROOT"
+  "$ARC_MACOS_FINAL_CANARY_ROOT" \
+  "$ARC_MACOS_PRIVATE_TMP"
 do
-  test "$(/usr/bin/dirname "$macos_canary_direct_child")" = "$HOME"
+  test "$(/usr/bin/dirname "$macos_canary_direct_child")" = "$ARC_MACOS_SECURE_HOME"
 done
 test -d "$ARC_MACOS_OLD_CANARY_ROOT" \
   && test ! -L "$ARC_MACOS_OLD_CANARY_ROOT"
@@ -2535,9 +2638,23 @@ test ! -e "$ARC_MACOS_FINAL_INPUT_ROOT" \
   && test ! -L "$ARC_MACOS_FINAL_INPUT_ROOT"
 test ! -e "$ARC_MACOS_FINAL_CANARY_ROOT" \
   && test ! -L "$ARC_MACOS_FINAL_CANARY_ROOT"
+test ! -e "$ARC_MACOS_PRIVATE_TMP" \
+  && test ! -L "$ARC_MACOS_PRIVATE_TMP"
+arc_require_macos_secure_canary_mount
 /bin/mkdir -m 0700 "$ARC_MACOS_FINAL_INPUT_ROOT"
+/bin/mkdir -m 0700 "$ARC_MACOS_PRIVATE_TMP"
 test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_MACOS_FINAL_INPUT_ROOT")" = \
   "700:1:$(/usr/bin/id -u)"
+test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_MACOS_PRIVATE_TMP")" = \
+  "700:1:$(/usr/bin/id -u)"
+
+arc_macos_secure_canary() {
+  arc_require_macos_secure_canary_mount || return 1
+  HOME="$ARC_MACOS_SECURE_HOME" \
+  TMPDIR="$ARC_MACOS_PRIVATE_TMP" \
+  RUNNER_TEMP="$ARC_MACOS_PRIVATE_TMP" \
+    "$macos_canary_helper" "$@"
+}
 macos_final_handoff_guest="/var/tmp/arc-macos-final-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
 macos_final_actions_zip="$ARC_MACOS_FINAL_INPUT_ROOT/headless-macos-arm64-actions.zip"
 macos_final_handoff_receipt="$ARC_MACOS_FINAL_INPUT_ROOT/FINAL-CANARY-HANDOFF.json"
@@ -2557,11 +2674,13 @@ do
       "$macos_final_handoff_guest/$macos_final_handoff_name")" = \
     root:root:444:1
 done
+arc_require_macos_secure_canary_mount
 "$ARC_LIMACTL" copy --backend=scp \
   "$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/headless-macos-arm64-actions.zip" \
   "$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/FINAL-CANARY-HANDOFF.json" \
   "$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/SHA256SUMS" \
   "$ARC_MACOS_FINAL_INPUT_ROOT/"
+arc_require_macos_secure_canary_mount
 for macos_final_input in \
   "$macos_final_actions_zip" \
   "$macos_final_handoff_receipt" \
@@ -2787,8 +2906,8 @@ else
   old_canary_status_rc=$?
 fi
 test "$old_canary_status_rc" -eq 3
-test ! -e "$HOME/Library/LaunchAgents/network.arc.pretag-community-canary.plist" \
-  && test ! -L "$HOME/Library/LaunchAgents/network.arc.pretag-community-canary.plist"
+test ! -e "$ARC_MACOS_USER_HOME/Library/LaunchAgents/network.arc.pretag-community-canary.plist" \
+  && test ! -L "$ARC_MACOS_USER_HOME/Library/LaunchAgents/network.arc.pretag-community-canary.plist"
 old_canary_ps_rows=''
 old_canary_ps_rc=0
 if old_canary_ps_rows="$(/bin/ps -p "$old_canary_pid" -o pid= 2>&1)"; then
@@ -2819,6 +2938,26 @@ test "$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
 test "$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
   "$macos_old_model")" = "$old_canary_model_identity"
 
+# Stage the canonical public model into the encrypted image only after the
+# historical helper namespace is fully retired. Plan reads this exact file.
+# After plan it is atomically moved into the final managed model path, so the
+# 4 GB model occupies the encrypted sparsebundle only once; install's
+# create-only resume path revalidates the already-present exact destination.
+macos_final_model="$ARC_MACOS_FINAL_INPUT_ROOT/llama-2-7b-chat.Q4_K_M.gguf"
+test ! -e "$macos_final_model" && test ! -L "$macos_final_model"
+arc_require_macos_secure_canary_mount
+/bin/cp -p "$macos_old_model" "$macos_final_model"
+/bin/chmod 0400 "$macos_final_model"
+/bin/sync
+test "$(/usr/bin/stat -f '%Lp:%l:%u:%z:%d' "$macos_final_model")" = \
+  "400:1:$(/usr/bin/id -u):4081004224:$(/usr/bin/stat -f '%d' "$ARC_MACOS_SECURE_HOME")"
+test "$(/usr/bin/shasum -a 256 "$macos_final_model" \
+  | /usr/bin/cut -d ' ' -f 1)" = \
+  08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+test "$(/usr/bin/stat -f '%d:%i:%z:%m:%c:%Lp:%l:%u' \
+  "$macos_old_model")" = "$old_canary_model_identity"
+arc_require_macos_secure_canary_mount
+
 ARC_MACOS_CANARY_CURL=/usr/bin/curl
 ARC_MACOS_CANARY_CA_BUNDLE=/private/etc/ssl/cert.pem
 test -x "$ARC_MACOS_CANARY_CURL" && test ! -L "$ARC_MACOS_CANARY_CURL"
@@ -2830,10 +2969,10 @@ ARC_MACOS_CANARY_CA_BUNDLE_SHA256="$(/usr/bin/shasum -a 256 \
   "$ARC_MACOS_CANARY_CA_BUNDLE" | /usr/bin/cut -d ' ' -f 1)"
 [[ "$ARC_MACOS_CANARY_CURL_SHA256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$ARC_MACOS_CANARY_CA_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-"$macos_canary_helper" plan \
+arc_macos_secure_canary plan \
   --root "$ARC_MACOS_FINAL_CANARY_ROOT" \
   --raw-actions-zip "$macos_final_actions_zip" \
-  --model "$macos_old_model" \
+  --model "$macos_final_model" \
   --expected-commit "$ARC_MACOS_PROTECTED_MAIN_SHA" \
   --expected-run-id "$ARC_MACOS_FINAL_RUN_ID" \
   --expected-run-attempt "$ARC_MACOS_FINAL_RUN_ATTEMPT" \
@@ -2844,10 +2983,24 @@ ARC_MACOS_CANARY_CA_BUNDLE_SHA256="$(/usr/bin/shasum -a 256 \
   --ca-bundle-sha256 "$ARC_MACOS_CANARY_CA_BUNDLE_SHA256"
 test ! -e "$ARC_MACOS_FINAL_CANARY_ROOT" \
   && test ! -L "$ARC_MACOS_FINAL_CANARY_ROOT"
-"$macos_canary_helper" install \
+macos_final_model_destination="$ARC_MACOS_FINAL_CANARY_ROOT/model/llama-2-7b-chat.Q4_K_M.gguf"
+arc_require_macos_secure_canary_mount
+/bin/mkdir -m 0700 "$ARC_MACOS_FINAL_CANARY_ROOT"
+/bin/mkdir -m 0700 "$ARC_MACOS_FINAL_CANARY_ROOT/model"
+/bin/mv "$macos_final_model" "$macos_final_model_destination"
+/bin/sync
+test ! -e "$macos_final_model" && test ! -L "$macos_final_model"
+macos_final_model="$macos_final_model_destination"
+test "$(/usr/bin/stat -f '%Lp:%l:%u:%z:%d' "$macos_final_model")" = \
+  "400:1:$(/usr/bin/id -u):4081004224:$(/usr/bin/stat -f '%d' "$ARC_MACOS_SECURE_HOME")"
+test "$(/usr/bin/shasum -a 256 "$macos_final_model" \
+  | /usr/bin/cut -d ' ' -f 1)" = \
+  08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+arc_require_macos_secure_canary_mount
+arc_macos_secure_canary install \
   --root "$ARC_MACOS_FINAL_CANARY_ROOT" \
   --raw-actions-zip "$macos_final_actions_zip" \
-  --model "$macos_old_model" \
+  --model "$macos_final_model" \
   --expected-commit "$ARC_MACOS_PROTECTED_MAIN_SHA" \
   --expected-run-id "$ARC_MACOS_FINAL_RUN_ID" \
   --expected-run-attempt "$ARC_MACOS_FINAL_RUN_ATTEMPT" \
@@ -2856,9 +3009,9 @@ test ! -e "$ARC_MACOS_FINAL_CANARY_ROOT" \
   --curl-sha256 "$ARC_MACOS_CANARY_CURL_SHA256" \
   --ca-bundle "$ARC_MACOS_CANARY_CA_BUNDLE" \
   --ca-bundle-sha256 "$ARC_MACOS_CANARY_CA_BUNDLE_SHA256"
-"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"
-"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"
-"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"
+arc_macos_secure_canary start --root "$ARC_MACOS_FINAL_CANARY_ROOT"
+arc_macos_secure_canary status --root "$ARC_MACOS_FINAL_CANARY_ROOT"
+arc_macos_secure_canary accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"
 macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"
 /usr/bin/python3 -I - \
   "$ARC_MACOS_FINAL_CANARY_ROOT/config/canary.json" \
@@ -2905,7 +3058,8 @@ if (
     raise SystemExit("final macOS acceptance does not bind the exact root/artifact tuple")
 PY
 
-ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"
+arc_require_macos_secure_canary_mount
+ARC_CANARY_TRANSFER_PARENT="$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer"
 if [ ! -e "$ARC_CANARY_TRANSFER_PARENT" ]; then
   /bin/mkdir -m 0700 "$ARC_CANARY_TRANSFER_PARENT"
 fi
@@ -2914,7 +3068,7 @@ test -d "$ARC_CANARY_TRANSFER_PARENT" \
 test "$(/usr/bin/stat -f '%Lp:%l:%u' "$ARC_CANARY_TRANSFER_PARENT")" = \
   "700:1:$(/usr/bin/id -u)"
 ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"
-case "$ARC_CANARY_TRANSFER_ROOT" in "$HOME"/*) ;; *) exit 1 ;; esac
+case "$ARC_CANARY_TRANSFER_ROOT" in "$ARC_MACOS_SECURE_HOME"/*) ;; *) exit 1 ;; esac
 macos_canary_acceptance_transfer_root="$ARC_CANARY_TRANSFER_ROOT"
 macos_canary_acceptance_transfer="$macos_canary_acceptance_transfer_root/MACOS-CANARY-ACCEPTANCE.json"
 test -f "$macos_canary_acceptance_source" && test ! -L "$macos_canary_acceptance_source"
@@ -2953,6 +3107,7 @@ lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0
   /usr/bin/test '!' -e "$lima_canary_drop_root"
 "$ARC_LIMACTL" shell "$ARC_OPERATOR_LIMA_INSTANCE" \
   /usr/bin/install -d -m 0700 "$lima_canary_drop_root"
+arc_require_macos_secure_canary_mount
 "$ARC_LIMACTL" copy --backend=scp \
   "$macos_canary_acceptance_transfer" \
   "$macos_canary_acceptance_transfer.sha256" \

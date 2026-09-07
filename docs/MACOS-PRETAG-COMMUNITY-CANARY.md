@@ -132,6 +132,13 @@ controller compares macOS `ps` output to one unambiguous complete argv. Move a
 model or materialized candidate to a simple absolute path before planning if
 needed.
 
+The commands below assume that `HOME` is protected by FileVault. Do not stage
+the selected artifact, generated worker key, chain data, or acceptance evidence
+on an unencrypted home volume. On a FileVault-disabled operator host, use the
+dedicated encrypted APFS sparsebundle boundary and fail-closed mount
+gate in `scripts/recovery/README.md`; it scopes `HOME`, `TMPDIR`, and
+`RUNNER_TEMP` into the mounted image before verification or installation.
+
 ## Materialize the exact selected preflight bytes
 
 Start from the reviewed successful `release-signing-preflight.yml` run on the
