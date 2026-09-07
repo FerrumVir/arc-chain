@@ -157,10 +157,14 @@ first mutation lease is capped at 300 seconds by paired operator monotonic and
 realtime elapsed clocks; clock regression, suspend divergence, or expiry fails
 closed. Once a create-only mutation dispatch binds the selection, crash resume
 uses each node's durable same-boot `CLOCK_BOOTTIME` acceptance lease rather
-than cross-host UTC. An expired dispatch becomes rotatable only after six exact
-challenged zero-progress proofs show no nft, selector, restart-effective write,
-or node transition. Old generations never satisfy a new status set, and
-generation files are never overwritten.
+than cross-host UTC. An expired dispatch is released only after exact challenged
+zero-progress proofs from every target in that authorization show no nft,
+selector, restart-effective write, or node transition. A released all-live
+round-1 dispatch makes the selection rotatable. In later rounds, the release
+neutralizes only that zero-progress attempt; the fully revalidated positive
+prefix keeps the selection bound while a fresh attempt targets its exact
+remaining fleet-ordered subset. Old generations never satisfy a new status
+set, and generation files are never overwritten.
 
 A positive partial dispatch has the same fail-closed boundary. Before its
 create-only result can be sealed, every remaining target must return one exact,
@@ -750,9 +754,12 @@ substitute a hand-copied top-level file for any of those paths.
    roots independently. The next round freshly samples only those remaining
    live nodes. Crash recovery reuses a durable positive result byte-for-byte and
    completes its prefix publication before any old-attempt status probe. A
-   zero-progress attempt is never appended to the transition ledger and may be
-   resampled. A positive round is never rewritten or reused as authorization
-   for a later target. Each node may cross live-to-fenced exactly once, so at
+   zero-progress attempt is never appended to the transition ledger. It may be
+   resampled only after every exact target supplies a challenged post-lease
+   live/unfenced proof; later-round release validation also replays the complete
+   immutable positive prefix before authorizing its remaining subset. A positive
+   round is never rewritten or reused as authorization for a later target. Each
+   node may cross live-to-fenced exactly once, so at
    most six positive rounds exist. The final generation ledger must cover all
    six nodes and sets the legacy cutoff to the maximum public height observed
    across all authorized rounds. There is no global all-six latch and no

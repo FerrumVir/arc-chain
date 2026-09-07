@@ -1344,7 +1344,12 @@ target's nft apply, the helper proves that round hash and deadline and writes a
 create-only node-applied receipt. A crash may leave any positive subset fenced;
 the immutable result records that subset and a later round freshly authorizes
 only the remainder. Zero-progress attempts stay outside the ledger and may be
-resampled; positive rounds are never rewritten, and no node may cross twice.
+resampled only after every target in that exact authorization returns a
+challenged post-lease live/unfenced proof. A round-1 release can rotate its
+all-live observation selection; a later-round release revalidates and preserves
+the immutable positive prefix, keeps that selection bound, and retries only its
+exact remaining fleet-ordered subset. Positive rounds are never rewritten, and
+no node may cross twice.
 The completed generation ledger has at most six rounds, covers all six nodes,
 and derives the legacy cutoff as the maximum public height across every round.
 This permits honest mixed-state resume without pretending that one local

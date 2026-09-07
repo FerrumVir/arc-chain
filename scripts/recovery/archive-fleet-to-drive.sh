@@ -4268,15 +4268,21 @@ PY
 live_observation_selection_resume_state() {
     local selection="$1" round_root="$2" current_drive_sha="$3"
     local freeze_sha="$4" capture_id="$5"
-    python3 - "$selection" "$round_root" "$current_drive_sha" "$freeze_sha" "$capture_id" <<'PY'
-import datetime,hashlib,json,os,pathlib,re,stat,sys
+    python3 - "$selection" "$round_root" "$current_drive_sha" "$freeze_sha" \
+        "$capture_id" "$QUARANTINE_ROUND_MODULE" <<'PY'
+import hashlib,importlib.util,json,os,pathlib,re,stat,sys
 selection=pathlib.Path(sys.argv[1]);round_root=pathlib.Path(sys.argv[2])
-drive_sha,freeze,capture=sys.argv[3:]
+drive_sha,freeze,capture,module_path=sys.argv[3:]
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
 digest=lambda raw:hashlib.sha256(raw).hexdigest()
 hash_re=re.compile(r"[0-9a-f]{64}");utc_format="%Y-%m-%dT%H:%M:%S.%fZ"
 if any(hash_re.fullmatch(value) is None for value in (drive_sha,freeze,capture)):
     raise SystemExit("live-observation resume identity is malformed")
+spec=importlib.util.spec_from_file_location("arc_live_observation_rounds",module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);sys.modules[spec.name]=rounds
+spec.loader.exec_module(rounds)
 def locked(path,label,maximum=32*1024*1024,links={1},modes={0o400}):
     fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
     try:
@@ -4343,80 +4349,47 @@ if not (selection.exists() or selection.is_symlink()):
 def zero_progress_released(attempt,authorization_raw,readiness_raw,dispatch_raw):
     path=attempt/"zero-progress-release.json"
     if not (path.exists() or path.is_symlink()):return False
-    release,_release_raw=locked(path,"zero-progress release")
-    fields={"schema","capture_id","freeze_plan_sha256","round_number",
-        "round_authorization_sha256","round_readiness_sha256",
-        "mutation_dispatch_sha256","live_observation_selection_sha256",
-        "live_observation_generation","observation_generation_receipt_sha256",
-        "drive_prefreeze_receipt_sha256","challenge","released_at","nodes"}
-    nodes=release.get("nodes");challenge=release.get("challenge")
+    for directory,label in ((attempt,"attempt"),(attempt.parent,"round")):
+        details=directory.lstat()
+        if (directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid!=os.geteuid()
+                or stat.S_IMODE(details.st_mode)!=0o700):
+            raise SystemExit(f"live-observation zero-progress {label} is unsafe")
     authorization=json.loads(authorization_raw)
-    targets=authorization.get("targets")
-    try:datetime.datetime.strptime(release.get("released_at"),"%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError,ValueError):
-        raise SystemExit("live-observation zero-progress release time differs")
-    if (set(release)!=fields
-            or release.get("schema")!="arc.recovery.quarantine-round-zero-progress-release.v1"
-            or release.get("round_number")!=1
-            or (release.get("capture_id"),release.get("freeze_plan_sha256"),
-                release.get("round_authorization_sha256"),release.get("round_readiness_sha256"),
-                release.get("mutation_dispatch_sha256"),
-                release.get("live_observation_selection_sha256"),
-                release.get("live_observation_generation"),
-                release.get("observation_generation_receipt_sha256"),
-                release.get("drive_prefreeze_receipt_sha256"))
-                !=(capture,freeze,digest(authorization_raw),digest(readiness_raw),
-                   digest(dispatch_raw),selection_sha,generation,generation_sha,
-                   selection_drive_sha)
-            or hash_re.fullmatch(str(challenge)) is None or not isinstance(nodes,list)
-            or not isinstance(targets,list)
-            or [row.get("node") for row in targets]
-                !=["nyc","lax","ams","lhr","nrt","sgp"]
-            or [row.get("value",{}).get("node") for row in nodes]
-                !=["nyc","lax","ams","lhr","nrt","sgp"]):
-        raise SystemExit("live-observation zero-progress release differs")
-    target_by_node={row["node"]:row for row in targets}
-    proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation",
-        "round_number","round_authorization_sha256","round_readiness_sha256",
-        "mutation_dispatch_sha256","challenge","node","boot_id","writer_live_unfenced",
-        "apply_state_present","restart_effective_mutation_absent","active_selector_absent",
-        "quarantine_nft_absent","authorization_accepted","readiness_present",
-        "accepted_boottime_ns","elapsed_since_acceptance_ns","observed_boottime_ns","observed_at"}
-    for wrapper in nodes:
-        proof=wrapper.get("value") if isinstance(wrapper,dict) else None
-        if isinstance(proof,dict):
-            accepted_ns=proof.get("accepted_boottime_ns")
-            observed_ns=proof.get("observed_boottime_ns")
-            elapsed_ns=proof.get("elapsed_since_acceptance_ns")
-            try:datetime.datetime.strptime(proof.get("observed_at"),"%Y-%m-%dT%H:%M:%SZ")
-            except (TypeError,ValueError):observed_at_valid=False
-            else:observed_at_valid=True
-        else:
-            accepted_ns=observed_ns=elapsed_ns=None;observed_at_valid=False
-        if (not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}
-                or not isinstance(wrapper.get("value"),dict)
-                or set(proof)!=proof_fields
-                or digest(canonical(proof))!=wrapper.get("sha256")
-                or proof.get("schema")!="arc.recovery.quarantine-round-zero-progress-node-proof.v1"
-                or (proof.get("capture_id"),proof.get("freeze_plan_sha256"),
-                    proof.get("observation_generation"),proof.get("round_number"),
-                    proof.get("round_authorization_sha256"),proof.get("round_readiness_sha256"),
-                    proof.get("mutation_dispatch_sha256"),proof.get("challenge"))
-                    !=(capture,freeze,generation,1,digest(authorization_raw),
-                       digest(readiness_raw),digest(dispatch_raw),challenge)
-                or proof.get("boot_id")!=target_by_node.get(proof.get("node"),{}).get("boot_id")
-                or proof.get("writer_live_unfenced") is not True
-                or proof.get("restart_effective_mutation_absent") is not True
-                or proof.get("active_selector_absent") is not True
-                or proof.get("quarantine_nft_absent") is not True
-                or proof.get("authorization_accepted") is not True
-                or not isinstance(proof.get("apply_state_present"),bool)
-                or not isinstance(proof.get("readiness_present"),bool)
-                or any(isinstance(number,bool) or not isinstance(number,int) or number<=0
-                       for number in (accepted_ns,elapsed_ns,observed_ns))
-                or observed_ns<=accepted_ns+300_000_000_000
-                or elapsed_ns!=observed_ns-accepted_ns or not observed_at_valid):
-            raise SystemExit("live-observation zero-progress node proof differs")
+    number=authorization.get("round_number")
+    if isinstance(number,bool) or not isinstance(number,int) or not 1<=number<=len(rounds.FLEET):
+        raise SystemExit("live-observation zero-progress round differs")
+    prior_authorizations=[];prior_results=[]
+    for previous in range(1,number):
+        prefix_directory=round_root/f"round-{previous}"
+        details=prefix_directory.lstat()
+        if (prefix_directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid!=os.geteuid()
+                or stat.S_IMODE(details.st_mode)!=0o700):
+            raise SystemExit("live-observation zero-progress prefix directory is unsafe")
+        prior_authorization,_=locked(
+            prefix_directory/"authorization.json",
+            f"round {previous} prefix authorization")
+        prior_result,_=locked(
+            prefix_directory/"result.json",
+            f"round {previous} prefix result")
+        prior_authorizations.append(prior_authorization);prior_results.append(prior_result)
+    release,_release_raw=locked(path,"zero-progress release")
+    result_path=attempt/"result.json"
+    result=locked(result_path,"zero-progress result")[0] \
+        if result_path.exists() or result_path.is_symlink() else None
+    transitions=attempt/"node-transitions"
+    if transitions.exists() or transitions.is_symlink():
+        details=transitions.lstat()
+        if (transitions.is_symlink() or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid!=os.geteuid()
+                or stat.S_IMODE(details.st_mode)!=0o700 or any(transitions.iterdir())):
+            raise SystemExit("live-observation zero-progress transition root differs")
+    rounds.validate_zero_progress_release(
+        release,authorization=authorization,readiness=json.loads(readiness_raw),
+        dispatch=json.loads(dispatch_raw),prior_authorizations=prior_authorizations,
+        prior_results=prior_results,result=result,expected_capture_id=capture,
+        expected_freeze_sha256=freeze,containing_round_name=attempt.parent.name)
     return True
 value,raw=locked(selection,"selection")
 fields={"schema","source_main_commit","freeze_plan_sha256","capture_id",
@@ -4443,6 +4416,17 @@ if round_root.exists() or round_root.is_symlink():
     for path in readinesses:
         authorization,authorization_raw=locked(
             path.with_name("authorization.json"),"readiness authorization")
+        _readiness,readiness_raw=locked(path,"quarantine readiness")
+        dispatch_path=path.with_name("mutation-dispatch.json")
+        if not (dispatch_path.exists() or dispatch_path.is_symlink()):
+            # Local readiness is built before dispatch publication and before
+            # any remote readiness send; alone it is a powerless crash prefix.
+            continue
+        _dispatch,dispatch_raw=locked(dispatch_path,"mutation dispatch")
+        # A fully validated release is historical evidence for its own exact
+        # selection.  Skip it before comparing against a later replacement.
+        if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
+            continue
         if ((authorization.get("capture_id"),authorization.get("freeze_plan_sha256"),
              authorization.get("live_observation_selection_sha256"),
              authorization.get("live_observation_generation"),
@@ -4451,18 +4435,15 @@ if round_root.exists() or round_root.is_symlink():
                 !=(capture,freeze,selection_sha,generation,generation_sha,
                    selection_drive_sha)):
             raise SystemExit("live-observation resume readiness authorization differs")
-        _readiness,readiness_raw=locked(path,"quarantine readiness")
-        dispatch_path=path.with_name("mutation-dispatch.json")
-        if not (dispatch_path.exists() or dispatch_path.is_symlink()):
-            # Local readiness is built before dispatch publication and before
-            # any remote readiness send; alone it is a powerless crash prefix.
-            continue
-        _dispatch,dispatch_raw=locked(dispatch_path,"mutation dispatch")
-        if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
-            continue
         bound=True
     for path in dispatches:
         dispatch,dispatch_raw=locked(path,"mutation dispatch")
+        authorization,authorization_raw=locked(path.with_name("authorization.json"),
+                                                "dispatch authorization")
+        _readiness,readiness_raw=locked(path.with_name("readiness.json"),
+                                        "dispatch readiness")
+        if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
+            continue
         if (dispatch.get("schema")!="arc.recovery.quarantine-mutation-dispatch.v1"
                 or (dispatch.get("capture_id"),dispatch.get("freeze_plan_sha256"),
                     dispatch.get("live_observation_selection_sha256"),
@@ -4472,12 +4453,6 @@ if round_root.exists() or round_root.is_symlink():
                     !=(capture,freeze,selection_sha,generation,generation_sha,
                        selection_drive_sha)):
             raise SystemExit("live-observation resume mutation dispatch differs")
-        authorization,authorization_raw=locked(path.with_name("authorization.json"),
-                                                "dispatch authorization")
-        _readiness,readiness_raw=locked(path.with_name("readiness.json"),
-                                        "dispatch readiness")
-        if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
-            continue
         bound=True
     for result_path in sorted(round_root.glob("round-*/result.json")):
         result,_result_raw=locked(result_path,"quarantine result")
@@ -4494,9 +4469,81 @@ if round_root.exists() or round_root.is_symlink():
 if bound:
     print("bound",generation);raise SystemExit(0)
 # Every unbound selection is invocation-local.  Even a wall-fresh selection is
-# rotated after the exact six-writer live/unfenced proof on a new invocation;
-# only a dispatch-bound selection may resume across an operator crash.
+# rotated on a new invocation; a released round-1 dispatch has exact all-six
+# live/unfenced proofs. Later-round releases leave their positive prefix bound.
 print("rotate",generation)
+PY
+}
+
+quarantine_zero_progress_attempt_context() {
+    local attempt_root="$1" freeze_sha="$2" capture_id="$3"
+    python3 -I - "$attempt_root" "$freeze_sha" "$capture_id" \
+        "$QUARANTINE_ROUND_MODULE" <<'PY'
+import importlib.util,json,os,pathlib,re,stat,sys
+attempt=pathlib.Path(sys.argv[1]);freeze,capture,module_path=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+if any(re.fullmatch(r"[0-9a-f]{64}",value) is None for value in (freeze,capture)):
+    raise SystemExit("zero-progress context identity is malformed")
+spec=importlib.util.spec_from_file_location("arc_zero_progress_context",module_path)
+if spec is None or spec.loader is None:raise SystemExit("cannot load quarantine-round validator")
+rounds=importlib.util.module_from_spec(spec);sys.modules[spec.name]=rounds;spec.loader.exec_module(rounds)
+def locked(path,label):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or path.is_symlink()
+                or details.st_uid!=os.geteuid() or details.st_nlink!=1
+                or stat.S_IMODE(details.st_mode)!=0o400
+                or not 0<details.st_size<=32*1024*1024):
+            raise SystemExit(f"zero-progress context {label} is unsafe")
+        raw=os.read(fd,32*1024*1024+1)
+        if len(raw)!=details.st_size:raise SystemExit(f"zero-progress context {label} changed")
+        value=json.loads(raw)
+        if raw!=canonical(value):raise SystemExit(f"zero-progress context {label} is noncanonical")
+        return value
+    finally:os.close(fd)
+for directory,label in ((attempt,"attempt"),(attempt.parent,"round"),
+                        (attempt.parent.parent,"round root")):
+    details=directory.lstat()
+    if (directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit(f"zero-progress context {label} is unsafe")
+authorization=locked(attempt/"authorization.json","authorization")
+readiness=locked(attempt/"readiness.json","readiness")
+dispatch=locked(attempt/"mutation-dispatch.json","dispatch")
+number=authorization.get("round_number")
+if isinstance(number,bool) or not isinstance(number,int) or not 1<=number<=len(rounds.FLEET):
+    raise SystemExit("zero-progress context round differs")
+prior_authorizations=[];prior_results=[]
+for previous in range(1,number):
+    prefix_directory=attempt.parent.parent/f"round-{previous}"
+    details=prefix_directory.lstat()
+    if (prefix_directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit("zero-progress context prefix directory is unsafe")
+    prior_authorizations.append(locked(
+        prefix_directory/"authorization.json",
+        f"round {previous} prefix authorization"))
+    prior_results.append(locked(
+        prefix_directory/"result.json",
+        f"round {previous} prefix result"))
+transitions=attempt/"node-transitions"
+if transitions.exists() or transitions.is_symlink():
+    details=transitions.lstat()
+    if (transitions.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700
+            or any(transitions.iterdir())):
+        raise SystemExit("zero-progress context transition root differs")
+result_path=attempt/"result.json"
+result=locked(result_path,"result") \
+    if result_path.exists() or result_path.is_symlink() else None
+state=rounds.validate_zero_progress_attempt(
+    authorization=authorization,readiness=readiness,dispatch=dispatch,
+    prior_authorizations=prior_authorizations,prior_results=prior_results,
+    result=result,expected_capture_id=capture,expected_freeze_sha256=freeze,
+    containing_round_name=attempt.parent.name)
+print(state["round_number"],state["live_observation_generation"],
+      ",".join(state["target_names"]))
 PY
 }
 
@@ -4506,7 +4553,9 @@ release_stale_zero_progress_dispatches() {
     [ -f "$selection" ] && [ ! -L "$selection" ] || return 0
     [ -d "$round_root" ] && [ ! -L "$round_root" ] || return 0
     local attempt authorization readiness dispatch auth_sha readiness_sha dispatch_sha
-    local round generation challenge proof_root node temporary release_temporary proof_failed
+    local round generation targets_csv challenge proof_root node temporary
+    local release_temporary proof_failed target_count context
+    local release_nodes=()
     while IFS= read -r attempt; do
         [ -n "$attempt" ] || continue
         authorization="$attempt/authorization.json"
@@ -4515,13 +4564,14 @@ release_stale_zero_progress_dispatches() {
         auth_sha="$(round_artifact_sha "$authorization")"
         readiness_sha="$(round_artifact_sha "$readiness")"
         dispatch_sha="$(round_artifact_sha "$dispatch")"
-        read -r round generation < <(python3 - "$authorization" "$selection" <<'PY'
-import json,pathlib,sys
-authorization=json.loads(pathlib.Path(sys.argv[1]).read_text())
-selection=json.loads(pathlib.Path(sys.argv[2]).read_text())
-print(authorization["round_number"],selection["observation_generation"])
-PY
-        )
+        context="$(quarantine_zero_progress_attempt_context \
+            "$attempt" "$freeze_sha" "$capture_id")" || die \
+            "expired zero-progress quarantine attempt failed exact prefix validation"
+        read -r round generation targets_csv <<< "$context"
+        IFS=',' read -r -a release_nodes <<< "$targets_csv"
+        target_count="${#release_nodes[@]}"
+        [ "$target_count" -gt 0 ] || die \
+            "expired zero-progress quarantine target set is empty"
         challenge="$(python3 - <<'PY'
 import secrets
 print(secrets.token_hex(32))
@@ -4530,7 +4580,7 @@ PY
         proof_root="$(prepare_protected_maintenance_directory \
             "$attempt/zero-progress-proofs-$challenge")"
         proof_failed=0
-        for node in nyc lax ams lhr nrt sgp; do
+        for node in "${release_nodes[@]}"; do
             temporary="$log_root/$node-zero-progress-$challenge.new.json"
             if ! run_remote "$node" quarantine-round-zero-progress-proof \
                 "$capture_id" "$generation" "$node" "$freeze_sha" "$round" \
@@ -4550,12 +4600,13 @@ PY
         fi
         release_temporary="$log_root/zero-progress-release-$challenge.new.json"
         python3 - "$authorization" "$readiness" "$dispatch" "$selection" \
-            "$proof_root" "$challenge" "$release_temporary" <<'PY'
+            "$proof_root" "$challenge" "$targets_csv" "$release_temporary" <<'PY'
 import datetime,hashlib,json,os,pathlib,stat,sys
-authorization_path,readiness_path,dispatch_path,selection_path,proof_root,challenge,output=sys.argv[1:]
+authorization_path,readiness_path,dispatch_path,selection_path,proof_root,challenge,targets_csv,output=sys.argv[1:]
 authorization_path=pathlib.Path(authorization_path);readiness_path=pathlib.Path(readiness_path)
 dispatch_path=pathlib.Path(dispatch_path);selection_path=pathlib.Path(selection_path)
 proof_root=pathlib.Path(proof_root);output=pathlib.Path(output)
+target_names=targets_csv.split(",")
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
 digest=lambda raw:hashlib.sha256(raw).hexdigest()
 def locked(path,label):
@@ -4581,8 +4632,6 @@ identity=(authorization["capture_id"],authorization["freeze_plan_sha256"],
           digest(dispatch_raw),digest(selection_raw),selection["observation_generation"],
           selection["observation_generation_receipt_sha256"],
           selection["drive_prefreeze_receipt_sha256"])
-if identity[2]!=1:
-    raise SystemExit("zero-progress release is only valid for the first all-live round")
 if ((readiness.get("round_authorization_sha256"),dispatch.get("round_authorization_sha256"),
      dispatch.get("round_readiness_sha256"))!=(identity[3],identity[3],identity[4])
         or (authorization.get("live_observation_selection_sha256"),
@@ -4593,7 +4642,7 @@ if ((readiness.get("round_authorization_sha256"),dispatch.get("round_authorizati
 nodes=[]
 targets=authorization.get("targets")
 if (not isinstance(targets,list) or [row.get("node") for row in targets]
-        !=["nyc","lax","ams","lhr","nrt","sgp"]):
+        !=target_names):
     raise SystemExit("zero-progress release authorization topology differs")
 target_by_node={row["node"]:row for row in targets}
 proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation",
@@ -4602,7 +4651,7 @@ proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation
  "apply_state_present","restart_effective_mutation_absent","active_selector_absent",
  "quarantine_nft_absent","authorization_accepted","readiness_present",
  "accepted_boottime_ns","elapsed_since_acceptance_ns","observed_boottime_ns","observed_at"}
-for node in ("nyc","lax","ams","lhr","nrt","sgp"):
+for node in target_names:
     value,raw=locked(proof_root/f"{node}.json",f"{node} proof")
     accepted_ns=value.get("accepted_boottime_ns");observed_ns=value.get("observed_boottime_ns")
     elapsed_ns=value.get("elapsed_since_acceptance_ns")
@@ -4643,9 +4692,16 @@ fd=os.open(output,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o
 with os.fdopen(fd,"wb") as handle:
     handle.write(raw);handle.flush();os.fsync(handle.fileno());os.fchmod(handle.fileno(),0o400)
 PY
+        quarantine_attempt_has_valid_zero_progress_release "$attempt" \
+            "$freeze_sha" "$capture_id" "$release_temporary" || die \
+            "temporary zero-progress release failed exact prefix/target validation"
         publish_canonical_maintenance_input "$release_temporary" \
             "$attempt/zero-progress-release.json"
-        printf 'archive fleet: released expired zero-progress quarantine dispatch after six challenged live/unfenced proofs\n'
+        quarantine_attempt_has_valid_zero_progress_release "$attempt" \
+            "$freeze_sha" "$capture_id" || die \
+            "published zero-progress release failed exact prefix/target validation"
+        printf 'archive fleet: released expired round %s zero-progress quarantine dispatch after %s challenged live/unfenced proofs (%s)\n' \
+            "$round" "$target_count" "$targets_csv"
     done < <(python3 - "$selection" "$round_root" "$current_drive_sha" <<'PY'
 import hashlib,json,pathlib,sys
 selection_path=pathlib.Path(sys.argv[1]);root=pathlib.Path(sys.argv[2]);_drive=sys.argv[3]
@@ -4663,8 +4719,6 @@ for readiness in sorted(root.glob("round-*/attempt.*/readiness.json")):
             !=(selection_sha,selection.get("observation_generation"),
                selection.get("observation_generation_receipt_sha256"),
                selection.get("drive_prefreeze_receipt_sha256"))):continue
-    if (authorization.get("round_number")!=1 or authorization.get("prior_fenced")
-            or authorization.get("prior_round_result_sha256s")):continue
     result=attempt/"result.json"
     if result.exists():
         value=json.loads(result.read_text())
@@ -7862,14 +7916,14 @@ PY
 
 quarantine_attempt_has_valid_zero_progress_release() {
     local attempt_root="$1" freeze_sha="$2" capture_id="$3"
-    local release="$attempt_root/zero-progress-release.json"
+    local release="${4:-$attempt_root/zero-progress-release.json}"
     [ -f "$release" ] && [ ! -L "$release" ] || return 1
-    python3 -I - "$attempt_root" "$freeze_sha" "$capture_id" \
+    python3 -I - "$attempt_root" "$release" "$freeze_sha" "$capture_id" \
         "$QUARANTINE_ROUND_MODULE" <<'PY'
-import datetime,hashlib,importlib.util,json,os,pathlib,re,stat,sys
-attempt=pathlib.Path(sys.argv[1]);freeze,capture,module_path=sys.argv[2:]
+import importlib.util,json,os,pathlib,re,stat,sys
+attempt=pathlib.Path(sys.argv[1]);release_path=pathlib.Path(sys.argv[2])
+freeze,capture,module_path=sys.argv[3:]
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
-digest=lambda raw:hashlib.sha256(raw).hexdigest()
 hash_re=re.compile(r"[0-9a-f]{64}")
 if any(hash_re.fullmatch(value) is None for value in (freeze,capture)):
     raise SystemExit("zero-progress resume identity is malformed")
@@ -7891,127 +7945,50 @@ def locked(path,label):
         if raw!=canonical(value):raise SystemExit(f"zero-progress resume {label} is noncanonical")
         return value,raw
     finally:os.close(fd)
-authorization,authorization_raw=locked(attempt/"authorization.json","authorization")
-readiness,readiness_raw=locked(attempt/"readiness.json","readiness")
-dispatch,dispatch_raw=locked(attempt/"mutation-dispatch.json","dispatch")
-release,_release_raw=locked(attempt/"zero-progress-release.json","release")
-state=rounds.validate_round_authorization(authorization,prior_results=[])
-auth_sha=digest(authorization_raw);readiness_sha=digest(readiness_raw);dispatch_sha=digest(dispatch_raw)
-targets=authorization.get("targets")
-names=[row.get("node") for row in targets] if isinstance(targets,list) else []
-if (state.get("round_number")!=1 or state.get("capture_id")!=capture
-        or state.get("freeze_plan_sha256")!=freeze
-        or names!=["nyc","lax","ams","lhr","nrt","sgp"]):
-    raise SystemExit("zero-progress resume authorization differs")
-probe={"schema":rounds.ROUND_RESULT_SCHEMA,"capture_id":capture,
-    "freeze_plan_sha256":freeze,"round_number":1,
-    "round_authorization_sha256":auth_sha,"target_readiness":rounds.wrap(readiness),
-    "transitions":[],"mutation_dispatch":rounds.wrap(dispatch),
-    "remaining_target_inert_proofs":[],"remaining_targets":names,
-    "completed_at":authorization["authorization_deadline"]}
-rounds.validate_round_result(
-    probe,authorization=authorization,prior_results=[],transition_receipts=[]
-)
-dispatch_fields={"schema","capture_id","freeze_plan_sha256","round_number",
-    "round_authorization_sha256","round_readiness_sha256",
-    "live_observation_selection_sha256","live_observation_generation",
-    "observation_generation_receipt_sha256","drive_prefreeze_receipt_sha256",
-    "targets","dispatched_at"}
-try:
-    dispatched=datetime.datetime.strptime(dispatch.get("dispatched_at"),"%Y-%m-%dT%H:%M:%SZ")
-except (TypeError,ValueError):
-    raise SystemExit("zero-progress resume dispatch time differs")
-del dispatched
-observation_identity=(authorization.get("live_observation_selection_sha256"),
-    authorization.get("live_observation_generation"),
-    authorization.get("observation_generation_receipt_sha256"),
-    authorization.get("drive_prefreeze_receipt_sha256"))
-if (set(dispatch)!=dispatch_fields
-        or dispatch.get("schema")!="arc.recovery.quarantine-mutation-dispatch.v1"
-        or (dispatch.get("capture_id"),dispatch.get("freeze_plan_sha256"),
-            dispatch.get("round_number"),dispatch.get("round_authorization_sha256"),
-            dispatch.get("round_readiness_sha256"))
-            !=(capture,freeze,1,auth_sha,readiness_sha)
-        or (dispatch.get("live_observation_selection_sha256"),
-            dispatch.get("live_observation_generation"),
-            dispatch.get("observation_generation_receipt_sha256"),
-            dispatch.get("drive_prefreeze_receipt_sha256"))!=observation_identity
-        or dispatch.get("targets")!=[
-            {"node":row.get("node"),"host":row.get("host")} for row in targets]):
-    raise SystemExit("zero-progress resume dispatch differs")
-release_fields={"schema","capture_id","freeze_plan_sha256","round_number",
-    "round_authorization_sha256","round_readiness_sha256","mutation_dispatch_sha256",
-    "live_observation_selection_sha256","live_observation_generation",
-    "observation_generation_receipt_sha256","drive_prefreeze_receipt_sha256",
-    "challenge","released_at","nodes"}
-challenge=release.get("challenge");nodes=release.get("nodes")
-try:
-    released=datetime.datetime.strptime(release.get("released_at"),"%Y-%m-%dT%H:%M:%SZ")
-except (TypeError,ValueError):
-    raise SystemExit("zero-progress resume release time differs")
-del released
-if (set(release)!=release_fields
-        or release.get("schema")!="arc.recovery.quarantine-round-zero-progress-release.v1"
-        or (release.get("capture_id"),release.get("freeze_plan_sha256"),
-            release.get("round_number"),release.get("round_authorization_sha256"),
-            release.get("round_readiness_sha256"),release.get("mutation_dispatch_sha256"))
-            !=(capture,freeze,1,auth_sha,readiness_sha,dispatch_sha)
-        or (release.get("live_observation_selection_sha256"),
-            release.get("live_observation_generation"),
-            release.get("observation_generation_receipt_sha256"),
-            release.get("drive_prefreeze_receipt_sha256"))!=observation_identity
-        or hash_re.fullmatch(str(challenge)) is None
-        or not isinstance(nodes,list) or len(nodes)!=6):
-    raise SystemExit("zero-progress resume release differs")
-target_by_node={row["node"]:row for row in targets}
-proof_fields={"schema","capture_id","freeze_plan_sha256","observation_generation",
-    "round_number","round_authorization_sha256","round_readiness_sha256",
-    "mutation_dispatch_sha256","challenge","node","boot_id","writer_live_unfenced",
-    "apply_state_present","restart_effective_mutation_absent","active_selector_absent",
-    "quarantine_nft_absent","authorization_accepted","readiness_present",
-    "accepted_boottime_ns","elapsed_since_acceptance_ns","observed_boottime_ns","observed_at"}
-for expected_node,wrapper in zip(names,nodes):
-    proof=wrapper.get("value") if isinstance(wrapper,dict) else None
-    if isinstance(proof,dict):
-        accepted=proof.get("accepted_boottime_ns");elapsed=proof.get("elapsed_since_acceptance_ns")
-        observed=proof.get("observed_boottime_ns")
-        try:seen=datetime.datetime.strptime(proof.get("observed_at"),"%Y-%m-%dT%H:%M:%SZ")
-        except (TypeError,ValueError):seen=None
-    else:accepted=elapsed=observed=seen=None
-    if (not isinstance(wrapper,dict) or set(wrapper)!={"value","sha256"}
-            or not isinstance(proof,dict) or set(proof)!=proof_fields
-            or wrapper.get("sha256")!=digest(canonical(proof))
-            or proof.get("schema")!="arc.recovery.quarantine-round-zero-progress-node-proof.v1"
-            or (proof.get("capture_id"),proof.get("freeze_plan_sha256"),
-                proof.get("observation_generation"),proof.get("round_number"),
-                proof.get("round_authorization_sha256"),proof.get("round_readiness_sha256"),
-                proof.get("mutation_dispatch_sha256"),proof.get("challenge"),proof.get("node"))
-                !=(capture,freeze,observation_identity[1],1,auth_sha,readiness_sha,
-                   dispatch_sha,challenge,expected_node)
-            or proof.get("boot_id")!=target_by_node[expected_node].get("boot_id")
-            or any(proof.get(field) is not True for field in
-                   ("writer_live_unfenced","restart_effective_mutation_absent",
-                    "active_selector_absent","quarantine_nft_absent","authorization_accepted"))
-            or not isinstance(proof.get("apply_state_present"),bool)
-            or not isinstance(proof.get("readiness_present"),bool)
-            or any(isinstance(number,bool) or not isinstance(number,int) or number<=0
-                   for number in (accepted,elapsed,observed))
-            or observed<=accepted+300_000_000_000 or elapsed!=observed-accepted
-            or seen is None):
-        raise SystemExit(f"zero-progress resume node proof differs: {expected_node}")
+for directory,label in ((attempt,"attempt"),(attempt.parent,"round"),
+                        (attempt.parent.parent,"round root")):
+    details=directory.lstat()
+    if (directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit(f"zero-progress resume {label} is unsafe")
+authorization,_authorization_raw=locked(attempt/"authorization.json","authorization")
+readiness,_readiness_raw=locked(attempt/"readiness.json","readiness")
+dispatch,_dispatch_raw=locked(attempt/"mutation-dispatch.json","dispatch")
+release,_release_raw=locked(release_path,"release")
+number=authorization.get("round_number")
+if isinstance(number,bool) or not isinstance(number,int) or not 1<=number<=len(rounds.FLEET):
+    raise SystemExit("zero-progress resume round differs")
+round_root=attempt.parent.parent
+prior_authorizations=[];prior_results=[]
+for previous in range(1,number):
+    prefix_directory=round_root/f"round-{previous}"
+    details=prefix_directory.lstat()
+    if (prefix_directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+        raise SystemExit("zero-progress resume prefix directory is unsafe")
+    prior_authorization,_=locked(
+        prefix_directory/"authorization.json",
+        f"round {previous} prefix authorization")
+    prior_result,_=locked(
+        prefix_directory/"result.json",
+        f"round {previous} prefix result")
+    prior_authorizations.append(prior_authorization);prior_results.append(prior_result)
 transitions=attempt/"node-transitions"
 if transitions.exists() or transitions.is_symlink():
     details=transitions.lstat()
-    if transitions.is_symlink() or not stat.S_ISDIR(details.st_mode):
+    if (transitions.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
         raise SystemExit("zero-progress resume transition root is unsafe")
     if any(transitions.iterdir()):raise SystemExit("zero-progress resume has a node transition")
 result_path=attempt/"result.json"
+result=None
 if result_path.exists() or result_path.is_symlink():
     result,_result_raw=locked(result_path,"result")
-    if result.get("transitions")!=[]:raise SystemExit("zero-progress resume result transitioned")
-    rounds.validate_round_result(
-        result,authorization=authorization,prior_results=[],transition_receipts=[]
-    )
+rounds.validate_zero_progress_release(
+    release,authorization=authorization,readiness=readiness,dispatch=dispatch,
+    prior_authorizations=prior_authorizations,prior_results=prior_results,
+    result=result,expected_capture_id=capture,expected_freeze_sha256=freeze,
+    containing_round_name=attempt.parent.name)
 PY
 }
 
@@ -8020,8 +7997,9 @@ quarantine_attempt_binds_live_observation_selection() {
     # Authorization, acceptances, and a locally sealed readiness are all
     # powerless crash prefixes: dispatch is published before readiness is sent
     # to any node.  Only dispatch/result/transition evidence can bind a stale
-    # attempt to its observation selection.  A complete exact six-node
-    # zero-progress release proves an otherwise-binding dispatch was inert.
+    # attempt to its observation selection.  A complete exact-target
+    # zero-progress release proves an otherwise-binding dispatch was inert;
+    # any positive immutable prefix continues to bind the selection itself.
     if quarantine_attempt_has_valid_zero_progress_release "$attempt_root" \
             "$freeze_sha" "$capture_id"; then
         return 1
@@ -8382,6 +8360,10 @@ run_quarantine_generation_rounds() {
                     die "positive quarantine round $round_number is awaiting exact remaining-target BOOTTIME closure"
                 fi
                 [ "$status" -eq 2 ] || die "quarantine round $round_number recovery failed"
+                if quarantine_attempt_binds_live_observation_selection \
+                        "$attempt_root" "$freeze_sha" "$capture_id"; then
+                    die "dispatch-bound zero-progress quarantine round $round_number requires capture resume and BOOTTIME closure"
+                fi
             fi
         done
         if [ -f "$round_dir/result.json" ] && [ ! -L "$round_dir/result.json" ]; then
@@ -8391,6 +8373,12 @@ run_quarantine_generation_rounds() {
         fi
         if [ ! -e "$round_dir" ]; then
             mkdir -m 700 -- "$round_dir"
+        fi
+        if [ "$round_number" -eq 1 ] && \
+                ! operator_selection_window_is_live \
+                    "$operator_selection_monotonic_ns" \
+                    "$operator_selection_realtime_ns"; then
+            die "live-observation selection expired before fresh quarantine round"
         fi
         attempt_root="$(mktemp -d "$round_dir/attempt.XXXXXX")"
         chmod 700 "$attempt_root"
@@ -8439,6 +8427,10 @@ run_quarantine_generation_rounds() {
                 die "positive quarantine round $round_number is awaiting exact remaining-target BOOTTIME closure"
             fi
             [ "$status" -eq 2 ] || die "fresh quarantine round failed"
+            if quarantine_attempt_binds_live_observation_selection \
+                    "$attempt_root" "$freeze_sha" "$capture_id"; then
+                die "dispatch-bound zero-progress quarantine round $round_number requires capture resume and BOOTTIME closure"
+            fi
             printf 'archive fleet: preserved zero-progress round attempt %s; resampling still-live targets\n' \
                 "$round_number"
         fi
