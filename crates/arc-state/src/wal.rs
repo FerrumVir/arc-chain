@@ -2394,7 +2394,7 @@ fn read_wal_strict_segment(
     path: &Path,
     expected_sequence: &mut Option<u64>,
 ) -> std::io::Result<Vec<WalEntry>> {
-    let file = File::open(path)?;
+    let file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
     let original_bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -2524,6 +2524,119 @@ pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntr
         all_entries.extend(read_wal_strict_segment(&segment, &mut expected_sequence)?);
     }
     Ok(all_entries)
+}
+
+/// A bounded, fail-closed view of the durable tail of a segmented legacy DAG
+/// WAL.  Legacy startup historically derives its resume cursor from the last
+/// three segments so an empty post-rotation segment cannot hide the preceding
+/// round.  Recovery uses the same bounded window, while additionally requiring
+/// a contiguous segment namespace and strict frame/checksum/sequence decoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrictWalTailInspection {
+    pub first_segment: u64,
+    pub last_segment: u64,
+    pub segment_count: u64,
+    pub inspected_first_segment: u64,
+    pub inspected_segment_count: u64,
+    pub inspected_entry_count: u64,
+    pub source_consensus_round: u64,
+}
+
+/// Strictly inspect the bounded legacy DAG-WAL tail used to derive a recovery
+/// consensus cursor.
+///
+/// Unlike [`latest_block_height_in_wal_dir`], this is fallible: namespace
+/// gaps, malformed frames, checksum failures, and sequence discontinuities in
+/// the inspected tail abort the operation.  Only the final three segments are
+/// decoded, matching the bounded legacy restart rule and avoiding an
+/// unbounded replay of historical DAG traffic during an offline cutover.
+pub fn inspect_wal_dir_tail_strict(
+    dir: impl AsRef<Path>,
+) -> std::io::Result<StrictWalTailInspection> {
+    const MAX_SEGMENTS_TO_SCAN: usize = 3;
+
+    let segments = WalWriter::list_segments_strict(dir.as_ref())?;
+    let first_segment = WalWriter::validate_segment_namespace(&segments)?;
+    let segment_count = u64::try_from(segments.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL segment count exceeds u64",
+        )
+    })?;
+    if segments.is_empty() {
+        return Ok(StrictWalTailInspection {
+            first_segment: 0,
+            last_segment: 0,
+            segment_count: 0,
+            inspected_first_segment: 0,
+            inspected_segment_count: 0,
+            inspected_entry_count: 0,
+            source_consensus_round: 0,
+        });
+    }
+
+    let start = segments.len().saturating_sub(MAX_SEGMENTS_TO_SCAN);
+    let inspected = &segments[start..];
+    let inspected_first_segment =
+        WalWriter::parse_segment_number(&inspected[0]).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL segment name: {}", inspected[0].display()),
+            )
+        })?;
+    let last_segment = WalWriter::parse_segment_number(segments.last().expect("non-empty"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "final WAL segment name is malformed",
+            )
+        })?;
+    let mut expected_sequence = (inspected_first_segment == 0).then_some(0);
+    let mut inspected_entry_count = 0u64;
+    let mut source_consensus_round = 0u64;
+    for segment in inspected {
+        let entries = read_wal_strict_segment(segment, &mut expected_sequence)?;
+        inspected_entry_count = inspected_entry_count
+            .checked_add(u64::try_from(entries.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL tail entry count exceeds u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL tail entry count overflows u64",
+                )
+            })?;
+        source_consensus_round = entries
+            .iter()
+            .map(|entry| entry.block_height)
+            .max()
+            .unwrap_or(source_consensus_round)
+            .max(source_consensus_round);
+    }
+    if segment_count > MAX_SEGMENTS_TO_SCAN as u64 && inspected_entry_count == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "latest three WAL segments are all empty",
+        ));
+    }
+
+    Ok(StrictWalTailInspection {
+        first_segment,
+        last_segment,
+        segment_count,
+        inspected_first_segment,
+        inspected_segment_count: u64::try_from(inspected.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "inspected WAL segment count exceeds u64",
+            )
+        })?,
+        inspected_entry_count,
+        source_consensus_round,
+    })
 }
 
 /// Find the highest `block_height` recorded in any WAL segment under `dir`.
@@ -4110,6 +4223,48 @@ mod tests {
             latest, 199,
             "helper must find max round even when newest segment is the empty post-rotation file"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_tail_inspection_returns_the_exact_durable_round() {
+        let dir = tmp_dir("strict_tail_round");
+        {
+            let writer = WalWriter::with_segments(&dir, 1024).expect("create");
+            for round in 0u64..200 {
+                writer.append(WalOp::Checkpoint(Hash256::ZERO), round);
+            }
+            writer.sync().unwrap();
+            drop(writer);
+        }
+
+        let inspection = inspect_wal_dir_tail_strict(&dir).unwrap();
+        assert_eq!(inspection.source_consensus_round, 199);
+        assert!(inspection.segment_count >= inspection.inspected_segment_count);
+        assert!((1..=3).contains(&inspection.inspected_segment_count));
+        assert!(inspection.inspected_entry_count > 0);
+        assert_eq!(inspection.first_segment, 0);
+        assert!(inspection.last_segment >= inspection.inspected_first_segment);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_tail_inspection_rejects_a_corrupt_final_segment() {
+        let dir = tmp_dir("strict_tail_corrupt");
+        {
+            let writer = WalWriter::with_segments(&dir, u64::MAX).expect("create");
+            writer.append(WalOp::Checkpoint(Hash256::ZERO), 77);
+            writer.sync().unwrap();
+            drop(writer);
+        }
+        let segment = dir.join("wal-00000000.bin");
+        let mut bytes = fs::read(&segment).unwrap();
+        *bytes.last_mut().expect("encoded WAL entry") ^= 0x80;
+        fs::write(&segment, bytes).unwrap();
+
+        let error = inspect_wal_dir_tail_strict(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum"));
         let _ = fs::remove_dir_all(&dir);
     }
 

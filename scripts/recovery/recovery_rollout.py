@@ -3060,8 +3060,8 @@ def verify_legacy_maintenance_stage_payloads(
             or cross_value.get("schema")
             != "arc.recovery.legacy-network-quarantine-public-cross-proof.v1"
             or persisted_value.get("schema") not in {
-                "arc.recovery.persisted-legacy-head.v1",
-                "arc.recovery.persisted-legacy-head.v2",
+                "arc.recovery.persisted-legacy-head.v3",
+                "arc.recovery.persisted-legacy-head.v4",
             }
             or persisted_value.get("source_main_commit") != source_commit
             or persisted_value.get("source_pair_role")
@@ -3072,6 +3072,13 @@ def verify_legacy_maintenance_stage_payloads(
             or persisted_value.get("global_absence_claimed") is not False
         ):
             fail(f"legacy maintenance {node} retained object policy differs")
+        try:
+            quarantine_rounds.validate_legacy_dag_round(
+                persisted_value.get("legacy_dag_round"),
+                f"legacy maintenance {node}",
+            )
+        except quarantine_rounds.QuarantineRoundError as error:
+            fail(f"legacy maintenance {node} durable DAG proof differs: {error}")
         exact_hash(
             persisted_value.get("final_source_capture_sha256"),
             f"legacy maintenance {node} final source capture root",
@@ -3110,7 +3117,7 @@ def verify_legacy_maintenance_stage_payloads(
         if selected_source_head != persisted_head:
             fail(f"legacy maintenance {node} selected final source head differs")
         normalized_persisted = persisted_value.get("schema") \
-            == "arc.recovery.persisted-legacy-head.v2"
+            == "arc.recovery.persisted-legacy-head.v4"
         archived_required = ["path", "sha256", "size", "file_identity", "preserved_by"]
         if normalized_persisted:
             archived_required += ["source_relation", "normalization_receipt_sha256",

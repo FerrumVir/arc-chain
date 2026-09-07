@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import base64
 import contextlib
+import datetime as dt
 import hashlib
 import importlib.util
 import io
@@ -29,6 +30,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = REPO_ROOT / "scripts" / "release" / "restore-validator-vault.py"
 FREEZE_TEST = REPO_ROOT / "scripts" / "recovery" / "test_recovery_freeze.py"
+QUARANTINE_TEST = REPO_ROOT / "scripts" / "recovery" / "test_quarantine_rounds.py"
 SOURCE_COMMIT = "a" * 40
 NODES = (
     ("NYC", "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f", 6_666_667),
@@ -200,6 +202,16 @@ def fake_live_proof(helper, kwargs: dict):
 
 def load_freeze_fixture_module():
     spec = importlib.util.spec_from_file_location("arc_vault_freeze_fixture", FREEZE_TEST)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_quarantine_fixture_module():
+    spec = importlib.util.spec_from_file_location(
+        "arc_vault_quarantine_fixture", QUARANTINE_TEST
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -537,10 +549,79 @@ class Fixture:
                     "stopped_status_argv_sha256": hashlib.sha256(canonical(argv)).hexdigest(),
                 }
             )
-        first_quarantine = "2026-08-28T12:00:00Z"
-        all_stopped = "2026-08-28T12:02:30Z"
         challenge = "9" * 64
         public_receipt_sha = "8" * 64
+        quarantine_fixture = load_quarantine_fixture_module()
+        quarantine_fixture.CAPTURE = capture_id
+        quarantine_fixture.FREEZE = plan_sha
+        quarantine_fixture.SOURCE = SOURCE_COMMIT
+        quarantine_fixture.BASE = dt.datetime(
+            2026, 8, 28, 11, 50, tzinfo=dt.timezone.utc
+        )
+        drive_value = {"schema": "arc.fixture.drive-prefreeze.v1"}
+        drive_wrapper = {
+            "path": "/private/arc-fixture/drive-prefreeze.json",
+            "sha256": hashlib.sha256(canonical(drive_value)).hexdigest(),
+            "value": drive_value,
+        }
+        observation_generation = "7" * 64
+        generation_receipt = {
+            "schema": "arc.recovery.legacy-live-observation-generation.v1",
+            "source_main_commit": SOURCE_COMMIT,
+            "freeze_plan_sha256": plan_sha,
+            "capture_id": capture_id,
+            "observation_generation": observation_generation,
+            "created_at": "2026-08-28T11:56:40.000000Z",
+            "max_selection_age_seconds": 300,
+            "drive_prefreeze_receipt": drive_wrapper,
+        }
+        generation_sha = hashlib.sha256(canonical(generation_receipt)).hexdigest()
+        selection = {
+            "schema": "arc.recovery.legacy-live-observation-selection.v1",
+            "source_main_commit": SOURCE_COMMIT,
+            "freeze_plan_sha256": plan_sha,
+            "capture_id": capture_id,
+            "observation_generation": observation_generation,
+            "observation_generation_receipt": generation_receipt,
+            "observation_generation_receipt_path": (
+                f"/private/arc-fixture/{observation_generation}.json"
+            ),
+            "observation_generation_receipt_sha256": generation_sha,
+            "drive_prefreeze_receipt_path": drive_wrapper["path"],
+            "drive_prefreeze_receipt_sha256": drive_wrapper["sha256"],
+            "generation_created_at": generation_receipt["created_at"],
+            "selected_at": "2026-08-28T11:56:42.000000Z",
+            "max_selection_age_seconds": 300,
+            "labels": ["diagnostic", "noncanonical", "nonreward"],
+            "nodes": [
+                {
+                    "node": row["name"],
+                    "created_at": "2026-08-28T11:56:40.000000Z",
+                    "completed_at": "2026-08-28T11:56:41.000000Z",
+                    "root_sha256": f"{700 + index:064x}",
+                    "receipt_sha256": f"{800 + index:064x}",
+                }
+                for index, row in enumerate(value["nodes"])
+            ],
+        }
+        selection_sha = hashlib.sha256(canonical(selection)).hexdigest()
+        quarantine_fixture.H["91"] = selection_sha
+        quarantine_fixture.H["92"] = observation_generation
+        quarantine_fixture.H["93"] = generation_sha
+        quarantine_fixture.H["94"] = drive_wrapper["sha256"]
+        ledger = quarantine_fixture.ledger_for_first_successes(0)
+        quarantine_fixture.qr.validate_generation_ledger(ledger)
+        first_quarantine = ledger["first_secured_at"]
+        all_stopped = "2026-08-28T12:02:30Z"
+        transition_wrappers = {
+            wrapper["value"]["node"]: wrapper
+            for round_row in ledger["rounds"]
+            for wrapper in round_row["result"]["value"]["transitions"]
+        }
+        transition_projections = {
+            node: quarantine_fixture.qr.validate_node_transition(wrapper["value"])
+            for node, wrapper in transition_wrappers.items()
+        }
         authenticated_rows = []
         for row in value["nodes"]:
             auth_proof = {
@@ -576,6 +657,60 @@ class Fixture:
             "capture_id": capture_id,
             "challenge": challenge,
         }
+        ledger_sha = hashlib.sha256(canonical(ledger)).hexdigest()
+        active_roots = [
+            {"node": row["name"], "sha256": transition_wrappers[row["name"]]["sha256"]}
+            for row in value["nodes"]
+        ]
+        stability_rows = []
+        stability_heads = []
+        for index, row in enumerate(value["nodes"]):
+            head = transition_projections[row["name"]]["stable_head"]
+            samples = []
+            for sample_index in (0, 1):
+                sample = {
+                    "schema": "arc.recovery.legacy-network-quarantine-stability-sample.v1",
+                    "capture_id": capture_id,
+                    "node": row["name"],
+                    "freeze_plan_sha256": plan_sha,
+                    "challenge": challenge,
+                    "sample_index": sample_index,
+                    "started_at": "2026-08-28T12:00:03Z",
+                    "completed_at": "2026-08-28T12:00:04Z",
+                    "quarantine_status_before": {},
+                    "quarantine_status_before_sha256": "1" * 64,
+                    "quarantine_status_after": {},
+                    "quarantine_status_after_sha256": "2" * 64,
+                    "writer": {"state": "fixture-stopped"},
+                    "listener_ownership": [],
+                    "head": {
+                        **head,
+                        "response_sha256": {
+                            "info_before": "3" * 64,
+                            "latest": "4" * 64,
+                            "exact": "5" * 64,
+                            "info_after": "6" * 64,
+                        },
+                        "stable_attempt": 1,
+                    },
+                    "output_deny_packets": 10 + sample_index,
+                    "ss_sha256": "7" * 64,
+                    "global_absence_claimed": False,
+                }
+                samples.append(
+                    {"value": sample, "sha256": hashlib.sha256(canonical(sample)).hexdigest()}
+                )
+            stability_rows.append(
+                {
+                    "node": row["name"],
+                    "host": row["host"],
+                    "samples": samples,
+                    "output_deny_packets": {"sample_0": 10, "sample_1": 11},
+                }
+            )
+            stability_heads.append(
+                {"node": row["name"], "host": row["host"], "head": head}
+            )
         stability = {
             "schema": "arc.recovery.legacy-network-quarantine-stability.v1",
             "source_main_commit": SOURCE_COMMIT,
@@ -587,13 +722,11 @@ class Fixture:
             "started_at": "2026-08-28T12:00:03Z",
             "completed_at": "2026-08-28T12:02:03Z",
             "monotonic_elapsed_ns": 120_000_000_000,
-            "fleet_heads": [
-                {"node": row["name"], "host": row["host"]} for row in value["nodes"]
-            ],
-            "nodes": [
-                {"node": row["name"], "host": row["host"]} for row in value["nodes"]
-            ],
+            "fleet_heads": stability_heads,
+            "nodes": stability_rows,
             "global_absence_claimed": False,
+            "quarantine_generation_ledger_sha256": ledger_sha,
+            "active_transition_sha256s": active_roots,
         }
         inventory = []
 
@@ -606,6 +739,12 @@ class Fixture:
         authenticated_sealed = sealed(
             authenticated, "fleet", "authenticated-prefence-height-cross-proof"
         )
+        selection_sealed = sealed(
+            selection, "fleet", "live-observation-selection"
+        )
+        ledger_sealed = sealed(
+            ledger, "fleet", "quarantine-generation-ledger"
+        )
         challenge_sealed = sealed(
             quarantine_challenge, "fleet", "network-quarantine-challenge"
         )
@@ -617,15 +756,44 @@ class Fixture:
             node = plan_row["name"]
             host = plan_row["host"]
             stopped_status = json.loads((status_root / f"{host}.json").read_text())
+            transition_wrapper = transition_wrappers[node]
+            network_wrapper = transition_wrapper["value"]["network_quarantine_receipt"]
+            head = transition_projections[node]["stable_head"]
             quarantine_status = {
                 "schema": "arc.recovery.legacy-network-quarantine-status.v1",
                 "capture_id": capture_id,
                 "node": node,
                 "freeze_plan_sha256": plan_sha,
+                "receipt_sha256": network_wrapper["sha256"],
+                "table": {},
+                "rule_counters": {},
+                "counter_snapshot_sha256": "1" * 64,
+                "owned_ruleset_stateless_sha256": "2" * 64,
+                "listener_inventory": [],
+                "loopback_head": {},
+                "quarantine_policy": {},
                 "active": True,
                 "enabled": True,
             }
             post_status = dict(quarantine_status)
+            monitor = {
+                "schema": "arc.recovery.legacy-network-quarantine-monitor.v1",
+                "capture_id": capture_id,
+                "node": node,
+                "freeze_plan_sha256": plan_sha,
+                "network_quarantine_receipt_sha256": network_wrapper["sha256"],
+                "monitor_contract_sha256": "3" * 64,
+                "semantic_interpreter": {},
+                "firewall_loader_inventory": [],
+                "file_sha256": {},
+                "unit": {},
+                "legacy_exec_start_pre": {},
+                "incident_latched": False,
+                "continuous_fail_closed": True,
+                "automatic_unfence": False,
+                "global_absence_claimed": False,
+            }
+            status_sha = hashlib.sha256(canonical(quarantine_status)).hexdigest()
             external = {
                 "schema": "arc.recovery.legacy-network-quarantine-external-proof.v1",
                 "capture_id": capture_id,
@@ -633,6 +801,11 @@ class Fixture:
                 "host": host,
                 "freeze_plan_sha256": plan_sha,
                 "challenge": challenge,
+                "network_quarantine_receipt_sha256": network_wrapper["sha256"],
+                "before_status_sha256": status_sha,
+                "after_status": post_status,
+                "after_status_sha256": hashlib.sha256(canonical(post_status)).hexdigest(),
+                "ssh_status_reproved": True,
                 "global_absence_claimed": False,
             }
             public_cross = {
@@ -641,25 +814,80 @@ class Fixture:
                 "node": node,
                 "freeze_plan_sha256": plan_sha,
                 "challenge": challenge,
+                "network_quarantine_receipt_sha256": network_wrapper["sha256"],
+                "quarantine_status": quarantine_status,
+                "quarantine_status_sha256": status_sha,
+                "fenced_head_covers_public_info_after": True,
+                "public_latest_hash_matches": True,
                 "global_absence_claimed": False,
             }
+            namespace = {
+                "schema": "arc.recovery.legacy-dag-wal-namespace.v1",
+                "segment_names": ["wal-00000000.bin"],
+                "inspected_tail": [
+                    {"name": "wal-00000000.bin", "sha256": "4" * 64, "size": 128}
+                ],
+            }
+            namespace_sha = hashlib.sha256(
+                json.dumps(namespace, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            dag_inspection = {
+                "schema": "arc.recovery.legacy-dag-round-inspection.v1",
+                "status": "VERIFIED_STOPPED_DAG_CURSOR",
+                "source_consensus_round": 9_999,
+                "first_segment": 0,
+                "last_segment": 0,
+                "segment_count": 1,
+                "inspected_first_segment": 0,
+                "inspected_segment_count": 1,
+                "inspected_entry_count": 1,
+                "namespace_sha256": namespace_sha,
+                "namespace": namespace,
+                "read_only": True,
+            }
             persisted = {
-                "schema": "arc.recovery.persisted-legacy-head.v1",
+                "schema": "arc.recovery.persisted-legacy-head.v3",
                 "source_main_commit": SOURCE_COMMIT,
                 "capture_id": capture_id,
                 "node": node,
+                "host": host,
                 "freeze_plan_sha256": plan_sha,
+                "source_pair_role": "post-quarantine-final-export",
+                "selected_source_head": head,
+                "head": head,
+                "final_source_capture_sha256": "5" * 64,
+                "stop_after_round_receipt_sha256": "6" * 64,
                 "writer_stopped": True,
                 "restart_barrier_active": True,
                 "network_quarantine_active": True,
                 "global_absence_claimed": False,
+                "legacy_dag_round": {
+                    "source_consensus_round": 9_999,
+                    "namespace_sha256": namespace_sha,
+                    "inspection": dag_inspection,
+                    "inspection_sha256": hashlib.sha256(canonical(dag_inspection)).hexdigest(),
+                },
+                "trusted_anchor_ancestry": {
+                    "anchor_height": 137145,
+                    "anchor_block_hash": "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+                    "anchor_state_root": "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+                    "classification": "below_trusted_anchor",
+                    "inspection": None,
+                    "inspection_sha256": hashlib.sha256(canonical(None)).hexdigest(),
+                },
             }
             bundle_nodes.append(
                 {
                     "node": node,
                     "host": host,
                     "stopped_status": sealed(stopped_status, node, "stopped-status"),
+                    "network_quarantine_receipt": sealed(
+                        network_wrapper["value"], node, "network-quarantine-receipt"
+                    ),
                     "quarantine_status": sealed(quarantine_status, node, "quarantine-status"),
+                    "quarantine_monitor": sealed(
+                        monitor, node, "network-quarantine-monitor"
+                    ),
                     "post_proof_quarantine_status": sealed(
                         post_status, node, "post-proof-quarantine-status"
                     ),
@@ -686,7 +914,9 @@ class Fixture:
             "first_quarantine_started_at": first_quarantine,
             "all_controlled_stopped_at": all_stopped,
             "challenge": challenge,
+            "live_observation_selection": selection_sealed,
             "authenticated_prefence_height_cross_proof": authenticated_sealed,
+            "quarantine_generation_ledger": ledger_sealed,
             "network_quarantine_challenge": challenge_sealed,
             "quarantine_stability_proof": stability_sealed,
             "nodes": bundle_nodes,
@@ -751,6 +981,11 @@ class Fixture:
                 "observed_max_height": 100,
             },
             "authenticated_prefence_height_cross_proof_sha256": authenticated_sealed["sha256"],
+            "legacy_live_observation_selection_sha256": selection_sealed["sha256"],
+            "legacy_live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": generation_sha,
+            "drive_prefreeze_receipt_sha256": drive_wrapper["sha256"],
+            "quarantine_generation_ledger_sha256": ledger_sealed["sha256"],
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
             "network_quarantine_stability_proof_sha256": stability_sealed["sha256"],
             "network_quarantine_challenge": challenge,
@@ -820,6 +1055,11 @@ class Fixture:
             "legacy_maintenance_boundary": boundary,
             "legacy_maintenance_boundary_sha256": boundary_sha,
             "legacy_maintenance_evidence_bundle_sha256": bundle_sha,
+            "legacy_live_observation_selection_sha256": selection_sealed["sha256"],
+            "legacy_live_observation_generation": observation_generation,
+            "observation_generation_receipt_sha256": generation_sha,
+            "drive_prefreeze_receipt_sha256": drive_wrapper["sha256"],
+            "quarantine_generation_ledger_sha256": ledger_sealed["sha256"],
             "nodes": evidence_rows,
         }
         proof_path = self.root / "offline-stop-evidence.json"
@@ -1084,6 +1324,221 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         self.assertIn(expected, result.stderr)
         self.assertFalse(self.fixture.output.exists())
 
+    def maintenance_union_bundle(
+        self, stopped_names: set[str]
+    ) -> tuple[object, Path, str, dict, dict]:
+        """Rewrite the valid active fixture as a sealed tagged-union bundle."""
+
+        plan, plan_sha, bundle_path, _bundle_sha, *_rest = self.fixture.write_freeze_inputs()
+        helper = load_helper_module()
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        ledger = bundle["quarantine_generation_ledger"]["value"]
+        result = ledger["rounds"][0]["result"]["value"]
+        transitions = {
+            wrapper["value"]["node"]: wrapper for wrapper in result["transitions"]
+        }
+        rows = {row["node"]: row for row in bundle["nodes"]}
+
+        def wrap(value: dict) -> dict:
+            return {"value": value, "sha256": hashlib.sha256(canonical(value)).hexdigest()}
+
+        for node in stopped_names:
+            persisted = copy.deepcopy(rows[node]["persisted_head"]["value"])
+            persisted["schema"] = "arc.recovery.persisted-legacy-head-stopped-precommit.v2"
+            persisted["source_pair_role"] = "preauthorization-boundary"
+            persisted["network_quarantine_active"] = False
+            persisted_wrapper = wrap(persisted)
+            fence = wrap({"schema": "arc.fixture.restart-fence.v1", "node": node})
+            precommit = wrap({"schema": "arc.fixture.precommit.v1", "node": node})
+            transition = {
+                "schema": helper.quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA,
+                "source_main_commit": SOURCE_COMMIT,
+                "capture_id": bundle["capture_id"],
+                "freeze_plan_sha256": bundle["freeze_plan_sha256"],
+                "node": node,
+                "host": rows[node]["host"],
+                "stable_head": persisted["head"],
+                "secured_at": ledger["first_secured_at"],
+                "persistent_restart_fence": fence,
+                "precommit_status": precommit,
+                "persisted_head": persisted_wrapper,
+            }
+            transition_wrapper = wrap(transition)
+            transitions[node] = transition_wrapper
+            current = {
+                "schema": "arc.recovery.quarantine-prior-persistently-stopped-status.v1",
+                "capture_id": bundle["capture_id"],
+                "freeze_plan_sha256": bundle["freeze_plan_sha256"],
+                "node": node,
+                "host": rows[node]["host"],
+                "node_transition_receipt_sha256": transition_wrapper["sha256"],
+                "transition_schema": helper.quarantine_rounds.NODE_STOPPED_PRECOMMIT_SCHEMA,
+                "transitioned_at": ledger["first_secured_at"],
+                "observed_at": "2026-08-28T12:02:20Z",
+                "writer_state": "persistently-stopped",
+                "current_boot_id": "00000000-0000-0000-0000-000000000001",
+                "stable_head": persisted["head"],
+                "persistent_restart_fence_sha256": fence["sha256"],
+                "precommit_status_sha256": precommit["sha256"],
+                "source_inputs": {},
+                "nft_table_absent": True,
+                "applied_commit_absent": True,
+                "active_selector_absent": True,
+                "fence_unit_enabled": True,
+                "fence_unit_active": False,
+                "automatic_legacy_restart": False,
+            }
+            rows[node] = {
+                "node": node,
+                "host": rows[node]["host"],
+                "transition_kind": helper.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND,
+                "transition_receipt": transition_wrapper,
+                "current_status": wrap(current),
+                "persisted_head": persisted_wrapper,
+            }
+
+        result["transitions"] = [
+            transitions[node.lower()] for node, _address, _stake in NODES
+        ]
+        ledger["rounds"][0]["result"] = wrap(result)
+        bundle["quarantine_generation_ledger"] = wrap(ledger)
+        active_names = [
+            node.lower() for node, _address, _stake in NODES
+            if node.lower() not in stopped_names
+        ]
+        stability = bundle["quarantine_stability_proof"]["value"]
+        stability["nodes"] = [row for row in stability["nodes"] if row["node"] in active_names]
+        stability["fleet_heads"] = [
+            row for row in stability["fleet_heads"] if row["node"] in active_names
+        ]
+        stability["quarantine_generation_ledger_sha256"] = bundle[
+            "quarantine_generation_ledger"
+        ]["sha256"]
+        stability["active_transition_sha256s"] = [
+            {"node": node, "sha256": transitions[node]["sha256"]}
+            for node in active_names
+        ]
+        stability["interval_seconds"] = 120 if active_names else 0
+        stability["sample_count"] = 2 if active_names else 0
+        stability["monotonic_elapsed_ns"] = 120_000_000_000 if active_names else 0
+        bundle["quarantine_stability_proof"] = wrap(stability)
+        bundle["nodes"] = [rows[node.lower()] for node, _address, _stake in NODES]
+
+        inventory = []
+
+        def reseal(field: str, node: str, role: str) -> None:
+            wrapper = bundle[field] if node == "fleet" else rows[node][field]
+            wrapper["sha256"] = hashlib.sha256(canonical(wrapper["value"])).hexdigest()
+            inventory.append(
+                {
+                    "node": node,
+                    "role": role,
+                    "sha256": wrapper["sha256"],
+                    "size": len(canonical(wrapper["value"])),
+                }
+            )
+
+        for field, role in (
+            ("authenticated_prefence_height_cross_proof", "authenticated-prefence-height-cross-proof"),
+            ("live_observation_selection", "live-observation-selection"),
+            ("quarantine_generation_ledger", "quarantine-generation-ledger"),
+            ("network_quarantine_challenge", "network-quarantine-challenge"),
+            ("quarantine_stability_proof", "network-quarantine-stability-proof"),
+        ):
+            reseal(field, "fleet", role)
+        for upper_node, _address, _stake in NODES:
+            node = upper_node.lower()
+            if node in stopped_names:
+                specs = (
+                    ("transition_receipt", "persistently-stopped-transition"),
+                    ("current_status", "stopped-current-status"),
+                    ("persisted_head", "persisted-head"),
+                )
+            else:
+                specs = (
+                    ("stopped_status", "stopped-status"),
+                    ("network_quarantine_receipt", "network-quarantine-receipt"),
+                    ("quarantine_status", "quarantine-status"),
+                    ("quarantine_monitor", "network-quarantine-monitor"),
+                    ("post_proof_quarantine_status", "post-proof-quarantine-status"),
+                    ("external_quarantine_proof", "external-quarantine-proof"),
+                    ("public_cross_proof", "public-cross-proof"),
+                    ("persisted_head", "persisted-head"),
+                )
+            for field, role in specs:
+                reseal(field, node, role)
+        bundle["object_inventory"] = inventory
+        bundle["aggregate_root_sha256"] = hashlib.sha256(
+            canonical(
+                {
+                    "schema": "arc.recovery.legacy-maintenance-evidence-inventory.v1",
+                    "objects": inventory,
+                }
+            )
+        ).hexdigest()
+        bundle_path.chmod(0o600)
+        create(bundle_path, canonical(bundle), 0o400)
+        bundle_sha = digest(bundle_path)
+        sidecar = bundle_path.with_name(bundle_path.name + ".sha256")
+        sidecar.chmod(0o600)
+        create(sidecar, f"{bundle_sha}  {bundle_path.name}\n".encode(), 0o400)
+        return plan, bundle_path, bundle_sha, bundle, helper
+
+    def validate_union_bundle(
+        self, stopped_names: set[str]
+    ) -> tuple[dict, dict[str, dict], object]:
+        plan, path, root, bundle, helper = self.maintenance_union_bundle(stopped_names)
+        selection = bundle["live_observation_selection"]
+        state = {
+            "capture_id": bundle["capture_id"],
+            "freeze_plan_sha256": bundle["freeze_plan_sha256"],
+            "all_nodes_secured_at": dt.datetime(
+                2026, 8, 28, 12, 2, 0, tzinfo=dt.timezone.utc
+            ),
+            "live_observation_selection_sha256": selection["sha256"],
+            "live_observation_generation": selection["value"]["observation_generation"],
+            "observation_generation_receipt_sha256": selection["value"][
+                "observation_generation_receipt_sha256"
+            ],
+            "drive_prefreeze_receipt_sha256": selection["value"][
+                "drive_prefreeze_receipt_sha256"
+            ],
+        }
+
+        def projection(transition: dict) -> dict:
+            stopped = transition["node"] in stopped_names
+            return {
+                "kind": (
+                    helper.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                    if stopped else helper.quarantine_rounds.ACTIVE_TRANSITION_KIND
+                ),
+                "source_main_commit": SOURCE_COMMIT,
+                "stable_head": transition["stable_head"],
+            }
+
+        with (
+            mock.patch.object(
+                helper.quarantine_rounds, "validate_generation_ledger", return_value=state
+            ),
+            mock.patch.object(
+                helper.quarantine_rounds, "validate_node_transition", side_effect=projection
+            ),
+            mock.patch.object(
+                helper.quarantine_rounds,
+                "validate_prior_fenced_status",
+                return_value=dt.datetime(2026, 8, 28, 12, 2, 20, tzinfo=dt.timezone.utc),
+            ),
+        ):
+            parsed, nodes, _ = helper.load_legacy_maintenance_evidence_bundle(
+                path,
+                path.with_name(path.name + ".sha256"),
+                root,
+                source_commit=SOURCE_COMMIT,
+                freeze_sha256=bundle["freeze_plan_sha256"],
+                freeze_plan=plan,
+            )
+        return parsed, nodes, helper
+
     def test_restore_produces_only_six_keys_public_manifest_and_private_receipt(self) -> None:
         result = self.fixture.restore()
         self.assertIn("six reviewed identities verified", result.stdout)
@@ -1304,6 +1759,83 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         result = run(linked, success=False)
         self.assertIn("single-link, non-writable regular file", result.stderr)
         self.assertFalse(self.fixture.output.exists())
+
+    def test_maintenance_bundle_accepts_mixed_active_and_persistently_stopped_union(self) -> None:
+        stopped = {"lhr", "nrt", "sgp"}
+        bundle, nodes, helper = self.validate_union_bundle(stopped)
+        self.assertEqual(
+            [row["node"] for row in bundle["quarantine_stability_proof"]["value"]["nodes"]],
+            ["nyc", "lax", "ams"],
+        )
+        for node in stopped:
+            self.assertEqual(
+                nodes[node.upper()]["transition_kind"],
+                helper.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND,
+            )
+        for node in {"nyc", "lax", "ams"}:
+            self.assertEqual(
+                nodes[node.upper()]["transition_kind"],
+                helper.quarantine_rounds.ACTIVE_TRANSITION_KIND,
+            )
+
+    def test_maintenance_bundle_accepts_all_stopped_zero_sample_union(self) -> None:
+        stopped = {node.lower() for node, _address, _stake in NODES}
+        bundle, nodes, helper = self.validate_union_bundle(stopped)
+        stability = bundle["quarantine_stability_proof"]["value"]
+        self.assertEqual(stability["nodes"], [])
+        self.assertEqual(stability["fleet_heads"], [])
+        self.assertEqual(stability["active_transition_sha256s"], [])
+        self.assertEqual(stability["interval_seconds"], 0)
+        self.assertEqual(stability["sample_count"], 0)
+        self.assertEqual(stability["monotonic_elapsed_ns"], 0)
+        self.assertTrue(
+            all(
+                row["transition_kind"]
+                == helper.quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                for row in nodes.values()
+            )
+        )
+
+    def test_maintenance_bundle_rejects_resealed_embedded_dag_tamper(self) -> None:
+        plan, plan_sha, bundle_path, _bundle_sha, *_rest = self.fixture.write_freeze_inputs()
+        helper = load_helper_module()
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        row = bundle["nodes"][0]
+        persisted = row["persisted_head"]["value"]
+        persisted["legacy_dag_round"]["inspection"]["source_consensus_round"] += 1
+        # Re-seal every outer layer an attacker controls, but deliberately
+        # leave the independently recomputed embedded inspection root intact.
+        persisted_raw = canonical(persisted)
+        row["persisted_head"]["sha256"] = hashlib.sha256(persisted_raw).hexdigest()
+        inventory_row = next(
+            item for item in bundle["object_inventory"]
+            if item["node"] == "nyc" and item["role"] == "persisted-head"
+        )
+        inventory_row["sha256"] = row["persisted_head"]["sha256"]
+        inventory_row["size"] = len(persisted_raw)
+        bundle["aggregate_root_sha256"] = hashlib.sha256(
+            canonical(
+                {
+                    "schema": "arc.recovery.legacy-maintenance-evidence-inventory.v1",
+                    "objects": bundle["object_inventory"],
+                }
+            )
+        ).hexdigest()
+        bundle_path.chmod(0o600)
+        create(bundle_path, canonical(bundle), 0o400)
+        bundle_sha = digest(bundle_path)
+        sidecar = bundle_path.with_name(bundle_path.name + ".sha256")
+        sidecar.chmod(0o600)
+        create(sidecar, f"{bundle_sha}  {bundle_path.name}\n".encode(), 0o400)
+        with self.assertRaisesRegex(helper.VaultError, "persisted DAG round differs"):
+            helper.load_legacy_maintenance_evidence_bundle(
+                bundle_path,
+                sidecar,
+                bundle_sha,
+                source_commit=SOURCE_COMMIT,
+                freeze_sha256=plan_sha,
+                freeze_plan=plan,
+            )
 
     def test_install_rejects_transport_hash_and_wrong_host_before_any_remote_operation(self) -> None:
         self.fixture.restore()

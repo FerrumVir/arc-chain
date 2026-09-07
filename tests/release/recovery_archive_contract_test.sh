@@ -3615,7 +3615,8 @@ body=t[t.index("persisted_head()") : t.index("stage_input()")]
 ordered=[
     'verify_stop_journal_semantics', 'verify_legacy_restart_fence',
     'verify_legacy_network_quarantine', 'verify_capture_source',
-    'exec 8<"$binary"', '/proc/self/fd/8 recovery export',
+    'exec 8<"$binary"', '/proc/self/fd/8 recovery inspect-legacy-dag-round',
+    '/proc/self/fd/8 recovery export',
     '--validator-set-id 1 --allow-unbound-legacy-wal',
     '[ "$(hash_file /proc/self/fd/14)" = "$wal_before" ]',
 ]
@@ -3623,8 +3624,8 @@ positions=[body.index(item) for item in ordered]
 assert positions==sorted(positions)
 assert body.index('verify_capture_source "$capture_root"', positions[-1]) > positions[-1]
 for exact in (
-    'arc.recovery.persisted-legacy-head.v1',
-    'arc.recovery.persisted-legacy-head.v2',
+    'arc.recovery.persisted-legacy-head.v3',
+    'arc.recovery.persisted-legacy-head.v4',
     'source_main_commit', 'inspector_binary_sha256',
     'network_quarantine_receipt_sha256', 'capture_source_sha256',
     'source_data_index_sha256', 'state_wal_size', 'snapshot_size',
@@ -3634,6 +3635,10 @@ for exact in (
     'details.st_nlink!=1', 'stat.S_IMODE(details.st_mode)!=0o400',
     'openat/O_NOFOLLOW FD identity differs', 'export-source/state.wal',
     'candidate.inspect.json', 'inspect_summary_sha256', 'wal_boundary_sha256',
+    'legacy-dag-round-inspection.json', 'legacy_dag_round',
+    'VERIFIED_STOPPED_DAG_CURSOR', 'namespace_sha256',
+    'trusted-anchor-inspection.json', 'trusted_anchor_ancestry',
+    'valid_anchor_descendant', 'below_trusted_anchor',
     '"allow_unbound_legacy_wal":True,"read_only":True',
     'os.dup(13)', 'os.dup(12)', 'export summary exact key set differs',
     'snapshot pathname changed after held-FD open',
@@ -3713,7 +3718,7 @@ persisted_head_partial_truncations_are_resumable() {
     python3 - <<'PY'
 import json
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
-payload=canonical({"schema":"arc.recovery.persisted-legacy-head.v1",
+payload=canonical({"schema":"arc.recovery.persisted-legacy-head.v3",
                    "completed_at":"2026-08-31T12:34:56Z","head":{"height":99}})
 completed=payload.index(b"completed_at")
 for cut in (0,1,completed-1,completed+3,completed+30,len(payload)-1):

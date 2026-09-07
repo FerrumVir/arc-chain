@@ -6124,6 +6124,61 @@ inventory=[]
 def sealed(value,raw,node,role):
     root=digest(raw);inventory.append({"node":node,"role":role,"sha256":root,"size":len(raw)})
     return {"value":value,"sha256":root}
+def validate_dag_and_anchor(persisted,node):
+    dag=persisted.get("legacy_dag_round")
+    try:rounds.validate_legacy_dag_round(dag,f"maintenance evidence bundle {node}")
+    except rounds.QuarantineRoundError as error:
+        raise SystemExit(
+            f"maintenance evidence bundle persisted DAG round differs: {node}: {error}"
+        ) from error
+    head=persisted.get("head",{});anchor=persisted.get("trusted_anchor_ancestry")
+    inspection=anchor.get("inspection") if isinstance(anchor,dict) else None
+    if (not isinstance(head,dict) or isinstance(head.get("height"),bool)
+            or not isinstance(head.get("height"),int) or head["height"]<1
+            or not isinstance(anchor,dict) or set(anchor)!={"anchor_height",
+                "anchor_block_hash","anchor_state_root","classification","inspection",
+                "inspection_sha256"}
+            or anchor.get("anchor_height")!=137145
+            or anchor.get("anchor_block_hash")
+                !="8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+            or anchor.get("anchor_state_root")
+                !="d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+            or anchor.get("inspection_sha256")!=digest(canonical(inspection))):
+        raise SystemExit(f"maintenance evidence bundle trusted anchor differs: {node}")
+    if head["height"]<anchor["anchor_height"]:
+        if anchor.get("classification")!="below_trusted_anchor" or inspection is not None:
+            raise SystemExit(f"maintenance evidence bundle below-anchor proof differs: {node}")
+        return
+    if (not isinstance(inspection,dict) or set(inspection)!={"schema","height",
+            "block_hash","state_root","input_roots"}
+            or inspection.get("schema")!="arc.recovery.legacy-block-inspection.v1"
+            or inspection.get("height")!=anchor["anchor_height"]
+            or hash_re.fullmatch(str(inspection.get("block_hash"))) is None
+            or hash_re.fullmatch(str(inspection.get("state_root"))) is None):
+        raise SystemExit(f"maintenance evidence bundle anchor inspection differs: {node}")
+    roots=inspection.get("input_roots")
+    if not isinstance(roots,dict) or set(roots)!={"data_dir","state_wal","snapshot",
+                                                 "genesis","legacy_validator_set"}:
+        raise SystemExit(f"maintenance evidence bundle anchor input roots differ: {node}")
+    if persisted.get("source_pair_role")=="post-quarantine-final-export":
+        expected_roots={"state_wal":persisted.get("state_wal_sha256"),
+            "snapshot":persisted.get("snapshot_sha256"),
+            "genesis":persisted.get("genesis_sha256"),
+            "legacy_validator_set":persisted.get("legacy_validator_set_sha256")}
+    else:
+        source=persisted.get("source_inputs",{});staged=persisted.get("staged_inputs",{})
+        expected_roots={"state_wal":source.get("fixed_state_wal",{}).get("sha256"),
+            "snapshot":source.get("fixed_snapshot",{}).get("sha256"),
+            "genesis":staged.get("genesis",{}).get("sha256"),
+            "legacy_validator_set":staged.get("legacy_validator_set",{}).get("sha256")}
+    if any(roots.get(label,{}).get("sha256")!=expected
+           for label,expected in expected_roots.items()):
+        raise SystemExit(f"maintenance evidence bundle anchor source binding differs: {node}")
+    matches=(inspection["block_hash"]==anchor["anchor_block_hash"]
+             and inspection["state_root"]==anchor["anchor_state_root"])
+    expected="valid_anchor_descendant" if matches else "conflicting_anchor"
+    if anchor.get("classification")!=expected:
+        raise SystemExit(f"maintenance evidence bundle anchor classification differs: {node}")
 authenticated_sealed=sealed(authenticated,authenticated_bytes,"fleet","authenticated-prefence-height-cross-proof")
 observation_selection_sealed=sealed(
     observation_selection,observation_selection_bytes,"fleet","live-observation-selection")
@@ -6175,6 +6230,9 @@ for node,host in fleet:
                     !=persisted.get("source_inputs",{}).get("live_source_capture_sha256")
                 or persisted.get("head")!=projection["stable_head"]):
             raise SystemExit(f"maintenance evidence stopped-round persisted head differs: {node}")
+        if persisted.get("schema")!="arc.recovery.persisted-legacy-head-stopped-precommit.v2":
+            raise SystemExit(f"maintenance evidence stopped persisted schema differs: {node}")
+        validate_dag_and_anchor(persisted,node)
         transition_sealed=sealed(
             transition,transition_bytes,node,"persistently-stopped-transition"
         )
@@ -6248,8 +6306,8 @@ for node,host in fleet:
             or cross.get("challenge")!=challenge
             or cross.get("quarantine_status_sha256")!=digest(canonical(cross.get("quarantine_status")))):
         raise SystemExit(f"maintenance evidence bundle public cross proof differs: {node}")
-    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v1",
-                                        "arc.recovery.persisted-legacy-head.v2"}
+    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v3",
+                                        "arc.recovery.persisted-legacy-head.v4"}
             or (persisted.get("capture_id"),persisted.get("node"),persisted.get("freeze_plan_sha256"))!=identity
             or persisted.get("source_main_commit")!=source_commit
             or persisted.get("writer_stopped") is not True
@@ -6257,6 +6315,7 @@ for node,host in fleet:
             or persisted.get("network_quarantine_active") is not True
             or persisted.get("global_absence_claimed") is not False):
         raise SystemExit(f"maintenance evidence bundle persisted head differs: {node}")
+    validate_dag_and_anchor(persisted,node)
     nodes.append({"node":node,"host":host,
         "stopped_status":sealed(stopped,stopped_bytes,node,"stopped-status"),
         "network_quarantine_receipt":sealed(network,network_bytes,node,"network-quarantine-receipt"),
@@ -6554,6 +6613,62 @@ def exact_tuple(value,label):
         raise SystemExit(f"maintenance-boundary {label} tuple is malformed")
     return {key:value[key] for key in ("height","block_hash","state_root")}
 
+def validate_dag_and_anchor(persisted,node):
+    dag=persisted.get("legacy_dag_round")
+    try:rounds.validate_legacy_dag_round(dag,f"maintenance-boundary {node}")
+    except rounds.QuarantineRoundError as error:
+        raise SystemExit(
+            f"maintenance-boundary persisted DAG round differs: {node}: {error}"
+        ) from error
+    head=persisted.get("head",{});anchor=persisted.get("trusted_anchor_ancestry")
+    inspection=anchor.get("inspection") if isinstance(anchor,dict) else None
+    if (not isinstance(head,dict) or isinstance(head.get("height"),bool)
+            or not isinstance(head.get("height"),int) or head["height"]<1
+            or not isinstance(anchor,dict) or set(anchor)!={"anchor_height",
+                "anchor_block_hash","anchor_state_root","classification","inspection",
+                "inspection_sha256"}
+            or anchor.get("anchor_height")!=137145
+            or anchor.get("anchor_block_hash")
+                !="8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+            or anchor.get("anchor_state_root")
+                !="d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+            or anchor.get("inspection_sha256")!=digest(canonical(inspection))):
+        raise SystemExit(f"maintenance-boundary trusted anchor differs: {node}")
+    if head["height"]<anchor["anchor_height"]:
+        if anchor.get("classification")!="below_trusted_anchor" or inspection is not None:
+            raise SystemExit(f"maintenance-boundary below-anchor proof differs: {node}")
+        return
+    if (not isinstance(inspection,dict) or set(inspection)!={"schema","height",
+            "block_hash","state_root","input_roots"}
+            or inspection.get("schema")!="arc.recovery.legacy-block-inspection.v1"
+            or inspection.get("height")!=anchor["anchor_height"]
+            or hash_re.fullmatch(str(inspection.get("block_hash"))) is None
+            or hash_re.fullmatch(str(inspection.get("state_root"))) is None):
+        raise SystemExit(f"maintenance-boundary anchor inspection differs: {node}")
+    roots=inspection.get("input_roots")
+    if not isinstance(roots,dict) or set(roots)!={"data_dir","state_wal","snapshot",
+                                                 "genesis","legacy_validator_set"}:
+        raise SystemExit(f"maintenance-boundary anchor input roots differ: {node}")
+    if persisted.get("source_pair_role")=="post-quarantine-final-export":
+        expected_roots={"state_wal":persisted.get("state_wal_sha256"),
+            "snapshot":persisted.get("snapshot_sha256"),
+            "genesis":persisted.get("genesis_sha256"),
+            "legacy_validator_set":persisted.get("legacy_validator_set_sha256")}
+    else:
+        source=persisted.get("source_inputs",{});staged=persisted.get("staged_inputs",{})
+        expected_roots={"state_wal":source.get("fixed_state_wal",{}).get("sha256"),
+            "snapshot":source.get("fixed_snapshot",{}).get("sha256"),
+            "genesis":staged.get("genesis",{}).get("sha256"),
+            "legacy_validator_set":staged.get("legacy_validator_set",{}).get("sha256")}
+    if any(roots.get(label,{}).get("sha256")!=expected
+           for label,expected in expected_roots.items()):
+        raise SystemExit(f"maintenance-boundary anchor source binding differs: {node}")
+    matches=(inspection["block_hash"]==anchor["anchor_block_hash"]
+             and inspection["state_root"]==anchor["anchor_state_root"])
+    expected="valid_anchor_descendant" if matches else "conflicting_anchor"
+    if anchor.get("classification")!=expected:
+        raise SystemExit(f"maintenance-boundary anchor classification differs: {node}")
+
 rows=[];evidence_heights=[];challenge=stability.get("challenge")
 if hash_re.fullmatch(str(challenge)) is None:
     raise SystemExit("maintenance-boundary quarantine challenge is malformed")
@@ -6576,6 +6691,9 @@ for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows
                 or persisted.get("source_pair_role")!="preauthorization-boundary"
                 or persisted.get("head")!=projection["stable_head"]):
             raise SystemExit(f"maintenance-boundary stopped transition binding differs: {node}")
+        if persisted.get("schema")!="arc.recovery.persisted-legacy-head-stopped-precommit.v2":
+            raise SystemExit(f"maintenance-boundary stopped persisted schema differs: {node}")
+        validate_dag_and_anchor(persisted,node)
         current=bundle_row.get("current_status",{})
         if (not isinstance(current,dict) or set(current)!={"value","sha256"}
                 or digest(canonical(current.get("value")))!=current.get("sha256")
@@ -6697,8 +6815,8 @@ for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows
             or public_latest["block_hash"]!=origin.get("latest_block_hash")
             or fenced_tuple["height"]<public_tuple["height"]):
         raise SystemExit(f"maintenance-boundary public/post-quarantine tuple differs: {node}")
-    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v1",
-                                        "arc.recovery.persisted-legacy-head.v2"}
+    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v3",
+                                        "arc.recovery.persisted-legacy-head.v4"}
             or (persisted.get("capture_id"),persisted.get("node"),persisted.get("freeze_plan_sha256"))!=identity
             or persisted.get("source_main_commit")!=source_commit
             or persisted.get("boot_id")!=next(row["boot_id"] for row in plan["nodes"] if row["name"]==node)
@@ -6712,6 +6830,7 @@ for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows
             or hash_re.fullmatch(str(persisted.get("final_source_capture_sha256"))) is None
             or persisted.get("export_status")!="EXPORTED_UNSIGNED"):
         raise SystemExit(f"maintenance-boundary persisted head identity differs: {node}")
+    validate_dag_and_anchor(persisted,node)
     persisted_tuple=exact_tuple(persisted.get("head"),f"{node} persisted")
     if persisted_tuple["height"]<fenced_tuple["height"]:
         raise SystemExit(f"maintenance-boundary persisted head precedes post-quarantine head: {node}")

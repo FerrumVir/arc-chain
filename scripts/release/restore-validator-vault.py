@@ -111,6 +111,18 @@ artifact_provenance = importlib.util.module_from_spec(_PROVENANCE_SPEC)
 sys.modules[_PROVENANCE_SPEC.name] = artifact_provenance
 _PROVENANCE_SPEC.loader.exec_module(artifact_provenance)
 
+_QUARANTINE_ROUNDS_PATH = (
+    Path(__file__).resolve().parents[1] / "recovery" / "quarantine_rounds.py"
+)
+_QUARANTINE_ROUNDS_SPEC = importlib.util.spec_from_file_location(
+    "arc_quarantine_rounds_for_vault", _QUARANTINE_ROUNDS_PATH
+)
+if _QUARANTINE_ROUNDS_SPEC is None or _QUARANTINE_ROUNDS_SPEC.loader is None:
+    raise RuntimeError("cannot load quarantine-generation validator")
+quarantine_rounds = importlib.util.module_from_spec(_QUARANTINE_ROUNDS_SPEC)
+sys.modules[_QUARANTINE_ROUNDS_SPEC.name] = quarantine_rounds
+_QUARANTINE_ROUNDS_SPEC.loader.exec_module(quarantine_rounds)
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -1789,6 +1801,8 @@ def load_legacy_maintenance_evidence_bundle(
     freeze_sha256: str,
     freeze_plan: Any,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
+    """Validate the generation-ledger tagged union emitted by archive-fleet."""
+
     value, expected = load_private_sealed_json(
         path,
         sidecar,
@@ -1799,30 +1813,23 @@ def load_legacy_maintenance_evidence_bundle(
     bundle = exact_object(
         value,
         {
-            "schema",
-            "source_main_commit",
-            "freeze_plan_sha256",
-            "capture_id",
-            "first_quarantine_started_at",
-            "all_controlled_stopped_at",
-            "challenge",
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "first_quarantine_started_at", "all_controlled_stopped_at", "challenge",
+            "live_observation_selection",
             "authenticated_prefence_height_cross_proof",
-            "network_quarantine_challenge",
-            "quarantine_stability_proof",
-            "nodes",
-            "object_inventory",
+            "quarantine_generation_ledger", "network_quarantine_challenge",
+            "quarantine_stability_proof", "nodes", "object_inventory",
             "aggregate_root_sha256",
         },
         "legacy maintenance evidence bundle",
     )
     capture_id = capture_id_for_freeze_hash(freeze_sha256)
-    expected_identity = {
-        "schema": MAINTENANCE_EVIDENCE_BUNDLE_SCHEMA,
-        "source_main_commit": source_commit,
-        "freeze_plan_sha256": freeze_sha256,
-        "capture_id": capture_id,
-    }
-    if any(bundle.get(field) != item for field, item in expected_identity.items()):
+    if (
+        bundle.get("schema") != MAINTENANCE_EVIDENCE_BUNDLE_SCHEMA
+        or bundle.get("source_main_commit") != source_commit
+        or bundle.get("freeze_plan_sha256") != freeze_sha256
+        or bundle.get("capture_id") != capture_id
+    ):
         fail("legacy maintenance evidence bundle source/freeze identity differs")
     first = require_utc_seconds(
         bundle.get("first_quarantine_started_at"), "maintenance first quarantine"
@@ -1833,90 +1840,138 @@ def load_legacy_maintenance_evidence_bundle(
     if first > stopped:
         fail("legacy maintenance evidence timestamps are reversed")
     challenge = require_hash(bundle.get("challenge"), "maintenance quarantine challenge")
-    inventory_expected: list[dict[str, Any]] = []
+    inventory: list[dict[str, Any]] = []
 
     def sealed(raw: object, node: str, role: str, label: str) -> tuple[dict[str, Any], str]:
         wrapper = exact_object(raw, {"value", "sha256"}, label)
-        object_value = wrapper.get("value")
-        if not isinstance(object_value, dict):
+        inner = wrapper.get("value")
+        if not isinstance(inner, dict):
             fail(f"{label} value is not an object")
-        object_sha = require_hash(wrapper.get("sha256"), f"{label} digest")
-        payload = canonical_json_bytes(object_value)
-        if hashlib.sha256(payload).hexdigest() != object_sha:
+        payload = canonical_json_bytes(inner)
+        root = require_hash(wrapper.get("sha256"), f"{label} digest")
+        if hashlib.sha256(payload).hexdigest() != root:
             fail(f"{label} digest is not reproducible")
-        inventory_expected.append(
-            {"node": node, "role": role, "sha256": object_sha, "size": len(payload)}
-        )
-        return object_value, object_sha
+        inventory.append({"node": node, "role": role, "sha256": root, "size": len(payload)})
+        return inner, root
 
+    # Inventory order is consensus-like: it must match the producer exactly.
     authenticated, _authenticated_sha = sealed(
-        bundle.get("authenticated_prefence_height_cross_proof"),
-        "fleet",
+        bundle.get("authenticated_prefence_height_cross_proof"), "fleet",
         "authenticated-prefence-height-cross-proof",
         "maintenance authenticated pre-fence proof",
     )
+    selection, selection_sha = sealed(
+        bundle.get("live_observation_selection"), "fleet", "live-observation-selection",
+        "maintenance live-observation selection",
+    )
+    ledger, ledger_sha = sealed(
+        bundle.get("quarantine_generation_ledger"), "fleet",
+        "quarantine-generation-ledger", "maintenance quarantine-generation ledger",
+    )
+    challenge_receipt, _challenge_sha = sealed(
+        bundle.get("network_quarantine_challenge"), "fleet",
+        "network-quarantine-challenge", "maintenance quarantine challenge receipt",
+    )
+    stability, _stability_sha = sealed(
+        bundle.get("quarantine_stability_proof"), "fleet",
+        "network-quarantine-stability-proof", "maintenance quarantine stability proof",
+    )
+
+    selection = exact_object(
+        selection,
+        {
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "observation_generation", "observation_generation_receipt",
+            "observation_generation_receipt_path",
+            "observation_generation_receipt_sha256", "drive_prefreeze_receipt_path",
+            "drive_prefreeze_receipt_sha256", "generation_created_at", "selected_at",
+            "max_selection_age_seconds", "labels", "nodes",
+        },
+        "maintenance live-observation selection",
+    )
+    generation = selection.get("observation_generation_receipt")
+    drive = generation.get("drive_prefreeze_receipt") if isinstance(generation, dict) else None
+    if not isinstance(generation, dict) or not isinstance(drive, dict):
+        fail("maintenance live-observation generation receipt differs")
+    if set(drive) != {"path", "value", "sha256"} or not isinstance(drive.get("value"), dict):
+        fail("maintenance live-observation Drive receipt wrapper differs")
+    if (
+        hashlib.sha256(canonical_json_bytes(generation)).hexdigest()
+        != selection.get("observation_generation_receipt_sha256")
+        or hashlib.sha256(canonical_json_bytes(drive["value"])).hexdigest()
+        != drive.get("sha256")
+        or selection.get("schema") != "arc.recovery.legacy-live-observation-selection.v1"
+        or (selection.get("source_main_commit"), selection.get("freeze_plan_sha256"),
+            selection.get("capture_id")) != (source_commit, freeze_sha256, capture_id)
+        or selection.get("observation_generation") != generation.get("observation_generation")
+        or selection.get("drive_prefreeze_receipt_sha256") != drive.get("sha256")
+        or selection.get("drive_prefreeze_receipt_path") != drive.get("path")
+        or selection.get("generation_created_at") != generation.get("created_at")
+        or selection.get("max_selection_age_seconds") != 300
+        or selection.get("labels") != ["diagnostic", "noncanonical", "nonreward"]
+    ):
+        fail("maintenance live-observation selection identity differs")
+    try:
+        created_at = datetime.datetime.strptime(
+            str(selection.get("generation_created_at")), "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        selected_at = datetime.datetime.strptime(
+            str(selection.get("selected_at")), "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+    except ValueError:
+        fail("maintenance live-observation selection timestamp differs")
+    if not 0 <= (selected_at - created_at).total_seconds() <= 300:
+        fail("maintenance live-observation selection age differs")
+    selection_rows = selection.get("nodes")
+    if not isinstance(selection_rows, list) or [
+        row.get("node") for row in selection_rows if isinstance(row, dict)
+    ] != list(LOWER_NODE_ORDER):
+        fail("maintenance live-observation selection topology differs")
+    for raw_row in selection_rows:
+        row = exact_object(
+            raw_row, {"node", "created_at", "completed_at", "root_sha256", "receipt_sha256"},
+            "maintenance live-observation selection node",
+        )
+        try:
+            row_first = datetime.datetime.strptime(str(row.get("created_at")), "%Y-%m-%dT%H:%M:%S.%fZ")
+            row_last = datetime.datetime.strptime(str(row.get("completed_at")), "%Y-%m-%dT%H:%M:%S.%fZ")
+        except ValueError:
+            fail("maintenance live-observation selection node timestamp differs")
+        if row_first > row_last:
+            fail("maintenance live-observation selection node timestamps are reversed")
+        require_hash(row.get("root_sha256"), "maintenance live-observation root")
+        require_hash(row.get("receipt_sha256"), "maintenance live-observation receipt")
+
     authenticated = exact_object(
         authenticated,
         {
-            "schema",
-            "source_main_commit",
-            "freeze_plan_sha256",
-            "capture_id",
-            "legacy_public_height_receipt_sha256",
-            "challenge",
-            "started_at",
-            "completed_at",
-            "conservative_height_floor",
-            "nodes",
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "legacy_public_height_receipt_sha256", "challenge", "started_at",
+            "completed_at", "conservative_height_floor", "nodes",
         },
         "maintenance authenticated pre-fence fleet proof",
     )
+    expected_topology = [(node.lower(), host) for node, _address, host in PRODUCTION_FLEET]
+    authenticated_rows = authenticated.get("nodes")
     if (
         authenticated.get("schema") != AUTHENTICATED_HEIGHT_FLEET_SCHEMA
-        or authenticated.get("source_main_commit") != source_commit
-        or authenticated.get("freeze_plan_sha256") != freeze_sha256
-        or authenticated.get("capture_id") != capture_id
-        or authenticated.get("challenge") != challenge
-    ):
-        fail("maintenance authenticated pre-fence fleet proof identity differs")
-    require_hash(
-        authenticated.get("legacy_public_height_receipt_sha256"),
-        "maintenance public-height receipt root",
-    )
-    require_uint(
-        authenticated.get("conservative_height_floor"),
-        "maintenance conservative height floor",
-    )
-    if require_utc_seconds(authenticated.get("started_at"), "authenticated proof start") > require_utc_seconds(
-        authenticated.get("completed_at"), "authenticated proof completion"
-    ):
-        fail("maintenance authenticated proof timestamps are reversed")
-    authenticated_rows = authenticated.get("nodes")
-    expected_topology = [(name.lower(), host) for name, _address, host in PRODUCTION_FLEET]
-    if (
-        not isinstance(authenticated_rows, list)
-        or [(row.get("node"), row.get("host")) for row in authenticated_rows if isinstance(row, dict)]
+        or (authenticated.get("source_main_commit"), authenticated.get("freeze_plan_sha256"),
+            authenticated.get("capture_id"), authenticated.get("challenge"))
+        != (source_commit, freeze_sha256, capture_id, challenge)
+        or not isinstance(authenticated_rows, list)
+        or [(row.get("node"), row.get("host")) for row in authenticated_rows]
         != expected_topology
     ):
-        fail("maintenance authenticated proof topology differs")
-    for index, row in enumerate(authenticated_rows):
-        item = exact_object(
-            row,
-            {"node", "host", "proof", "proof_sha256"},
-            f"maintenance authenticated node {index}",
-        )
-        if not isinstance(item["proof"], dict):
-            fail("maintenance authenticated node proof is not an object")
-        proof_sha = require_hash(item["proof_sha256"], "maintenance authenticated node proof root")
-        if hashlib.sha256(canonical_json_bytes(item["proof"])).hexdigest() != proof_sha:
-            fail("maintenance authenticated node proof root is not reproducible")
+        fail("maintenance authenticated pre-fence fleet proof identity differs")
+    require_hash(authenticated.get("legacy_public_height_receipt_sha256"), "maintenance public height")
+    require_uint(authenticated.get("conservative_height_floor"), "maintenance height floor")
+    for row in authenticated_rows:
+        item = exact_object(row, {"node", "host", "proof", "proof_sha256"}, "maintenance authenticated node")
+        if not isinstance(item.get("proof"), dict) or hashlib.sha256(
+            canonical_json_bytes(item["proof"])
+        ).hexdigest() != require_hash(item.get("proof_sha256"), "maintenance authenticated node proof"):
+            fail("maintenance authenticated node proof is not reproducible")
 
-    challenge_receipt, _challenge_sha = sealed(
-        bundle.get("network_quarantine_challenge"),
-        "fleet",
-        "network-quarantine-challenge",
-        "maintenance quarantine challenge receipt",
-    )
     if challenge_receipt != {
         "schema": "arc.recovery.legacy-network-quarantine-challenge.v1",
         "freeze_plan_sha256": freeze_sha256,
@@ -1925,133 +1980,312 @@ def load_legacy_maintenance_evidence_bundle(
     }:
         fail("maintenance quarantine challenge receipt differs")
 
-    stability, _stability_sha = sealed(
-        bundle.get("quarantine_stability_proof"),
-        "fleet",
-        "network-quarantine-stability-proof",
-        "maintenance quarantine stability proof",
-    )
+    try:
+        ledger_state = quarantine_rounds.validate_generation_ledger(ledger)
+    except quarantine_rounds.QuarantineRoundError as error:
+        fail(f"maintenance quarantine-generation ledger differs: {error}")
+    if (
+        (ledger_state.get("freeze_plan_sha256"), ledger_state.get("capture_id"))
+        != (freeze_sha256, capture_id)
+        or (ledger_state.get("live_observation_selection_sha256"),
+            ledger_state.get("live_observation_generation"),
+            ledger_state.get("observation_generation_receipt_sha256"),
+            ledger_state.get("drive_prefreeze_receipt_sha256"))
+        != (selection_sha, selection.get("observation_generation"),
+            selection.get("observation_generation_receipt_sha256"),
+            selection.get("drive_prefreeze_receipt_sha256"))
+        or ledger.get("first_secured_at") != bundle.get("first_quarantine_started_at")
+        or ledger_state.get("all_nodes_secured_at") > stopped
+    ):
+        fail("maintenance quarantine-generation ledger identity/timeline differs")
+    transition_wrappers: dict[str, dict[str, Any]] = {}
+    projections: dict[str, dict[str, Any]] = {}
+    for round_wrapper in ledger.get("rounds", []):
+        for wrapper in round_wrapper["result"]["value"]["transitions"]:
+            transition = wrapper["value"]
+            node = transition["node"]
+            if node in transition_wrappers:
+                fail("maintenance generation ledger repeats a node transition")
+            transition_wrappers[node] = wrapper
+            try:
+                projections[node] = quarantine_rounds.validate_node_transition(transition)
+            except quarantine_rounds.QuarantineRoundError as error:
+                fail(f"maintenance {node} transition differs: {error}")
+            if projections[node].get("source_main_commit") != source_commit:
+                fail(f"maintenance {node} transition source commit differs")
+    if set(transition_wrappers) != set(LOWER_NODE_ORDER):
+        fail("maintenance generation-ledger transition partition differs")
+    active_topology = [
+        row for row in expected_topology
+        if projections[row[0]]["kind"] == quarantine_rounds.ACTIVE_TRANSITION_KIND
+    ]
+    active_roots = [
+        {"node": node, "sha256": transition_wrappers[node]["sha256"]}
+        for node, _host in active_topology
+    ]
     stability = exact_object(
         stability,
         {
-            "schema",
-            "source_main_commit",
-            "freeze_plan_sha256",
-            "capture_id",
-            "challenge",
-            "interval_seconds",
-            "sample_count",
-            "started_at",
-            "completed_at",
-            "monotonic_elapsed_ns",
-            "fleet_heads",
-            "nodes",
-            "global_absence_claimed",
+            "schema", "source_main_commit", "freeze_plan_sha256", "capture_id",
+            "challenge", "interval_seconds", "sample_count", "started_at",
+            "completed_at", "monotonic_elapsed_ns", "fleet_heads", "nodes",
+            "global_absence_claimed", "quarantine_generation_ledger_sha256",
+            "active_transition_sha256s",
         },
         "maintenance quarantine stability proof",
     )
+    elapsed = require_uint(stability.get("monotonic_elapsed_ns"), "maintenance stability elapsed")
     if (
         stability.get("schema") != "arc.recovery.legacy-network-quarantine-stability.v1"
-        or stability.get("source_main_commit") != source_commit
-        or stability.get("freeze_plan_sha256") != freeze_sha256
-        or stability.get("capture_id") != capture_id
-        or stability.get("challenge") != challenge
-        or stability.get("interval_seconds") != 120
-        or stability.get("sample_count") != 2
+        or (stability.get("source_main_commit"), stability.get("freeze_plan_sha256"),
+            stability.get("capture_id"), stability.get("challenge"))
+        != (source_commit, freeze_sha256, capture_id, challenge)
+        or stability.get("quarantine_generation_ledger_sha256") != ledger_sha
+        or stability.get("active_transition_sha256s") != active_roots
+        or stability.get("interval_seconds") != (120 if active_topology else 0)
+        or stability.get("sample_count") != (2 if active_topology else 0)
+        or (active_topology and elapsed < 120_000_000_000)
+        or (not active_topology and elapsed != 0)
         or stability.get("global_absence_claimed") is not False
-        or require_uint(stability.get("monotonic_elapsed_ns"), "maintenance stability elapsed")
-        < 120_000_000_000
     ):
         fail("maintenance quarantine stability proof differs")
-    stability_started = require_utc_seconds(stability.get("started_at"), "stability start")
-    stability_completed = require_utc_seconds(
-        stability.get("completed_at"), "stability completion"
-    )
-    if not first <= stability_started <= stability_completed <= stopped:
-        fail("maintenance quarantine stability timestamps are outside the quarantine/stop window")
     stability_rows = stability.get("nodes")
     stability_heads = stability.get("fleet_heads")
     if (
-        not isinstance(stability_rows, list)
-        or not isinstance(stability_heads, list)
-        or [(row.get("node"), row.get("host")) for row in stability_rows if isinstance(row, dict)]
-        != expected_topology
-        or [(row.get("node"), row.get("host")) for row in stability_heads if isinstance(row, dict)]
-        != expected_topology
+        not isinstance(stability_rows, list) or not isinstance(stability_heads, list)
+        or [(row.get("node"), row.get("host")) for row in stability_rows] != active_topology
+        or [(row.get("node"), row.get("host")) for row in stability_heads] != active_topology
     ):
         fail("maintenance quarantine stability topology differs")
+    for row, head_row, (node, host) in zip(stability_rows, stability_heads, active_topology):
+        item = exact_object(row, {"node", "host", "samples", "output_deny_packets"}, f"maintenance {node} stability row")
+        samples = item.get("samples")
+        if not isinstance(samples, list) or len(samples) != 2:
+            fail(f"maintenance {node} stability samples differ")
+        heads: list[dict[str, Any]] = []
+        counters: list[int] = []
+        writer: object = None
+        for index, raw_sample in enumerate(samples):
+            wrapper = exact_object(raw_sample, {"value", "sha256"}, f"maintenance {node} stability sample")
+            sample = wrapper.get("value")
+            if not isinstance(sample, dict) or hashlib.sha256(canonical_json_bytes(sample)).hexdigest() != require_hash(
+                wrapper.get("sha256"), f"maintenance {node} stability sample root"
+            ):
+                fail(f"maintenance {node} stability sample root differs")
+            if (
+                sample.get("schema") != "arc.recovery.legacy-network-quarantine-stability-sample.v1"
+                or (sample.get("capture_id"), sample.get("node"),
+                    sample.get("freeze_plan_sha256"), sample.get("challenge"),
+                    sample.get("sample_index"))
+                != (capture_id, node, freeze_sha256, challenge, index)
+                or sample.get("global_absence_claimed") is not False
+            ):
+                fail(f"maintenance {node} stability sample identity differs")
+            head = exact_object(
+                sample.get("head"),
+                {"height", "block_hash", "state_root", "response_sha256", "stable_attempt"},
+                f"maintenance {node} stability head",
+            )
+            projected = {
+                "height": require_uint(head.get("height"), f"maintenance {node} stability height"),
+                "block_hash": require_hash(head.get("block_hash"), f"maintenance {node} stability block"),
+                "state_root": require_hash(head.get("state_root"), f"maintenance {node} stability state"),
+            }
+            if projected["height"] < 1:
+                fail(f"maintenance {node} stability height is not positive")
+            response_roots = exact_object(head.get("response_sha256"), {"info_before", "latest", "exact", "info_after"}, f"maintenance {node} response roots")
+            for root in response_roots.values():
+                require_hash(root, f"maintenance {node} stability response")
+            if not 1 <= require_uint(head.get("stable_attempt"), f"maintenance {node} stability attempt") <= 10:
+                fail(f"maintenance {node} stability attempt differs")
+            heads.append(projected)
+            counters.append(require_uint(sample.get("output_deny_packets"), f"maintenance {node} deny counter"))
+            if writer is None:
+                writer = sample.get("writer")
+            elif sample.get("writer") != writer:
+                fail(f"maintenance {node} stability writer changed")
+        if (
+            heads[0] != heads[1]
+            or head_row != {"node": node, "host": host, "head": heads[0]}
+            or counters[1] < counters[0]
+            or item.get("output_deny_packets") != {"sample_0": counters[0], "sample_1": counters[1]}
+        ):
+            fail(f"maintenance {node} stability contract differs")
 
     rows = bundle.get("nodes")
     if not isinstance(rows, list) or len(rows) != len(PRODUCTION_FLEET):
         fail("legacy maintenance evidence bundle must contain six ordered nodes")
-    node_fields = {
-        "node",
-        "host",
-        "stopped_status",
-        "quarantine_status",
-        "post_proof_quarantine_status",
-        "external_quarantine_proof",
-        "public_cross_proof",
-        "persisted_head",
-    }
-    role_fields = (
-        ("stopped_status", "stopped-status", "arc.recovery.offline-stop-status.v1"),
-        ("quarantine_status", "quarantine-status", "arc.recovery.legacy-network-quarantine-status.v1"),
-        ("post_proof_quarantine_status", "post-proof-quarantine-status", "arc.recovery.legacy-network-quarantine-status.v1"),
-        ("external_quarantine_proof", "external-quarantine-proof", "arc.recovery.legacy-network-quarantine-external-proof.v1"),
-        ("public_cross_proof", "public-cross-proof", "arc.recovery.legacy-network-quarantine-public-cross-proof.v1"),
-        ("persisted_head", "persisted-head", "arc.recovery.persisted-legacy-head.v1"),
-    )
+
+    def validate_dag_and_anchor(persisted: dict[str, Any], node: str) -> None:
+        try:
+            quarantine_rounds.validate_legacy_dag_round(persisted.get("legacy_dag_round"), f"maintenance {node}")
+        except quarantine_rounds.QuarantineRoundError as error:
+            fail(f"maintenance {node} persisted DAG round differs: {error}")
+        head = exact_object(persisted.get("head"), {"height", "block_hash", "state_root"}, f"maintenance {node} persisted head")
+        height = require_uint(head.get("height"), f"maintenance {node} persisted height")
+        if height < 1:
+            fail(f"maintenance {node} persisted height is not positive")
+        require_hash(head.get("block_hash"), f"maintenance {node} persisted block")
+        require_hash(head.get("state_root"), f"maintenance {node} persisted state")
+        anchor = exact_object(
+            persisted.get("trusted_anchor_ancestry"),
+            {"anchor_height", "anchor_block_hash", "anchor_state_root", "classification", "inspection", "inspection_sha256"},
+            f"maintenance {node} trusted anchor",
+        )
+        inspection = anchor.get("inspection")
+        if (
+            anchor.get("anchor_height") != 137145
+            or anchor.get("anchor_block_hash") != "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+            or anchor.get("anchor_state_root") != "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+            or anchor.get("inspection_sha256") != hashlib.sha256(canonical_json_bytes(inspection)).hexdigest()
+        ):
+            fail(f"maintenance {node} trusted-anchor binding differs")
+        if height < anchor["anchor_height"]:
+            if anchor.get("classification") != "below_trusted_anchor" or inspection is not None:
+                fail(f"maintenance {node} below-anchor classification differs")
+        else:
+            inspected = exact_object(inspection, {"schema", "height", "block_hash", "state_root", "input_roots"}, f"maintenance {node} anchor inspection")
+            if inspected.get("schema") != "arc.recovery.legacy-block-inspection.v1" or inspected.get("height") != 137145:
+                fail(f"maintenance {node} anchor inspection differs")
+            observed_block = require_hash(inspected.get("block_hash"), f"maintenance {node} anchor block")
+            observed_state = require_hash(inspected.get("state_root"), f"maintenance {node} anchor state")
+            expected_class = "valid_anchor_descendant" if (
+                observed_block == anchor["anchor_block_hash"] and observed_state == anchor["anchor_state_root"]
+            ) else "conflicting_anchor"
+            if anchor.get("classification") != expected_class:
+                fail(f"maintenance {node} anchor classification differs")
+
     by_node: dict[str, dict[str, Any]] = {}
+    active_fields = {
+        "node", "host", "stopped_status", "network_quarantine_receipt",
+        "quarantine_status", "quarantine_monitor", "post_proof_quarantine_status",
+        "external_quarantine_proof", "public_cross_proof", "persisted_head",
+    }
+    stopped_fields = {"node", "host", "transition_kind", "transition_receipt", "current_status", "persisted_head"}
     for (upper_node, _address, host), raw_row in zip(PRODUCTION_FLEET, rows):
         node = upper_node.lower()
-        item = exact_object(raw_row, node_fields, "maintenance evidence node")
-        if (item.get("node"), item.get("host")) != (node, host):
-            fail("legacy maintenance evidence bundle topology differs")
-        normalized: dict[str, Any] = {"node": node, "host": host}
-        for field, role, schema in role_fields:
-            object_value, object_sha = sealed(
-                item.get(field), node, role, f"maintenance {node} {role}"
-            )
-            if (
-                object_value.get("schema") != schema
-                or object_value.get("capture_id") != capture_id
-                or object_value.get("node") != node
-                or object_value.get("freeze_plan_sha256") != freeze_sha256
+        projection = projections[node]
+        if projection["kind"] == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+            item = exact_object(raw_row, stopped_fields, f"maintenance stopped node {node}")
+            if (item.get("node"), item.get("host"), item.get("transition_kind")) != (
+                node, host, quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
             ):
-                fail(f"maintenance {node} {role} identity differs")
-            normalized[field] = {"value": object_value, "sha256": object_sha}
-        if (
-            normalized["stopped_status"]["value"].get("stopped") is not True
-            or normalized["stopped_status"]["value"].get("restart_fenced") is not True
-            or normalized["quarantine_status"]["value"].get("active") is not True
-            or normalized["quarantine_status"]["value"].get("enabled") is not True
-            or normalized["post_proof_quarantine_status"]["value"].get("active") is not True
-            or normalized["post_proof_quarantine_status"]["value"].get("enabled") is not True
-            or normalized["external_quarantine_proof"]["value"].get("host") != host
-            or normalized["external_quarantine_proof"]["value"].get("challenge") != challenge
-            or normalized["external_quarantine_proof"]["value"].get("global_absence_claimed") is not False
-            or normalized["public_cross_proof"]["value"].get("challenge") != challenge
-            or normalized["public_cross_proof"]["value"].get("global_absence_claimed") is not False
-            or normalized["persisted_head"]["value"].get("source_main_commit") != source_commit
-            or normalized["persisted_head"]["value"].get("writer_stopped") is not True
-            or normalized["persisted_head"]["value"].get("restart_barrier_active") is not True
-            or normalized["persisted_head"]["value"].get("network_quarantine_active") is not True
-            or normalized["persisted_head"]["value"].get("global_absence_claimed") is not False
+                fail("legacy maintenance stopped node topology/kind differs")
+            transition, transition_sha = sealed(item.get("transition_receipt"), node, "persistently-stopped-transition", f"maintenance {node} stopped transition")
+            current, current_sha = sealed(item.get("current_status"), node, "stopped-current-status", f"maintenance {node} stopped current status")
+            persisted, persisted_sha = sealed(item.get("persisted_head"), node, "persisted-head", f"maintenance {node} stopped persisted head")
+            if item.get("transition_receipt") != transition_wrappers[node]:
+                fail(f"maintenance {node} stopped transition differs from the generation ledger")
+            try:
+                quarantine_rounds.validate_prior_fenced_status(current, transition=transition, transition_sha256=transition_sha)
+            except quarantine_rounds.QuarantineRoundError as error:
+                fail(f"maintenance {node} stopped current status differs: {error}")
+            if (
+                persisted.get("schema") != "arc.recovery.persisted-legacy-head-stopped-precommit.v2"
+                or (persisted.get("source_main_commit"), persisted.get("capture_id"),
+                    persisted.get("node"), persisted.get("host"),
+                    persisted.get("freeze_plan_sha256"))
+                != (source_commit, capture_id, node, host, freeze_sha256)
+                or persisted.get("source_pair_role") != "preauthorization-boundary"
+                or persisted.get("head") != projection.get("stable_head")
+                or transition.get("persisted_head") != {"value": persisted, "sha256": persisted_sha}
+            ):
+                fail(f"maintenance {node} stopped persisted-head binding differs")
+            validate_dag_and_anchor(persisted, node)
+            by_node[upper_node] = {
+                "node": node, "host": host,
+                "transition_kind": quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND,
+                "transition_receipt": {"value": transition, "sha256": transition_sha},
+                "current_status": {"value": current, "sha256": current_sha},
+                "persisted_head": {"value": persisted, "sha256": persisted_sha},
+            }
+            continue
+
+        item = exact_object(raw_row, active_fields, f"maintenance active node {node}")
+        if (item.get("node"), item.get("host")) != (node, host):
+            fail("legacy maintenance active node topology differs")
+        normalized: dict[str, Any] = {"node": node, "host": host, "transition_kind": quarantine_rounds.ACTIVE_TRANSITION_KIND}
+        for field, role in (
+            ("stopped_status", "stopped-status"),
+            ("network_quarantine_receipt", "network-quarantine-receipt"),
+            ("quarantine_status", "quarantine-status"),
+            ("quarantine_monitor", "network-quarantine-monitor"),
+            ("post_proof_quarantine_status", "post-proof-quarantine-status"),
+            ("external_quarantine_proof", "external-quarantine-proof"),
+            ("public_cross_proof", "public-cross-proof"),
+            ("persisted_head", "persisted-head"),
         ):
-            fail(f"maintenance {node} stopped/persisted state differs")
+            inner, root = sealed(item.get(field), node, role, f"maintenance {node} {role}")
+            if (inner.get("capture_id"), inner.get("node"), inner.get("freeze_plan_sha256")) != (capture_id, node, freeze_sha256):
+                fail(f"maintenance {node} {role} identity differs")
+            normalized[field] = {"value": inner, "sha256": root}
+        stopped_status = normalized["stopped_status"]["value"]
+        network = normalized["network_quarantine_receipt"]
+        status = normalized["quarantine_status"]["value"]
+        monitor = normalized["quarantine_monitor"]["value"]
+        post_status = normalized["post_proof_quarantine_status"]["value"]
+        external = normalized["external_quarantine_proof"]["value"]
+        public_cross = normalized["public_cross_proof"]["value"]
+        persisted = normalized["persisted_head"]["value"]
+        if network != transition_wrappers[node]["value"].get("network_quarantine_receipt"):
+            fail(f"maintenance {node} network receipt differs from its transition")
+        if (
+            stopped_status.get("schema") != "arc.recovery.offline-stop-status.v1"
+            or stopped_status.get("stopped") is not True
+            or stopped_status.get("restart_fenced") is not True
+            or status.get("schema") != "arc.recovery.legacy-network-quarantine-status.v1"
+            or status.get("active") is not True or status.get("enabled") is not True
+            or status.get("receipt_sha256") != network["sha256"]
+            or post_status.get("schema") != "arc.recovery.legacy-network-quarantine-status.v1"
+            or post_status.get("active") is not True or post_status.get("enabled") is not True
+            or post_status.get("receipt_sha256") != network["sha256"]
+            or monitor.get("schema") != "arc.recovery.legacy-network-quarantine-monitor.v1"
+            or monitor.get("network_quarantine_receipt_sha256") != network["sha256"]
+            or monitor.get("incident_latched") is not False
+            or monitor.get("continuous_fail_closed") is not True
+            or monitor.get("automatic_unfence") is not False
+            or monitor.get("global_absence_claimed") is not False
+            or external.get("schema") != "arc.recovery.legacy-network-quarantine-external-proof.v1"
+            or external.get("host") != host or external.get("challenge") != challenge
+            or external.get("network_quarantine_receipt_sha256") != network["sha256"]
+            or external.get("before_status_sha256") != normalized["quarantine_status"]["sha256"]
+            or hashlib.sha256(canonical_json_bytes(external.get("after_status"))).hexdigest() != external.get("after_status_sha256")
+            or external.get("ssh_status_reproved") is not True
+            or external.get("global_absence_claimed") is not False
+            or public_cross.get("schema") != "arc.recovery.legacy-network-quarantine-public-cross-proof.v1"
+            or public_cross.get("challenge") != challenge
+            or public_cross.get("network_quarantine_receipt_sha256") != network["sha256"]
+            or hashlib.sha256(canonical_json_bytes(public_cross.get("quarantine_status"))).hexdigest() != public_cross.get("quarantine_status_sha256")
+            or public_cross.get("fenced_head_covers_public_info_after") is not True
+            or public_cross.get("public_latest_hash_matches") is not True
+            or public_cross.get("global_absence_claimed") is not False
+            or persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v3", "arc.recovery.persisted-legacy-head.v4"}
+            or persisted.get("source_main_commit") != source_commit
+            or persisted.get("source_pair_role") != "post-quarantine-final-export"
+            or persisted.get("selected_source_head") != persisted.get("head")
+            or persisted.get("writer_stopped") is not True
+            or persisted.get("restart_barrier_active") is not True
+            or persisted.get("network_quarantine_active") is not True
+            or persisted.get("global_absence_claimed") is not False
+        ):
+            fail(f"maintenance {node} retained active object policy differs")
+        require_hash(persisted.get("final_source_capture_sha256"), f"maintenance {node} final source capture")
+        require_hash(persisted.get("stop_after_round_receipt_sha256"), f"maintenance {node} stop-after-round receipt")
+        validate_dag_and_anchor(persisted, node)
+        persisted_head = persisted["head"]
+        transition_head = projection["stable_head"]
+        if persisted_head["height"] < transition_head["height"] or (
+            persisted_head["height"] == transition_head["height"] and persisted_head != transition_head
+        ):
+            fail(f"maintenance {node} persisted head precedes its transition")
         by_node[upper_node] = normalized
 
-    if bundle.get("object_inventory") != inventory_expected:
+    if bundle.get("object_inventory") != inventory:
         fail("legacy maintenance evidence bundle inventory differs from its sealed objects")
-    inventory_root = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "schema": "arc.recovery.legacy-maintenance-evidence-inventory.v1",
-                "objects": inventory_expected,
-            }
-        )
-    ).hexdigest()
+    inventory_root = hashlib.sha256(canonical_json_bytes({
+        "schema": "arc.recovery.legacy-maintenance-evidence-inventory.v1",
+        "objects": inventory,
+    })).hexdigest()
     if bundle.get("aggregate_root_sha256") != inventory_root:
         fail("legacy maintenance evidence aggregate root is not reproducible")
     return bundle, by_node, expected
@@ -2082,6 +2316,11 @@ def load_legacy_maintenance_boundary(
             "first_quarantine_started_at", "all_controlled_stopped_at", "created_at",
             "official_origin_scope", "legacy_public_height_receipt",
             "authenticated_prefence_height_cross_proof_sha256",
+            "legacy_live_observation_selection_sha256",
+            "legacy_live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
+            "quarantine_generation_ledger_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
             "network_quarantine_stability_proof_sha256", "network_quarantine_challenge",
             "tools", "nodes", "evidence_heights", "observed_cutoff_height",
@@ -2130,10 +2369,20 @@ def load_legacy_maintenance_boundary(
     require_utc_seconds(public_root.get("completed_at"), "legacy public-height completion")
     require_uint(public_root.get("observed_max_height"), "legacy public observed maximum")
     authenticated_root = evidence_bundle["authenticated_prefence_height_cross_proof"]["sha256"]
+    selection = evidence_bundle["live_observation_selection"]
+    ledger_root = evidence_bundle["quarantine_generation_ledger"]["sha256"]
     stability_root = evidence_bundle["quarantine_stability_proof"]["sha256"]
     if (
         boundary.get("legacy_maintenance_evidence_bundle_sha256") != evidence_bundle_sha256
         or boundary.get("authenticated_prefence_height_cross_proof_sha256") != authenticated_root
+        or boundary.get("legacy_live_observation_selection_sha256") != selection["sha256"]
+        or boundary.get("legacy_live_observation_generation")
+        != selection["value"].get("observation_generation")
+        or boundary.get("observation_generation_receipt_sha256")
+        != selection["value"].get("observation_generation_receipt_sha256")
+        or boundary.get("drive_prefreeze_receipt_sha256")
+        != selection["value"].get("drive_prefreeze_receipt_sha256")
+        or boundary.get("quarantine_generation_ledger_sha256") != ledger_root
         or boundary.get("network_quarantine_stability_proof_sha256") != stability_root
         or boundary.get("network_quarantine_challenge") != evidence_bundle.get("challenge")
     ):
@@ -2185,12 +2434,16 @@ def load_legacy_maintenance_boundary(
     auth_rows = evidence_bundle["authenticated_prefence_height_cross_proof"]["value"]["nodes"]
     if not isinstance(rows, list) or len(rows) != len(PRODUCTION_FLEET):
         fail("legacy maintenance boundary must contain six ordered nodes")
-    node_fields = {
+    active_node_fields = {
         "node", "host", "origin", "public_observation",
         "authenticated_prefence_proof_sha256", "network_quarantine_receipt_sha256",
         "quarantine_status_sha256", "post_proof_quarantine_status_sha256",
         "external_quarantine_proof_sha256", "public_cross_proof_sha256",
         "initial_post_quarantine_head", "post_quarantine_head", "final_persisted_head",
+    }
+    stopped_node_fields = {
+        "node", "host", "origin", "transition_kind",
+        "transition_receipt_sha256", "final_persisted_head",
     }
 
     def observation(raw: object, label: str) -> dict[str, Any]:
@@ -2203,11 +2456,35 @@ def load_legacy_maintenance_boundary(
         return wrapper
 
     for index, (origin, row, bundle_row, auth_row) in enumerate(zip(origins, rows, bundle_rows, auth_rows)):
-        item = exact_object(row, node_fields, f"legacy maintenance boundary node {index}")
+        is_stopped = bundle_row.get("transition_kind") == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+        item = exact_object(
+            row,
+            stopped_node_fields if is_stopped else active_node_fields,
+            f"legacy maintenance boundary node {index}",
+        )
         if (item.get("node"), item.get("host"), item.get("origin")) != (
             origin["node"], origin["host"], origin["origin"]
         ):
             fail("legacy maintenance boundary topology differs")
+        if is_stopped:
+            if (
+                item.get("transition_kind")
+                != quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+                or item.get("transition_receipt_sha256")
+                != bundle_row["transition_receipt"]["sha256"]
+            ):
+                fail(f"legacy maintenance {origin['node']} stopped transition root differs")
+            final = observation(
+                item.get("final_persisted_head"),
+                f"legacy maintenance {origin['node']} final_persisted_head",
+            )
+            persisted = bundle_row["persisted_head"]
+            if (
+                final["evidence_sha256"] != persisted["sha256"]
+                or final["tuple"] != persisted["value"].get("head")
+            ):
+                fail(f"legacy maintenance {origin['node']} stopped persisted root differs")
+            continue
         for field in (
             "authenticated_prefence_proof_sha256", "network_quarantine_receipt_sha256",
             "quarantine_status_sha256", "post_proof_quarantine_status_sha256",
@@ -2291,6 +2568,11 @@ def load_offline_stop_evidence(
             "legacy_maintenance_boundary",
             "legacy_maintenance_boundary_sha256",
             "legacy_maintenance_evidence_bundle_sha256",
+            "legacy_live_observation_selection_sha256",
+            "legacy_live_observation_generation",
+            "observation_generation_receipt_sha256",
+            "drive_prefreeze_receipt_sha256",
+            "quarantine_generation_ledger_sha256",
             "nodes",
         },
         "offline-stop evidence",
@@ -2317,6 +2599,26 @@ def load_offline_stop_evidence(
         or evidence.get("legacy_maintenance_evidence_bundle_sha256") != evidence_bundle_sha256
         or evidence.get("legacy_maintenance_evidence_bundle_sha256")
         != maintenance_boundary["legacy_maintenance_evidence_bundle_sha256"]
+        or evidence.get("legacy_live_observation_selection_sha256")
+        != evidence_bundle["live_observation_selection"]["sha256"]
+        or evidence.get("legacy_live_observation_generation")
+        != evidence_bundle["live_observation_selection"]["value"].get(
+            "observation_generation"
+        )
+        or evidence.get("observation_generation_receipt_sha256")
+        != evidence_bundle["live_observation_selection"]["value"].get(
+            "observation_generation_receipt_sha256"
+        )
+        or evidence.get("drive_prefreeze_receipt_sha256")
+        != evidence_bundle["live_observation_selection"]["value"].get(
+            "drive_prefreeze_receipt_sha256"
+        )
+        or evidence.get("quarantine_generation_ledger_sha256")
+        != evidence_bundle["quarantine_generation_ledger"]["sha256"]
+        or evidence.get("legacy_live_observation_selection_sha256")
+        != maintenance_boundary["legacy_live_observation_selection_sha256"]
+        or evidence.get("quarantine_generation_ledger_sha256")
+        != maintenance_boundary["quarantine_generation_ledger_sha256"]
     ):
         fail("offline-stop evidence maintenance bundle/boundary binding differs")
     cross = exact_object(
@@ -2343,7 +2645,7 @@ def load_offline_stop_evidence(
     plan_rows = plan_value["nodes"]
     by_node: dict[str, dict[str, Any]] = {}
     completion_roots: set[str] = set()
-    node_fields = {
+    active_node_fields = {
         "node",
         "host",
         "validator_address",
@@ -2353,14 +2655,49 @@ def load_offline_stop_evidence(
         "stopped_status_sha256",
         "stopped_status_argv_sha256",
     }
+    stopped_node_fields = {
+        "node", "host", "transition_kind", "transition_receipt_sha256",
+        "current_status_sha256", "persisted_head_sha256",
+    }
     for (upper_node, _new_address, host), plan_node, row in zip(PRODUCTION_FLEET, plan_rows, rows):
         expected_node = upper_node.lower()
         legacy_address = require_hash(
             plan_node.get("validator_address"), f"{expected_node} legacy validator address"
         )
+        bundle_node = evidence_bundle_nodes[upper_node]
+        if bundle_node.get("transition_kind") == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND:
+            item = exact_object(
+                row, stopped_node_fields, "offline-stop persistently-stopped node evidence"
+            )
+            if (
+                plan_node.get("name") != expected_node
+                or plan_node.get("host") != host
+                or (item.get("node"), item.get("host"), item.get("transition_kind"))
+                != (expected_node, host, quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND)
+                or item.get("transition_receipt_sha256")
+                != bundle_node["transition_receipt"]["sha256"]
+                or item.get("current_status_sha256")
+                != bundle_node["current_status"]["sha256"]
+                or item.get("persisted_head_sha256")
+                != bundle_node["persisted_head"]["sha256"]
+            ):
+                fail(f"offline-stop evidence {expected_node} stopped transition binding differs")
+            for field in (
+                "transition_receipt_sha256", "current_status_sha256",
+                "persisted_head_sha256",
+            ):
+                require_hash(item.get(field), f"{expected_node} {field}")
+            by_node[upper_node] = {
+                "transition_kind": quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND,
+                "transition": bundle_node["transition_receipt"]["value"],
+                "transition_sha256": bundle_node["transition_receipt"]["sha256"],
+                "historical_status": bundle_node["current_status"]["value"],
+                "row": item,
+            }
+            continue
         item = exact_object(
             row,
-            node_fields,
+            active_node_fields,
             "offline-stop node evidence",
         )
         if (
@@ -2402,13 +2739,16 @@ def load_offline_stop_evidence(
             fail(f"offline-stop evidence {expected_node} argv hash is not reproducible")
         if hashlib.sha256(canonical_json_bytes(status)).hexdigest() != status_sha:
             fail(f"offline-stop evidence {expected_node} status hash is not reproducible")
-        bundle_status = evidence_bundle_nodes[upper_node]["stopped_status"]
+        bundle_status = bundle_node["stopped_status"]
         if bundle_status["sha256"] != status_sha or bundle_status["value"] != status:
             fail(f"offline-stop evidence {expected_node} status differs from the evidence bundle")
         if complete_sha in completion_roots:
             fail("offline-stop evidence repeats a validator completion root")
         completion_roots.add(complete_sha)
-        by_node[upper_node] = {"argv": argv, "status": status, "row": item}
+        by_node[upper_node] = {
+            "transition_kind": quarantine_rounds.ACTIVE_TRANSITION_KIND,
+            "argv": argv, "status": status, "row": item,
+        }
     return evidence, by_node, expected
 
 
@@ -2432,6 +2772,35 @@ def validate_fresh_stopped_status(
         fail(f"fresh {node} stopped-status hash differs from the authenticated evidence")
 
 
+def validate_fresh_persistently_stopped_status(
+    output: str,
+    *,
+    transition: dict[str, Any],
+    transition_sha256: str,
+    historical_status: dict[str, Any],
+    node: str,
+) -> None:
+    try:
+        raw = output.encode("ascii")
+        value = json.loads(raw)
+    except (UnicodeEncodeError, json.JSONDecodeError):
+        fail(f"fresh {node} persistently-stopped status is not canonical JSON")
+    if not isinstance(value, dict) or raw != canonical_json_bytes(value):
+        fail(f"fresh {node} persistently-stopped status is not canonical JSON")
+    try:
+        fresh_observed = quarantine_rounds.validate_prior_fenced_status(
+            value, transition=transition, transition_sha256=transition_sha256
+        )
+        historical_observed = quarantine_rounds.validate_prior_fenced_status(
+            historical_status, transition=transition,
+            transition_sha256=transition_sha256,
+        )
+    except quarantine_rounds.QuarantineRoundError as error:
+        fail(f"fresh {node} persistently-stopped status differs: {error}")
+    if fresh_observed < historical_observed:
+        fail(f"fresh {node} persistently-stopped status predates sealed evidence")
+
+
 def exact_control_line(output: str, label: str) -> str:
     if "\r" in output or not output.endswith("\n") or "\n" in output[:-1]:
         fail(f"{label} did not return exactly one newline-terminated control line")
@@ -2453,7 +2822,7 @@ case "$op" in
     test -f /proc/self/fd/9
     actual_helper=$(sha256sum /proc/self/fd/9 | cut -d' ' -f1)
     test "$actual_helper" = "$expected_helper"
-    test "$1" = stopped-status
+    case "$1" in stopped-status|quarantine-round-stopped-status) ;; *) exit 1 ;; esac
     /proc/self/fd/9 "$@"
     ;;
   probe)
@@ -3030,6 +3399,37 @@ def _install_verified(args: argparse.Namespace, proof: Any) -> None:
         # host.  A stale or merely self-hashed local JSON document cannot pass.
         def prove_node_stopped(node: str, host: str) -> None:
             node_evidence = stop_evidence[node]
+            if (
+                node_evidence["transition_kind"]
+                == quarantine_rounds.STOPPED_PRECOMMIT_TRANSITION_KIND
+            ):
+                fresh_status = run_ssh(
+                    pinned_ssh,
+                    ssh_sha256,
+                    transport_root,
+                    pinned_known_hosts,
+                    pinned_identity,
+                    identity_sha256,
+                    host,
+                    (
+                        "stopped-status",
+                        evidence["remote_helper_path"],
+                        evidence["remote_helper_sha256"],
+                        "quarantine-round-stopped-status",
+                        evidence["capture_id"],
+                        node.lower(),
+                        evidence["freeze_plan_sha256"],
+                        node_evidence["transition_sha256"],
+                    ),
+                )
+                validate_fresh_persistently_stopped_status(
+                    fresh_status,
+                    transition=node_evidence["transition"],
+                    transition_sha256=node_evidence["transition_sha256"],
+                    historical_status=node_evidence["historical_status"],
+                    node=node.lower(),
+                )
+                return
             fresh_status = run_ssh(
                 pinned_ssh,
                 ssh_sha256,
