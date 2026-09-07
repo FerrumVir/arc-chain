@@ -71,7 +71,18 @@ class Fixture:
 
         self.manifest = {
             "mode": "production",
+            "rollout_id": "arc-v080-recovery-fixture",
             "provenance": {"source_main_commit": self.source_sha},
+            "archive": {
+                "capture_id": "a" * 64,
+                "prearchive_rollout_sha256": "b" * 64,
+                "archive_manifest_sha256": "c" * 64,
+                "complete_sha256": "d" * 64,
+            },
+            "artifacts": {
+                "checkpoint": {"sha256": "3" * 64},
+                "legacy_late_fork_interlock_tool": {"sha256": "a" * 64},
+            },
             "checks": {
                 "reward": {
                     "mode": "receipt",
@@ -80,11 +91,23 @@ class Fixture:
                 }
             },
             "chain": {
+                "chain_id": TRUTH.CHAIN_ID,
+                "protocol_version": "3.0.0",
+                "recovery_epoch": 1,
+                "validator_set_id": 1,
                 "source_height": 137_145,
                 "transition_height": 137_146,
+                "legacy_observed_cutoff_height": 141_000,
+                "legacy_continuity_safety_margin": 128,
                 "legacy_public_max_height": 141_128,
                 "source_block_hash": "2" * 64,
                 "source_state_root": "3" * 64,
+                "transition_block_hash": "5" * 64,
+                "full_state_root": "6" * 64,
+                "recovery_domain": "7" * 64,
+                "approved_checkpoint_manifest_hash": "4" * 64,
+                "legacy_maintenance_boundary_sha256": "9" * 64,
+                "legacy_late_fork_source_set_sha256": "8" * 64,
                 "canonical_source": {
                     "node": "nyc",
                 },
@@ -133,7 +156,7 @@ class Fixture:
                 "kind": "v3",
                 "baseUrl": f"https://{host}",
                 "enabled": True,
-                "replicaGroup": "rollout",
+                "replicaGroup": self.manifest["rollout_id"],
             }
             for name, host in TRUTH.PRODUCTION_FLEET
         ]
@@ -160,9 +183,9 @@ class Fixture:
                     "inventorySha256": "f" * 64,
                     "bindingIndexSha256": "1" * 64,
                     "bindingSha256": "2" * 64,
-                    "checkpointSha256": "3" * 64,
-                    "checkpointManifestHash": "4" * 64,
-                    "checkpointPayloadHash": "5" * 64,
+                    "checkpointSha256": format(index, "x") * 64,
+                    "checkpointManifestHash": format(index + 5, "x") * 64,
+                    "checkpointPayloadHash": format(index + 10, "x") * 64,
                     "canonicalCheckpointHeight": 137145,
                     "sourceHeight": 141000,
                     "sourceBlockHash": "6" * 64,
@@ -170,7 +193,7 @@ class Fixture:
                     "provenancePath": "/provenance",
                 },
             }
-            for name, host in TRUTH.PRODUCTION_FLEET
+            for index, (name, host) in enumerate(TRUTH.PRODUCTION_FLEET[1:], 1)
         )
         self.config = {
             "schema": TRUTH.NETWORK_SCHEMA,
@@ -185,6 +208,8 @@ class Fixture:
                 "manifestHash": "4" * 64,
                 "boundaryBlockHash": "5" * 64,
                 "boundaryStateRoot": "6" * 64,
+                "checkpointFileSha256": "3" * 64,
+                "checkpointPayloadHash": "e" * 64,
                 "recoveryEpoch": 1,
                 "validatorSetId": 1,
                 "protocolVersion": "3.0.0",
@@ -930,13 +955,32 @@ class PublicTruthTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.fixture = Fixture(self.root)
-        self.recovery_calls: list[tuple[Path, Path]] = []
+        self.recovery_calls: list[tuple[Path, Path, Path]] = []
         self.product_calls: list[tuple[Path, Path, Path, str]] = []
         self.appimage_calls: list[tuple[Path, Path]] = []
 
-        def verified(manifest, reward, manifest_raw, reward_raw, temporary_root):
-            self.recovery_calls.append((manifest, reward))
-            return {"manifestSha256": digest(manifest_raw), "rewardEvidenceSha256": digest(reward_raw), "stdoutSha256": "9" * 64, "verifierPath": TRUTH.RECOVERY_VERIFIER_RELATIVE.as_posix(), "verifierSha256": "8" * 64}
+        def verified(
+            manifest,
+            reward,
+            config,
+            manifest_raw,
+            reward_raw,
+            config_raw,
+            temporary_root,
+        ):
+            self.recovery_calls.append((manifest, reward, config))
+            TRUTH.require_exact_frontend_projection(
+                config_raw, TRUTH.canonical_json(self.fixture.config)
+            )
+            return {
+                "frontendConfigSha256": digest(config_raw),
+                "frontendProjectionSidecarSha256": "7" * 64,
+                "manifestSha256": digest(manifest_raw),
+                "rewardEvidenceSha256": digest(reward_raw),
+                "stdoutSha256": "9" * 64,
+                "verifierPath": TRUTH.RECOVERY_VERIFIER_RELATIVE.as_posix(),
+                "verifierSha256": "8" * 64,
+            }
 
         self.recovery_patch = mock.patch.object(TRUTH, "run_recovery_verify", side_effect=verified)
         self.recovery_patch.start()
@@ -1000,9 +1044,245 @@ class PublicTruthTests(unittest.TestCase):
         manifest["chain"]["canonical_source"]["node"] = "lax"
         config["checkpoint"]["legacySourceId"] = "v3-lax"
         config["checkpoint"]["v3SourceId"] = "v3-lax"
+        config["sources"] = [
+            row for row in config["sources"] if row["id"] != "legacy-fork-lax"
+        ]
 
         checkpoint = TRUTH.validate_network(config, self.fixture.source_sha, manifest)
         self.assertEqual(checkpoint["legacySourceId"], "v3-lax")
+
+    def test_network_rejects_frontend_identity_not_bound_to_sealed_manifest(self) -> None:
+        def every_v3(value: dict[str, object], field: str, replacement: object) -> None:
+            for row in value["sources"]:
+                if row["kind"] == "v3":
+                    row[field] = replacement
+
+        def every_archive(
+            value: dict[str, object], field: str, replacement: object
+        ) -> None:
+            for row in value["sources"]:
+                if row["kind"] == "legacy-fork":
+                    row["archive"][field] = replacement
+
+        def capture(value: dict[str, object]) -> None:
+            every_archive(value, "captureId", "0" * 64)
+            for row in value["sources"]:
+                if row["kind"] == "legacy-fork":
+                    row["replicaGroup"] = "legacy-capture-" + "0" * 64
+
+        def checkpoint_manifest(value: dict[str, object]) -> None:
+            value["checkpoint"]["manifestHash"] = "0" * 64
+            every_archive(value, "checkpointManifestHash", "0" * 64)
+
+        mutations = (
+            (
+                "boundary block",
+                lambda value: value["checkpoint"].__setitem__(
+                    "boundaryBlockHash", "0" * 64
+                ),
+            ),
+            (
+                "boundary state",
+                lambda value: value["checkpoint"].__setitem__(
+                    "boundaryStateRoot", "0" * 64
+                ),
+            ),
+            (
+                "recovery domain",
+                lambda value: value["checkpoint"].__setitem__(
+                    "recoveryDomain", "0" * 64
+                ),
+            ),
+            ("coordinated checkpoint manifest", checkpoint_manifest),
+            (
+                "canonical checkpoint file",
+                lambda value: value["checkpoint"].__setitem__(
+                    "checkpointFileSha256", "0" * 64
+                ),
+            ),
+            (
+                "v3 rollout identity",
+                lambda value: every_v3(value, "replicaGroup", "attacker-rollout"),
+            ),
+            ("archive capture", capture),
+            (
+                "prearchive rollout root",
+                lambda value: every_archive(
+                    value, "rolloutManifestSha256", "0" * 64
+                ),
+            ),
+            (
+                "archive manifest root",
+                lambda value: every_archive(
+                    value, "archiveManifestSha256", "0" * 64
+                ),
+            ),
+            (
+                "archive complete root",
+                lambda value: every_archive(
+                    value, "completeSha256", "0" * 64
+                ),
+            ),
+            (
+                "interlock source set",
+                lambda value: value["services"]["maintenanceInterlock"].__setitem__(
+                    "sourceSetSha256", "0" * 64
+                ),
+            ),
+            (
+                "interlock boundary",
+                lambda value: value["services"]["maintenanceInterlock"].__setitem__(
+                    "boundarySha256", "0" * 64
+                ),
+            ),
+            (
+                "interlock tool",
+                lambda value: value["services"]["maintenanceInterlock"].__setitem__(
+                    "toolSha256", "0" * 64
+                ),
+            ),
+            (
+                "interlock cutoff",
+                lambda value: value["services"]["maintenanceInterlock"].__setitem__(
+                    "observedCutoffHeight", 140_999
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            config = copy.deepcopy(self.fixture.config)
+            mutate(config)
+            with self.subTest(label=label), self.assertRaises(TRUTH.TruthError):
+                TRUTH.validate_network(config, self.fixture.source_sha, self.fixture.manifest)
+
+    def test_exact_projection_rejects_coordinated_candidate_checkpoint_mutations(self) -> None:
+        # The sealed rollout schema intentionally does not duplicate this
+        # candidate-specific identity. The final verifier derives every fork
+        # row from immutable archive provenance and compares complete bytes.
+        for field in (
+            "checkpointSha256",
+            "checkpointManifestHash",
+            "checkpointPayloadHash",
+        ):
+            mutated = copy.deepcopy(self.fixture.config)
+            for row in mutated["sources"]:
+                if row["kind"] == "legacy-fork":
+                    row["archive"][field] = "0" * 64
+            with self.subTest(field=field), self.assertRaisesRegex(
+                TRUTH.TruthError, "exact capture-bound"
+            ):
+                TRUTH.require_exact_frontend_projection(
+                    TRUTH.canonical_json(mutated),
+                    TRUTH.canonical_json(self.fixture.config),
+                )
+
+    def test_network_accepts_exact_zero_one_or_multiple_noncanonical_forks(self) -> None:
+        v3 = self.fixture.config["sources"][:6]
+        forks = self.fixture.config["sources"][6:]
+        for count in (0, 1, len(forks)):
+            config = copy.deepcopy(self.fixture.config)
+            config["sources"] = copy.deepcopy(v3 + forks[:count])
+            with self.subTest(count=count):
+                checkpoint = TRUTH.validate_network(
+                    config, self.fixture.source_sha, self.fixture.manifest
+                )
+                self.assertEqual(checkpoint["legacyForkCount"], count)
+                self.assertEqual(
+                    checkpoint["legacyForkNodes"],
+                    [row["archive"]["node"] for row in forks[:count]],
+                )
+
+    def test_network_rejects_wrong_fork_order_or_canonical_capture_as_fork(self) -> None:
+        reordered = copy.deepcopy(self.fixture.config)
+        reordered["sources"][6], reordered["sources"][7] = (
+            reordered["sources"][7],
+            reordered["sources"][6],
+        )
+        with self.assertRaises(TRUTH.TruthError):
+            TRUTH.validate_network(
+                reordered, self.fixture.source_sha, self.fixture.manifest
+            )
+
+        canonical_fork = copy.deepcopy(self.fixture.config)
+        row = canonical_fork["sources"][6]
+        row["id"] = "legacy-fork-nyc"
+        row["name"] = "Preserved legacy fork · NYC"
+        row["region"] = "NYC"
+        row["baseUrl"] = "https://149.28.32.76/legacy/nyc"
+        row["archive"]["node"] = "nyc"
+        with self.assertRaises(TRUTH.TruthError):
+            TRUTH.validate_network(
+                canonical_fork, self.fixture.source_sha, self.fixture.manifest
+            )
+
+    def test_recovery_gate_uses_exact_frontend_projection_without_duplicate_verify(self) -> None:
+        self.recovery_patch.stop()
+        commands: list[list[str]] = []
+
+        def projected(command, **kwargs):
+            commands.append(command)
+            self.assertIn("frontend-config", command)
+            self.assertNotIn("verify", command)
+            self.assertGreaterEqual(kwargs["timeout"], 24 * 60 * 60)
+            output = Path(command[command.index("--output") + 1])
+            raw = TRUTH.canonical_json(self.fixture.config)
+            output.write_bytes(raw)
+            output.with_name(output.name + ".sha256").write_text(
+                f"{digest(raw)}  {output.name}\n", encoding="ascii"
+            )
+            kwargs["stdout"].write(
+                (
+                    f"FRONTEND CONFIG {output} sha256={digest(raw)} "
+                    f"rollout_sha256={self.fixture.manifest_sha256}\n"
+                ).encode()
+            )
+            return TRUTH.subprocess.CompletedProcess(command, 0)
+
+        try:
+            mutated_config = copy.deepcopy(self.fixture.config)
+            for row in mutated_config["sources"]:
+                if row["kind"] == "legacy-fork":
+                    row["archive"]["checkpointPayloadHash"] = "0" * 64
+            mutated_config_path = self.root / "payload-mutated-config.json"
+            mutated_config_raw = write_json(mutated_config_path, mutated_config)
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                tempfile.TemporaryDirectory() as rejected_temporary,
+                mock.patch.object(TRUTH.subprocess, "run", side_effect=projected),
+            ):
+                receipt = TRUTH.run_recovery_verify(
+                    self.fixture.manifest_path,
+                    self.fixture.reward_path,
+                    self.fixture.config_path,
+                    self.fixture.manifest_path.read_bytes(),
+                    self.fixture.reward_path.read_bytes(),
+                    self.fixture.config_path.read_bytes(),
+                    Path(temporary),
+                )
+                with self.assertRaisesRegex(TRUTH.TruthError, "exact capture-bound"):
+                    TRUTH.run_recovery_verify(
+                        self.fixture.manifest_path,
+                        self.fixture.reward_path,
+                        mutated_config_path,
+                        self.fixture.manifest_path.read_bytes(),
+                        self.fixture.reward_path.read_bytes(),
+                        mutated_config_raw,
+                        Path(rejected_temporary),
+                    )
+            self.assertEqual(receipt["frontendConfigSha256"], digest(
+                self.fixture.config_path.read_bytes()
+            ))
+            self.assertEqual(len(commands), 2)
+        finally:
+            self.recovery_patch.start()
+
+    def test_network_rejects_nonstandard_margin_even_when_f_matches(self) -> None:
+        manifest = copy.deepcopy(self.fixture.manifest)
+        config = copy.deepcopy(self.fixture.config)
+        manifest["chain"]["legacy_continuity_safety_margin"] = 127
+        manifest["chain"]["legacy_observed_cutoff_height"] = 141_001
+        config["services"]["maintenanceInterlock"]["observedCutoffHeight"] = 141_001
+        with self.assertRaisesRegex(TRUTH.TruthError, "exactly 128"):
+            TRUTH.validate_network(config, self.fixture.source_sha, manifest)
 
     def test_builds_v2_receipt_and_claims_from_raw_evidence(self) -> None:
         output = self.root / "output"
@@ -1014,6 +1294,12 @@ class PublicTruthTests(unittest.TestCase):
         readme = readme_path.read_text(encoding="utf-8")
         self.assertIn("published Linux x86_64 component proved", readme)
         self.assertIn(f"ARC_INSTALL_SHA256={self.fixture.installer_sha}", readme)
+        self.assertIn("C=**141,000**", readme)
+        self.assertIn("**128 blocks**", readme)
+        self.assertIn("F=C+128=**141,128**", readme)
+        self.assertIn("recovery domain `" + "7" * 64 + "`", readme)
+        self.assertIn("epoch **1**, validator set **1**", readme)
+        self.assertIn("**5** divergent captured history views are available", readme)
         acceptance_raw = acceptance_path.read_bytes()
         acceptance = json.loads(acceptance_raw)
         self.assertEqual(acceptance["schema"], "arc.post-release-acceptance.v2")
@@ -1036,7 +1322,33 @@ class PublicTruthTests(unittest.TestCase):
         )
         self.assertEqual(status["pages"]["acceptedConfigCommit"], self.fixture.frontend_sha)
         self.assertEqual(status["rewards"]["demonstratedGrossBase"], 5_000_000_000)
-        self.assertEqual(self.recovery_calls, [(self.fixture.manifest_path, self.fixture.reward_path)])
+        self.assertEqual(status["checkpoint"]["legacyObservedCutoffHeight"], 141_000)
+        self.assertEqual(status["checkpoint"]["legacyContinuitySafetyMargin"], 128)
+        self.assertEqual(status["checkpoint"]["legacyPublicMaxHeight"], 141_128)
+        self.assertEqual(status["checkpoint"]["legacyReopeningFormula"], "F=C+128")
+        self.assertEqual(status["checkpoint"]["boundaryBlockHash"], "5" * 64)
+        self.assertEqual(status["checkpoint"]["boundaryStateRoot"], "6" * 64)
+        self.assertEqual(status["checkpoint"]["recoveryDomain"], "7" * 64)
+        self.assertEqual(status["checkpoint"]["recoveryEpoch"], 1)
+        self.assertEqual(status["checkpoint"]["validatorSetId"], 1)
+        self.assertEqual(status["checkpoint"]["checkpointFileSha256"], "3" * 64)
+        self.assertEqual(status["checkpoint"]["checkpointPayloadHash"], "e" * 64)
+        self.assertEqual(status["fleet"]["legacyForkCount"], 5)
+        self.assertEqual(
+            status["fleet"]["legacyForkNodes"],
+            [name for name, _host in TRUTH.PRODUCTION_FLEET[1:]],
+        )
+        self.assertEqual(
+            status["fleet"]["rolloutId"], self.fixture.manifest["rollout_id"]
+        )
+        self.assertEqual(
+            self.recovery_calls,
+            [(
+                self.fixture.manifest_path,
+                self.fixture.reward_path,
+                self.fixture.config_path,
+            )],
+        )
         self.assertEqual(
             self.product_calls,
             [(

@@ -34,7 +34,7 @@ import tempfile
 import zipfile
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, NoReturn, Sequence
+from typing import Any, Mapping, NoReturn, Sequence
 
 
 STATUS_SCHEMA = "arc.public-production-status.v1"
@@ -48,6 +48,8 @@ CHAIN_ID = "0x415243"
 PROTOCOL_VERSION_RE = re.compile(r"^3\.[0-9]+\.[0-9]+$")
 RECOVERY_EPOCH = 1
 VALIDATOR_SET_ID = 1
+LEGACY_CONTINUITY_SAFETY_MARGIN = 128
+RECOVERY_FRONTEND_PROJECTION_TIMEOUT_SECONDS = 30 * 60 * 60
 REWARD_PER_RECEIPT_BASE = 2_500_000_000
 PUBLIC_CONSOLE = "https://ferrumvir.github.io/arc-chain/"
 PUBLIC_EXPLORER = PUBLIC_CONSOLE + "explorer/"
@@ -380,7 +382,13 @@ if blake3_short(b"") != "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93c
     raise RuntimeError("public-truth BLAKE3 known-answer self-test failed")
 
 
-def load_bytes(path: Path, label: str, maximum: int = MAX_INPUT_BYTES) -> bytes:
+def load_bytes(
+    path: Path,
+    label: str,
+    maximum: int = MAX_INPUT_BYTES,
+    *,
+    allow_empty: bool = False,
+) -> bytes:
     descriptor = -1
     try:
         flags = os.O_RDONLY
@@ -390,7 +398,7 @@ def load_bytes(path: Path, label: str, maximum: int = MAX_INPUT_BYTES) -> bytes:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             fail(f"{label} must be a non-symlink regular file")
-        if before.st_size <= 0 or before.st_size > maximum:
+        if before.st_size > maximum or (before.st_size == 0 and not allow_empty):
             fail(f"{label} has an unsupported size")
         chunks: list[bytes] = []
         remaining = maximum + 1
@@ -1999,7 +2007,8 @@ def validate_network(
             "height", "recoveryHeight", "legacyPublicMaxHeight", "blockHash",
             "stateRoot", "manifestHash", "boundaryBlockHash", "boundaryStateRoot",
             "recoveryEpoch", "validatorSetId", "protocolVersion", "recoveryDomain",
-            "legacySourceId", "v3SourceId",
+            "checkpointFileSha256", "checkpointPayloadHash", "legacySourceId",
+            "v3SourceId",
         },
         "frontend checkpoint",
     )
@@ -2011,22 +2020,96 @@ def validate_network(
             "frontend checkpoint does not preserve capture-derived H/H+1 "
             "above trusted anchor 137145"
         )
-    if (
-        not isinstance(checkpoint["protocolVersion"], str)
-        or PROTOCOL_VERSION_RE.fullmatch(checkpoint["protocolVersion"]) is None
-    ):
-        fail("frontend checkpoint is not protocol v3")
     chain = manifest.get("chain")
-    canonical_source = chain.get("canonical_source") if isinstance(chain, dict) else None
+    manifest_archive = manifest.get("archive")
+    artifacts = manifest.get("artifacts")
+    rollout_id = manifest.get("rollout_id")
+    if (
+        not isinstance(chain, dict)
+        or not isinstance(manifest_archive, dict)
+        or not isinstance(artifacts, dict)
+        or not isinstance(rollout_id, str)
+        or not rollout_id
+    ):
+        fail("rollout manifest omits its production chain/archive identity")
+    canonical_source = chain.get("canonical_source")
     canonical_node = (
         canonical_source.get("node") if isinstance(canonical_source, dict) else None
     )
     if canonical_node not in {name for name, _host in PRODUCTION_FLEET}:
         fail("rollout manifest omits its captured canonical source node")
+    manifest_epoch = positive_int(
+        chain.get("recovery_epoch"), "manifest recovery epoch"
+    )
+    manifest_validator_set = positive_int(
+        chain.get("validator_set_id"), "manifest validator set ID"
+    )
+    observed_cutoff = positive_int(
+        chain.get("legacy_observed_cutoff_height"),
+        "manifest legacy observed cutoff height",
+    )
+    continuity_margin = positive_int(
+        chain.get("legacy_continuity_safety_margin"),
+        "manifest legacy continuity safety margin",
+    )
+    protocol_version = chain.get("protocol_version")
+    if (
+        not isinstance(protocol_version, str)
+        or PROTOCOL_VERSION_RE.fullmatch(protocol_version) is None
+        or not isinstance(checkpoint["protocolVersion"], str)
+        or PROTOCOL_VERSION_RE.fullmatch(checkpoint["protocolVersion"]) is None
+    ):
+        fail("frontend checkpoint is not protocol v3")
+    if continuity_margin != LEGACY_CONTINUITY_SAFETY_MARGIN:
+        fail("rollout manifest continuity safety margin is not exactly 128")
+    if observed_cutoff < height or legacy_max != observed_cutoff + continuity_margin:
+        fail("rollout manifest does not prove the exact F=C+128 reopening floor")
+
+    checkpoint_artifact = artifacts.get("checkpoint")
+    interlock_artifact = artifacts.get("legacy_late_fork_interlock_tool")
+    if not isinstance(checkpoint_artifact, dict) or not isinstance(
+        interlock_artifact, dict
+    ):
+        fail("rollout manifest omits checkpoint or interlock artifacts")
+    manifest_checkpoint_sha = hash_value(
+        checkpoint_artifact.get("sha256"), "manifest checkpoint artifact SHA-256"
+    )
+    checkpoint_payload_hash = hash_value(
+        checkpoint.get("checkpointPayloadHash"),
+        "frontend canonical checkpoint payload hash",
+    )
+    manifest_interlock_tool_sha = hash_value(
+        interlock_artifact.get("sha256"), "manifest interlock tool SHA-256"
+    )
+    expected_capture_id = hash_value(
+        manifest_archive.get("capture_id"), "manifest archive capture ID"
+    )
+    expected_archive_roots = {
+        "rolloutManifestSha256": hash_value(
+            manifest_archive.get("prearchive_rollout_sha256"),
+            "manifest prearchive rollout SHA-256",
+        ),
+        "archiveManifestSha256": hash_value(
+            manifest_archive.get("archive_manifest_sha256"),
+            "manifest archive-manifest SHA-256",
+        ),
+        "completeSha256": hash_value(
+            manifest_archive.get("complete_sha256"),
+            "manifest archive COMPLETE SHA-256",
+        ),
+    }
+    if any(value == "0" * 64 for value in expected_archive_roots.values()):
+        fail("public truth requires a fully finalized archive manifest")
+
     source_id = f"v3-{canonical_node}"
     if (
-        checkpoint["recoveryEpoch"] != RECOVERY_EPOCH
-        or checkpoint["validatorSetId"] != VALIDATOR_SET_ID
+        chain.get("chain_id") != CHAIN_ID
+        or checkpoint["recoveryEpoch"] != manifest_epoch
+        or checkpoint["validatorSetId"] != manifest_validator_set
+        or manifest_epoch != RECOVERY_EPOCH
+        or manifest_validator_set != VALIDATOR_SET_ID
+        or checkpoint["protocolVersion"] != protocol_version
+        or checkpoint.get("checkpointFileSha256") != manifest_checkpoint_sha
         or checkpoint["legacySourceId"] != source_id
         or checkpoint["v3SourceId"] != source_id
         or height != chain.get("source_height")
@@ -2036,16 +2119,31 @@ def validate_network(
         != chain_hash(chain.get("source_block_hash"), "manifest source block hash")
         or chain_hash(checkpoint["stateRoot"], "checkpoint.stateRoot")
         != chain_hash(chain.get("source_state_root"), "manifest source state root")
+        or chain_hash(checkpoint["manifestHash"], "checkpoint.manifestHash")
+        != chain_hash(
+            chain.get("approved_checkpoint_manifest_hash"),
+            "manifest approved checkpoint manifest hash",
+        )
+        or chain_hash(
+            checkpoint["boundaryBlockHash"], "checkpoint.boundaryBlockHash"
+        )
+        != chain_hash(
+            chain.get("transition_block_hash"), "manifest transition block hash"
+        )
+        or chain_hash(
+            checkpoint["boundaryStateRoot"], "checkpoint.boundaryStateRoot"
+        )
+        != chain_hash(chain.get("full_state_root"), "manifest full state root")
+        or chain_hash(checkpoint["recoveryDomain"], "checkpoint.recoveryDomain")
+        != chain_hash(chain.get("recovery_domain"), "manifest recovery domain")
     ):
         fail("frontend checkpoint differs from the reviewed recovery identity")
-    for field in (
-        "blockHash", "stateRoot", "manifestHash", "boundaryBlockHash",
-        "boundaryStateRoot", "recoveryDomain",
-    ):
-        chain_hash(checkpoint[field], f"checkpoint.{field}")
     sources = config["sources"]
-    if not isinstance(sources, list) or len(sources) != 12:
-        fail("frontend sources must contain only the six validators and six legacy forks")
+    # The former `len(sources) != 12` invariant incorrectly presented every
+    # stopped capture as a noncanonical fork. The producer emits six v3 rows
+    # plus only the captures actually classified valid_noncanonical_fork.
+    if not isinstance(sources, list) or not 6 <= len(sources) <= 12:
+        fail("frontend sources must contain six validators and only captured legacy forks")
     if any(not isinstance(row, dict) for row in sources):
         fail("frontend source rows must be objects")
     identifiers = [row.get("id") for row in sources]
@@ -2060,9 +2158,12 @@ def validate_network(
         (f"v3-{name}", f"https://{host}") for name, host in PRODUCTION_FLEET
     ]
     actual_v3 = [(row.get("id"), row.get("baseUrl")) for row in v3]
-    if actual_v3 != expected_v3:
+    if (
+        actual_v3 != expected_v3
+        or sources[: len(PRODUCTION_FLEET)] != v3
+        or len(v3) + len(forks) != len(sources)
+    ):
         fail("frontend config does not expose the exact six protocol-v3 validators")
-    replica_groups: set[str] = set()
     for (name, _host), row in zip(PRODUCTION_FLEET, v3, strict=True):
         exact_keys(
             row,
@@ -2074,36 +2175,31 @@ def validate_network(
             row["name"] != f"ARC v3 {name.upper()}"
             or row["region"] != name.upper()
             or row["enabled"] is not True
-            or not isinstance(replica_group, str)
-            or not replica_group
+            or replica_group != rollout_id
         ):
             fail(f"frontend v3 source {name} differs from its rollout identity")
-        replica_groups.add(replica_group)
-    if len(replica_groups) != 1:
-        fail("frontend validators do not share one rollout identity")
-    if len(forks) != 6:
-        fail("frontend config does not preserve exactly six legacy fork views")
-    expected_forks = [
-        (f"legacy-fork-{name}", f"https://{host}/legacy/{name}")
-        for name, host in PRODUCTION_FLEET
-    ]
-    if [(row.get("id"), row.get("baseUrl")) for row in forks] != expected_forks:
-        fail("frontend legacy forks differ from the exact six archived validators")
+    fleet_hosts = dict(PRODUCTION_FLEET)
+    fleet_order = {name: index for index, (name, _host) in enumerate(PRODUCTION_FLEET)}
     capture_ids: set[str] = set()
-    for (name, _host), row in zip(PRODUCTION_FLEET, forks, strict=True):
+    fork_nodes: list[str] = []
+    previous_fleet_index = -1
+    for index, row in enumerate(forks):
         exact_keys(
             row,
             {
                 "id", "name", "region", "kind", "baseUrl", "enabled",
                 "replicaGroup", "description", "archive",
             },
-            f"frontend legacy source {name}",
+            f"frontend legacy source {index}",
         )
-        archive = row.get("archive")
-        if not isinstance(archive, dict):
+        archive_view = row.get("archive")
+        if not isinstance(archive_view, dict):
             fail("a legacy history lacks its archive commitment")
+        name = archive_view.get("node")
+        if not isinstance(name, str) or name not in fleet_hosts:
+            fail("a legacy history does not name a production capture")
         exact_keys(
-            archive,
+            archive_view,
             {
                 "schema", "readOnly", "classification", "captureId", "node",
                 "rolloutManifestSha256", "archiveManifestSha256", "completeSha256",
@@ -2114,25 +2210,37 @@ def validate_network(
             },
             f"frontend legacy source {name} archive",
         )
+        fleet_index = fleet_order[name]
         if (
-            row.get("enabled") is not True
+            fleet_index <= previous_fleet_index
+            or name == canonical_node
+            or row.get("id") != f"legacy-fork-{name}"
+            or row.get("baseUrl") != f"https://{fleet_hosts[name]}/legacy/{name}"
+            or row.get("enabled") is not True
             or row.get("name") != f"Preserved legacy fork · {name.upper()}"
             or row.get("region") != name.upper()
             or row.get("description")
             != "Explicit immutable historical fork; diagnostic only and never canonical."
-            or archive.get("readOnly") is not True
-            or archive.get("schema") != "arc.legacy-archive.source.v1"
-            or archive.get("classification") != "valid_noncanonical_fork"
-            or archive.get("node") != name
-            or archive.get("provenancePath") != "/provenance"
-            or archive.get("canonicalCheckpointHeight") != height
-            or isinstance(archive.get("sourceHeight"), bool)
-            or not isinstance(archive.get("sourceHeight"), int)
-            or archive["sourceHeight"] < 0
+            or archive_view.get("readOnly") is not True
+            or archive_view.get("schema") != "arc.legacy-archive.source.v1"
+            or archive_view.get("classification") != "valid_noncanonical_fork"
+            or archive_view.get("node") != name
+            or archive_view.get("provenancePath") != "/provenance"
+            or archive_view.get("canonicalCheckpointHeight") != height
+            or isinstance(archive_view.get("sourceHeight"), bool)
+            or not isinstance(archive_view.get("sourceHeight"), int)
+            or archive_view["sourceHeight"] < 0
         ):
             fail("a legacy history is not explicit, read-only, and noncanonical")
-        capture_id = hash_value(archive["captureId"], f"legacy source {name} captureId")
-        if row.get("replicaGroup") != f"legacy-capture-{capture_id}":
+        previous_fleet_index = fleet_index
+        fork_nodes.append(name)
+        capture_id = hash_value(
+            archive_view["captureId"], f"legacy source {name} captureId"
+        )
+        if (
+            capture_id != expected_capture_id
+            or row.get("replicaGroup") != f"legacy-capture-{expected_capture_id}"
+        ):
             fail(f"legacy source {name} is not bound to its capture identity")
         capture_ids.add(capture_id)
         for field in (
@@ -2141,12 +2249,13 @@ def validate_network(
             "checkpointSha256", "checkpointManifestHash", "checkpointPayloadHash",
             "sourceBlockHash", "sourceStateRoot",
         ):
-            chain_hash(archive[field], f"legacy source {name} archive.{field}")
-        if chain_hash(archive["checkpointManifestHash"], f"legacy source {name} checkpoint") != chain_hash(
-            checkpoint["manifestHash"], "checkpoint.manifestHash"
-        ):
-            fail(f"legacy source {name} refers to another checkpoint manifest")
-    if len(capture_ids) != 1:
+            chain_hash(archive_view[field], f"legacy source {name} archive.{field}")
+        for field, expected in expected_archive_roots.items():
+            if chain_hash(
+                archive_view[field], f"legacy source {name} archive.{field}"
+            ) != expected:
+                fail(f"legacy source {name} {field} differs from the sealed manifest")
+    if capture_ids and capture_ids != {expected_capture_id}:
         fail("frontend legacy forks do not share one sealed capture")
     services = config["services"]
     if not isinstance(services, dict):
@@ -2164,6 +2273,14 @@ def validate_network(
         },
         "frontend maintenance interlock",
     )
+    expected_source_set_sha = hash_value(
+        chain.get("legacy_late_fork_source_set_sha256"),
+        "manifest late-fork source-set SHA-256",
+    )
+    expected_boundary_sha = hash_value(
+        chain.get("legacy_maintenance_boundary_sha256"),
+        "manifest maintenance-boundary SHA-256",
+    )
     if (
         interlock.get("schema") != "arc.frontend.maintenance-interlock.v1"
         or interlock.get("path") != "/maintenance/status"
@@ -2171,13 +2288,33 @@ def validate_network(
         or interlock.get("maxStalenessSeconds") != 90
         or isinstance(interlock.get("observedCutoffHeight"), bool)
         or not isinstance(interlock.get("observedCutoffHeight"), int)
-        or interlock["observedCutoffHeight"] < height
-        or legacy_max != interlock["observedCutoffHeight"] + 128
+        or interlock["observedCutoffHeight"] != observed_cutoff
+        or legacy_max != interlock["observedCutoffHeight"] + continuity_margin
+        or interlock.get("sourceSetSha256") != expected_source_set_sha
+        or interlock.get("boundarySha256") != expected_boundary_sha
+        or interlock.get("toolSha256") != manifest_interlock_tool_sha
     ):
-        fail("frontend live gate does not require all six validators")
-    for field in ("sourceSetSha256", "boundarySha256", "toolSha256"):
-        hash_value(interlock[field], f"frontend maintenance interlock.{field}")
-    return checkpoint
+        fail("frontend live gate differs from the sealed all-six interlock")
+
+    # Per-fork checkpoint, binding, inventory, and source roots are
+    # intentionally candidate-specific: a valid noncanonical capture is
+    # expected to differ from the selected checkpoint. They are authenticated
+    # by the exact recovery verifier's deterministic frontend-config
+    # projection below, which derives them from the capture-bound immutable
+    # archive rather than trusting the supplied frontend JSON.
+    validated_checkpoint = dict(checkpoint)
+    validated_checkpoint.update(
+        {
+            "checkpointFileSha256": manifest_checkpoint_sha,
+            "checkpointPayloadHash": checkpoint_payload_hash,
+            "legacyContinuitySafetyMargin": continuity_margin,
+            "legacyObservedCutoffHeight": observed_cutoff,
+            "legacyForkCount": len(fork_nodes),
+            "legacyForkNodes": fork_nodes,
+            "rolloutId": rollout_id,
+        }
+    )
+    return validated_checkpoint
 
 
 def validate_reward(
@@ -2727,15 +2864,31 @@ def validate_published_acceptance(
 def run_recovery_verify(
     manifest_path: Path,
     reward_path: Path,
+    config_path: Path,
     manifest_raw: bytes,
     reward_raw: bytes,
+    config_raw: bytes,
     temporary_root: Path,
 ) -> dict[str, Any]:
+    """Rebuild the public config with the exact verifier and require byte identity.
+
+    ``frontend-config`` includes the same final all-six live/reward gate as
+    ``verify`` and additionally authenticates the finalized archive before
+    deriving every frontend field.  Using that command here avoids a duplicate
+    live pass while making the archive checkpoint payload hash come from the
+    exact capture-bound provenance path instead of an unauthenticated value in
+    the supplied frontend JSON.
+    """
+
     verifier, verifier_sha = repository_tool(
         RECOVERY_VERIFIER_RELATIVE, "recovery rollout verifier"
     )
     stdout_path = temporary_root / "recovery-verify.stdout"
     stderr_path = temporary_root / "recovery-verify.stderr"
+    projected_config_path = temporary_root / "recovery-projected-frontend.json"
+    projected_sidecar_path = projected_config_path.with_name(
+        projected_config_path.name + ".sha256"
+    )
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
         result = subprocess.run(
             [
@@ -2743,25 +2896,58 @@ def run_recovery_verify(
                 "-B",
                 "-I",
                 str(verifier),
-                "verify",
+                "frontend-config",
                 "--manifest",
                 str(manifest_path),
                 "--reward-evidence",
                 str(reward_path),
+                "--output",
+                str(projected_config_path),
             ],
             stdin=subprocess.DEVNULL,
             stdout=stdout,
             stderr=stderr,
             check=False,
-            timeout=30 * 60,
+            # The nested immutable-archive verifier alone has a reviewed
+            # 24-hour bound. Leave room for the subsequent all-six live and
+            # reward checks while retaining a finite outer watchdog.
+            timeout=RECOVERY_FRONTEND_PROJECTION_TIMEOUT_SECONDS,
         )
-    stderr_raw = load_bytes(stderr_path, "recovery verifier stderr", maximum=16 * 1024 * 1024)
+    stderr_raw = load_bytes(
+        stderr_path,
+        "recovery verifier stderr",
+        maximum=16 * 1024 * 1024,
+        allow_empty=True,
+    )
     if result.returncode != 0:
         detail = stderr_raw.decode("utf-8", errors="replace").strip()[-1000:]
         fail(f"exact checked-in recovery verifier failed closed: {detail or f'exit {result.returncode}'}")
     stdout_raw = load_bytes(stdout_path, "recovery verifier stdout", maximum=16 * 1024 * 1024)
-    if not stdout_raw or b"VERIFIED locked rollout sha256=" not in stdout_raw:
+    projected_raw = load_bytes(
+        projected_config_path,
+        "recovery-projected frontend config",
+        maximum=MAX_INPUT_BYTES,
+    )
+    projected_sidecar_raw = load_bytes(
+        projected_sidecar_path,
+        "recovery-projected frontend config sidecar",
+        maximum=1024,
+    )
+    projected_sha = sha256(projected_raw)
+    if projected_sidecar_raw != (
+        f"{projected_sha}  {projected_config_path.name}\n".encode("ascii")
+    ):
+        fail("recovery-projected frontend config sidecar differs")
+    expected_terminal = (
+        f"FRONTEND CONFIG {projected_config_path} sha256={projected_sha} "
+        f"rollout_sha256={sha256(manifest_raw)}\n"
+    ).encode("utf-8")
+    if (
+        stdout_raw.count(b"FRONTEND CONFIG ") != 1
+        or not stdout_raw.endswith(expected_terminal)
+    ):
         fail("exact checked-in recovery verifier produced no terminal verification record")
+    require_exact_frontend_projection(config_raw, projected_raw)
     _verifier_after, verifier_after_sha = repository_tool(
         RECOVERY_VERIFIER_RELATIVE, "recovery rollout verifier"
     )
@@ -2770,15 +2956,31 @@ def run_recovery_verify(
     if (
         load_bytes(manifest_path, "rollout manifest", maximum=MAX_INPUT_BYTES) != manifest_raw
         or load_bytes(reward_path, "reward evidence", maximum=MAX_INPUT_BYTES) != reward_raw
+        or load_bytes(config_path, "frontend config", maximum=MAX_INPUT_BYTES)
+        != config_raw
     ):
-        fail("sealed rollout or reward evidence changed during live verification")
+        fail("sealed rollout, reward evidence, or frontend config changed during verification")
     return {
+        "frontendConfigSha256": projected_sha,
+        "frontendProjectionSidecarSha256": sha256(projected_sidecar_raw),
         "manifestSha256": sha256(manifest_raw),
         "rewardEvidenceSha256": sha256(reward_raw),
         "stdoutSha256": sha256(stdout_raw),
         "verifierPath": RECOVERY_VERIFIER_RELATIVE.as_posix(),
         "verifierSha256": verifier_sha,
     }
+
+
+def require_exact_frontend_projection(
+    supplied_raw: bytes, projected_raw: bytes
+) -> None:
+    """Fail unless public bytes are the verifier's exact deterministic projection."""
+
+    if supplied_raw != projected_raw:
+        fail(
+            "frontend config differs from the exact capture-bound sealed-manifest "
+            "projection"
+        )
 
 
 def run_product_surface_verify(
@@ -2914,6 +3116,16 @@ def render_readme_block(
     each_arc = arc_text(reward_base)
     short_source = source_sha[:12]
     short_frontend = frontend_sha[:12]
+    fork_count = checkpoint["legacyForkCount"]
+    fork_summary = (
+        "No divergent capture requires an alternate public fork view."
+        if fork_count == 0
+        else (
+            f"**{fork_count}** divergent captured history "
+            f"{'view is' if fork_count == 1 else 'views are'} available as explicit, "
+            "immutable, read-only noncanonical forks."
+        )
+    )
     return f"""{BEGIN_MARKER}
 > **Live public testnet (evidence sealed after {published_at}):** The immutable
 > [v0.8.0 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.0)
@@ -2921,11 +3133,18 @@ def render_readme_block(
 > All six protocol-v3 validators serve the retained canonical chain through
 > block **{checkpoint['height']:,}**, continue at **{checkpoint['recoveryHeight']:,}**, and are
 > required to agree before the public console reports the network as healthy.
-> Checkpoint height H is distinct from maintenance reopening floor
-> F=**{checkpoint['legacyPublicMaxHeight']:,}**; every v3 validator must advance
-> strictly above F before canonical public surfaces reopen.
-> The six prior public histories remain available as explicit, immutable,
-> read-only noncanonical fork views; no legacy block was erased or renumbered.
+> Checkpoint height H is distinct from the last observed legacy height
+> C=**{checkpoint['legacyObservedCutoffHeight']:,}**. The sealed continuity margin is
+> **{checkpoint['legacyContinuitySafetyMargin']} blocks**, so
+> F=C+128=**{checkpoint['legacyPublicMaxHeight']:,}**; every v3 validator must advance
+> strictly above F before canonical public surfaces reopen. The H+1 boundary
+> block/state are `{chain_hash(checkpoint['boundaryBlockHash'], 'checkpoint.boundaryBlockHash')}` /
+> `{chain_hash(checkpoint['boundaryStateRoot'], 'checkpoint.boundaryStateRoot')}`;
+> recovery domain `{chain_hash(checkpoint['recoveryDomain'], 'checkpoint.recoveryDomain')}`,
+> epoch **{checkpoint['recoveryEpoch']}**, validator set **{checkpoint['validatorSetId']}**.
+> All six stopped captures remain preservation-bound. Selected or equivalent
+> canonical history is retained by v3. {fork_summary} No legacy block was erased
+> or renumbered.
 > The recovered network bytes were first accepted on Pages from verified config
 > commit [`{short_frontend}`](https://github.com/FerrumVir/arc-chain/commit/{frontend_sha}).
 > This block and its machine-readable status are published only by a subsequent
@@ -3057,8 +3276,10 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
         recovery = run_recovery_verify(
             args.rollout_manifest,
             args.reward_evidence,
+            args.frontend_config,
             manifest_raw,
             reward_raw,
+            config_raw,
             temporary_root,
         )
         product_surfaces = run_product_surface_verify(
@@ -3138,17 +3359,39 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
         },
         "checkpoint": {
             "blockHash": chain_hash(checkpoint["blockHash"], "checkpoint.blockHash"),
+            "boundaryBlockHash": chain_hash(
+                checkpoint["boundaryBlockHash"], "checkpoint.boundaryBlockHash"
+            ),
+            "boundaryStateRoot": chain_hash(
+                checkpoint["boundaryStateRoot"], "checkpoint.boundaryStateRoot"
+            ),
+            "checkpointFileSha256": checkpoint["checkpointFileSha256"],
+            "checkpointPayloadHash": checkpoint["checkpointPayloadHash"],
             "height": checkpoint["height"],
+            "legacyContinuitySafetyMargin": checkpoint[
+                "legacyContinuitySafetyMargin"
+            ],
+            "legacyObservedCutoffHeight": checkpoint[
+                "legacyObservedCutoffHeight"
+            ],
             "legacyPublicMaxHeight": checkpoint["legacyPublicMaxHeight"],
+            "legacyReopeningFormula": "F=C+128",
             "manifestHash": chain_hash(checkpoint["manifestHash"], "checkpoint.manifestHash"),
             "protocolVersion": checkpoint["protocolVersion"],
+            "recoveryDomain": chain_hash(
+                checkpoint["recoveryDomain"], "checkpoint.recoveryDomain"
+            ),
+            "recoveryEpoch": checkpoint["recoveryEpoch"],
             "recoveryHeight": checkpoint["recoveryHeight"],
             "stateRoot": chain_hash(checkpoint["stateRoot"], "checkpoint.stateRoot"),
+            "validatorSetId": checkpoint["validatorSetId"],
         },
         "fleet": {
-            "legacyForkCount": 6,
+            "legacyForkCount": checkpoint["legacyForkCount"],
+            "legacyForkNodes": checkpoint["legacyForkNodes"],
             "legacyForkPolicy": "immutable-read-only-noncanonical",
             "requiredHealthyValidators": 6,
+            "rolloutId": checkpoint["rolloutId"],
             "validatorCount": 6,
         },
         "network": config["network"],
