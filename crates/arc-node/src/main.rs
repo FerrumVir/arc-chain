@@ -5865,8 +5865,32 @@ fn p2p_listen_ip(
     }
 }
 
+#[cfg(windows)]
+fn main() -> Result<()> {
+    // The MSVC process entry thread reserves a substantially smaller stack
+    // than ARC's Unix entry threads. Keep the large async node/recovery
+    // future off that fixed entry stack so adding a fail-closed recovery
+    // field cannot make an otherwise normal Windows node overflow before it
+    // reaches lifecycle admission. The reservation is virtual address space;
+    // pages are committed only as they are used.
+    let node = std::thread::Builder::new()
+        .name("arc-node-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_arc_node)
+        .context("failed to start the Windows ARC node runtime thread")?;
+    match node.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(not(windows))]
+fn main() -> Result<()> {
+    run_arc_node()
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+async fn run_arc_node() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
         .init();
