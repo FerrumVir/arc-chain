@@ -3096,7 +3096,9 @@ while :; do /bin/sleep 1; done
 archive_dispatcher_signals_stop_the_full_phase_group_and_clean() (
     local fixture python_bin
     fixture="$(mktemp -d "$REPO_ROOT/.archive-dispatch-signal-test.XXXXXX")"
-    trap 'chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"' EXIT
+    trap 'if [ -e "$fixture/.retain-fixture" ]; then \
+        printf "retained failed archive-dispatch fixture: %s\\n" "$fixture" >&2; \
+        else chmod -R u+w "$fixture" 2>/dev/null || true; rm -rf -- "$fixture"; fi' EXIT
     chmod 700 "$fixture"
     python_bin="$(type -P python3)" || return 1
     [ -x "$python_bin" ] || return 1
@@ -3131,23 +3133,60 @@ sealed_config = snapshot(config)
 
 def process_rows():
     result = subprocess.run(
-        ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+        ["/bin/ps", "-ax", "-o", "pid=", "-o", "ppid=", "-o", "pgid=",
+         "-o", "stat="],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     rows = []
     for raw in result.stdout.splitlines():
-        fields = raw.split(None, 2)
-        if len(fields) == 3:
-            rows.append((int(fields[0]), int(fields[1]), fields[2]))
+        fields = raw.split(None, 3)
+        if len(fields) == 4:
+            rows.append((int(fields[0]), int(fields[1]), int(fields[2]), fields[3]))
     return rows
 
 def live_pid(pid):
     return any(row_pid == pid and not state.startswith("Z")
-               for row_pid, _pgid, state in process_rows())
+               for row_pid, _ppid, _pgid, state in process_rows())
 
 def live_group(pgid):
     return any(row_pgid == pgid and not state.startswith("Z")
-               for _pid, row_pgid, state in process_rows())
+               for _pid, _ppid, row_pgid, state in process_rows())
+
+def live_session(sid):
+    rows = []
+    for pid, ppid, pgid, state in process_rows():
+        if state.startswith("Z"):
+            continue
+        try:
+            process_sid = os.getsid(pid)
+        except ProcessLookupError:
+            continue
+        if process_sid == sid:
+            rows.append((pid, ppid, pgid, process_sid, state))
+    return rows
+
+def stop_owned_session(sid):
+    # Every dispatcher case starts a fresh session. On an assertion, sweep all
+    # of its process groups (including the guardian's separate group) before
+    # the shell trap removes the evidence directory. Killing only the parent
+    # and phase group can orphan a guardian or stopped descendant.
+    for sent_signal in (signal.SIGKILL,):
+        rows = live_session(sid)
+        for pgid in sorted({row[2] for row in rows}):
+            try:
+                os.killpg(pgid, sent_signal)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 2
+        while live_session(sid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not live_session(sid):
+            return
+    survivors = live_session(sid)
+    (fixture / ".retain-fixture").write_text(
+        f"owned session survived SIGKILL: {survivors!r}\n", encoding="utf-8"
+    )
+    raise AssertionError(f"owned dispatcher session survived SIGKILL: {survivors!r}")
 
 def wait_until(predicate, seconds, label):
     deadline = time.monotonic() + seconds
@@ -3329,7 +3368,7 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
                 except OSError as exc:
                     diagnosis.append(f"gate unreadable: {exc}")
                 diagnosis.append(
-                    f"group_rows={[row for row in process_rows() if row[1] == phase_pgid]}"
+                    f"group_rows={[row for row in process_rows() if row[2] == phase_pgid]}"
                 )
                 diagnosis.append(
                     "arc_env=" + repr(sorted(
@@ -3356,7 +3395,33 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
                 fast_teardowns.append(time.monotonic() - signal_sent_at)
             status = 128 - raw_status if raw_status < 0 else raw_status
             if status != expected_status:
-                raise AssertionError(f"{name} dispatcher status {status}, expected {expected_status}")
+                diagnosis = [
+                    f"{name} dispatcher status {status}, expected {expected_status}",
+                    f"raw_status={raw_status}",
+                ]
+                try:
+                    diagnosis.append(
+                        f"stderr={stderr_path.read_text(encoding='utf-8')[-3000:]!r}"
+                    )
+                except OSError as error:
+                    diagnosis.append(f"stderr unreadable: {error}")
+                diagnosis.append(
+                    f"case_entries={sorted(path.name for path in case.iterdir())}"
+                )
+                for marker_name in ("cleanup.started", "cleanup.complete", "cleanup.failed"):
+                    marker = case / marker_name
+                    if marker.is_file():
+                        diagnosis.append(
+                            f"{marker_name}={marker.read_text(encoding='utf-8')!r}"
+                        )
+                diagnosis.append(f"session_rows={live_session(process.pid)!r}")
+                try:
+                    diagnosis.append(
+                        f"gate_entries={sorted(path.name for path in gates[0].iterdir())}"
+                    )
+                except OSError as error:
+                    diagnosis.append(f"gate unreadable: {error}")
+                raise AssertionError(" | ".join(diagnosis))
             cleanup = case / "cleanup.complete"
             if name != "KILL" and not gate_remove_fails and any(
                     path.exists() or path.is_symlink() for _kind, path in roots):
@@ -3428,14 +3493,10 @@ for (name, sent_signal, expected_status, child_ignores, child_resurrects,
             if snapshot(identity) != sealed_identity or snapshot(config) != sealed_config:
                 raise AssertionError(f"{name} changed an original credential/config")
     finally:
-        if process is not None and process.poll() is None:
-            try: os.kill(process.pid, signal.SIGKILL)
-            except ProcessLookupError: pass
+        if process is not None:
+            stop_owned_session(process.pid)
             try: process.wait(timeout=2)
             except subprocess.TimeoutExpired: pass
-        if phase_pgid is not None and live_group(phase_pgid):
-            try: os.killpg(phase_pgid, signal.SIGKILL)
-            except ProcessLookupError: pass
 
 if fast_teardowns:
     ordered = sorted(fast_teardowns)
