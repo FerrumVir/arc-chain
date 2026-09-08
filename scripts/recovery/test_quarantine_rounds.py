@@ -73,6 +73,27 @@ def rust_input(seed: int, sha256: str, size: int) -> dict:
     }
 
 
+def reviewed_recovery_snapshot(head: dict) -> dict:
+    attempt = (
+        "/root/arc-recovery-live-source-captures/"
+        + "4" * 64
+        + "/sgp/round-1/preauthorization-boundary/"
+        + "5" * 64
+        + "/attempts/00000000-0000-4000-8000-000000000001"
+    )
+    return {
+        **head,
+        "path": f"{attempt}/fixed-source/state.snapshot.lz4",
+        "sha256": "6" * 64,
+        "size": 51,
+        "source_receipt": {
+            "path": f"{attempt}/receipt.json",
+            "sha256": "7" * 64,
+            "size": 52,
+        },
+    }
+
+
 def sgp_persisted_v5() -> tuple[dict, str]:
     wal_sha = "a" * 64
     source_snapshot_sha = "b" * 64
@@ -80,13 +101,14 @@ def sgp_persisted_v5() -> tuple[dict, str]:
     derived_snapshot_sha = "d" * 64
     head = {"height": 101, "block_hash": "e" * 64, "state_root": "f" * 64}
     plan = {
-        "node": "sgp", "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA,
-        "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY,
+        "node": "sgp", "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2,
+        "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V2,
         "source_snapshot": {
             "height": 99, "sha256": source_snapshot_sha, "size": 50,
             "state_root": source_snapshot_root,
         },
         "source_wal": {"sha256": wal_sha, "size": 100},
+        "recovery_snapshot": reviewed_recovery_snapshot(head),
     }
     plan_sha = qr.digest(plan)
     plan_size = len(qr.canonical_bytes(plan))
@@ -966,6 +988,22 @@ def ledger_for_first_successes(count: int) -> dict:
 
 
 class QuarantineRoundTests(unittest.TestCase):
+    def test_durable_wal_v1_plan_remains_compatible(self) -> None:
+        plan = {
+            "node": "sgp",
+            "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V1,
+            "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V1,
+            "source_snapshot": {
+                "height": 99,
+                "sha256": "a" * 64,
+                "size": 50,
+                "state_root": "b" * 64,
+            },
+            "source_wal": {"sha256": "c" * 64, "size": 100},
+        }
+        projection = qr.validate_durable_wal_boundary_plan(plan, "v1 plan")
+        self.assertNotIn("recovery_snapshot", projection)
+
     def test_sgp_persisted_v5_requires_exact_durable_evidence(self) -> None:
         persisted, plan_sha = sgp_persisted_v5()
         projection = qr.validate_sgp_persisted_head_v5(
@@ -1212,8 +1250,8 @@ class QuarantineRoundTests(unittest.TestCase):
         rust["fixed_pair"]["snapshot"] = derived_snapshot
         plan = {
             "node": "sgp",
-            "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA,
-            "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY,
+            "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2,
+            "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V2,
             "source_snapshot": {
                 "height": head["height"] + 1,
                 "sha256": source_snapshot["sha256"],
@@ -1224,6 +1262,7 @@ class QuarantineRoundTests(unittest.TestCase):
                 "sha256": source_wal["accepted_prefix_sha256"],
                 "size": source_wal["accepted_prefix_bytes"],
             },
+            "recovery_snapshot": reviewed_recovery_snapshot(head),
         }
         plan_sha = qr.digest(plan)
 
@@ -1292,6 +1331,46 @@ class QuarantineRoundTests(unittest.TestCase):
                 public_sha256=qr.digest(public),
                 cross_sha256=qr.digest(cross),
             )
+
+        for label, mutate in (
+            (
+                "reviewed recovery head",
+                lambda candidate: candidate["rust_capture"]["value"]
+                ["durable_wal_boundary"]["plan"]["recovery_snapshot"].update(
+                    {"state_root": "d" * 64}
+                ),
+            ),
+            (
+                "reviewed recovery receipt",
+                lambda candidate: candidate["rust_capture"]["value"]
+                ["durable_wal_boundary"]["plan"]["recovery_snapshot"]
+                ["source_receipt"].update({"path": "/root/not-reviewed/receipt.json"}),
+            ),
+        ):
+            tampered = copy.deepcopy(value)
+            mutate(tampered)
+            plan_value = tampered["rust_capture"]["value"]["durable_wal_boundary"]["plan"]
+            tampered_plan_sha = qr.digest(plan_value)
+            plan_size = len(qr.canonical_bytes(plan_value))
+            durable = tampered["rust_capture"]["value"]["durable_wal_boundary"]
+            for key in ("source_plan", "fixed_plan"):
+                durable[key]["sha256"] = tampered_plan_sha
+                durable[key]["size"] = plan_size
+            tampered["durable_wal_boundary"]["plan_sha256"] = tampered_plan_sha
+            tampered["rust_capture"] = qr.wrap(tampered["rust_capture"]["value"])
+            with self.subTest(label=label), self.assertRaises(qr.QuarantineRoundError):
+                qr.validate_live_source_capture(
+                    tampered,
+                    capture_id=CAPTURE,
+                    freeze_sha256=FREEZE,
+                    source_main_commit=SOURCE,
+                    round_number=1,
+                    target=target,
+                    public_row=public_row,
+                    cross_row=cross_row,
+                    public_sha256=qr.digest(public),
+                    cross_sha256=qr.digest(cross),
+                )
 
     def test_authorization_requires_exact_ordered_live_source_captures(self) -> None:
         names = [name for name, _host in qr.FLEET]

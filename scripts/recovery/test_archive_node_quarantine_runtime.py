@@ -356,6 +356,134 @@ class EmbeddedProgramTests(unittest.TestCase):
         self.assertIn('"legacy_dag_wal_dir"', self.shell)
         self.assertIn("exact-content-pinned-normalization-source", self.shell)
 
+    def test_persistently_stopped_source_projection_reproves_normal_and_sgp_inputs(
+        self,
+    ) -> None:
+        function = next(
+            node for node in ast.walk(ast.parse(self.outer))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "current_source_projection"
+        )
+
+        class ProjectionError(RuntimeError):
+            pass
+
+        def fail(message: str) -> None:
+            raise ProjectionError(message)
+
+        namespace = {
+            "os": os, "pathlib": pathlib, "hashlib": hashlib,
+            "HASH_RE": re.compile(r"[0-9a-f]{64}"), "fail": fail,
+            "node": "nyc",
+        }
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                "persistently-stopped-source-projection", "exec",
+            ),
+            namespace,
+        )
+        project = namespace["current_source_projection"]
+
+        def file_identity(path: pathlib.Path) -> dict[str, object]:
+            details = path.stat()
+            return {
+                "path": str(path), "device": details.st_dev,
+                "inode": details.st_ino, "mode": details.st_mode,
+                "uid": details.st_uid, "gid": details.st_gid,
+                "nlink": details.st_nlink, "size": details.st_size,
+                "mtime_ns": details.st_mtime_ns, "ctime_ns": details.st_ctime_ns,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+
+        def directory_identity(path: pathlib.Path) -> dict[str, object]:
+            details = path.stat()
+            return {
+                "path": str(path), "device": details.st_dev,
+                "inode": details.st_ino, "mode": details.st_mode,
+                "uid": details.st_uid, "gid": details.st_gid,
+                "nlink": details.st_nlink, "size": details.st_size,
+                "mtime_ns": details.st_mtime_ns, "ctime_ns": details.st_ctime_ns,
+            }
+
+        def source_inputs(root: pathlib.Path, *, durable: bool) -> tuple[
+            dict[str, object], dict[str, object]
+        ]:
+            original = root / "original"
+            dag_wal = original / "dag-wal"
+            fixed = root / "fixed-source"
+            dag_wal.mkdir(parents=True)
+            fixed.mkdir()
+            final_wal = original / "state.wal"
+            fixed_wal = fixed / "state.wal"
+            snapshot = fixed / "state.snapshot.lz4"
+            genesis = fixed / "genesis.network-hash"
+            final_wal.write_bytes(b"original-wal")
+            fixed_wal.write_bytes(b"fixed-wal")
+            snapshot.write_bytes(b"replayed-snapshot")
+            genesis.write_bytes(b"genesis-binding")
+            head = {
+                "height": 97591, "block_hash": "b" * 64,
+                "state_root": "c" * 64,
+            }
+            durable_value = None
+            if durable:
+                fixed_plan = fixed / "durable-wal-boundary.plan.json"
+                preserved = fixed / "source.snapshot.inconsistent.lz4"
+                fixed_plan.write_bytes(b"durable-plan")
+                preserved.write_bytes(b"observed-snapshot")
+                fixed_plan_identity = file_identity(fixed_plan)
+                durable_value = {
+                    "plan_sha256": fixed_plan_identity["sha256"],
+                    "selected_boundary": {
+                        **head, "checkpoint_sequence": 17,
+                    },
+                    "fixed_plan": fixed_plan_identity,
+                    "preserved_source_snapshot": file_identity(preserved),
+                    "replay_derived_snapshot": file_identity(snapshot),
+                }
+            value = {
+                "original_data_dir": directory_identity(original),
+                "legacy_dag_wal_dir": directory_identity(dag_wal),
+                "final_state_wal": file_identity(final_wal),
+                "fixed_data_dir": directory_identity(fixed),
+                "fixed_state_wal": file_identity(fixed_wal),
+                "fixed_snapshot": file_identity(snapshot),
+                "fixed_genesis_binding": file_identity(genesis),
+                "live_source_capture_sha256": "d" * 64,
+                "rust_live_source_capture_sha256": "e" * 64,
+                "source_pair_role": "preauthorization-boundary",
+            }
+            if durable_value is not None:
+                value["durable_wal_boundary"] = durable_value
+            return value, head
+
+        with tempfile.TemporaryDirectory() as raw:
+            normal, head = source_inputs(pathlib.Path(raw), durable=False)
+            self.assertEqual(project(normal, head), normal)
+            self.assertIn("legacy_dag_wal_dir", normal)
+            changed = dict(normal)
+            changed["legacy_dag_wal_dir"] = dict(normal["legacy_dag_wal_dir"])
+            changed["legacy_dag_wal_dir"]["inode"] += 1
+            with self.assertRaisesRegex(ProjectionError, "data directory changed"):
+                project(changed, head)
+
+        with tempfile.TemporaryDirectory() as raw:
+            durable, head = source_inputs(pathlib.Path(raw), durable=True)
+            namespace["node"] = "sgp"
+            self.assertEqual(project(durable, head), durable)
+            evidence = durable["durable_wal_boundary"]
+            self.assertEqual(evidence["selected_boundary"]["height"], head["height"])
+            changed = dict(durable)
+            changed_evidence = dict(evidence)
+            changed_evidence["plan_sha256"] = "f" * 64
+            changed["durable_wal_boundary"] = changed_evidence
+            with self.assertRaisesRegex(ProjectionError, "durable WAL boundary roots"):
+                project(changed, head)
+            namespace["node"] = "nyc"
+            with self.assertRaisesRegex(ProjectionError, "durable WAL boundary evidence"):
+                project(durable, head)
+
     def test_live_capture_persists_bounded_child_process_diagnostics(self) -> None:
         source = self.live_capture
         self.assertIn(

@@ -896,9 +896,12 @@ struct RecoveryCapturedHead {
     state_root: String,
 }
 
-const DURABLE_WAL_BOUNDARY_PLAN_SCHEMA: &str = "arc.recovery.durable-wal-boundary-plan.v1";
-const DURABLE_WAL_BOUNDARY_SELECTION_POLICY: &str =
+const DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V1: &str = "arc.recovery.durable-wal-boundary-plan.v1";
+const DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2: &str = "arc.recovery.durable-wal-boundary-plan.v2";
+const DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V1: &str =
     "strict-latest-complete-final-frame-wal-boundary";
+const DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V2: &str =
+    "reviewed-exact-snapshot-for-unchanged-current-head-wal";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -918,12 +921,34 @@ struct RecoveryPinnedSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RecoveryPinnedPathContent {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPinnedExactSnapshot {
+    path: String,
+    height: u64,
+    block_hash: String,
+    state_root: String,
+    sha256: String,
+    size: u64,
+    source_receipt: RecoveryPinnedPathContent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyDurableWalBoundaryPlan {
     node: String,
     schema: String,
     selection_policy: String,
     source_snapshot: RecoveryPinnedSnapshot,
     source_wal: RecoveryPinnedContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_snapshot: Option<RecoveryPinnedExactSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1142,7 +1167,7 @@ fn load_legacy_durable_wal_boundary_plan(
 ) -> Result<(
     LegacyDurableWalBoundaryPlan,
     RecoveryReadOnlyInput,
-    arc_state::recovery::LegacyDurableWalSnapshotExpectation,
+    Option<arc_state::recovery::LegacyDurableWalSnapshotExpectation>,
 )> {
     ensure!(
         path.is_absolute(),
@@ -1167,14 +1192,6 @@ fn load_legacy_durable_wal_boundary_plan(
     let plan: LegacyDurableWalBoundaryPlan =
         serde_json::from_slice(&bytes).context("failed to parse durable-WAL boundary plan")?;
     ensure!(
-        plan.schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA,
-        "durable-WAL boundary plan schema is unsupported"
-    );
-    ensure!(
-        plan.selection_policy == DURABLE_WAL_BOUNDARY_SELECTION_POLICY,
-        "durable-WAL boundary plan selection_policy is unsupported"
-    );
-    ensure!(
         plan.node == "sgp",
         "durable-WAL boundary exception is hard-gated to the reviewed SGP source"
     );
@@ -1194,14 +1211,204 @@ fn load_legacy_durable_wal_boundary_plan(
             "durable-WAL boundary plan {label} SHA-256 is malformed"
         );
     }
-    let expectation = arc_state::recovery::LegacyDurableWalSnapshotExpectation {
-        source_snapshot_height: plan.source_snapshot.height,
-        source_snapshot_state_root: parse_recovery_hash(
-            "durable-WAL boundary plan source_snapshot.state_root",
-            &plan.source_snapshot.state_root,
-        )?,
+    let expectation = match plan.schema.as_str() {
+        DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V1 => {
+            ensure!(
+                plan.selection_policy == DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V1
+                    && plan.recovery_snapshot.is_none(),
+                "durable-WAL boundary v1 plan policy differs"
+            );
+            Some(arc_state::recovery::LegacyDurableWalSnapshotExpectation {
+                source_snapshot_height: plan.source_snapshot.height,
+                source_snapshot_state_root: parse_recovery_hash(
+                    "durable-WAL boundary plan source_snapshot.state_root",
+                    &plan.source_snapshot.state_root,
+                )?,
+            })
+        }
+        DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2 => {
+            ensure!(
+                plan.selection_policy == DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V2
+                    && plan.recovery_snapshot.is_some(),
+                "durable-WAL boundary v2 plan policy differs"
+            );
+            None
+        }
+        _ => bail!("durable-WAL boundary plan schema is unsupported"),
     };
     Ok((plan, input, expectation))
+}
+
+fn reviewed_recovery_path(value: &str, label: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    ensure!(path.is_absolute(), "{label} must be absolute");
+    ensure!(
+        path.starts_with("/root/arc-recovery-live-source-captures/"),
+        "{label} is outside the retained live-source capture namespace"
+    );
+    ensure!(
+        path.components().all(|component| matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )),
+        "{label} contains a non-canonical path component"
+    );
+    Ok(path)
+}
+
+fn require_reviewed_recovery_input(
+    input: &RecoveryReadOnlyInput,
+    expected_sha256: &str,
+    expected_size: u64,
+    label: &str,
+) -> Result<()> {
+    require_recovery_input_hash(input, expected_sha256, label)?;
+    ensure!(
+        input.size == expected_size
+            && input.size > 0
+            && input.uid == 0
+            && input.gid == 0
+            && input.nlink == 1
+            && input.mode & 0o022 == 0,
+        "{label} size/ownership/mode differs from the reviewed pin"
+    );
+    Ok(())
+}
+
+fn validate_reviewed_exact_snapshot_inputs(
+    plan: &LegacyDurableWalBoundaryPlan,
+) -> Result<(RecoveryReadOnlyInput, RecoveryReadOnlyInput)> {
+    use sha2::{Digest, Sha256};
+
+    let reviewed = plan
+        .recovery_snapshot
+        .as_ref()
+        .context("reviewed exact-snapshot plan lost its recovery snapshot")?;
+    ensure!(
+        reviewed.height > 0 && reviewed.size > 0 && reviewed.source_receipt.size > 0,
+        "reviewed exact-snapshot plan contains an empty input"
+    );
+    let reviewed_state_root =
+        parse_recovery_hash("reviewed exact-snapshot state_root", &reviewed.state_root)?;
+    let reviewed_block_hash =
+        parse_recovery_hash("reviewed exact-snapshot block_hash", &reviewed.block_hash)?;
+    ensure!(
+        reviewed_state_root != Hash256::ZERO && reviewed_block_hash != Hash256::ZERO,
+        "reviewed exact-snapshot head contains a zero hash"
+    );
+    let snapshot_path = reviewed_recovery_path(&reviewed.path, "reviewed exact snapshot")?;
+    let receipt_path = reviewed_recovery_path(
+        &reviewed.source_receipt.path,
+        "reviewed exact-snapshot source receipt",
+    )?;
+    ensure!(
+        snapshot_path.file_name().and_then(|value| value.to_str()) == Some("state.snapshot.lz4")
+            && snapshot_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                == Some("fixed-source")
+            && receipt_path.file_name().and_then(|value| value.to_str()) == Some("receipt.json")
+            && receipt_path.parent() == snapshot_path.parent().and_then(Path::parent),
+        "reviewed exact snapshot and source receipt are not one retained capture attempt"
+    );
+    let snapshot_input =
+        recovery_read_only_input(&snapshot_path, "reviewed exact recovery snapshot")?;
+    require_reviewed_recovery_input(
+        &snapshot_input,
+        &reviewed.sha256,
+        reviewed.size,
+        "reviewed exact recovery snapshot",
+    )?;
+    let receipt_input =
+        recovery_read_only_input(&receipt_path, "reviewed exact-snapshot source receipt")?;
+    require_reviewed_recovery_input(
+        &receipt_input,
+        &reviewed.source_receipt.sha256,
+        reviewed.source_receipt.size,
+        "reviewed exact-snapshot source receipt",
+    )?;
+
+    let receipt_bytes = std::fs::read(&receipt_path)
+        .context("failed to read reviewed exact-snapshot source receipt")?;
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)
+        .context("reviewed exact-snapshot source receipt is invalid JSON")?;
+    let head = receipt
+        .get("head")
+        .context("reviewed exact-snapshot source receipt has no head")?;
+    let rust_wrapper = receipt
+        .get("rust_capture")
+        .context("reviewed exact-snapshot source receipt has no Rust capture")?;
+    let rust = rust_wrapper
+        .get("value")
+        .context("reviewed exact-snapshot source receipt has no Rust value")?;
+    let fixed = rust
+        .get("fixed_pair")
+        .context("reviewed exact-snapshot source receipt has no fixed pair")?;
+    let mut rust_bytes = serde_json::to_vec(rust)?;
+    rust_bytes.push(b'\n');
+    let rust_sha256 = hex::encode(Sha256::digest(&rust_bytes));
+    let fixed_dir = snapshot_path
+        .parent()
+        .context("reviewed exact snapshot has no fixed directory")?;
+    ensure!(
+        receipt.get("schema").and_then(serde_json::Value::as_str)
+            == Some("arc.recovery.quarantine-live-source-capture.v1")
+            && receipt.get("node").and_then(serde_json::Value::as_str) == Some("sgp")
+            && receipt
+                .get("content_sealed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && receipt
+                .get("strict_offline_replay")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && head.get("height").and_then(serde_json::Value::as_u64) == Some(reviewed.height)
+            && head.get("block_hash").and_then(serde_json::Value::as_str)
+                == Some(reviewed.block_hash.as_str())
+            && head.get("state_root").and_then(serde_json::Value::as_str)
+                == Some(reviewed.state_root.as_str())
+            && receipt
+                .get("fixed_pair_path")
+                .and_then(serde_json::Value::as_str)
+                == fixed_dir.to_str()
+            && rust_wrapper
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                == Some(rust_sha256.as_str())
+            && rust.get("head") == Some(head)
+            && fixed
+                .get("state_wal")
+                .and_then(|value| value.get("sha256"))
+                .and_then(serde_json::Value::as_str)
+                == Some(plan.source_wal.sha256.as_str())
+            && fixed
+                .get("state_wal")
+                .and_then(|value| value.get("size"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(plan.source_wal.size)
+            && fixed
+                .get("snapshot")
+                .and_then(|value| value.get("sha256"))
+                .and_then(serde_json::Value::as_str)
+                == Some(reviewed.sha256.as_str())
+            && fixed
+                .get("snapshot")
+                .and_then(|value| value.get("size"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(reviewed.size),
+        "reviewed exact-snapshot receipt/content/head binding differs"
+    );
+    ensure!(
+        recovery_read_only_input(&snapshot_path, "reviewed exact snapshot final recheck")?
+            == snapshot_input
+            && recovery_read_only_input(
+                &receipt_path,
+                "reviewed exact-snapshot source receipt final recheck",
+            )? == receipt_input,
+        "reviewed exact-snapshot evidence changed while it was validated"
+    );
+    Ok((snapshot_input, receipt_input))
 }
 
 fn recovery_directory_input(metadata: &std::fs::Metadata) -> Result<RecoveryReadOnlyDirectory> {
@@ -3697,18 +3904,38 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 ),
             };
 
+            let reviewed_exact_snapshot_inputs = durable_plan
+                .as_ref()
+                .filter(|(_, plan, _, _)| plan.schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2)
+                .map(|(_, plan, _, _)| validate_reviewed_exact_snapshot_inputs(plan))
+                .transpose()?;
+
             let (_, network) = recovery_network_from_genesis(&genesis, 1, 1)?;
             let legacy_validators = load_legacy_recovery_validator_file(&legacy_validator_set)?;
             let (source_state, source_report) =
-                if let Some((_, _, _, expectation)) = durable_plan.as_ref() {
-                    StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
-                        &loader_data_dir,
-                        network.genesis_hash,
-                        allow_unbound_legacy_wal,
-                        &snapshot,
-                        &legacy_validators,
-                        expectation,
-                    )?
+                if let Some((_, plan, _, expectation)) = durable_plan.as_ref() {
+                    if let Some(expectation) = expectation.as_ref() {
+                        StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+                            &loader_data_dir,
+                            network.genesis_hash,
+                            allow_unbound_legacy_wal,
+                            &snapshot,
+                            &legacy_validators,
+                            expectation,
+                        )?
+                    } else {
+                        let reviewed = plan
+                            .recovery_snapshot
+                            .as_ref()
+                            .context("reviewed exact-snapshot plan lost its recovery snapshot")?;
+                        StateDB::load_legacy_recovery_export_source_with_report(
+                            &loader_data_dir,
+                            network.genesis_hash,
+                            allow_unbound_legacy_wal,
+                            &reviewed.path,
+                            &legacy_validators,
+                        )?
+                    }
                 } else {
                     StateDB::load_legacy_recovery_export_source_with_report(
                         &loader_data_dir,
@@ -3728,6 +3955,26 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 block_hash: source_head.hash.to_hex(),
                 state_root: source_head.header.state_root.to_hex(),
             };
+            if let Some((_, plan, _, expectation)) = durable_plan.as_ref()
+                && expectation.is_none()
+            {
+                let reviewed = plan.recovery_snapshot.as_ref().context(
+                    "reviewed exact-snapshot plan lost its recovery snapshot after replay",
+                )?;
+                ensure!(
+                    head.height == reviewed.height
+                        && head.block_hash == reviewed.block_hash
+                        && head.state_root == reviewed.state_root,
+                    "reviewed exact recovery snapshot selected a different legacy head"
+                );
+                ensure!(
+                    (
+                        plan.source_snapshot.height,
+                        plan.source_snapshot.state_root.as_str()
+                    ) != (head.height, head.state_root.as_str()),
+                    "reviewed exact-snapshot exception is forbidden when the live snapshot already matches the selected head"
+                );
+            }
             ensure!(
                 recovery_read_only_input(snapshot_path, "live legacy snapshot")? == source_snapshot
                     && recovery_read_only_input(genesis_path, "recovery genesis")? == genesis_input
@@ -3888,6 +4135,23 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                         "durable-WAL boundary plan final capture recheck"
                     )? == *source_plan,
                     "durable-WAL boundary plan changed before content seal"
+                );
+            }
+            if let Some((snapshot_input, receipt_input)) = reviewed_exact_snapshot_inputs.as_ref() {
+                let reviewed = durable_plan
+                    .as_ref()
+                    .and_then(|(_, plan, _, _)| plan.recovery_snapshot.as_ref())
+                    .context("reviewed exact-snapshot plan disappeared before content seal")?;
+                ensure!(
+                    recovery_read_only_input(
+                        Path::new(&reviewed.path),
+                        "reviewed exact snapshot content-seal recheck",
+                    )? == *snapshot_input
+                        && recovery_read_only_input(
+                            Path::new(&reviewed.source_receipt.path),
+                            "reviewed exact-snapshot receipt content-seal recheck",
+                        )? == *receipt_input,
+                    "reviewed exact-snapshot evidence changed before content seal"
                 );
             }
 
@@ -8735,17 +8999,20 @@ mod tests {
             .unwrap();
         let (plan, input, expectation) = load_legacy_durable_wal_boundary_plan(
             &plan_path,
-            "9dbb076fa1d3ffb37874e36103d4b588c0662f46a010bef72ca00ff0f4cd821e",
+            "8f80124441dce087a74cbb8dd4febc066731d8b3921043ea091fcf33117eda82",
         )
         .expect("the canonical SGP exception plan must remain content-addressed and parseable");
-        assert_eq!(input.size, 449);
+        assert_eq!(input.size, 1_421);
         assert_eq!(plan.node, "sgp");
         assert_eq!(plan.source_wal.size, 53_342_777);
         assert_eq!(plan.source_snapshot.size, 752_568);
-        assert_eq!(expectation.source_snapshot_height, 97_591);
+        assert!(expectation.is_none());
+        let recovery_snapshot = plan.recovery_snapshot.as_ref().unwrap();
+        assert_eq!(recovery_snapshot.height, 97_591);
+        assert_eq!(recovery_snapshot.size, 751_260);
         assert_eq!(
-            expectation.source_snapshot_state_root.to_hex(),
-            "fadd4f9d5d2e5cd659ea02261987e209aec8aa2f5673e21929bc566d257969b4"
+            recovery_snapshot.state_root,
+            "55790e3c1fcef9b064d0fe27bc28bc6c3cbd51324705d8a86508237265ff494a"
         );
         assert!(
             load_legacy_durable_wal_boundary_plan(&plan_path, &"0".repeat(64))
