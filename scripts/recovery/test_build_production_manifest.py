@@ -3083,6 +3083,9 @@ print(json.dumps(value,sort_keys=True))
             "legacy-wal-normalization-ams.json": art(
                 "legacy_wal_normalization_ams", "legacy-wal-normalization-ams.json"
             ),
+            "durable-wal-boundary-sgp.json": art(
+                "durable_wal_boundary_sgp", "durable-wal-boundary-sgp.json"
+            ),
             "offline-stop-evidence.json": art("offline_stop_evidence", "offline-stop-evidence.json"),
             "offline-stop-evidence.json.sha256": art(
                 "offline_stop_evidence_sidecar", "offline-stop-evidence.json.sha256"

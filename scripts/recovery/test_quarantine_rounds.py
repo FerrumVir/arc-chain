@@ -65,6 +65,109 @@ def legacy_dag_round() -> dict:
     }
 
 
+def rust_input(seed: int, sha256: str, size: int) -> dict:
+    return {
+        "device": seed, "inode": seed + 1, "mode": 0o100400,
+        "uid": 0, "gid": 0, "nlink": 1, "mtime_ns": seed + 2,
+        "ctime_ns": seed + 3, "sha256": sha256, "size": size,
+    }
+
+
+def sgp_persisted_v5() -> tuple[dict, str]:
+    wal_sha = "a" * 64
+    source_snapshot_sha = "b" * 64
+    source_snapshot_root = "c" * 64
+    derived_snapshot_sha = "d" * 64
+    head = {"height": 101, "block_hash": "e" * 64, "state_root": "f" * 64}
+    plan = {
+        "node": "sgp", "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA,
+        "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY,
+        "source_snapshot": {
+            "height": 99, "sha256": source_snapshot_sha, "size": 50,
+            "state_root": source_snapshot_root,
+        },
+        "source_wal": {"sha256": wal_sha, "size": 100},
+    }
+    plan_sha = qr.digest(plan)
+    plan_size = len(qr.canonical_bytes(plan))
+    durable = {
+        "source_plan": rust_input(100, plan_sha, plan_size),
+        "fixed_plan": rust_input(200, plan_sha, plan_size),
+        "plan": plan,
+        "selected_boundary": {**head, "checkpoint_sequence": 1234},
+        "preserved_source_snapshot": rust_input(300, source_snapshot_sha, 50),
+        "replay_derived_snapshot": rust_input(400, derived_snapshot_sha, 60),
+    }
+    compact_wal = {"device": 10, "inode": 11, "size": 100, "mode": 0o100400}
+    compact_snapshot = {"device": 12, "inode": 13, "size": 60, "mode": 0o100400}
+    archived_identity = {"device": 14, "inode": 15, "size": 110, "mode": 0o100400}
+    hashes = iter(f"{index:064x}" for index in range(1, 40))
+    value = {
+        "schema": qr.PERSISTED_LEGACY_HEAD_SCHEMA_V5,
+        "source_main_commit": SOURCE, "capture_id": next(hashes), "node": "sgp",
+        "freeze_plan_sha256": next(hashes),
+        "boot_id": "00000000-0000-0000-0000-000000000006",
+        "inspector_binary_sha256": next(hashes), "genesis_sha256": next(hashes),
+        "validator_public_keys_sha256": next(hashes),
+        "legacy_validator_set_sha256": next(hashes),
+        "source_pair_role": "post-quarantine-final-export",
+        "final_source_capture_sha256": next(hashes),
+        "selected_source_head": dict(head),
+        "stop_after_round_receipt_sha256": next(hashes),
+        "network_quarantine_receipt_sha256": next(hashes),
+        "stop_complete_sha256": next(hashes), "stop_files_sha256": next(hashes),
+        "capture_complete_sha256": next(hashes), "capture_files_sha256": next(hashes),
+        "capture_source_sha256": next(hashes), "source_data_index_sha256": next(hashes),
+        "state_wal_sha256": wal_sha, "state_wal_size": 100,
+        "snapshot_sha256": derived_snapshot_sha, "snapshot_size": 60,
+        "source_file_identity": {
+            "state_wal": compact_wal, "snapshot": compact_snapshot,
+        },
+        "staged_file_contract": {
+            "state_wal": {"sha256": wal_sha, "size": 100, "mode": 0o100400,
+                          "uid": 0, "gid": 0, "nlink": 1},
+            "snapshot": {"sha256": derived_snapshot_sha, "size": 60,
+                         "mode": 0o100400, "uid": 0, "gid": 0, "nlink": 1},
+            "ephemeral_inode_receipted": False,
+        },
+        "export_summary_sha256": next(hashes), "inspect_summary_sha256": next(hashes),
+        "legacy_dag_round": legacy_dag_round(),
+        "trusted_anchor_ancestry": {
+            "anchor_height": 137145, "anchor_block_hash": "1" * 64,
+            "anchor_state_root": "2" * 64, "classification": "below_trusted_anchor",
+            "inspection": None, "inspection_sha256": qr.digest(None),
+        },
+        "wal_boundary_sha256": next(hashes), "export_status": "EXPORTED_UNSIGNED",
+        "head": dict(head), "candidate_checkpoint_sha256": next(hashes),
+        "candidate_checkpoint_size": 1000,
+        "snapshot_path": "/root/fixed/state.snapshot.lz4",
+        "state_wal_path": "/root/fixed/state.wal",
+        "export_contract": {
+            "binary_path": "/proc/self/fd/8", "exit_code": 0,
+            "source_consensus_round": 0, "created_at_unix_ms": 0,
+            "recovery_epoch": 1, "validator_set_id": 1,
+            "allow_unbound_legacy_wal": True, "read_only": True,
+        },
+        "completed_at": utc(10), "rerun_reexecutes_export": True,
+        "writer_stopped": True, "restart_barrier_active": True,
+        "network_quarantine_active": True, "global_absence_claimed": False,
+        "durable_wal_boundary": {"plan_sha256": plan_sha, "capture": durable},
+        "archived_final_wal": {
+            "path": "/root/archive/state.wal", "sha256": next(hashes), "size": 110,
+            "file_identity": archived_identity,
+            "source_relation": "exact-content-pinned-durable-wal-source-prefix",
+            "durable_wal_boundary_plan_sha256": plan_sha,
+            "selected_prefix_bytes": 100, "selected_prefix_sha256": wal_sha,
+            "post_capture_suffix_bytes": 10,
+            "post_capture_suffix_sha256": next(hashes),
+            "post_capture_suffix_classification":
+                "durable_wal_boundary_from_content_pinned_archived_original",
+            "preserved_by": "complete-content-indexed-stopped-legacy-source-v4",
+        },
+    }
+    return value, plan_sha
+
+
 def target_row(name: str) -> dict:
     index = [row[0] for row in qr.FLEET].index(name) + 1
     return {
@@ -863,7 +966,36 @@ def ledger_for_first_successes(count: int) -> dict:
 
 
 class QuarantineRoundTests(unittest.TestCase):
-    def test_normalized_live_source_v2_binds_derivative_snapshot_and_head(self) -> None:
+    def test_sgp_persisted_v5_requires_exact_durable_evidence(self) -> None:
+        persisted, plan_sha = sgp_persisted_v5()
+        projection = qr.validate_sgp_persisted_head_v5(
+            persisted, plan_sha, "test SGP persisted head"
+        )
+        self.assertEqual(projection["selected_boundary"]["height"], persisted["head"]["height"])
+
+        mutations = (
+            ("checkpoint sequence", lambda value: value["durable_wal_boundary"][
+                "capture"]["selected_boundary"].pop("checkpoint_sequence")),
+            ("preserved snapshot", lambda value: value["durable_wal_boundary"][
+                "capture"]["preserved_source_snapshot"].update({"sha256": "0" * 64})),
+            ("archive relation", lambda value: value["archived_final_wal"].update(
+                {"selected_prefix_bytes": 99})),
+            ("missing suffix hash", lambda value: value[
+                "archived_final_wal"].update({"post_capture_suffix_sha256": None})),
+        )
+        for label, mutate in mutations:
+            tampered = copy.deepcopy(persisted)
+            mutate(tampered)
+            with self.subTest(label=label), self.assertRaises(qr.QuarantineRoundError):
+                qr.validate_sgp_persisted_head_v5(
+                    tampered, plan_sha, "test SGP persisted head"
+                )
+        with self.assertRaisesRegex(qr.QuarantineRoundError, "plan pin"):
+            qr.validate_sgp_persisted_head_v5(
+                persisted, "0" * 64, "test SGP persisted head"
+            )
+
+    def test_normalized_live_source_v1_receipt_remains_compatible(self) -> None:
         target = target_row("lax")
         public = public_receipt(["lax"], 0)
         cross = cross_receipt(["lax"], public, 0)
@@ -899,6 +1031,255 @@ class QuarantineRoundTests(unittest.TestCase):
         normalization["head"]["state_root"] = "f" * 64
         tampered["wal_normalization"]["receipt"] = qr.wrap(normalization)
         with self.assertRaisesRegex(qr.QuarantineRoundError, "identity differs"):
+            qr.validate_live_source_capture(
+                tampered,
+                capture_id=CAPTURE,
+                freeze_sha256=FREEZE,
+                source_main_commit=SOURCE,
+                round_number=1,
+                target=target,
+                public_row=public_row,
+                cross_row=cross_row,
+                public_sha256=qr.digest(public),
+                cross_sha256=qr.digest(cross),
+            )
+
+    def test_normalized_live_source_v2_accepts_and_binds_snapshot_tail(self) -> None:
+        target = target_row("lax")
+        public = public_receipt(["lax"], 0)
+        cross = cross_receipt(["lax"], public, 0)
+        public_row = public["origins"][0]
+        cross_row = cross["nodes"][0]
+        wrapper = live_source_capture(
+            target,
+            public_row,
+            cross_row,
+            round_number=1,
+            public_sha256=qr.digest(public),
+            cross_sha256=qr.digest(cross),
+            completed_at=cross["completed_at"],
+            normalized=True,
+        )
+        value = wrapper["value"]
+        rust = value["rust_capture"]["value"]
+        old = value["wal_normalization"]["receipt"]["value"]
+        plan_sha = value["wal_normalization"]["plan_sha256"]
+        base_source_root = old["source_wal"]["sha256"]
+        base_derivative_root = rust["fixed_pair"]["state_wal"]["sha256"]
+        full_source_root = "a" * 64
+        full_derivative_root = "b" * 64
+        suffix_source_root = "c" * 64
+        suffix_derivative_root = "d" * 64
+        source_wal = copy.deepcopy(old["source_wal"])
+        source_wal.update({"sha256": full_source_root, "size": 16})
+        derivative_wal = copy.deepcopy(old["derivative_wal"])
+        derivative_wal.update({"sha256": full_derivative_root, "size": 16})
+        rust["source_wal_prefix"].update({
+            "loader_observed_bytes": 16,
+            "copy_observed_bytes": 16,
+            "accepted_prefix_bytes": 8,
+            "accepted_prefix_sha256": base_derivative_root,
+            "quarantined_suffix_bytes_at_loader": 8,
+            "loader_tail_reason": "valid_entries_after_selected_snapshot_boundary:1",
+        })
+        normalization = {
+            "schema": qr.WAL_NORMALIZATION_SCHEMA_V2,
+            "plan_sha256": plan_sha,
+            "node": "lax",
+            "base_source_wal": {"sha256": base_source_root, "size": 8},
+            "base_source_snapshot": {"sha256": "e" * 64, "size": 8},
+            "base_derivative_wal": {
+                "sha256": base_derivative_root,
+                "size": 8,
+            },
+            "base_head": {"height": 1, "block_hash": "1" * 64, "state_root": "2" * 64},
+            "partition": [{
+                "kind": "selected-frame-run",
+                "source_start": 0,
+                "source_end": 8,
+                "sha256": base_source_root,
+                "frame_count": 1,
+                "source_first_sequence": 0,
+                "source_last_sequence": 0,
+                "sequence_delta": 0,
+                "derivative_first_sequence": 0,
+                "derivative_last_sequence": 0,
+            }],
+            "sequence_rewrites": [],
+            "append_policy": {
+                "mode": qr.WAL_APPEND_MODE,
+                "maximum_bytes": 64,
+                "maximum_frames": 8,
+                "source_first_sequence": 1,
+                "derivative_first_sequence": 1,
+                "sequence_delta": 0,
+            },
+            "snapshot_policy": {
+                "mode": qr.WAL_SNAPSHOT_MODE,
+                "maximum_size": 1024,
+            },
+            "source_wal": source_wal,
+            "source_snapshot": copy.deepcopy(rust["source_snapshot"]),
+            "derivative_wal": derivative_wal,
+            "appended_suffix": {
+                "source_start": 8,
+                "source_end": 16,
+                "source_bytes": 8,
+                "source_sha256": suffix_source_root,
+                "derivative_start": 8,
+                "derivative_end": 16,
+                "derivative_bytes": 8,
+                "derivative_sha256": suffix_derivative_root,
+                "frame_count": 1,
+                "source_first_sequence": 1,
+                "source_last_sequence": 1,
+                "derivative_first_sequence": 1,
+                "derivative_last_sequence": 1,
+                "sequence_delta": 0,
+            },
+            "base_selected_frame_count": 1,
+            "selected_frame_count": 2,
+            "excluded_bytes": 0,
+            "semantic_stream_sha256": "f" * 64,
+            "transform": qr.WAL_TRANSFORM_V2,
+            "source_unchanged": True,
+        }
+        value["wal_normalization"]["receipt"] = qr.wrap(normalization)
+        value["rust_capture"] = qr.wrap(rust)
+
+        completed, projection = qr.validate_live_source_capture(
+            value,
+            capture_id=CAPTURE,
+            freeze_sha256=FREEZE,
+            source_main_commit=SOURCE,
+            round_number=1,
+            target=target,
+            public_row=public_row,
+            cross_row=cross_row,
+            public_sha256=qr.digest(public),
+            cross_sha256=qr.digest(cross),
+        )
+        self.assertEqual(projection["head"], value["head"])
+        self.assertEqual(completed.strftime("%Y-%m-%dT%H:%M:%SZ"), cross["completed_at"])
+
+        for field, replacement in (
+            ("source_last_sequence", 2),
+            ("source_bytes", 7),
+        ):
+            tampered = copy.deepcopy(value)
+            receipt = tampered["wal_normalization"]["receipt"]["value"]
+            receipt["appended_suffix"][field] = replacement
+            tampered["wal_normalization"]["receipt"] = qr.wrap(receipt)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                qr.QuarantineRoundError, "accounting"
+            ):
+                qr.validate_live_source_capture(
+                    tampered,
+                    capture_id=CAPTURE,
+                    freeze_sha256=FREEZE,
+                    source_main_commit=SOURCE,
+                    round_number=1,
+                    target=target,
+                    public_row=public_row,
+                    cross_row=cross_row,
+                    public_sha256=qr.digest(public),
+                    cross_sha256=qr.digest(cross),
+                )
+
+    def test_sgp_durable_wal_boundary_capture_is_exact_and_separate(self) -> None:
+        target = target_row("sgp")
+        public = public_receipt(["sgp"], 0)
+        cross = cross_receipt(["sgp"], public, 0)
+        public_row = public["origins"][0]
+        cross_row = cross["nodes"][0]
+        wrapper = live_source_capture(
+            target,
+            public_row,
+            cross_row,
+            round_number=1,
+            public_sha256=qr.digest(public),
+            cross_sha256=qr.digest(cross),
+            completed_at=cross["completed_at"],
+        )
+        value = wrapper["value"]
+        rust = value["rust_capture"]["value"]
+        head = value["head"]
+        source_snapshot = rust["source_snapshot"]
+        source_wal = rust["source_wal_prefix"]
+        source_wal["loader_tail_reason"] = "none"
+        derived_snapshot = copy.deepcopy(rust["fixed_pair"]["snapshot"])
+        derived_snapshot["sha256"] = "a" * 64
+        rust["fixed_pair"]["snapshot"] = derived_snapshot
+        plan = {
+            "node": "sgp",
+            "schema": qr.DURABLE_WAL_BOUNDARY_PLAN_SCHEMA,
+            "selection_policy": qr.DURABLE_WAL_BOUNDARY_SELECTION_POLICY,
+            "source_snapshot": {
+                "height": head["height"] + 1,
+                "sha256": source_snapshot["sha256"],
+                "size": source_snapshot["size"],
+                "state_root": "b" * 64,
+            },
+            "source_wal": {
+                "sha256": source_wal["accepted_prefix_sha256"],
+                "size": source_wal["accepted_prefix_bytes"],
+            },
+        }
+        plan_sha = qr.digest(plan)
+
+        def regular_identity(seed: int, root: str, size: int) -> dict:
+            return {
+                "device": seed,
+                "inode": seed + 1,
+                "mode": 0o100400,
+                "uid": 0,
+                "gid": 0,
+                "nlink": 1,
+                "mtime_ns": seed + 2,
+                "ctime_ns": seed + 3,
+                "sha256": root,
+                "size": size,
+            }
+
+        preserved = regular_identity(50_000, source_snapshot["sha256"], source_snapshot["size"])
+        plan_size = len(qr.canonical_bytes(plan))
+        rust.update({
+            "schema": qr.RUST_DURABLE_SOURCE_CAPTURE_SCHEMA,
+            "allow_unbound_legacy_wal": True,
+            "durable_wal_boundary": {
+                "source_plan": regular_identity(50_100, plan_sha, plan_size),
+                "fixed_plan": regular_identity(50_200, plan_sha, plan_size),
+                "plan": plan,
+                "selected_boundary": {**head, "checkpoint_sequence": 1234},
+                "preserved_source_snapshot": preserved,
+                "replay_derived_snapshot": copy.deepcopy(derived_snapshot),
+            },
+        })
+        value.update({
+            "schema": qr.DURABLE_LIVE_SOURCE_CAPTURE_SCHEMA,
+            "durable_wal_boundary": {"plan_sha256": plan_sha},
+            "rust_capture": qr.wrap(rust),
+        })
+
+        _completed, projection = qr.validate_live_source_capture(
+            value,
+            capture_id=CAPTURE,
+            freeze_sha256=FREEZE,
+            source_main_commit=SOURCE,
+            round_number=1,
+            target=target,
+            public_row=public_row,
+            cross_row=cross_row,
+            public_sha256=qr.digest(public),
+            cross_sha256=qr.digest(cross),
+        )
+        self.assertEqual(projection["head"], head)
+
+        tampered = copy.deepcopy(value)
+        durable = tampered["rust_capture"]["value"]["durable_wal_boundary"]
+        durable["replay_derived_snapshot"]["sha256"] = "c" * 64
+        tampered["rust_capture"] = qr.wrap(tampered["rust_capture"]["value"])
+        with self.assertRaisesRegex(qr.QuarantineRoundError, "content proof differs"):
             qr.validate_live_source_capture(
                 tampered,
                 capture_id=CAPTURE,

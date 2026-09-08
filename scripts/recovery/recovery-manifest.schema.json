@@ -484,6 +484,7 @@
         "legacy_wal_normalizer": { "$ref": "#/$defs/artifact" },
         "legacy_wal_normalization_lax": { "$ref": "#/$defs/artifact" },
         "legacy_wal_normalization_ams": { "$ref": "#/$defs/artifact" },
+        "durable_wal_boundary_sgp": { "$ref": "#/$defs/artifact" },
         "offline_stop_evidence": { "$ref": "#/$defs/artifact" },
         "offline_stop_evidence_sidecar": { "$ref": "#/$defs/artifact" },
         "ssh_known_hosts": { "$ref": "#/$defs/artifact" },

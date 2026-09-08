@@ -1497,6 +1497,27 @@ pub struct LegacyWalBoundaryReport {
     pub source_wal_accepted_prefix_bytes: u64,
     pub source_wal_quarantined_tail_bytes: u64,
     pub source_wal_tail_reason: String,
+    pub source_wal_selected_checkpoint_sequence: u64,
+}
+
+/// Exact operator-approved snapshot tuple for the exceptional case where a
+/// content-addressed live snapshot does not describe any durable WAL
+/// boundary. Normal snapshot-assisted recovery never consults this structure
+/// and continues to require an exact snapshot height/root match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LegacyDurableWalSnapshotExpectation {
+    pub source_snapshot_height: u64,
+    pub source_snapshot_state_root: Hash256,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyRecoveryBoundarySelection<'a> {
+    LatestWal,
+    ExactSnapshot(&'a Path),
+    PinnedDurableWal {
+        evidence_snapshot: &'a Path,
+        expected: &'a LegacyDurableWalSnapshotExpectation,
+    },
 }
 
 fn legacy_wal_boundary_report(
@@ -1549,13 +1570,15 @@ fn legacy_wal_boundary_report(
         source_wal_accepted_prefix_bytes: accepted_prefix,
         source_wal_quarantined_tail_bytes: quarantined_tail,
         source_wal_tail_reason,
+        source_wal_selected_checkpoint_sequence: read.entries[boundary.checkpoint_index].sequence,
     })
 }
 
 /// Read the longest checksum- and sequence-valid WAL prefix while retaining a
-/// precise reason for any rejected tail. This is used only with an exact-height
-/// snapshot: the caller must prove the selected block boundary matches the
-/// independently captured snapshot before it may ignore `tail_error`.
+/// precise reason for any rejected tail. Exact-snapshot recovery binds the
+/// selected block boundary to the independently captured snapshot; the
+/// exceptional durable-WAL path instead requires a separately content-pinned
+/// plan and rejects every tail byte.
 fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError> {
     let file = File::open(path).map_err(|error| {
         StateError::PersistenceError(format!("failed to open legacy WAL {path:?}: {error}"))
@@ -2526,7 +2549,7 @@ impl StateDB {
             wal_dir.as_ref(),
             expected_genesis_hash,
             allow_unbound_legacy_wal,
-            None,
+            LegacyRecoveryBoundarySelection::LatestWal,
         )
         .map(|(state, _)| state)
     }
@@ -2568,7 +2591,7 @@ impl StateDB {
             wal_dir.as_ref(),
             expected_genesis_hash,
             allow_unbound_legacy_wal,
-            Some(snapshot_path.as_ref()),
+            LegacyRecoveryBoundarySelection::ExactSnapshot(snapshot_path.as_ref()),
         )?;
         let report = report.ok_or_else(|| {
             StateError::PersistenceError(
@@ -2619,12 +2642,52 @@ impl StateDB {
             wal_dir.as_ref(),
             expected_genesis_hash,
             allow_unbound_legacy_wal,
-            Some(snapshot_path.as_ref()),
+            LegacyRecoveryBoundarySelection::ExactSnapshot(snapshot_path.as_ref()),
         )?;
         state.bind_legacy_recovery_validator_set(&legacy_validators)?;
         let report = report.ok_or_else(|| {
             StateError::PersistenceError(
                 "snapshot-assisted export did not produce a physical WAL boundary report".into(),
+            )
+        })?;
+        Ok((state, report))
+    }
+
+    /// Exceptional, explicitly pinned export path for a legacy live snapshot
+    /// whose claimed height/root has no exact durable WAL boundary.
+    ///
+    /// The snapshot is parsed and its claimed tuple must match `expected`, but
+    /// none of its state sections are imported. Instead, the complete source
+    /// WAL must parse through EOF with no torn/corrupt/sequence-invalid tail,
+    /// its final frame must be the latest complete SetBlock + Checkpoint
+    /// boundary named by `expected`, and WAL-only replay must recompute that
+    /// checkpoint root. The latest boundary is derived rather than accepted as
+    /// caller input; callers are responsible for pinning the complete WAL by
+    /// content hash and preserving the rejected snapshot as evidence.
+    pub fn load_legacy_recovery_export_source_from_durable_wal_with_report(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        evidence_snapshot_path: impl AsRef<Path>,
+        legacy_validators: &[(Address, u64)],
+        expected: &LegacyDurableWalSnapshotExpectation,
+    ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
+        // Validate before the potentially expensive production WAL replay.
+        let legacy_validators =
+            canonicalize_legacy_recovery_validator_set(legacy_validators.to_vec())?;
+        let (state, report) = Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            LegacyRecoveryBoundarySelection::PinnedDurableWal {
+                evidence_snapshot: evidence_snapshot_path.as_ref(),
+                expected,
+            },
+        )?;
+        state.bind_legacy_recovery_validator_set(&legacy_validators)?;
+        let report = report.ok_or_else(|| {
+            StateError::PersistenceError(
+                "pinned durable-WAL export did not produce a physical WAL boundary report".into(),
             )
         })?;
         Ok((state, report))
@@ -2690,7 +2753,7 @@ impl StateDB {
         wal_dir: &Path,
         expected_genesis_hash: Hash256,
         allow_unbound_legacy_wal: bool,
-        snapshot_path: Option<&Path>,
+        selection: LegacyRecoveryBoundarySelection<'_>,
     ) -> Result<(Self, Option<LegacyWalBoundaryReport>), StateError> {
         if wal_dir.join(ACTIVE_RECOVERY_MARKER).exists() {
             return Err(StateError::PersistenceError(
@@ -2735,11 +2798,17 @@ impl StateDB {
             }
         }
 
+        let snapshot_path = match selection {
+            LegacyRecoveryBoundarySelection::LatestWal => None,
+            LegacyRecoveryBoundarySelection::ExactSnapshot(path) => Some(path),
+            LegacyRecoveryBoundarySelection::PinnedDurableWal {
+                evidence_snapshot, ..
+            } => Some(evidence_snapshot),
+        };
         let snapshot = snapshot_path
             .map(read_legacy_recovery_snapshot)
             .transpose()?;
-        let prefix_read = snapshot
-            .as_ref()
+        let prefix_read = snapshot_path
             .map(|_| read_legacy_wal_prefix(&wal_path))
             .transpose()?;
         let strict_entries = if prefix_read.is_none() {
@@ -2764,15 +2833,82 @@ impl StateDB {
             ));
         }
 
-        let boundary = if let Some(snapshot) = snapshot.as_ref() {
-            exact_complete_legacy_boundary(entries, snapshot.block_height, snapshot.state_root)?
-        } else {
-            latest_complete_legacy_boundary(entries)?
+        let boundary = match selection {
+            LegacyRecoveryBoundarySelection::LatestWal => latest_complete_legacy_boundary(entries)?,
+            LegacyRecoveryBoundarySelection::ExactSnapshot(_) => {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    StateError::PersistenceError(
+                        "exact legacy snapshot selection lost its snapshot".into(),
+                    )
+                })?;
+                exact_complete_legacy_boundary(entries, snapshot.block_height, snapshot.state_root)?
+            }
+            LegacyRecoveryBoundarySelection::PinnedDurableWal { expected, .. } => {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    StateError::PersistenceError(
+                        "pinned durable-WAL selection lost its evidence snapshot".into(),
+                    )
+                })?;
+                if snapshot.block_height != expected.source_snapshot_height
+                    || snapshot.state_root != expected.source_snapshot_state_root
+                {
+                    return Err(StateError::PersistenceError(format!(
+                        "durable-WAL evidence snapshot tuple differs from the exact plan: expected {}/{}, got {}/{}",
+                        expected.source_snapshot_height,
+                        expected.source_snapshot_state_root,
+                        snapshot.block_height,
+                        snapshot.state_root
+                    )));
+                }
+                let read = prefix_read.as_ref().ok_or_else(|| {
+                    StateError::PersistenceError(
+                        "pinned durable-WAL selection did not produce a prefix reader".into(),
+                    )
+                })?;
+                if let Some(reason) = read.rejected_tail.as_ref() {
+                    return Err(StateError::PersistenceError(format!(
+                        "pinned durable-WAL source is not fully checksum/sequence-valid through EOF: {}",
+                        reason.stable_reason()
+                    )));
+                }
+                if exact_complete_legacy_boundary(
+                    entries,
+                    snapshot.block_height,
+                    snapshot.state_root,
+                )
+                .is_ok()
+                {
+                    return Err(StateError::PersistenceError(
+                        "pinned durable-WAL exception is forbidden because the evidence snapshot has an exact complete WAL boundary; use normal exact-snapshot capture"
+                            .into(),
+                    ));
+                }
+                latest_complete_legacy_boundary(entries)?
+            }
         };
         let wal_report = prefix_read
             .as_ref()
             .map(|read| legacy_wal_boundary_report(read, &boundary))
             .transpose()?;
+        if matches!(
+            selection,
+            LegacyRecoveryBoundarySelection::PinnedDurableWal { .. }
+        ) {
+            let report = wal_report.as_ref().ok_or_else(|| {
+                StateError::PersistenceError(
+                    "pinned durable-WAL selection has no physical boundary report".into(),
+                )
+            })?;
+            if report.source_wal_accepted_prefix_bytes != report.source_wal_original_bytes
+                || report.source_wal_quarantined_tail_bytes != 0
+                || report.source_wal_tail_reason != "none"
+            {
+                return Err(StateError::PersistenceError(
+                    "pinned durable-WAL source does not end at its latest complete SetBlock + Checkpoint boundary"
+                        .into(),
+                ));
+            }
+        }
         validate_legacy_boundary(entries, &boundary)?;
         let committed_entries = &entries[..=boundary.checkpoint_index];
         let state = StateDB::new();
@@ -2786,19 +2922,29 @@ impl StateDB {
             ));
         }
 
-        if let Some(snapshot) = snapshot.as_ref() {
-            validate_snapshot_sections_against_wal(snapshot, &state)?;
-            state.import_snapshot(snapshot, boundary.state_root)?;
-            // import_snapshot changes only the three snapshot-covered state
-            // sections and height. WAL-derived blocks/history/receipts remain.
-            state.rebuild_transaction_indexes();
-        } else {
-            let actual_root = state.compute_state_root();
-            if actual_root != boundary.state_root {
-                return Err(StateError::PersistenceError(format!(
-                    "legacy source checkpoint root mismatch: WAL {}, replayed {}; provide an exact-height --snapshot capture so missing legacy state can be root-verified without weakening the checkpoint",
-                    boundary.state_root, actual_root
-                )));
+        match selection {
+            LegacyRecoveryBoundarySelection::ExactSnapshot(_) => {
+                let snapshot = snapshot.as_ref().ok_or_else(|| {
+                    StateError::PersistenceError(
+                        "exact legacy snapshot selection lost its snapshot after replay".into(),
+                    )
+                })?;
+                validate_snapshot_sections_against_wal(snapshot, &state)?;
+                state.import_snapshot(snapshot, boundary.state_root)?;
+                // import_snapshot changes only the three snapshot-covered
+                // state sections and height. WAL-derived blocks/history/
+                // receipts remain.
+                state.rebuild_transaction_indexes();
+            }
+            LegacyRecoveryBoundarySelection::LatestWal
+            | LegacyRecoveryBoundarySelection::PinnedDurableWal { .. } => {
+                let actual_root = state.compute_state_root();
+                if actual_root != boundary.state_root {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy source checkpoint root mismatch: WAL {}, replayed {}; provide an exact-height --snapshot capture so missing legacy state can be root-verified without weakening the checkpoint",
+                        boundary.state_root, actual_root
+                    )));
+                }
             }
         }
 
@@ -5456,6 +5602,216 @@ mod tests {
             recipient,
             snapshot.state_root,
         )
+    }
+
+    fn durable_wal_snapshot_mismatch_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        Snapshot,
+        LegacyDurableWalSnapshotExpectation,
+        Block,
+    ) {
+        let data_dir = temp_dir(label);
+        let snapshot_path = data_dir.with_extension("inconsistent.snapshot.lz4");
+        let sender = hash_bytes(format!("{label}-sender").as_bytes());
+        let recipient = hash_bytes(format!("{label}-recipient").as_bytes());
+        let reference = StateDB::with_genesis(&[
+            (sender, 1_000),
+            (recipient, 0),
+            (recovery_stake_reserve_address(), 1_000_000_000_000),
+        ]);
+        let transaction = Transaction::new_transfer(sender, recipient, 125, 0);
+        let (block, receipts) = reference.execute_block(&[transaction], sender).unwrap();
+        assert!(receipts[0].success);
+        let durable_snapshot = reference.export_snapshot();
+        assert_eq!(durable_snapshot.block_height, 1);
+        assert_eq!(durable_snapshot.state_root, block.header.state_root);
+
+        // Build a complete WAL whose state sections independently reproduce
+        // the checkpoint root. Unlike `legacy_snapshot_fixture`, this fixture
+        // deliberately does not need any snapshot state to replay safely.
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        let mut accounts = durable_snapshot.accounts.clone();
+        accounts.sort_by_key(|entry| entry.0.0);
+        for (address, account) in accounts {
+            writer.append(WalOp::SetAccount(address, account), 1);
+        }
+        writer.append(WalOp::SetBlock(0, Block::genesis()), 0);
+        writer.append(WalOp::SetBlock(1, block.clone()), 1);
+        writer.append(WalOp::Checkpoint(durable_snapshot.state_root), 1);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let mut inconsistent_snapshot = durable_snapshot.clone();
+        inconsistent_snapshot.block_height = 2;
+        inconsistent_snapshot.state_root = hash_bytes(format!("{label}-stale-root").as_bytes());
+        inconsistent_snapshot.write_to(&snapshot_path).unwrap();
+        let expected = LegacyDurableWalSnapshotExpectation {
+            source_snapshot_height: inconsistent_snapshot.block_height,
+            source_snapshot_state_root: inconsistent_snapshot.state_root,
+        };
+        (data_dir, snapshot_path, durable_snapshot, expected, block)
+    }
+
+    #[test]
+    fn pinned_durable_wal_loader_is_explicit_and_derives_the_latest_final_boundary() {
+        let (data_dir, snapshot_path, durable_snapshot, expected, block) =
+            durable_wal_snapshot_mismatch_fixture("durable-wal-explicit");
+        let evidence_before = fs::read(&snapshot_path).unwrap();
+
+        let exact_error = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .err()
+        .expect("normal capture must never silently weaken exact snapshot matching");
+        assert!(
+            exact_error
+                .to_string()
+                .contains("has no exact complete SetBlock + Checkpoint WAL boundary")
+        );
+
+        let (loaded, report) =
+            StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+                &data_dir,
+                Hash256::ZERO,
+                true,
+                &snapshot_path,
+                &legacy_validator_set(),
+                &expected,
+            )
+            .expect("the exact exceptional mode should accept a complete replayable WAL");
+        assert_eq!(loaded.height(), durable_snapshot.block_height);
+        assert_eq!(loaded.get_state_root(), durable_snapshot.state_root);
+        assert_eq!(loaded.get_block(1).unwrap().hash, block.hash);
+        assert_eq!(report.source_wal_tail_reason, "none");
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes,
+            report.source_wal_original_bytes
+        );
+        assert!(report.source_wal_selected_checkpoint_sequence > 0);
+        let derived = loaded.export_snapshot();
+        assert_eq!(derived.block_height, durable_snapshot.block_height);
+        assert_eq!(derived.state_root, durable_snapshot.state_root);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), evidence_before);
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn pinned_durable_wal_loader_rejects_any_nonvalidated_eof_tail() {
+        let (data_dir, snapshot_path, _, expected, _) =
+            durable_wal_snapshot_mismatch_fixture("durable-wal-torn-tail");
+        let mut wal = OpenOptions::new()
+            .append(true)
+            .open(data_dir.join("state.wal"))
+            .unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"truncated").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+
+        let error = StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+            &legacy_validator_set(),
+            &expected,
+        )
+        .err()
+        .expect("the exceptional path must validate every source WAL byte");
+        assert!(
+            error
+                .to_string()
+                .contains("not fully checksum/sequence-valid through EOF"),
+            "{error}"
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn pinned_durable_wal_loader_requires_the_latest_boundary_to_be_the_final_frame() {
+        let (data_dir, snapshot_path, _, expected, _) =
+            durable_wal_snapshot_mismatch_fixture("durable-wal-valid-tail");
+        let attacker = hash_bytes(b"durable-wal-valid-tail-attacker");
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        writer.append(
+            WalOp::SetAccount(attacker, Account::new(attacker, u64::MAX)),
+            2,
+        );
+        writer.sync().unwrap();
+        drop(writer);
+
+        let error = StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+            &legacy_validator_set(),
+            &expected,
+        )
+        .err()
+        .expect("valid frames after the final checkpoint must remain unselected evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("does not end at its latest complete SetBlock + Checkpoint boundary"),
+            "{error}"
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn pinned_durable_wal_exception_rejects_an_exact_snapshot_or_wrong_snapshot_pin() {
+        let (data_dir, snapshot_path, durable_snapshot, expected, _) =
+            durable_wal_snapshot_mismatch_fixture("durable-wal-guardrails");
+        let mut wrong = expected;
+        wrong.source_snapshot_height += 1;
+        let mismatch = StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+            &legacy_validator_set(),
+            &wrong,
+        )
+        .err()
+        .expect("the exceptional evidence tuple must be plan-pinned");
+        assert!(mismatch.to_string().contains("differs from the exact plan"));
+
+        durable_snapshot.write_to(&snapshot_path).unwrap();
+        let exact = LegacyDurableWalSnapshotExpectation {
+            source_snapshot_height: durable_snapshot.block_height,
+            source_snapshot_state_root: durable_snapshot.state_root,
+        };
+        let unnecessary = StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+            &legacy_validator_set(),
+            &exact,
+        )
+        .err()
+        .expect("the exceptional path must not replace normal exact capture");
+        assert!(
+            unnecessary
+                .to_string()
+                .contains("exception is forbidden because the evidence snapshot has an exact")
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
     }
 
     #[test]

@@ -19,6 +19,7 @@ LATE_FORK_INTERLOCK_TOOL="$SCRIPT_DIR/legacy-late-fork-interlock.py"
 LEGACY_WAL_NORMALIZER="$SCRIPT_DIR/normalize-legacy-wal.py"
 LEGACY_WAL_NORMALIZATION_LAX="$SCRIPT_DIR/legacy-wal-normalization-lax.json"
 LEGACY_WAL_NORMALIZATION_AMS="$SCRIPT_DIR/legacy-wal-normalization-ams.json"
+DURABLE_WAL_BOUNDARY_SGP="$SCRIPT_DIR/durable-wal-boundary-sgp.json"
 DRIVE_REMOTE="${ARC_RECOVERY_DRIVE_REMOTE:-arc-drive-arc:ARC Chain Recovery v0.8}"
 SSH_USER="${ARC_RECOVERY_SSH_USER:-root}"
 
@@ -5933,11 +5934,12 @@ create_legacy_maintenance_evidence_bundle() {
         "$authenticated_cross" "$quarantine_root" "$persisted_root" "$stability_proof" "$output" \
         "$first_quarantine_started_at" "$all_controlled_stopped_at" \
         "$quarantine_generation_ledger" "$live_observation_selection" \
-        "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
+        "$QUARANTINE_ROUND_MODULE" "$(hash_file "$DURABLE_WAL_BOUNDARY_SGP")" \
+        "${NODES[@]}" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
 (plan_raw,freeze_sha,capture_id,status_root_raw,authenticated_raw,quarantine_raw,
  persisted_raw,stability_raw,output_raw,first_started,all_stopped,ledger_raw,
- observation_selection_raw,rounds_module_raw,*fleet_raw)=sys.argv[1:]
+ observation_selection_raw,rounds_module_raw,durable_plan_sha,*fleet_raw)=sys.argv[1:]
 plan_path=pathlib.Path(plan_raw);status_root=pathlib.Path(status_root_raw)
 authenticated_path=pathlib.Path(authenticated_raw);quarantine_root=pathlib.Path(quarantine_raw)
 persisted_root=pathlib.Path(persisted_raw);stability_path=pathlib.Path(stability_raw)
@@ -6306,8 +6308,10 @@ for node,host in fleet:
             or cross.get("challenge")!=challenge
             or cross.get("quarantine_status_sha256")!=digest(canonical(cross.get("quarantine_status")))):
         raise SystemExit(f"maintenance evidence bundle public cross proof differs: {node}")
-    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v3",
-                                        "arc.recovery.persisted-legacy-head.v4"}
+    expected_persisted_schema=("arc.recovery.persisted-legacy-head.v5" if node=="sgp"
+        else "arc.recovery.persisted-legacy-head.v4" if node in {"lax","ams"}
+        else "arc.recovery.persisted-legacy-head.v3")
+    if (persisted.get("schema")!=expected_persisted_schema
             or (persisted.get("capture_id"),persisted.get("node"),persisted.get("freeze_plan_sha256"))!=identity
             or persisted.get("source_main_commit")!=source_commit
             or persisted.get("writer_stopped") is not True
@@ -6315,6 +6319,13 @@ for node,host in fleet:
             or persisted.get("network_quarantine_active") is not True
             or persisted.get("global_absence_claimed") is not False):
         raise SystemExit(f"maintenance evidence bundle persisted head differs: {node}")
+    if node=="sgp":
+        try:rounds.validate_sgp_persisted_head_v5(
+            persisted,durable_plan_sha,"maintenance evidence bundle SGP persisted head")
+        except rounds.QuarantineRoundError as error:
+            raise SystemExit(
+                f"maintenance evidence bundle SGP persisted v5 differs: {error}"
+            ) from error
     validate_dag_and_anchor(persisted,node)
     nodes.append({"node":node,"host":host,
         "stopped_status":sealed(stopped,stopped_bytes,node,"stopped-status"),
@@ -6404,7 +6415,8 @@ create_legacy_maintenance_boundary() {
         "$first_quarantine_started_at" "$all_controlled_stopped_at" \
         "$helper_sha" "$inspector_binary_sha" "$genesis_sha" \
         "$validators_sha" "$legacy_validators_sha" "$evidence_bundle" \
-        "$QUARANTINE_ROUND_MODULE" "${NODES[@]}" <<'PY'
+        "$QUARANTINE_ROUND_MODULE" "$(hash_file "$DURABLE_WAL_BOUNDARY_SGP")" \
+        "${NODES[@]}" <<'PY'
 import datetime
 import hashlib
 import json
@@ -6417,7 +6429,8 @@ import sys
 (plan_raw, freeze_sha, capture_id, public_raw, public_sha, authenticated_raw,
  quarantine_root_raw, persisted_root_raw, output_raw, first_quarantine_started_at,
  all_controlled_stopped_at, helper_sha, inspector_sha, genesis_sha, validators_sha,
- legacy_validators_sha, evidence_bundle_raw, rounds_module_raw, *fleet_raw) = sys.argv[1:]
+ legacy_validators_sha, evidence_bundle_raw, rounds_module_raw, durable_plan_sha,
+ *fleet_raw) = sys.argv[1:]
 plan_path=pathlib.Path(plan_raw);public_path=pathlib.Path(public_raw)
 authenticated_path=pathlib.Path(authenticated_raw);quarantine_root=pathlib.Path(quarantine_root_raw)
 persisted_root=pathlib.Path(persisted_root_raw);output=pathlib.Path(output_raw)
@@ -6815,8 +6828,10 @@ for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows
             or public_latest["block_hash"]!=origin.get("latest_block_hash")
             or fenced_tuple["height"]<public_tuple["height"]):
         raise SystemExit(f"maintenance-boundary public/post-quarantine tuple differs: {node}")
-    if (persisted.get("schema") not in {"arc.recovery.persisted-legacy-head.v3",
-                                        "arc.recovery.persisted-legacy-head.v4"}
+    expected_persisted_schema=("arc.recovery.persisted-legacy-head.v5" if node=="sgp"
+        else "arc.recovery.persisted-legacy-head.v4" if node in {"lax","ams"}
+        else "arc.recovery.persisted-legacy-head.v3")
+    if (persisted.get("schema")!=expected_persisted_schema
             or (persisted.get("capture_id"),persisted.get("node"),persisted.get("freeze_plan_sha256"))!=identity
             or persisted.get("source_main_commit")!=source_commit
             or persisted.get("boot_id")!=next(row["boot_id"] for row in plan["nodes"] if row["name"]==node)
@@ -6830,6 +6845,13 @@ for (node,host),origin,authenticated_row in zip(fleet,origins,authenticated_rows
             or hash_re.fullmatch(str(persisted.get("final_source_capture_sha256"))) is None
             or persisted.get("export_status")!="EXPORTED_UNSIGNED"):
         raise SystemExit(f"maintenance-boundary persisted head identity differs: {node}")
+    if node=="sgp":
+        try:rounds.validate_sgp_persisted_head_v5(
+            persisted,durable_plan_sha,"maintenance-boundary SGP persisted head")
+        except rounds.QuarantineRoundError as error:
+            raise SystemExit(
+                f"maintenance-boundary SGP persisted v5 differs: {error}"
+            ) from error
     validate_dag_and_anchor(persisted,node)
     persisted_tuple=exact_tuple(persisted.get("head"),f"{node} persisted")
     if persisted_tuple["height"]<fenced_tuple["height"]:
@@ -7720,6 +7742,10 @@ capture_quarantine_round_live_sources() {
                     normalization_args=("$(hash_file "$LEGACY_WAL_NORMALIZER")" \
                         "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")")
                     ;;
+                sgp)
+                    capture_action="capture-durable-wal-live-source"
+                    normalization_args=(- - "$(hash_file "$DURABLE_WAL_BOUNDARY_SGP")")
+                    ;;
             esac
             run_remote "$node" "$capture_action" "$capture_id" "$node" "$freeze_sha" \
                 "$round_number" \
@@ -7940,6 +7966,10 @@ PY
                     capture_action="capture-normalized-live-source"
                     normalization_args=("$(hash_file "$LEGACY_WAL_NORMALIZER")" \
                         "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")")
+                    ;;
+                sgp)
+                    capture_action="capture-durable-wal-live-source"
+                    normalization_args=(- - "$(hash_file "$DURABLE_WAL_BOUNDARY_SGP")")
                     ;;
             esac
             run_remote "$node" "$capture_action" "$capture_id" "$node" "$freeze_sha" \
@@ -8820,7 +8850,8 @@ capture_phase() {
         require_hash "$inspector_expected" "capture recovery-export input hash"
     done
     for inspector_path in "$LEGACY_WAL_NORMALIZER" \
-        "$LEGACY_WAL_NORMALIZATION_LAX" "$LEGACY_WAL_NORMALIZATION_AMS"; do
+        "$LEGACY_WAL_NORMALIZATION_LAX" "$LEGACY_WAL_NORMALIZATION_AMS" \
+        "$DURABLE_WAL_BOUNDARY_SGP"; do
         require_absolute_file "$inspector_path" "content-pinned legacy WAL normalization input"
     done
     [ "$allow_unbound_legacy_wal" = true ] || die \
@@ -9771,6 +9802,11 @@ stage_capture_inspector_inputs() {
             stage_file "$node" "$freeze_sha" wal-normalization-plan \
                 "$LEGACY_WAL_NORMALIZATION_AMS" \
                 "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")"
+            ;;
+        sgp)
+            stage_file "$node" "$freeze_sha" durable-wal-boundary-plan \
+                "$DURABLE_WAL_BOUNDARY_SGP" \
+                "$(hash_file "$DURABLE_WAL_BOUNDARY_SGP")"
             ;;
     esac
 }
@@ -12582,6 +12618,9 @@ PY
     register_shared_input "$LEGACY_WAL_NORMALIZATION_AMS" \
         "$(hash_file "$LEGACY_WAL_NORMALIZATION_AMS")" "$shared_root" \
         legacy-wal-normalization-ams.json
+    register_shared_input "$DURABLE_WAL_BOUNDARY_SGP" \
+        "$(hash_file "$DURABLE_WAL_BOUNDARY_SGP")" "$shared_root" \
+        durable-wal-boundary-sgp.json
     register_shared_input "$ROLLOUT_TOOL" "$rollout_tool_sha" "$shared_root" recovery_rollout.py
     register_shared_input "$SCRIPT_DIR/recovery-manifest.schema.json" "$schema_sha" \
         "$shared_root" recovery-manifest.schema.json

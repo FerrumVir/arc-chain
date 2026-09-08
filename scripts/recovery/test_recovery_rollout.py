@@ -1840,13 +1840,30 @@ class RecoveryRolloutTests(unittest.TestCase):
                     "schema": "arc.recovery.persisted-legacy-head.v3",
                     **identity,
                     "source_main_commit": source_commit,
+                    "boot_id": f"00000000-0000-0000-0000-{index + 1:012x}",
+                    "inspector_binary_sha256": f"{index + 5500:064x}",
+                    "genesis_sha256": f"{index + 5600:064x}",
+                    "validator_public_keys_sha256": f"{index + 5700:064x}",
+                    "legacy_validator_set_sha256": f"{index + 5800:064x}",
                     "source_pair_role": "post-quarantine-final-export",
                     "final_source_capture_sha256": f"{index + 5000:064x}",
                     "selected_source_head": copy.deepcopy(persisted_head),
                     "stop_after_round_receipt_sha256": f"{index + 5100:064x}",
                     "network_quarantine_receipt_sha256": receipt_sha,
+                    "stop_complete_sha256": f"{index + 20:064x}",
+                    "stop_files_sha256": f"{index + 40:064x}",
+                    "capture_complete_sha256": f"{index + 5900:064x}",
+                    "capture_files_sha256": f"{index + 6000:064x}",
+                    "capture_source_sha256": f"{index + 6100:064x}",
+                    "source_data_index_sha256": f"{index + 6200:064x}",
                     "state_wal_sha256": f"{index + 5200:064x}",
                     "state_wal_size": 8,
+                    "snapshot_sha256": f"{index + 6300:064x}",
+                    "snapshot_size": 8,
+                    "source_file_identity": {
+                        "state_wal": f"fixture-wal-{index}",
+                        "snapshot": f"fixture-snapshot-{index}",
+                    },
                     "head": persisted_head,
                     "legacy_dag_round": {
                         "source_consensus_round": 10_000_001 + index,
@@ -1873,6 +1890,41 @@ class RecoveryRolloutTests(unittest.TestCase):
                             "complete-content-indexed-stopped-legacy-source-v4"
                         ),
                     },
+                    "staged_file_contract": {
+                        "state_wal": {
+                            "sha256": f"{index + 5200:064x}", "size": 8,
+                            "mode": 0o100400, "uid": 0, "gid": 0, "nlink": 1,
+                        },
+                        "snapshot": {
+                            "sha256": f"{index + 6300:064x}", "size": 8,
+                            "mode": 0o100400, "uid": 0, "gid": 0, "nlink": 1,
+                        },
+                        "ephemeral_inode_receipted": False,
+                    },
+                    "export_summary_sha256": f"{index + 6400:064x}",
+                    "inspect_summary_sha256": f"{index + 6500:064x}",
+                    "wal_boundary_sha256": f"{index + 6600:064x}",
+                    "export_status": "EXPORTED_UNSIGNED",
+                    "candidate_checkpoint_sha256": f"{index + 6700:064x}",
+                    "candidate_checkpoint_size": 8,
+                    "snapshot_path": f"/private/fixed/{node}/state.snapshot.lz4",
+                    "state_wal_path": f"/private/fixed/{node}/state.wal",
+                    "export_contract": {
+                        "binary_path": "/proc/self/fd/8", "exit_code": 0,
+                        "source_consensus_round": 0, "created_at_unix_ms": 0,
+                        "recovery_epoch": 1, "validator_set_id": 1,
+                        "allow_unbound_legacy_wal": True, "read_only": True,
+                    },
+                    "trusted_anchor_ancestry": {
+                        "anchor_height": 137145,
+                        "anchor_block_hash": f"{index + 6800:064x}",
+                        "anchor_state_root": f"{index + 6900:064x}",
+                        "classification": "below_trusted_anchor",
+                        "inspection": None,
+                        "inspection_sha256": hashlib.sha256(b"null\n").hexdigest(),
+                    },
+                    "completed_at": "2026-08-28T12:03:00Z",
+                    "rerun_reexecutes_export": True,
                     "writer_stopped": True,
                     "restart_barrier_active": True,
                     "network_quarantine_active": True,
@@ -2828,6 +2880,226 @@ class RecoveryRolloutTests(unittest.TestCase):
         hostile_payloads = dict(payloads)
         hostile_payloads["offline_stop_evidence"] = rollout.canonical_bytes(bad_offline)
         with self.assertRaisesRegex(rollout.RolloutError, "exact maintenance bundle/boundary"):
+            rollout.verify_legacy_maintenance_stage_payloads(value, rows, hostile_payloads)
+
+    def test_legacy_maintenance_stage_accepts_v2_normalization_and_v5_durable_boundary(self) -> None:
+        canonical = rollout.canonical_bytes
+
+        def sha_value(value):
+            return hashlib.sha256(canonical(value)).hexdigest()
+
+        def identity(seed: int, root: str, size: int) -> dict:
+            return {
+                "device": seed, "inode": seed + 1, "mode": 0o100400,
+                "uid": 0, "gid": 0, "nlink": 1, "mtime_ns": seed + 2,
+                "ctime_ns": seed + 3, "sha256": root, "size": size,
+            }
+
+        def replace_persisted(value, rows, payloads, node, persisted, stage):
+            bundle = copy.deepcopy(
+                json.loads(payloads["legacy_maintenance_evidence_bundle"])
+            )
+            boundary = copy.deepcopy(json.loads(payloads["legacy_maintenance_boundary"]))
+            wrapper_sha = sha_value(persisted)
+            bundle_row = next(row for row in bundle["nodes"] if row["node"] == node)
+            bundle_row["persisted_head"] = {"value": persisted, "sha256": wrapper_sha}
+            boundary_row = next(row for row in boundary["nodes"] if row["node"] == node)
+            boundary_row["final_persisted_head"]["evidence_sha256"] = wrapper_sha
+            final_height_row = next(
+                row for row in boundary["evidence_heights"]
+                if row["node"] == node and row["label"] == "final_persisted_head"
+            )
+            final_height_row["evidence_sha256"] = wrapper_sha
+            value, rows, payloads = self.repack_maintenance_stage(
+                value, rows, payloads, bundle, boundary
+            )
+            rows.update(stage[0])
+            payloads.update(stage[1])
+            return value, rows, payloads
+
+        value, rows, payloads = self.maintenance_stage_fixture()
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        lax = copy.deepcopy(next(row for row in bundle["nodes"] if row["node"] == "lax")[
+            "persisted_head"
+        ]["value"])
+        plan = json.loads(
+            MODULE_PATH.with_name("legacy-wal-normalization-lax.json").read_text()
+        )
+        plan_sha = sha_value(plan)
+        plan_projection = quarantine_rounds.validate_wal_normalization_v2_plan(
+            plan, "test LAX normalization plan"
+        )
+        append = plan["append_policy"]
+        source_size = plan["base_source_wal"]["size"] + 8
+        derivative_size = plan["base_derivative_wal"]["size"] + 8
+        source_sha = "a" * 64
+        derivative_sha = "b" * 64
+        snapshot = plan["base_source_snapshot"]
+        normalization = {
+            "schema": quarantine_rounds.WAL_NORMALIZATION_SCHEMA_V2,
+            "plan_sha256": plan_sha,
+            "node": "lax",
+            **{key: copy.deepcopy(plan[key]) for key in (
+                "base_source_wal", "base_source_snapshot", "base_derivative_wal",
+                "base_head", "partition", "sequence_rewrites", "append_policy",
+                "snapshot_policy",
+            )},
+            "source_wal": identity(10_000, source_sha, source_size),
+            "source_snapshot": identity(10_100, snapshot["sha256"], snapshot["size"]),
+            "derivative_wal": identity(10_200, derivative_sha, derivative_size),
+            "appended_suffix": {
+                "source_start": plan["base_source_wal"]["size"],
+                "source_end": source_size, "source_bytes": 8,
+                "source_sha256": "c" * 64,
+                "derivative_start": plan["base_derivative_wal"]["size"],
+                "derivative_end": derivative_size, "derivative_bytes": 8,
+                "derivative_sha256": "d" * 64, "frame_count": 1,
+                "source_first_sequence": append["source_first_sequence"],
+                "source_last_sequence": append["source_first_sequence"],
+                "derivative_first_sequence": append["derivative_first_sequence"],
+                "derivative_last_sequence": append["derivative_first_sequence"],
+                "sequence_delta": append["sequence_delta"],
+            },
+            "base_selected_frame_count": plan_projection["base_selected_frame_count"],
+            "selected_frame_count": plan_projection["base_selected_frame_count"] + 1,
+            "excluded_bytes": (
+                plan["base_source_wal"]["size"] - plan["base_derivative_wal"]["size"]
+            ),
+            "semantic_stream_sha256": "e" * 64,
+            "transform": quarantine_rounds.WAL_TRANSFORM_V2,
+            "source_unchanged": True,
+        }
+        normalization_sha = sha_value(normalization)
+        normalizer_sha = "f" * 64
+        lax.update({
+            "schema": quarantine_rounds.PERSISTED_LEGACY_HEAD_SCHEMA_V4,
+            "state_wal_sha256": plan["base_derivative_wal"]["sha256"],
+            "state_wal_size": plan["base_derivative_wal"]["size"],
+            "snapshot_sha256": snapshot["sha256"], "snapshot_size": snapshot["size"],
+            "wal_normalization": {
+                "normalizer_sha256": normalizer_sha, "plan_sha256": plan_sha,
+                "receipt": {"value": normalization, "sha256": normalization_sha},
+            },
+            "archived_final_wal": {
+                "path": "/private/archive/lax/state.wal", "sha256": source_sha,
+                "size": source_size,
+                "file_identity": {"device": 1, "inode": 2, "size": source_size,
+                                  "mode": 0o100600},
+                "source_relation": "exact-content-pinned-normalization-source",
+                "normalization_receipt_sha256": normalization_sha,
+                "derivative_sha256": derivative_sha, "derivative_size": derivative_size,
+                "selected_prefix_sha256": plan["base_derivative_wal"]["sha256"],
+                "selected_prefix_bytes": plan["base_derivative_wal"]["size"],
+                "quarantined_derivative_tail_bytes": 8,
+                "quarantined_derivative_tail_reason": (
+                    "valid_entries_after_selected_snapshot_boundary:1"
+                ),
+                "preserved_by": "complete-content-indexed-stopped-legacy-source-v4",
+            },
+        })
+        lax["staged_file_contract"]["state_wal"].update({
+            "sha256": lax["state_wal_sha256"], "size": lax["state_wal_size"],
+        })
+        lax["staged_file_contract"]["snapshot"].update({
+            "sha256": lax["snapshot_sha256"], "size": lax["snapshot_size"],
+        })
+        value, rows, payloads = replace_persisted(
+            value, rows, payloads, "lax", lax,
+            ({
+                "legacy_wal_normalizer": {"path": "normalize-legacy-wal.py",
+                                           "sha256": normalizer_sha},
+                "legacy_wal_normalization_lax": {
+                    "path": "legacy-wal-normalization-lax.json", "sha256": plan_sha,
+                },
+            }, {"legacy_wal_normalization_lax": canonical(plan)}),
+        )
+        rollout.verify_legacy_maintenance_stage_payloads(value, rows, payloads)
+        hostile = copy.deepcopy(json.loads(payloads["legacy_maintenance_evidence_bundle"]))
+        hostile_lax = next(row for row in hostile["nodes"] if row["node"] == "lax")
+        hostile_lax["persisted_head"]["value"]["archived_final_wal"][
+            "quarantined_derivative_tail_bytes"
+        ] = 7
+        hostile_lax["persisted_head"] = quarantine_rounds.wrap(
+            hostile_lax["persisted_head"]["value"]
+        )
+        hostile_payloads = dict(payloads)
+        hostile_payloads["legacy_maintenance_evidence_bundle"] = canonical(hostile)
+        with self.assertRaises(rollout.RolloutError):
+            rollout.verify_legacy_maintenance_stage_payloads(value, rows, hostile_payloads)
+
+        value, rows, payloads = self.maintenance_stage_fixture()
+        bundle = json.loads(payloads["legacy_maintenance_evidence_bundle"])
+        sgp = copy.deepcopy(next(row for row in bundle["nodes"] if row["node"] == "sgp")[
+            "persisted_head"
+        ]["value"])
+        durable_plan = json.loads(
+            MODULE_PATH.with_name("durable-wal-boundary-sgp.json").read_text()
+        )
+        durable_plan_sha = sha_value(durable_plan)
+        plan_size = len(canonical(durable_plan))
+        replay_sha = "9" * 64
+        replay_size = 512
+        head = copy.deepcopy(sgp["head"])
+        capture = {
+            "source_plan": identity(20_000, durable_plan_sha, plan_size),
+            "fixed_plan": identity(20_100, durable_plan_sha, plan_size),
+            "plan": durable_plan,
+            "selected_boundary": {**head, "checkpoint_sequence": 777},
+            "preserved_source_snapshot": identity(
+                20_200, durable_plan["source_snapshot"]["sha256"],
+                durable_plan["source_snapshot"]["size"],
+            ),
+            "replay_derived_snapshot": identity(20_300, replay_sha, replay_size),
+        }
+        archive_size = durable_plan["source_wal"]["size"] + 8
+        sgp.update({
+            "schema": quarantine_rounds.PERSISTED_LEGACY_HEAD_SCHEMA_V5,
+            "state_wal_sha256": durable_plan["source_wal"]["sha256"],
+            "state_wal_size": durable_plan["source_wal"]["size"],
+            "snapshot_sha256": replay_sha, "snapshot_size": replay_size,
+            "durable_wal_boundary": {
+                "plan_sha256": durable_plan_sha, "capture": capture,
+            },
+            "archived_final_wal": {
+                "path": "/private/archive/sgp/state.wal", "sha256": "8" * 64,
+                "size": archive_size,
+                "file_identity": {"device": 3, "inode": 4, "size": archive_size,
+                                  "mode": 0o100600},
+                "source_relation": "exact-content-pinned-durable-wal-source-prefix",
+                "durable_wal_boundary_plan_sha256": durable_plan_sha,
+                "selected_prefix_bytes": durable_plan["source_wal"]["size"],
+                "selected_prefix_sha256": durable_plan["source_wal"]["sha256"],
+                "post_capture_suffix_bytes": 8, "post_capture_suffix_sha256": "7" * 64,
+                "post_capture_suffix_classification": (
+                    "durable_wal_boundary_from_content_pinned_archived_original"
+                ),
+                "preserved_by": "complete-content-indexed-stopped-legacy-source-v4",
+            },
+        })
+        sgp["staged_file_contract"]["state_wal"].update({
+            "sha256": sgp["state_wal_sha256"], "size": sgp["state_wal_size"],
+        })
+        sgp["staged_file_contract"]["snapshot"].update({
+            "sha256": replay_sha, "size": replay_size,
+        })
+        value, rows, payloads = replace_persisted(
+            value, rows, payloads, "sgp", sgp,
+            ({"durable_wal_boundary_sgp": {
+                "path": "durable-wal-boundary-sgp.json", "sha256": durable_plan_sha,
+            }}, {"durable_wal_boundary_sgp": canonical(durable_plan)}),
+        )
+        rollout.verify_legacy_maintenance_stage_payloads(value, rows, payloads)
+        hostile = copy.deepcopy(json.loads(payloads["legacy_maintenance_evidence_bundle"]))
+        hostile_sgp = next(row for row in hostile["nodes"] if row["node"] == "sgp")
+        hostile_sgp["persisted_head"]["value"]["archived_final_wal"][
+            "source_relation"
+        ] = "unbound"
+        hostile_sgp["persisted_head"] = quarantine_rounds.wrap(
+            hostile_sgp["persisted_head"]["value"]
+        )
+        hostile_payloads = dict(payloads)
+        hostile_payloads["legacy_maintenance_evidence_bundle"] = canonical(hostile)
+        with self.assertRaises(rollout.RolloutError):
             rollout.verify_legacy_maintenance_stage_payloads(value, rows, hostile_payloads)
 
     def test_live_observation_selection_rejects_semantically_rehashed_forgery(self) -> None:
