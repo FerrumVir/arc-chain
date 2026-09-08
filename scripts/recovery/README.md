@@ -1378,16 +1378,17 @@ WALs contain interior sequence/byte discontinuities even though later complete
 block/checkpoint boundaries remain replayable. Each v2 plan pins the reviewed
 base WAL/snapshot/derivative and permits only a bounded suffix of complete,
 CRC-valid, sequence-contiguous frames; it cannot reinterpret or replace any
-reviewed base byte. The fleet driver stages only these three reviewed inputs under
-`/root/.arc-recovery-seals/<freeze-sha>/<node>/`: `normalize-legacy-wal.py`
-(mode 0500), plus the node-specific `legacy-wal-normalization-plan.json`
-(mode 0400). At this source revision their SHA-256 roots are:
+reviewed base byte. For LAX and AMS, the fleet driver stages exactly three
+reviewed inputs under `/root/.arc-recovery-seals/<freeze-sha>/<node>/`: one
+`normalize-legacy-wal.py` (mode 0500) and the two node-specific
+`legacy-wal-normalization-plan.json` files (mode 0400). SGP's separate durable
+plan is staged only on SGP. At this source revision their SHA-256 roots are:
 
 ```text
 normalizer  e524b82c9fff8e9e81abea5541a178f00e87e006986ca4633db2c0fccbc45f31
 LAX plan    c9c1efd51bd3e2152b4bf47031346dbe7a39ae1ccb4098bfefc689e456214be8
 AMS plan    4ad7924fa780e7c7a64543705b672a2348a2dd378bc9688fe52ab6b2cfc99081
-SGP durable 9dbb076fa1d3ffb37874e36103d4b588c0662f46a010bef72ca00ff0f4cd821e
+SGP durable 8f80124441dce087a74cbb8dd4febc066731d8b3921043ea091fcf33117eda82
 ```
 
 The exact operator-side preflight is:
@@ -1401,7 +1402,7 @@ test "$(arc_sha256 scripts/recovery/legacy-wal-normalization-lax.json)" = \
 test "$(arc_sha256 scripts/recovery/legacy-wal-normalization-ams.json)" = \
   4ad7924fa780e7c7a64543705b672a2348a2dd378bc9688fe52ab6b2cfc99081
 test "$(arc_sha256 scripts/recovery/durable-wal-boundary-sgp.json)" = \
-  9dbb076fa1d3ffb37874e36103d4b588c0662f46a010bef72ca00ff0f4cd821e
+  8f80124441dce087a74cbb8dd4febc066731d8b3921043ea091fcf33117eda82
 ```
 
 For those two nodes the driver invokes `capture-normalized-live-source` with
@@ -1416,19 +1417,24 @@ derivative, transform receipt, semantic replay head/state root, normalizer, and
 node plan. A source/snapshot/hash/partition mismatch fails before selection.
 
 SGP uses the separate `capture-durable-wal-live-source` v3 wrapper because its
-content-pinned snapshot tuple has no exact complete boundary in its
-content-pinned WAL. The SGP-only plan is not permission to choose an arbitrary
-height: it pins the complete original WAL and snapshot bytes. The Rust v2
-capture must reject the exception if the snapshot actually has an exact
-boundary, parse every WAL byte through EOF with valid CRC/encoding/sequence,
-derive the latest complete SetBlock + Checkpoint boundary only when that
-checkpoint is the final frame, and reproduce its state root by WAL-only replay.
-It preserves the original inconsistent snapshot and plan as immutable evidence,
-exports a new replay-derived snapshot, and strictly replays the fixed pair. The
-persisted-head v5 receipt, archived original-WAL prefix/suffix accounting, build
-manifest, and rollout verifier independently bind all of those relations. Any
-tail byte, plan drift, pathname rotation, replay mismatch, or malformed v5
-provenance fails before authorization or stop.
+current content-pinned snapshot tuple has no exact complete boundary in its
+content-pinned WAL. The SGP-only v2 plan is not permission to choose an
+arbitrary height or fork. It pins the complete current WAL and inconsistent
+current snapshot bytes, plus a previously sealed, strict SGP snapshot and its
+content-addressed capture receipt. That reviewed snapshot has the same exact
+height, block hash, and state root as the unchanged current WAL's final
+checkpoint. The current Rust binary revalidates the retained receipt, file
+identity, ownership, mode, hash, size, fixed-pair relation, and exact head before
+using it as the replay base. It then parses every current WAL byte through EOF,
+requires valid CRC/encoding/sequence and a final complete SetBlock + Checkpoint,
+and rejects any head/root drift. The current inconsistent snapshot remains
+preserved as immutable evidence; the selected output is a newly replay-derived
+snapshot paired with the byte-identical current WAL, followed by a strict replay
+of that fresh pair. The persisted-head v5 receipt, archived original-WAL
+prefix/suffix accounting, build manifest, and rollout verifier independently
+bind all of those relations. Any tail byte, prior-receipt drift, path rotation,
+plan drift, replay mismatch, or malformed v5 provenance fails before
+authorization or stop.
 
 For a node that remains active behind the full-host quarantine, two stable
 post-quarantine samples precede a second exact capture with immutable role

@@ -56,9 +56,13 @@ WAL_TRANSFORM_V2 = (
     "copy-reviewed-base-runs-rewrite-sequence-and-crc32-then-append-"
     "strict-contiguous-frames"
 )
-DURABLE_WAL_BOUNDARY_PLAN_SCHEMA = "arc.recovery.durable-wal-boundary-plan.v1"
-DURABLE_WAL_BOUNDARY_SELECTION_POLICY = (
+DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V1 = "arc.recovery.durable-wal-boundary-plan.v1"
+DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2 = "arc.recovery.durable-wal-boundary-plan.v2"
+DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V1 = (
     "strict-latest-complete-final-frame-wal-boundary"
+)
+DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V2 = (
+    "reviewed-exact-snapshot-for-unchanged-current-head-wal"
 )
 MAX_WAL_APPEND_BYTES = 64 * 1024 * 1024
 MAX_WAL_APPEND_FRAMES = 1_000_000
@@ -635,16 +639,24 @@ def validate_wal_normalization_v2_receipt(
 
 
 def validate_durable_wal_boundary_plan(value: Any, label: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
-        "node", "schema", "selection_policy", "source_snapshot", "source_wal",
-    }:
+    if not isinstance(value, dict):
         fail(f"{label} fields differ")
-    if (
-        value.get("schema") != DURABLE_WAL_BOUNDARY_PLAN_SCHEMA
-        or value.get("node") != "sgp"
-        or value.get("selection_policy") != DURABLE_WAL_BOUNDARY_SELECTION_POLICY
-    ):
+    schema = value.get("schema")
+    expected_fields = {
+        "node", "schema", "selection_policy", "source_snapshot", "source_wal",
+    }
+    if schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2:
+        expected_fields.add("recovery_snapshot")
+    if set(value) != expected_fields or value.get("node") != "sgp":
         fail(f"{label} policy differs")
+    if schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V1:
+        if value.get("selection_policy") != DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V1:
+            fail(f"{label} v1 policy differs")
+    elif schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2:
+        if value.get("selection_policy") != DURABLE_WAL_BOUNDARY_SELECTION_POLICY_V2:
+            fail(f"{label} v2 policy differs")
+    else:
+        fail(f"{label} schema differs")
     source_wal = validate_content_pin(value.get("source_wal"), f"{label} source WAL")
     source_snapshot = value.get("source_snapshot")
     if not isinstance(source_snapshot, dict) or set(source_snapshot) != {
@@ -655,7 +667,47 @@ def validate_durable_wal_boundary_plan(value: Any, label: str) -> dict[str, Any]
     require_hash(source_snapshot.get("sha256"), f"{label} source snapshot sha256")
     require_uint(source_snapshot.get("size"), f"{label} source snapshot size", positive=True)
     require_hash(source_snapshot.get("state_root"), f"{label} source snapshot state root")
-    return {"source_wal": source_wal, "source_snapshot": dict(source_snapshot)}
+    result = {"source_wal": source_wal, "source_snapshot": dict(source_snapshot)}
+    if schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA_V2:
+        recovery = value.get("recovery_snapshot")
+        recovery_fields = {
+            "path", "height", "block_hash", "state_root", "sha256", "size",
+            "source_receipt",
+        }
+        if not isinstance(recovery, dict) or set(recovery) != recovery_fields:
+            fail(f"{label} recovery snapshot fields differ")
+        recovery_path = recovery.get("path")
+        receipt = recovery.get("source_receipt")
+        if (
+            not isinstance(recovery_path, str)
+            or not recovery_path.startswith(
+                "/root/arc-recovery-live-source-captures/"
+            )
+            or not recovery_path.endswith("/fixed-source/state.snapshot.lz4")
+            or ".." in recovery_path
+            or "\x00" in recovery_path
+            or not isinstance(receipt, dict)
+            or set(receipt) != {"path", "sha256", "size"}
+            or not isinstance(receipt.get("path"), str)
+            or receipt["path"] != recovery_path.removesuffix(
+                "/fixed-source/state.snapshot.lz4"
+            ) + "/receipt.json"
+        ):
+            fail(f"{label} recovery snapshot provenance path differs")
+        require_uint(recovery.get("height"), f"{label} recovery height", positive=True)
+        require_hash(recovery.get("block_hash"), f"{label} recovery block hash")
+        require_hash(recovery.get("state_root"), f"{label} recovery state root")
+        require_hash(recovery.get("sha256"), f"{label} recovery snapshot sha256")
+        require_uint(recovery.get("size"), f"{label} recovery snapshot size", positive=True)
+        require_hash(receipt.get("sha256"), f"{label} recovery receipt sha256")
+        require_uint(receipt.get("size"), f"{label} recovery receipt size", positive=True)
+        if (
+            (recovery["height"], recovery["state_root"])
+            == (source_snapshot["height"], source_snapshot["state_root"])
+        ):
+            fail(f"{label} recovery snapshot does not differ from the observed snapshot")
+        result["recovery_snapshot"] = dict(recovery)
+    return result
 
 
 def validate_durable_wal_boundary_capture(
@@ -838,6 +890,7 @@ def validate_sgp_persisted_head_v5(
     )
     plan_wal = durable["plan_projection"]["source_wal"]
     plan_snapshot = durable["plan_projection"]["source_snapshot"]
+    recovery_snapshot = durable["plan_projection"].get("recovery_snapshot")
     selected = durable["selected_boundary"]
     preserved = durable["preserved_source_snapshot"]
     replay = durable["replay_derived_snapshot"]
@@ -850,6 +903,12 @@ def validate_sgp_persisted_head_v5(
         or replay["size"] != snapshot_size
         or (plan_snapshot["height"], plan_snapshot["state_root"])
             == (head["height"], head["state_root"])
+        or (
+            recovery_snapshot is not None
+            and {key: recovery_snapshot[key] for key in (
+                "height", "block_hash", "state_root"
+            )} != head
+        )
     ):
         fail(f"{label} durable WAL content relation differs")
 
@@ -1256,6 +1315,7 @@ def validate_live_source_capture(
         selected_boundary = durable_projection["selected_boundary"]
         plan_snapshot = plan_projection["source_snapshot"]
         plan_wal = plan_projection["source_wal"]
+        recovery_snapshot = plan_projection.get("recovery_snapshot")
         if (
             selected_boundary.get("height") != head["height"]
             or selected_boundary.get("block_hash") != head["block_hash"]
@@ -1273,6 +1333,12 @@ def validate_live_source_capture(
             or preserved_snapshot["size"] != source_snapshot["size"]
             or replay_snapshot != fixed_snapshot
             or rust.get("allow_unbound_legacy_wal") is not True
+            or (
+                recovery_snapshot is not None
+                and {key: recovery_snapshot[key] for key in (
+                    "height", "block_hash", "state_root"
+                )} != head
+            )
         ):
             fail("durable WAL boundary content proof differs")
     del rust_sha

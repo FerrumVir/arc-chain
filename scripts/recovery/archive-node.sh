@@ -4655,6 +4655,69 @@ def parse_canonical(raw,label):
     except (UnicodeDecodeError,json.JSONDecodeError) as error:raise RuntimeError(f"{label} is invalid JSON") from error
     if not isinstance(value,dict) or raw!=canonical(value):fail(f"{label} is not canonical JSON")
     return value
+def validate_durable_wal_boundary_plan(value,label,selected_head=None):
+    if not isinstance(value,dict):fail(f"{label} fields differ")
+    schema=value.get("schema")
+    fields={"node","schema","selection_policy","source_snapshot","source_wal"}
+    if schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        fields.add("recovery_snapshot")
+    if set(value)!=fields or value.get("node")!="sgp":fail(f"{label} policy differs")
+    if schema=="arc.recovery.durable-wal-boundary-plan.v1":
+        if value.get("selection_policy")!="strict-latest-complete-final-frame-wal-boundary":
+            fail(f"{label} v1 policy differs")
+    elif schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        if value.get("selection_policy") \
+                !="reviewed-exact-snapshot-for-unchanged-current-head-wal":
+            fail(f"{label} v2 policy differs")
+    else:fail(f"{label} schema differs")
+    valid_hash=lambda item:isinstance(item,str) and HASH_RE.fullmatch(item) is not None
+    positive=lambda item:isinstance(item,int) and not isinstance(item,bool) and item>0
+    source_wal=value.get("source_wal")
+    source_snapshot=value.get("source_snapshot")
+    if (not isinstance(source_wal,dict) or set(source_wal)!={"sha256","size"}
+            or not valid_hash(source_wal.get("sha256"))
+            or not positive(source_wal.get("size"))):
+        fail(f"{label} source WAL fields differ")
+    if (not isinstance(source_snapshot,dict)
+            or set(source_snapshot)!={"height","sha256","size","state_root"}
+            or not positive(source_snapshot.get("height"))
+            or not valid_hash(source_snapshot.get("sha256"))
+            or not positive(source_snapshot.get("size"))
+            or not valid_hash(source_snapshot.get("state_root"))):
+        fail(f"{label} source snapshot fields differ")
+    if schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        recovery=value.get("recovery_snapshot")
+        recovery_fields={"path","height","block_hash","state_root","sha256","size",
+            "source_receipt"}
+        if not isinstance(recovery,dict) or set(recovery)!=recovery_fields:
+            fail(f"{label} recovery snapshot fields differ")
+        recovery_path=recovery.get("path");receipt=recovery.get("source_receipt")
+        suffix="/fixed-source/state.snapshot.lz4"
+        if (not isinstance(recovery_path,str)
+                or not recovery_path.startswith("/root/arc-recovery-live-source-captures/")
+                or not recovery_path.endswith(suffix) or ".." in recovery_path
+                or "\x00" in recovery_path or not isinstance(receipt,dict)
+                or set(receipt)!={"path","sha256","size"}
+                or not isinstance(receipt.get("path"),str)
+                or receipt["path"]!=recovery_path.removesuffix(suffix)+"/receipt.json"):
+            fail(f"{label} recovery snapshot provenance path differs")
+        if (not positive(recovery.get("height"))
+                or not valid_hash(recovery.get("block_hash"))
+                or not valid_hash(recovery.get("state_root"))
+                or not valid_hash(recovery.get("sha256"))
+                or not positive(recovery.get("size"))
+                or not valid_hash(receipt.get("sha256"))
+                or not positive(receipt.get("size"))):
+            fail(f"{label} recovery snapshot content pin differs")
+        if ((recovery["height"],recovery["state_root"])
+                ==(source_snapshot["height"],source_snapshot["state_root"])):
+            fail(f"{label} recovery snapshot does not differ from the observed snapshot")
+        if (selected_head is not None
+                and {key:recovery[key] for key in ("height","block_hash","state_root")}
+                    !={key:selected_head.get(key) for key in (
+                        "height","block_hash","state_root")}):
+            fail(f"{label} recovery snapshot differs from the selected durable head")
+    return value
 def proc_start(process):
     raw=pathlib.Path(f"/proc/{process}/stat").read_text(encoding="ascii");end=raw.rfind(")")
     fields=raw[end+2:].split()
@@ -4807,13 +4870,7 @@ if durable_wal_boundary_enabled:
     durable_plan_value=parse_canonical(
         secure_raw(durable_wal_boundary_plan,0o400,4*1024*1024),
         "durable WAL boundary plan")
-    if (set(durable_plan_value)!={"node","schema","selection_policy","source_snapshot","source_wal"}
-            or durable_plan_value.get("schema")
-                !="arc.recovery.durable-wal-boundary-plan.v1"
-            or durable_plan_value.get("node")!="sgp"
-            or durable_plan_value.get("selection_policy")
-                !="strict-latest-complete-final-frame-wal-boundary"):
-        fail("durable WAL boundary plan policy differs")
+    validate_durable_wal_boundary_plan(durable_plan_value,"durable WAL boundary plan")
     durable_wal_boundary_binding={"plan_sha256":durable_wal_boundary_plan_sha}
 data_details=data_dir.lstat()
 if (data_dir.is_symlink() or not stat.S_ISDIR(data_details.st_mode) or data_details.st_uid!=0
@@ -5061,6 +5118,8 @@ def validate_durable_wal_boundary(value,attempt,rust):
             or isinstance(selected_boundary.get("checkpoint_sequence"),bool)
             or selected_boundary.get("checkpoint_sequence",-1)<0):
         fail("selected durable WAL boundary differs from the captured head")
+    validate_durable_wal_boundary_plan(
+        plan,"selected durable WAL boundary plan",selected_boundary)
     source_prefix=rust.get("source_wal_prefix",{})
     source_snapshot=rust.get("source_snapshot",{})
     fixed_pair=rust.get("fixed_pair",{})
@@ -5660,6 +5719,80 @@ def unwrap(value, label):
         fail(f"{label} wrapper root differs")
     return wrapped, root
 
+def validate_durable_wal_boundary_plan(value, label, selected_head=None):
+    if not isinstance(value, dict):
+        fail(f"{label} fields differ")
+    schema = value.get("schema")
+    fields = {"node", "schema", "selection_policy", "source_snapshot", "source_wal"}
+    if schema == "arc.recovery.durable-wal-boundary-plan.v2":
+        fields.add("recovery_snapshot")
+    if set(value) != fields or value.get("node") != "sgp":
+        fail(f"{label} policy differs")
+    if schema == "arc.recovery.durable-wal-boundary-plan.v1":
+        if value.get("selection_policy") != \
+                "strict-latest-complete-final-frame-wal-boundary":
+            fail(f"{label} v1 policy differs")
+    elif schema == "arc.recovery.durable-wal-boundary-plan.v2":
+        if value.get("selection_policy") != \
+                "reviewed-exact-snapshot-for-unchanged-current-head-wal":
+            fail(f"{label} v2 policy differs")
+    else:
+        fail(f"{label} schema differs")
+    valid_hash = lambda item: isinstance(item, str) and HASH_RE.fullmatch(item) is not None
+    positive = lambda item: isinstance(item, int) and not isinstance(item, bool) and item > 0
+    source_wal = value.get("source_wal")
+    source_snapshot = value.get("source_snapshot")
+    if (not isinstance(source_wal, dict) or set(source_wal) != {"sha256", "size"}
+            or not valid_hash(source_wal.get("sha256"))
+            or not positive(source_wal.get("size"))):
+        fail(f"{label} source WAL fields differ")
+    if (not isinstance(source_snapshot, dict)
+            or set(source_snapshot) != {"height", "sha256", "size", "state_root"}
+            or not positive(source_snapshot.get("height"))
+            or not valid_hash(source_snapshot.get("sha256"))
+            or not positive(source_snapshot.get("size"))
+            or not valid_hash(source_snapshot.get("state_root"))):
+        fail(f"{label} source snapshot fields differ")
+    if schema == "arc.recovery.durable-wal-boundary-plan.v2":
+        recovery = value.get("recovery_snapshot")
+        recovery_fields = {
+            "path", "height", "block_hash", "state_root", "sha256", "size",
+            "source_receipt",
+        }
+        if not isinstance(recovery, dict) or set(recovery) != recovery_fields:
+            fail(f"{label} recovery snapshot fields differ")
+        recovery_path = recovery.get("path")
+        receipt = recovery.get("source_receipt")
+        suffix = "/fixed-source/state.snapshot.lz4"
+        if (not isinstance(recovery_path, str)
+                or not recovery_path.startswith(
+                    "/root/arc-recovery-live-source-captures/"
+                ) or not recovery_path.endswith(suffix) or ".." in recovery_path
+                or "\x00" in recovery_path or not isinstance(receipt, dict)
+                or set(receipt) != {"path", "sha256", "size"}
+                or not isinstance(receipt.get("path"), str)
+                or receipt["path"] != recovery_path.removesuffix(suffix) + "/receipt.json"):
+            fail(f"{label} recovery snapshot provenance path differs")
+        if (not positive(recovery.get("height"))
+                or not valid_hash(recovery.get("block_hash"))
+                or not valid_hash(recovery.get("state_root"))
+                or not valid_hash(recovery.get("sha256"))
+                or not positive(recovery.get("size"))
+                or not valid_hash(receipt.get("sha256"))
+                or not positive(receipt.get("size"))):
+            fail(f"{label} recovery snapshot content pin differs")
+        if ((recovery["height"], recovery["state_root"])
+                == (source_snapshot["height"], source_snapshot["state_root"])):
+            fail(f"{label} recovery snapshot does not differ from the observed snapshot")
+        if (selected_head is not None
+                and {key: recovery[key] for key in (
+                    "height", "block_hash", "state_root"
+                )} != {key: selected_head.get(key) for key in (
+                    "height", "block_hash", "state_root"
+                )}):
+            fail(f"{label} recovery snapshot differs from the selected durable head")
+    return value
+
 def load_freeze():
     path = pathlib.Path(f"/root/.arc-recovery-plans/{freeze_sha}/freeze.lock.json")
     raw = secure_read(path, 0o400)
@@ -6243,18 +6376,15 @@ def validate_authorization(raw):
             plan = durable.get("plan", {}) if isinstance(durable, dict) else {}
             selected = durable.get("selected_boundary", {}) \
                 if isinstance(durable, dict) else {}
+            validate_durable_wal_boundary_plan(
+                plan, f"{expected_name} durable WAL boundary plan", selected
+            )
             if (not isinstance(durable_wrapper, dict)
                     or set(durable_wrapper) != {"plan_sha256"}
                     or HASH_RE.fullmatch(str(
                         durable_wrapper.get("plan_sha256"))) is None
                     or not isinstance(durable, dict) or set(durable) != durable_fields
-                    or set(plan) != {"node", "schema", "selection_policy",
-                        "source_snapshot", "source_wal"}
-                    or plan.get("node") != "sgp" or expected_name != "sgp"
-                    or plan.get("schema")
-                        != "arc.recovery.durable-wal-boundary-plan.v1"
-                    or plan.get("selection_policy")
-                        != "strict-latest-complete-final-frame-wal-boundary"
+                    or expected_name != "sgp"
                     or set(selected) != {"height", "block_hash", "state_root",
                         "checkpoint_sequence"}
                     or {key:selected.get(key) for key in ("height", "block_hash", "state_root")}
@@ -7562,13 +7692,10 @@ WantedBy=multi-user.target
                     fail("stopped-precommit durable WAL boundary wrapper differs")
                 plan = durable.get("plan", {})
                 selected = durable.get("selected_boundary", {})
-                if (set(plan) != {"node", "schema", "selection_policy",
-                            "source_snapshot", "source_wal"}
-                        or plan.get("node") != "sgp" or node != "sgp"
-                        or plan.get("schema")
-                            != "arc.recovery.durable-wal-boundary-plan.v1"
-                        or plan.get("selection_policy")
-                            != "strict-latest-complete-final-frame-wal-boundary"
+                validate_durable_wal_boundary_plan(
+                    plan, "stopped-precommit durable WAL boundary plan", selected
+                )
+                if (node != "sgp"
                         or set(selected) != {"height", "block_hash", "state_root",
                             "checkpoint_sequence"}
                         or {key:selected.get(key) for key in (
@@ -8479,16 +8606,22 @@ WantedBy=multi-user.target
                         not in properties["DropInPaths"]):
                 fail("fresh stopped legacy activation source differs")
 
-        def current_source_projection(sealed):
+        def current_source_projection(sealed, stable_head):
             expected_labels = {
-                "original_data_dir", "final_state_wal", "fixed_data_dir",
-                "fixed_state_wal", "fixed_snapshot", "fixed_genesis_binding",
+                "original_data_dir", "legacy_dag_wal_dir", "final_state_wal",
+                "fixed_data_dir", "fixed_state_wal", "fixed_snapshot",
+                "fixed_genesis_binding",
                 "live_source_capture_sha256", "rust_live_source_capture_sha256",
                 "source_pair_role",
             }
             normalized = isinstance(sealed, dict) and "wal_normalization" in sealed
+            durable = isinstance(sealed, dict) and "durable_wal_boundary" in sealed
+            if normalized and durable:
+                fail("fresh stopped source inputs mix normalization and durable WAL evidence")
             if normalized:
                 expected_labels.add("wal_normalization")
+            if durable:
+                expected_labels.add("durable_wal_boundary")
             if not isinstance(sealed, dict) or set(sealed) != expected_labels:
                 fail("fresh stopped source-input inventory differs")
             result = {}
@@ -8496,6 +8629,7 @@ WantedBy=multi-user.target
                 "final_state_wal", "fixed_state_wal", "fixed_snapshot",
                 "fixed_genesis_binding",
             ]
+            normalization = None
             if normalized:
                 normalization = sealed.get("wal_normalization")
                 if not isinstance(normalization, dict) or set(normalization) != {
@@ -8505,10 +8639,48 @@ WantedBy=multi-user.target
                     }:
                     fail("fresh stopped normalization evidence differs")
                 file_labels.extend(("normalized_state_wal", "source_snapshot"))
+            durable_evidence = None
+            if durable:
+                durable_evidence = sealed.get("durable_wal_boundary")
+                durable_fields = {
+                    "plan_sha256", "selected_boundary", "fixed_plan",
+                    "preserved_source_snapshot", "replay_derived_snapshot",
+                }
+                selected = durable_evidence.get("selected_boundary") \
+                    if isinstance(durable_evidence, dict) else None
+                if (node != "sgp" or not isinstance(durable_evidence, dict)
+                        or set(durable_evidence) != durable_fields
+                        or not isinstance(selected, dict) or set(selected) != {
+                            "height", "block_hash", "state_root", "checkpoint_sequence"
+                        } or isinstance(selected.get("height"), bool)
+                        or not isinstance(selected.get("height"), int)
+                        or selected["height"] < 1
+                        or not isinstance(selected.get("block_hash"), str)
+                        or HASH_RE.fullmatch(selected["block_hash"]) is None
+                        or not isinstance(selected.get("state_root"), str)
+                        or HASH_RE.fullmatch(selected["state_root"]) is None
+                        or isinstance(selected.get("checkpoint_sequence"), bool)
+                        or not isinstance(selected.get("checkpoint_sequence"), int)
+                        or selected["checkpoint_sequence"] < 0
+                        or not isinstance(stable_head, dict) or set(stable_head) != {
+                            "height", "block_hash", "state_root"
+                        } or {key:selected[key] for key in (
+                            "height", "block_hash", "state_root"
+                        )} != stable_head):
+                    fail("fresh stopped durable WAL boundary evidence differs")
+                file_labels.extend((
+                    "fixed_plan", "preserved_source_snapshot",
+                    "replay_derived_snapshot",
+                ))
             for label in file_labels:
-                row = (normalization.get(label) if normalized and label in {
-                    "normalized_state_wal", "source_snapshot"
-                } else sealed.get(label))
+                if normalized and label in {"normalized_state_wal", "source_snapshot"}:
+                    row = normalization.get(label)
+                elif durable and label in {
+                    "fixed_plan", "preserved_source_snapshot", "replay_derived_snapshot"
+                }:
+                    row = durable_evidence.get(label)
+                else:
+                    row = sealed.get(label)
                 if not isinstance(row, dict) or "path" not in row:
                     fail("fresh stopped source-input row differs")
                 path = pathlib.Path(row["path"])
@@ -8536,9 +8708,15 @@ WantedBy=multi-user.target
                     fail("fresh stopped source input changed")
                 if normalized and label in {"normalized_state_wal", "source_snapshot"}:
                     normalization[label] = observed_row
+                elif durable and label in {
+                    "fixed_plan", "preserved_source_snapshot", "replay_derived_snapshot"
+                }:
+                    durable_evidence[label] = observed_row
                 else:
                     result[label] = observed_row
-            directory_labels = ["original_data_dir", "fixed_data_dir"]
+            directory_labels = [
+                "original_data_dir", "legacy_dag_wal_dir", "fixed_data_dir",
+            ]
             if normalized:directory_labels.append("normalized_data_dir")
             for label in directory_labels:
                 data_row = (normalization.get(label)
@@ -8589,9 +8767,19 @@ WantedBy=multi-user.target
                     if HASH_RE.fullmatch(str(normalization.get(label))) is None:
                         fail("fresh stopped normalization root differs")
                 result["wal_normalization"] = normalization
+            if durable:
+                plan_sha = durable_evidence.get("plan_sha256")
+                if (not isinstance(plan_sha, str) or HASH_RE.fullmatch(plan_sha) is None
+                        or durable_evidence["fixed_plan"].get("sha256") != plan_sha
+                        or durable_evidence["replay_derived_snapshot"]
+                            != result["fixed_snapshot"]):
+                    fail("fresh stopped durable WAL boundary roots differ")
+                result["durable_wal_boundary"] = durable_evidence
             return result
 
-        fresh_sources = current_source_projection(persisted.get("source_inputs"))
+        fresh_sources = current_source_projection(
+            persisted.get("source_inputs"), persisted.get("head")
+        )
         observed_at = format_utc(now_value())
         status_value = {
             "schema": STOPPED_STATUS_SCHEMA, "capture_id": capture_id,
@@ -9024,12 +9212,10 @@ WantedBy=multi-user.target
             plan = durable.get("plan", {}); selected = durable.get("selected_boundary", {})
             source_wal = plan.get("source_wal", {}); source_snapshot = plan.get("source_snapshot", {})
             source_prefix = final_rust.get("source_wal_prefix", {})
-            if (set(plan) != {"node", "schema", "selection_policy", "source_snapshot",
-                        "source_wal"}
-                    or plan.get("node") != "sgp" or node != "sgp"
-                    or plan.get("schema") != "arc.recovery.durable-wal-boundary-plan.v1"
-                    or plan.get("selection_policy")
-                        != "strict-latest-complete-final-frame-wal-boundary"
+            validate_durable_wal_boundary_plan(
+                plan, "post-quarantine durable WAL boundary plan", selected
+            )
+            if (node != "sgp"
                     or set(selected) != {"height", "block_hash", "state_root",
                         "checkpoint_sequence"}
                     or {key:selected.get(key) for key in (
@@ -19585,9 +19771,70 @@ persisted_head() {
         selected_normalization_receipt_sha selected_original_wal_sha \
         selected_original_wal_size < <(
         python3 - "$QUARANTINE_ROUND_BASE" "$capture_id" "$node" <<'PY'
-import hashlib,json,pathlib,stat,sys
+import hashlib,json,pathlib,re,stat,sys
 base=pathlib.Path(sys.argv[1]);capture,node=sys.argv[2:]
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+def validate_durable_wal_boundary_plan(value,label,selected_head=None):
+    if not isinstance(value,dict):raise SystemExit(f"{label} fields differ")
+    schema=value.get("schema")
+    fields={"node","schema","selection_policy","source_snapshot","source_wal"}
+    if schema=="arc.recovery.durable-wal-boundary-plan.v2":fields.add("recovery_snapshot")
+    if set(value)!=fields or value.get("node")!="sgp":
+        raise SystemExit(f"{label} policy differs")
+    if schema=="arc.recovery.durable-wal-boundary-plan.v1":
+        if value.get("selection_policy")!="strict-latest-complete-final-frame-wal-boundary":
+            raise SystemExit(f"{label} v1 policy differs")
+    elif schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        if value.get("selection_policy") \
+                !="reviewed-exact-snapshot-for-unchanged-current-head-wal":
+            raise SystemExit(f"{label} v2 policy differs")
+    else:raise SystemExit(f"{label} schema differs")
+    valid_hash=lambda item:isinstance(item,str) and re.fullmatch(r"[0-9a-f]{64}",item) is not None
+    positive=lambda item:isinstance(item,int) and not isinstance(item,bool) and item>0
+    source_wal=value.get("source_wal");source_snapshot=value.get("source_snapshot")
+    if (not isinstance(source_wal,dict) or set(source_wal)!={"sha256","size"}
+            or not valid_hash(source_wal.get("sha256"))
+            or not positive(source_wal.get("size"))):
+        raise SystemExit(f"{label} source WAL fields differ")
+    if (not isinstance(source_snapshot,dict)
+            or set(source_snapshot)!={"height","sha256","size","state_root"}
+            or not positive(source_snapshot.get("height"))
+            or not valid_hash(source_snapshot.get("sha256"))
+            or not positive(source_snapshot.get("size"))
+            or not valid_hash(source_snapshot.get("state_root"))):
+        raise SystemExit(f"{label} source snapshot fields differ")
+    if schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        recovery=value.get("recovery_snapshot")
+        fields={"path","height","block_hash","state_root","sha256","size","source_receipt"}
+        if not isinstance(recovery,dict) or set(recovery)!=fields:
+            raise SystemExit(f"{label} recovery snapshot fields differ")
+        recovery_path=recovery.get("path");receipt=recovery.get("source_receipt")
+        suffix="/fixed-source/state.snapshot.lz4"
+        if (not isinstance(recovery_path,str)
+                or not recovery_path.startswith("/root/arc-recovery-live-source-captures/")
+                or not recovery_path.endswith(suffix) or ".." in recovery_path
+                or "\x00" in recovery_path or not isinstance(receipt,dict)
+                or set(receipt)!={"path","sha256","size"}
+                or not isinstance(receipt.get("path"),str)
+                or receipt["path"]!=recovery_path.removesuffix(suffix)+"/receipt.json"):
+            raise SystemExit(f"{label} recovery snapshot provenance path differs")
+        if (not positive(recovery.get("height"))
+                or not valid_hash(recovery.get("block_hash"))
+                or not valid_hash(recovery.get("state_root"))
+                or not valid_hash(recovery.get("sha256"))
+                or not positive(recovery.get("size"))
+                or not valid_hash(receipt.get("sha256"))
+                or not positive(receipt.get("size"))):
+            raise SystemExit(f"{label} recovery snapshot content pin differs")
+        if ((recovery["height"],recovery["state_root"])
+                ==(source_snapshot["height"],source_snapshot["state_root"])):
+            raise SystemExit(f"{label} recovery snapshot does not differ from the observed snapshot")
+        if (selected_head is not None
+                and {key:recovery[key] for key in ("height","block_hash","state_root")}
+                    !={key:selected_head.get(key) for key in (
+                        "height","block_hash","state_root")}):
+            raise SystemExit(f"{label} recovery snapshot differs from the selected durable head")
+    return value
 candidates=[]
 for path in (base/capture).glob("*/stop-after-round.json"):
     details=path.lstat();raw=path.read_bytes();value=json.loads(raw)
@@ -19650,15 +19897,13 @@ elif source_schema=="arc.recovery.quarantine-live-source-capture.v3":
     plan=durable.get("plan",{}) if isinstance(durable,dict) else {}
     source_wal=plan.get("source_wal",{}) if isinstance(plan,dict) else {}
     selected=durable.get("selected_boundary",{}) if isinstance(durable,dict) else {}
+    validate_durable_wal_boundary_plan(
+        plan,"persisted-head durable WAL boundary plan",selected)
     if (not isinstance(wrapper,dict) or set(wrapper)!={"plan_sha256"}
             or not isinstance(durable,dict) or set(durable)!={"source_plan","fixed_plan",
                 "plan","selected_boundary","preserved_source_snapshot",
                 "replay_derived_snapshot"}
-            or set(plan)!={"node","schema","selection_policy","source_snapshot","source_wal"}
-            or plan.get("node")!="sgp" or node!="sgp"
-            or plan.get("schema")!="arc.recovery.durable-wal-boundary-plan.v1"
-            or plan.get("selection_policy")
-                !="strict-latest-complete-final-frame-wal-boundary"
+            or node!="sgp"
             or {key:selected.get(key) for key in ("height","block_hash","state_root")}!=head
             or durable.get("source_plan",{}).get("sha256")!=wrapper.get("plan_sha256")
             or durable.get("fixed_plan",{}).get("sha256")!=wrapper.get("plan_sha256")
@@ -20034,6 +20279,67 @@ capture_root=pathlib.Path(capture_raw); stop_root=pathlib.Path(stop_raw)
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
 digest=lambda path:hashlib.sha256(path.read_bytes()).hexdigest()
 bare=lambda value:value.removeprefix("0x") if isinstance(value,str) else ""
+def validate_durable_wal_boundary_plan(value,label,selected_head=None):
+    if not isinstance(value,dict):raise SystemExit(f"{label} fields differ")
+    schema=value.get("schema")
+    fields={"node","schema","selection_policy","source_snapshot","source_wal"}
+    if schema=="arc.recovery.durable-wal-boundary-plan.v2":fields.add("recovery_snapshot")
+    if set(value)!=fields or value.get("node")!="sgp":
+        raise SystemExit(f"{label} policy differs")
+    if schema=="arc.recovery.durable-wal-boundary-plan.v1":
+        if value.get("selection_policy")!="strict-latest-complete-final-frame-wal-boundary":
+            raise SystemExit(f"{label} v1 policy differs")
+    elif schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        if value.get("selection_policy") \
+                !="reviewed-exact-snapshot-for-unchanged-current-head-wal":
+            raise SystemExit(f"{label} v2 policy differs")
+    else:raise SystemExit(f"{label} schema differs")
+    valid_hash=lambda item:isinstance(item,str) and re.fullmatch(r"[0-9a-f]{64}",item) is not None
+    positive=lambda item:isinstance(item,int) and not isinstance(item,bool) and item>0
+    source_wal=value.get("source_wal");source_snapshot=value.get("source_snapshot")
+    if (not isinstance(source_wal,dict) or set(source_wal)!={"sha256","size"}
+            or not valid_hash(source_wal.get("sha256"))
+            or not positive(source_wal.get("size"))):
+        raise SystemExit(f"{label} source WAL fields differ")
+    if (not isinstance(source_snapshot,dict)
+            or set(source_snapshot)!={"height","sha256","size","state_root"}
+            or not positive(source_snapshot.get("height"))
+            or not valid_hash(source_snapshot.get("sha256"))
+            or not positive(source_snapshot.get("size"))
+            or not valid_hash(source_snapshot.get("state_root"))):
+        raise SystemExit(f"{label} source snapshot fields differ")
+    if schema=="arc.recovery.durable-wal-boundary-plan.v2":
+        recovery=value.get("recovery_snapshot")
+        fields={"path","height","block_hash","state_root","sha256","size","source_receipt"}
+        if not isinstance(recovery,dict) or set(recovery)!=fields:
+            raise SystemExit(f"{label} recovery snapshot fields differ")
+        recovery_path=recovery.get("path");receipt=recovery.get("source_receipt")
+        suffix="/fixed-source/state.snapshot.lz4"
+        if (not isinstance(recovery_path,str)
+                or not recovery_path.startswith("/root/arc-recovery-live-source-captures/")
+                or not recovery_path.endswith(suffix) or ".." in recovery_path
+                or "\x00" in recovery_path or not isinstance(receipt,dict)
+                or set(receipt)!={"path","sha256","size"}
+                or not isinstance(receipt.get("path"),str)
+                or receipt["path"]!=recovery_path.removesuffix(suffix)+"/receipt.json"):
+            raise SystemExit(f"{label} recovery snapshot provenance path differs")
+        if (not positive(recovery.get("height"))
+                or not valid_hash(recovery.get("block_hash"))
+                or not valid_hash(recovery.get("state_root"))
+                or not valid_hash(recovery.get("sha256"))
+                or not positive(recovery.get("size"))
+                or not valid_hash(receipt.get("sha256"))
+                or not positive(receipt.get("size"))):
+            raise SystemExit(f"{label} recovery snapshot content pin differs")
+        if ((recovery["height"],recovery["state_root"])
+                ==(source_snapshot["height"],source_snapshot["state_root"])):
+            raise SystemExit(f"{label} recovery snapshot does not differ from the observed snapshot")
+        if (selected_head is not None
+                and {key:recovery[key] for key in ("height","block_hash","state_root")}
+                    !={key:selected_head.get(key) for key in (
+                        "height","block_hash","state_root")}):
+            raise SystemExit(f"{label} recovery snapshot differs from the selected durable head")
+    return value
 def source_identity(raw):
     device,inode,size,mode=raw.split(":")
     return {"device":int(device),"inode":int(inode),"size":int(size),"mode":int(mode,16)}
@@ -20329,16 +20635,14 @@ elif selected_source_schema=="arc.recovery.quarantine-live-source-capture.v3":
     source_snapshot=plan_value.get("source_snapshot",{}) if isinstance(plan_value,dict) else {}
     source_prefix=rust.get("source_wal_prefix",{}) if isinstance(rust,dict) else {}
     fixed=rust.get("fixed_pair",{}) if isinstance(rust,dict) else {}
+    validate_durable_wal_boundary_plan(
+        plan_value,"persisted-head durable WAL boundary plan",selected)
     if (not isinstance(capture_wrapper,dict) or set(capture_wrapper)!={"plan_sha256"}
             or capture_wrapper.get("plan_sha256")!=selected_normalization_receipt_sha
             or not isinstance(durable,dict) or set(durable)!={"source_plan","fixed_plan",
                 "plan","selected_boundary","preserved_source_snapshot",
                 "replay_derived_snapshot"}
-            or set(plan_value)!={"node","schema","selection_policy","source_snapshot","source_wal"}
-            or plan_value.get("node")!="sgp" or node!="sgp"
-            or plan_value.get("schema")!="arc.recovery.durable-wal-boundary-plan.v1"
-            or plan_value.get("selection_policy")
-                !="strict-latest-complete-final-frame-wal-boundary"
+            or node!="sgp"
             or {key:selected.get(key) for key in ("height","block_hash","state_root")}
                 !={"height":selected_height,"block_hash":selected_hash,"state_root":selected_state}
             or source_wal.get("sha256")!=wal_sha
