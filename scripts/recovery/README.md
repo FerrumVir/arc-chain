@@ -1375,16 +1375,19 @@ Authorization heights may never exceed the selected capture head.
 
 LAX and AMS use the additive normalized-source v2 gate because their retained
 WALs contain interior sequence/byte discontinuities even though later complete
-block/checkpoint boundaries remain replayable. The fleet driver stages only
-these three reviewed inputs under
+block/checkpoint boundaries remain replayable. Each v2 plan pins the reviewed
+base WAL/snapshot/derivative and permits only a bounded suffix of complete,
+CRC-valid, sequence-contiguous frames; it cannot reinterpret or replace any
+reviewed base byte. The fleet driver stages only these three reviewed inputs under
 `/root/.arc-recovery-seals/<freeze-sha>/<node>/`: `normalize-legacy-wal.py`
 (mode 0500), plus the node-specific `legacy-wal-normalization-plan.json`
 (mode 0400). At this source revision their SHA-256 roots are:
 
 ```text
-normalizer  fdb1c0dc5cd00a965d4180e5e4f5cd04937faac07096615e6821d67ad289222c
-LAX plan    b44b19bf920e81dee7a5d6ce5629269428463e7d1c66bde20693131518a1b26b
-AMS plan    4aa43f037380ae6de2aef878a2fb3e5ef01318cad22a84418a31636ed795d17c
+normalizer  e524b82c9fff8e9e81abea5541a178f00e87e006986ca4633db2c0fccbc45f31
+LAX plan    c9c1efd51bd3e2152b4bf47031346dbe7a39ae1ccb4098bfefc689e456214be8
+AMS plan    4ad7924fa780e7c7a64543705b672a2348a2dd378bc9688fe52ab6b2cfc99081
+SGP durable 9dbb076fa1d3ffb37874e36103d4b588c0662f46a010bef72ca00ff0f4cd821e
 ```
 
 The exact operator-side preflight is:
@@ -1392,23 +1395,40 @@ The exact operator-side preflight is:
 ```bash
 arc_sha256() { shasum -a 256 -- "$1" | awk '{print $1}'; }
 test "$(arc_sha256 scripts/recovery/normalize-legacy-wal.py)" = \
-  fdb1c0dc5cd00a965d4180e5e4f5cd04937faac07096615e6821d67ad289222c
+  e524b82c9fff8e9e81abea5541a178f00e87e006986ca4633db2c0fccbc45f31
 test "$(arc_sha256 scripts/recovery/legacy-wal-normalization-lax.json)" = \
-  b44b19bf920e81dee7a5d6ce5629269428463e7d1c66bde20693131518a1b26b
+  c9c1efd51bd3e2152b4bf47031346dbe7a39ae1ccb4098bfefc689e456214be8
 test "$(arc_sha256 scripts/recovery/legacy-wal-normalization-ams.json)" = \
-  4aa43f037380ae6de2aef878a2fb3e5ef01318cad22a84418a31636ed795d17c
+  4ad7924fa780e7c7a64543705b672a2348a2dd378bc9688fe52ab6b2cfc99081
+test "$(arc_sha256 scripts/recovery/durable-wal-boundary-sgp.json)" = \
+  9dbb076fa1d3ffb37874e36103d4b588c0662f46a010bef72ca00ff0f4cd821e
 ```
 
 For those two nodes the driver invokes `capture-normalized-live-source` with
-the normalizer and plan hashes as the final two arguments; NYC, LHR, NRT, and
-SGP retain the byte-identical `capture-live-source` v1 invocation. The helper
+the normalizer and plan hashes as the final two arguments; NYC, LHR, and NRT
+retain the byte-identical `capture-live-source` v1 invocation. The helper
 copies selected runs into a new attempt-owned directory, rewrites only declared
-sequence fields and their CRCs, and sends that derivative to the pinned Rust
-inspector. It never edits or replaces the production WAL. `selected.json`, the
-final-source receipt, persisted-head v2 receipt, production input-stage
+sequence fields and their CRCs, appends only the bounded v2 suffix, and sends
+that derivative to the pinned Rust inspector. It never edits or replaces the
+production WAL. `selected.json`, the final-source receipt, persisted-head v4 receipt, production input-stage
 manifest, and archive shared-input catalog bind the original WAL, snapshot,
 derivative, transform receipt, semantic replay head/state root, normalizer, and
 node plan. A source/snapshot/hash/partition mismatch fails before selection.
+
+SGP uses the separate `capture-durable-wal-live-source` v3 wrapper because its
+content-pinned snapshot tuple has no exact complete boundary in its
+content-pinned WAL. The SGP-only plan is not permission to choose an arbitrary
+height: it pins the complete original WAL and snapshot bytes. The Rust v2
+capture must reject the exception if the snapshot actually has an exact
+boundary, parse every WAL byte through EOF with valid CRC/encoding/sequence,
+derive the latest complete SetBlock + Checkpoint boundary only when that
+checkpoint is the final frame, and reproduce its state root by WAL-only replay.
+It preserves the original inconsistent snapshot and plan as immutable evidence,
+exports a new replay-derived snapshot, and strictly replays the fixed pair. The
+persisted-head v5 receipt, archived original-WAL prefix/suffix accounting, build
+manifest, and rollout verifier independently bind all of those relations. Any
+tail byte, plan drift, pathname rotation, replay mismatch, or malformed v5
+provenance fails before authorization or stop.
 
 For a node that remains active behind the full-host quarantine, two stable
 post-quarantine samples precede a second exact capture with immutable role

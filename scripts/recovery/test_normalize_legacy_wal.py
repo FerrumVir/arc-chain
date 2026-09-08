@@ -128,6 +128,46 @@ class LegacyWalNormalizerTests(unittest.TestCase):
         }
         return source, snapshot, plan, expected
 
+    def append_aware_plan(
+        self,
+        exact_plan: dict,
+        *,
+        maximum_bytes: int = 1024 * 1024,
+        maximum_frames: int = 1024,
+    ) -> dict:
+        terminal = exact_plan["partition"][-1]
+        self.assertEqual(terminal["kind"], "selected-frame-run")
+        return {
+            "schema": normalizer.SCHEMA_V2,
+            "node": exact_plan["node"],
+            "base_source_wal": exact_plan["source_wal"],
+            "base_source_snapshot": exact_plan["source_snapshot"],
+            "base_derivative_wal": exact_plan["derivative_wal"],
+            "base_head": exact_plan["head"],
+            "partition": exact_plan["partition"],
+            "sequence_rewrites": exact_plan["sequence_rewrites"],
+            "append_policy": {
+                "mode": normalizer.APPEND_MODE,
+                "maximum_bytes": maximum_bytes,
+                "maximum_frames": maximum_frames,
+                "source_first_sequence": terminal["source_last_sequence"] + 1,
+                "derivative_first_sequence": terminal[
+                    "derivative_last_sequence"
+                ]
+                + 1,
+                "sequence_delta": terminal["sequence_delta"],
+            },
+            "snapshot_policy": {
+                "mode": normalizer.SNAPSHOT_MODE,
+                "maximum_size": normalizer.MAX_SNAPSHOT_BYTES,
+            },
+        }
+
+    def parsed_plan(self, plan: dict) -> tuple[dict, str]:
+        raw = normalizer.canonical_bytes(plan)
+        plan_sha256 = digest(raw)
+        return normalizer.parse_plan(raw, plan_sha256), plan_sha256
+
     def test_exact_transform_closes_every_opened_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -169,6 +209,349 @@ class LegacyWalNormalizerTests(unittest.TestCase):
             self.assertEqual(
                 stat.S_IMODE((root / "normalized-source").lstat().st_mode), 0o500
             )
+
+    def test_v1_remains_exact_and_rejects_an_append(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source, snapshot, plan, _expected = self.fixture(root)
+            source.write_bytes(source.read_bytes() + frame(3, 4, 14))
+            with self.assertRaisesRegex(
+                normalizer.NormalizationError,
+                "source WAL differs from the content-addressed plan",
+            ):
+                normalizer.normalize(
+                    plan, "4" * 64, source, snapshot, root / "normalized-source"
+                )
+
+    def test_v2_accepts_only_a_fully_proved_append_and_binds_live_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source, snapshot, exact_plan, expected_base = self.fixture(root)
+            plan, plan_sha256 = self.parsed_plan(
+                self.append_aware_plan(exact_plan)
+            )
+            suffix_frames = (frame(3, 4, 14), frame(4, 5, 15))
+            suffix = b"".join(suffix_frames)
+            source.write_bytes(source.read_bytes() + suffix)
+            live_snapshot = b"new-live-snapshot-at-a-later-head"
+            snapshot.write_bytes(live_snapshot)
+
+            receipt = normalizer.normalize(
+                plan,
+                plan_sha256,
+                source,
+                snapshot,
+                root / "normalized-source",
+            )
+
+            derivative = expected_base + suffix
+            self.assertEqual(
+                (root / "normalized-source" / "state.wal").read_bytes(), derivative
+            )
+            self.assertEqual(receipt["schema"], normalizer.RECEIPT_SCHEMA_V2)
+            self.assertNotIn("head", receipt)
+            self.assertEqual(receipt["base_head"], exact_plan["head"])
+            self.assertEqual(receipt["base_source_wal"], exact_plan["source_wal"])
+            self.assertEqual(
+                receipt["base_source_snapshot"], exact_plan["source_snapshot"]
+            )
+            self.assertEqual(receipt["source_wal"]["sha256"], digest(source.read_bytes()))
+            self.assertEqual(receipt["source_snapshot"]["sha256"], digest(live_snapshot))
+            self.assertEqual(receipt["derivative_wal"]["sha256"], digest(derivative))
+            self.assertEqual(receipt["base_selected_frame_count"], 4)
+            self.assertEqual(receipt["selected_frame_count"], 6)
+            self.assertEqual(
+                receipt["transform"],
+                "copy-reviewed-base-runs-rewrite-sequence-and-crc32-then-append-"
+                "strict-contiguous-frames",
+            )
+            self.assertEqual(
+                receipt["appended_suffix"],
+                {
+                    "source_start": exact_plan["source_wal"]["size"],
+                    "source_end": source.stat().st_size,
+                    "source_bytes": len(suffix),
+                    "source_sha256": digest(suffix),
+                    "derivative_start": len(expected_base),
+                    "derivative_end": len(derivative),
+                    "derivative_bytes": len(suffix),
+                    "derivative_sha256": digest(suffix),
+                    "frame_count": 2,
+                    "source_first_sequence": 4,
+                    "source_last_sequence": 5,
+                    "derivative_first_sequence": 4,
+                    "derivative_last_sequence": 5,
+                    "sequence_delta": 0,
+                },
+            )
+
+    def test_v2_extends_using_terminal_selected_run_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "state.wal"
+            snapshot = root / "state.snapshot.lz4"
+            base_frames = (frame(10, 178, 20), frame(11, 179, 21))
+            base_source = b"".join(base_frames)
+            base_derivative = b"".join(
+                rewrite_sequence(item, sequence)
+                for item, sequence in zip(base_frames, (0, 1))
+            )
+            source.write_bytes(base_source)
+            snapshot.write_bytes(b"reviewed-snapshot")
+            exact_plan = {
+                "schema": normalizer.SCHEMA_V1,
+                "node": "ams",
+                "source_wal": {
+                    "sha256": digest(base_source),
+                    "size": len(base_source),
+                },
+                "source_snapshot": {
+                    "sha256": digest(snapshot.read_bytes()),
+                    "size": snapshot.stat().st_size,
+                },
+                "derivative_wal": {
+                    "sha256": digest(base_derivative),
+                    "size": len(base_derivative),
+                },
+                "head": {
+                    "height": 11,
+                    "block_hash": "1" * 64,
+                    "state_root": "2" * 64,
+                },
+                "partition": [
+                    {
+                        "kind": "selected-frame-run",
+                        "source_start": 0,
+                        "source_end": len(base_source),
+                        "sha256": digest(base_source),
+                        "frame_count": 2,
+                        "source_first_sequence": 178,
+                        "source_last_sequence": 179,
+                        "sequence_delta": -178,
+                        "derivative_first_sequence": 0,
+                        "derivative_last_sequence": 1,
+                    }
+                ],
+                "sequence_rewrites": [],
+            }
+            plan, plan_sha256 = self.parsed_plan(
+                self.append_aware_plan(exact_plan)
+            )
+            appended_frames = (frame(12, 180, 22), frame(13, 181, 23))
+            source.write_bytes(base_source + b"".join(appended_frames))
+
+            receipt = normalizer.normalize(
+                plan,
+                plan_sha256,
+                source,
+                snapshot,
+                root / "normalized-source",
+            )
+
+            appended_derivative = b"".join(
+                rewrite_sequence(item, sequence)
+                for item, sequence in zip(appended_frames, (2, 3))
+            )
+            self.assertEqual(
+                (root / "normalized-source" / "state.wal").read_bytes(),
+                base_derivative + appended_derivative,
+            )
+            self.assertEqual(receipt["appended_suffix"]["sequence_delta"], -178)
+            self.assertEqual(
+                receipt["appended_suffix"]["derivative_first_sequence"], 2
+            )
+            self.assertEqual(
+                receipt["appended_suffix"]["derivative_last_sequence"], 3
+            )
+            self.assertEqual(
+                receipt["appended_suffix"]["derivative_sha256"],
+                digest(appended_derivative),
+            )
+
+    def test_v2_records_an_empty_append_without_inventing_sequence_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source, snapshot, exact_plan, expected = self.fixture(root)
+            plan, plan_sha256 = self.parsed_plan(
+                self.append_aware_plan(exact_plan)
+            )
+            receipt = normalizer.normalize(
+                plan,
+                plan_sha256,
+                source,
+                snapshot,
+                root / "normalized-source",
+            )
+            empty_hash = digest(b"")
+            suffix = receipt["appended_suffix"]
+            self.assertEqual(suffix["source_bytes"], 0)
+            self.assertEqual(suffix["derivative_bytes"], 0)
+            self.assertEqual(suffix["source_sha256"], empty_hash)
+            self.assertEqual(suffix["derivative_sha256"], empty_hash)
+            self.assertEqual(suffix["frame_count"], 0)
+            self.assertIsNone(suffix["source_first_sequence"])
+            self.assertIsNone(suffix["source_last_sequence"])
+            self.assertIsNone(suffix["derivative_first_sequence"])
+            self.assertIsNone(suffix["derivative_last_sequence"])
+            self.assertEqual(receipt["derivative_wal"]["sha256"], digest(expected))
+
+    def test_v2_enforces_content_addressed_byte_and_frame_bounds(self) -> None:
+        for label, maximum_bytes, maximum_frames, error in (
+            ("bytes", 1, 1024, "append exceeds the content-addressed safety bound"),
+            ("frames", 1024, 1, "append exceeds the frame-count safety bound"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                source, snapshot, exact_plan, _expected = self.fixture(root)
+                plan, plan_sha256 = self.parsed_plan(
+                    self.append_aware_plan(
+                        exact_plan,
+                        maximum_bytes=maximum_bytes,
+                        maximum_frames=maximum_frames,
+                    )
+                )
+                source.write_bytes(
+                    source.read_bytes() + frame(3, 4, 14) + frame(4, 5, 15)
+                )
+                with self.assertRaisesRegex(normalizer.NormalizationError, error):
+                    normalizer.normalize(
+                        plan,
+                        plan_sha256,
+                        source,
+                        snapshot,
+                        root / "normalized-source",
+                    )
+
+    def test_v2_rejects_changed_reviewed_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source, snapshot, exact_plan, _expected = self.fixture(root)
+            plan, plan_sha256 = self.parsed_plan(
+                self.append_aware_plan(exact_plan)
+            )
+            current = bytearray(source.read_bytes())
+            current[0] ^= 1
+            source.write_bytes(current + frame(3, 4, 14))
+            with self.assertRaisesRegex(
+                normalizer.NormalizationError, "reviewed base prefix differs"
+            ):
+                normalizer.normalize(
+                    plan,
+                    plan_sha256,
+                    source,
+                    snapshot,
+                    root / "normalized-source",
+                )
+
+    def test_v2_rejects_truncated_invalid_and_noncontiguous_appends(self) -> None:
+        cases = {
+            "truncated": (
+                frame(3, 4, 14)[:-1],
+                "crosses its manifest run boundary",
+            ),
+            "invalid-crc": (
+                frame(3, 4, 14)[:-1] + bytes([frame(3, 4, 14)[-1] ^ 1]),
+                "checksum differs",
+            ),
+            "sequence-gap": (frame(3, 5, 14), "not sequence-contiguous"),
+        }
+        for label, (suffix, error) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                source, snapshot, exact_plan, _expected = self.fixture(root)
+                plan, plan_sha256 = self.parsed_plan(
+                    self.append_aware_plan(exact_plan)
+                )
+                source.write_bytes(source.read_bytes() + suffix)
+                with self.assertRaisesRegex(normalizer.NormalizationError, error):
+                    normalizer.normalize(
+                        plan,
+                        plan_sha256,
+                        source,
+                        snapshot,
+                        root / "normalized-source",
+                    )
+
+    def test_v2_rejects_concurrent_source_append(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source, snapshot, exact_plan, _expected = self.fixture(root)
+            plan, plan_sha256 = self.parsed_plan(
+                self.append_aware_plan(exact_plan)
+            )
+            base_size = source.stat().st_size
+            source.write_bytes(source.read_bytes() + frame(3, 4, 14))
+            real_read_frame = normalizer.read_frame
+            mutation_done = False
+
+            def read_frame_then_append(descriptor, offset, run_end):
+                nonlocal mutation_done
+                result = real_read_frame(descriptor, offset, run_end)
+                if offset >= base_size and not mutation_done:
+                    mutation_done = True
+                    with source.open("ab") as handle:
+                        handle.write(frame(4, 5, 15))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                return result
+
+            with unittest.mock.patch.object(
+                normalizer, "read_frame", read_frame_then_append
+            ), self.assertRaisesRegex(
+                normalizer.NormalizationError, "identity changed during normalization"
+            ):
+                normalizer.normalize(
+                    plan,
+                    plan_sha256,
+                    source,
+                    snapshot,
+                    root / "normalized-source",
+                )
+
+    def test_v2_rejects_concurrent_snapshot_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source, snapshot, exact_plan, _expected = self.fixture(root)
+            plan, plan_sha256 = self.parsed_plan(
+                self.append_aware_plan(exact_plan)
+            )
+            source.write_bytes(source.read_bytes() + frame(3, 4, 14))
+            real_write_all = normalizer.write_all
+            mutation_done = False
+
+            def write_then_change_snapshot(handle, raw):
+                nonlocal mutation_done
+                real_write_all(handle, raw)
+                if not mutation_done:
+                    mutation_done = True
+                    snapshot.write_bytes(b"concurrently-changed-snapshot")
+
+            with unittest.mock.patch.object(
+                normalizer, "write_all", write_then_change_snapshot
+            ), self.assertRaisesRegex(
+                normalizer.NormalizationError,
+                "snapshot identity changed during normalization",
+            ):
+                normalizer.normalize(
+                    plan,
+                    plan_sha256,
+                    source,
+                    snapshot,
+                    root / "normalized-source",
+                )
+
+    def test_v2_plan_rejects_a_policy_that_does_not_continue_the_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _source, _snapshot, exact_plan, _expected = self.fixture(root)
+            plan = self.append_aware_plan(exact_plan)
+            plan["append_policy"]["source_first_sequence"] += 1
+            raw = normalizer.canonical_bytes(plan)
+            with self.assertRaisesRegex(
+                normalizer.NormalizationError,
+                "append policy does not continue the reviewed base",
+            ):
+                normalizer.parse_plan(raw, digest(raw))
 
     def test_failed_output_is_never_promoted_and_sources_remain_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -302,13 +685,14 @@ class LegacyWalNormalizerTests(unittest.TestCase):
                 raw = path.read_bytes()
                 plan = normalizer.parse_plan(raw, digest(raw))
                 self.assertEqual(plan["node"], node)
+                self.assertEqual(plan["schema"], normalizer.SCHEMA_V2)
                 self.assertEqual(
                     sum(
                         row["source_end"] - row["source_start"]
                         for row in plan["partition"]
                         if row["kind"] == "selected-frame-run"
                     ),
-                    plan["derivative_wal"]["size"],
+                    plan["base_derivative_wal"]["size"],
                 )
 
 

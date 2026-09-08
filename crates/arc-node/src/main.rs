@@ -531,6 +531,22 @@ enum RecoveryCommand {
         expected_genesis_sha256: String,
         #[arg(long)]
         expected_legacy_validator_set_sha256: String,
+        /// Content-addressed exceptional policy for a source snapshot whose
+        /// tuple has no exact durable WAL boundary. Omission keeps the normal
+        /// exact-snapshot capture path.
+        #[arg(
+            long,
+            value_name = "ABSOLUTE_JSON_PATH",
+            requires = "expected_durable_wal_boundary_plan_sha256"
+        )]
+        durable_wal_boundary_plan: Option<String>,
+        /// SHA-256 trust root for --durable-wal-boundary-plan.
+        #[arg(
+            long,
+            value_name = "64_HEX_CHARS",
+            requires = "durable_wal_boundary_plan"
+        )]
+        expected_durable_wal_boundary_plan_sha256: Option<String>,
         /// Explicitly permit a source WAL that predates
         /// genesis.network-hash.  The fixed output is always bound.
         #[arg(long, default_value_t = false)]
@@ -880,6 +896,44 @@ struct RecoveryCapturedHead {
     state_root: String,
 }
 
+const DURABLE_WAL_BOUNDARY_PLAN_SCHEMA: &str = "arc.recovery.durable-wal-boundary-plan.v1";
+const DURABLE_WAL_BOUNDARY_SELECTION_POLICY: &str =
+    "strict-latest-complete-final-frame-wal-boundary";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPinnedContent {
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryPinnedSnapshot {
+    height: u64,
+    sha256: String,
+    size: u64,
+    state_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDurableWalBoundaryPlan {
+    node: String,
+    schema: String,
+    selection_policy: String,
+    source_snapshot: RecoveryPinnedSnapshot,
+    source_wal: RecoveryPinnedContent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoverySelectedDurableWalBoundary {
+    height: u64,
+    block_hash: String,
+    state_root: String,
+    checkpoint_sequence: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct RecoverySourceWalPrefix {
     device: u64,
@@ -906,6 +960,16 @@ struct RecoveryFixedSourcePair {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryDurableWalBoundaryCapture {
+    source_plan: RecoveryReadOnlyInput,
+    fixed_plan: RecoveryReadOnlyInput,
+    plan: LegacyDurableWalBoundaryPlan,
+    selected_boundary: RecoverySelectedDurableWalBoundary,
+    preserved_source_snapshot: RecoveryReadOnlyInput,
+    replay_derived_snapshot: RecoveryReadOnlyInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct LegacySourceCaptureReceipt {
     schema: String,
     captured_at_unix_ms: u64,
@@ -917,6 +981,8 @@ struct LegacySourceCaptureReceipt {
     legacy_validator_set: RecoveryReadOnlyInput,
     fixed_pair: RecoveryFixedSourcePair,
     allow_unbound_legacy_wal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    durable_wal_boundary: Option<RecoveryDurableWalBoundaryCapture>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1068,6 +1134,74 @@ fn require_recovery_input_hash(
         "{label} SHA-256 differs from the exact pin"
     );
     Ok(())
+}
+
+fn load_legacy_durable_wal_boundary_plan(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<(
+    LegacyDurableWalBoundaryPlan,
+    RecoveryReadOnlyInput,
+    arc_state::recovery::LegacyDurableWalSnapshotExpectation,
+)> {
+    ensure!(
+        path.is_absolute(),
+        "durable-WAL boundary plan must be absolute"
+    );
+    let input = recovery_read_only_input(path, "durable-WAL boundary plan")?;
+    require_recovery_input_hash(&input, expected_sha256, "durable-WAL boundary plan")?;
+    ensure!(
+        input.size > 0 && input.size <= 64 * 1024,
+        "durable-WAL boundary plan size is outside 1..=65536 bytes"
+    );
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "failed to read durable-WAL boundary plan {}",
+            path.display()
+        )
+    })?;
+    ensure!(
+        recovery_read_only_input(path, "durable-WAL boundary plan final recheck")? == input,
+        "durable-WAL boundary plan changed while it was parsed"
+    );
+    let plan: LegacyDurableWalBoundaryPlan =
+        serde_json::from_slice(&bytes).context("failed to parse durable-WAL boundary plan")?;
+    ensure!(
+        plan.schema == DURABLE_WAL_BOUNDARY_PLAN_SCHEMA,
+        "durable-WAL boundary plan schema is unsupported"
+    );
+    ensure!(
+        plan.selection_policy == DURABLE_WAL_BOUNDARY_SELECTION_POLICY,
+        "durable-WAL boundary plan selection_policy is unsupported"
+    );
+    ensure!(
+        plan.node == "sgp",
+        "durable-WAL boundary exception is hard-gated to the reviewed SGP source"
+    );
+    ensure!(
+        plan.source_wal.size > 0 && plan.source_snapshot.size > 0,
+        "durable-WAL boundary plan contains an empty source input"
+    );
+    for (label, sha256) in [
+        ("source WAL", plan.source_wal.sha256.as_str()),
+        ("source snapshot", plan.source_snapshot.sha256.as_str()),
+    ] {
+        ensure!(
+            sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) }),
+            "durable-WAL boundary plan {label} SHA-256 is malformed"
+        );
+    }
+    let expectation = arc_state::recovery::LegacyDurableWalSnapshotExpectation {
+        source_snapshot_height: plan.source_snapshot.height,
+        source_snapshot_state_root: parse_recovery_hash(
+            "durable-WAL boundary plan source_snapshot.state_root",
+            &plan.source_snapshot.state_root,
+        )?,
+    };
+    Ok((plan, input, expectation))
 }
 
 fn recovery_directory_input(metadata: &std::fs::Metadata) -> Result<RecoveryReadOnlyDirectory> {
@@ -1322,6 +1456,42 @@ fn recovery_write_create_new(
     }
     drop(file);
     recovery_read_only_input(output, label)
+}
+
+fn recovery_write_replay_derived_snapshot_create_new(
+    state: &StateDB,
+    checkpoint_sequence: u64,
+    output: &Path,
+) -> Result<RecoveryReadOnlyInput> {
+    let mut snapshot = state.export_snapshot();
+    snapshot.wal_sequence = checkpoint_sequence;
+    snapshot.accounts.sort_by_key(|entry| entry.0.0);
+    for (_, entries) in &mut snapshot.storage {
+        entries.sort_by_key(|entry| entry.0.0);
+    }
+    snapshot.storage.sort_by_key(|entry| entry.0.0);
+    snapshot.contracts.sort_by_key(|entry| entry.0.0);
+    ensure!(
+        snapshot.block_height == state.height() && snapshot.state_root == state.get_state_root(),
+        "replay-derived snapshot tuple differs from the selected durable WAL boundary"
+    );
+    let raw = bincode::serialize(&snapshot)
+        .context("failed to serialize replay-derived legacy snapshot")?;
+    ensure!(
+        raw.len() <= arc_state::recovery::LEGACY_SNAPSHOT_MAX_BYTES,
+        "replay-derived legacy snapshot exceeds the recovery size limit"
+    );
+    let compressed = lz4_flex::compress_prepend_size(&raw);
+    let fixed = recovery_write_create_new(output, &compressed, "replay-derived legacy snapshot")?;
+    let round_trip = arc_state::wal::Snapshot::read_from(output)
+        .context("failed to re-read replay-derived legacy snapshot")?;
+    ensure!(
+        round_trip.block_height == snapshot.block_height
+            && round_trip.state_root == snapshot.state_root
+            && round_trip.wal_sequence == checkpoint_sequence,
+        "sealed replay-derived snapshot tuple/sequence changed during serialization"
+    );
+    Ok(fixed)
 }
 
 fn recovery_copy_exact_wal_prefix(
@@ -3379,6 +3549,8 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
             expected_snapshot_sha256,
             expected_genesis_sha256,
             expected_legacy_validator_set_sha256,
+            durable_wal_boundary_plan,
+            expected_durable_wal_boundary_plan_sha256,
             allow_unbound_legacy_wal,
         } => {
             let data_dir_path = Path::new(&data_dir);
@@ -3496,16 +3668,56 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 "legacy validator set",
             )?;
 
+            let durable_plan = match (
+                durable_wal_boundary_plan.as_deref(),
+                expected_durable_wal_boundary_plan_sha256.as_deref(),
+            ) {
+                (None, None) => None,
+                (Some(path), Some(expected_sha256)) => {
+                    let path = PathBuf::from(path);
+                    let (plan, input, expectation) =
+                        load_legacy_durable_wal_boundary_plan(&path, expected_sha256)?;
+                    ensure!(
+                        source_snapshot.sha256 == plan.source_snapshot.sha256
+                            && source_snapshot.size == plan.source_snapshot.size,
+                        "live legacy snapshot content differs from the durable-WAL boundary plan"
+                    );
+                    ensure!(
+                        expected_snapshot_sha256 == plan.source_snapshot.sha256,
+                        "CLI snapshot pin differs from the durable-WAL boundary plan"
+                    );
+                    ensure!(
+                        source_wal_initial_bytes == plan.source_wal.size,
+                        "live legacy WAL size differs from the durable-WAL boundary plan"
+                    );
+                    Some((path, plan, input, expectation))
+                }
+                _ => bail!(
+                    "durable-WAL boundary plan path and expected SHA-256 must be supplied together"
+                ),
+            };
+
             let (_, network) = recovery_network_from_genesis(&genesis, 1, 1)?;
             let legacy_validators = load_legacy_recovery_validator_file(&legacy_validator_set)?;
             let (source_state, source_report) =
-                StateDB::load_legacy_recovery_export_source_with_report(
-                    &loader_data_dir,
-                    network.genesis_hash,
-                    allow_unbound_legacy_wal,
-                    &snapshot,
-                    &legacy_validators,
-                )?;
+                if let Some((_, _, _, expectation)) = durable_plan.as_ref() {
+                    StateDB::load_legacy_recovery_export_source_from_durable_wal_with_report(
+                        &loader_data_dir,
+                        network.genesis_hash,
+                        allow_unbound_legacy_wal,
+                        &snapshot,
+                        &legacy_validators,
+                        expectation,
+                    )?
+                } else {
+                    StateDB::load_legacy_recovery_export_source_with_report(
+                        &loader_data_dir,
+                        network.genesis_hash,
+                        allow_unbound_legacy_wal,
+                        &snapshot,
+                        &legacy_validators,
+                    )?
+                };
             ensure!(
                 source_report.source_wal_original_bytes >= source_wal_initial_bytes,
                 "live legacy WAL shrank between its held open and snapshot-bound replay"
@@ -3548,12 +3760,62 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 "live legacy WAL did not remain append-only after snapshot-bound replay"
             );
             let fixed_snapshot_path = output_dir.join("state.snapshot.lz4");
-            let fixed_snapshot = recovery_copy_input_create_new(
-                snapshot_path,
-                &fixed_snapshot_path,
-                "legacy snapshot",
-                &expected_snapshot_sha256,
-            )?;
+            let (fixed_snapshot, durable_artifacts) = if let Some((
+                plan_path,
+                plan,
+                source_plan,
+                _,
+            )) = durable_plan.as_ref()
+            {
+                ensure!(
+                    source_report.source_wal_original_bytes == plan.source_wal.size
+                        && source_report.source_wal_accepted_prefix_bytes == plan.source_wal.size
+                        && source_report.source_wal_quarantined_tail_bytes == 0
+                        && source_report.source_wal_tail_reason == "none",
+                    "durable-WAL source does not exactly match the plan's complete final boundary"
+                );
+                ensure!(
+                    fixed_wal.size == plan.source_wal.size
+                        && fixed_wal.sha256 == plan.source_wal.sha256,
+                    "fixed durable WAL content differs from the exact plan"
+                );
+                let preserved_source_snapshot = recovery_copy_input_create_new(
+                    snapshot_path,
+                    &output_dir.join("source.snapshot.inconsistent.lz4"),
+                    "inconsistent source snapshot evidence",
+                    &plan.source_snapshot.sha256,
+                )?;
+                let fixed_plan = recovery_copy_input_create_new(
+                    plan_path,
+                    &output_dir.join("durable-wal-boundary.plan.json"),
+                    "durable-WAL boundary plan",
+                    &source_plan.sha256,
+                )?;
+                let fixed_snapshot = recovery_write_replay_derived_snapshot_create_new(
+                    &source_state,
+                    source_report.source_wal_selected_checkpoint_sequence,
+                    &fixed_snapshot_path,
+                )?;
+                (
+                    fixed_snapshot,
+                    Some((
+                        source_plan.clone(),
+                        fixed_plan,
+                        plan.clone(),
+                        preserved_source_snapshot,
+                    )),
+                )
+            } else {
+                (
+                    recovery_copy_input_create_new(
+                        snapshot_path,
+                        &fixed_snapshot_path,
+                        "legacy snapshot",
+                        &expected_snapshot_sha256,
+                    )?,
+                    None,
+                )
+            };
             let fixed_binding = recovery_write_create_new(
                 &output_dir.join("genesis.network-hash"),
                 format!("{}\n", network.genesis_hash.to_hex()).as_bytes(),
@@ -3619,6 +3881,15 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                         == legacy_input,
                 "a fixed capture input changed before content seal"
             );
+            if let Some((plan_path, _, source_plan, _)) = durable_plan.as_ref() {
+                ensure!(
+                    recovery_read_only_input(
+                        plan_path,
+                        "durable-WAL boundary plan final capture recheck"
+                    )? == *source_plan,
+                    "durable-WAL boundary plan changed before content seal"
+                );
+            }
 
             #[cfg(unix)]
             {
@@ -3648,6 +3919,36 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                     && fixed_pair.genesis_binding == fixed_binding,
                 "fixed pair changed while its directory was sealed"
             );
+            let durable_wal_boundary = durable_artifacts
+                .map(
+                    |(source_plan, fixed_plan, plan, preserved_source_snapshot)| {
+                        ensure!(
+                            preserved_source_snapshot.sha256 == source_snapshot.sha256
+                                && preserved_source_snapshot.size == source_snapshot.size,
+                            "preserved inconsistent snapshot differs from its source evidence"
+                        );
+                        ensure!(
+                            fixed_plan.sha256 == source_plan.sha256
+                                && fixed_plan.size == source_plan.size,
+                            "fixed durable-WAL boundary plan differs from its source"
+                        );
+                        Ok::<_, anyhow::Error>(RecoveryDurableWalBoundaryCapture {
+                            source_plan,
+                            fixed_plan,
+                            plan,
+                            selected_boundary: RecoverySelectedDurableWalBoundary {
+                                height: head.height,
+                                block_hash: head.block_hash.clone(),
+                                state_root: head.state_root.clone(),
+                                checkpoint_sequence: source_report
+                                    .source_wal_selected_checkpoint_sequence,
+                            },
+                            preserved_source_snapshot,
+                            replay_derived_snapshot: fixed_pair.snapshot.clone(),
+                        })
+                    },
+                )
+                .transpose()?;
             let captured_at_unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .context("host clock is before the Unix epoch")?
@@ -3655,7 +3956,12 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 .try_into()
                 .context("Unix timestamp exceeds u64")?;
             let receipt = LegacySourceCaptureReceipt {
-                schema: "arc.recovery.live-legacy-source-capture.v1".to_string(),
+                schema: if durable_wal_boundary.is_some() {
+                    "arc.recovery.live-legacy-source-capture.v2"
+                } else {
+                    "arc.recovery.live-legacy-source-capture.v1"
+                }
+                .to_string(),
                 captured_at_unix_ms,
                 head,
                 source_data_dir,
@@ -3679,6 +3985,7 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 legacy_validator_set: legacy_input,
                 fixed_pair,
                 allow_unbound_legacy_wal,
+                durable_wal_boundary,
             };
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
@@ -5558,8 +5865,32 @@ fn p2p_listen_ip(
     }
 }
 
+#[cfg(windows)]
+fn main() -> Result<()> {
+    // The MSVC process entry thread reserves a substantially smaller stack
+    // than ARC's Unix entry threads. Keep the large async node/recovery
+    // future off that fixed entry stack so adding a fail-closed recovery
+    // field cannot make an otherwise normal Windows node overflow before it
+    // reaches lifecycle admission. The reservation is virtual address space;
+    // pages are committed only as they are used.
+    let node = std::thread::Builder::new()
+        .name("arc-node-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_arc_node)
+        .context("failed to start the Windows ARC node runtime thread")?;
+    match node.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(not(windows))]
+fn main() -> Result<()> {
+    run_arc_node()
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+async fn run_arc_node() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
         .init();
@@ -8298,6 +8629,8 @@ mod tests {
                 RecoveryCommand::CaptureLegacySource {
                     output_data_dir,
                     allow_unbound_legacy_wal,
+                    durable_wal_boundary_plan,
+                    expected_durable_wal_boundary_plan_sha256,
                     ..
                 },
         }) = cli.operator_command
@@ -8306,6 +8639,8 @@ mod tests {
         };
         assert_eq!(output_data_dir, "/attempt/fixed");
         assert!(allow_unbound_legacy_wal);
+        assert!(durable_wal_boundary_plan.is_none());
+        assert!(expected_durable_wal_boundary_plan_sha256.is_none());
 
         assert!(
             Cli::try_parse_from([
@@ -8326,6 +8661,128 @@ mod tests {
             .is_err(),
             "floating static capture inputs must not parse"
         );
+    }
+
+    #[test]
+    fn durable_wal_capture_cli_requires_a_paired_content_addressed_plan() {
+        let hash = "a".repeat(64);
+        let base = [
+            "arc-node",
+            "recovery",
+            "capture-legacy-source",
+            "--data-dir",
+            "/legacy",
+            "--snapshot",
+            "/attempt/live.snapshot.lz4",
+            "--genesis",
+            "/sealed/genesis.toml",
+            "--legacy-validator-set",
+            "/sealed/legacy.json",
+            "--output-data-dir",
+            "/attempt/fixed",
+            "--expected-snapshot-sha256",
+            hash.as_str(),
+            "--expected-genesis-sha256",
+            hash.as_str(),
+            "--expected-legacy-validator-set-sha256",
+            hash.as_str(),
+        ];
+        let mut complete = base.to_vec();
+        complete.extend([
+            "--durable-wal-boundary-plan",
+            "/sealed/durable-wal-boundary-sgp.json",
+            "--expected-durable-wal-boundary-plan-sha256",
+            hash.as_str(),
+        ]);
+        let cli = Cli::try_parse_from(complete).expect("paired durable-WAL pins should parse");
+        let Some(OperatorCommand::Recovery {
+            command:
+                RecoveryCommand::CaptureLegacySource {
+                    durable_wal_boundary_plan,
+                    expected_durable_wal_boundary_plan_sha256,
+                    ..
+                },
+        }) = cli.operator_command
+        else {
+            panic!("wrong operator command parsed")
+        };
+        assert_eq!(
+            durable_wal_boundary_plan.as_deref(),
+            Some("/sealed/durable-wal-boundary-sgp.json")
+        );
+        assert_eq!(
+            expected_durable_wal_boundary_plan_sha256.as_deref(),
+            Some(hash.as_str())
+        );
+
+        let mut missing_hash = base.to_vec();
+        missing_hash.extend([
+            "--durable-wal-boundary-plan",
+            "/sealed/durable-wal-boundary-sgp.json",
+        ]);
+        assert!(Cli::try_parse_from(missing_hash).is_err());
+
+        let mut missing_plan = base.to_vec();
+        missing_plan.extend(["--expected-durable-wal-boundary-plan-sha256", hash.as_str()]);
+        assert!(Cli::try_parse_from(missing_plan).is_err());
+    }
+
+    #[test]
+    fn canonical_sgp_durable_wal_plan_has_the_frozen_parser_contract() {
+        let plan_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/recovery/durable-wal-boundary-sgp.json")
+            .canonicalize()
+            .unwrap();
+        let (plan, input, expectation) = load_legacy_durable_wal_boundary_plan(
+            &plan_path,
+            "9dbb076fa1d3ffb37874e36103d4b588c0662f46a010bef72ca00ff0f4cd821e",
+        )
+        .expect("the canonical SGP exception plan must remain content-addressed and parseable");
+        assert_eq!(input.size, 449);
+        assert_eq!(plan.node, "sgp");
+        assert_eq!(plan.source_wal.size, 53_342_777);
+        assert_eq!(plan.source_snapshot.size, 752_568);
+        assert_eq!(expectation.source_snapshot_height, 97_591);
+        assert_eq!(
+            expectation.source_snapshot_state_root.to_hex(),
+            "fadd4f9d5d2e5cd659ea02261987e209aec8aa2f5673e21929bc566d257969b4"
+        );
+        assert!(
+            load_legacy_durable_wal_boundary_plan(&plan_path, &"0".repeat(64))
+                .unwrap_err()
+                .to_string()
+                .contains("differs from the exact pin")
+        );
+        let mut value = serde_json::to_value(plan).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<LegacyDurableWalBoundaryPlan>(value).is_err());
+    }
+
+    #[test]
+    fn replay_derived_snapshot_is_canonical_and_carries_the_selected_sequence() {
+        let first = hash_bytes(b"durable-derived-first");
+        let second = hash_bytes(b"durable-derived-second");
+        let state = StateDB::with_genesis(&[(second, 2), (first, 1)]);
+        let path = std::env::temp_dir().join(format!(
+            "arc-durable-derived-snapshot-{}.lz4",
+            uuid::Uuid::new_v4()
+        ));
+        let fixed = recovery_write_replay_derived_snapshot_create_new(&state, 42, &path).unwrap();
+        let snapshot = arc_state::wal::Snapshot::read_from(&path).unwrap();
+        assert_eq!(snapshot.block_height, state.height());
+        assert_eq!(snapshot.state_root, state.get_state_root());
+        assert_eq!(snapshot.wal_sequence, 42);
+        assert!(
+            snapshot
+                .accounts
+                .windows(2)
+                .all(|pair| pair[0].0.0 < pair[1].0.0)
+        );
+        assert_eq!(fixed.size, std::fs::metadata(&path).unwrap().len());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

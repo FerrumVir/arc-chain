@@ -44,8 +44,46 @@ TARGET_HEIGHT_SCHEMA = "arc.recovery.legacy-public-height-targets.v1"
 TARGET_CROSS_SCHEMA = "arc.recovery.authenticated-legacy-height-targets.v1"
 LIVE_SOURCE_CAPTURE_SCHEMA = "arc.recovery.quarantine-live-source-capture.v1"
 NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA = "arc.recovery.quarantine-live-source-capture.v2"
+DURABLE_LIVE_SOURCE_CAPTURE_SCHEMA = "arc.recovery.quarantine-live-source-capture.v3"
 RUST_SOURCE_CAPTURE_SCHEMA = "arc.recovery.live-legacy-source-capture.v1"
+RUST_DURABLE_SOURCE_CAPTURE_SCHEMA = "arc.recovery.live-legacy-source-capture.v2"
 WAL_NORMALIZATION_SCHEMA = "arc.recovery.legacy-wal-normalization.v1"
+WAL_NORMALIZATION_SCHEMA_V2 = "arc.recovery.legacy-wal-normalization.v2"
+WAL_NORMALIZATION_PLAN_SCHEMA_V2 = "arc.recovery.legacy-wal-normalization-plan.v2"
+WAL_APPEND_MODE = "strict-crc32-sequence-contiguous-full-frame-suffix"
+WAL_SNAPSHOT_MODE = "capture-bind-and-require-rust-exact-boundary"
+WAL_TRANSFORM_V2 = (
+    "copy-reviewed-base-runs-rewrite-sequence-and-crc32-then-append-"
+    "strict-contiguous-frames"
+)
+DURABLE_WAL_BOUNDARY_PLAN_SCHEMA = "arc.recovery.durable-wal-boundary-plan.v1"
+DURABLE_WAL_BOUNDARY_SELECTION_POLICY = (
+    "strict-latest-complete-final-frame-wal-boundary"
+)
+MAX_WAL_APPEND_BYTES = 64 * 1024 * 1024
+MAX_WAL_APPEND_FRAMES = 1_000_000
+MAX_LEGACY_SNAPSHOT_BYTES = 256 * 1024 * 1024
+PERSISTED_LEGACY_HEAD_SCHEMA_V3 = "arc.recovery.persisted-legacy-head.v3"
+PERSISTED_LEGACY_HEAD_SCHEMA_V4 = "arc.recovery.persisted-legacy-head.v4"
+PERSISTED_LEGACY_HEAD_SCHEMA_V5 = "arc.recovery.persisted-legacy-head.v5"
+PERSISTED_LEGACY_HEAD_COMMON_FIELDS = frozenset({
+    "schema", "source_main_commit", "capture_id", "node", "freeze_plan_sha256",
+    "boot_id", "inspector_binary_sha256", "genesis_sha256",
+    "validator_public_keys_sha256", "legacy_validator_set_sha256",
+    "source_pair_role", "final_source_capture_sha256", "selected_source_head",
+    "stop_after_round_receipt_sha256", "network_quarantine_receipt_sha256",
+    "stop_complete_sha256", "stop_files_sha256", "capture_complete_sha256",
+    "capture_files_sha256", "capture_source_sha256", "source_data_index_sha256",
+    "state_wal_sha256", "state_wal_size", "snapshot_sha256", "snapshot_size",
+    "source_file_identity", "archived_final_wal", "staged_file_contract",
+    "export_summary_sha256", "inspect_summary_sha256", "wal_boundary_sha256",
+    "export_status", "head", "candidate_checkpoint_sha256",
+    "candidate_checkpoint_size", "snapshot_path", "state_wal_path",
+    "export_contract", "legacy_dag_round", "trusted_anchor_ancestry",
+    "completed_at", "rerun_reexecutes_export", "writer_stopped",
+    "restart_barrier_active", "network_quarantine_active",
+    "global_absence_claimed",
+})
 PRIOR_STATUS_SCHEMA = "arc.recovery.quarantine-prior-fenced-status.v1"
 STOPPED_STATUS_SCHEMA = "arc.recovery.quarantine-prior-persistently-stopped-status.v1"
 NFT_GATE_SCHEMA = "arc.recovery.quarantine-nft-deadline-gate.v1"
@@ -292,6 +330,579 @@ def validate_rust_input_identity(
     return dict(value)
 
 
+def validate_content_pin(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"sha256", "size"}:
+        fail(f"{label} fields differ")
+    require_hash(value.get("sha256"), f"{label} sha256")
+    require_uint(value.get("size"), f"{label} size", positive=True)
+    return dict(value)
+
+
+def validate_head(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"height", "block_hash", "state_root"}:
+        fail(f"{label} fields differ")
+    require_uint(value.get("height"), f"{label} height", positive=True)
+    require_hash(value.get("block_hash"), f"{label} block hash")
+    require_hash(value.get("state_root"), f"{label} state root")
+    return dict(value)
+
+
+def validate_wal_normalization_v2_plan(
+    value: Any, label: str
+) -> dict[str, Any]:
+    fields = {
+        "schema", "node", "base_source_wal", "base_source_snapshot",
+        "base_derivative_wal", "base_head", "partition", "sequence_rewrites",
+        "append_policy", "snapshot_policy",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{label} fields differ")
+    if value.get("schema") != WAL_NORMALIZATION_PLAN_SCHEMA_V2:
+        fail(f"{label} schema differs")
+    if value.get("node") not in {"lax", "ams"}:
+        fail(f"{label} node differs")
+    base_source = validate_content_pin(value.get("base_source_wal"), f"{label} base source WAL")
+    base_snapshot = validate_content_pin(
+        value.get("base_source_snapshot"), f"{label} base source snapshot"
+    )
+    base_derivative = validate_content_pin(
+        value.get("base_derivative_wal"), f"{label} base derivative WAL"
+    )
+    validate_head(value.get("base_head"), f"{label} base head")
+    partition = value.get("partition")
+    if not isinstance(partition, list) or not partition:
+        fail(f"{label} partition differs")
+    expected_start = 0
+    expected_derivative_sequence = 0
+    selected_bytes = 0
+    selected_frames = 0
+    selected_ranges: list[tuple[int, int]] = []
+    for index, row in enumerate(partition):
+        if not isinstance(row, dict):
+            fail(f"{label} partition row {index} differs")
+        kind = row.get("kind")
+        common = {"kind", "source_start", "source_end", "sha256"}
+        if kind == "selected-frame-run":
+            expected_fields = common | {
+                "frame_count", "source_first_sequence", "source_last_sequence",
+                "sequence_delta", "derivative_first_sequence",
+                "derivative_last_sequence",
+            }
+        elif kind == "excluded-zero-fill":
+            expected_fields = common | {"classification"}
+            if row.get("classification") != "interior-zero-fill-gap":
+                fail(f"{label} zero-fill classification differs")
+        elif kind == "excluded-valid-frame-run":
+            expected_fields = common | {
+                "classification", "frame_count", "first_sequence", "last_sequence",
+            }
+            if row.get("classification") != "stale-valid-fork":
+                fail(f"{label} excluded-frame classification differs")
+        else:
+            fail(f"{label} partition row {index} kind differs")
+        if set(row) != expected_fields:
+            fail(f"{label} partition row {index} fields differ")
+        start = require_uint(row.get("source_start"), f"{label} partition start")
+        end = require_uint(row.get("source_end"), f"{label} partition end", positive=True)
+        require_hash(row.get("sha256"), f"{label} partition hash")
+        if start != expected_start or end <= start:
+            fail(f"{label} partition byte accounting differs")
+        expected_start = end
+        if kind == "selected-frame-run":
+            count = require_uint(row.get("frame_count"), f"{label} selected frames", positive=True)
+            source_first = require_uint(
+                row.get("source_first_sequence"), f"{label} selected first sequence"
+            )
+            source_last = require_uint(
+                row.get("source_last_sequence"), f"{label} selected last sequence"
+            )
+            derivative_first = require_uint(
+                row.get("derivative_first_sequence"), f"{label} derivative first sequence"
+            )
+            derivative_last = require_uint(
+                row.get("derivative_last_sequence"), f"{label} derivative last sequence"
+            )
+            delta = row.get("sequence_delta")
+            if isinstance(delta, bool) or not isinstance(delta, int):
+                fail(f"{label} sequence delta differs")
+            if (
+                source_last - source_first + 1 != count
+                or derivative_last - derivative_first + 1 != count
+                or derivative_first != expected_derivative_sequence
+            ):
+                fail(f"{label} selected sequence accounting differs")
+            expected_derivative_sequence = derivative_last + 1
+            selected_bytes += end - start
+            selected_frames += count
+            selected_ranges.append((start, end))
+        elif kind == "excluded-valid-frame-run":
+            count = require_uint(row.get("frame_count"), f"{label} excluded frames", positive=True)
+            first = require_uint(row.get("first_sequence"), f"{label} excluded first sequence")
+            last = require_uint(row.get("last_sequence"), f"{label} excluded last sequence")
+            if last - first + 1 != count:
+                fail(f"{label} excluded sequence accounting differs")
+    if expected_start != base_source["size"] or selected_bytes != base_derivative["size"]:
+        fail(f"{label} base byte accounting differs")
+    terminal = partition[-1]
+    if terminal.get("kind") != "selected-frame-run":
+        fail(f"{label} base does not end in a selected frame run")
+    rewrites = value.get("sequence_rewrites")
+    if not isinstance(rewrites, list):
+        fail(f"{label} sequence rewrites differ")
+    previous_offset = -1
+    for index, rewrite in enumerate(rewrites):
+        if not isinstance(rewrite, dict) or set(rewrite) != {
+            "source_offset", "source_sequence", "derivative_sequence",
+        }:
+            fail(f"{label} sequence rewrite {index} fields differ")
+        offset = require_uint(rewrite.get("source_offset"), f"{label} rewrite offset")
+        require_uint(rewrite.get("source_sequence"), f"{label} rewrite source")
+        require_uint(rewrite.get("derivative_sequence"), f"{label} rewrite derivative")
+        if offset <= previous_offset or not any(start <= offset < end for start, end in selected_ranges):
+            fail(f"{label} sequence rewrite placement differs")
+        previous_offset = offset
+    append_policy = value.get("append_policy")
+    if not isinstance(append_policy, dict) or set(append_policy) != {
+        "mode", "maximum_bytes", "maximum_frames", "source_first_sequence",
+        "derivative_first_sequence", "sequence_delta",
+    }:
+        fail(f"{label} append policy fields differ")
+    maximum_bytes = require_uint(
+        append_policy.get("maximum_bytes"), f"{label} maximum append bytes", positive=True
+    )
+    maximum_frames = require_uint(
+        append_policy.get("maximum_frames"), f"{label} maximum append frames", positive=True
+    )
+    source_first = require_uint(
+        append_policy.get("source_first_sequence"), f"{label} append source sequence"
+    )
+    derivative_first = require_uint(
+        append_policy.get("derivative_first_sequence"), f"{label} append derivative sequence"
+    )
+    append_delta = append_policy.get("sequence_delta")
+    if isinstance(append_delta, bool) or not isinstance(append_delta, int):
+        fail(f"{label} append sequence delta differs")
+    if (
+        append_policy.get("mode") != WAL_APPEND_MODE
+        or maximum_bytes > MAX_WAL_APPEND_BYTES
+        or maximum_frames > MAX_WAL_APPEND_FRAMES
+        or source_first != terminal["source_last_sequence"] + 1
+        or derivative_first != terminal["derivative_last_sequence"] + 1
+        or derivative_first != selected_frames
+        or append_delta != terminal["sequence_delta"]
+        or source_first + append_delta != derivative_first
+    ):
+        fail(f"{label} append policy differs from the reviewed base")
+    snapshot_policy = value.get("snapshot_policy")
+    if not isinstance(snapshot_policy, dict) or set(snapshot_policy) != {"mode", "maximum_size"}:
+        fail(f"{label} snapshot policy fields differ")
+    maximum_snapshot = require_uint(
+        snapshot_policy.get("maximum_size"), f"{label} maximum snapshot size", positive=True
+    )
+    if (
+        snapshot_policy.get("mode") != WAL_SNAPSHOT_MODE
+        or maximum_snapshot > MAX_LEGACY_SNAPSHOT_BYTES
+        or maximum_snapshot < base_snapshot["size"]
+    ):
+        fail(f"{label} snapshot policy differs")
+    return {
+        "plan": dict(value),
+        "base_source_wal": base_source,
+        "base_source_snapshot": base_snapshot,
+        "base_derivative_wal": base_derivative,
+        "base_selected_frame_count": selected_frames,
+        "append_policy": dict(append_policy),
+    }
+
+
+def validate_wal_normalization_v2_receipt(
+    value: Any, label: str
+) -> dict[str, Any]:
+    fields = {
+        "schema", "plan_sha256", "node", "base_source_wal",
+        "base_source_snapshot", "base_derivative_wal", "base_head", "partition",
+        "sequence_rewrites", "append_policy", "snapshot_policy", "source_wal",
+        "source_snapshot", "derivative_wal", "appended_suffix",
+        "base_selected_frame_count", "selected_frame_count", "excluded_bytes",
+        "semantic_stream_sha256", "transform", "source_unchanged",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{label} fields differ")
+    if value.get("schema") != WAL_NORMALIZATION_SCHEMA_V2:
+        fail(f"{label} schema differs")
+    plan_projection = validate_wal_normalization_v2_plan(
+        {
+            "schema": WAL_NORMALIZATION_PLAN_SCHEMA_V2,
+            "node": value.get("node"),
+            "base_source_wal": value.get("base_source_wal"),
+            "base_source_snapshot": value.get("base_source_snapshot"),
+            "base_derivative_wal": value.get("base_derivative_wal"),
+            "base_head": value.get("base_head"),
+            "partition": value.get("partition"),
+            "sequence_rewrites": value.get("sequence_rewrites"),
+            "append_policy": value.get("append_policy"),
+            "snapshot_policy": value.get("snapshot_policy"),
+        },
+        f"{label} embedded plan",
+    )
+    require_hash(value.get("plan_sha256"), f"{label} plan sha256")
+    source_wal = validate_rust_input_identity(value.get("source_wal"), f"{label} source WAL")
+    source_snapshot = validate_rust_input_identity(
+        value.get("source_snapshot"), f"{label} source snapshot"
+    )
+    derivative = validate_rust_input_identity(
+        value.get("derivative_wal"), f"{label} derivative WAL"
+    )
+    base_source = plan_projection["base_source_wal"]
+    base_derivative = plan_projection["base_derivative_wal"]
+    appended = value.get("appended_suffix")
+    append_fields = {
+        "source_start", "source_end", "source_bytes", "source_sha256",
+        "derivative_start", "derivative_end", "derivative_bytes", "derivative_sha256",
+        "frame_count", "source_first_sequence", "source_last_sequence",
+        "derivative_first_sequence", "derivative_last_sequence", "sequence_delta",
+    }
+    if not isinstance(appended, dict) or set(appended) != append_fields:
+        fail(f"{label} appended suffix fields differ")
+    for key in (
+        "source_start", "source_end", "source_bytes", "derivative_start",
+        "derivative_end", "derivative_bytes", "frame_count",
+    ):
+        require_uint(appended.get(key), f"{label} appended {key}")
+    require_hash(appended.get("source_sha256"), f"{label} appended source root")
+    require_hash(appended.get("derivative_sha256"), f"{label} appended derivative root")
+    frame_count = appended["frame_count"]
+    no_append = frame_count == 0
+    policy = plan_projection["append_policy"]
+    if (
+        appended["source_start"] != base_source["size"]
+        or appended["source_end"] != source_wal["size"]
+        or appended["source_bytes"] != source_wal["size"] - base_source["size"]
+        or appended["derivative_start"] != base_derivative["size"]
+        or appended["derivative_end"] != derivative["size"]
+        or appended["derivative_bytes"]
+            != derivative["size"] - base_derivative["size"]
+        or appended["source_bytes"] != appended["derivative_bytes"]
+        or appended["source_bytes"] > policy["maximum_bytes"]
+        or frame_count > policy["maximum_frames"]
+        or source_snapshot["size"]
+            > value["snapshot_policy"]["maximum_size"]
+        or appended.get("sequence_delta") != policy["sequence_delta"]
+        or value.get("base_selected_frame_count")
+            != plan_projection["base_selected_frame_count"]
+        or value.get("selected_frame_count")
+            != plan_projection["base_selected_frame_count"] + frame_count
+        or require_uint(value.get("excluded_bytes"), f"{label} excluded bytes") < 0
+        or value.get("transform") != WAL_TRANSFORM_V2
+        or value.get("source_unchanged") is not True
+    ):
+        fail(f"{label} append/base accounting differs")
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    sequence_fields = (
+        "source_first_sequence", "source_last_sequence",
+        "derivative_first_sequence", "derivative_last_sequence",
+    )
+    if no_append:
+        if (
+            any(appended.get(key) is not None for key in sequence_fields)
+            or appended["source_sha256"] != empty_sha256
+            or appended["derivative_sha256"] != empty_sha256
+            or appended["source_bytes"] != 0
+        ):
+            fail(f"{label} empty append inventory differs")
+    else:
+        for key in sequence_fields:
+            require_uint(appended.get(key), f"{label} appended {key}")
+        if (
+            appended["source_bytes"] == 0
+            or appended["source_first_sequence"] != policy["source_first_sequence"]
+            or appended["derivative_first_sequence"]
+                != policy["derivative_first_sequence"]
+            or appended["source_last_sequence"]
+                != appended["source_first_sequence"] + frame_count - 1
+            or appended["derivative_last_sequence"]
+                != appended["derivative_first_sequence"] + frame_count - 1
+        ):
+            fail(f"{label} appended sequence accounting differs")
+    require_hash(value.get("semantic_stream_sha256"), f"{label} semantic stream")
+    return {
+        "source_wal": source_wal,
+        "source_snapshot": source_snapshot,
+        "derivative_wal": derivative,
+        "appended_suffix": dict(appended),
+        **plan_projection,
+    }
+
+
+def validate_durable_wal_boundary_plan(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "node", "schema", "selection_policy", "source_snapshot", "source_wal",
+    }:
+        fail(f"{label} fields differ")
+    if (
+        value.get("schema") != DURABLE_WAL_BOUNDARY_PLAN_SCHEMA
+        or value.get("node") != "sgp"
+        or value.get("selection_policy") != DURABLE_WAL_BOUNDARY_SELECTION_POLICY
+    ):
+        fail(f"{label} policy differs")
+    source_wal = validate_content_pin(value.get("source_wal"), f"{label} source WAL")
+    source_snapshot = value.get("source_snapshot")
+    if not isinstance(source_snapshot, dict) or set(source_snapshot) != {
+        "height", "sha256", "size", "state_root",
+    }:
+        fail(f"{label} source snapshot fields differ")
+    require_uint(source_snapshot.get("height"), f"{label} source snapshot height", positive=True)
+    require_hash(source_snapshot.get("sha256"), f"{label} source snapshot sha256")
+    require_uint(source_snapshot.get("size"), f"{label} source snapshot size", positive=True)
+    require_hash(source_snapshot.get("state_root"), f"{label} source snapshot state root")
+    return {"source_wal": source_wal, "source_snapshot": dict(source_snapshot)}
+
+
+def validate_durable_wal_boundary_capture(
+    value: Any, plan_sha256: Any, label: str
+) -> dict[str, Any]:
+    """Validate the content-addressed Rust SGP durable-boundary proof."""
+
+    plan_sha = require_hash(plan_sha256, f"{label} plan sha256")
+    if not isinstance(value, dict) or set(value) != {
+        "source_plan", "fixed_plan", "plan", "selected_boundary",
+        "preserved_source_snapshot", "replay_derived_snapshot",
+    }:
+        fail(f"{label} fields differ")
+    source_plan = validate_rust_input_identity(
+        value.get("source_plan"), f"{label} source plan"
+    )
+    fixed_plan = validate_rust_input_identity(
+        value.get("fixed_plan"), f"{label} fixed plan"
+    )
+    plan = value.get("plan")
+    plan_projection = validate_durable_wal_boundary_plan(
+        plan, f"{label} embedded plan"
+    )
+    preserved_snapshot = validate_rust_input_identity(
+        value.get("preserved_source_snapshot"),
+        f"{label} preserved source snapshot",
+    )
+    replay_snapshot = validate_rust_input_identity(
+        value.get("replay_derived_snapshot"),
+        f"{label} replay-derived snapshot",
+    )
+    selected_boundary = value.get("selected_boundary")
+    if not isinstance(selected_boundary, dict) or set(selected_boundary) != {
+        "height", "block_hash", "state_root", "checkpoint_sequence",
+    }:
+        fail(f"{label} selected boundary fields differ")
+    validate_head(
+        {
+            key: selected_boundary.get(key)
+            for key in ("height", "block_hash", "state_root")
+        },
+        f"{label} selected boundary",
+    )
+    require_uint(
+        selected_boundary.get("checkpoint_sequence"),
+        f"{label} selected checkpoint sequence",
+    )
+    plan_size = len(canonical_bytes(plan))
+    if (
+        digest(plan) != plan_sha
+        or source_plan["sha256"] != plan_sha
+        or source_plan["size"] != plan_size
+        or fixed_plan["sha256"] != plan_sha
+        or fixed_plan["size"] != plan_size
+    ):
+        fail(f"{label} plan content binding differs")
+    return {
+        "plan": dict(plan),
+        "plan_projection": plan_projection,
+        "source_plan": source_plan,
+        "fixed_plan": fixed_plan,
+        "selected_boundary": dict(selected_boundary),
+        "preserved_source_snapshot": preserved_snapshot,
+        "replay_derived_snapshot": replay_snapshot,
+    }
+
+
+def validate_sgp_persisted_head_v5(
+    value: Any, expected_plan_sha256: Any, label: str
+) -> dict[str, Any]:
+    """Validate the exact persisted SGP durable-WAL exception and its archive relation."""
+
+    expected_plan = require_hash(expected_plan_sha256, f"{label} expected plan")
+    fields = set(PERSISTED_LEGACY_HEAD_COMMON_FIELDS) | {"durable_wal_boundary"}
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{label} fields differ")
+    if (
+        value.get("schema") != PERSISTED_LEGACY_HEAD_SCHEMA_V5
+        or value.get("node") != "sgp"
+        or value.get("source_pair_role") != "post-quarantine-final-export"
+        or value.get("export_status") != "EXPORTED_UNSIGNED"
+        or value.get("rerun_reexecutes_export") is not True
+        or value.get("writer_stopped") is not True
+        or value.get("restart_barrier_active") is not True
+        or value.get("network_quarantine_active") is not True
+        or value.get("global_absence_claimed") is not False
+    ):
+        fail(f"{label} fixed policy differs")
+    require_commit(value.get("source_main_commit"), f"{label} source commit")
+    if not isinstance(value.get("boot_id"), str) or UUID_RE.fullmatch(value["boot_id"]) is None:
+        fail(f"{label} boot id differs")
+    for key in (
+        "capture_id", "freeze_plan_sha256", "inspector_binary_sha256",
+        "genesis_sha256", "validator_public_keys_sha256",
+        "legacy_validator_set_sha256", "final_source_capture_sha256",
+        "stop_after_round_receipt_sha256", "network_quarantine_receipt_sha256",
+        "stop_complete_sha256", "stop_files_sha256", "capture_complete_sha256",
+        "capture_files_sha256", "capture_source_sha256", "source_data_index_sha256",
+        "state_wal_sha256", "snapshot_sha256", "export_summary_sha256",
+        "inspect_summary_sha256", "wal_boundary_sha256", "candidate_checkpoint_sha256",
+    ):
+        require_hash(value.get(key), f"{label} {key}")
+    wal_size = require_uint(value.get("state_wal_size"), f"{label} WAL size", positive=True)
+    snapshot_size = require_uint(
+        value.get("snapshot_size"), f"{label} snapshot size", positive=True
+    )
+    require_uint(
+        value.get("candidate_checkpoint_size"), f"{label} checkpoint size", positive=True
+    )
+    head = validate_head(value.get("head"), f"{label} head")
+    if validate_head(value.get("selected_source_head"), f"{label} selected head") != head:
+        fail(f"{label} selected head differs")
+    parse_utc(value.get("completed_at"), f"{label} completion")
+    for key in ("snapshot_path", "state_wal_path"):
+        path = value.get(key)
+        if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+            fail(f"{label} {key} differs")
+
+    def compact_identity(candidate: Any, identity_label: str) -> dict[str, Any]:
+        identity_fields = {"device", "inode", "size", "mode"}
+        if not isinstance(candidate, dict) or set(candidate) != identity_fields:
+            fail(f"{identity_label} fields differ")
+        for key in identity_fields:
+            require_uint(candidate.get(key), f"{identity_label} {key}")
+        if candidate.get("inode") == 0:
+            fail(f"{identity_label} inode differs")
+        return dict(candidate)
+
+    source_identity = value.get("source_file_identity")
+    if not isinstance(source_identity, dict) or set(source_identity) != {"state_wal", "snapshot"}:
+        fail(f"{label} source-file identity fields differ")
+    source_wal_identity = compact_identity(
+        source_identity.get("state_wal"), f"{label} source WAL identity"
+    )
+    source_snapshot_identity = compact_identity(
+        source_identity.get("snapshot"), f"{label} source snapshot identity"
+    )
+    if source_wal_identity["size"] != wal_size or source_snapshot_identity["size"] != snapshot_size:
+        fail(f"{label} source-file size differs")
+
+    staged = value.get("staged_file_contract")
+    if not isinstance(staged, dict) or set(staged) != {
+        "state_wal", "snapshot", "ephemeral_inode_receipted",
+    } or staged.get("ephemeral_inode_receipted") is not False:
+        fail(f"{label} staged-file contract fields differ")
+    staged_fields = {"sha256", "size", "mode", "uid", "gid", "nlink"}
+    for key, expected_sha, expected_size in (
+        ("state_wal", value["state_wal_sha256"], wal_size),
+        ("snapshot", value["snapshot_sha256"], snapshot_size),
+    ):
+        item = staged.get(key)
+        if (
+            not isinstance(item, dict)
+            or set(item) != staged_fields
+            or item.get("sha256") != expected_sha
+            or item.get("size") != expected_size
+            or item.get("mode") != 0o100400
+            or item.get("uid") != 0
+            or item.get("gid") != 0
+            or item.get("nlink") != 1
+        ):
+            fail(f"{label} staged {key} differs")
+
+    export_contract = value.get("export_contract")
+    if not isinstance(export_contract, dict) or export_contract != {
+        "binary_path": "/proc/self/fd/8", "exit_code": 0,
+        "source_consensus_round": 0, "created_at_unix_ms": 0,
+        "recovery_epoch": 1, "validator_set_id": 1,
+        "allow_unbound_legacy_wal": True, "read_only": True,
+    }:
+        fail(f"{label} export contract differs")
+
+    wrapper = value.get("durable_wal_boundary")
+    if not isinstance(wrapper, dict) or set(wrapper) != {"plan_sha256", "capture"}:
+        fail(f"{label} durable WAL wrapper fields differ")
+    if wrapper.get("plan_sha256") != expected_plan:
+        fail(f"{label} durable WAL plan pin differs")
+    durable = validate_durable_wal_boundary_capture(
+        wrapper.get("capture"), expected_plan, f"{label} durable WAL capture"
+    )
+    plan_wal = durable["plan_projection"]["source_wal"]
+    plan_snapshot = durable["plan_projection"]["source_snapshot"]
+    selected = durable["selected_boundary"]
+    preserved = durable["preserved_source_snapshot"]
+    replay = durable["replay_derived_snapshot"]
+    if (
+        {key: selected[key] for key in ("height", "block_hash", "state_root")} != head
+        or plan_wal != {"sha256": value["state_wal_sha256"], "size": wal_size}
+        or preserved["sha256"] != plan_snapshot["sha256"]
+        or preserved["size"] != plan_snapshot["size"]
+        or replay["sha256"] != value["snapshot_sha256"]
+        or replay["size"] != snapshot_size
+        or (plan_snapshot["height"], plan_snapshot["state_root"])
+            == (head["height"], head["state_root"])
+    ):
+        fail(f"{label} durable WAL content relation differs")
+
+    archived = value.get("archived_final_wal")
+    archived_fields = {
+        "path", "sha256", "size", "file_identity", "source_relation",
+        "durable_wal_boundary_plan_sha256", "selected_prefix_bytes",
+        "selected_prefix_sha256", "post_capture_suffix_bytes",
+        "post_capture_suffix_sha256", "post_capture_suffix_classification",
+        "preserved_by",
+    }
+    if not isinstance(archived, dict) or set(archived) != archived_fields:
+        fail(f"{label} archived WAL fields differ")
+    archive_path = archived.get("path")
+    archive_size = require_uint(
+        archived.get("size"), f"{label} archived WAL size", positive=True
+    )
+    suffix_bytes = require_uint(
+        archived.get("post_capture_suffix_bytes"), f"{label} archived WAL suffix"
+    )
+    archive_identity = compact_identity(
+        archived.get("file_identity"), f"{label} archived WAL identity"
+    )
+    archive_sha = require_hash(
+        archived.get("sha256"), f"{label} archived WAL sha256"
+    )
+    if (
+        not isinstance(archive_path, str) or not archive_path.startswith("/")
+        or "\x00" in archive_path
+        or archive_identity["size"] != archive_size
+        or archived.get("source_relation")
+            != "exact-content-pinned-durable-wal-source-prefix"
+        or archived.get("durable_wal_boundary_plan_sha256") != expected_plan
+        or archived.get("selected_prefix_bytes") != wal_size
+        or archived.get("selected_prefix_sha256") != value["state_wal_sha256"]
+        or archive_size != wal_size + suffix_bytes
+        or archived.get("post_capture_suffix_classification")
+            != "durable_wal_boundary_from_content_pinned_archived_original"
+        or archived.get("preserved_by")
+            != "complete-content-indexed-stopped-legacy-source-v4"
+    ):
+        fail(f"{label} archived WAL relation differs")
+    suffix_sha = archived.get("post_capture_suffix_sha256")
+    if suffix_bytes == 0:
+        if suffix_sha is not None or archive_sha != value["state_wal_sha256"]:
+            fail(f"{label} archived WAL suffix hash differs")
+    elif require_hash(
+        suffix_sha, f"{label} archived WAL suffix sha256"
+    ) != suffix_sha:
+        fail(f"{label} archived WAL suffix hash differs")
+    return durable
+
+
 def validate_live_source_capture(
     value: Any,
     *,
@@ -320,13 +931,22 @@ def validate_live_source_capture(
     }
     schema = value.get("schema") if isinstance(value, dict) else None
     normalized = schema == NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA
+    durable = schema == DURABLE_LIVE_SOURCE_CAPTURE_SCHEMA
     if normalized:
         fields.add("wal_normalization")
+    if durable:
+        fields.add("durable_wal_boundary")
     if not isinstance(value, dict) or set(value) != fields:
         fail("live source capture fields differ")
     node = target.get("node")
     if (
-        schema not in {LIVE_SOURCE_CAPTURE_SCHEMA, NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA}
+        schema not in {
+            LIVE_SOURCE_CAPTURE_SCHEMA,
+            NORMALIZED_LIVE_SOURCE_CAPTURE_SCHEMA,
+            DURABLE_LIVE_SOURCE_CAPTURE_SCHEMA,
+        }
+        or (normalized and node not in {"lax", "ams"})
+        or (durable and node != "sgp")
         or (
             value.get("capture_id"), value.get("freeze_plan_sha256"),
             value.get("source_main_commit"), value.get("round_number"),
@@ -452,12 +1072,17 @@ def validate_live_source_capture(
         "source_wal_prefix", "source_snapshot", "genesis", "legacy_validator_set",
         "fixed_pair", "allow_unbound_legacy_wal",
     }
+    if durable:
+        rust_fields.add("durable_wal_boundary")
     if not isinstance(rust, dict) or set(rust) != rust_fields:
         fail("Rust live source capture fields differ")
-    if rust.get("schema") != RUST_SOURCE_CAPTURE_SCHEMA or rust.get("head") != head:
+    expected_rust_schema = (
+        RUST_DURABLE_SOURCE_CAPTURE_SCHEMA if durable else RUST_SOURCE_CAPTURE_SCHEMA
+    )
+    if rust.get("schema") != expected_rust_schema or rust.get("head") != head:
         fail("Rust live source capture head/schema differs")
-    if normalized and rust.get("allow_unbound_legacy_wal") is not True:
-        fail("normalized Rust live source did not use the explicit unbound-WAL policy")
+    if (normalized or durable) and rust.get("allow_unbound_legacy_wal") is not True:
+        fail("exceptional Rust live source did not use the explicit unbound-WAL policy")
     require_uint(rust.get("captured_at_unix_ms"), "Rust live capture timestamp", positive=True)
     validate_rust_input_identity(rust.get("source_data_dir"), "Rust source directory", directory=True)
     source_wal = rust.get("source_wal_prefix")
@@ -496,7 +1121,8 @@ def validate_live_source_capture(
         rust.get("legacy_validator_set"), "Rust legacy validator set"
     )
     if (
-        source_snapshot["sha256"] != rust.get("fixed_pair", {}).get("snapshot", {}).get("sha256")
+        (not durable and source_snapshot["sha256"]
+            != rust.get("fixed_pair", {}).get("snapshot", {}).get("sha256"))
         or genesis["sha256"] != value.get("genesis_sha256")
         or legacy["sha256"] != value.get("legacy_validator_set_sha256")
     ):
@@ -514,7 +1140,7 @@ def validate_live_source_capture(
         fixed.get("strict_replay") is not True
         or fixed_wal["sha256"] != source_wal["accepted_prefix_sha256"]
         or fixed_wal["size"] != source_wal["accepted_prefix_bytes"]
-        or fixed_snapshot["sha256"] != source_snapshot["sha256"]
+        or (not durable and fixed_snapshot["sha256"] != source_snapshot["sha256"])
     ):
         fail("Rust fixed pair is not the exact replayed source prefix/snapshot")
     if normalized:
@@ -532,60 +1158,123 @@ def validate_live_source_capture(
         normalization_receipt, _normalization_sha = validate_wrapper(
             normalization.get("receipt"), "legacy WAL normalization receipt"
         )
-        normalization_fields = {
-            "schema", "plan_sha256", "node", "source_wal", "source_snapshot",
-            "partition", "sequence_rewrites", "derivative_wal", "head",
-            "selected_frame_count", "excluded_bytes", "semantic_stream_sha256",
-            "transform", "source_unchanged",
-        }
+        normalization_schema = (
+            normalization_receipt.get("schema")
+            if isinstance(normalization_receipt, dict)
+            else None
+        )
+        if normalization_schema == WAL_NORMALIZATION_SCHEMA:
+            normalization_fields = {
+                "schema", "plan_sha256", "node", "source_wal", "source_snapshot",
+                "partition", "sequence_rewrites", "derivative_wal", "head",
+                "selected_frame_count", "excluded_bytes", "semantic_stream_sha256",
+                "transform", "source_unchanged",
+            }
+            if (
+                set(normalization_receipt) != normalization_fields
+                or normalization_receipt.get("plan_sha256") != plan_sha
+                or normalization_receipt.get("node") != node
+                or normalization_receipt.get("head") != head
+                or normalization_receipt.get("transform")
+                    != "copy-selected-runs-rewrite-sequence-and-crc32"
+                or normalization_receipt.get("source_unchanged") is not True
+                or not isinstance(normalization_receipt.get("partition"), list)
+                or not normalization_receipt.get("partition")
+                or not isinstance(normalization_receipt.get("sequence_rewrites"), list)
+            ):
+                fail("legacy WAL v1 normalization receipt identity differs")
+            validate_rust_input_identity(
+                normalization_receipt.get("source_wal"),
+                "legacy WAL v1 normalization source",
+            )
+            normalization_snapshot = validate_rust_input_identity(
+                normalization_receipt.get("source_snapshot"),
+                "legacy WAL v1 normalization snapshot",
+            )
+            derivative = validate_rust_input_identity(
+                normalization_receipt.get("derivative_wal"),
+                "legacy WAL v1 normalization derivative",
+            )
+            if (
+                normalization_snapshot["sha256"] != source_snapshot["sha256"]
+                or derivative["sha256"] != source_wal["accepted_prefix_sha256"]
+                or derivative["size"] != source_wal["accepted_prefix_bytes"]
+                or source_wal["quarantined_suffix_bytes_at_loader"] != 0
+                or source_wal["loader_tail_reason"] != "none"
+                or require_uint(
+                    normalization_receipt.get("selected_frame_count"),
+                    "legacy WAL v1 selected frame count",
+                    positive=True,
+                ) == 0
+                or require_uint(
+                    normalization_receipt.get("excluded_bytes"),
+                    "legacy WAL v1 excluded bytes",
+                ) < 0
+            ):
+                fail("v1 normalized derivative is not the exact strict Rust capture source")
+            require_hash(
+                normalization_receipt.get("semantic_stream_sha256"),
+                "legacy WAL v1 semantic stream",
+            )
+        elif normalization_schema == WAL_NORMALIZATION_SCHEMA_V2:
+            projection = validate_wal_normalization_v2_receipt(
+                normalization_receipt, "legacy WAL v2 normalization receipt"
+            )
+            derivative = projection["derivative_wal"]
+            normalization_snapshot = projection["source_snapshot"]
+            tail_bytes = source_wal["quarantined_suffix_bytes_at_loader"]
+            tail_reason = source_wal["loader_tail_reason"]
+            if (
+                normalization_receipt.get("plan_sha256") != plan_sha
+                or normalization_receipt.get("node") != node
+                or normalization_snapshot["sha256"] != source_snapshot["sha256"]
+                or normalization_snapshot["size"] != source_snapshot["size"]
+                or derivative["size"] != source_wal["loader_observed_bytes"]
+                or (tail_bytes == 0 and (
+                    tail_reason != "none"
+                    or derivative["sha256"] != source_wal["accepted_prefix_sha256"]
+                ))
+                or (tail_bytes > 0 and not tail_reason.startswith(
+                    "valid_entries_after_selected_snapshot_boundary:"
+                ))
+            ):
+                fail("v2 normalized derivative is not the exact Rust snapshot-bound source")
+        else:
+            fail("legacy WAL normalization receipt schema differs")
+    if durable:
+        wrapper = value.get("durable_wal_boundary")
+        if not isinstance(wrapper, dict) or set(wrapper) != {"plan_sha256"}:
+            fail("durable WAL boundary wrapper fields differ")
+        plan_sha = require_hash(wrapper.get("plan_sha256"), "durable WAL boundary plan")
+        durable_receipt = rust.get("durable_wal_boundary")
+        durable_projection = validate_durable_wal_boundary_capture(
+            durable_receipt, plan_sha, "Rust durable WAL boundary"
+        )
+        plan_projection = durable_projection["plan_projection"]
+        preserved_snapshot = durable_projection["preserved_source_snapshot"]
+        replay_snapshot = durable_projection["replay_derived_snapshot"]
+        selected_boundary = durable_projection["selected_boundary"]
+        plan_snapshot = plan_projection["source_snapshot"]
+        plan_wal = plan_projection["source_wal"]
         if (
-            not isinstance(normalization_receipt, dict)
-            or set(normalization_receipt) != normalization_fields
-            or normalization_receipt.get("schema") != WAL_NORMALIZATION_SCHEMA
-            or normalization_receipt.get("plan_sha256") != plan_sha
-            or normalization_receipt.get("node") != node
-            or normalization_receipt.get("head") != head
-            or normalization_receipt.get("transform")
-                != "copy-selected-runs-rewrite-sequence-and-crc32"
-            or normalization_receipt.get("source_unchanged") is not True
-            or not isinstance(normalization_receipt.get("partition"), list)
-            or not normalization_receipt.get("partition")
-            or not isinstance(normalization_receipt.get("sequence_rewrites"), list)
-        ):
-            fail("legacy WAL normalization receipt identity differs")
-        normalization_source = validate_rust_input_identity(
-            normalization_receipt.get("source_wal"),
-            "legacy WAL normalization source",
-        )
-        normalization_snapshot = validate_rust_input_identity(
-            normalization_receipt.get("source_snapshot"),
-            "legacy WAL normalization snapshot",
-        )
-        derivative = validate_rust_input_identity(
-            normalization_receipt.get("derivative_wal"),
-            "legacy WAL normalization derivative",
-        )
-        if (
-            normalization_snapshot["sha256"] != source_snapshot["sha256"]
-            or derivative["sha256"] != source_wal["accepted_prefix_sha256"]
-            or derivative["size"] != source_wal["accepted_prefix_bytes"]
+            selected_boundary.get("height") != head["height"]
+            or selected_boundary.get("block_hash") != head["block_hash"]
+            or selected_boundary.get("state_root") != head["state_root"]
+            or (plan_snapshot["height"], plan_snapshot["state_root"])
+                == (head["height"], head["state_root"])
+            or plan_wal["sha256"] != source_wal["accepted_prefix_sha256"]
+            or plan_wal["size"] != source_wal["accepted_prefix_bytes"]
+            or source_wal["loader_observed_bytes"] != source_wal["accepted_prefix_bytes"]
             or source_wal["quarantined_suffix_bytes_at_loader"] != 0
             or source_wal["loader_tail_reason"] != "none"
-            or require_uint(
-                normalization_receipt.get("selected_frame_count"),
-                "legacy WAL selected frame count",
-                positive=True,
-            ) == 0
-            or require_uint(
-                normalization_receipt.get("excluded_bytes"),
-                "legacy WAL excluded bytes",
-            ) < 0
+            or plan_snapshot["sha256"] != source_snapshot["sha256"]
+            or plan_snapshot["size"] != source_snapshot["size"]
+            or preserved_snapshot["sha256"] != source_snapshot["sha256"]
+            or preserved_snapshot["size"] != source_snapshot["size"]
+            or replay_snapshot != fixed_snapshot
+            or rust.get("allow_unbound_legacy_wal") is not True
         ):
-            fail("normalized derivative is not the exact strict Rust capture source")
-        require_hash(
-            normalization_receipt.get("semantic_stream_sha256"),
-            "legacy WAL semantic stream",
-        )
+            fail("durable WAL boundary content proof differs")
     del rust_sha
     started = parse_utc(value.get("capture_started_at"), "live source capture start")
     completed = parse_utc(value.get("capture_completed_at"), "live source capture completion")

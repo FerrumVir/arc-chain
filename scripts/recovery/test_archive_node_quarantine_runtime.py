@@ -17,6 +17,7 @@ import pathlib
 import re
 import socket
 import sys
+import tempfile
 import unittest
 
 
@@ -51,7 +52,7 @@ def helper_source(source: str) -> str:
 def live_capture_source() -> str:
     text = SCRIPT.read_text(encoding="utf-8")
     function = text.index("capture_live_legacy_source()")
-    start = text.index("\nimport datetime\n", function) + 1
+    start = text.index("\nimport base64\n", function) + 1
     end = text.index("\nPY\n}", start)
     return text[start:end]
 
@@ -233,25 +234,100 @@ class EmbeddedProgramTests(unittest.TestCase):
         compile(self.helper, "archive-node-pinned-helper", "exec")
         compile(self.live_capture, "archive-node-live-source-capture", "exec")
 
+    def test_prefix_reproof_rejects_path_rotation_after_held_fd_open(self) -> None:
+        def fail(message: str) -> None:
+            raise RuntimeError(message)
+
+        sources = {
+            "current_append_only_prefix": self.live_capture,
+            "reprove_capture_prefix": self.outer,
+            "reprove_final_prefix": self.outer,
+        }
+        for name, source in sources.items():
+            with self.subTest(function=name), tempfile.TemporaryDirectory() as raw:
+                function = next(
+                    node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.FunctionDef) and node.name == name
+                )
+                root = pathlib.Path(raw)
+                path = root / "state.wal"
+                moved = root / "state.wal.rotated"
+                content = b"durable-prefix" * 64
+                path.write_bytes(content)
+                details = path.stat()
+                expected = {
+                    "device": details.st_dev, "inode": details.st_ino,
+                    "mode": details.st_mode, "uid": details.st_uid,
+                    "gid": details.st_gid, "nlink": details.st_nlink,
+                    "size": len(content), "mtime_ns": details.st_mtime_ns,
+                    "ctime_ns": details.st_ctime_ns,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+
+                class RotatingOs:
+                    O_RDONLY = os.O_RDONLY
+                    O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+                    def __init__(self) -> None:
+                        self.rotated = False
+
+                    def __getattr__(self, attribute: str):
+                        return getattr(os, attribute)
+
+                    def pread(self, descriptor: int, size: int, offset: int) -> bytes:
+                        chunk = os.pread(descriptor, size, offset)
+                        if not self.rotated:
+                            self.rotated = True
+                            os.replace(path, moved)
+                            path.write_bytes(content)
+                            os.chmod(path, details.st_mode & 0o777)
+                        return chunk
+
+                namespace = {
+                    "os": RotatingOs(), "pathlib": pathlib,
+                    "stat": __import__("stat"), "hashlib": hashlib,
+                    "HASH_RE": re.compile(r"[0-9a-f]{64}"), "fail": fail,
+                }
+                exec(
+                    compile(
+                        ast.Module(body=[function], type_ignores=[]),
+                        f"{name}-rotation", "exec",
+                    ),
+                    namespace,
+                )
+                arguments = (
+                    (path, expected, details.st_mode & 0o777, "test WAL")
+                    if name == "reprove_capture_prefix"
+                    else (path, expected, "test WAL")
+                )
+                with self.assertRaisesRegex(RuntimeError, "reviewed prefix changed"):
+                    namespace[name](*arguments)
+
     def test_normalized_capture_precedes_rust_inspection_and_binds_both_wals(self) -> None:
         source = self.live_capture
-        normalize_at = source.index("normalized=subprocess.run(normalize_command")
-        rust_capture_at = source.index("result=subprocess.run(capture_command", normalize_at)
+        normalize_at = source.index(
+            'normalized=run_recorded(normalize_command,"wal-normalizer",600)'
+        )
+        rust_capture_at = source.index(
+            'result=run_recorded(capture_command,"legacy-source-inspector",240)',
+            normalize_at,
+        )
         seal_at = source.index('create(attempt/"receipt.json",raw)', rust_capture_at)
         self.assertLess(normalize_at, rust_capture_at)
         self.assertLess(rust_capture_at, seal_at)
         for required in (
             'capture_data_dir=normalized_source',
-            'current_identity(data_dir/"state.wal",receipt.get("source_wal")',
+            'current_append_only_prefix(data_dir/"state.wal",receipt.get("source_wal")',
             'current_identity(normalized/"state.wal",receipt.get("derivative_wal")',
-            'source_prefix.get("quarantined_suffix_bytes_at_loader")!=0',
-            '!=normalization_receipt["head"]["state_root"]',
+            'tail_bytes!=loader_bytes-accepted_bytes',
+            '"arc.recovery.legacy-wal-normalization.v2"',
         ):
             self.assertIn(required, source)
 
-    def test_v3_and_v4_persisted_heads_bind_the_durable_dag_cursor(self) -> None:
+    def test_v3_v4_and_v5_persisted_heads_bind_the_durable_dag_cursor(self) -> None:
         self.assertIn("capture-live-source)", self.shell)
         self.assertIn("capture-normalized-live-source)", self.shell)
+        self.assertIn("capture-durable-wal-live-source)", self.shell)
         self.assertIn("wal-normalizer) filename=normalize-legacy-wal.py; mode=500", self.shell)
         self.assertIn(
             "wal-normalization-plan) filename=legacy-wal-normalization-plan.json; mode=400",
@@ -259,6 +335,14 @@ class EmbeddedProgramTests(unittest.TestCase):
         )
         self.assertIn("arc.recovery.persisted-legacy-head.v3", self.shell)
         self.assertIn("arc.recovery.persisted-legacy-head.v4", self.shell)
+        self.assertIn("arc.recovery.persisted-legacy-head.v5", self.shell)
+        self.assertEqual(
+            self.fleet.count("rounds.validate_sgp_persisted_head_v5("), 2
+        )
+        self.assertIn(
+            "durable-wal-boundary-plan) filename=durable-wal-boundary-plan.json; mode=400",
+            self.shell,
+        )
         self.assertIn("recovery inspect-legacy-dag-round", self.shell)
         self.assertIn('"legacy_dag_round"', self.shell)
         self.assertIn('"inspection": dag_inspection', self.shell)
@@ -271,6 +355,19 @@ class EmbeddedProgramTests(unittest.TestCase):
         )
         self.assertIn('"legacy_dag_wal_dir"', self.shell)
         self.assertIn("exact-content-pinned-normalization-source", self.shell)
+
+    def test_live_capture_persists_bounded_child_process_diagnostics(self) -> None:
+        source = self.live_capture
+        self.assertIn(
+            '"schema":"arc.recovery.live-source-child-process.v1"', source
+        )
+        self.assertIn('prefix=raw[:64*1024]', source)
+        self.assertIn('"prefix_base64":base64.b64encode(prefix)', source)
+        self.assertIn('create(attempt/f"{stage}.process.json",canonical(evidence))', source)
+        self.assertIn(
+            'run_recorded(inspect_command,f"ancestry-{label}-inspector",240)', source
+        )
+        self.assertIn('except subprocess.TimeoutExpired as error:', source)
 
     def test_fleet_stages_normalization_only_for_lax_and_ams(self) -> None:
         self.assertIn('case "$node" in\n        lax)', self.fleet)
