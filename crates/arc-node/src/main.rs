@@ -503,6 +503,13 @@ enum RecoveryCommand {
         #[arg(long, default_value_t = false)]
         allow_unbound_legacy_wal: bool,
     },
+    /// Derive the exact durable legacy DAG cursor from a stopped, immutable
+    /// segmented WAL. This never starts a node, opens a listener, or writes
+    /// the source namespace.
+    InspectLegacyDagRound {
+        #[arg(long)]
+        dag_wal_dir: String,
+    },
     /// Materialize and strictly replay-validate the exact WAL prefix committed
     /// by a live `/sync/snapshot` capture.  The source directory is read-only;
     /// OUTPUT_DATA_DIR is create-only and contains an immutable snapshot/WAL
@@ -912,6 +919,20 @@ struct LegacySourceCaptureReceipt {
     allow_unbound_legacy_wal: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryLegacyDagSegment {
+    name: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct RecoveryLegacyDagNamespace {
+    schema: String,
+    segment_names: Vec<String>,
+    inspected_tail: Vec<RecoveryLegacyDagSegment>,
+}
+
 /// Stable no-follow metadata identity projected in
 /// `(device, inode, mode, uid, gid, nlink, mtime_ns, ctime_ns)` order.
 type RecoveryMetadataProjection = (u64, u64, u32, u32, u32, u64, i64, i64);
@@ -1061,6 +1082,163 @@ fn recovery_directory_input(metadata: &std::fs::Metadata) -> Result<RecoveryRead
         mtime_ns: projection.6,
         ctime_ns: projection.7,
     })
+}
+
+fn recovery_legacy_dag_segment_names(directory: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed to enumerate legacy DAG WAL {}", directory.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("failed to enumerate an entry in {}", directory.display()))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("legacy DAG WAL contains a non-UTF-8 entry"))?;
+        if !(name.starts_with("wal-") && name.ends_with(".bin")) {
+            continue;
+        }
+        let digits = name
+            .strip_prefix("wal-")
+            .and_then(|value| value.strip_suffix(".bin"))
+            .expect("prefix and suffix checked");
+        ensure!(
+            digits.len() == 8 && digits.bytes().all(|byte| byte.is_ascii_digit()),
+            "legacy DAG WAL segment name is noncanonical: {name}"
+        );
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn build_legacy_dag_round_inspection(dag_wal_dir: &str) -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+
+    let requested = Path::new(dag_wal_dir);
+    let path_metadata = std::fs::symlink_metadata(requested)
+        .with_context(|| format!("failed to stat legacy DAG WAL {dag_wal_dir}"))?;
+    ensure!(
+        path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
+        "legacy DAG WAL is not a regular no-follow directory"
+    );
+    let handle = arc_crypto::secret_file::open_owned_nofollow_directory(requested)
+        .with_context(|| format!("failed to no-follow open legacy DAG WAL {dag_wal_dir}"))?;
+    let open_metadata = handle
+        .metadata()
+        .context("failed to inspect open legacy DAG WAL directory")?;
+    let directory_projection = recovery_metadata_projection(&open_metadata)?;
+    ensure!(
+        directory_projection == recovery_metadata_projection(&path_metadata)?,
+        "legacy DAG WAL directory pathname changed before its no-follow open"
+    );
+    ensure!(
+        directory_projection.2 & 0o022 == 0,
+        "legacy DAG WAL directory is group/world writable"
+    );
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let pinned_directory = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let pinned_directory = requested.to_path_buf();
+
+    let names_before = recovery_legacy_dag_segment_names(&pinned_directory)?;
+    ensure!(
+        !names_before.is_empty(),
+        "legacy DAG WAL contains no segments"
+    );
+    let inspection = arc_state::wal::inspect_wal_dir_tail_strict(&pinned_directory)
+        .context("legacy DAG WAL tail failed strict replay")?;
+    ensure!(
+        inspection.source_consensus_round > 0 && inspection.inspected_entry_count > 0,
+        "legacy DAG WAL has no durable positive consensus cursor"
+    );
+    ensure!(
+        inspection.segment_count == u64::try_from(names_before.len())?,
+        "legacy DAG WAL segment count changed during strict replay"
+    );
+    let inspected_count = usize::try_from(inspection.inspected_segment_count)
+        .context("legacy DAG WAL inspected segment count exceeds usize")?;
+    ensure!(
+        inspected_count > 0 && inspected_count <= names_before.len(),
+        "legacy DAG WAL inspected tail is malformed"
+    );
+    let inspected_names = &names_before[names_before.len() - inspected_count..];
+    let mut identities = Vec::with_capacity(inspected_names.len());
+    let mut content = Vec::with_capacity(inspected_names.len());
+    for name in inspected_names {
+        let identity = recovery_read_only_input(
+            &pinned_directory.join(name),
+            &format!("legacy DAG WAL segment {name}"),
+        )?;
+        ensure!(
+            identity.mode & 0o022 == 0,
+            "legacy DAG WAL segment {name} is group/world writable"
+        );
+        content.push(RecoveryLegacyDagSegment {
+            name: name.clone(),
+            sha256: identity.sha256.clone(),
+            size: identity.size,
+        });
+        identities.push(identity);
+    }
+    let namespace = RecoveryLegacyDagNamespace {
+        schema: "arc.recovery.legacy-dag-wal-namespace.v1".to_string(),
+        segment_names: names_before.clone(),
+        inspected_tail: content,
+    };
+    // Hash the same key-sorted JSON Value that is emitted below.  Consumers
+    // can therefore reproduce the root from the embedded object without
+    // depending on Rust struct field declaration order.
+    let namespace_value = serde_json::to_value(&namespace)?;
+    let namespace_bytes = serde_json::to_vec(&namespace_value)?;
+    let namespace_sha256 = hex::encode(Sha256::digest(&namespace_bytes));
+
+    ensure!(
+        names_before == recovery_legacy_dag_segment_names(&pinned_directory)?,
+        "legacy DAG WAL namespace changed during inspection"
+    );
+    for (name, before) in inspected_names.iter().zip(&identities) {
+        ensure!(
+            *before
+                == recovery_read_only_input(
+                    &pinned_directory.join(name),
+                    &format!("legacy DAG WAL segment {name} final recheck"),
+                )?,
+            "legacy DAG WAL segment {name} changed during inspection"
+        );
+    }
+    ensure!(
+        directory_projection == recovery_metadata_projection(&handle.metadata()?)?
+            && directory_projection
+                == recovery_metadata_projection(&std::fs::symlink_metadata(requested)?)?,
+        "legacy DAG WAL directory changed during inspection"
+    );
+
+    let output = serde_json::json!({
+        "schema": "arc.recovery.legacy-dag-round-inspection.v1",
+        "status": "VERIFIED_STOPPED_DAG_CURSOR",
+        "source_consensus_round": inspection.source_consensus_round,
+        "first_segment": inspection.first_segment,
+        "last_segment": inspection.last_segment,
+        "segment_count": inspection.segment_count,
+        "inspected_first_segment": inspection.inspected_first_segment,
+        "inspected_segment_count": inspection.inspected_segment_count,
+        "inspected_entry_count": inspection.inspected_entry_count,
+        "namespace_sha256": namespace_sha256,
+        "namespace": namespace_value,
+        "read_only": true,
+    });
+    Ok(output)
+}
+
+fn inspect_legacy_dag_round(dag_wal_dir: &str) -> Result<()> {
+    let output = build_legacy_dag_round_inspection(dag_wal_dir)?;
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
 }
 
 fn recovery_copy_input_create_new(
@@ -3035,17 +3213,11 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 data_dir_metadata.is_dir() && !data_dir_metadata.file_type().is_symlink(),
                 "legacy data directory is not a regular no-follow directory"
             );
-            let mut directory_options = OpenOptions::new();
-            directory_options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                directory_options
-                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-            }
-            let data_dir_handle = directory_options
-                .open(data_dir_path)
-                .with_context(|| format!("failed to no-follow open data directory {data_dir}"))?;
+            let data_dir_handle =
+                arc_crypto::secret_file::open_owned_nofollow_directory(data_dir_path)
+                    .with_context(|| {
+                        format!("failed to no-follow open data directory {data_dir}")
+                    })?;
             let data_dir_open_metadata = data_dir_handle
                 .metadata()
                 .context("failed to inspect open legacy data directory")?;
@@ -3195,6 +3367,9 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
             println!("{}", serde_json::to_string(&output)?);
             Ok(())
         }
+        RecoveryCommand::InspectLegacyDagRound { dag_wal_dir } => {
+            inspect_legacy_dag_round(&dag_wal_dir)
+        }
         RecoveryCommand::CaptureLegacySource {
             data_dir,
             snapshot,
@@ -3235,17 +3410,11 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 data_dir_metadata.is_dir() && !data_dir_metadata.file_type().is_symlink(),
                 "legacy data directory is not a regular no-follow directory"
             );
-            let mut directory_options = OpenOptions::new();
-            directory_options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                directory_options
-                    .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
-            }
-            let data_dir_handle = directory_options
-                .open(data_dir_path)
-                .with_context(|| format!("failed to no-follow open data directory {data_dir}"))?;
+            let data_dir_handle =
+                arc_crypto::secret_file::open_owned_nofollow_directory(data_dir_path)
+                    .with_context(|| {
+                        format!("failed to no-follow open data directory {data_dir}")
+                    })?;
             let data_dir_open_metadata = data_dir_handle
                 .metadata()
                 .context("failed to inspect open legacy data directory")?;
@@ -8037,6 +8206,65 @@ mod tests {
             .is_err(),
             "floating recovery inputs must not parse"
         );
+    }
+
+    #[test]
+    fn inspect_legacy_dag_round_cli_requires_an_explicit_directory() {
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "recovery",
+            "inspect-legacy-dag-round",
+            "--dag-wal-dir",
+            "/stopped/arc-data/dag-wal",
+        ])
+        .expect("stopped legacy DAG inspection should parse");
+        let Some(OperatorCommand::Recovery {
+            command: RecoveryCommand::InspectLegacyDagRound { dag_wal_dir },
+        }) = cli.operator_command
+        else {
+            panic!("wrong operator command parsed")
+        };
+        assert_eq!(dag_wal_dir, "/stopped/arc-data/dag-wal");
+        assert!(
+            Cli::try_parse_from(["arc-node", "recovery", "inspect-legacy-dag-round"]).is_err(),
+            "a floating legacy DAG namespace must not parse"
+        );
+    }
+
+    #[test]
+    fn legacy_dag_round_inspection_root_is_reproducible_from_embedded_namespace() {
+        use sha2::{Digest, Sha256};
+
+        let dag_wal = std::env::temp_dir().join(format!(
+            "arc-legacy-dag-inspection-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dag_wal).unwrap();
+        {
+            let writer = arc_state::WalWriter::with_segments(&dag_wal, 1024).unwrap();
+            for round in 1..=64 {
+                writer.append(arc_state::WalOp::Checkpoint(Hash256::ZERO), round);
+            }
+            writer.sync().unwrap();
+        }
+
+        let value = build_legacy_dag_round_inspection(dag_wal.to_str().unwrap()).unwrap();
+        assert_eq!(value["status"], "VERIFIED_STOPPED_DAG_CURSOR");
+        assert_eq!(value["source_consensus_round"], 64);
+        let namespace_bytes = serde_json::to_vec(&value["namespace"]).unwrap();
+        assert_eq!(
+            value["namespace_sha256"],
+            hex::encode(Sha256::digest(namespace_bytes))
+        );
+        assert_eq!(
+            value["namespace"]["inspected_tail"]
+                .as_array()
+                .unwrap()
+                .len(),
+            value["inspected_segment_count"].as_u64().unwrap() as usize
+        );
+
+        std::fs::remove_dir_all(dag_wal).unwrap();
     }
 
     #[test]

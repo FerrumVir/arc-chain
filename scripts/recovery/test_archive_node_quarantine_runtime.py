@@ -249,7 +249,7 @@ class EmbeddedProgramTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_v1_and_v2_dispatch_are_additive(self) -> None:
+    def test_v3_and_v4_persisted_heads_bind_the_durable_dag_cursor(self) -> None:
         self.assertIn("capture-live-source)", self.shell)
         self.assertIn("capture-normalized-live-source)", self.shell)
         self.assertIn("wal-normalizer) filename=normalize-legacy-wal.py; mode=500", self.shell)
@@ -257,7 +257,19 @@ class EmbeddedProgramTests(unittest.TestCase):
             "wal-normalization-plan) filename=legacy-wal-normalization-plan.json; mode=400",
             self.shell,
         )
-        self.assertIn("arc.recovery.persisted-legacy-head.v2", self.shell)
+        self.assertIn("arc.recovery.persisted-legacy-head.v3", self.shell)
+        self.assertIn("arc.recovery.persisted-legacy-head.v4", self.shell)
+        self.assertIn("recovery inspect-legacy-dag-round", self.shell)
+        self.assertIn('"legacy_dag_round"', self.shell)
+        self.assertIn('"inspection": dag_inspection', self.shell)
+        self.assertIn('sha(canonical(dag_inspection))', self.shell)
+        self.assertIn('"trusted_anchor_ancestry"', self.shell)
+        self.assertIn('"valid_anchor_descendant"', self.shell)
+        self.assertIn('"below_trusted_anchor"', self.shell)
+        self.assertIn(
+            "arc.recovery.persisted-legacy-head-stopped-precommit.v2", self.shell
+        )
+        self.assertIn('"legacy_dag_wal_dir"', self.shell)
         self.assertIn("exact-content-pinned-normalization-source", self.shell)
 
     def test_fleet_stages_normalization_only_for_lax_and_ams(self) -> None:

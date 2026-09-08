@@ -15,6 +15,7 @@ ROLLOUT="$REPO_ROOT/docs/VALIDATOR-FLEET-ROLLOUT.md"
 RECOVERY_README="$REPO_ROOT/scripts/recovery/README.md"
 OWNER_EMERGENCY_HELPER="$REPO_ROOT/scripts/recovery/owner-emergency-recovery.py"
 OWNER_EMERGENCY_SCHEMA="$REPO_ROOT/scripts/recovery/owner-emergency-recovery.schema.json"
+OWNER_EMERGENCY_WORKFLOW="$REPO_ROOT/.github/workflows/owner-emergency-recovery-approval.yml"
 ARCHIVE_TOOL="$REPO_ROOT/scripts/recovery/archive-fleet-to-drive.sh"
 DRIVE_PREFREEZE_GATE="$REPO_ROOT/scripts/recovery/verify-drive-prefreeze.sh"
 DRIVE_IDENTITY_HELPER="$REPO_ROOT/scripts/recovery/drive-account-identity.py"
@@ -673,6 +674,17 @@ hardened_canary_and_vault_commands_match_current_parsers() {
             'signing-key backup runbook omits its encrypted-at-rest staging boundary' \
             || return 1
     done
+    for literal in \
+        'commands below assume that `HOME` is protected by FileVault' \
+        'FileVault-disabled operator host' \
+        'dedicated encrypted APFS sparsebundle boundary' \
+        '`HOME`, `TMPDIR`, and' \
+        '`RUNNER_TEMP`'
+    do
+        require_literal "$CANARY_RUNBOOK" "$literal" \
+            'macOS canary runbook omits its encrypted-at-rest boundary' \
+            || return 1
+    done
     help="$(python3 "$CANARY_HELPER" plan --help)" || return 1
     for option in \
         --raw-actions-zip --model --expected-commit --expected-run-id \
@@ -936,9 +948,11 @@ required_embedded_python = {
     "legacy validator-set installer":
         '"$legacy_source" "$legacy_validator_set" <<\'PY\'',
     "reference snapshot/WAL verifier":
-        '"$reference_pair" "$reference_block_height" <<\'PY\'',
+        '"$reference_snapshot_size" "$reference_snapshot_sha256" <<\'PY\'',
     "final macOS artifact handoff builder":
         '"$pretag_run_attempt" <<\'PY\'',
+    "native macOS encrypted mount verifier":
+        '"$(/usr/bin/id -u)" <<\'PY\'',
     "native macOS handoff extractor":
         '"$ARC_MACOS_PROTECTED_MAIN_SHA" <<\'PY\'',
     "historical macOS canary root verifier":
@@ -1157,17 +1171,20 @@ require(
     '--receipt-output /secure/operator/VALIDATOR-KEY-INSTALL-RECEIPT.json',
 )
 require(
-    export[1], "reference_pair=/secure/operator/reference-pair",
-    '"state.snapshot.lz4"', "1_160_246",
-    "ecb4e39d45e6711cffcd78183851587e4deb37ad63163f541ef6c1f821a4ce47",
-    '"state.wal"', "83_385_625",
-    "3820e112af1684567f0336abe73ae9aafc4228d0e02a5fccb1ff32f64dfed44c",
-    '"latest.json"',
-    "0c9bcafd99375de7e3167c271350279c4d267dd9cf91de37aa830a2b817f80af",
-    '"snapshot-info.json"',
-    "98f327fb9c4405cd0f6e7c31052d571a024738df5bf6987ad78d9b1ba5856b49",
-    'read_locked(root_fd, "SHA256SUMS", 324)',
-    "reference_source_consensus_round=9774808", "reference_block_height=137145",
+    export[1], "canonical_source_preselection=/secure/operator/canonical-source-preselection.json",
+    "scripts/recovery/build-production-manifest.py select-source",
+    '--legacy-maintenance-evidence-bundle "$legacy_maintenance_evidence_bundle"',
+    '--legacy-maintenance-boundary "$legacy_maintenance_boundary"',
+    '--output "$canonical_source_preselection"',
+    "reference_source_consensus_round=\"$(/usr/bin/jq -er",
+    "reference_block_height=\"$(/usr/bin/jq -er",
+    'test "$transition_height" -eq "$((reference_block_height + 1))"',
+    'test "$reference_block_height" -le "$observed_cutoff_height"',
+    'test "$reopening_floor_height" -eq "$((observed_cutoff_height + 128))"',
+    'reference_pair="$(/usr/bin/mktemp -d',
+    '"$scp_tool" -q -B -i "$ssh_identity"',
+    '"state.wal": (int(sys.argv[2]), sys.argv[3])',
+    '"state.snapshot.lz4": (int(sys.argv[4]), sys.argv[5])',
     "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
     "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
     '"$arc_node_linux" recovery export',
@@ -1178,6 +1195,9 @@ require(
 )
 require_order(
     export[1],
+    "scripts/recovery/build-production-manifest.py select-source",
+    'reference_pair="$(/usr/bin/mktemp -d',
+    '"$scp_tool" -q -B -i "$ssh_identity"',
     'candidate_attempt_root="$(',
     '"$arc_node_linux" recovery export',
     'chmod 0400 "$candidate_attempt"',
@@ -1212,9 +1232,19 @@ require(
     "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'",
     'case "$ARC_MACOS_PROTECTED_CHECKOUT" in /*)',
     "ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'",
-    'ARC_MACOS_FINAL_INPUT_ROOT="$HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
-    'ARC_MACOS_OLD_CANARY_ROOT="$HOME/.arc-pretag-community-canary"',
-    'ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    "ARC_MACOS_SECURE_IMAGE='<absolute pre-provisioned encrypted APFS sparsebundle path>'",
+    "ARC_MACOS_SECURE_HOME='<absolute mounted APFS canary home path>'",
+    'arc_require_macos_secure_canary_mount() {',
+    'image.get("image-encrypted") is not True',
+    'image.get("image-type") != "sparse bundle disk image"',
+    'disk.get("FilesystemType") != "apfs"',
+    'disk.get("DeviceNode") != mounts[0].get("dev-entry")',
+    'ARC_MACOS_FINAL_INPUT_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-input-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'ARC_MACOS_OLD_CANARY_ROOT="$ARC_MACOS_USER_HOME/.arc-pretag-community-canary"',
+    'ARC_MACOS_FINAL_CANARY_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'ARC_MACOS_PRIVATE_TMP="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-tmp-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
+    'HOME="$ARC_MACOS_SECURE_HOME"', 'TMPDIR="$ARC_MACOS_PRIVATE_TMP"',
+    'RUNNER_TEMP="$ARC_MACOS_PRIVATE_TMP"',
     'macos_final_handoff_guest="/var/tmp/arc-macos-final-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
     '"$ARC_OPERATOR_LIMA_INSTANCE:$macos_final_handoff_guest/headless-macos-arm64-actions.zip"',
     '"schema", "repository", "commit", "run_id", "run_attempt"',
@@ -1224,19 +1254,28 @@ require(
     '"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"',
     'test "$old_canary_status_rc" -eq 3',
     '/usr/sbin/lsof -nP -a -iTCP:19944 -sTCP:LISTEN',
-    '"$macos_canary_helper" plan',
-    '"$macos_canary_helper" install',
-    '"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'macos_final_model="$ARC_MACOS_FINAL_INPUT_ROOT/llama-2-7b-chat.Q4_K_M.gguf"',
+    '/bin/cp -p "$macos_old_model" "$macos_final_model"',
+    'macos_final_model_destination="$ARC_MACOS_FINAL_CANARY_ROOT/model/llama-2-7b-chat.Q4_K_M.gguf"',
+    '/bin/mv "$macos_final_model" "$macos_final_model_destination"',
+    'macos_final_model="$macos_final_model_destination"',
+    'arc_macos_secure_canary plan',
+    'arc_macos_secure_canary install',
+    'arc_macos_secure_canary start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
     'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"',
     '"artifact_digest": artifact_digest', '"archive_sha256": archive_sha256',
     'final macOS acceptance does not bind the exact root/artifact tuple',
-    'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"',
+    'ARC_CANARY_TRANSFER_PARENT="$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer"',
     'ARC_CANARY_TRANSFER_ROOT="$ARC_CANARY_TRANSFER_PARENT/v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"',
     'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
     '"$ARC_LIMACTL" copy --backend=scp',
 )
+if macos_transfer[1].count('--model "$macos_final_model"') != 2:
+    raise SystemExit("final canary does not use its encrypted model input exactly twice")
+if '--model "$macos_old_model"' in macos_transfer[1]:
+    raise SystemExit("final canary still consumes the model directly from unencrypted real HOME")
 require_order(
     macos_transfer[1],
     '"$ARC_LIMACTL" copy --backend=scp',
@@ -1244,11 +1283,13 @@ require_order(
     '"$macos_canary_helper" stop --root "$ARC_MACOS_OLD_CANARY_ROOT"',
     '"$macos_canary_helper" cleanup --root "$ARC_MACOS_OLD_CANARY_ROOT"',
     'test "$old_canary_status_rc" -eq 3',
-    '"$macos_canary_helper" plan',
-    '"$macos_canary_helper" install',
-    '"$macos_canary_helper" start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
-    '"$macos_canary_helper" accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    '/bin/cp -p "$macos_old_model" "$macos_final_model"',
+    'arc_macos_secure_canary plan',
+    '/bin/mv "$macos_final_model" "$macos_final_model_destination"',
+    'arc_macos_secure_canary install',
+    'arc_macos_secure_canary start --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary status --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
+    'arc_macos_secure_canary accept --root "$ARC_MACOS_FINAL_CANARY_ROOT"',
     'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"',
     'lima_canary_drop_root=/var/tmp/arc-macos-canary-import-v0.8.0',
 )
@@ -1300,6 +1341,7 @@ require(
     '"$ARC_RECOVERY_PYTHON_PATH" -I scripts/recovery/build-production-manifest.py prearchive',
     'production_stage_root=/secure/operator/production-input-stage-v0.8.0',
     '--stage-root "$production_stage_root"',
+    '--canonical-source-preselection "$canonical_source_preselection"',
     '--source-snapshot "$reference_pair/state.snapshot.lz4"',
     '--source-wal "$reference_pair/state.wal"',
     'prearchive_existing=0', 'elif [ "$prearchive_existing" = 3 ]; then',
@@ -1820,15 +1862,15 @@ PY
     for literal in \
         'first of two **native macOS shell** blocks' \
         'Lima root shell open and untouched' \
-        '$HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>' \
+        '$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer/v0.8.0-<protected-main-sha>' \
         '# BEGIN LIMA FINAL MACOS CANARY HANDOFF STAGE' \
         'arc.recovery.macos-final-canary-handoff.v1' \
         '# BEGIN NATIVE MACOS CANARY TRANSFER' \
         "ARC_MACOS_PROTECTED_CHECKOUT='<absolute protected-main checkout on the canary Mac>'" \
         "ARC_MACOS_OLD_CANARY_SHA='c5ca31acecd0a48dd49c9236040dda442abe29a8'" \
-        'ARC_MACOS_FINAL_CANARY_ROOT="$HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"' \
+        'ARC_MACOS_FINAL_CANARY_ROOT="$ARC_MACOS_SECURE_HOME/.arc-pretag-community-canary-v0.8.0-$ARC_MACOS_PROTECTED_MAIN_SHA"' \
         'macos_canary_acceptance_source="$ARC_MACOS_FINAL_CANARY_ROOT/evidence/ACCEPTED.json"' \
-        'ARC_CANARY_TRANSFER_PARENT="$HOME/.arc-recovery-transfer"' \
+        'ARC_CANARY_TRANSFER_PARENT="$ARC_MACOS_SECURE_HOME/.arc-recovery-transfer"' \
         '"$ARC_LIMACTL" copy --backend=scp' \
         '# BEGIN LIMA ROOT SHELL REVALIDATION AND MACOS RECEIPT IMPORT' \
         ': "${operator_checkout:?the original Lima root shell was lost}"' \
@@ -2042,6 +2084,7 @@ PY
         'scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan' \
         $'scripts/recovery/archive-fleet-to-drive.sh capture \\' \
         'scripts/release/restore-validator-vault.py install' \
+        'scripts/recovery/build-production-manifest.py select-source' \
         $'"$arc_node_linux" recovery export \\' \
         $'offline_signer "$signing_binary" recovery sign \\' \
         $'scripts/recovery/build-production-manifest.py prearchive \\' \
@@ -2189,21 +2232,29 @@ owner_emergency_recovery_receipt_replaces_ceremonial_approval() {
         'The six validator identities are not six independent human operators.' \
         '`owner_emergency_recovery`' \
         '`owner-emergency-recovery-approval.yml`' \
-        '`arc.recovery.owner-emergency-recovery.v2`' \
+        '`arc.recovery.owner-emergency-recovery.v3`' \
         'locally is not authorization.' \
         'root-owned mode-0700 attempt directory' \
         'input file becomes root-owned mode 0400.' \
-        'H=137145/H+1=137146' \
+        '`H/T=H+1/hash/state/final-round/C/F/boundary/checkpoint`' \
         'epoch/set 1/1' \
         'does not claim six-human' \
         'owner_recovery_gh_token="$(' \
         'arc_scoped_gh "$owner_recovery_gh_token" workflow run' \
         '-f expected_main_sha="$protected_main_sha"' \
         '-f checkpoint_manifest_hash="$checkpoint_manifest_hash"' \
+        '-f source_height="$reference_block_height"' \
+        '-f transition_height="$transition_height"' \
+        '-f source_block_hash="$source_block_hash"' \
+        '-f source_state_root="$source_state_root"' \
+        '-f source_consensus_round="$reference_source_consensus_round"' \
+        '-f observed_cutoff_height="$observed_cutoff_height"' \
+        '-f reopening_floor_height="$reopening_floor_height"' \
+        '-f legacy_maintenance_boundary_sha256="$legacy_maintenance_boundary_sha256"' \
         '-f validator_public_keys_sha256="$validator_public_keys_sha256"' \
         '-f nyc_public_key="$owner_recovery_nyc_public_key"' \
         '-f sgp_public_key="$owner_recovery_sgp_public_key"' \
-        '-f confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY $protected_main_sha"' \
+        '-f confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY $protected_main_sha H=$reference_block_height T=$transition_height HASH=$source_block_hash STATE=$source_state_root ROUND=$reference_source_consensus_round C=$observed_cutoff_height F=$reopening_floor_height BOUNDARY=$legacy_maintenance_boundary_sha256 CHECKPOINT=$checkpoint_manifest_hash"' \
         'GH_TOKEN="$owner_recovery_gh_token" scripts/release/wait-workflow-attempt.sh' \
         'actions/runs/$owner_recovery_run_id/attempts/$owner_recovery_run_attempt/jobs?per_page=100' \
         'arc-owner-emergency-recovery-$protected_main_sha-$owner_recovery_run_id-attempt-$owner_recovery_run_attempt' \
@@ -2222,6 +2273,14 @@ owner_emergency_recovery_receipt_replaces_ceremonial_approval() {
         '--artifact-digest "$owner_recovery_artifact_digest"' \
         '--source-main-sha "$protected_main_sha"' \
         '--checkpoint-manifest-hash "$checkpoint_manifest_hash"' \
+        '--source-height "$reference_block_height"' \
+        '--transition-height "$transition_height"' \
+        '--source-block-hash "$source_block_hash"' \
+        '--source-state-root "$source_state_root"' \
+        '--source-consensus-round "$reference_source_consensus_round"' \
+        '--observed-cutoff-height "$observed_cutoff_height"' \
+        '--reopening-floor-height "$reopening_floor_height"' \
+        '--legacy-maintenance-boundary-sha256 "$legacy_maintenance_boundary_sha256"' \
         '--validator-public-keys "$validator_public_keys"' \
         '--validator-public-keys-sha256 "$validator_public_keys_sha256"' \
         '--output "$owner_recovery_receipt"' \
@@ -2238,12 +2297,12 @@ owner_emergency_recovery_receipt_replaces_ceremonial_approval() {
         'Checkpoint signing has a separate, durable authorization boundary.' \
         '`owner-emergency-recovery-approval.yml`' \
         '`owner-emergency-recovery.py verify-github-artifact`' \
-        '`arc.recovery.owner-emergency-recovery.v2`' \
+        '`arc.recovery.owner-emergency-recovery.v3`' \
         'actor and triggering actor are both the pinned owner' \
         'exact-attempt jobs' \
         'text is not authorization.' \
         'GitHub-authenticated `owner_emergency_recovery` decision' \
-        'H=137145/H+1=137146' \
+        'capture-derived `H`, `T=H+1`' \
         'does not claim six-human approval'
     do
         require_literal "$PRODUCTION_RECOVERY_AUDIT" "$required" \
@@ -2271,6 +2330,64 @@ owner_emergency_recovery_receipt_replaces_ceremonial_approval() {
         printf 'local or ceremonial checkpoint approval remains in the recovery guide\n'
         return 1
     fi
+    python3 - "$RECOVERY_README" "$OWNER_EMERGENCY_WORKFLOW" <<'PY' || return 1
+import pathlib
+import re
+import sys
+
+readme = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+workflow = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+expected_inputs = [
+    "expected_main_sha", "checkpoint_manifest_hash", "source_height",
+    "transition_height", "source_block_hash", "source_state_root",
+    "source_consensus_round", "observed_cutoff_height", "reopening_floor_height",
+    "legacy_maintenance_boundary_sha256", "validator_public_keys_sha256",
+    "nyc_public_key", "lax_public_key", "ams_public_key", "lhr_public_key",
+    "nrt_public_key", "sgp_public_key", "confirmation",
+]
+inputs_body = workflow.split("    inputs:\n", 1)[1].split("\npermissions:\n", 1)[0]
+workflow_inputs = re.findall(r"(?m)^      ([a-z0-9_]+):$", inputs_body)
+assert workflow_inputs == expected_inputs, workflow_inputs
+expected_title = (
+    "run-name: Owner recovery approval for ${{ inputs.expected_main_sha }} "
+    "H=${{ inputs.source_height }} at ${{ inputs.checkpoint_manifest_hash }}"
+)
+assert workflow.count(expected_title) == 1
+
+dispatch = readme.split(
+    'arc_scoped_gh "$owner_recovery_gh_token" workflow run', 1
+)[1].split("owner_recovery_new_runs='[]'", 1)[0]
+dispatch_inputs = re.findall(r"(?m)^  -f ([a-z0-9_]+)=", dispatch)
+assert dispatch_inputs == expected_inputs, dispatch_inputs
+confirmation = (
+    '-f confirmation="AUTHORIZE ARC OWNER EMERGENCY RECOVERY '
+    '$protected_main_sha H=$reference_block_height T=$transition_height '
+    'HASH=$source_block_hash STATE=$source_state_root '
+    'ROUND=$reference_source_consensus_round C=$observed_cutoff_height '
+    'F=$reopening_floor_height BOUNDARY=$legacy_maintenance_boundary_sha256 '
+    'CHECKPOINT=$checkpoint_manifest_hash"'
+)
+assert dispatch.count(confirmation) == 1
+
+verification = readme.split(
+    '"$owner_recovery_helper" verify-github-artifact', 1
+)[1].split('for owner_recovery_output in', 1)[0]
+expected_verify_args = [
+    "workflow-json", "run-json", "jobs-json", "artifact-json", "artifact-zip",
+    "run-id", "run-attempt", "artifact-id", "artifact-digest", "source-main-sha",
+    "checkpoint-manifest-hash", "source-height", "transition-height",
+    "source-block-hash", "source-state-root", "source-consensus-round",
+    "observed-cutoff-height", "reopening-floor-height",
+    "legacy-maintenance-boundary-sha256", "validator-public-keys",
+    "validator-public-keys-sha256", "output", "max-age-seconds",
+]
+assert re.findall(r"(?m)^    --([a-z0-9-]+)(?: |$)", verification) == expected_verify_args
+
+signing = readme.split("signing_keys=(", 1)[1].split("\n)", 1)[0]
+assert re.findall(r"keys/([A-Z]+)\.validator-key\.json", signing) == [
+    "NYC", "LAX", "AMS", "LHR", "NRT"
+]
+PY
     test -f "$OWNER_EMERGENCY_HELPER" && test -f "$OWNER_EMERGENCY_SCHEMA" || {
         printf 'documented owner emergency helper or schema is missing\n'
         return 1

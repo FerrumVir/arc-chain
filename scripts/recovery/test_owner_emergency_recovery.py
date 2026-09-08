@@ -53,6 +53,14 @@ class Fixture:
         self.public_sha = digest(self.public_raw)
         self.commit = "a" * 40
         self.checkpoint = "0x" + "b" * 64
+        self.source_height = 141_062
+        self.transition_height = self.source_height + 1
+        self.source_block_hash = "c" * 64
+        self.source_state_root = "d" * 64
+        self.source_consensus_round = 9_774_808
+        self.observed_cutoff_height = 141_062
+        self.reopening_floor_height = self.observed_cutoff_height + 128
+        self.legacy_maintenance_boundary_sha256 = "e" * 64
         self.run_id = 987654321
         self.run_attempt = 2
         self.workflow_id = 445566
@@ -99,7 +107,17 @@ class Fixture:
             },
             "schema": APPROVAL.RECEIPT_SCHEMA,
             "scope": APPROVAL.scope_value(
-                self.commit, self.checkpoint, self.public_sha
+                self.commit,
+                self.checkpoint,
+                self.public_sha,
+                self.source_height,
+                self.transition_height,
+                self.source_block_hash,
+                self.source_state_root,
+                self.source_consensus_round,
+                self.observed_cutoff_height,
+                self.reopening_floor_height,
+                self.legacy_maintenance_boundary_sha256,
             ),
             "signing_policy": APPROVAL.signing_policy(validators),
         }
@@ -198,6 +216,14 @@ class Fixture:
             "run_id": self.run_id,
             "run_json": self.run,
             "source_main_sha": self.commit,
+            "source_height": self.source_height,
+            "transition_height": self.transition_height,
+            "source_block_hash": self.source_block_hash,
+            "source_state_root": self.source_state_root,
+            "source_consensus_round": self.source_consensus_round,
+            "observed_cutoff_height": self.observed_cutoff_height,
+            "reopening_floor_height": self.reopening_floor_height,
+            "legacy_maintenance_boundary_sha256": self.legacy_maintenance_boundary_sha256,
             "validator_public_keys": self.public_keys,
             "validator_public_keys_sha256": self.public_sha,
             "workflow_json": self.workflow,
@@ -242,6 +268,22 @@ class OwnerEmergencyRecoveryTests(unittest.TestCase):
                 self.fixture.commit,
                 "--checkpoint-manifest-hash",
                 self.fixture.checkpoint,
+                "--source-height",
+                str(self.fixture.source_height),
+                "--transition-height",
+                str(self.fixture.transition_height),
+                "--source-block-hash",
+                self.fixture.source_block_hash,
+                "--source-state-root",
+                self.fixture.source_state_root,
+                "--source-consensus-round",
+                str(self.fixture.source_consensus_round),
+                "--observed-cutoff-height",
+                str(self.fixture.observed_cutoff_height),
+                "--reopening-floor-height",
+                str(self.fixture.reopening_floor_height),
+                "--legacy-maintenance-boundary-sha256",
+                self.fixture.legacy_maintenance_boundary_sha256,
                 "--validator-public-keys",
                 str(self.fixture.public_keys),
                 "--validator-public-keys-sha256",
@@ -298,6 +340,14 @@ class OwnerEmergencyRecoveryTests(unittest.TestCase):
             {"source_main_sha": "c" * 40},
             {"checkpoint_manifest_hash": "0x" + "d" * 64},
             {"validator_public_keys_sha256": "e" * 64},
+            {"source_height": self.fixture.source_height + 1},
+            {"transition_height": self.fixture.transition_height + 1},
+            {"source_block_hash": "0" * 64},
+            {"source_state_root": "1" * 64},
+            {"source_consensus_round": self.fixture.source_consensus_round + 1},
+            {"observed_cutoff_height": self.fixture.observed_cutoff_height + 1},
+            {"reopening_floor_height": self.fixture.reopening_floor_height + 1},
+            {"legacy_maintenance_boundary_sha256": "2" * 64},
             {"artifact_id": self.fixture.artifact_id + 1},
             {"artifact_digest": "sha256:" + "f" * 64},
         ):
@@ -375,12 +425,28 @@ class OwnerEmergencyRecoveryTests(unittest.TestCase):
             properties["decision"]["properties"]["authority_basis"]["const"],
             APPROVAL.AUTHORITY_BASIS,
         )
-        self.assertEqual(properties["scope"]["properties"]["source_height"]["const"], 137145)
-        self.assertEqual(properties["scope"]["properties"]["transition_height"]["const"], 137146)
+        self.assertEqual(properties["scope"]["properties"]["source_height"]["minimum"], 137145)
+        self.assertEqual(properties["scope"]["properties"]["transition_height"]["minimum"], 137146)
         self.assertEqual(
             properties["signing_policy"]["properties"]["signatures_required"]["const"],
             5,
         )
+
+    def test_scope_enforces_capture_derived_height_relationships(self) -> None:
+        scope = copy.deepcopy(self.fixture.receipt_value["scope"])
+        scope["transition_height"] += 1
+        with self.assertRaisesRegex(APPROVAL.ApprovalError, "source height plus one"):
+            APPROVAL.validate_scope(scope)
+
+        scope = copy.deepcopy(self.fixture.receipt_value["scope"])
+        scope["source_height"] = APPROVAL.TRUSTED_ANCHOR_HEIGHT - 1
+        with self.assertRaisesRegex(APPROVAL.ApprovalError, "below the reviewed history anchor"):
+            APPROVAL.validate_scope(scope)
+
+        scope = copy.deepcopy(self.fixture.receipt_value["scope"])
+        scope["reopening_floor_height"] += 1
+        with self.assertRaisesRegex(APPROVAL.ApprovalError, "cutoff plus 128"):
+            APPROVAL.validate_scope(scope)
 
 
 if __name__ == "__main__":

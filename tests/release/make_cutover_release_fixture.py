@@ -134,17 +134,33 @@ def main() -> int:
         {
             "chain_id": "0x415243",
             "genesis_hash": "0x" + "1" * 64,
-            "source_height": 137145,
-            "transition_height": 137146,
             "recovery_epoch": 1,
             "validator_set_id": 1,
-            "legacy_observed_cutoff_height": 137017,
-            "legacy_public_max_height": 137145,
+            "legacy_observed_cutoff_height": chain["source_height"],
+            "legacy_public_max_height": chain["source_height"] + 128,
         }
     )
-    boundary["observed_cutoff_height"] = 137017
-    boundary["legacy_public_max_height"] = 137145
-    boundary["evidence_heights"][-1]["height"] = 137017
+    source = chain["canonical_source"]
+    source_node = next(
+        row for row in boundary["nodes"] if row["node"] == source["node"]
+    )
+    source_node["final_persisted_head"] = {
+        "tuple": {
+            "height": chain["source_height"],
+            "block_hash": chain["source_block_hash"],
+            "state_root": chain["source_state_root"],
+        },
+        "evidence_sha256": source["persisted_head_sha256"],
+    }
+    source_evidence = next(
+        row
+        for row in boundary["evidence_heights"]
+        if row["node"] == source["node"] and row["label"] == "final_persisted_head"
+    )
+    source_evidence["height"] = chain["source_height"]
+    source_evidence["evidence_sha256"] = source["persisted_head_sha256"]
+    boundary["observed_cutoff_height"] = chain["source_height"]
+    boundary["legacy_public_max_height"] = chain["source_height"] + 128
 
     checkpoint = b"ARCCHKPT deterministic release fixture v1\n"
     checkpoint_sha256 = hashlib.sha256(checkpoint).hexdigest()
@@ -242,6 +258,8 @@ def main() -> int:
         linux[window]["artifact"]["files"]["arc-node-linux-x86_64"] = binary_sha256
         linux[window]["artifact"]["files"]["genesis.toml"] = genesis_sha256
     value["provenance"]["validator_key_receipt_chain"]["genesis_sha256"] = genesis_sha256
+    chain["trusted_anchor"]["inspector_binary_sha256"] = binary_sha256
+    chain["trusted_anchor"]["genesis_sha256"] = genesis_sha256
     value["provenance"]["validator_key_receipt_chain"][
         "offline_stop_evidence_sha256"
     ] = artifacts["offline_stop_evidence"]["sha256"]

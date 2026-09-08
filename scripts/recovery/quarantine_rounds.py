@@ -52,7 +52,7 @@ NFT_GATE_SCHEMA = "arc.recovery.quarantine-nft-deadline-gate.v1"
 NFT_INTENT_SCHEMA = "arc.recovery.quarantine-nft-apply-intent.v1"
 ANCESTRY_SCHEMA = "arc.recovery.quarantine-post-fence-ancestry.v1"
 STOPPED_ANCESTRY_SCHEMA = "arc.recovery.quarantine-stopped-precommit-ancestry.v1"
-PERSISTED_STOPPED_SCHEMA = "arc.recovery.persisted-legacy-head-stopped-precommit.v1"
+PERSISTED_STOPPED_SCHEMA = "arc.recovery.persisted-legacy-head-stopped-precommit.v2"
 PERSISTENCE_PLAN_SCHEMA = "arc.recovery.quarantine-persistence-plan.v1"
 PERSISTENT_FENCE_SCHEMA = "arc.recovery.quarantine-persistent-restart-fence.v1"
 PRECOMMIT_STATUS_SCHEMA = "arc.recovery.quarantine-precommit-stopped-status.v1"
@@ -96,6 +96,108 @@ def require_commit(value: Any, label: str) -> str:
 def require_uint(value: Any, label: str, *, positive: bool = False) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < (1 if positive else 0):
         fail(f"{label} must be a {'positive' if positive else 'non-negative'} integer")
+    return value
+
+
+def validate_legacy_dag_round(value: Any, label: str) -> Mapping[str, Any]:
+    """Validate the self-contained, read-only durable DAG cursor proof.
+
+    The outer scalar projection is intentionally redundant.  Consumers must
+    recompute both roots from the embedded inspector output so a release can be
+    selected without trusting a live node or reopening archived WAL bytes.
+    """
+
+    fields = {
+        "source_consensus_round", "namespace_sha256", "inspection",
+        "inspection_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{label} durable DAG round fields differ")
+    source_round = require_uint(
+        value.get("source_consensus_round"), f"{label} source consensus round",
+        positive=True,
+    )
+    namespace_sha = require_hash(
+        value.get("namespace_sha256"), f"{label} DAG namespace"
+    )
+    inspection_sha = require_hash(
+        value.get("inspection_sha256"), f"{label} DAG inspection"
+    )
+    inspection = value.get("inspection")
+    inspection_fields = {
+        "schema", "status", "source_consensus_round", "first_segment",
+        "last_segment", "segment_count", "inspected_first_segment",
+        "inspected_segment_count", "inspected_entry_count", "namespace_sha256",
+        "namespace", "read_only",
+    }
+    if not isinstance(inspection, dict) or set(inspection) != inspection_fields:
+        fail(f"{label} embedded DAG inspection fields differ")
+    if (
+        inspection.get("schema")
+        != "arc.recovery.legacy-dag-round-inspection.v1"
+        or inspection.get("status") != "VERIFIED_STOPPED_DAG_CURSOR"
+        or inspection.get("read_only") is not True
+        or inspection_sha != digest(inspection)
+        or inspection.get("source_consensus_round") != source_round
+        or inspection.get("namespace_sha256") != namespace_sha
+    ):
+        fail(f"{label} embedded DAG inspection identity differs")
+    first = require_uint(
+        inspection.get("first_segment"), f"{label} first DAG WAL segment"
+    )
+    last = require_uint(
+        inspection.get("last_segment"), f"{label} last DAG WAL segment"
+    )
+    segment_count = require_uint(
+        inspection.get("segment_count"), f"{label} DAG WAL segment count",
+        positive=True,
+    )
+    inspected_first = require_uint(
+        inspection.get("inspected_first_segment"),
+        f"{label} first inspected DAG WAL segment",
+    )
+    inspected_count = require_uint(
+        inspection.get("inspected_segment_count"),
+        f"{label} inspected DAG WAL segment count", positive=True,
+    )
+    require_uint(
+        inspection.get("inspected_entry_count"),
+        f"{label} inspected DAG WAL entry count", positive=True,
+    )
+    if (
+        last < first
+        or segment_count != last - first + 1
+        or inspected_count != min(3, segment_count)
+        or inspected_first != last - inspected_count + 1
+    ):
+        fail(f"{label} DAG WAL segment arithmetic differs")
+    namespace = inspection.get("namespace")
+    if not isinstance(namespace, dict) or set(namespace) != {
+        "schema", "segment_names", "inspected_tail"
+    }:
+        fail(f"{label} DAG WAL namespace fields differ")
+    segment_names = namespace.get("segment_names")
+    expected_names = [f"wal-{index:08d}.bin" for index in range(first, last + 1)]
+    tail = namespace.get("inspected_tail")
+    if (
+        namespace.get("schema") != "arc.recovery.legacy-dag-wal-namespace.v1"
+        or segment_names != expected_names
+        or not isinstance(tail, list)
+        or len(tail) != inspected_count
+    ):
+        fail(f"{label} DAG WAL namespace differs")
+    for index, row in enumerate(tail):
+        if not isinstance(row, dict) or set(row) != {"name", "sha256", "size"}:
+            fail(f"{label} inspected DAG WAL tail fields differ")
+        if row.get("name") != expected_names[-inspected_count + index]:
+            fail(f"{label} inspected DAG WAL tail order differs")
+        require_hash(row.get("sha256"), f"{label} inspected DAG WAL tail root")
+        require_uint(row.get("size"), f"{label} inspected DAG WAL tail size")
+    namespace_bytes = json.dumps(
+        namespace, sort_keys=True, separators=(",", ":")
+    ).encode()
+    if hashlib.sha256(namespace_bytes).hexdigest() != namespace_sha:
+        fail(f"{label} DAG WAL namespace root is not reproducible")
     return value
 
 
@@ -1570,6 +1672,7 @@ def validate_node_stopped_precommit(
         "source_pair_role",
         "live_source_capture_sha256", "final_absence_sample",
         "export_summary_sha256", "inspect_summary_sha256",
+        "legacy_dag_round", "trusted_anchor_ancestry",
         "candidate_checkpoint_sha256", "candidate_checkpoint_size",
         "authorization_ancestry_proof_sha256", "head", "allow_unbound_legacy_wal",
         "completed_at", "writer_stopped", "restart_barrier_active",
@@ -1617,15 +1720,26 @@ def validate_node_stopped_precommit(
         "persistently-stopped candidate checkpoint size", positive=True,
     )
     source_inputs = persisted.get("source_inputs")
-    if not isinstance(source_inputs, dict) or set(source_inputs) != {
-        "original_data_dir", "final_state_wal", "fixed_data_dir",
+    source_input_fields = {
+        "original_data_dir", "legacy_dag_wal_dir", "final_state_wal", "fixed_data_dir",
         "fixed_state_wal", "fixed_snapshot", "fixed_genesis_binding",
         "live_source_capture_sha256", "rust_live_source_capture_sha256",
         "source_pair_role",
-    }:
+    }
+    if (
+        not isinstance(source_inputs, dict)
+        or set(source_inputs) not in (
+            source_input_fields, source_input_fields | {"wal_normalization"}
+        )
+    ):
         fail("persistently-stopped source-input inventory differs")
     validate_file_identity(
         source_inputs["original_data_dir"], "persistently-stopped original data dir",
+        directory=True,
+    )
+    validate_file_identity(
+        source_inputs["legacy_dag_wal_dir"],
+        "persistently-stopped legacy DAG WAL dir",
         directory=True,
     )
     validate_file_identity(
@@ -1649,6 +1763,49 @@ def validate_node_stopped_precommit(
         require_hash(source_inputs.get(label), f"persistently-stopped {label}")
     if source_inputs.get("source_pair_role") != "preauthorization-boundary":
         fail("persistently-stopped source-pair role differs")
+    normalization = source_inputs.get("wal_normalization")
+    if normalization is not None:
+        normalization_fields = {
+            "normalizer_sha256", "plan_sha256", "receipt_sha256",
+            "normalized_data_dir", "normalized_state_wal", "source_snapshot",
+            "semantic_stream_sha256",
+        }
+        if not isinstance(normalization, dict) or set(normalization) != normalization_fields:
+            fail("persistently-stopped WAL normalization evidence differs")
+        for label in (
+            "normalizer_sha256", "plan_sha256", "receipt_sha256",
+            "semantic_stream_sha256",
+        ):
+            require_hash(
+                normalization.get(label),
+                f"persistently-stopped normalization {label}",
+            )
+        validate_file_identity(
+            normalization["normalized_data_dir"],
+            "persistently-stopped normalized source directory",
+            directory=True,
+        )
+        normalized_wal = validate_file_identity(
+            normalization["normalized_state_wal"],
+            "persistently-stopped normalized source WAL",
+        )
+        normalization_snapshot = validate_file_identity(
+            normalization["source_snapshot"],
+            "persistently-stopped normalization source snapshot",
+        )
+        if (
+            (normalized_wal["sha256"], normalized_wal["size"])
+            != (
+                source_inputs["fixed_state_wal"]["sha256"],
+                source_inputs["fixed_state_wal"]["size"],
+            )
+            or (normalization_snapshot["sha256"], normalization_snapshot["size"])
+            != (
+                source_inputs["fixed_snapshot"]["sha256"],
+                source_inputs["fixed_snapshot"]["size"],
+            )
+        ):
+            fail("persistently-stopped normalized/fixed pair content differs")
     if (
         persisted.get("live_source_capture_sha256")
         != source_inputs["live_source_capture_sha256"]
@@ -1675,11 +1832,103 @@ def validate_node_stopped_precommit(
         row = validate_file_identity(staged_inputs[label], f"persistently-stopped staged {label}")
         if row["sha256"] != persisted[root_field]:
             fail(f"persistently-stopped staged {label} root differs")
+    expected_input_roots = {
+        "data_dir": {
+            key: source_inputs["fixed_data_dir"][key]
+            for key in (
+                "device", "inode", "mode", "uid", "gid", "nlink", "mtime_ns", "ctime_ns",
+            )
+        },
+        "state_wal": {
+            key: source_inputs["fixed_state_wal"][key]
+            for key in (
+                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
+                "size", "mtime_ns", "ctime_ns",
+            )
+        },
+        "snapshot": {
+            key: source_inputs["fixed_snapshot"][key]
+            for key in (
+                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
+                "size", "mtime_ns", "ctime_ns",
+            )
+        },
+        "genesis": {
+            key: staged_inputs["genesis"][key]
+            for key in (
+                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
+                "size", "mtime_ns", "ctime_ns",
+            )
+        },
+        "legacy_validator_set": {
+            key: staged_inputs["legacy_validator_set"][key]
+            for key in (
+                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
+                "size", "mtime_ns", "ctime_ns",
+            )
+        },
+    }
     head, height = validate_stable_head(
         persisted.get("head"), "persistently-stopped persisted head"
     )
     if value.get("stable_head") != head:
         fail("persistently-stopped stable-head projection differs")
+    validate_legacy_dag_round(
+        persisted.get("legacy_dag_round"), "persistently-stopped"
+    )
+    anchor = persisted.get("trusted_anchor_ancestry")
+    anchor_fields = {
+        "anchor_height", "anchor_block_hash", "anchor_state_root",
+        "classification", "inspection", "inspection_sha256",
+    }
+    anchor_inspection = anchor.get("inspection") if isinstance(anchor, dict) else None
+    if (
+        not isinstance(anchor, dict)
+        or set(anchor) != anchor_fields
+        or anchor.get("anchor_height") != 137145
+        or anchor.get("anchor_block_hash")
+            != "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+        or anchor.get("anchor_state_root")
+            != "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+        or anchor.get("inspection_sha256") != digest(anchor_inspection)
+    ):
+        fail("persistently-stopped trusted anchor binding differs")
+    if height < anchor["anchor_height"]:
+        if (
+            anchor.get("classification") != "below_trusted_anchor"
+            or anchor_inspection is not None
+        ):
+            fail("persistently-stopped below-anchor classification differs")
+    else:
+        inspection_fields = {
+            "schema", "height", "block_hash", "state_root", "input_roots",
+        }
+        if (
+            not isinstance(anchor_inspection, dict)
+            or set(anchor_inspection) != inspection_fields
+            or anchor_inspection.get("schema")
+                != "arc.recovery.legacy-block-inspection.v1"
+            or anchor_inspection.get("height") != anchor["anchor_height"]
+            or anchor_inspection.get("input_roots") != expected_input_roots
+        ):
+            fail("persistently-stopped trusted anchor inspection differs")
+        observed_hash = require_hash(
+            anchor_inspection.get("block_hash"),
+            "persistently-stopped observed anchor block",
+        )
+        observed_state = require_hash(
+            anchor_inspection.get("state_root"),
+            "persistently-stopped observed anchor state",
+        )
+        matches = (
+            observed_hash == anchor["anchor_block_hash"]
+            and observed_state == anchor["anchor_state_root"]
+        )
+        expected_classification = (
+            "valid_anchor_descendant" if matches else "conflicting_anchor"
+        )
+        if anchor.get("classification") != expected_classification:
+            fail("persistently-stopped trusted anchor classification differs")
     completed = parse_utc(
         persisted.get("completed_at"), "persistently-stopped persisted-head completion"
     )
@@ -1719,42 +1968,6 @@ def validate_node_stopped_precommit(
         item.get("label") if isinstance(item, dict) else None for item in checks
     ] != ["public-latest", "authenticated-loopback-latest"]:
         fail("persistently-stopped authorization ancestry checks differ")
-    expected_input_roots = {
-        "data_dir": {
-            key: source_inputs["fixed_data_dir"][key]
-            for key in (
-                "device", "inode", "mode", "uid", "gid", "nlink", "mtime_ns", "ctime_ns",
-            )
-        },
-        "state_wal": {
-            key: source_inputs["fixed_state_wal"][key]
-            for key in (
-                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
-                "size", "mtime_ns", "ctime_ns",
-            )
-        },
-        "snapshot": {
-            key: source_inputs["fixed_snapshot"][key]
-            for key in (
-                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
-                "size", "mtime_ns", "ctime_ns",
-            )
-        },
-        "genesis": {
-            key: staged_inputs["genesis"][key]
-            for key in (
-                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
-                "size", "mtime_ns", "ctime_ns",
-            )
-        },
-        "legacy_validator_set": {
-            key: staged_inputs["legacy_validator_set"][key]
-            for key in (
-                "device", "inode", "mode", "uid", "gid", "nlink", "sha256",
-                "size", "mtime_ns", "ctime_ns",
-            )
-        },
-    }
     for check in checks:
         if set(check) != {
             "label", "height", "expected_block_hash", "observed_block_hash",

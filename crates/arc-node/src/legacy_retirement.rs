@@ -47,8 +47,9 @@ const POLICY_ASSET: &str = "arc-cutover-policy.json";
 const BOUNDARY_ASSET: &str = "arc-legacy-maintenance-boundary.json";
 const DESCRIPTOR_ASSET: &str = "arc-recovery-checkpoint-descriptor.json";
 const JOBS_DISPOSITION: &str = "expired_noncanonical_at_cutover";
-const SOURCE_HEIGHT: u64 = 137_145;
-const TRANSITION_HEIGHT: u64 = 137_146;
+const MINIMUM_SOURCE_HEIGHT: u64 = 137_145;
+const COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT: u64 = 137_146;
+const CONTINUITY_SAFETY_MARGIN: u64 = 128;
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -757,6 +758,7 @@ struct ReleaseBinding {
 #[derive(Clone, Debug)]
 struct BoundaryBinding {
     projected: Value,
+    observed_cutoff_height: u64,
     legacy_public_max_height: u64,
     freeze_plan_sha256: String,
     capture_id: String,
@@ -946,10 +948,17 @@ fn validate_boundary(value: &Value) -> Result<BoundaryBinding> {
     let observed = u64_field(object, "observed_cutoff_height", "maintenance boundary")?;
     let margin = u64_field(object, "continuity_safety_margin", "maintenance boundary")?;
     let public_max = u64_field(object, "legacy_public_max_height", "maintenance boundary")?;
-    ensure!(margin > 0, "maintenance continuity margin must be positive");
     ensure!(
-        observed.checked_add(margin) == Some(public_max) && public_max == SOURCE_HEIGHT,
-        "maintenance boundary must bind observed cutoff plus margin to H=137145"
+        observed >= MINIMUM_SOURCE_HEIGHT,
+        "maintenance observed cutoff is below the reviewed ARC history anchor"
+    );
+    ensure!(
+        margin == CONTINUITY_SAFETY_MARGIN,
+        "maintenance continuity margin must equal 128"
+    );
+    ensure!(
+        observed.checked_add(margin) == Some(public_max),
+        "maintenance boundary must bind the reopening floor to observed cutoff plus 128"
     );
     ensure!(
         !bool_field(object, "global_absence_claimed", "maintenance boundary")?,
@@ -1006,6 +1015,7 @@ fn validate_boundary(value: &Value) -> Result<BoundaryBinding> {
             "all_controlled_stopped_at": stopped,
             "global_absence_claimed": false,
         }),
+        observed_cutoff_height: observed,
         legacy_public_max_height: public_max,
         freeze_plan_sha256: freeze,
         capture_id: capture,
@@ -1033,6 +1043,7 @@ fn validate_descriptor_projection(
             "inspector_binary_sha256",
             "checkpoint_file",
             "canonical_inspection",
+            "canonical_source",
             "checkpoint_certificate",
             "approved_validators",
             "verified_quorum",
@@ -1104,14 +1115,17 @@ fn validate_descriptor_projection(
         ],
         "checkpoint canonical inspection",
     )?;
+    let source_height = u64_field(inspection, "source_height", "checkpoint inspection")?;
+    let transition_height = u64_field(inspection, "transition_height", "checkpoint inspection")?;
+    let expected_transition_height = source_height
+        .checked_add(1)
+        .context("checkpoint source height cannot have an H+1 transition")?;
     ensure!(
         u64_field(inspection, "format_version", "checkpoint inspection")? == 1
             && string_field(inspection, "chain_id", "checkpoint inspection")? == "0x415243"
-            && u64_field(inspection, "source_height", "checkpoint inspection")?
-                == boundary.legacy_public_max_height
-            && u64_field(inspection, "source_height", "checkpoint inspection")? == SOURCE_HEIGHT
-            && u64_field(inspection, "transition_height", "checkpoint inspection")?
-                == TRANSITION_HEIGHT
+            && source_height >= MINIMUM_SOURCE_HEIGHT
+            && source_height <= boundary.observed_cutoff_height
+            && transition_height == expected_transition_height
             && u64_field(inspection, "recovery_epoch", "checkpoint inspection")? == 1
             && u64_field(inspection, "validator_set_id", "checkpoint inspection")? == 1
             && u64_field(inspection, "validator_count", "checkpoint inspection")? == 6
@@ -1119,8 +1133,9 @@ fn validate_descriptor_projection(
                 inspection,
                 "community_rewards_v1_activation_height",
                 "checkpoint inspection",
-            )? == TRANSITION_HEIGHT,
-        "checkpoint canonical inspection differs from production cutover"
+            )? == COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT
+            && COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT <= transition_height,
+        "checkpoint canonical inspection differs from the capture-derived production cutover"
     );
     ensure!(
         string_field(inspection, "manifest_hash", "checkpoint inspection")?
@@ -1129,8 +1144,8 @@ fn validate_descriptor_projection(
                 == verified.network_genesis_hash
             && string_field(inspection, "recovery_domain", "checkpoint inspection")?
                 == verified.recovery_domain
-            && verified.source_height == SOURCE_HEIGHT
-            && verified.transition_height == TRANSITION_HEIGHT
+            && verified.source_height == source_height
+            && verified.transition_height == transition_height
             && verified.recovery_epoch == 1
             && verified.validator_set_id == 1
             && verified.validator_count == 6,
@@ -1152,6 +1167,56 @@ fn validate_descriptor_projection(
         string_field(inspection, "protocol_version", "checkpoint inspection")? == "3.0.0",
         "checkpoint protocol version differs"
     );
+    let canonical_source = object_exact(
+        object
+            .get("canonical_source")
+            .context("checkpoint canonical source is missing")?,
+        &[
+            "node",
+            "source_height",
+            "source_block_hash",
+            "source_state_root",
+            "source_consensus_round",
+            "snapshot_sha256",
+            "wal_sha256",
+            "persisted_head_sha256",
+            "legacy_dag_round_inspection_sha256",
+            "legacy_dag_wal_namespace_sha256",
+        ],
+        "checkpoint canonical source",
+    )?;
+    let canonical_source_node =
+        string_field(canonical_source, "node", "checkpoint canonical source")?;
+    ensure!(
+        FLEET.iter().any(|(name, _)| canonical_source_node == *name),
+        "checkpoint canonical source is not a controlled ARC fleet node"
+    );
+    ensure!(
+        canonical_source.get("source_height") == inspection.get("source_height")
+            && canonical_source.get("source_block_hash") == inspection.get("source_block_hash")
+            && canonical_source.get("source_state_root") == inspection.get("source_state_root")
+            && canonical_source.get("source_consensus_round")
+                == inspection.get("source_consensus_round")
+            && u64_field(
+                canonical_source,
+                "source_consensus_round",
+                "checkpoint canonical source",
+            )? > 0,
+        "checkpoint canonical source tuple differs from checkpoint inspection"
+    );
+    for field in [
+        "snapshot_sha256",
+        "wal_sha256",
+        "persisted_head_sha256",
+        "legacy_dag_round_inspection_sha256",
+        "legacy_dag_wal_namespace_sha256",
+    ] {
+        let hash = expect_hash_field(canonical_source, field, "checkpoint canonical source")?;
+        ensure!(
+            hash.bytes().any(|byte| byte != b'0'),
+            "checkpoint canonical source.{field} must not be zero"
+        );
+    }
     let certificate = object
         .get("checkpoint_certificate")
         .and_then(Value::as_object)
@@ -1193,6 +1258,10 @@ fn validate_descriptor_projection(
         (
             "checkpoint_file",
             object.get("checkpoint_file").expect("validated").clone(),
+        ),
+        (
+            "canonical_source",
+            object.get("canonical_source").expect("validated").clone(),
         ),
         (
             "approved_validators",
@@ -1245,6 +1314,9 @@ fn validate_policy(
             "legacy_admission_cutoff_utc",
             "canonical_boundary_height",
             "required_post_cutover_min_height",
+            "legacy_observed_cutoff_height",
+            "legacy_continuity_safety_margin",
+            "legacy_public_max_height",
             "required_recovery_epoch",
             "required_validator_set_id",
             "required_validator_count",
@@ -1332,14 +1404,32 @@ fn validate_policy(
             == boundary.all_controlled_stopped_at,
         "cutover admission cutoff differs from controlled stop"
     );
+    let source_height = u64_field(descriptor_object, "source_height", "checkpoint projection")?;
+    let transition_height = u64_field(
+        descriptor_object,
+        "transition_height",
+        "checkpoint projection",
+    )?;
     ensure!(
-        u64_field(object, "canonical_boundary_height", "cutover policy")? == SOURCE_HEIGHT
+        source_height >= MINIMUM_SOURCE_HEIGHT
+            && source_height <= boundary.observed_cutoff_height
+            && transition_height
+                == source_height
+                    .checked_add(1)
+                    .context("checkpoint source height cannot have an H+1 transition")?
+            && u64_field(object, "canonical_boundary_height", "cutover policy")? == source_height
             && u64_field(object, "required_post_cutover_min_height", "cutover policy",)?
-                == TRANSITION_HEIGHT
+                == transition_height
+            && u64_field(object, "legacy_observed_cutoff_height", "cutover policy")?
+                == boundary.observed_cutoff_height
+            && u64_field(object, "legacy_continuity_safety_margin", "cutover policy")?
+                == CONTINUITY_SAFETY_MARGIN
+            && u64_field(object, "legacy_public_max_height", "cutover policy")?
+                == boundary.legacy_public_max_height
             && u64_field(object, "required_recovery_epoch", "cutover policy")? == 1
             && u64_field(object, "required_validator_set_id", "cutover policy")? == 1
             && u64_field(object, "required_validator_count", "cutover policy")? == 6,
-        "cutover policy height/epoch/validator constants differ"
+        "cutover policy height/epoch/validator bindings differ"
     );
     for (policy_field, descriptor_field) in [
         ("checkpoint_format_version", "format_version"),
@@ -1435,15 +1525,18 @@ fn validate_policy(
         "legacy_maintenance_boundary_sha256": boundary_sha256,
         "recovery_checkpoint_descriptor_sha256": descriptor_sha256,
         "recovery_checkpoint_file_sha256": object["recovery_checkpoint_file_sha256"],
-        "canonical_boundary_height": SOURCE_HEIGHT,
-        "required_post_cutover_min_height": TRANSITION_HEIGHT,
+        "canonical_boundary_height": source_height,
+        "required_post_cutover_min_height": transition_height,
+        "legacy_observed_cutoff_height": boundary.observed_cutoff_height,
+        "legacy_continuity_safety_margin": CONTINUITY_SAFETY_MARGIN,
+        "legacy_public_max_height": boundary.legacy_public_max_height,
         "required_recovery_epoch": 1,
         "required_validator_set_id": 1,
         "required_validator_count": 6,
         "checkpoint_format_version": 1,
         "chain_id": "0x415243",
         "payload_hash": descriptor_object["payload_hash"],
-        "community_rewards_v1_activation_height": TRANSITION_HEIGHT,
+        "community_rewards_v1_activation_height": COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT,
         "legacy_validators": validators,
         "legacy_worker_rpc": object["legacy_worker_rpc"],
         "uncompleted_job_disposition": JOBS_DISPOSITION,
@@ -4361,6 +4454,28 @@ fn validate_receipt(value: &Value) -> Result<()> {
     let verified = u64_field(checkpoint, "verified_signature_count", "receipt checkpoint")?;
     let signed_stake = u64_field(checkpoint, "signed_stake", "receipt checkpoint")?;
     let total_stake = u64_field(checkpoint, "total_stake", "receipt checkpoint")?;
+    let boundary = object
+        .get("maintenance_boundary")
+        .and_then(Value::as_object)
+        .context("receipt maintenance boundary is malformed")?;
+    let observed_cutoff_height = u64_field(
+        boundary,
+        "observed_cutoff_height",
+        "receipt maintenance boundary",
+    )?;
+    let reopening_floor_height = u64_field(
+        boundary,
+        "legacy_public_max_height",
+        "receipt maintenance boundary",
+    )?;
+    ensure!(
+        observed_cutoff_height >= MINIMUM_SOURCE_HEIGHT
+            && observed_cutoff_height.checked_add(CONTINUITY_SAFETY_MARGIN)
+                == Some(reopening_floor_height),
+        "receipt maintenance boundary does not preserve the cutoff-plus-128 reopening floor"
+    );
+    let source_height = u64_field(checkpoint, "source_height", "receipt checkpoint")?;
+    let transition_height = u64_field(checkpoint, "transition_height", "receipt checkpoint")?;
     let signers = checkpoint
         .get("signed_validator_addresses")
         .and_then(Value::as_array)
@@ -4387,10 +4502,14 @@ fn validate_receipt(value: &Value) -> Result<()> {
                 checkpoint,
                 "community_rewards_v1_activation_height",
                 "receipt checkpoint",
-            )? == TRANSITION_HEIGHT
-            && u64_field(checkpoint, "source_height", "receipt checkpoint")? == SOURCE_HEIGHT
-            && u64_field(checkpoint, "transition_height", "receipt checkpoint")?
-                == TRANSITION_HEIGHT
+            )? == COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT
+            && source_height >= MINIMUM_SOURCE_HEIGHT
+            && source_height <= observed_cutoff_height
+            && transition_height
+                == source_height
+                    .checked_add(1)
+                    .context("receipt checkpoint source height cannot have an H+1 transition")?
+            && COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT <= transition_height
             && string_field(checkpoint, "canonical_history_source", "receipt checkpoint")?
                 == "signed_recovery_checkpoint",
         "receipt checkpoint certificate/quorum binding differs"
@@ -5233,6 +5352,12 @@ pub(crate) fn run(command: LegacyRetirementCommand) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    const TEST_SOURCE_HEIGHT: u64 = 141_062;
+    const TEST_TRANSITION_HEIGHT: u64 = TEST_SOURCE_HEIGHT + 1;
+    // A taller noncanonical fork raises C/F without becoming canonical H.
+    const TEST_OBSERVED_CUTOFF_HEIGHT: u64 = 141_100;
+    const TEST_REOPENING_FLOOR_HEIGHT: u64 = TEST_OBSERVED_CUTOFF_HEIGHT + CONTINUITY_SAFETY_MARGIN;
     use clap::Parser as _;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -5417,9 +5542,9 @@ mod tests {
                 &json!({
                     "schema": BOUNDARY_SCHEMA,
                     "source_main_commit": "a".repeat(40),
-                    "observed_cutoff_height": 137017,
-                    "continuity_safety_margin": 128,
-                    "legacy_public_max_height": SOURCE_HEIGHT,
+                    "observed_cutoff_height": TEST_OBSERVED_CUTOFF_HEIGHT,
+                    "continuity_safety_margin": CONTINUITY_SAFETY_MARGIN,
+                    "legacy_public_max_height": TEST_REOPENING_FLOOR_HEIGHT,
                     "freeze_plan_sha256": freeze,
                     "capture_id": capture,
                     "first_quarantine_started_at": "2026-01-01T00:00:00Z",
@@ -5489,19 +5614,31 @@ mod tests {
                     "payload_hash": payload,
                     "network_genesis_hash": network,
                     "full_state_root": full_root,
-                    "source_height": SOURCE_HEIGHT,
+                    "source_height": TEST_SOURCE_HEIGHT,
                     "source_consensus_round": 137200,
                     "created_at_unix_ms": 1767225660000u64,
                     "source_block_hash": source_block,
                     "source_state_root": source_root,
-                    "transition_height": TRANSITION_HEIGHT,
+                    "transition_height": TEST_TRANSITION_HEIGHT,
                     "transition_block_hash": transition_block,
                     "recovery_domain": recovery_domain,
                     "recovery_epoch": 1,
                     "validator_set_id": 1,
                     "protocol_version": "3.0.0",
                     "validator_count": 6,
-                    "community_rewards_v1_activation_height": TRANSITION_HEIGHT,
+                    "community_rewards_v1_activation_height": COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT,
+                },
+                "canonical_source": {
+                    "node": "nyc",
+                    "source_height": TEST_SOURCE_HEIGHT,
+                    "source_block_hash": source_block,
+                    "source_state_root": source_root,
+                    "source_consensus_round": 137200,
+                    "snapshot_sha256": hash_number(32),
+                    "wal_sha256": hash_number(33),
+                    "persisted_head_sha256": hash_number(34),
+                    "legacy_dag_round_inspection_sha256": hash_number(35),
+                    "legacy_dag_wal_namespace_sha256": hash_number(36),
                 },
                 "checkpoint_certificate": {
                     "signing_hash": signing,
@@ -5513,56 +5650,67 @@ mod tests {
             });
             let descriptor_sha = write_json(&descriptor_path, &descriptor);
             let policy_path = root.join(POLICY_ASSET);
-            let policy_sha = write_json(
-                &policy_path,
-                &json!({
-                    "schema_version": POLICY_SCHEMA,
-                    "repository": REPOSITORY,
-                    "release_tag": "v0.8.0",
-                    "release_commit": "b".repeat(40),
-                    "recovery_manifest_sha256": recovery_manifest_sha,
-                    "legacy_maintenance_boundary_sha256": boundary_sha,
-                    "recovery_checkpoint_descriptor_sha256": descriptor_sha,
-                    "recovery_checkpoint_file_sha256": checkpoint_file_sha,
-                    "freeze_plan_sha256": freeze,
-                    "capture_id": capture,
-                    "first_quarantine_started_at": "2026-01-01T00:00:00Z",
-                    "all_controlled_stopped_at": "2026-01-01T00:01:00Z",
-                    "legacy_admission_cutoff_utc": "2026-01-01T00:01:00Z",
-                    "canonical_boundary_height": SOURCE_HEIGHT,
-                    "required_post_cutover_min_height": TRANSITION_HEIGHT,
-                    "required_recovery_epoch": 1,
-                    "required_validator_set_id": 1,
-                    "required_validator_count": 6,
-                    "checkpoint_format_version": 1,
-                    "chain_id": "0x415243",
-                    "protocol_version": "3.0.0",
-                    "payload_hash": payload,
-                    "community_rewards_v1_activation_height": TRANSITION_HEIGHT,
-                    "network_genesis_hash": network,
-                    "source_block_hash": source_block,
-                    "source_state_root": source_root,
-                    "transition_block_hash": transition_block,
-                    "full_state_root": full_root,
-                    "recovery_domain": recovery_domain,
-                    "checkpoint_manifest_hash": manifest,
-                    "checkpoint_source_consensus_round": 137200,
-                    "checkpoint_created_at_unix_ms": 1767225660000u64,
-                    "checkpoint_quorum": quorum,
-                    "legacy_validators": validators,
-                    "legacy_worker_rpc": {
-                        "claim_path": "/community/claim_work",
-                        "submit_path": "/community/submit_work",
-                        "listener_ports": [9090, 3001],
-                    },
-                    "uncompleted_job_disposition": JOBS_DISPOSITION,
-                    "legacy_exit_clean_claimed": false,
-                    "legacy_restart_allowed": false,
-                    "global_legacy_absence_claimed": false,
-                    "offline_retirement_receipt_required": true,
-                    "v08_start_requires_offline_receipt": true,
-                }),
+            let mut policy = json!({
+                "schema_version": POLICY_SCHEMA,
+                "repository": REPOSITORY,
+                "release_tag": "v0.8.0",
+                "release_commit": "b".repeat(40),
+                "recovery_manifest_sha256": recovery_manifest_sha,
+                "legacy_maintenance_boundary_sha256": boundary_sha,
+                "recovery_checkpoint_descriptor_sha256": descriptor_sha,
+                "recovery_checkpoint_file_sha256": checkpoint_file_sha,
+                "freeze_plan_sha256": freeze,
+                "capture_id": capture,
+                "first_quarantine_started_at": "2026-01-01T00:00:00Z",
+                "all_controlled_stopped_at": "2026-01-01T00:01:00Z",
+                "legacy_admission_cutoff_utc": "2026-01-01T00:01:00Z",
+                "canonical_boundary_height": TEST_SOURCE_HEIGHT,
+                "required_post_cutover_min_height": TEST_TRANSITION_HEIGHT,
+                "required_recovery_epoch": 1,
+                "required_validator_set_id": 1,
+                "required_validator_count": 6,
+                "checkpoint_format_version": 1,
+                "chain_id": "0x415243",
+                "protocol_version": "3.0.0",
+                "payload_hash": payload,
+                "community_rewards_v1_activation_height": COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT,
+                "network_genesis_hash": network,
+                "source_block_hash": source_block,
+                "source_state_root": source_root,
+                "transition_block_hash": transition_block,
+                "full_state_root": full_root,
+                "recovery_domain": recovery_domain,
+                "checkpoint_manifest_hash": manifest,
+                "checkpoint_source_consensus_round": 137200,
+                "checkpoint_created_at_unix_ms": 1767225660000u64,
+                "checkpoint_quorum": quorum,
+                "legacy_validators": validators,
+                "legacy_worker_rpc": {
+                    "claim_path": "/community/claim_work",
+                    "submit_path": "/community/submit_work",
+                    "listener_ports": [9090, 3001],
+                },
+                "uncompleted_job_disposition": JOBS_DISPOSITION,
+                "legacy_exit_clean_claimed": false,
+                "legacy_restart_allowed": false,
+                "global_legacy_absence_claimed": false,
+                "offline_retirement_receipt_required": true,
+                "v08_start_requires_offline_receipt": true,
+            });
+            let policy_object = policy.as_object_mut().expect("test policy object");
+            policy_object.insert(
+                "legacy_observed_cutoff_height".into(),
+                TEST_OBSERVED_CUTOFF_HEIGHT.into(),
             );
+            policy_object.insert(
+                "legacy_continuity_safety_margin".into(),
+                CONTINUITY_SAFETY_MARGIN.into(),
+            );
+            policy_object.insert(
+                "legacy_public_max_height".into(),
+                TEST_REOPENING_FLOOR_HEIGHT.into(),
+            );
+            let policy_sha = write_json(&policy_path, &policy);
             let release_path = root.join("arc-release-installer-binding.json");
             let release_sha = write_json(
                 &release_path,
@@ -5589,8 +5737,8 @@ mod tests {
                 recovery_domain,
                 recovery_epoch: 1,
                 validator_set_id: 1,
-                source_height: SOURCE_HEIGHT,
-                transition_height: TRANSITION_HEIGHT,
+                source_height: TEST_SOURCE_HEIGHT,
+                transition_height: TEST_TRANSITION_HEIGHT,
                 validator_count: 6,
                 verified_signature_count: 5,
                 signed_stake: 50,

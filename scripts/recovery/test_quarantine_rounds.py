@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -24,6 +26,43 @@ BASE = dt.datetime(2026, 8, 31, 12, 0, tzinfo=dt.timezone.utc)
 
 def utc(seconds: int) -> str:
     return (BASE + dt.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def legacy_dag_round() -> dict:
+    namespace = {
+        "schema": "arc.recovery.legacy-dag-wal-namespace.v1",
+        "segment_names": [
+            "wal-00000007.bin", "wal-00000008.bin", "wal-00000009.bin",
+            "wal-00000010.bin",
+        ],
+        "inspected_tail": [
+            {"name": f"wal-{index:08d}.bin", "sha256": f"{index:064x}", "size": index}
+            for index in (8, 9, 10)
+        ],
+    }
+    namespace_sha = hashlib.sha256(
+        json.dumps(namespace, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    inspection = {
+        "schema": "arc.recovery.legacy-dag-round-inspection.v1",
+        "status": "VERIFIED_STOPPED_DAG_CURSOR",
+        "source_consensus_round": 10_280_531,
+        "first_segment": 7,
+        "last_segment": 10,
+        "segment_count": 4,
+        "inspected_first_segment": 8,
+        "inspected_segment_count": 3,
+        "inspected_entry_count": 17,
+        "namespace_sha256": namespace_sha,
+        "namespace": namespace,
+        "read_only": True,
+    }
+    return {
+        "source_consensus_round": inspection["source_consensus_round"],
+        "namespace_sha256": namespace_sha,
+        "inspection": inspection,
+        "inspection_sha256": qr.digest(inspection),
+    }
 
 
 def target_row(name: str) -> dict:
@@ -1239,6 +1278,35 @@ class QuarantineRoundTests(unittest.TestCase):
             value["rounds"][0]["result"] = qr.wrap(result_value)
             with self.assertRaises(qr.QuarantineRoundError):
                 qr.validate_generation_ledger(value)
+
+    def test_embedded_legacy_dag_round_is_self_authenticating(self) -> None:
+        value = legacy_dag_round()
+        self.assertIs(qr.validate_legacy_dag_round(value, "test"), value)
+
+    def test_embedded_legacy_dag_round_rejects_every_projection_tamper(self) -> None:
+        mutations = []
+        for mutate in (
+            lambda value: value.__setitem__(
+                "source_consensus_round", value["source_consensus_round"] + 1
+            ),
+            lambda value: value.__setitem__("inspection_sha256", "f" * 64),
+            lambda value: value.__setitem__("namespace_sha256", "e" * 64),
+            lambda value: value["inspection"].__setitem__("read_only", False),
+            lambda value: value["inspection"]["namespace"]["segment_names"].__setitem__(
+                1, "wal-00000011.bin"
+            ),
+            lambda value: value["inspection"]["namespace"]["inspected_tail"][0].__setitem__(
+                "sha256", "d" * 64
+            ),
+        ):
+            value = legacy_dag_round()
+            mutate(value)
+            mutations.append(value)
+        for value in mutations:
+            with self.subTest(value=value), self.assertRaises(
+                qr.QuarantineRoundError
+            ):
+                qr.validate_legacy_dag_round(value, "test")
 
 
 if __name__ == "__main__":

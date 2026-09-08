@@ -888,19 +888,27 @@ argv/output hashes must verify before any new validator key is installed.
    not create a second full local data-tree copy. Confirm each capture inventory
    binds the immutable pre-freeze observation root/receipt and that all three
    outcomes remain labelled diagnostic, noncanonical, and nonreward.
-5. Run the recovery README's exact root/mode/size/SHA-256, four-row
-   `SHA256SUMS`, and metadata verification for the independently preserved
-   shared reference pair first. It binds block height 137145, block hash
+5. Run the recovery README's `build-production-manifest.py select-source`
+   phase over the complete sealed six-node capture first. It treats height
+   137145, block hash
    `8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90`,
    and state root
-   `d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d`.
-   Source consensus round 9774808 is distinct recovery metadata, not the block
-   height. Then use `arc-node recovery export --data-dir <reference-pair>
+   `d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d`
+   as the trusted minimum ancestry anchor, verifies every embedded anchor and
+   durable DAG-WAL inspection, and selects the highest strictly replayed
+   anchor-descendant tuple as `H`. Equal-height replicas are permitted only
+   when their block/state tuple agrees. Download the exact selected pair and
+   verify its size and SHA-256 against the create-only preselection receipt.
+   The final consensus round comes from that selected node's stopped DAG-WAL
+   proof, never from a live endpoint. Then use
+   `arc-node recovery export --data-dir <reference-pair>
    --snapshot <reference-pair/state.snapshot.lz4> --legacy-validator-set
    <legacy-validator-set-40m.json> ...` to reproduce the candidate from that
    exact pair. Successful export—not
    endpoint metadata or a later validator capture—must prove that the decoded
-   snapshot H/root equals its complete WAL block/checkpoint boundary.
+   snapshot H/root equals its complete WAL block/checkpoint boundary and the
+   preselection receipt. The transition is `T=H+1`; a taller conflicting fork
+   may make `C>H`, and public reopening remains held until `F=C+128`.
    The audited legacy WAL needs the explicit `--allow-unbound-legacy-wal`
    exception because it predates the genesis network hash; record that fact.
 6. In the one reviewed, root-only operator enclave that contains the six-key

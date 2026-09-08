@@ -48,7 +48,7 @@ verified installer below.
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
-ARC_INSTALL_SHA256=4480a627e5f50f61a22b6a3b97ab4a8f102400c03f03a1c73d7d8abe79601151
+ARC_INSTALL_SHA256=0413fdd6088d0522841c472abfcf460b1ffaba67a6923355325d699c2f5b0242
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
@@ -261,8 +261,9 @@ v0.8. Never run the generations concurrently, even with separate data paths.
 Released v0.7 cannot prove quiescence: its signal handler exits immediately and
 does not close inference admission, join producer tasks, or establish a final
 WAL barrier. Waiting longer does not turn that behavior into a drain. The
-signed cutover policy instead fixes canonical height 137145, requires the v3
-fleet at height 137146 or later, records unfinished v0.7 work as
+signed cutover policy instead fixes the capture-derived canonical height `H`
+at the highest strictly replayed captured descendant of the trusted 137145
+anchor, requires the v3 fleet at `H+1` or later, records unfinished v0.7 work as
 `expired_noncanonical_at_cutover`, and explicitly sets
 `legacy_exit_clean_claimed=false`. Before TERM, the installer authenticates the
 policy, maintenance boundary, and quorum checkpoint, verifies all six exact v3

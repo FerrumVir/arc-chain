@@ -105,6 +105,10 @@ class Fixture:
     source_state_root = "5" * 64
     transition_block_hash = "6" * 64
     recovery_domain = "7" * 64
+    source_height = 141_062
+    transition_height = source_height + 1
+    observed_cutoff_height = source_height
+    legacy_public_max_height = observed_cutoff_height + 128
 
     def __init__(self, root: Path, *, mode: str = "term_only") -> None:
         self.root = root
@@ -163,11 +167,27 @@ class Fixture:
                     for name, host in verifier.PRODUCTION_FLEET
                 ],
             },
-            "observed_cutoff_height": 137_017,
+            "observed_cutoff_height": self.observed_cutoff_height,
             "continuity_safety_margin": 128,
-            "legacy_public_max_height": verifier.CANONICAL_BOUNDARY_HEIGHT,
+            "legacy_public_max_height": self.legacy_public_max_height,
             "global_absence_claimed": False,
             "threat_model": {"hostile_root_containment_claimed": False},
+            "nodes": [
+                {
+                    "node": name,
+                    "host": host,
+                    "origin": f"http://{host}:9090",
+                    "final_persisted_head": {
+                        "tuple": {
+                            "height": self.source_height if index == 0 else self.source_height - index,
+                            "block_hash": self.source_block_hash if index == 0 else f"{index + 8:x}" * 64,
+                            "state_root": self.source_state_root if index == 0 else f"{index + 1:x}" * 64,
+                        },
+                        "evidence_sha256": "a" * 64 if index == 0 else f"{index + 1:x}" * 64,
+                    },
+                }
+                for index, (name, host) in enumerate(verifier.PRODUCTION_FLEET)
+            ],
         }
         self.boundary = root / verifier.BOUNDARY_ASSET
         self.boundary_sha = write(self.boundary, canonical(self.boundary_value))
@@ -217,21 +237,19 @@ class Fixture:
             "payload_hash": self.payload_hash,
             "network_genesis_hash": self.network_genesis_hash,
             "full_state_root": self.full_state_root,
-            "source_height": verifier.CANONICAL_BOUNDARY_HEIGHT,
+            "source_height": self.source_height,
             "source_consensus_round": 77,
             "created_at_unix_ms": 1_788_000_000_000,
             "source_block_hash": self.source_block_hash,
             "source_state_root": self.source_state_root,
-            "transition_height": verifier.REQUIRED_POST_CUTOVER_MIN_HEIGHT,
+            "transition_height": self.transition_height,
             "transition_block_hash": self.transition_block_hash,
             "recovery_domain": self.recovery_domain,
             "recovery_epoch": 1,
             "validator_set_id": 1,
             "protocol_version": "3.0.0",
             "validator_count": 6,
-            "community_rewards_v1_activation_height": (
-                verifier.REQUIRED_POST_CUTOVER_MIN_HEIGHT
-            ),
+            "community_rewards_v1_activation_height": 137_146,
         }
         self.descriptor_value = {
             "schema_version": verifier.CHECKPOINT_DESCRIPTOR_SCHEMA,
@@ -248,6 +266,18 @@ class Fixture:
                 "sha256": self.full_checkpoint_sha,
             },
             "canonical_inspection": self.identity,
+            "canonical_source": {
+                "node": "nyc",
+                "source_height": self.source_height,
+                "source_block_hash": self.source_block_hash,
+                "source_state_root": self.source_state_root,
+                "source_consensus_round": self.identity["source_consensus_round"],
+                "snapshot_sha256": "8" * 64,
+                "wal_sha256": "9" * 64,
+                "persisted_head_sha256": "a" * 64,
+                "legacy_dag_round_inspection_sha256": "b" * 64,
+                "legacy_dag_wal_namespace_sha256": "c" * 64,
+            },
             "checkpoint_certificate": {
                 "signing_hash": signing_hash.hex(),
                 "validators": certificate_validators,
@@ -283,8 +313,11 @@ class Fixture:
             "first_quarantine_started_at": self.boundary_value["first_quarantine_started_at"],
             "all_controlled_stopped_at": self.boundary_value["all_controlled_stopped_at"],
             "legacy_admission_cutoff_utc": self.boundary_value["all_controlled_stopped_at"],
-            "canonical_boundary_height": verifier.CANONICAL_BOUNDARY_HEIGHT,
-            "required_post_cutover_min_height": verifier.REQUIRED_POST_CUTOVER_MIN_HEIGHT,
+            "canonical_boundary_height": self.source_height,
+            "required_post_cutover_min_height": self.transition_height,
+            "legacy_observed_cutoff_height": self.observed_cutoff_height,
+            "legacy_continuity_safety_margin": 128,
+            "legacy_public_max_height": self.legacy_public_max_height,
             "required_recovery_epoch": 1,
             "required_validator_set_id": 1,
             "required_validator_count": 6,
@@ -292,9 +325,7 @@ class Fixture:
             "chain_id": verifier.RECOVERY_CHAIN_ID,
             "protocol_version": "3.0.0",
             "payload_hash": self.payload_hash,
-            "community_rewards_v1_activation_height": (
-                verifier.REQUIRED_POST_CUTOVER_MIN_HEIGHT
-            ),
+            "community_rewards_v1_activation_height": 137_146,
             "network_genesis_hash": self.network_genesis_hash,
             "source_block_hash": self.source_block_hash,
             "source_state_root": self.source_state_root,
@@ -511,14 +542,19 @@ class RetirementTests(unittest.TestCase):
                             candidate,
                             release_binding=release_binding,
                             boundary=verifier.validate_boundary(fixture.boundary_value),
+                            boundary_nodes=fixture.boundary_value["nodes"],
                         )
 
     def test_boundary_hashes_and_canonical_public_maximum_are_cross_bound(self) -> None:
         temporary, fixture = self.fixture()
         with temporary:
             boundary = verifier.validate_boundary(fixture.boundary_value)
-            self.assertEqual(boundary["legacy_public_max_height"], 137_145)
-            self.assertEqual(boundary["observed_cutoff_height"], 137_017)
+            self.assertEqual(
+                boundary["legacy_public_max_height"], fixture.legacy_public_max_height
+            )
+            self.assertEqual(
+                boundary["observed_cutoff_height"], fixture.observed_cutoff_height
+            )
             release_binding = {
                 "tag": fixture.tag,
                 "commit": fixture.commit,
@@ -528,6 +564,7 @@ class RetirementTests(unittest.TestCase):
                 fixture.descriptor_value,
                 release_binding=release_binding,
                 boundary=boundary,
+                boundary_nodes=fixture.boundary_value["nodes"],
             )
             for field in ("freeze_plan_sha256", "capture_id"):
                 candidate = copy.deepcopy(fixture.descriptor_value)
@@ -537,6 +574,7 @@ class RetirementTests(unittest.TestCase):
                         candidate,
                         release_binding=release_binding,
                         boundary=boundary,
+                        boundary_nodes=fixture.boundary_value["nodes"],
                     )
 
     def test_forensic_retirement_is_honest_and_does_not_mutate_old_tree(self) -> None:
@@ -649,7 +687,7 @@ class RetirementTests(unittest.TestCase):
                     input_roots[name] = {"sha256": record["sha256"]}
                 result = {
                     "schema": verifier.LEGACY_BLOCK_INSPECTION_SCHEMA,
-                    "height": verifier.CANONICAL_BOUNDARY_HEIGHT,
+                    "height": fixture.source_height,
                     "block_hash": fixture.source_block_hash,
                     "state_root": fixture.source_state_root,
                     "input_roots": input_roots,

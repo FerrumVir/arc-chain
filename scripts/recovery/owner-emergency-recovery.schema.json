@@ -13,7 +13,7 @@
   ],
   "properties": {
     "schema": {
-      "const": "arc.recovery.owner-emergency-recovery.v2"
+      "const": "arc.recovery.owner-emergency-recovery.v3"
     },
     "decision": {
       "type": "object",
@@ -64,7 +64,7 @@
           "const": "legacy_fleet_divergence_history_preserving_v080_cutover"
         },
         "risk_acknowledgement": {
-          "const": "I authorize five reviewed ARC validator identities to sign the recovery checkpoint rooted at preserved source block 137145 and transition block 137146. I understand that the six legacy forks remain preserved read-only, that rollback cannot rewrite signed history, and that this receipt does not represent approval by six independent humans."
+          "const": "I authorize five reviewed ARC validator identities to sign the recovery checkpoint rooted at the capture-derived preserved source block and its immediate successor transition. I understand that the six legacy forks remain preserved read-only, that rollback cannot rewrite signed history, and that this receipt does not represent approval by six independent humans."
         }
       }
     },
@@ -122,9 +122,15 @@
         "protected_branch",
         "recovery_epoch",
         "repository",
+        "source_block_hash",
+        "source_consensus_round",
         "source_height",
         "source_main_sha",
+        "source_state_root",
         "transition_height",
+        "observed_cutoff_height",
+        "reopening_floor_height",
+        "legacy_maintenance_boundary_sha256",
         "validator_public_keys_sha256",
         "validator_set_id"
       ],
@@ -143,10 +149,38 @@
           "pattern": "^0x[0-9a-f]{64}$"
         },
         "source_height": {
-          "const": 137145
+          "type": "integer",
+          "minimum": 137145,
+          "maximum": 9007199254740991
         },
         "transition_height": {
-          "const": 137146
+          "type": "integer",
+          "minimum": 137146,
+          "maximum": 9007199254740991
+        },
+        "source_block_hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "source_state_root": {
+          "$ref": "#/$defs/hash"
+        },
+        "source_consensus_round": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "observed_cutoff_height": {
+          "type": "integer",
+          "minimum": 137145,
+          "maximum": 9007199254740991
+        },
+        "reopening_floor_height": {
+          "type": "integer",
+          "minimum": 137273,
+          "maximum": 9007199254740991
+        },
+        "legacy_maintenance_boundary_sha256": {
+          "$ref": "#/$defs/hash"
         },
         "recovery_epoch": {
           "const": 1

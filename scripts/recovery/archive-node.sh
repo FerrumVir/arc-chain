@@ -5261,7 +5261,7 @@ BINDING_SCHEMA = "arc.recovery.quarantine-nft-table-binding.v1"
 APPLIED_COMMIT_SCHEMA = "arc.recovery.quarantine-nft-applied-commit.v1"
 NODE_APPLIED_SCHEMA = "arc.recovery.quarantine-node-nft-applied.v1"
 NODE_STOPPED_SCHEMA = "arc.recovery.quarantine-node-persistently-stopped-precommit.v1"
-PERSISTED_STOPPED_SCHEMA = "arc.recovery.persisted-legacy-head-stopped-precommit.v1"
+PERSISTED_STOPPED_SCHEMA = "arc.recovery.persisted-legacy-head-stopped-precommit.v2"
 STOPPED_STATUS_SCHEMA = "arc.recovery.quarantine-prior-persistently-stopped-status.v1"
 ANCESTRY_SCHEMA = "arc.recovery.quarantine-post-fence-ancestry.v1"
 STATUS_SCHEMA = "arc.recovery.quarantine-prior-fenced-status.v1"
@@ -6882,6 +6882,13 @@ WantedBy=multi-user.target
                     or data_identity["inode"] <= 0):
                 fail("stopped-precommit data directory device differs")
             held["original_data_dir"] = (data_dir, data_fd, data_identity, True)
+            dag_wal_dir = data_dir / "dag-wal"
+            dag_wal_dir_fd, dag_wal_dir_identity = open_held(
+                dag_wal_dir, directory=True
+            )
+            held["legacy_dag_wal_dir"] = (
+                dag_wal_dir, dag_wal_dir_fd, dag_wal_dir_identity, True,
+            )
             final_wal_path = data_dir / "state.wal"
             final_wal_fd, final_wal_identity = open_held(final_wal_path)
             if final_wal_identity["size"] <= 0:
@@ -7060,6 +7067,7 @@ WantedBy=multi-user.target
                 }
             source_inputs = {
                 "original_data_dir": data_identity,
+                "legacy_dag_wal_dir": dag_wal_dir_identity,
                 "final_state_wal": final_wal_identity,
                 "fixed_data_dir": fixed_dir_identity,
                 "fixed_state_wal": wal_identity,
@@ -7088,6 +7096,89 @@ WantedBy=multi-user.target
             ) as work_raw:
                 work = pathlib.Path(work_raw)
                 candidate = work / "candidate.arcchkpt"
+                dag_result = subprocess.run(
+                    [str(staged_paths["inspector"][0]), "recovery",
+                     "inspect-legacy-dag-round", "--dag-wal-dir", str(dag_wal_dir)],
+                    env=command_env, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=False,
+                )
+                if dag_result.returncode != 0:
+                    fail("stopped-precommit exact legacy DAG round inspection failed")
+                try:
+                    dag_inspection = json.loads(dag_result.stdout)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    fail("stopped-precommit legacy DAG round inspection is invalid JSON")
+                dag_fields = {
+                    "schema", "status", "source_consensus_round", "first_segment",
+                    "last_segment", "segment_count", "inspected_first_segment",
+                    "inspected_segment_count", "inspected_entry_count",
+                    "namespace_sha256", "namespace", "read_only",
+                }
+                namespace_fields = {"schema", "segment_names", "inspected_tail"}
+                namespace = dag_inspection.get("namespace", {}) \
+                    if isinstance(dag_inspection, dict) else {}
+                segment_names = namespace.get("segment_names") \
+                    if isinstance(namespace, dict) else None
+                tail = namespace.get("inspected_tail") \
+                    if isinstance(namespace, dict) else None
+                if (
+                    not isinstance(dag_inspection, dict)
+                    or set(dag_inspection) != dag_fields
+                    or dag_inspection.get("schema")
+                        != "arc.recovery.legacy-dag-round-inspection.v1"
+                    or dag_inspection.get("status") != "VERIFIED_STOPPED_DAG_CURSOR"
+                    or dag_inspection.get("read_only") is not True
+                    or any(
+                        isinstance(dag_inspection.get(field), bool)
+                        or not isinstance(dag_inspection.get(field), int)
+                        or dag_inspection[field] < 1
+                        for field in (
+                            "source_consensus_round", "segment_count",
+                            "inspected_segment_count", "inspected_entry_count",
+                        )
+                    )
+                    or any(
+                        isinstance(dag_inspection.get(field), bool)
+                        or not isinstance(dag_inspection.get(field), int)
+                        or dag_inspection[field] < 0
+                        for field in (
+                            "first_segment", "last_segment", "inspected_first_segment",
+                        )
+                    )
+                    or dag_inspection["first_segment"]
+                        > dag_inspection["inspected_first_segment"]
+                    or dag_inspection["inspected_first_segment"]
+                        > dag_inspection["last_segment"]
+                    or not 1 <= dag_inspection["inspected_segment_count"] <= 3
+                    or not isinstance(namespace, dict)
+                    or set(namespace) != namespace_fields
+                    or namespace.get("schema")
+                        != "arc.recovery.legacy-dag-wal-namespace.v1"
+                    or not isinstance(segment_names, list)
+                    or len(segment_names) != dag_inspection["segment_count"]
+                    or segment_names != sorted(segment_names)
+                    or len(set(segment_names)) != len(segment_names)
+                    or not isinstance(tail, list)
+                    or len(tail) != dag_inspection["inspected_segment_count"]
+                    or [row.get("name") for row in tail if isinstance(row, dict)]
+                        != segment_names[-dag_inspection["inspected_segment_count"]:]
+                    or any(
+                        not isinstance(row, dict)
+                        or set(row) != {"name", "sha256", "size"}
+                        or re.fullmatch(r"wal-[0-9]{8}\.bin", str(row.get("name"))) is None
+                        or HASH_RE.fullmatch(str(row.get("sha256"))) is None
+                        or isinstance(row.get("size"), bool)
+                        or not isinstance(row.get("size"), int)
+                        or row["size"] < 0
+                        for row in tail
+                    )
+                    or HASH_RE.fullmatch(str(dag_inspection.get("namespace_sha256")))
+                        is None
+                    or sha(json.dumps(
+                        namespace, sort_keys=True, separators=(",", ":")
+                    ).encode()) != dag_inspection["namespace_sha256"]
+                ):
+                    fail("stopped-precommit legacy DAG round inspection differs")
                 export_command = [
                     str(staged_paths["inspector"][0]), "recovery", "export",
                     "--data-dir", str(fixed_dir), "--snapshot", str(snapshot_path),
@@ -7210,6 +7301,71 @@ WantedBy=multi-user.target
                         )
                     },
                 }
+                trusted_anchor = {
+                    "height": 137145,
+                    "block_hash":
+                        "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+                    "state_root":
+                        "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+                }
+                anchor_inspection = None
+                if head_height >= trusted_anchor["height"]:
+                    anchor_command = [
+                        str(staged_paths["inspector"][0]), "recovery",
+                        "inspect-legacy-block", "--data-dir", str(fixed_dir),
+                        "--snapshot", str(snapshot_path), "--genesis",
+                        str(staged_paths["genesis"][0]), "--legacy-validator-set",
+                        str(staged_paths["legacy_validator_set"][0]), "--height",
+                        str(trusted_anchor["height"]),
+                        "--expected-state-wal-sha256", wal_identity["sha256"],
+                        "--expected-snapshot-sha256", snapshot_identity["sha256"],
+                        "--expected-genesis-sha256", genesis_sha,
+                        "--expected-legacy-validator-set-sha256",
+                        legacy_validators_sha,
+                    ]
+                    anchor_result = subprocess.run(
+                        anchor_command, env=command_env, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, check=False,
+                    )
+                    if anchor_result.returncode != 0:
+                        fail("stopped-precommit trusted anchor inspection failed")
+                    try:
+                        anchor_inspection = json.loads(anchor_result.stdout)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        fail("stopped-precommit trusted anchor inspection returned invalid JSON")
+                    if (
+                        not isinstance(anchor_inspection, dict)
+                        or set(anchor_inspection) != {
+                            "schema", "height", "block_hash", "state_root", "input_roots",
+                        }
+                        or anchor_inspection.get("schema")
+                            != "arc.recovery.legacy-block-inspection.v1"
+                        or anchor_inspection.get("height") != trusted_anchor["height"]
+                        or HASH_RE.fullmatch(str(anchor_inspection.get("block_hash"))) is None
+                        or HASH_RE.fullmatch(str(anchor_inspection.get("state_root"))) is None
+                        or anchor_inspection.get("input_roots") != expected_cli_inputs
+                    ):
+                        fail("stopped-precommit trusted anchor inspection differs")
+                    anchor_classification = (
+                        "valid_anchor_descendant"
+                        if (
+                            anchor_inspection["block_hash"]
+                                == trusted_anchor["block_hash"]
+                            and anchor_inspection["state_root"]
+                                == trusted_anchor["state_root"]
+                        )
+                        else "conflicting_anchor"
+                    )
+                else:
+                    anchor_classification = "below_trusted_anchor"
+                trusted_anchor_ancestry = {
+                    "anchor_height": trusted_anchor["height"],
+                    "anchor_block_hash": trusted_anchor["block_hash"],
+                    "anchor_state_root": trusted_anchor["state_root"],
+                    "classification": anchor_classification,
+                    "inspection": anchor_inspection,
+                    "inspection_sha256": sha(canonical(anchor_inspection)),
+                }
                 checks = []
                 for label, height, expected_hash in (
                     ("public-latest", public_row["latest_block_height"],
@@ -7287,7 +7443,7 @@ WantedBy=multi-user.target
                     completed_at = format_utc(now_value())
                 parse_utc(completed_at, "stopped persisted-head completion")
                 persisted = {
-                    "schema": "arc.recovery.persisted-legacy-head-stopped-precommit.v1",
+                    "schema": "arc.recovery.persisted-legacy-head-stopped-precommit.v2",
                     "source_main_commit": auth["source_main_commit"],
                     "capture_id": capture_id, "node": node, "host": FLEET_MAP[node],
                     "freeze_plan_sha256": freeze_sha, "round_number": round_number,
@@ -7311,6 +7467,13 @@ WantedBy=multi-user.target
                     "final_absence_sample": final_absence_sample,
                     "export_summary_sha256": sha(export_result.stdout),
                     "inspect_summary_sha256": sha(inspect_result.stdout),
+                    "legacy_dag_round": {
+                        "source_consensus_round": dag_inspection["source_consensus_round"],
+                        "namespace_sha256": dag_inspection["namespace_sha256"],
+                        "inspection": dag_inspection,
+                        "inspection_sha256": sha(canonical(dag_inspection)),
+                    },
+                    "trusted_anchor_ancestry": trusted_anchor_ancestry,
                     "candidate_checkpoint_sha256": candidate_sha,
                     "candidate_checkpoint_size": candidate_details.st_size,
                     "authorization_ancestry_proof_sha256": sha(ancestry_raw),
@@ -7467,7 +7630,8 @@ WantedBy=multi-user.target
             "source_inputs", "staged_inputs", "source_pair_role",
             "live_source_capture_sha256",
             "final_absence_sample", "export_summary_sha256",
-            "inspect_summary_sha256", "candidate_checkpoint_sha256",
+            "inspect_summary_sha256", "legacy_dag_round",
+            "trusted_anchor_ancestry", "candidate_checkpoint_sha256",
             "candidate_checkpoint_size", "authorization_ancestry_proof_sha256",
             "head", "allow_unbound_legacy_wal", "completed_at", "writer_stopped",
             "restart_barrier_active", "network_quarantine_active",
@@ -7504,6 +7668,107 @@ WantedBy=multi-user.target
                 or HASH_RE.fullmatch(str(head.get("block_hash"))) is None
                 or HASH_RE.fullmatch(str(head.get("state_root"))) is None):
             fail("persistently-stopped stable head differs")
+        dag_round = persisted.get("legacy_dag_round")
+        if (not isinstance(dag_round, dict) or set(dag_round) != {
+                "source_consensus_round", "namespace_sha256", "inspection",
+                "inspection_sha256"
+            } or isinstance(dag_round.get("source_consensus_round"), bool)
+                or not isinstance(dag_round.get("source_consensus_round"), int)
+                or dag_round["source_consensus_round"] < 1
+                or HASH_RE.fullmatch(str(dag_round.get("namespace_sha256"))) is None
+                or HASH_RE.fullmatch(str(dag_round.get("inspection_sha256"))) is None
+                or dag_round.get("inspection_sha256")
+                    != sha(canonical(dag_round.get("inspection")))):
+            fail("persistently-stopped durable DAG round differs")
+        dag_inspection = dag_round["inspection"]
+        dag_namespace = dag_inspection.get("namespace") \
+            if isinstance(dag_inspection, dict) else None
+        dag_segment_names = dag_namespace.get("segment_names") \
+            if isinstance(dag_namespace, dict) else None
+        dag_tail = dag_namespace.get("inspected_tail") \
+            if isinstance(dag_namespace, dict) else None
+        if (not isinstance(dag_inspection, dict) or set(dag_inspection) != {
+                "schema", "status", "source_consensus_round", "first_segment",
+                "last_segment", "segment_count", "inspected_first_segment",
+                "inspected_segment_count", "inspected_entry_count",
+                "namespace_sha256", "namespace", "read_only"
+            } or dag_inspection.get("schema")
+                != "arc.recovery.legacy-dag-round-inspection.v1"
+                or dag_inspection.get("status") != "VERIFIED_STOPPED_DAG_CURSOR"
+                or dag_inspection.get("read_only") is not True
+                or dag_round["source_consensus_round"]
+                    != dag_inspection.get("source_consensus_round")
+                or dag_round["namespace_sha256"]
+                    != dag_inspection.get("namespace_sha256")
+                or not isinstance(dag_namespace, dict)
+                or set(dag_namespace) != {"schema", "segment_names", "inspected_tail"}
+                or dag_namespace.get("schema")
+                    != "arc.recovery.legacy-dag-wal-namespace.v1"
+                or not isinstance(dag_segment_names, list)
+                or dag_segment_names != [
+                    f"wal-{index:08d}.bin"
+                    for index in range(
+                        dag_inspection.get("first_segment", -1),
+                        dag_inspection.get("last_segment", -2) + 1,
+                    )
+                ]
+                or dag_inspection.get("segment_count") != len(dag_segment_names)
+                or dag_inspection.get("inspected_segment_count")
+                    != min(3, len(dag_segment_names))
+                or dag_inspection.get("inspected_first_segment")
+                    != dag_inspection.get("last_segment")
+                        - dag_inspection.get("inspected_segment_count", 0) + 1
+                or isinstance(dag_inspection.get("inspected_entry_count"), bool)
+                or not isinstance(dag_inspection.get("inspected_entry_count"), int)
+                or dag_inspection["inspected_entry_count"] < 1
+                or not isinstance(dag_tail, list)
+                or [row.get("name") for row in dag_tail if isinstance(row, dict)]
+                    != dag_segment_names[-dag_inspection["inspected_segment_count"]:]
+                or any(not isinstance(row, dict) or set(row) != {
+                        "name", "sha256", "size"
+                    } or HASH_RE.fullmatch(str(row.get("sha256"))) is None
+                        or isinstance(row.get("size"), bool)
+                        or not isinstance(row.get("size"), int) or row["size"] < 0
+                    for row in dag_tail)
+                or sha(json.dumps(
+                    dag_namespace, sort_keys=True, separators=(",", ":")
+                ).encode()) != dag_round["namespace_sha256"]):
+            fail("persistently-stopped durable DAG inspection differs")
+        anchor = persisted.get("trusted_anchor_ancestry")
+        anchor_inspection = anchor.get("inspection") if isinstance(anchor, dict) else None
+        if (not isinstance(anchor, dict) or set(anchor) != {
+                "anchor_height", "anchor_block_hash", "anchor_state_root",
+                "classification", "inspection", "inspection_sha256"
+            } or anchor.get("anchor_height") != 137145
+                or anchor.get("anchor_block_hash")
+                    != "8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90"
+                or anchor.get("anchor_state_root")
+                    != "d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d"
+                or anchor.get("inspection_sha256") != sha(canonical(anchor_inspection))
+                or (head["height"] < 137145 and (
+                    anchor.get("classification") != "below_trusted_anchor"
+                    or anchor_inspection is not None))
+                or (head["height"] >= 137145 and (
+                    anchor.get("classification") not in {
+                        "valid_anchor_descendant", "conflicting_anchor"
+                    } or not isinstance(anchor_inspection, dict)
+                    or set(anchor_inspection) != {
+                        "schema", "height", "block_hash", "state_root", "input_roots"
+                    } or anchor_inspection.get("schema")
+                        != "arc.recovery.legacy-block-inspection.v1"
+                    or anchor_inspection.get("height") != 137145
+                    or HASH_RE.fullmatch(str(anchor_inspection.get("block_hash"))) is None
+                    or HASH_RE.fullmatch(str(anchor_inspection.get("state_root"))) is None
+                ))):
+            fail("persistently-stopped trusted-anchor ancestry differs")
+        anchor_matches = isinstance(anchor_inspection, dict) and (
+            anchor_inspection.get("block_hash") == anchor["anchor_block_hash"]
+            and anchor_inspection.get("state_root") == anchor["anchor_state_root"]
+        )
+        if head["height"] >= 137145 and (
+                (anchor.get("classification") == "valid_anchor_descendant")
+                is not anchor_matches):
+            fail("persistently-stopped trusted-anchor classification differs")
         if (wrappers["nft_apply_intent"][1]
                 != persisted.get("nft_apply_intent_sha256")
                 or wrappers["persistence_plan"][1]
@@ -18877,6 +19142,16 @@ PY
     local staged_wal_identity staged_snapshot_identity
     staged_wal_identity="$(stat -Lc %d:%i:%s:%f:%u:%g:%h "$temporary/export-source/state.wal")"
     staged_snapshot_identity="$(stat -Lc %d:%i:%s:%f:%u:%g:%h "$temporary/export-source/state.snapshot.lz4")"
+    local legacy_dag_wal_dir="$archive_data_dir/dag-wal"
+    require_safe_absolute_path "$legacy_dag_wal_dir" "persisted-head legacy DAG WAL directory"
+    [ -d "$legacy_dag_wal_dir" ] && [ ! -L "$legacy_dag_wal_dir" ] || \
+        die "persisted-head captured legacy DAG WAL directory is missing or a symlink"
+    /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+        /proc/self/fd/8 recovery inspect-legacy-dag-round \
+        --dag-wal-dir "$legacy_dag_wal_dir" \
+        > "$temporary/legacy-dag-round-inspection.json" \
+        2> "$temporary/legacy-dag-round-inspection.stderr" || \
+        die "persisted-head exact legacy DAG round inspection failed"
     if /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LANG=C LC_ALL=C \
         /proc/self/fd/8 recovery export \
         --data-dir "$temporary/export-source" \
@@ -18891,6 +19166,36 @@ PY
         export_exit="$?"
     fi
     [ "$export_exit" -eq 0 ] || die "persisted-head exact recovery export failed: exit=$export_exit"
+    local anchor_source_height
+    anchor_source_height="$(python3 - "$temporary/export-summary.json" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+height=value.get("source_height")
+if isinstance(height,bool) or not isinstance(height,int) or height<0:
+    raise SystemExit("persisted-head source height is malformed")
+print(height)
+PY
+    )" || die "cannot read persisted-head source height for trusted-anchor proof"
+    if [ "$anchor_source_height" -ge 137145 ]; then
+        /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+            /proc/self/fd/8 recovery inspect-legacy-block \
+            --data-dir "$temporary/export-source" \
+            --snapshot "$temporary/export-source/state.snapshot.lz4" \
+            --genesis "$genesis" --legacy-validator-set "$legacy_validators" \
+            --height 137145 --expected-state-wal-sha256 "$wal_before" \
+            --expected-snapshot-sha256 "$snapshot_before" \
+            --expected-genesis-sha256 "$genesis_sha" \
+            --expected-legacy-validator-set-sha256 "$legacy_validators_sha" \
+            --allow-unbound-legacy-wal \
+            > "$temporary/trusted-anchor-inspection.json" \
+            2> "$temporary/trusted-anchor-inspection.stderr" || \
+            die "persisted-head trusted anchor inspection failed"
+    else
+        python3 - "$temporary/trusted-anchor-inspection.json" <<'PY'
+import pathlib,sys
+pathlib.Path(sys.argv[1]).write_bytes(b"null\n")
+PY
+    fi
     python3 - "$temporary" <<'PY'
 import pathlib,stat,sys
 root=pathlib.Path(sys.argv[1]); candidate=root/"candidate.arcchkpt"
@@ -18923,6 +19228,8 @@ PY
     verify_legacy_network_quarantine "$stop_root" "$capture_id" "$node" "$freeze_sha"
     pgrep -x arc-node >/dev/null 2>&1 && die "legacy writer appeared during persisted-head export"
     python3 - "$temporary/export-summary.json" "$temporary/candidate.inspect.json" \
+        "$temporary/legacy-dag-round-inspection.json" \
+        "$temporary/trusted-anchor-inspection.json" \
         "$temporary/offline-wal-boundary.json" "$temporary/candidate.arcchkpt" "$output" \
         "$capture_id" "$node" "$freeze_sha" "$boot_id" "$binary_sha" "$genesis_sha" \
         "$validators_sha" "$legacy_validators_sha" "$snapshot" "$snapshot_before" \
@@ -18936,7 +19243,7 @@ PY
         "$archive_wal_suffix_sha" "$archive_wal_suffix_classification" \
         "$selected_source_schema" "$selected_normalization_receipt_sha" <<'PY'
 import datetime,hashlib,json,os,pathlib,re,stat,sys
-(summary_raw,inspect_raw,boundary_raw,candidate_raw,output_raw,capture,node,freeze,boot,binary_sha,genesis_sha,
+(summary_raw,inspect_raw,dag_raw,anchor_raw,boundary_raw,candidate_raw,output_raw,capture,node,freeze,boot,binary_sha,genesis_sha,
  validators_sha,legacy_sha,snapshot_raw,snapshot_sha,snapshot_size_raw,wal_raw,wal_sha,
  wal_size_raw,capture_raw,stop_raw,wal_identity_raw,snapshot_identity_raw,
  staged_wal_identity_raw,staged_snapshot_identity_raw,final_capture_sha,
@@ -18944,7 +19251,8 @@ import datetime,hashlib,json,os,pathlib,re,stat,sys
  archive_wal_raw,archive_wal_sha,archive_wal_size_raw,archive_wal_identity_raw,
  archive_suffix_bytes_raw,archive_suffix_sha,archive_suffix_classification,
  selected_source_schema,selected_normalization_receipt_sha)=sys.argv[1:]
-summary_path=pathlib.Path(summary_raw); inspect_path=pathlib.Path(inspect_raw)
+summary_path=pathlib.Path(summary_raw); inspect_path=pathlib.Path(inspect_raw); dag_path=pathlib.Path(dag_raw)
+anchor_path=pathlib.Path(anchor_raw)
 boundary_path=pathlib.Path(boundary_raw); candidate=pathlib.Path(candidate_raw); output=pathlib.Path(output_raw)
 capture_root=pathlib.Path(capture_raw); stop_root=pathlib.Path(stop_raw)
 canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
@@ -18959,6 +19267,8 @@ def staged_identity(raw):
             "uid":int(uid),"gid":int(gid),"nlink":int(nlink)}
 summary_bytes=summary_path.read_bytes(); summary=json.loads(summary_bytes)
 inspect_bytes=inspect_path.read_bytes(); inspect=json.loads(inspect_bytes)
+dag_bytes=dag_path.read_bytes(); dag=json.loads(dag_bytes)
+anchor_bytes=anchor_path.read_bytes(); anchor_inspection=json.loads(anchor_bytes)
 boundary_bytes=boundary_path.read_bytes(); boundary=json.loads(boundary_bytes)
 source_wal_identity=source_identity(wal_identity_raw)
 source_snapshot_identity=source_identity(snapshot_identity_raw)
@@ -19041,6 +19351,77 @@ if (inspect.get("status")!="UNTRUSTED_INSPECTION"
             "manifest_hash","payload_hash","source_consensus_round","created_at_unix_ms",
             "recovery_epoch","validator_set_id","transition_height","transition_block_hash"))):
     raise SystemExit("persisted-head inspect/export candidate cross-check differs")
+dag_fields={"schema","status","source_consensus_round","first_segment","last_segment",
+            "segment_count","inspected_first_segment","inspected_segment_count",
+            "inspected_entry_count","namespace_sha256","namespace","read_only"}
+namespace_fields={"schema","segment_names","inspected_tail"}
+namespace=dag.get("namespace",{}) if isinstance(dag,dict) else {}
+segment_names=namespace.get("segment_names") if isinstance(namespace,dict) else None
+tail=namespace.get("inspected_tail") if isinstance(namespace,dict) else None
+if (not isinstance(dag,dict) or set(dag)!=dag_fields
+        or dag.get("schema")!="arc.recovery.legacy-dag-round-inspection.v1"
+        or dag.get("status")!="VERIFIED_STOPPED_DAG_CURSOR" or dag.get("read_only") is not True
+        or any(isinstance(dag.get(field),bool) or not isinstance(dag.get(field),int)
+               or dag[field]<1 for field in ("source_consensus_round","segment_count",
+                    "inspected_segment_count","inspected_entry_count"))
+        or any(isinstance(dag.get(field),bool) or not isinstance(dag.get(field),int)
+               or dag[field]<0 for field in ("first_segment","last_segment","inspected_first_segment"))
+        or dag["first_segment"]>dag["inspected_first_segment"]>dag["last_segment"]
+        or dag["inspected_segment_count"]>3
+        or not isinstance(namespace,dict) or set(namespace)!=namespace_fields
+        or namespace.get("schema")!="arc.recovery.legacy-dag-wal-namespace.v1"
+        or not isinstance(segment_names,list) or len(segment_names)!=dag["segment_count"]
+        or segment_names!=sorted(segment_names) or len(set(segment_names))!=len(segment_names)
+        or not isinstance(tail,list) or len(tail)!=dag["inspected_segment_count"]
+        or [row.get("name") for row in tail if isinstance(row,dict)]
+            !=segment_names[-dag["inspected_segment_count"]:]
+        or any(not isinstance(row,dict) or set(row)!={"name","sha256","size"}
+               or re.fullmatch(r"wal-[0-9]{8}\.bin",str(row.get("name"))) is None
+               or re.fullmatch(r"[0-9a-f]{64}",str(row.get("sha256"))) is None
+               or isinstance(row.get("size"),bool) or not isinstance(row.get("size"),int)
+               or row["size"]<0 for row in tail)
+        or re.fullmatch(r"[0-9a-f]{64}",str(dag.get("namespace_sha256"))) is None
+        or hashlib.sha256(json.dumps(namespace,sort_keys=True,
+                separators=(",",":")).encode()).hexdigest()
+            !=dag["namespace_sha256"]):
+    raise SystemExit("persisted-head legacy DAG round inspection differs")
+trusted_anchor={
+    "height":137145,
+    "block_hash":"8fac459a8de0164b28e30d3f67adf6aefe01054912a3d1ae5c53765e59935a90",
+    "state_root":"d300a2bb8dbe7f6da9596b550f31efd36eb842a1861e294c25740a19c8e3bc6d",
+}
+if height<trusted_anchor["height"]:
+    if anchor_inspection is not None or anchor_bytes!=b"null\n":
+        raise SystemExit("below-anchor persisted head unexpectedly has an inspection")
+    anchor_classification="below_trusted_anchor"
+else:
+    if (not isinstance(anchor_inspection,dict) or set(anchor_inspection)!={
+            "schema","height","block_hash","state_root","input_roots"}
+            or anchor_inspection.get("schema")!="arc.recovery.legacy-block-inspection.v1"
+            or anchor_inspection.get("height")!=trusted_anchor["height"]
+            or not re.fullmatch(r"[0-9a-f]{64}",str(anchor_inspection.get("block_hash")))
+            or not re.fullmatch(r"[0-9a-f]{64}",str(anchor_inspection.get("state_root")))):
+        raise SystemExit("persisted-head trusted anchor inspection differs")
+    roots=anchor_inspection.get("input_roots")
+    if (not isinstance(roots,dict) or set(roots)!={
+            "data_dir","state_wal","snapshot","genesis","legacy_validator_set"}
+            or roots.get("state_wal",{}).get("sha256")!=wal_sha
+            or roots.get("snapshot",{}).get("sha256")!=snapshot_sha
+            or roots.get("genesis",{}).get("sha256")!=genesis_sha
+            or roots.get("legacy_validator_set",{}).get("sha256")!=legacy_sha):
+        raise SystemExit("persisted-head trusted anchor inputs differ")
+    anchor_classification=("valid_anchor_descendant"
+        if (anchor_inspection["block_hash"]==trusted_anchor["block_hash"]
+            and anchor_inspection["state_root"]==trusted_anchor["state_root"])
+        else "conflicting_anchor")
+trusted_anchor_ancestry={
+    "anchor_height":trusted_anchor["height"],
+    "anchor_block_hash":trusted_anchor["block_hash"],
+    "anchor_state_root":trusted_anchor["state_root"],
+    "classification":anchor_classification,
+    "inspection":anchor_inspection,
+    "inspection_sha256":hashlib.sha256(canonical(anchor_inspection)).hexdigest(),
+}
 boundary_keys={"schema","capture_wal_sha256","capture_wal_bytes","accepted_prefix_bytes",
                "accepted_prefix_sha256","quarantined_tail_bytes","quarantined_tail_sha256",
                "tail_reason","prefix_plus_tail_sha256","prefix_plus_tail_reconstructs_capture"}
@@ -19173,8 +19554,8 @@ elif partial.exists() and not partial.is_symlink():
     try:
         parsed=json.loads(partial.read_text(encoding="utf-8"))
         if (isinstance(parsed,dict) and parsed.get("schema") in {
-                "arc.recovery.persisted-legacy-head.v1",
-                "arc.recovery.persisted-legacy-head.v2"}):
+                "arc.recovery.persisted-legacy-head.v3",
+                "arc.recovery.persisted-legacy-head.v4"}):
             prior_source=partial
     except (UnicodeError,json.JSONDecodeError): pass
 if prior_source is not None:
@@ -19183,8 +19564,8 @@ else: completed_at=datetime.datetime.now(datetime.timezone.utc).replace(microsec
 if not isinstance(completed_at,str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",completed_at):
     raise SystemExit("persisted-head completion timestamp is malformed")
 receipt={
- "schema":("arc.recovery.persisted-legacy-head.v2" if normalization_wrapper is not None
-           else "arc.recovery.persisted-legacy-head.v1"),
+ "schema":("arc.recovery.persisted-legacy-head.v4" if normalization_wrapper is not None
+           else "arc.recovery.persisted-legacy-head.v3"),
  "source_main_commit":plan["source_commit"],
  "capture_id":capture,"node":node,"freeze_plan_sha256":freeze,"boot_id":boot,
  "inspector_binary_sha256":binary_sha,"genesis_sha256":genesis_sha,
@@ -19213,6 +19594,11 @@ receipt={
  },
  "export_summary_sha256":hashlib.sha256(summary_bytes).hexdigest(),
  "inspect_summary_sha256":hashlib.sha256(inspect_bytes).hexdigest(),
+ "legacy_dag_round":{"source_consensus_round":dag["source_consensus_round"],
+                     "namespace_sha256":dag["namespace_sha256"],
+                     "inspection":dag,
+                     "inspection_sha256":hashlib.sha256(canonical(dag)).hexdigest()},
+ "trusted_anchor_ancestry":trusted_anchor_ancestry,
  "wal_boundary_sha256":hashlib.sha256(boundary_bytes).hexdigest(),
  "export_status":"EXPORTED_UNSIGNED",
  "head":{"height":height,"block_hash":block_hash,"state_root":state_root},

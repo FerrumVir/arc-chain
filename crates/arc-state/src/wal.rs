@@ -375,6 +375,61 @@ fn cleanup_removed_wal_tombstones(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+const WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS: usize = 400;
+#[cfg(windows)]
+const WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(5);
+
+#[cfg(windows)]
+fn retry_windows_wal_retirement_move<Move, Sleep>(
+    mut move_once: Move,
+    mut sleep: Sleep,
+) -> std::io::Result<()>
+where
+    Move: FnMut() -> std::io::Result<()>,
+    Sleep: FnMut(std::time::Duration),
+{
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    // Antivirus, backup, and indexing software can briefly open a just-closed
+    // WAL segment without FILE_SHARE_DELETE. Retry only those two transient
+    // Windows errors. Namespace conflicts, permission errors, and every other
+    // failure remain fail-closed.
+    let mut last_transient = None;
+    for attempt in 0..WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS {
+        match move_once() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code)
+                        if code == ERROR_SHARING_VIOLATION as i32
+                            || code == ERROR_LOCK_VIOLATION as i32
+                ) =>
+            {
+                last_transient = Some(error);
+                if attempt + 1 < WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS {
+                    sleep(WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_transient.expect("a bounded WAL retirement retry always records its transient error"))
+}
+
+#[cfg(windows)]
+fn move_wal_segment_to_tombstone_create_only_with_retry(
+    source: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    retry_windows_wal_retirement_move(
+        || move_file_create_only_write_through(source, destination),
+        std::thread::sleep,
+    )
+}
+
 fn durably_remove_wal_segment(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -384,7 +439,7 @@ fn durably_remove_wal_segment(path: &Path) -> std::io::Result<()> {
             .and_then(|name| name.to_str())
             .unwrap_or("wal");
         let tombstone = parent.join(format!(".{file_name}.removed-{}.tmp", uuid::Uuid::new_v4()));
-        move_file_create_only_write_through(path, &tombstone)?;
+        move_wal_segment_to_tombstone_create_only_with_retry(path, &tombstone)?;
         remove_wal_tombstone_best_effort(&tombstone);
         Ok(())
     }
@@ -1124,7 +1179,7 @@ impl WalWriter {
         sync_result.map_err(|error| std::io::Error::new(error.kind(), error))?;
 
         synchronized();
-        Self::delete_segments_before_in_dir(&self.wal_dir, wal_sequence, 2)
+        Self::delete_segments_before_live_writer_fenced(&self.wal_dir, wal_sequence, 2)
     }
 
     /// Offline-only static version: scan an inactive `wal_dir` for segment
@@ -1136,6 +1191,27 @@ impl WalWriter {
         wal_dir: &Path,
         wal_sequence: u64,
         min_retain: usize,
+    ) -> std::io::Result<u32> {
+        Self::delete_segments_before_in_dir_inner(wal_dir, wal_sequence, min_retain, false)
+    }
+
+    /// The admission lock and successful Sync acknowledgement must remain in
+    /// force for this complete call. On Windows only the final segment uses a
+    /// read-only opener compatible with the still-live append handle; every
+    /// offline/recovery reader retains its exclusive fail-closed open.
+    fn delete_segments_before_live_writer_fenced(
+        wal_dir: &Path,
+        wal_sequence: u64,
+        min_retain: usize,
+    ) -> std::io::Result<u32> {
+        Self::delete_segments_before_in_dir_inner(wal_dir, wal_sequence, min_retain, true)
+    }
+
+    fn delete_segments_before_in_dir_inner(
+        wal_dir: &Path,
+        wal_sequence: u64,
+        min_retain: usize,
+        live_writer_fenced: bool,
     ) -> std::io::Result<u32> {
         cleanup_removed_wal_tombstones(wal_dir)?;
         let min_retain = if min_retain < 2 { 2 } else { min_retain };
@@ -1159,7 +1235,16 @@ impl WalWriter {
         for (segment_index, seg_path) in segments.iter().enumerate() {
             // Pruning is destructive, so a corrupt frame or cross-segment
             // sequence gap must abort before any namespace entry is removed.
+            #[cfg(windows)]
+            let entries = if live_writer_fenced && segment_index + 1 == segments.len() {
+                read_wal_strict_live_writer_segment(seg_path, &mut expected_sequence)?
+            } else {
+                read_wal_strict_segment(seg_path, &mut expected_sequence)?
+            };
+            #[cfg(not(windows))]
             let entries = read_wal_strict_segment(seg_path, &mut expected_sequence)?;
+            #[cfg(not(windows))]
+            let _ = live_writer_fenced;
             if !entries.is_empty() {
                 last_nonempty_segment = Some(segment_index);
             }
@@ -2394,7 +2479,23 @@ fn read_wal_strict_segment(
     path: &Path,
     expected_sequence: &mut Option<u64>,
 ) -> std::io::Result<Vec<WalEntry>> {
-    let file = File::open(path)?;
+    let file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+    read_wal_strict_segment_from_file(file, expected_sequence)
+}
+
+#[cfg(windows)]
+fn read_wal_strict_live_writer_segment(
+    path: &Path,
+    expected_sequence: &mut Option<u64>,
+) -> std::io::Result<Vec<WalEntry>> {
+    let file = arc_crypto::secret_file::open_owned_nofollow_shared_read(path)?;
+    read_wal_strict_segment_from_file(file, expected_sequence)
+}
+
+fn read_wal_strict_segment_from_file(
+    file: File,
+    expected_sequence: &mut Option<u64>,
+) -> std::io::Result<Vec<WalEntry>> {
     let original_bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -2524,6 +2625,119 @@ pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntr
         all_entries.extend(read_wal_strict_segment(&segment, &mut expected_sequence)?);
     }
     Ok(all_entries)
+}
+
+/// A bounded, fail-closed view of the durable tail of a segmented legacy DAG
+/// WAL.  Legacy startup historically derives its resume cursor from the last
+/// three segments so an empty post-rotation segment cannot hide the preceding
+/// round.  Recovery uses the same bounded window, while additionally requiring
+/// a contiguous segment namespace and strict frame/checksum/sequence decoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StrictWalTailInspection {
+    pub first_segment: u64,
+    pub last_segment: u64,
+    pub segment_count: u64,
+    pub inspected_first_segment: u64,
+    pub inspected_segment_count: u64,
+    pub inspected_entry_count: u64,
+    pub source_consensus_round: u64,
+}
+
+/// Strictly inspect the bounded legacy DAG-WAL tail used to derive a recovery
+/// consensus cursor.
+///
+/// Unlike [`latest_block_height_in_wal_dir`], this is fallible: namespace
+/// gaps, malformed frames, checksum failures, and sequence discontinuities in
+/// the inspected tail abort the operation.  Only the final three segments are
+/// decoded, matching the bounded legacy restart rule and avoiding an
+/// unbounded replay of historical DAG traffic during an offline cutover.
+pub fn inspect_wal_dir_tail_strict(
+    dir: impl AsRef<Path>,
+) -> std::io::Result<StrictWalTailInspection> {
+    const MAX_SEGMENTS_TO_SCAN: usize = 3;
+
+    let segments = WalWriter::list_segments_strict(dir.as_ref())?;
+    let first_segment = WalWriter::validate_segment_namespace(&segments)?;
+    let segment_count = u64::try_from(segments.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL segment count exceeds u64",
+        )
+    })?;
+    if segments.is_empty() {
+        return Ok(StrictWalTailInspection {
+            first_segment: 0,
+            last_segment: 0,
+            segment_count: 0,
+            inspected_first_segment: 0,
+            inspected_segment_count: 0,
+            inspected_entry_count: 0,
+            source_consensus_round: 0,
+        });
+    }
+
+    let start = segments.len().saturating_sub(MAX_SEGMENTS_TO_SCAN);
+    let inspected = &segments[start..];
+    let inspected_first_segment =
+        WalWriter::parse_segment_number(&inspected[0]).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL segment name: {}", inspected[0].display()),
+            )
+        })?;
+    let last_segment = WalWriter::parse_segment_number(segments.last().expect("non-empty"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "final WAL segment name is malformed",
+            )
+        })?;
+    let mut expected_sequence = (inspected_first_segment == 0).then_some(0);
+    let mut inspected_entry_count = 0u64;
+    let mut source_consensus_round = 0u64;
+    for segment in inspected {
+        let entries = read_wal_strict_segment(segment, &mut expected_sequence)?;
+        inspected_entry_count = inspected_entry_count
+            .checked_add(u64::try_from(entries.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL tail entry count exceeds u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL tail entry count overflows u64",
+                )
+            })?;
+        source_consensus_round = entries
+            .iter()
+            .map(|entry| entry.block_height)
+            .max()
+            .unwrap_or(source_consensus_round)
+            .max(source_consensus_round);
+    }
+    if segment_count > MAX_SEGMENTS_TO_SCAN as u64 && inspected_entry_count == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "latest three WAL segments are all empty",
+        ));
+    }
+
+    Ok(StrictWalTailInspection {
+        first_segment,
+        last_segment,
+        segment_count,
+        inspected_first_segment,
+        inspected_segment_count: u64::try_from(inspected.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "inspected WAL segment count exceeds u64",
+            )
+        })?,
+        inspected_entry_count,
+        source_consensus_round,
+    })
 }
 
 /// Find the highest `block_height` recorded in any WAL segment under `dir`.
@@ -3275,18 +3489,32 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn live_wal_identity_probe_allows_reopen_but_keeps_writer_exclusive() {
-        let dir = tmp_dir("windows_live_identity_probe");
+    fn live_wal_shared_read_is_narrow_and_keeps_writer_exclusive() {
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let dir = tmp_dir("windows_live_shared_read");
         let path = dir.join("state.wal");
 
         let writer = WalWriter::new(&path).unwrap();
         writer.append(WalOp::Checkpoint(hash_bytes(b"first")), 1);
         writer.sync().unwrap();
 
+        let exclusive_error = read_wal_strict(&path).unwrap_err();
+        assert_eq!(
+            exclusive_error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32)
+        );
+
+        let mut expected_sequence = Some(0);
+        let live_entries =
+            read_wal_strict_live_writer_segment(&path, &mut expected_sequence).unwrap();
+        assert_eq!(live_entries.len(), 1);
+        assert_eq!(live_entries[0].sequence, 0);
+
         let second = WalWriter::new(&path);
         assert!(
             second.is_err(),
-            "the compatible identity probe must not admit a second writer"
+            "the compatible shared reader must not admit a second writer"
         );
         drop(writer);
 
@@ -3970,6 +4198,119 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_wal_retirement_retry_accepts_only_sharing_and_lock_violations() {
+        use std::collections::VecDeque;
+
+        let mut outcomes = VecDeque::from([
+            Err(std::io::Error::from_raw_os_error(32)),
+            Err(std::io::Error::from_raw_os_error(33)),
+            Ok(()),
+        ]);
+        let mut sleeps = Vec::new();
+        retry_windows_wal_retirement_move(
+            || outcomes.pop_front().expect("one configured move outcome"),
+            |duration| sleeps.push(duration),
+        )
+        .unwrap();
+        assert!(outcomes.is_empty());
+        assert_eq!(
+            sleeps,
+            vec![
+                WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY,
+                WINDOWS_WAL_RETIREMENT_MOVE_RETRY_DELAY,
+            ]
+        );
+
+        let mut move_attempts = 0;
+        let mut sleep_attempts = 0;
+        let error = retry_windows_wal_retirement_move(
+            || {
+                move_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(5))
+            },
+            |_| sleep_attempts += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(move_attempts, 1);
+        assert_eq!(sleep_attempts, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_retry_is_bounded() {
+        let mut move_attempts = 0;
+        let mut sleep_attempts = 0;
+        let error = retry_windows_wal_retirement_move(
+            || {
+                move_attempts += 1;
+                Err(std::io::Error::from_raw_os_error(32))
+            },
+            |_| sleep_attempts += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(move_attempts, WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS);
+        assert_eq!(sleep_attempts, WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS - 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_move_retries_a_real_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let dir = tmp_dir("wal_create_only_move_sharing_violation");
+        let source = dir.join("wal-00000000.bin");
+        let destination = dir.join(".wal-00000000.bin.removed-test.tmp");
+        fs::write(&source, b"immutable WAL segment").unwrap();
+
+        // Deliberately omit FILE_SHARE_DELETE so MoveFileExW must return a
+        // sharing violation until this independently owned handle closes.
+        let mut blocker = Some(
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&source)
+                .unwrap(),
+        );
+        let mut sleep_attempts = 0;
+
+        retry_windows_wal_retirement_move(
+            || move_file_create_only_write_through(&source, &destination),
+            |_| {
+                sleep_attempts += 1;
+                drop(blocker.take());
+            },
+        )
+        .unwrap();
+        assert_eq!(sleep_attempts, 1);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"immutable WAL segment");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wal_retirement_move_never_replaces_a_destination() {
+        let dir = tmp_dir("wal_create_only_move_existing_destination");
+        let source = dir.join("wal-00000000.bin");
+        let destination = dir.join(".wal-00000000.bin.removed-existing.tmp");
+        fs::write(&source, b"live WAL segment").unwrap();
+        fs::write(&destination, b"existing tombstone").unwrap();
+
+        let error = move_wal_segment_to_tombstone_create_only_with_retry(&source, &destination)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_ne!(error.raw_os_error(), Some(32));
+        assert_ne!(error.raw_os_error(), Some(33));
+        assert_eq!(fs::read(&source).unwrap(), b"live WAL segment");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing tombstone");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn segmented_wal_restores_a_staged_root_before_discovery() {
         let parent =
             std::env::temp_dir().join(format!("arc-wal-staged-root-{}", uuid::Uuid::new_v4()));
@@ -4110,6 +4451,48 @@ mod tests {
             latest, 199,
             "helper must find max round even when newest segment is the empty post-rotation file"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_tail_inspection_returns_the_exact_durable_round() {
+        let dir = tmp_dir("strict_tail_round");
+        {
+            let writer = WalWriter::with_segments(&dir, 1024).expect("create");
+            for round in 0u64..200 {
+                writer.append(WalOp::Checkpoint(Hash256::ZERO), round);
+            }
+            writer.sync().unwrap();
+            drop(writer);
+        }
+
+        let inspection = inspect_wal_dir_tail_strict(&dir).unwrap();
+        assert_eq!(inspection.source_consensus_round, 199);
+        assert!(inspection.segment_count >= inspection.inspected_segment_count);
+        assert!((1..=3).contains(&inspection.inspected_segment_count));
+        assert!(inspection.inspected_entry_count > 0);
+        assert_eq!(inspection.first_segment, 0);
+        assert!(inspection.last_segment >= inspection.inspected_first_segment);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_tail_inspection_rejects_a_corrupt_final_segment() {
+        let dir = tmp_dir("strict_tail_corrupt");
+        {
+            let writer = WalWriter::with_segments(&dir, u64::MAX).expect("create");
+            writer.append(WalOp::Checkpoint(Hash256::ZERO), 77);
+            writer.sync().unwrap();
+            drop(writer);
+        }
+        let segment = dir.join("wal-00000000.bin");
+        let mut bytes = fs::read(&segment).unwrap();
+        *bytes.last_mut().expect("encoded WAL entry") ^= 0x80;
+        fs::write(&segment, bytes).unwrap();
+
+        let error = inspect_wal_dir_tail_strict(&dir).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum"));
         let _ = fs::remove_dir_all(&dir);
     }
 

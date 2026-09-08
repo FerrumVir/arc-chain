@@ -177,6 +177,7 @@ def validate_descriptor(
         descriptor,
         {
             "approved_validators",
+            "canonical_source",
             "canonical_inspection",
             "capture_id",
             "checkpoint_certificate",
@@ -300,9 +301,12 @@ def validate_descriptor(
         inspection["format_version"] != 1
         or inspection["chain_id"] != "0x415243"
         or inspection["protocol_version"] != "3.0.0"
-        or inspection["source_height"] != 137145
-        or inspection["transition_height"] != 137146
-        or inspection["community_rewards_v1_activation_height"] != 137146
+        or inspection["source_height"] < cutover.TRUSTED_CHECKPOINT_MIN_HEIGHT
+        or inspection["transition_height"] != inspection["source_height"] + 1
+        or inspection["community_rewards_v1_activation_height"]
+        != cutover.COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT
+        or inspection["community_rewards_v1_activation_height"]
+        > inspection["transition_height"]
         or inspection["recovery_epoch"] != 1
         or inspection["validator_set_id"] != 1
         or inspection["validator_count"] != 6
@@ -323,6 +327,51 @@ def validate_descriptor(
         fail("canonical inspection network genesis must not be zero")
     require_int(inspection["source_consensus_round"], "source consensus round")
     require_int(inspection["created_at_unix_ms"], "checkpoint creation time", minimum=1)
+    canonical_source = require_keys(
+        descriptor["canonical_source"],
+        {
+            "node",
+            "source_height",
+            "source_block_hash",
+            "source_state_root",
+            "source_consensus_round",
+            "snapshot_sha256",
+            "wal_sha256",
+            "persisted_head_sha256",
+            "legacy_dag_round_inspection_sha256",
+            "legacy_dag_wal_namespace_sha256",
+        },
+        "canonical captured source",
+    )
+    if canonical_source["node"] not in {
+        name for name, _host in cutover.recovery.PRODUCTION_FLEET
+    }:
+        fail("canonical captured source node is not in the production fleet")
+    for key in (
+        "source_block_hash",
+        "source_state_root",
+        "snapshot_sha256",
+        "wal_sha256",
+        "persisted_head_sha256",
+        "legacy_dag_round_inspection_sha256",
+        "legacy_dag_wal_namespace_sha256",
+    ):
+        require_hash(canonical_source[key], f"canonical captured source {key}")
+    require_int(canonical_source["source_height"], "canonical captured source height")
+    require_int(
+        canonical_source["source_consensus_round"],
+        "canonical captured source consensus round",
+    )
+    if any(
+        canonical_source[field] != inspection[field]
+        for field in (
+            "source_height",
+            "source_block_hash",
+            "source_state_root",
+            "source_consensus_round",
+        )
+    ):
+        fail("canonical captured source differs from checkpoint inspection")
 
 
 def validate_boundary(
@@ -360,12 +409,26 @@ def validate_boundary(
         "threat_model",
     }
     require_keys(boundary, expected_fields, "legacy maintenance boundary")
+    source_height = descriptor["canonical_inspection"]["source_height"]
+    observed_cutoff = require_int(
+        boundary["observed_cutoff_height"], "legacy observed cutoff height"
+    )
+    continuity_margin = require_int(
+        boundary["continuity_safety_margin"],
+        "legacy continuity safety margin",
+        minimum=1,
+    )
+    legacy_public_max = require_int(
+        boundary["legacy_public_max_height"], "legacy public maximum height"
+    )
     if (
         boundary["schema"] != "arc.recovery.legacy-maintenance-boundary.v1"
         or boundary["source_main_commit"] != commit
         or boundary["freeze_plan_sha256"] != descriptor["freeze_plan_sha256"]
         or boundary["capture_id"] != descriptor["capture_id"]
-        or boundary["legacy_public_max_height"] != 137145
+        or observed_cutoff < source_height
+        or continuity_margin != cutover.recovery.LEGACY_CONTINUITY_SAFETY_MARGIN
+        or legacy_public_max != observed_cutoff + continuity_margin
         or boundary["global_absence_claimed"] is not False
     ):
         fail("legacy maintenance boundary identity differs")
@@ -384,6 +447,32 @@ def validate_boundary(
             cutover.exact_utc(boundary[key], f"legacy maintenance boundary {key}")
         except cutover.CutoverAssetError as error:
             fail(str(error))
+
+    nodes = boundary["nodes"]
+    if not isinstance(nodes, list) or len(nodes) != len(cutover.recovery.PRODUCTION_FLEET):
+        fail("legacy maintenance boundary does not contain the exact six-node fleet")
+    canonical_source = descriptor["canonical_source"]
+    source_node = next(
+        (row for row in nodes if row.get("node") == canonical_source["node"]),
+        None,
+    )
+    source_head = (
+        source_node.get("final_persisted_head", {}).get("tuple", {})
+        if isinstance(source_node, dict)
+        else {}
+    )
+    identity = descriptor["canonical_inspection"]
+    if (
+        not isinstance(source_node, dict)
+        or source_node.get("final_persisted_head", {}).get("evidence_sha256")
+        != canonical_source["persisted_head_sha256"]
+        or source_head.get("height") != identity["source_height"]
+        or str(source_head.get("block_hash", "")).removeprefix("0x")
+        != identity["source_block_hash"].removeprefix("0x")
+        or str(source_head.get("state_root", "")).removeprefix("0x")
+        != identity["source_state_root"].removeprefix("0x")
+    ):
+        fail("checkpoint source tuple differs from its selected captured head")
 
 
 def validate_policy(
@@ -415,7 +504,10 @@ def validate_policy(
         "global_legacy_absence_claimed",
         "legacy_admission_cutoff_utc",
         "legacy_exit_clean_claimed",
+        "legacy_continuity_safety_margin",
         "legacy_maintenance_boundary_sha256",
+        "legacy_observed_cutoff_height",
+        "legacy_public_max_height",
         "legacy_restart_allowed",
         "legacy_validators",
         "legacy_worker_rpc",
@@ -460,6 +552,12 @@ def validate_policy(
         != boundary["all_controlled_stopped_at"]
         or policy["legacy_admission_cutoff_utc"]
         != boundary["all_controlled_stopped_at"]
+        or policy["legacy_observed_cutoff_height"]
+        != boundary["observed_cutoff_height"]
+        or policy["legacy_continuity_safety_margin"]
+        != boundary["continuity_safety_margin"]
+        or policy["legacy_public_max_height"]
+        != boundary["legacy_public_max_height"]
     ):
         fail("cutover policy provenance/hash/time binding differs")
     projected = {

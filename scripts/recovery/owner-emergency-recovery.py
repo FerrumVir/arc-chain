@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, NoReturn, Sequence
 
 
-RECEIPT_SCHEMA = "arc.recovery.owner-emergency-recovery.v2"
+RECEIPT_SCHEMA = "arc.recovery.owner-emergency-recovery.v3"
 REPOSITORY = "FerrumVir/arc-chain"
 PROTECTED_BRANCH = "main"
 WORKFLOW_PATH = ".github/workflows/owner-emergency-recovery-approval.yml"
@@ -44,19 +44,21 @@ REASON = (
 )
 RISK_ACKNOWLEDGEMENT = (
     "I authorize five reviewed ARC validator identities to sign the recovery "
-    "checkpoint rooted at preserved source block 137145 and transition block "
-    "137146. I understand that the six legacy forks remain preserved read-only, "
-    "that rollback cannot rewrite signed history, and that this receipt does not "
-    "represent approval by six independent humans."
+    "checkpoint rooted at the capture-derived preserved source block and its "
+    "immediate successor transition. I understand that the six legacy forks "
+    "remain preserved read-only, that rollback cannot rewrite signed history, "
+    "and that this receipt does not represent approval by six independent humans."
 )
-SOURCE_HEIGHT = 137_145
-TRANSITION_HEIGHT = 137_146
+TRUSTED_ANCHOR_HEIGHT = 137_145
+COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT = 137_146
+CONTINUITY_SAFETY_MARGIN = 128
 RECOVERY_EPOCH = 1
 VALIDATOR_SET_ID = 1
 SIGNATURES_REQUIRED = 5
 TOTAL_STAKE = 40_000_000
 MINIMUM_SIGNED_STAKE = TOTAL_STAKE * 2 // 3 + 1
 MAX_JSON_BYTES = 256 * 1024
+MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
 DEFAULT_MAX_AGE_SECONDS = 900
 FUTURE_TOLERANCE_SECONDS = 30
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -171,6 +173,13 @@ def require_commit(value: object, label: str) -> str:
 def require_positive_int(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         fail(f"{label} must be a positive integer")
+    return value
+
+
+def require_safe_positive_int(value: object, label: str) -> int:
+    value = require_positive_int(value, label)
+    if value > MAX_SAFE_JSON_INTEGER:
+        fail(f"{label} exceeds the exact JSON integer bound")
     return value
 
 
@@ -486,6 +495,14 @@ def scope_value(
     source_main_sha: str,
     checkpoint_manifest_hash: str,
     validator_public_keys_sha256: str,
+    source_height: int,
+    transition_height: int,
+    source_block_hash: str,
+    source_state_root: str,
+    source_consensus_round: int,
+    observed_cutoff_height: int,
+    reopening_floor_height: int,
+    legacy_maintenance_boundary_sha256: str,
 ) -> dict[str, Any]:
     return {
         "checkpoint_manifest_hash": require_checkpoint_hash(
@@ -494,9 +511,26 @@ def scope_value(
         "protected_branch": PROTECTED_BRANCH,
         "recovery_epoch": RECOVERY_EPOCH,
         "repository": REPOSITORY,
-        "source_height": SOURCE_HEIGHT,
+        "source_block_hash": require_hash(source_block_hash, "source block hash"),
+        "source_consensus_round": require_safe_positive_int(
+            source_consensus_round, "source consensus round"
+        ),
+        "source_height": require_safe_positive_int(source_height, "source height"),
         "source_main_sha": require_commit(source_main_sha, "protected-main commit"),
-        "transition_height": TRANSITION_HEIGHT,
+        "source_state_root": require_hash(source_state_root, "source state root"),
+        "transition_height": require_safe_positive_int(
+            transition_height, "transition height"
+        ),
+        "observed_cutoff_height": require_safe_positive_int(
+            observed_cutoff_height, "observed cutoff height"
+        ),
+        "reopening_floor_height": require_safe_positive_int(
+            reopening_floor_height, "reopening floor height"
+        ),
+        "legacy_maintenance_boundary_sha256": require_hash(
+            legacy_maintenance_boundary_sha256,
+            "legacy maintenance boundary SHA-256",
+        ),
         "validator_public_keys_sha256": require_hash(
             validator_public_keys_sha256, "validator public-key manifest SHA-256"
         ),
@@ -512,9 +546,15 @@ def validate_scope(value: object) -> dict[str, Any]:
             "protected_branch",
             "recovery_epoch",
             "repository",
+            "source_block_hash",
+            "source_consensus_round",
             "source_height",
             "source_main_sha",
+            "source_state_root",
             "transition_height",
+            "observed_cutoff_height",
+            "reopening_floor_height",
+            "legacy_maintenance_boundary_sha256",
             "validator_public_keys_sha256",
             "validator_set_id",
         },
@@ -523,12 +563,41 @@ def validate_scope(value: object) -> dict[str, Any]:
     if (
         scope["repository"] != REPOSITORY
         or scope["protected_branch"] != PROTECTED_BRANCH
-        or scope["source_height"] != SOURCE_HEIGHT
-        or scope["transition_height"] != TRANSITION_HEIGHT
         or scope["recovery_epoch"] != RECOVERY_EPOCH
         or scope["validator_set_id"] != VALIDATOR_SET_ID
     ):
         fail("authorization scope differs from the reviewed ARC v0.8 recovery boundary")
+    source_height = require_safe_positive_int(
+        scope["source_height"], "authorization source height"
+    )
+    transition_height = require_safe_positive_int(
+        scope["transition_height"], "authorization transition height"
+    )
+    observed_cutoff_height = require_safe_positive_int(
+        scope["observed_cutoff_height"], "authorization observed cutoff height"
+    )
+    reopening_floor_height = require_safe_positive_int(
+        scope["reopening_floor_height"], "authorization reopening floor height"
+    )
+    if source_height < TRUSTED_ANCHOR_HEIGHT:
+        fail("authorization source height is below the reviewed history anchor")
+    if transition_height != source_height + 1:
+        fail("authorization transition height must equal source height plus one")
+    if source_height > observed_cutoff_height:
+        fail("authorization source height exceeds the maximum observed legacy cutoff")
+    if reopening_floor_height != observed_cutoff_height + CONTINUITY_SAFETY_MARGIN:
+        fail("authorization reopening floor must equal observed cutoff plus 128")
+    if COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT > transition_height:
+        fail("community rewards activation cannot follow the recovery transition")
+    require_hash(scope["source_block_hash"], "authorization source block hash")
+    require_hash(scope["source_state_root"], "authorization source state root")
+    require_safe_positive_int(
+        scope["source_consensus_round"], "authorization source consensus round"
+    )
+    require_hash(
+        scope["legacy_maintenance_boundary_sha256"],
+        "authorization legacy maintenance boundary SHA-256",
+    )
     require_commit(scope["source_main_sha"], "authorization protected-main commit")
     normalized_checkpoint = require_checkpoint_hash(
         scope["checkpoint_manifest_hash"], "authorization checkpoint hash"
@@ -768,6 +837,14 @@ def verify_github_artifact(args: argparse.Namespace) -> str:
         args.source_main_sha,
         args.checkpoint_manifest_hash,
         args.validator_public_keys_sha256,
+        args.source_height,
+        args.transition_height,
+        args.source_block_hash,
+        args.source_state_root,
+        args.source_consensus_round,
+        args.observed_cutoff_height,
+        args.reopening_floor_height,
+        args.legacy_maintenance_boundary_sha256,
     )
     if receipt["scope"] != expected_scope:
         fail("owner emergency-recovery receipt does not authorize these exact signing inputs")
@@ -838,6 +915,14 @@ def parser() -> argparse.ArgumentParser:
     verifier.add_argument("--artifact-digest", required=True)
     verifier.add_argument("--source-main-sha", required=True)
     verifier.add_argument("--checkpoint-manifest-hash", required=True)
+    verifier.add_argument("--source-height", required=True, type=int)
+    verifier.add_argument("--transition-height", required=True, type=int)
+    verifier.add_argument("--source-block-hash", required=True)
+    verifier.add_argument("--source-state-root", required=True)
+    verifier.add_argument("--source-consensus-round", required=True, type=int)
+    verifier.add_argument("--observed-cutoff-height", required=True, type=int)
+    verifier.add_argument("--reopening-floor-height", required=True, type=int)
+    verifier.add_argument("--legacy-maintenance-boundary-sha256", required=True)
     verifier.add_argument("--validator-public-keys", required=True, type=Path)
     verifier.add_argument("--validator-public-keys-sha256", required=True)
     verifier.add_argument("--output", required=True, type=Path)

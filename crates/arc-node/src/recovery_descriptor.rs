@@ -24,8 +24,7 @@ const DESCRIPTOR_SCHEMA: &str = "arc-recovery-checkpoint-descriptor/v1";
 const DESCRIPTOR_MAX_BYTES: u64 = 1024 * 1024;
 const EXPECTED_REPOSITORY: &str = "FerrumVir/arc-chain";
 const EXPECTED_CHAIN_ID: &str = "0x415243";
-const EXPECTED_SOURCE_HEIGHT: u64 = 137_145;
-const EXPECTED_TRANSITION_HEIGHT: u64 = 137_146;
+const MINIMUM_SOURCE_HEIGHT: u64 = 137_145;
 const EXPECTED_RECOVERY_EPOCH: u64 = 1;
 const EXPECTED_VALIDATOR_SET_ID: u64 = 1;
 const EXPECTED_REWARD_ACTIVATION_HEIGHT: u64 = 137_146;
@@ -81,6 +80,7 @@ struct RecoveryCheckpointDescriptor {
     inspector_binary_sha256: String,
     checkpoint_file: DescriptorCheckpointFile,
     canonical_inspection: DescriptorInspection,
+    canonical_source: DescriptorCanonicalSource,
     checkpoint_certificate: DescriptorCertificate,
     approved_validators: Vec<DescriptorApprovedValidator>,
     verified_quorum: DescriptorQuorum,
@@ -117,6 +117,21 @@ struct DescriptorInspection {
     validator_count: usize,
     #[serde(deserialize_with = "deserialize_explicit_optional_u64")]
     community_rewards_v1_activation_height: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DescriptorCanonicalSource {
+    node: String,
+    source_height: u64,
+    source_block_hash: String,
+    source_state_root: String,
+    source_consensus_round: u64,
+    snapshot_sha256: String,
+    wal_sha256: String,
+    persisted_head_sha256: String,
+    legacy_dag_round_inspection_sha256: String,
+    legacy_dag_wal_namespace_sha256: String,
 }
 
 /// JSON must contain the activation field even when its value is `null`.
@@ -353,16 +368,64 @@ fn verify_descriptor_with_expected(
         inspection.validator_count == RECOVERY_VALIDATOR_SET_SIZE,
         "descriptor inspection has the wrong validator count"
     );
+    let expected_transition_height = inspection
+        .source_height
+        .checked_add(1)
+        .context("descriptor source height cannot have an H+1 transition")?;
     ensure!(
         inspection.chain_id == EXPECTED_CHAIN_ID
-            && inspection.source_height == EXPECTED_SOURCE_HEIGHT
-            && inspection.transition_height == EXPECTED_TRANSITION_HEIGHT
+            && inspection.source_height >= MINIMUM_SOURCE_HEIGHT
+            && inspection.transition_height == expected_transition_height
             && inspection.recovery_epoch == EXPECTED_RECOVERY_EPOCH
             && inspection.validator_set_id == EXPECTED_VALIDATOR_SET_ID
             && inspection.community_rewards_v1_activation_height
-                == Some(EXPECTED_REWARD_ACTIVATION_HEIGHT),
-        "descriptor does not bind the fixed ARC H=137145 to H+1=137146 recovery policy"
+                == Some(EXPECTED_REWARD_ACTIVATION_HEIGHT)
+            && EXPECTED_REWARD_ACTIVATION_HEIGHT <= inspection.transition_height,
+        "descriptor does not bind a capture-derived ARC H at or above 137145 to H+1 while preserving the 137146 rewards floor"
     );
+
+    let canonical_source = &descriptor.canonical_source;
+    ensure!(
+        EXPECTED_FLEET
+            .iter()
+            .any(|(name, _, _, _)| canonical_source.node == *name),
+        "descriptor canonical source is not a controlled ARC fleet node"
+    );
+    ensure!(
+        canonical_source.source_height == inspection.source_height
+            && canonical_source.source_block_hash == inspection.source_block_hash
+            && canonical_source.source_state_root == inspection.source_state_root
+            && canonical_source.source_consensus_round == inspection.source_consensus_round
+            && canonical_source.source_consensus_round > 0,
+        "descriptor canonical source tuple differs from the validator-signed checkpoint source"
+    );
+    for (value, label) in [
+        (
+            canonical_source.snapshot_sha256.as_str(),
+            "canonical source snapshot SHA-256",
+        ),
+        (
+            canonical_source.wal_sha256.as_str(),
+            "canonical source WAL SHA-256",
+        ),
+        (
+            canonical_source.persisted_head_sha256.as_str(),
+            "canonical source persisted-head SHA-256",
+        ),
+        (
+            canonical_source.legacy_dag_round_inspection_sha256.as_str(),
+            "canonical source legacy DAG-round inspection SHA-256",
+        ),
+        (
+            canonical_source.legacy_dag_wal_namespace_sha256.as_str(),
+            "canonical source legacy DAG-WAL namespace SHA-256",
+        ),
+    ] {
+        ensure!(
+            is_lower_hex(value, 64) && value.bytes().any(|byte| byte != b'0'),
+            "descriptor {label} must be one non-zero lowercase 32-byte hexadecimal value"
+        );
+    }
     let protocol_version = parse_protocol_version(&inspection.protocol_version)?;
 
     let descriptor_genesis_hash = parse_hash(
@@ -676,7 +739,7 @@ mod tests {
         verify_descriptor_with_expected(descriptor, Some(genesis), &expected)
     }
 
-    fn fixture() -> (RecoveryCheckpointDescriptor, config::GenesisConfig) {
+    fn fixture_at(source_height: u64) -> (RecoveryCheckpointDescriptor, config::GenesisConfig) {
         let keys = (0..RECOVERY_VALIDATOR_SET_SIZE)
             .map(|_| KeyPair::generate_ed25519())
             .collect::<Vec<_>>();
@@ -720,7 +783,7 @@ mod tests {
             format_version: ARCCHKPT_FORMAT_VERSION,
             chain_id: genesis.chain.chain_id.clone(),
             genesis_hash: genesis.network_hash(false).unwrap(),
-            source_height: 137_145,
+            source_height,
             source_block_hash: hash_bytes(b"descriptor source block"),
             source_state_root: hash_bytes(b"descriptor source state"),
             source_consensus_round: 91,
@@ -814,6 +877,18 @@ mod tests {
                 community_rewards_v1_activation_height: manifest
                     .community_rewards_v1_activation_height,
             },
+            canonical_source: DescriptorCanonicalSource {
+                node: "nyc".into(),
+                source_height: manifest.source_height,
+                source_block_hash: manifest.source_block_hash.to_hex(),
+                source_state_root: manifest.source_state_root.to_hex(),
+                source_consensus_round: manifest.source_consensus_round,
+                snapshot_sha256: "1".repeat(64),
+                wal_sha256: "2".repeat(64),
+                persisted_head_sha256: "3".repeat(64),
+                legacy_dag_round_inspection_sha256: "4".repeat(64),
+                legacy_dag_wal_namespace_sha256: "5".repeat(64),
+            },
             checkpoint_certificate: DescriptorCertificate {
                 signing_hash: signing_hash.to_hex(),
                 validators: validators
@@ -843,6 +918,10 @@ mod tests {
         (descriptor, genesis)
     }
 
+    fn fixture() -> (RecoveryCheckpointDescriptor, config::GenesisConfig) {
+        fixture_at(MINIMUM_SOURCE_HEIGHT)
+    }
+
     #[test]
     fn certificate_reconstructs_and_verifies_the_exact_manifest() {
         let (descriptor, genesis) = fixture();
@@ -859,11 +938,28 @@ mod tests {
         let error = verify_fixture_descriptor(&descriptor, &genesis)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("fixed ARC H=137145 to H+1=137146 recovery policy"));
+        assert!(error.contains("capture-derived ARC H at or above 137145"));
 
         let (mut descriptor, genesis) = fixture();
         descriptor.canonical_inspection.full_state_root = hash_bytes(b"forged").to_hex();
         assert!(verify_fixture_descriptor(&descriptor, &genesis).is_err());
+    }
+
+    #[test]
+    fn canonical_source_must_match_the_signed_tuple_and_bind_capture_evidence() {
+        let (mut descriptor, genesis) = fixture();
+        descriptor.canonical_source.source_consensus_round += 1;
+        let error = verify_fixture_descriptor(&descriptor, &genesis)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical source tuple differs"));
+
+        let (mut descriptor, genesis) = fixture();
+        descriptor.canonical_source.persisted_head_sha256 = "0".repeat(64);
+        let error = verify_fixture_descriptor(&descriptor, &genesis)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("persisted-head SHA-256"));
     }
 
     #[test]
@@ -894,5 +990,22 @@ mod tests {
         let (mut descriptor, genesis) = fixture();
         descriptor.release_tag = "v0.7.99".into();
         assert!(verify_fixture_descriptor(&descriptor, &genesis).is_err());
+    }
+
+    #[test]
+    fn capture_derived_source_above_the_reviewed_anchor_is_accepted() {
+        let (descriptor, genesis) = fixture_at(141_062);
+        let summary = verify_fixture_descriptor(&descriptor, &genesis).unwrap();
+        assert_eq!(summary.source_height, 141_062);
+        assert_eq!(summary.transition_height, 141_063);
+    }
+
+    #[test]
+    fn source_below_the_reviewed_anchor_is_rejected() {
+        let (descriptor, genesis) = fixture_at(MINIMUM_SOURCE_HEIGHT - 1);
+        let error = verify_fixture_descriptor(&descriptor, &genesis)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("capture-derived ARC H at or above 137145"));
     }
 }

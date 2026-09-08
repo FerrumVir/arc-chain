@@ -20,6 +20,7 @@ separately from that inference-job disposition.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -54,8 +55,9 @@ CUTOVER_POLICY_SCHEMA = "arc-cutover-policy/v1"
 CUTOVER_POLICY_ASSET = "arc-cutover-policy.json"
 BOUNDARY_ASSET = "arc-legacy-maintenance-boundary.json"
 CHECKPOINT_DESCRIPTOR_ASSET = "arc-recovery-checkpoint-descriptor.json"
-CANONICAL_BOUNDARY_HEIGHT = 137_145
-REQUIRED_POST_CUTOVER_MIN_HEIGHT = 137_146
+TRUSTED_CHECKPOINT_MIN_HEIGHT = 137_145
+COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT = 137_146
+LEGACY_CONTINUITY_SAFETY_MARGIN = 128
 RECOVERY_CHAIN_ID = "0x415243"
 PRODUCTION_FLEET = (
     ("nyc", "149.28.32.76"),
@@ -1186,6 +1188,8 @@ def validate_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
     public_maximum = require_uint(value.get("legacy_public_max_height"), "legacy public maximum height")
     if public_maximum != cutoff + margin:
         fail("legacy public maximum height is not cutoff plus the continuity margin")
+    if margin != LEGACY_CONTINUITY_SAFETY_MARGIN:
+        fail("legacy maintenance boundary continuity margin is not 128")
     freeze_plan_sha256 = require_hash(
         value.get("freeze_plan_sha256"), "legacy maintenance freeze-plan sha256"
     )
@@ -1203,6 +1207,14 @@ def validate_boundary(value: Mapping[str, Any]) -> dict[str, Any]:
     origin_scope = value.get("official_origin_scope")
     if not isinstance(origin_scope, dict) or origin_scope.get("global_absence_claimed") is not False:
         fail("legacy maintenance boundary official-origin scope is dishonest")
+    nodes = value.get("nodes")
+    if not isinstance(nodes, list) or len(nodes) != len(PRODUCTION_FLEET):
+        fail("legacy maintenance boundary does not contain the production fleet")
+    for (name, host), row in zip(PRODUCTION_FLEET, nodes):
+        if not isinstance(row, dict) or (
+            row.get("node"), row.get("host"), row.get("origin")
+        ) != (name, host, f"http://{host}:9090"):
+            fail(f"legacy maintenance boundary node {name} differs")
     threat_model = value.get("threat_model")
     if not isinstance(threat_model, dict) or threat_model.get("hostile_root_containment_claimed") is not False:
         fail("legacy maintenance boundary threat model is unsupported")
@@ -1253,12 +1265,10 @@ def validate_checkpoint_identity(value: Mapping[str, Any], boundary: Mapping[str
     transition_height = require_uint(value.get("transition_height"), "checkpoint transition height", positive=True)
     if transition_height != source_height + 1:
         fail("checkpoint transition height is not exactly source height plus one")
-    if (
-        source_height != boundary["legacy_public_max_height"]
-        or source_height != CANONICAL_BOUNDARY_HEIGHT
-        or transition_height != REQUIRED_POST_CUTOVER_MIN_HEIGHT
-    ):
-        fail("checkpoint does not bind the canonical H=137145 to H+1=137146 cutover")
+    if source_height > boundary["observed_cutoff_height"]:
+        fail("checkpoint source height is above the captured legacy cutoff")
+    if source_height < TRUSTED_CHECKPOINT_MIN_HEIGHT:
+        fail("checkpoint source height predates the trusted recovery anchor")
     if require_uint(value.get("format_version"), "checkpoint format version", positive=True) != 1:
         fail("checkpoint descriptor format version is not ARCCHKPT v1")
     if value.get("chain_id") != RECOVERY_CHAIN_ID:
@@ -1267,8 +1277,16 @@ def validate_checkpoint_identity(value: Mapping[str, Any], boundary: Mapping[str
         fail("checkpoint descriptor is not exact recovery protocol 3.0.0")
     if value.get("validator_count") != 6:
         fail("checkpoint descriptor does not bind exactly six validators")
-    if value.get("community_rewards_v1_activation_height") != REQUIRED_POST_CUTOVER_MIN_HEIGHT:
-        fail("checkpoint descriptor community rewards activation differs from H+1")
+    activation_height = require_uint(
+        value.get("community_rewards_v1_activation_height"),
+        "checkpoint descriptor community rewards activation",
+        positive=True,
+    )
+    if (
+        activation_height != COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT
+        or activation_height > transition_height
+    ):
+        fail("checkpoint descriptor community rewards activation is invalid for H+1")
     return {
         "format_version": 1,
         "chain_id": RECOVERY_CHAIN_ID,
@@ -1292,7 +1310,7 @@ def validate_checkpoint_identity(value: Mapping[str, Any], boundary: Mapping[str
         ),
         "protocol_version": value["protocol_version"],
         "validator_count": 6,
-        "community_rewards_v1_activation_height": REQUIRED_POST_CUTOVER_MIN_HEIGHT,
+        "community_rewards_v1_activation_height": activation_height,
     }
 
 
@@ -1301,12 +1319,13 @@ def validate_checkpoint_descriptor(
     *,
     release_binding: Mapping[str, Any],
     boundary: Mapping[str, Any],
+    boundary_nodes: Any = None,
 ) -> dict[str, Any]:
     if set(value) != {
         "schema_version", "repository", "release_tag", "release_commit",
         "recovery_manifest_sha256", "freeze_plan_sha256", "capture_id",
         "inspector_binary_sha256", "checkpoint_file", "canonical_inspection",
-        "checkpoint_certificate", "approved_validators", "verified_quorum",
+        "canonical_source", "checkpoint_certificate", "approved_validators", "verified_quorum",
     } or value.get("schema_version") != CHECKPOINT_DESCRIPTOR_SCHEMA:
         fail("checkpoint descriptor has missing, unknown, or unsupported fields")
     if (
@@ -1337,6 +1356,73 @@ def validate_checkpoint_descriptor(
     if not isinstance(identity_raw, dict):
         fail("checkpoint descriptor canonical inspection is missing")
     identity = validate_checkpoint_identity(identity_raw, boundary)
+    canonical_source = value.get("canonical_source")
+    if not isinstance(canonical_source, dict) or set(canonical_source) != {
+        "node",
+        "source_height",
+        "source_block_hash",
+        "source_state_root",
+        "source_consensus_round",
+        "snapshot_sha256",
+        "wal_sha256",
+        "persisted_head_sha256",
+        "legacy_dag_round_inspection_sha256",
+        "legacy_dag_wal_namespace_sha256",
+    }:
+        fail("checkpoint descriptor canonical source is malformed")
+    if canonical_source.get("node") not in {name for name, _host in PRODUCTION_FLEET}:
+        fail("checkpoint descriptor canonical source node differs")
+    for field in (
+        "source_block_hash",
+        "source_state_root",
+        "snapshot_sha256",
+        "wal_sha256",
+        "persisted_head_sha256",
+        "legacy_dag_round_inspection_sha256",
+        "legacy_dag_wal_namespace_sha256",
+    ):
+        require_hash(canonical_source.get(field), f"canonical source {field}")
+    require_uint(canonical_source.get("source_height"), "canonical source height")
+    require_uint(
+        canonical_source.get("source_consensus_round"),
+        "canonical source consensus round",
+    )
+    if any(
+        canonical_source.get(field) != identity[field]
+        for field in (
+            "source_height",
+            "source_block_hash",
+            "source_state_root",
+            "source_consensus_round",
+        )
+    ):
+        fail("checkpoint descriptor canonical source differs from checkpoint identity")
+    if not isinstance(boundary_nodes, list):
+        fail("checkpoint descriptor validation requires captured boundary nodes")
+    source_node = next(
+        (
+            row
+            for row in boundary_nodes
+            if row.get("node") == canonical_source["node"]
+        ),
+        None,
+    )
+    source_head_wrapper = (
+        source_node.get("final_persisted_head", {})
+        if isinstance(source_node, dict)
+        else {}
+    )
+    source_head = source_head_wrapper.get("tuple", {})
+    if (
+        source_head_wrapper.get("evidence_sha256")
+        != canonical_source["persisted_head_sha256"]
+        or source_head.get("height") != identity["source_height"]
+        or str(source_head.get("block_hash", "")).removeprefix("0x")
+        != str(identity["source_block_hash"]).removeprefix("0x")
+        or str(source_head.get("state_root", "")).removeprefix("0x")
+        != str(identity["source_state_root"]).removeprefix("0x")
+    ):
+        fail("checkpoint descriptor canonical source differs from captured persisted head")
     validators = value.get("approved_validators")
     if not isinstance(validators, list) or len(validators) != 6:
         fail("checkpoint descriptor must bind six approved validators")
@@ -1524,6 +1610,9 @@ def validate_cutover_policy(
         "legacy_admission_cutoff_utc",
         "canonical_boundary_height",
         "required_post_cutover_min_height",
+        "legacy_observed_cutoff_height",
+        "legacy_continuity_safety_margin",
+        "legacy_public_max_height",
         "required_recovery_epoch",
         "required_validator_set_id",
         "required_validator_count",
@@ -1589,6 +1678,9 @@ def validate_cutover_policy(
     for field in (
         "canonical_boundary_height",
         "required_post_cutover_min_height",
+        "legacy_observed_cutoff_height",
+        "legacy_continuity_safety_margin",
+        "legacy_public_max_height",
         "required_recovery_epoch",
         "required_validator_set_id",
         "required_validator_count",
@@ -1597,13 +1689,19 @@ def validate_cutover_policy(
     ):
         require_uint(value.get(field), f"cutover policy {field}", positive=True)
     if (
-        value.get("canonical_boundary_height") != CANONICAL_BOUNDARY_HEIGHT
-        or value.get("required_post_cutover_min_height") != REQUIRED_POST_CUTOVER_MIN_HEIGHT
+        value.get("canonical_boundary_height") != checkpoint["source_height"]
+        or value.get("required_post_cutover_min_height") != checkpoint["transition_height"]
+        or value.get("legacy_observed_cutoff_height")
+        != boundary["observed_cutoff_height"]
+        or value.get("legacy_continuity_safety_margin")
+        != boundary["continuity_safety_margin"]
+        or value.get("legacy_public_max_height")
+        != boundary["legacy_public_max_height"]
         or value.get("required_recovery_epoch") != 1
         or value.get("required_validator_set_id") != 1
         or value.get("required_validator_count") != 6
     ):
-        fail("cutover policy height/epoch/validator constants differ")
+        fail("cutover policy checkpoint/cutoff/floor/epoch/validator identity differs")
     if checkpoint["recovery_epoch"] != 1 or checkpoint["validator_set_id"] != 1:
         fail("inspected checkpoint recovery epoch/validator-set id differs from cutover policy")
     comparisons = {
@@ -1696,15 +1794,20 @@ def validate_cutover_policy(
         "legacy_maintenance_boundary_sha256": boundary_sha256,
         "recovery_checkpoint_descriptor_sha256": checkpoint_descriptor_sha256,
         "recovery_checkpoint_file_sha256": checkpoint["checkpoint_file"]["sha256"],
-        "canonical_boundary_height": CANONICAL_BOUNDARY_HEIGHT,
-        "required_post_cutover_min_height": REQUIRED_POST_CUTOVER_MIN_HEIGHT,
+        "canonical_boundary_height": checkpoint["source_height"],
+        "required_post_cutover_min_height": checkpoint["transition_height"],
+        "legacy_observed_cutoff_height": boundary["observed_cutoff_height"],
+        "legacy_continuity_safety_margin": boundary["continuity_safety_margin"],
+        "legacy_public_max_height": boundary["legacy_public_max_height"],
         "required_recovery_epoch": 1,
         "required_validator_set_id": 1,
         "required_validator_count": 6,
         "checkpoint_format_version": 1,
         "chain_id": RECOVERY_CHAIN_ID,
         "payload_hash": checkpoint["payload_hash"],
-        "community_rewards_v1_activation_height": REQUIRED_POST_CUTOVER_MIN_HEIGHT,
+        "community_rewards_v1_activation_height": checkpoint[
+            "community_rewards_v1_activation_height"
+        ],
         "legacy_validators": expected_validators,
         "legacy_worker_rpc": worker_rpc,
         "uncompleted_job_disposition": JOBS_DISPOSITION,
@@ -2133,6 +2236,7 @@ def prepare_intent(
         checkpoint_descriptor,
         release_binding=release_binding,
         boundary=boundary_binding,
+        boundary_nodes=boundary.get("nodes"),
     )
     policy, policy_raw, _policy_record = load_canonical_json(
         request.cutover_policy,
@@ -2563,6 +2667,30 @@ def validate_receipt(value: Mapping[str, Any]) -> None:
     verified_count = checkpoint.get("verified_signature_count")
     signed_stake = require_uint(checkpoint.get("signed_stake"), "receipt signed stake", positive=True)
     total_stake = require_uint(checkpoint.get("total_stake"), "receipt total stake", positive=True)
+    source_height = require_uint(
+        checkpoint.get("source_height"), "receipt checkpoint source height", positive=True
+    )
+    transition_height = require_uint(
+        checkpoint.get("transition_height"),
+        "receipt checkpoint transition height",
+        positive=True,
+    )
+    activation_height = require_uint(
+        checkpoint.get("community_rewards_v1_activation_height"),
+        "receipt checkpoint reward activation height",
+        positive=True,
+    )
+    maintenance_boundary = value.get("maintenance_boundary")
+    if not isinstance(maintenance_boundary, dict):
+        fail("retirement receipt maintenance boundary is malformed")
+    observed_cutoff = require_uint(
+        maintenance_boundary.get("observed_cutoff_height"),
+        "receipt maintenance observed cutoff",
+    )
+    legacy_public_max = require_uint(
+        maintenance_boundary.get("legacy_public_max_height"),
+        "receipt maintenance public maximum",
+    )
     if (
         checkpoint.get("certificate_cryptographically_verified") is not True
         or isinstance(verified_count, bool)
@@ -2575,10 +2703,13 @@ def validate_receipt(value: Mapping[str, Any]) -> None:
         or signed_stake * 3 <= total_stake * 2
         or checkpoint.get("format_version") != 1
         or checkpoint.get("chain_id") != RECOVERY_CHAIN_ID
-        or checkpoint.get("community_rewards_v1_activation_height")
-        != REQUIRED_POST_CUTOVER_MIN_HEIGHT
-        or checkpoint.get("source_height") != CANONICAL_BOUNDARY_HEIGHT
-        or checkpoint.get("transition_height") != REQUIRED_POST_CUTOVER_MIN_HEIGHT
+        or activation_height != COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT
+        or activation_height > transition_height
+        or source_height < TRUSTED_CHECKPOINT_MIN_HEIGHT
+        or source_height > observed_cutoff
+        or transition_height != source_height + 1
+        or legacy_public_max
+        != observed_cutoff + LEGACY_CONTINUITY_SAFETY_MARGIN
         or checkpoint.get("canonical_history_source") != "signed_recovery_checkpoint"
     ):
         fail("retirement receipt checkpoint certificate/quorum binding differs")
@@ -2873,6 +3004,7 @@ def finalize(
         checkpoint_descriptor,
         release_binding=release_binding,
         boundary=boundary_binding,
+        boundary_nodes=boundary.get("nodes"),
     )
     for field, expected in current_checkpoint.items():
         if intent["checkpoint"].get(field) != expected:

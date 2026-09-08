@@ -3141,6 +3141,9 @@ RETIREMENT_RECOVERY_EPOCH=""
 RETIREMENT_VALIDATOR_SET_ID=""
 RETIREMENT_SOURCE_HEIGHT=""
 RETIREMENT_TRANSITION_HEIGHT=""
+RETIREMENT_OBSERVED_CUTOFF_HEIGHT=""
+RETIREMENT_CONTINUITY_SAFETY_MARGIN=""
+RETIREMENT_LEGACY_PUBLIC_MAX_HEIGHT=""
 
 write_release_installer_binding() {
     local records="$TMP_DIR/release-binding-files" sorted="$TMP_DIR/release-binding-files-sorted"
@@ -3214,16 +3217,34 @@ verify_recovery_descriptor_for_retirement() {
         || die "Recovery descriptor verifier omitted source_height"
     RETIREMENT_TRANSITION_HEIGHT="$(top_level_json_bare "$output" transition_height)" \
         || die "Recovery descriptor verifier omitted transition_height"
+    RETIREMENT_OBSERVED_CUTOFF_HEIGHT="$(top_level_json_bare \
+        "$TMP_DIR/$CUTOVER_POLICY_ASSET" legacy_observed_cutoff_height)" \
+        || die "Cutover policy omitted legacy_observed_cutoff_height"
+    RETIREMENT_CONTINUITY_SAFETY_MARGIN="$(top_level_json_bare \
+        "$TMP_DIR/$CUTOVER_POLICY_ASSET" legacy_continuity_safety_margin)" \
+        || die "Cutover policy omitted legacy_continuity_safety_margin"
+    RETIREMENT_LEGACY_PUBLIC_MAX_HEIGHT="$(top_level_json_bare \
+        "$TMP_DIR/$CUTOVER_POLICY_ASSET" legacy_public_max_height)" \
+        || die "Cutover policy omitted legacy_public_max_height"
     canonical_uint "$RETIREMENT_RECOVERY_EPOCH" \
         && canonical_uint "$RETIREMENT_VALIDATOR_SET_ID" \
         && canonical_uint "$RETIREMENT_SOURCE_HEIGHT" \
         && canonical_uint "$RETIREMENT_TRANSITION_HEIGHT" \
+        && canonical_uint "$RETIREMENT_OBSERVED_CUTOFF_HEIGHT" \
+        && canonical_uint "$RETIREMENT_CONTINUITY_SAFETY_MARGIN" \
+        && canonical_uint "$RETIREMENT_LEGACY_PUBLIC_MAX_HEIGHT" \
         || die "Recovery descriptor verifier returned malformed numeric identity"
-    [ "$RETIREMENT_SOURCE_HEIGHT" -eq 137145 ] \
-        && [ "$RETIREMENT_TRANSITION_HEIGHT" -eq 137146 ] \
+    [ "$RETIREMENT_SOURCE_HEIGHT" -ge 137145 ] \
+        && [ "$RETIREMENT_TRANSITION_HEIGHT" \
+            -eq "$((RETIREMENT_SOURCE_HEIGHT + 1))" ] \
+        && [ "$RETIREMENT_OBSERVED_CUTOFF_HEIGHT" \
+            -ge "$RETIREMENT_SOURCE_HEIGHT" ] \
+        && [ "$RETIREMENT_CONTINUITY_SAFETY_MARGIN" -eq 128 ] \
+        && [ "$RETIREMENT_LEGACY_PUBLIC_MAX_HEIGHT" \
+            -eq "$((RETIREMENT_OBSERVED_CUTOFF_HEIGHT + RETIREMENT_CONTINUITY_SAFETY_MARGIN))" ] \
         && [ "$RETIREMENT_RECOVERY_EPOCH" -eq 1 ] \
         && [ "$RETIREMENT_VALIDATOR_SET_ID" -eq 1 ] \
-        || die "Recovery descriptor differs from the fixed ARC cutover boundary"
+        || die "Recovery assets differ from the capture-derived ARC cutover boundary"
 }
 
 ensure_legacy_retirement_evidence_dirs() {
@@ -3463,7 +3484,7 @@ verify_legacy_v07_network_retirement() {
             || die "Recovered validator returned malformed numeric identity: $origin"
         [ "$recovery_epoch" -eq "$RETIREMENT_RECOVERY_EPOCH" ] \
             && [ "$validator_set_id" -eq "$RETIREMENT_VALIDATOR_SET_ID" ] \
-            && [ "$height" -ge "$RETIREMENT_TRANSITION_HEIGHT" ] \
+            && [ "$height" -gt "$RETIREMENT_LEGACY_PUBLIC_MAX_HEIGHT" ] \
             || die "Validator has not crossed the approved v0.7 retirement boundary: $origin"
 
         validator_address="$(top_level_json_string "$info_file" validator_address)" \
@@ -3521,7 +3542,7 @@ verify_legacy_v07_network_retirement() {
             die "Legacy v0.7 RPC is still reachable at ${probe_labels[$index]}; the old node was not stopped"
         fi
     done
-    ok "All six exact validators match the signed checkpoint at or above block $RETIREMENT_TRANSITION_HEIGHT and legacy claim/submit ports are unreachable"
+    ok "All six exact validators match the signed checkpoint above legacy reopening floor $RETIREMENT_LEGACY_PUBLIC_MAX_HEIGHT and legacy claim/submit ports are unreachable"
 }
 
 prepare_absent_v08_data_dir_for_retirement() {

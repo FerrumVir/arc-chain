@@ -152,7 +152,10 @@ render_asset() {
             printf '#!/usr/bin/env bash\n# release v%s\nexit 0\n' "$version" >"$destination"
             chmod +x "$destination"
             ;;
-        arc-cutover-policy.json|arc-legacy-maintenance-boundary.json|arc-recovery-checkpoint-descriptor.json)
+        arc-cutover-policy.json)
+            printf '{"canonical_boundary_height":137145,"legacy_observed_cutoff_height":137145,"legacy_continuity_safety_margin":128,"legacy_public_max_height":137273,"fixture_version":"%s"}\n' "$version" >"$destination"
+            ;;
+        arc-legacy-maintenance-boundary.json|arc-recovery-checkpoint-descriptor.json)
             printf '{"asset":"%s","fixture_version":"%s"}\n' "$asset" "$version" >"$destination"
             ;;
         *)
@@ -231,7 +234,7 @@ case "$url" in
         retirement_mode="${MOCK_V3_RETIREMENT_MODE:-ok}"
         [ "$retirement_mode" != offline ] || { [ "$retirement_host" != 149.28.153.31 ] || exit 7; }
         retirement_active=true
-        retirement_height=137146
+        retirement_height=137274
         retirement_manifest="0x$(printf '%064d' 1)"
         retirement_network_genesis="0x$(printf '%064d' 3)"
         retirement_node_version=0.8.0
@@ -239,7 +242,7 @@ case "$url" in
         case "$retirement_mode" in
             ok|offline|legacy-listener) ;;
             recovery-inactive) retirement_active=false ;;
-            low-height) retirement_height=137145 ;;
+            low-height) retirement_height=137273 ;;
             split-manifest)
                 [ "$retirement_host" != 149.28.153.31 ] \
                     || retirement_manifest="0x$(printf '%064d' 4)" ;;
@@ -251,7 +254,7 @@ case "$url" in
                     || retirement_validator=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
             old-node) retirement_node_version=0.7.11 ;;
             duplicate-field) ;;
-            leading-zero-height) retirement_height=0137146 ;;
+            leading-zero-height) retirement_height=0137274 ;;
             huge-height) retirement_height=9999999999999999999 ;;
             exponent-height) retirement_height=1e9 ;;
             *) exit 22 ;;

@@ -45,8 +45,8 @@ HANDOFF_FILES = {
 BOUNDARY_OUTPUT = "arc-legacy-maintenance-boundary.json"
 CHECKPOINT_DESCRIPTOR_OUTPUT = "arc-recovery-checkpoint-descriptor.json"
 POLICY_OUTPUT = "arc-cutover-policy.json"
-CANONICAL_BOUNDARY_HEIGHT = 137_145
-REQUIRED_POST_CUTOVER_MIN_HEIGHT = 137_146
+TRUSTED_CHECKPOINT_MIN_HEIGHT = 137_145
+COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT = 137_146
 OLD_CLAIM_SUBMIT_LISTENER_PORTS = [9090, 3001]
 EXPECTED_RECOVERY_VALIDATORS = (
     (
@@ -339,6 +339,28 @@ def validate_boundary(
         ) != (name, host, f"http://{host}:9090"):
             fail(f"legacy maintenance node {index} topology differs")
 
+    canonical_source = chain["canonical_source"]
+    source_node = next(
+        (row for row in boundary_nodes if row.get("node") == canonical_source["node"]),
+        None,
+    )
+    source_head = (
+        source_node.get("final_persisted_head", {}).get("tuple", {})
+        if isinstance(source_node, dict)
+        else {}
+    )
+    if (
+        not isinstance(source_node, dict)
+        or source_node.get("final_persisted_head", {}).get("evidence_sha256")
+        != canonical_source["persisted_head_sha256"]
+        or source_head.get("height") != chain["source_height"]
+        or str(source_head.get("block_hash", "")).removeprefix("0x")
+        != str(chain["source_block_hash"]).removeprefix("0x")
+        or str(source_head.get("state_root", "")).removeprefix("0x")
+        != str(chain["source_state_root"]).removeprefix("0x")
+    ):
+        fail("recovery manifest source tuple differs from its selected captured head")
+
     # The final sealed manifest itself is an input to the owner-signed policy;
     # keep the argument used so static analyzers cannot mistake it for an
     # unbound parse.
@@ -445,7 +467,7 @@ def validate_checkpoint_outputs(
         "validator_set_id": chain["validator_set_id"],
         "protocol_version": chain["protocol_version"],
         "validator_count": recovery.REQUIRED_VALIDATORS,
-        "community_rewards_v1_activation_height": REQUIRED_POST_CUTOVER_MIN_HEIGHT,
+        "community_rewards_v1_activation_height": COMMUNITY_REWARDS_V1_ACTIVATION_HEIGHT,
     }
     hash_fields = {
         "manifest_hash",
@@ -678,6 +700,7 @@ def build_checkpoint_descriptor(
             "size_bytes": checkpoint_size_bytes,
             "sha256": checkpoint_sha256,
         },
+        "canonical_source": dict(manifest["chain"]["canonical_source"]),
         "canonical_inspection": checkpoint_identity,
         "checkpoint_certificate": checkpoint_certificate,
         "approved_validators": validators,
@@ -779,6 +802,9 @@ def build_policy(
         "legacy_admission_cutoff_utc": boundary["all_controlled_stopped_at"],
         "canonical_boundary_height": identity["source_height"],
         "required_post_cutover_min_height": identity["transition_height"],
+        "legacy_observed_cutoff_height": boundary["observed_cutoff_height"],
+        "legacy_continuity_safety_margin": boundary["continuity_safety_margin"],
+        "legacy_public_max_height": boundary["legacy_public_max_height"],
         "required_recovery_epoch": identity["recovery_epoch"],
         "required_validator_set_id": identity["validator_set_id"],
         "required_validator_count": identity["validator_count"],
@@ -911,17 +937,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         chain = manifest["chain"]
         if (
-            chain["source_height"] != CANONICAL_BOUNDARY_HEIGHT
-            or chain["legacy_public_max_height"] != CANONICAL_BOUNDARY_HEIGHT
-            or chain["transition_height"] != REQUIRED_POST_CUTOVER_MIN_HEIGHT
+            chain["source_height"] < TRUSTED_CHECKPOINT_MIN_HEIGHT
+            or chain["transition_height"] != chain["source_height"] + 1
+            or chain["legacy_observed_cutoff_height"] < chain["source_height"]
+            or chain["legacy_public_max_height"]
+            != chain["legacy_observed_cutoff_height"]
+            + recovery.LEGACY_CONTINUITY_SAFETY_MARGIN
             or chain["recovery_epoch"] != 1
             or chain["validator_set_id"] != 1
             or chain["protocol_version"] != "3.0.0"
             or len(manifest["validators"]) != recovery.REQUIRED_VALIDATORS
         ):
             fail(
-                "recovery manifest does not bind canonical v3.0.0 H/H+1, "
-                "legacy ceiling H, epoch 1, set 1, and six validators"
+                "recovery manifest does not bind capture-derived v3.0.0 H/H+1, "
+                "reopening floor F=cutoff+128, epoch 1, set 1, and six validators"
             )
 
         inspected, verified = run_checkpoint_cli(

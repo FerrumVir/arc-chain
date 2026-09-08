@@ -243,12 +243,35 @@ pub fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_read(path)
 }
 
+/// Open an existing owner-controlled directory without following its final
+/// link and without changing its permission boundary.
+///
+/// The returned handle is an identity pin only. On Windows it uses directory
+/// backup semantics and shares reads, writes, and deletes so holding the pin
+/// does not create an OS-specific namespace lock that Unix callers would not
+/// receive. Callers that require a quiescent namespace must enforce that
+/// separately.
+pub fn open_owned_nofollow_directory(path: &Path) -> io::Result<File> {
+    platform::open_owned_nofollow_directory(path)
+}
+
+/// Open an owner-validated, non-reparse Windows file for a read-only inspection
+/// while an independently synchronized writer handle remains live.
+///
+/// The caller must exclude content mutation for the complete inspection. This
+/// opener requests no write access and its share flags grant no access; the
+/// already-open writer's own share mode continues to exclude a second writer.
+#[cfg(windows)]
+pub fn open_owned_nofollow_shared_read(path: &Path) -> io::Result<File> {
+    platform::open_owned_nofollow_shared_read(path)
+}
+
 /// Open an owner-validated, non-reparse Windows file only to compare its
 /// kernel identity with an already-open writer handle.
 ///
 /// The identity probe requests no write access but must share reads, writes,
 /// and deletes: the WAL append handle is intentionally live while its final
-/// pathname is rebound to the same file ID.  This narrowly scoped opener does
+/// pathname is rebound to the same file ID. This narrowly scoped opener does
 /// not weaken the append handle's own share mode, so a second writer remains
 /// excluded.
 #[cfg(windows)]
@@ -391,7 +414,7 @@ pub fn same_private_directory_namespace(left: &Path, right: &Path) -> io::Result
         }
         let left_leaf = windows_canonical_namespace_leaf(&left_parent.join(left_leaf))?;
         let right_leaf = windows_canonical_namespace_leaf(&right_parent.join(right_leaf))?;
-        return windows_namespace_leaves_equal(&left_leaf, &right_leaf);
+        windows_namespace_leaves_equal(&left_leaf, &right_leaf)
     }
     #[cfg(target_os = "macos")]
     {
@@ -2349,6 +2372,19 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_owned_nofollow_directory(path: &Path) -> io::Result<File> {
+        let directory = open_private_directory(path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(permission_error(format!(
+                "owner-controlled path is not a directory: {}",
+                path.display()
+            )));
+        }
+        validate_owner(&metadata, path, "directory")?;
+        Ok(directory)
+    }
+
     pub(super) fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -3324,6 +3360,31 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_nofollow_directory_opener_accepts_directory_and_rejects_junction() {
+        let root = TestDir::new("nofollow-directory-open");
+        let directory = root.0.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let handle = open_owned_nofollow_directory(&directory).unwrap();
+        assert!(handle.metadata().unwrap().is_dir());
+        drop(handle);
+
+        let linked = root.0.join("linked");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&linked)
+            .arg(&directory)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "failed to create Windows junction fixture"
+        );
+        assert!(open_owned_nofollow_directory(&linked).is_err());
+        std::fs::remove_dir(&linked).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_owned_inherited_directory_migrates_to_private_dacl() {
         let root = TestDir::new("windows-directory-migration");
         let inherited = root.0.join("legacy-app-data");
@@ -3828,7 +3889,20 @@ mod platform {
         Ok(file)
     }
 
-    pub(super) fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
+    pub(super) fn open_owned_nofollow_directory(path: &Path) -> io::Result<File> {
+        let directory = open_private_directory_raw_with_access(path, READ_CONTROL)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(permission_error(format!(
+                "owner-controlled path is not a non-reparse directory: {}",
+                path.display()
+            )));
+        }
+        validate_private_owner(&directory, path, "directory")?;
+        Ok(directory)
+    }
+
+    pub(super) fn open_owned_nofollow_shared_read(path: &Path) -> io::Result<File> {
         let file = open_private_raw_with_access_and_share(
             path,
             GENERIC_READ | READ_CONTROL,
@@ -3837,12 +3911,16 @@ mod platform {
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(permission_error(format!(
-                "owner-controlled identity probe is not a non-reparse regular file: {}",
+                "owner-controlled shared reader is not a non-reparse regular file: {}",
                 path.display()
             )));
         }
         validate_private_owner(&file, path, "file")?;
         Ok(file)
+    }
+
+    pub(super) fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
+        open_owned_nofollow_shared_read(path)
     }
 
     pub(super) fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
@@ -4123,7 +4201,7 @@ mod platform {
                 path.display()
             )));
         }
-        validate_private_security(&directory, path, "directory")
+        validate_private_security(directory, path, "directory")
     }
 
     fn validate_private_owner(file: &File, path: &Path, object: &str) -> io::Result<()> {
