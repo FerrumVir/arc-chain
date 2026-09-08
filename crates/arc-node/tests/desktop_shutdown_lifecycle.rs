@@ -1,5 +1,5 @@
 use std::io::{Read as _, Write as _};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const CONTROL_DIR: &str = ".arc-desktop-control";
@@ -14,6 +14,23 @@ const REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 // the production graceful-drain budget while allowing the integrity checks to
 // complete under slow CI I/O instead of weakening or bypassing them.
 const STARTUP_SHUTDOWN_TEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn take_child_logs(child: &mut Child) -> String {
+    let mut logs = String::new();
+    child
+        .stdout
+        .take()
+        .expect("arc-node stdout was not piped")
+        .read_to_string(&mut logs)
+        .expect("read arc-node stdout");
+    child
+        .stderr
+        .take()
+        .expect("arc-node stderr was not piped")
+        .read_to_string(&mut logs)
+        .expect("read arc-node stderr");
+    logs
+}
 
 #[cfg(windows)]
 fn acquire_managed_lifecycle_fixture(
@@ -172,10 +189,10 @@ fn private_desktop_request_stops_node_during_initialization() {
     let lock_file = data_dir.join(".arc-node.lock");
     let startup_deadline = Instant::now() + Duration::from_secs(15);
     while !lock_file.is_file() && Instant::now() < startup_deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "node exited before acquiring its data-directory lock"
-        );
+        if let Some(status) = child.try_wait().unwrap() {
+            let logs = take_child_logs(&mut child);
+            panic!("node exited before acquiring its data-directory lock with {status}: {logs}");
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
@@ -198,19 +215,7 @@ fn private_desktop_request_stops_node_during_initialization() {
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    let mut logs = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut logs)
-        .unwrap();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut logs)
-        .unwrap();
+    let logs = take_child_logs(&mut child);
     assert!(
         !timed_out,
         "node did not honor the authenticated startup shutdown request: {logs}"
@@ -292,19 +297,7 @@ fn sigterm_is_armed_before_synchronous_initialization() {
         );
         std::thread::sleep(Duration::from_millis(25));
     };
-    let mut logs = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut logs)
-        .unwrap();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut logs)
-        .unwrap();
+    let logs = take_child_logs(&mut child);
     assert!(status.success(), "SIGTERM shutdown was not clean: {logs}");
     assert!(
         logs.contains("shutdown requested before persistent state opened"),
