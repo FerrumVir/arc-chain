@@ -1480,7 +1480,7 @@ class RecoveryRolloutTests(unittest.TestCase):
                 "applied.commit.json": sha_value(applied_commit),
                 "persistent-restart-fence.json": restart_sha,
                 "rendered-policy.nft": f"{index + 3800:064x}",
-                "/usr/local/libexec/arc-legacy-maintenance-fence": f"{index + 3900:064x}",
+                "/etc/arc-recovery/network-fence-dispatch": f"{index + 3900:064x}",
                 "/etc/systemd/system/arc-legacy-maintenance-fence.service": f"{index + 4000:064x}",
                 "/etc/systemd/system/arc-self-heal.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 4100:064x}",
                 "/etc/systemd/system/arc-node.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 4200:064x}",

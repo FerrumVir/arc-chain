@@ -1549,7 +1549,8 @@ if state.exists() or state.is_symlink():
     if (state.is_symlink() or not stat.S_ISDIR(details.st_mode) or details.st_uid!=0
             or details.st_gid!=0 or stat.S_IMODE(details.st_mode)!=0o700):
         raise SystemExit("zero-progress apply state is unsafe")
-    allowed={"authorization.json":0o400,"readiness.json":0o400,"policy.nft":0o400,
+    allowed={"freeze.lock.json":0o400,"authorization.json":0o400,
+             "readiness.json":0o400,"policy.nft":0o400,
              "apply":0o500,"nft":0o500,"table-binding.json":0o400,
              "nft-apply-intent.json":0o400,"persistence-plan.json":0o400,
              "contract.json":0o400}
@@ -1560,7 +1561,7 @@ if state.exists() or state.is_symlink():
     # root-owned, single-link, bounded regular-file identity.  Anything else
     # remains a hard failure.
     partial_re=__import__("re").compile(
-        r"^\.(authorization\.json|readiness\.json|policy\.nft|apply|nft|"
+        r"^\.(freeze\.lock\.json|authorization\.json|readiness\.json|policy\.nft|apply|nft|"
         r"table-binding\.json|nft-apply-intent\.json|persistence-plan\.json|"
         r"contract\.json)\.([1-9][0-9]*)\.([0-9a-f]{16})\.partial$"
     )
@@ -1589,6 +1590,10 @@ if state.exists() or state.is_symlink():
             raise SystemExit("zero-progress apply-state member is unsafe")
     if (state/"authorization.json").exists() and load(state/"authorization.json","state authorization")[1]!=auth_raw:
         raise SystemExit("zero-progress apply-state authorization differs")
+    if (state/"freeze.lock.json").exists() and hashlib.sha256(
+            load(state/"freeze.lock.json","state freeze plan")[1]
+        ).hexdigest()!=freeze:
+        raise SystemExit("zero-progress apply-state freeze plan differs")
     if (state/"readiness.json").exists() and (readiness_raw is None
             or load(state/"readiness.json","state readiness")[1]!=readiness_raw):
         raise SystemExit("zero-progress apply-state readiness differs")
@@ -6913,6 +6918,11 @@ WantedBy=multi-user.target
 
     def persistence_file_roots(dispatcher, unit, dependencies):
         return {
+            "freeze_plan": {
+                "path": str(state / "freeze.lock.json"),
+                "sha256": freeze_sha,
+                "mode": 0o400,
+            },
             "dispatcher": {"path": str(dispatcher_path), "sha256": sha(dispatcher),
                            "mode": 0o500},
             "unit": {"path": str(unit_path), "sha256": sha(unit), "mode": 0o400},
@@ -8572,10 +8582,12 @@ WantedBy=multi-user.target
             fail("fresh stopped durable intent/plan/barrier bytes differ")
         plan_files = plan.get("files")
         if not isinstance(plan_files, dict) or set(plan_files) != {
-                "dispatcher", "unit", "dependencies"
-            }:
+                    "freeze_plan", "dispatcher", "unit", "dependencies"
+                }:
             fail("fresh stopped persistence file inventory differs")
-        file_rows = [plan_files["dispatcher"], plan_files["unit"]]
+        file_rows = [
+            plan_files["freeze_plan"], plan_files["dispatcher"], plan_files["unit"]
+        ]
         dependencies_rows = plan_files.get("dependencies")
         if not isinstance(dependencies_rows, list):
             fail("fresh stopped dependency inventory differs")
@@ -8887,10 +8899,10 @@ WantedBy=multi-user.target
                 fail("applied legacy restart allow path exists")
             files = plan.get("files")
             if not isinstance(files, dict) or set(files) != {
-                    "dispatcher", "unit", "dependencies"
+                    "freeze_plan", "dispatcher", "unit", "dependencies"
                 }:
                 fail("applied persistence file inventory differs")
-            rows = [files["dispatcher"], files["unit"]]
+            rows = [files["freeze_plan"], files["dispatcher"], files["unit"]]
             if not isinstance(files.get("dependencies"), list):
                 fail("applied persistence dependency inventory differs")
             rows.extend(files["dependencies"])
@@ -9927,7 +9939,9 @@ if local_writer!=contract["writer"] or local[0].get("host")!=contract["host"]:fa
 def enforce_monotonic_lease():
  accepted=local_acceptance[0];accepted_ns=accepted.get("accepted_monotonic_ns");accepted_boot=accepted.get("accepted_boot_id");current_boot=pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip();current_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME);lease=ready["max_elapsed_since_acceptance_ns"]
  if accepted_boot!=contract["writer"]["boot_id"] or current_boot!=accepted_boot or isinstance(accepted_ns,bool) or not isinstance(accepted_ns,int) or current_ns<accepted_ns or current_ns-accepted_ns>lease:fail("quarantine monotonic mutation lease expired")
-plan_path=pathlib.Path(f"/root/.arc-recovery-plans/{contract['freeze_plan_sha256']}/freeze.lock.json");plan_raw=read(plan_path,0o400);plan=json.loads(plan_raw)
+plan_path=pathlib.Path(contract.get("freeze_plan_path",""))
+if plan_path!=STATE/"freeze.lock.json":fail("quarantine helper freeze-plan path differs")
+plan_raw=read(plan_path,0o400);plan=json.loads(plan_raw)
 if sha(plan_raw)!=contract["freeze_plan_sha256"] or canonical(plan)!=plan_raw or plan.get("source_commit")!=contract["source_main_commit"]:fail("freeze/source changed at nft gate")
 nft=STATE/"nft";policy=read(STATE/"policy.nft",0o400);rendered=policy.replace(b"__ARC_TABLE_COMMENT__",contract["table_comment"].encode())
 if rendered==policy or rendered.count(contract["table_comment"].encode())!=1:fail("rendered nft policy binding differs")
@@ -10032,6 +10046,77 @@ publish(commit_path,canonical(commit),0o400);result(commit)
     nft_raw = tool_bytes(nft_system)
     nft_sha = sha(nft_raw)
 
+    def load_postcommit_reconciliation():
+        """Return an exact durable commit eligible for receipt reconciliation.
+
+        This is deliberately narrower than the initial apply path.  A durable,
+        hash-bound commit proves the deadline-gated kernel mutation already
+        happened; only then may a retry proceed without the now-inactive
+        supervisor or the expired readiness lease.  Missing or changed STATE
+        inputs fail closed before any systemd or nft operation.
+        """
+        commit_path = state / "applied.commit.json"
+        if not commit_path.exists() and not commit_path.is_symlink():
+            return None
+        secure_dir(state_base.parent, 0o700)
+        secure_dir(state_base, 0o700)
+        secure_dir(state_base / capture_id, 0o700)
+        secure_dir(state, 0o700)
+        persisted_freeze_raw = secure_read(state / "freeze.lock.json", 0o400)
+        if (sha(persisted_freeze_raw) != freeze_sha
+                or parse_canonical(
+                    persisted_freeze_raw, "postcommit persisted freeze plan"
+                ) != plan):
+            fail("postcommit persisted freeze-plan copy differs")
+        commit_raw = secure_read(commit_path, 0o400)
+        commit = parse_canonical(commit_raw, "postcommit applied commit")
+        expected = {
+            "schema": APPLIED_COMMIT_SCHEMA,
+            "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
+            "round_number": round_number,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "node": node, "host": FLEET_MAP[node],
+            "table_binding_sha256": table_binding_sha,
+            "table_comment": table_comment,
+            "apply_helper_sha256": helper_sha,
+            "nft_policy_source_sha256": policy_sha,
+        }
+        if (set(commit) != set(expected) | {
+                "nft_deadline_gate_sha256", "owned_ruleset_stateless_sha256",
+                "nft_applied_at",
+            } or any(commit.get(key) != value for key, value in expected.items())
+                or HASH_RE.fullmatch(str(
+                    commit.get("owned_ruleset_stateless_sha256")
+                )) is None):
+            fail("postcommit applied commit binding differs")
+        gate_raw = secure_read(state / "nft-deadline-gate.json", 0o400)
+        gate = parse_canonical(gate_raw, "postcommit nft deadline gate")
+        gate_expected = {
+            "schema": GATE_SCHEMA, "capture_id": capture_id,
+            "freeze_plan_sha256": freeze_sha,
+            "round_authorization_sha256": authorization_sha,
+            "round_readiness_sha256": readiness_sha,
+            "round_number": round_number, "node": node,
+            "host": FLEET_MAP[node],
+            "authorization_deadline": auth["authorization_deadline"],
+            "apply_helper_sha256": helper_sha, "policy_sha256": policy_sha,
+            "table_binding_sha256": table_binding_sha,
+            "table_comment": table_comment,
+        }
+        if (set(gate) != set(gate_expected) | {"invoked_at"}
+                or any(gate.get(key) != value
+                       for key, value in gate_expected.items())
+                or commit.get("nft_deadline_gate_sha256") != sha(gate_raw)
+                or commit.get("nft_applied_at") != gate.get("invoked_at")):
+            fail("postcommit nft deadline gate binding differs")
+        parse_utc(gate.get("invoked_at"), "postcommit nft deadline gate")
+        selector_value = (str(state) + "\n").encode()
+        if ((active_path.exists() or active_path.is_symlink())
+                and secure_read(active_path, 0o400) != selector_value):
+            fail("postcommit active selector belongs to another round")
+        return commit_raw, commit
+
     def system_table_comment():
         exists_result = subprocess.run(
             [str(nft_system), "list", "table", "inet", table_name],
@@ -10048,18 +10133,34 @@ publish(commit_path,canonical(commit),0o400);result(commit)
             fail("preexisting quarantine table identity is ambiguous")
         return rows[0].get("comment")
 
+    postcommit = load_postcommit_reconciliation()
+
     # Expired attempts with no exact kernel mutation stop here, before any
     # /etc, systemd, STOP_BASE, or nft write.  An exact table is allowed through
     # solely so the post-kernel/pre-receipt crash can be reconciled.
     existing_comment = system_table_comment()
     if existing_comment is None:
-        enforce_monotonic_mutation_lease(readiness, acceptance, target, "apply entry")
-        verify_writer(target)
+        if postcommit is None:
+            enforce_monotonic_mutation_lease(
+                readiness, acceptance, target, "apply entry"
+            )
+            verify_writer(target)
     elif existing_comment != table_comment:
         fail("a nonmatching quarantine table already owns the host")
 
     secure_dir(state_base.parent, 0o700, create=True)
     create_hierarchy(state_base, capture_id, authorization_sha)
+    # The persistent fence keeps ProtectHome=yes.  Materialize the already
+    # hash-verified plan inside the attempt's protected /etc state before any
+    # systemd/drop-in mutation, so boot-time ensure never depends on masked
+    # home-directory bytes.
+    freeze_plan_raw = secure_read(
+        pathlib.Path(f"/root/.arc-recovery-plans/{freeze_sha}/freeze.lock.json"),
+        0o400,
+    )
+    if sha(freeze_plan_raw) != freeze_sha:
+        fail("persistence freeze-plan source hash differs")
+    publish(state / "freeze.lock.json", freeze_plan_raw, 0o400)
     publish(state / "authorization.json", auth_raw, 0o400)
     publish(state / "readiness.json", readiness_raw, 0o400)
     publish(state / "policy.nft", policy_template, 0o400)
@@ -10163,6 +10264,7 @@ publish(commit_path,canonical(commit),0o400);result(commit)
         "persistence_plan_sha256": persistence_plan_sha,
         "pinned_nft_sha256": nft_sha,
         "round_artifact_path": str(attempt),
+        "freeze_plan_path": str(state / "freeze.lock.json"),
         "state_path": str(state),
     }
     publish(state / "contract.json", canonical(contract), 0o400)
@@ -10171,15 +10273,23 @@ publish(commit_path,canonical(commit),0o400);result(commit)
     # fence.  The generic unit therefore exists before the nft batch but has no
     # active selector until an applied.commit is durable.  Its ensure command
     # fails closed while the selector is absent.
-    verify_supervisor(frozen, target)
+    if postcommit is None:
+        verify_supervisor(frozen, target)
+    else:
+        # The applied commit is the completed mutation authority.  The
+        # persistence drop-ins intentionally deactivate the old supervisor,
+        # but the exact original writer must remain alive while its missing
+        # network/ancestry/node-applied receipts are reconstructed.
+        verify_writer(target)
     legacy_start_allow = pathlib.Path(
         persistence_plan["legacy_start_allow_path"]
     )
     if legacy_start_allow.exists() or legacy_start_allow.is_symlink():
         fail("quarantine-round legacy restart allow path unexpectedly exists")
-    enforce_monotonic_mutation_lease(
-        readiness, acceptance, target, "first restart-effective mutation"
-    )
+    if postcommit is None:
+        enforce_monotonic_mutation_lease(
+            readiness, acceptance, target, "first restart-effective mutation"
+        )
     secure_dir(pathlib.Path("/etc/arc-recovery"), 0o700)
     # The selected frozen supervisor dependency is first in insertion order.
     # A crash after this or any later prefix leaves boot activation fail-closed.
@@ -10239,10 +10349,14 @@ publish(commit_path,canonical(commit),0o400);result(commit)
 
     # Re-prove the exact live supervisor plus direct/detached writer immediately
     # before the only initial kernel mutation.
-    verify_supervisor(frozen, target)
+    if postcommit is None:
+        verify_supervisor(frozen, target)
     # The pinned helper owns the exact gate -> nft -> applied.commit sequence.
     # It is the sole command below that may call nft -f.
-    commit_raw = subprocess.check_output([str(state / "apply"), "initial"])
+    helper_mode = "initial"
+    if postcommit is not None:
+        helper_mode = "probe" if existing_comment is not None else "ensure"
+    commit_raw = subprocess.check_output([str(state / "apply"), helper_mode])
     commit = parse_canonical(commit_raw, "quarantine nft applied commit")
     if (commit.get("schema") != APPLIED_COMMIT_SCHEMA
             or commit.get("round_authorization_sha256") != authorization_sha
@@ -10253,6 +10367,8 @@ publish(commit_path,canonical(commit),0o400);result(commit)
     durable_commit_raw = secure_read(state / "applied.commit.json", 0o400)
     if durable_commit_raw != commit_raw:
         fail("quarantine nft applied commit stdout differs from durable bytes")
+    if postcommit is not None and durable_commit_raw != postcommit[0]:
+        fail("postcommit applied commit changed during reconciliation")
     gate_raw = secure_read(state / "nft-deadline-gate.json", 0o400)
     gate = parse_canonical(gate_raw, "quarantine nft deadline gate")
     if sha(gate_raw) != commit.get("nft_deadline_gate_sha256"):

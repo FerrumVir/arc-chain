@@ -107,7 +107,8 @@ boundary=b.index('create_legacy_maintenance_boundary')
 offline=b.index('create_offline_stop_evidence')
 assert (b.index('capture_all_live_observations') < late_sample < height_cross
         < fresh_capacity < selection < selection_clocks < rounds < first_boundary)
-assert ('remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan" "$log_root"\n'
+assert ('remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan" "$log_root" \\\n'
+        '        "$maintenance_input_root/quarantine-rounds"\n'
         '    observation_selection_sha="$(seal_live_observation_selection' in b)
 assert first_boundary < stop < capture < persisted < boundary < offline
 assert 'ALL SIX CONTROLLED WRITERS HALTED' in b and 'no global halt is claimed' in b
@@ -1095,9 +1096,229 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
         esac
     }
     remote_readiness "$(printf 'b%.0s' {1..64})" "$(printf 'a%.0s' {1..64})" \
-        /sealed/freeze.json "$f" >/dev/null || return 1
+        /sealed/freeze.json "$f" "$f/absent-rounds" >/dev/null || return 1
     grep -Fq 'nyc stopped-status' "$f/actions" && grep -Fq 'nyc status' "$f/actions" && \
         grep -Fq 'lax stopped-status' "$f/actions" && grep -Fq 'lax status' "$f/actions"
+)
+
+make_active_quarantine_resume_fixture() {
+    local root="$1"
+    python3 - "$root" "$(dirname -- "$ORCHESTRATOR")/test_quarantine_rounds.py" <<'PY'
+import importlib.util,os,pathlib,sys
+root=pathlib.Path(sys.argv[1]);module_path=pathlib.Path(sys.argv[2])
+spec=importlib.util.spec_from_file_location("active_resume_fixture",module_path)
+fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+names=[name for name,_host in fixture.qr.FLEET]
+authorization=fixture.authorization(1,[],names,0)
+readiness=fixture.target_readiness(authorization)
+dispatch=fixture.mutation_dispatch(authorization,readiness)
+attempt=root/"rounds"/"round-1"/"attempt.fixture"
+applied_root=root/"applied"
+attempt.mkdir(parents=True);applied_root.mkdir()
+for directory in (root/"rounds",attempt.parent,attempt,applied_root):
+    os.chmod(directory,0o700)
+for name,value in (
+    ("authorization.json",authorization),
+    ("readiness.json",readiness),
+    ("mutation-dispatch.json",dispatch),
+):
+    path=attempt/name;path.write_bytes(fixture.qr.canonical_bytes(value));os.chmod(path,0o400)
+for index,name in enumerate(names):
+    value=fixture.applied(
+        authorization,name,20+index,fixture.authorized_height(authorization,name)
+    )
+    path=applied_root/f"{name}.json"
+    path.write_bytes(fixture.qr.canonical_bytes(value));os.chmod(path,0o400)
+PY
+}
+
+active_quarantine_test_host_for() {
+    case "$1" in
+        nyc) printf '149.28.32.76\n' ;; lax) printf '140.82.16.112\n' ;;
+        ams) printf '136.244.109.1\n' ;; lhr) printf '104.238.171.11\n' ;;
+        nrt) printf '202.182.107.41\n' ;; sgp) printf '149.28.153.31\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+active_quarantine_test_freeze_field() {
+    local node="$2" field="$3" index
+    case "$node" in
+        nyc) index=1 ;; lax) index=2 ;; ams) index=3 ;;
+        lhr) index=4 ;; nrt) index=5 ;; sgp) index=6 ;; *) return 1 ;;
+    esac
+    case "$field" in
+        writer_pid) printf '%s\n' "$((1000 + index))" ;;
+        writer_start_ticks) printf '%s\n' "$((2000 + index))" ;;
+        supervisor_main_pid|supervisor_start_ticks) printf '%s\n' "$((3000 + index))" ;;
+        boot_id) printf '00000000-0000-0000-0000-%012d\n' "$index" ;;
+        writer_supervision_mode) printf 'systemd-unit\n' ;;
+        supervisor_unit) printf 'arc-node.service\n' ;;
+        executable_path|supervisor_executable_path|data_dir|model_path)
+            printf '/safe/%s/%s\n' "$node" "$field" ;;
+        executable_sha256|argv_sha256|supervisor_executable_sha256|supervisor_argv_sha256|model_sha256)
+            printf 'a%.0s' {1..64}; printf '\n' ;;
+        writer_cgroup_sha256) printf '%064x\n' "$((10 + index))" ;;
+        model_size_bytes) printf '4081004224\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+active_quarantine_test_ssh() {
+    local host="$1"
+    if [ ! -e "$f/$host-live-classifier" ]; then
+        : > "$f/$host-live-classifier"
+        return 1
+    fi
+    printf '%s\n' "$host" >> "$f/active-content-probes"
+}
+
+active_quarantine_test_run_remote() {
+    local node="$1" action="$2" active_mode="${mode:-valid}"
+    printf '%s %s\n' "$node" "$action" >> "$f/actions"
+    case "$action" in
+        quarantine-round-applied-status)
+            python3 - "$f/applied/$node.json" "$active_mode" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_bytes());mode=sys.argv[2]
+if mode=="wrong-capture":value["capture_id"]="9"*64
+elif mode=="wrong-freeze":value["freeze_plan_sha256"]="8"*64
+elif mode=="malformed-applied":value["owned_ruleset_stateless_sha256"]="not-a-hash"
+print(json.dumps(value,sort_keys=True,separators=(",",":")))
+PY
+            ;;
+        quarantine-round-status)
+            local count=0
+            [ ! -f "$f/$node-status-count" ] || count="$(cat "$f/$node-status-count")"
+            count=$((count + 1)); printf '%s\n' "$count" > "$f/$node-status-count"
+            python3 - "$f/applied/$node.json" "$active_mode" <<'PY'
+import hashlib,json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_bytes());mode=sys.argv[2]
+if mode=="wrong-capture":value["capture_id"]="9"*64
+elif mode=="wrong-freeze":value["freeze_plan_sha256"]="8"*64
+elif mode=="malformed-applied":value["owned_ruleset_stateless_sha256"]="not-a-hash"
+raw=(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+status={"schema":"arc.recovery.quarantine-prior-fenced-status.v1",
+ "capture_id":value["capture_id"],"freeze_plan_sha256":value["freeze_plan_sha256"],
+ "node":value["node"],"host":value["host"],
+ "node_applied_receipt_sha256":hashlib.sha256(raw).hexdigest(),
+ "observed_at":"2026-08-31T12:01:00Z","writer_state":"exact-live-fenced",
+ "boot_id":value["boot_id"],"writer_pid":value["writer_pid"],
+ "writer_start_ticks":value["writer_start_ticks"],
+ "writer_cgroup_sha256":value["writer_cgroup_sha256"],
+ "network_quarantine_receipt_sha256":value["network_quarantine_receipt_sha256"],
+ "owned_ruleset_stateless_sha256":value["owned_ruleset_stateless_sha256"],
+ "stable_head":value["stable_head"],"active":True,"enabled":True,
+ "persistent_restart_fence_sha256":None}
+if mode=="wrong-status":status["writer_state"]="persistently-stopped"
+print(json.dumps(status,sort_keys=True,separators=(",",":")))
+PY
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+capture_readiness_resumes_active_applied_prestop_nodes() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f capture_id freeze_sha node mode=valid
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    capture_id="$(printf '0%.0s' {1..63})1"
+    freeze_sha="$(printf '0%.0s' {1..63})2"
+    make_active_quarantine_resume_fixture "$f"
+    # shellcheck disable=SC2317,SC2329
+    host_for() { active_quarantine_test_host_for "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    freeze_node_field() { active_quarantine_test_freeze_field "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    ssh_remote_exact() { active_quarantine_test_ssh "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    run_remote() { active_quarantine_test_run_remote "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    run_stopped_status_exact() { : > "$f/stopped-classifier-reached"; return 1; }
+
+    remote_readiness "$capture_id" "$freeze_sha" /sealed/freeze.json "$f" \
+        "$f/rounds" > "$f/readiness.out" || return 1
+    [ "$(grep -c 'active applied-prestop quarantine/disk ready' "$f/readiness.out")" -eq 6 ] && \
+        [ "$(grep -c 'quarantine-round-applied-status' "$f/actions")" -eq 6 ] && \
+        [ "$(grep -c 'quarantine-round-status' "$f/actions")" -eq 12 ] && \
+        [ "$(wc -l < "$f/active-content-probes" | tr -d ' ')" -eq 6 ] && \
+        [ ! -e "$f/stopped-classifier-reached" ]
+)
+
+capture_readiness_rejects_wrong_or_malformed_active_quarantine() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f capture_id freeze_sha mode attempt active_status
+    f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    capture_id="$(printf '0%.0s' {1..63})1"
+    freeze_sha="$(printf '0%.0s' {1..63})2"
+    # shellcheck disable=SC2317,SC2329
+    host_for() { active_quarantine_test_host_for "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    freeze_node_field() { active_quarantine_test_freeze_field "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    ssh_remote_exact() { active_quarantine_test_ssh "$@"; }
+    # shellcheck disable=SC2317,SC2329
+    run_remote() { active_quarantine_test_run_remote "$@"; }
+    for mode in wrong-capture wrong-freeze malformed-applied wrong-status \
+            malformed-dispatch contradictory-result-prefix \
+            contradictory-result-dispatch ambiguous-attempt released-attempt; do
+        rm -rf -- "$f/rounds" "$f/applied"
+        rm -f -- "$f"/*-live-classifier "$f"/*-status-count \
+            "$f/stopped-classifier-reached" "$f/actions" "$f/active-content-probes"
+        make_active_quarantine_resume_fixture "$f"
+        attempt="$f/rounds/round-1/attempt.fixture"
+        case "$mode" in
+            malformed-dispatch)
+                chmod 600 "$attempt/mutation-dispatch.json"
+                python3 - "$attempt/mutation-dispatch.json" <<'PY'
+import json,pathlib,sys
+path=pathlib.Path(sys.argv[1]);value=json.loads(path.read_bytes())
+value["round_readiness_sha256"]="f"*64
+path.write_text(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n")
+PY
+                chmod 400 "$attempt/mutation-dispatch.json"
+                ;;
+            contradictory-result-prefix|contradictory-result-dispatch)
+                python3 - "$attempt" \
+                    "$(dirname -- "$ORCHESTRATOR")/test_quarantine_rounds.py" \
+                    "$mode" <<'PY'
+import importlib.util,json,os,pathlib,sys
+attempt=pathlib.Path(sys.argv[1]);module_path=pathlib.Path(sys.argv[2]);mode=sys.argv[3]
+spec=importlib.util.spec_from_file_location("active_result_fixture",module_path)
+fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+auth=json.loads((attempt/"authorization.json").read_bytes())
+item=fixture.applied(auth,"nyc",20,fixture.authorized_height(auth,"nyc"))
+transitions=attempt/"node-transitions";transitions.mkdir();os.chmod(transitions,0o700)
+path=transitions/"nyc.json";path.write_bytes(fixture.qr.canonical_bytes(item));os.chmod(path,0o400)
+result=fixture.result(auth,[item],30)
+if mode=="contradictory-result-prefix":
+    result["remaining_targets"]=[row["node"] for row in auth["targets"]]
+else:
+    result["mutation_dispatch"]["sha256"]="f"*64
+path=attempt/"result.json";path.write_bytes(fixture.qr.canonical_bytes(result));os.chmod(path,0o400)
+PY
+                ;;
+            ambiguous-attempt)
+                cp -R "$attempt" "$f/rounds/round-1/attempt.duplicate"
+                chmod 700 "$f/rounds/round-1/attempt.duplicate"
+                ;;
+            released-attempt)
+                python3 - "$attempt/zero-progress-release.json" <<'PY'
+import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1]);path.write_text(json.dumps({},separators=(",",":"))+"\n")
+os.chmod(path,0o400)
+PY
+                ;;
+        esac
+        set +e
+        active_quarantine_applied_prestop_ready "$capture_id" "$freeze_sha" \
+            /sealed/freeze.json nyc "$f/rounds" >/dev/null 2>&1
+        active_status=$?
+        set -e
+        [ "$active_status" -ne 0 ] || return 1
+    done
 )
 
 capture_readiness_fans_out_all_slow_host_probes() (
@@ -1143,6 +1364,7 @@ capture_readiness_fans_out_all_slow_host_probes() (
         /bin/sleep "$delay"
     }
     remote_readiness "$capture_id" "$freeze_sha" /sealed/freeze.json "$f" \
+        "$f/absent-rounds" \
         > "$f/readiness.out" || return 1
     for node in nyc lax ams lhr nrt sgp; do
         [ -f "$f/$node.started" ] || return 1
@@ -1208,6 +1430,7 @@ stale_freeze_capacity_cannot_cross_current_readiness_gate() (
     }
 
     if ( remote_readiness "$capture_id" "$freeze_sha" /sealed/stale-freeze.json "$f" \
+        "$f/absent-rounds" \
         >/dev/null 2>&1; : > "$f/quarantine-mutation-reached" ); then
         return 1
     fi
@@ -2442,7 +2665,7 @@ proof=text[text.index("quarantine_round_zero_progress_proof()"):
            text.index("legacy_height_bracket()")]
 assert proof.index("partial_re=") < proof.index("for member in state.iterdir():")
 for exact in (
-    "authorization\\.json|readiness\\.json|policy\\.nft|apply|nft|",
+    "freeze\\.lock\\.json|authorization\\.json|readiness\\.json|policy\\.nft|apply|nft|",
     "table-binding\\.json|nft-apply-intent\\.json|persistence-plan\\.json|",
     "item.st_size<0 or item.st_size>16*1024*1024",
     "stat.S_IMODE(item.st_mode) not in {0o600,expected_mode}",
@@ -2451,11 +2674,12 @@ for exact in (
     assert exact in proof, exact
 
 # Crash-before-rename model for the exact reviewed random temporary namespace.
-allowed={"authorization.json":0o400,"readiness.json":0o400,"policy.nft":0o400,
+allowed={"freeze.lock.json":0o400,"authorization.json":0o400,
+         "readiness.json":0o400,"policy.nft":0o400,
          "apply":0o500,"nft":0o500,"table-binding.json":0o400,
          "nft-apply-intent.json":0o400,"persistence-plan.json":0o400,
          "contract.json":0o400}
-pattern=re.compile(r"^\.(authorization\.json|readiness\.json|policy\.nft|apply|nft|"
+pattern=re.compile(r"^\.(freeze\.lock\.json|authorization\.json|readiness\.json|policy\.nft|apply|nft|"
                    r"table-binding\.json|nft-apply-intent\.json|persistence-plan\.json|"
                    r"contract\.json)\.([1-9][0-9]*)\.([0-9a-f]{16})\.partial$")
 with tempfile.TemporaryDirectory() as raw:
@@ -4163,6 +4387,8 @@ run_test 'v5 freeze transaction is fault-closed' v5_freeze_transaction_is_fault_
 run_test 'v5 stop journal semantics are fault-closed' v5_stop_journal_semantics_are_fault_closed
 run_test 'classification requires each node once' classification_requires_each_node_once
 run_test 'capture readiness resumes exact stopped state' capture_readiness_resumes_stopped_and_indexed_nodes
+run_test 'capture readiness resumes exact active applied-prestop state' capture_readiness_resumes_active_applied_prestop_nodes
+run_test 'capture readiness rejects wrong or malformed active quarantine' capture_readiness_rejects_wrong_or_malformed_active_quarantine
 run_test 'capture readiness fans out all slow host probes' capture_readiness_fans_out_all_slow_host_probes
 run_test 'stale freeze capacity cannot cross current readiness gate' stale_freeze_capacity_cannot_cross_current_readiness_gate
 run_test 'fleet observation retry rejects any stopped writer' fleet_live_observation_retry_rejects_any_stopped_writer

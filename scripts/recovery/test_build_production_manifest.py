@@ -1078,7 +1078,7 @@ print(json.dumps(value,sort_keys=True))
                     "applied.commit.json": builder.quarantine_rounds.digest(round_commit),
                     "persistent-restart-fence.json": round_restart_sha,
                     "rendered-policy.nft": f"{index + 215:064x}",
-                    "/usr/local/libexec/arc-legacy-maintenance-fence": f"{index + 216:064x}",
+                    "/etc/arc-recovery/network-fence-dispatch": f"{index + 216:064x}",
                     "/etc/systemd/system/arc-legacy-maintenance-fence.service": f"{index + 217:064x}",
                     "/etc/systemd/system/arc-self-heal.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 218:064x}",
                     "/etc/systemd/system/arc-node.service.d/zzzy-arc-recovery-network-fence.conf": f"{index + 219:064x}",
