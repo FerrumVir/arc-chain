@@ -12,10 +12,12 @@ from __future__ import annotations
 import ast
 import dataclasses
 import hashlib
+import json
 import os
 import pathlib
 import re
 import socket
+import stat
 import sys
 import tempfile
 import unittest
@@ -775,6 +777,115 @@ class EmbeddedProgramTests(unittest.TestCase):
             "subprocess.check_output([str(state / \"apply\"), \"initial\"])",
         ):
             self.assertGreater(self.outer.index(token), ready)
+
+    def test_systemd_dropin_directory_contract_accepts_umask_private_mode(self) -> None:
+        tree = ast.parse(self.outer)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "secure_systemd_dropin_dir"
+        )
+
+        def fail(message: str) -> None:
+            raise RuntimeError(message)
+
+        namespace = {"os": os, "stat": stat, "fail": fail}
+        exec(compile(ast.Module(body=[function], type_ignores=[]),
+                     "secure-systemd-dropin-dir", "exec"), namespace)
+        validate = namespace["secure_systemd_dropin_dir"]
+
+        class FakePath:
+            def __init__(self, mode: int, *, uid: int = 0, gid: int = 0,
+                         symlink: bool = False, directory: bool = True) -> None:
+                self.mode = mode
+                self.uid = uid
+                self.gid = gid
+                self.symlink = symlink
+                self.directory = directory
+
+            def exists(self) -> bool:
+                return True
+
+            def is_symlink(self) -> bool:
+                return self.symlink
+
+            def lstat(self):
+                file_type = stat.S_IFDIR if self.directory else stat.S_IFREG
+                return os.stat_result((file_type | self.mode, 0, 0, 1,
+                                       self.uid, self.gid, 0, 0, 0, 0))
+
+            def __str__(self) -> str:
+                return "/etc/systemd/system/arc-self-heal.service.d"
+
+        # 0700 is what mkdir(0755) produces under archive-node.sh's umask 077;
+        # 0750 and 0755 are also safe pre-existing administrator layouts.
+        for mode in (0o700, 0o750, 0o755):
+            with self.subTest(accepted=oct(mode)):
+                validate(FakePath(mode))
+
+        rejected = (
+            FakePath(0o770), FakePath(0o707), FakePath(0o600),
+            FakePath(0o700, uid=1), FakePath(0o700, gid=1),
+            FakePath(0o700, symlink=True), FakePath(0o700, directory=False),
+        )
+        for path in rejected:
+            with self.subTest(rejected=vars(path)), self.assertRaisesRegex(
+                    RuntimeError, "unsafe quarantine-round systemd drop-in directory"):
+                validate(path)
+
+        for call in (
+            "secure_systemd_dropin_dir(dependency.parent, create=True)",
+            "secure_systemd_dropin_dir(path.parent, create=True)",
+            "secure_systemd_dropin_dir(dependency.parent)",
+        ):
+            self.assertIn(call, self.outer)
+        self.assertNotIn("secure_dir(dependency.parent, 0o755", self.outer)
+        self.assertNotIn("secure_dir(path.parent, 0o755", self.outer)
+
+    def test_nft_json_verification_requests_numeric_icmpv6_values(self) -> None:
+        tree = ast.parse(self.helper)
+        functions = {
+            node.name: node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"nft_json", "extract"}
+        }
+        calls: list[list[str]] = []
+        numeric_types = [2, 133, 134, 135, 136]
+        symbolic_types = [
+            "packet-too-big", "nd-router-solicit", "nd-router-advert",
+            "nd-neighbor-solicit", "nd-neighbor-advert",
+        ]
+
+        class FakeSubprocess:
+            def check_output(self, argv: list[str]) -> bytes:
+                calls.append(argv)
+                values = numeric_types if "--numeric" in argv else symbolic_types
+                return json.dumps({"nftables": [{"rule": {"expr": [{
+                    "match": {
+                        "left": {"payload": {"protocol": "icmpv6", "field": "type"}},
+                        "op": "==", "right": {"set": values},
+                    },
+                }]}}]}).encode()
+
+        def fail(message: str, code: int = 1) -> None:
+            raise RuntimeError(f"{code}: {message}")
+
+        namespace = {"json": json, "subprocess": FakeSubprocess(), "fail": fail}
+        exec(compile(ast.Module(body=[functions["nft_json"], functions["extract"]],
+                                    type_ignores=[]),
+                     "numeric-nft-json", "exec"), namespace)
+        value, _raw = namespace["nft_json"](
+            "/pinned/nft", "list", "table", "inet", "arc_legacy_maintenance_v1",
+        )
+        self.assertEqual(calls, [[
+            "/pinned/nft", "--json", "--numeric", "list", "table", "inet",
+            "arc_legacy_maintenance_v1",
+        ]])
+        expression = value["nftables"][0]["rule"]["expr"]
+        self.assertEqual(
+            namespace["extract"](expression, "iifname"),
+            (None, [("icmpv6", "type", numeric_types)], None, False),
+        )
 
     def test_intent_precedes_restart_affecting_paths(self) -> None:
         intent = self.outer.index("publish(intent_path, intent_raw, 0o400)")

@@ -5612,6 +5612,28 @@ def secure_dir(path, mode_value, *, create=False):
             or stat.S_IMODE(details.st_mode) != mode_value):
         fail(f"unsafe quarantine-round directory: {path}")
 
+def secure_systemd_dropin_dir(path, *, create=False):
+    """Accept root-private or conventionally traversable systemd drop-in dirs.
+
+    The remote helper runs under umask 077, so ``mkdir(..., 0o755)`` may
+    legitimately materialize as 0700.  Existing administrator-created drop-in
+    directories are commonly 0755.  Both are safe here: the security boundary
+    is root ownership plus the absence of group/world write permission, while
+    owner rwx is required for the create-only publications below.
+    """
+    if create and not path.exists() and not path.is_symlink():
+        try:
+            os.mkdir(path, 0o755)
+            fsync_dir(path.parent)
+        except FileExistsError:
+            pass
+    details = path.lstat()
+    permissions = stat.S_IMODE(details.st_mode)
+    if (path.is_symlink() or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != 0 or details.st_gid != 0
+            or permissions & 0o700 != 0o700 or permissions & 0o022):
+        fail(f"unsafe quarantine-round systemd drop-in directory: {path}")
+
 def secure_read(path, mode_value, *, maximum=16 * 1024 * 1024):
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
@@ -7099,7 +7121,7 @@ WantedBy=multi-user.target
         # Same order as initial apply: the selected live supervisor barrier is
         # the first effective mutation; a missing dispatcher also fails closed.
         for dependency, dependency_value in dependencies.items():
-            secure_dir(dependency.parent, 0o755, create=True)
+            secure_systemd_dropin_dir(dependency.parent, create=True)
             publish(dependency, dependency_value, 0o400)
         publish(dispatcher_path, dispatcher_raw_value, 0o500)
         publish(unit_path, unit_value, 0o400)
@@ -9429,7 +9451,7 @@ WantedBy=multi-user.target
             publish(stop_intent_path, stop_intent_raw, 0o400)
 
         for path, raw in stop_dropins.items():
-            secure_dir(path.parent, 0o755, create=True)
+            secure_systemd_dropin_dir(path.parent, create=True)
             publish(path, raw, 0o400)
         if allow_marker.exists() or allow_marker.is_symlink():
             if marker_identity() != marker_before:
@@ -9833,7 +9855,7 @@ def normalize_nonowned(value):
   answer.append(scrub(entry))
  return answer
 def nft_json(nft,*args):
- raw=subprocess.check_output([str(nft),"--json",*args]);value=json.loads(raw)
+ raw=subprocess.check_output([str(nft),"--json","--numeric",*args]);value=json.loads(raw)
  if not isinstance(value,dict) or not isinstance(value.get("nftables"),list):fail("nft JSON differs")
  return value,raw
 def exists(nft):return subprocess.run([str(nft),"list","table","inet",TABLE],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
@@ -10162,7 +10184,7 @@ publish(commit_path,canonical(commit),0o400);result(commit)
     # The selected frozen supervisor dependency is first in insertion order.
     # A crash after this or any later prefix leaves boot activation fail-closed.
     for dependency, dependency_value in dependencies.items():
-        secure_dir(dependency.parent, 0o755)
+        secure_systemd_dropin_dir(dependency.parent)
         publish(dependency, dependency_value, 0o400)
     publish(dispatcher_path, dispatcher_raw_value, 0o500)
     publish(unit_path, unit_value, 0o400)
