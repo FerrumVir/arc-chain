@@ -1763,7 +1763,7 @@ def validate_node_applied(
         "nft-apply-intent.json", "policy.nft", "apply", "nft",
         "nft-deadline-gate.json", "applied.commit.json",
         "persistent-restart-fence.json", "rendered-policy.nft",
-        "/usr/local/libexec/arc-legacy-maintenance-fence",
+        "/etc/arc-recovery/network-fence-dispatch",
         "/etc/systemd/system/arc-legacy-maintenance-fence.service",
         "/etc/systemd/system/arc-self-heal.service.d/zzzy-arc-recovery-network-fence.conf",
         "/etc/systemd/system/arc-node.service.d/zzzy-arc-recovery-network-fence.conf",
@@ -2200,15 +2200,26 @@ def validate_node_stopped_precommit(
     ):
         require_hash(supervisor.get(key), f"persistently-stopped supervisor {key}")
     files = plan.get("files")
-    if not isinstance(files, dict) or set(files) != {"dispatcher", "unit", "dependencies"}:
+    if not isinstance(files, dict) or set(files) != {
+        "freeze_plan", "dispatcher", "unit", "dependencies"
+    }:
         fail("persistently-stopped persistence file inventory differs")
+    freeze_plan_file = files.get("freeze_plan")
     dispatcher = files.get("dispatcher")
     unit = files.get("unit")
     dependencies = files.get("dependencies")
     if (
-        not isinstance(dispatcher, dict)
+        not isinstance(freeze_plan_file, dict)
+        or set(freeze_plan_file) != {"path", "sha256", "mode"}
+        or freeze_plan_file.get("path") != (
+            f"/etc/arc-recovery/network-fence-rounds/{capture}/{auth_sha}/"
+            "freeze.lock.json"
+        )
+        or freeze_plan_file.get("sha256") != freeze
+        or freeze_plan_file.get("mode") != 0o400
+        or not isinstance(dispatcher, dict)
         or set(dispatcher) != {"path", "sha256", "mode"}
-        or dispatcher.get("path") != "/usr/local/libexec/arc-legacy-maintenance-fence"
+        or dispatcher.get("path") != "/etc/arc-recovery/network-fence-dispatch"
         or dispatcher.get("mode") != 0o500
         or not isinstance(unit, dict)
         or set(unit) != {"path", "sha256", "mode"}

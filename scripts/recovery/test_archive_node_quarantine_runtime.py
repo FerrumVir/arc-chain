@@ -102,6 +102,7 @@ class FakeRuntime:
     boot: int = 1
     sealed_boot: int = 1
     intent: bool = False
+    freeze_copy: bool = False
     persistence_plan: bool = False
     persistence_files: int = 0
     persistence_file_total: int = 6
@@ -130,14 +131,16 @@ class FakeRuntime:
         if self.now > self.deadline and not self.table and not self.commit:
             raise TimeoutError("expired before mutation")
         order = (
-            "intent", "persistence-plan", "supervisor-dropin", "dropin-2",
+            "freeze-copy", "intent", "persistence-plan", "supervisor-dropin", "dropin-2",
             "dropin-3", "dropin-4", "dispatcher", "unit", "daemon-reload",
             "enable", "sync", "barrier", "gate", "nft", "commit",
             "selector", "unit-start",
         )
         target = order.index(name)
         for index, step in enumerate(order[: target + 1]):
-            if step == "intent":
+            if step == "freeze-copy":
+                self.freeze_copy = True
+            elif step == "intent":
                 self.intent = True
             elif step == "persistence-plan":
                 self.persistence_plan = True
@@ -204,6 +207,14 @@ class FakeRuntime:
             self.commit = True
             return True
         return False
+
+    def reconcile_postcommit_receipts(self) -> None:
+        if (not self.commit or not self.freeze_copy or not self.roots_exact
+                or not self.writer_live):
+            raise RuntimeError("exact committed state and original writer required")
+        self.ensure()
+        self.selector = True
+        self.service = True
 
     def stopped_candidate(self) -> bool:
         return (
@@ -774,7 +785,7 @@ class EmbeddedProgramTests(unittest.TestCase):
         for token in (
             "secure_dir(state_base.parent, 0o700, create=True)",
             "systemctl\", \"daemon-reload",
-            "subprocess.check_output([str(state / \"apply\"), \"initial\"])",
+            "commit_raw = subprocess.check_output([str(state / \"apply\"), helper_mode])",
         ):
             self.assertGreater(self.outer.index(token), ready)
 
@@ -841,6 +852,108 @@ class EmbeddedProgramTests(unittest.TestCase):
             self.assertIn(call, self.outer)
         self.assertNotIn("secure_dir(dependency.parent, 0o755", self.outer)
         self.assertNotIn("secure_dir(path.parent, 0o755", self.outer)
+
+    def test_protected_service_uses_only_hash_bound_state_freeze_plan(self) -> None:
+        payloads = self.outer[
+            self.outer.index("def persistence_payloads():"):
+            self.outer.index("def persistence_file_roots(")
+        ]
+        self.assertIn("ProtectHome=yes", payloads)
+        self.assertNotIn("ProtectHome=read-only", payloads)
+        self.assertNotIn("/root/.arc-recovery-plans", self.helper)
+        self.assertIn(
+            'if plan_path!=STATE/"freeze.lock.json":fail(', self.helper
+        )
+        self.assertIn('plan_raw=read(plan_path,0o400)', self.helper)
+        roots = self.outer[
+            self.outer.index("def persistence_file_roots("):
+            self.outer.index('if mode in {"precommit-status", "stopped-precommit"}:')
+        ]
+        for required in (
+            '"freeze_plan"', '"path": str(state / "freeze.lock.json")',
+            '"sha256": freeze_sha', '"mode": 0o400',
+        ):
+            self.assertIn(required, roots)
+        copy_at = self.outer.index('publish(state / "freeze.lock.json", freeze_plan_raw, 0o400)')
+        persistence_at = self.outer.index(
+            "for dependency, dependency_value in dependencies.items():", copy_at
+        )
+        unit_at = self.outer.index("publish(unit_path, unit_value, 0o400)", persistence_at)
+        self.assertLess(copy_at, persistence_at)
+        self.assertLess(copy_at, unit_at)
+
+    def test_helper_freeze_copy_missing_or_tampered_fails_closed(self) -> None:
+        tree = ast.parse(self.helper)
+        start = next(
+            index for index,node in enumerate(tree.body)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "plan_path"
+                    for target in node.targets)
+        )
+        end = next(
+            index for index,node in enumerate(tree.body[start:], start)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "nft"
+                    for target in node.targets)
+        )
+        fragment = ast.Module(body=tree.body[start:end], type_ignores=[])
+
+        class CopyError(RuntimeError):
+            pass
+
+        def fail(message: str) -> None:
+            raise CopyError(message)
+
+        with tempfile.TemporaryDirectory() as raw:
+            state = pathlib.Path(raw)
+            source = {"source_commit": "a" * 40}
+            canonical = lambda value: (
+                json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            contract = {
+                "freeze_plan_path": str(state / "freeze.lock.json"),
+                "freeze_plan_sha256": hashlib.sha256(canonical(source)).hexdigest(),
+                "source_main_commit": source["source_commit"],
+            }
+
+            def execute() -> None:
+                namespace = {
+                    "STATE": state, "pathlib": pathlib, "contract": contract,
+                    "json": json, "sha": lambda value: hashlib.sha256(value).hexdigest(),
+                    "canonical": canonical, "fail": fail,
+                    "read": lambda path,_mode: path.read_bytes(),
+                }
+                exec(compile(fragment, "helper-freeze-copy", "exec"), namespace)
+
+            with self.assertRaises(FileNotFoundError):
+                execute()
+            (state / "freeze.lock.json").write_bytes(canonical({"source_commit": "b" * 40}))
+            with self.assertRaisesRegex(CopyError, "freeze/source changed"):
+                execute()
+            (state / "freeze.lock.json").write_bytes(canonical(source))
+            execute()
+
+    def test_postcommit_reconciliation_never_reenters_initial_window(self) -> None:
+        reconciliation = self.outer[
+            self.outer.index("def load_postcommit_reconciliation():"):
+            self.outer.index("origin = urllib.parse.urlsplit", self.outer.index(
+                "def load_postcommit_reconciliation():"
+            ))
+        ]
+        for required in (
+            'persisted_freeze_raw = secure_read(state / "freeze.lock.json", 0o400)',
+            'verify_writer(target)',
+            'helper_mode = "probe" if existing_comment is not None else "ensure"',
+            'durable_commit_raw != postcommit[0]',
+        ):
+            self.assertIn(required, reconciliation)
+        postcommit_helper = reconciliation[
+            reconciliation.index('helper_mode = "initial"'):
+            reconciliation.index("commit = parse_canonical", reconciliation.index(
+                'helper_mode = "initial"'
+            ))
+        ]
+        self.assertNotIn('[str(state / "apply"), "initial"]', postcommit_helper)
 
     def test_nft_json_verification_requests_numeric_icmpv6_values(self) -> None:
         tree = ast.parse(self.helper)
@@ -1050,6 +1163,27 @@ class FakeCrashMatrixTests(unittest.TestCase):
         self.assertFalse(value.writer_live)
         self.assertTrue(value.ensure())
         self.assertTrue(value.table)
+
+    def test_expired_postcommit_resume_needs_no_old_supervisor_or_lease(self) -> None:
+        value = self.runtime()
+        value.prefix("commit")
+        value.supervisor_live = False
+        value.now = 10_000
+        value.reconcile_postcommit_receipts()
+        self.assertTrue(value.table and value.selector and value.service)
+
+    def test_postcommit_resume_rejects_missing_or_changed_freeze_copy(self) -> None:
+        for mutate in (
+            lambda value: setattr(value, "freeze_copy", False),
+            lambda value: setattr(value, "roots_exact", False),
+        ):
+            value = self.runtime()
+            value.prefix("commit")
+            value.supervisor_live = False
+            value.now = 10_000
+            mutate(value)
+            with self.assertRaisesRegex(RuntimeError, "exact committed state"):
+                value.reconcile_postcommit_receipts()
 
     def test_wrong_root_fails_before_mutation(self) -> None:
         value = self.runtime()

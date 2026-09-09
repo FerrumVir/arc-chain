@@ -716,7 +716,7 @@ def applied(auth: dict, name: str, second: int, height: int) -> dict:
         "applied.commit.json": qr.digest(applied_commit),
         "persistent-restart-fence.json": restart_sha,
         "rendered-policy.nft": H["22"],
-        "/usr/local/libexec/arc-legacy-maintenance-fence": H["23"],
+        "/etc/arc-recovery/network-fence-dispatch": H["23"],
         "/etc/systemd/system/arc-legacy-maintenance-fence.service": H["24"],
         "/etc/systemd/system/arc-self-heal.service.d/zzzy-arc-recovery-network-fence.conf": H["25"],
         "/etc/systemd/system/arc-node.service.d/zzzy-arc-recovery-network-fence.conf": H["26"],

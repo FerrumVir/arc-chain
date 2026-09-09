@@ -5307,8 +5307,396 @@ run_sealed_source_status_exact() {
         "$(freeze_node_field "$freeze_plan" "$node" data_dir)"
 }
 
+active_quarantine_round_candidates() {
+    [ "$#" -eq 4 ] || \
+        die "active quarantine candidates require round root, capture, freeze, and node"
+    local round_root="$1" capture_id="$2" freeze_sha="$3" node="$4"
+    python3 - "$round_root" "$capture_id" "$freeze_sha" "$node" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+
+root=pathlib.Path(sys.argv[1]);capture,freeze,node=sys.argv[2:]
+canonical=lambda value:(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode()
+hash_re=re.compile(r"[0-9a-f]{64}")
+fleet=("nyc","lax","ams","lhr","nrt","sgp")
+if not os.path.lexists(root):raise SystemExit(0)
+details=root.lstat()
+if (root.is_symlink() or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid!=os.geteuid() or stat.S_IMODE(details.st_mode)!=0o700):
+    raise SystemExit("active quarantine round root is unsafe")
+def locked(path,label):
+    fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+    try:
+        details=os.fstat(fd)
+        if (not stat.S_ISREG(details.st_mode) or details.st_uid!=os.geteuid()
+                or details.st_nlink!=1 or stat.S_IMODE(details.st_mode)!=0o400
+                or not 0<details.st_size<=32*1024*1024):
+            raise SystemExit(f"active quarantine {label} is unsafe")
+        raw=os.read(fd,32*1024*1024+1);value=json.loads(raw)
+        if len(raw)!=details.st_size or raw!=canonical(value) or not isinstance(value,dict):
+            raise SystemExit(f"active quarantine {label} differs")
+        return value,raw
+    finally:os.close(fd)
+candidates=[]
+for round_path in sorted(root.glob("round-*")):
+    match=re.fullmatch(r"round-([1-6])",round_path.name)
+    if match is None:continue
+    round_number=int(match.group(1))
+    round_details=round_path.lstat()
+    if (round_path.is_symlink() or not stat.S_ISDIR(round_details.st_mode)
+            or round_details.st_uid!=os.geteuid()
+            or stat.S_IMODE(round_details.st_mode)!=0o700):
+        raise SystemExit("active quarantine round directory is unsafe")
+    for attempt in sorted(round_path.glob("attempt.*")):
+        attempt_details=attempt.lstat()
+        if (attempt.is_symlink() or not stat.S_ISDIR(attempt_details.st_mode)
+                or attempt_details.st_uid!=os.geteuid()
+                or stat.S_IMODE(attempt_details.st_mode)!=0o700):
+            raise SystemExit("active quarantine attempt directory is unsafe")
+        release_path=attempt/"zero-progress-release.json"
+        if os.path.lexists(release_path):
+            # A released dispatch has a separately validated fleet-wide proof
+            # that it produced no transition. It can never classify an active
+            # host, and malformed release bytes still fail closed here.
+            locked(release_path,"zero-progress release")
+            continue
+        auth_path=attempt/"authorization.json";readiness_path=attempt/"readiness.json"
+        dispatch_path=attempt/"mutation-dispatch.json"
+        if not all(os.path.lexists(path) for path in (
+                auth_path,readiness_path,dispatch_path)):continue
+        auth,auth_raw=locked(auth_path,"authorization")
+        auth_sha=hashlib.sha256(auth_raw).hexdigest()
+        targets=auth.get("targets")
+        if (auth.get("schema")!="arc.recovery.quarantine-round-authorization.v1"
+                or (auth.get("capture_id"),auth.get("freeze_plan_sha256"),
+                    auth.get("round_number"))!=(capture,freeze,round_number)
+                or not isinstance(targets,list)):
+            raise SystemExit("active quarantine authorization identity differs")
+        target_names=[row.get("node") for row in targets if isinstance(row,dict)]
+        if (len(target_names)!=len(targets) or len(target_names)!=len(set(target_names))
+                or any(name not in fleet for name in target_names) or node not in target_names):
+            continue
+        readiness,readiness_raw=locked(readiness_path,"readiness")
+        readiness_sha=hashlib.sha256(readiness_raw).hexdigest()
+        ready_targets=readiness.get("targets")
+        ready_names=[row.get("node") for row in ready_targets] \
+            if isinstance(ready_targets,list) and all(isinstance(row,dict) for row in ready_targets) else []
+        if (readiness.get("schema")!="arc.recovery.quarantine-round-readiness.v1"
+                or (readiness.get("capture_id"),readiness.get("freeze_plan_sha256"),
+                    readiness.get("round_number"),readiness.get("round_authorization_sha256"))
+                    !=(capture,freeze,round_number,auth_sha)
+                or ready_names!=target_names):
+            raise SystemExit("active quarantine readiness identity differs")
+        dispatch,dispatch_raw=locked(dispatch_path,"mutation dispatch")
+        dispatch_targets=dispatch.get("targets")
+        expected_dispatch_targets=[
+            {"node":row.get("node"),"host":row.get("host")} for row in targets
+        ]
+        dispatch_fields={"schema","capture_id","freeze_plan_sha256","round_number",
+            "round_authorization_sha256","round_readiness_sha256",
+            "live_observation_selection_sha256","live_observation_generation",
+            "observation_generation_receipt_sha256","drive_prefreeze_receipt_sha256",
+            "targets","dispatched_at"}
+        if (set(dispatch)!=dispatch_fields
+                or dispatch.get("schema")!="arc.recovery.quarantine-mutation-dispatch.v1"
+                or (dispatch.get("capture_id"),dispatch.get("freeze_plan_sha256"),
+                    dispatch.get("round_number"),dispatch.get("round_authorization_sha256"),
+                    dispatch.get("round_readiness_sha256"),dispatch_targets)
+                    !=(capture,freeze,round_number,auth_sha,readiness_sha,
+                       expected_dispatch_targets)
+                or any(dispatch.get(label)!=auth.get(label) for label in (
+                    "live_observation_selection_sha256","live_observation_generation",
+                    "observation_generation_receipt_sha256",
+                    "drive_prefreeze_receipt_sha256"))):
+            raise SystemExit("active quarantine mutation dispatch identity differs")
+        try:
+            import datetime
+            datetime.datetime.strptime(dispatch.get("dispatched_at",""),
+                                       "%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError,ValueError):
+            raise SystemExit("active quarantine mutation dispatch time differs")
+        local_applied="-";applied_path=attempt/"node-transitions"/f"{node}.json"
+        if os.path.lexists(applied_path):
+            applied,applied_raw=locked(applied_path,"local applied receipt")
+            if (applied.get("schema")!="arc.recovery.quarantine-node-nft-applied.v1"
+                    or (applied.get("capture_id"),applied.get("freeze_plan_sha256"),
+                        applied.get("round_number"),applied.get("round_authorization_sha256"),
+                        applied.get("round_readiness_sha256"),applied.get("node"))
+                        !=(capture,freeze,round_number,auth_sha,readiness_sha,node)):
+                raise SystemExit("active quarantine local applied receipt differs")
+            local_applied=hashlib.sha256(applied_raw).hexdigest()
+        result_path=attempt/"result.json"
+        if os.path.lexists(result_path):
+            result,result_raw=locked(result_path,"round result")
+            transitions=result.get("transitions")
+            result_fields={"schema","capture_id","freeze_plan_sha256","round_number",
+                "round_authorization_sha256","target_readiness","transitions",
+                "mutation_dispatch","remaining_target_inert_proofs",
+                "remaining_targets","completed_at"}
+            if (set(result)!=result_fields
+                    or result.get("schema")!="arc.recovery.quarantine-round-result.v3"
+                    or (result.get("capture_id"),result.get("freeze_plan_sha256"),
+                        result.get("round_number"),
+                        result.get("round_authorization_sha256"))
+                        !=(capture,freeze,round_number,auth_sha)
+                    or not isinstance(transitions,list)):
+                raise SystemExit("active quarantine round result identity differs")
+            def exact_wrapper(wrapper,value,expected_sha,label):
+                if (not isinstance(wrapper,dict) or set(wrapper)!={"sha256","value"}
+                        or wrapper.get("value")!=value
+                        or wrapper.get("sha256")!=expected_sha
+                        or hashlib.sha256(canonical(wrapper.get("value"))).hexdigest()
+                            !=expected_sha):
+                    raise SystemExit(f"active quarantine result {label} differs")
+            exact_wrapper(result.get("target_readiness"),readiness,readiness_sha,
+                          "readiness")
+            dispatch_sha=hashlib.sha256(dispatch_raw).hexdigest()
+            exact_wrapper(result.get("mutation_dispatch"),dispatch,dispatch_sha,
+                          "mutation dispatch")
+            matching=[]
+            transitioned=[]
+            for wrapper in transitions:
+                if (not isinstance(wrapper,dict) or set(wrapper)!={"sha256","value"}
+                        or not isinstance(wrapper.get("value"),dict)
+                        or hashlib.sha256(canonical(wrapper["value"])).hexdigest()
+                            !=wrapper.get("sha256")):
+                    raise SystemExit("active quarantine result transition differs")
+                item=wrapper["value"];item_node=item.get("node")
+                if (item_node not in target_names or item_node in transitioned
+                        or (item.get("capture_id"),item.get("freeze_plan_sha256"),
+                            item.get("round_number"),
+                            item.get("round_authorization_sha256"),
+                            item.get("round_readiness_sha256"))
+                            !=(capture,freeze,round_number,auth_sha,readiness_sha)):
+                    raise SystemExit("active quarantine result transition identity differs")
+                transition_path=attempt/"node-transitions"/f"{item_node}.json"
+                if not os.path.lexists(transition_path):
+                    raise SystemExit("active quarantine result transition file is missing")
+                transition,transition_raw=locked(
+                    transition_path,f"{item_node} result transition")
+                if (transition!=item
+                        or hashlib.sha256(transition_raw).hexdigest()!=wrapper["sha256"]):
+                    raise SystemExit("active quarantine result transition file differs")
+                transitioned.append(item_node)
+                if item_node==node:matching.append(wrapper)
+            if transitioned != [name for name in target_names if name in set(transitioned)]:
+                raise SystemExit("active quarantine result transition order differs")
+            remaining=[name for name in target_names if name not in set(transitioned)]
+            if result.get("remaining_targets")!=remaining:
+                raise SystemExit("active quarantine result remaining targets differ")
+            inert=result.get("remaining_target_inert_proofs")
+            if not isinstance(inert,list):
+                raise SystemExit("active quarantine result inert proofs differ")
+            inert_nodes=[]
+            for wrapper in inert:
+                if (not isinstance(wrapper,dict) or set(wrapper)!={"sha256","value"}
+                        or not isinstance(wrapper.get("value"),dict)
+                        or hashlib.sha256(canonical(wrapper["value"])).hexdigest()
+                            !=wrapper.get("sha256")):
+                    raise SystemExit("active quarantine result inert proof differs")
+                inert_nodes.append(wrapper["value"].get("node"))
+            if inert_nodes not in ([],remaining):
+                raise SystemExit("active quarantine result inert proof order differs")
+            if not matching:
+                continue
+            if (len(matching)!=1 or local_applied=="-"
+                    or matching[0].get("sha256")!=local_applied):
+                raise SystemExit("active quarantine result/local transition differs")
+        candidates.append((round_number,auth_sha,readiness_sha,local_applied))
+for row in candidates:print(*row)
+PY
+}
+
+validate_active_quarantine_round_status() {
+    [ "$#" -eq 15 ] || die "active quarantine round status arguments differ"
+    python3 - "$@" <<'PY'
+import datetime,hashlib,importlib.util,json,re,sys
+
+(capture,freeze,node,host,round_raw,auth_sha,readiness_sha,local_applied_sha,
+ boot,pid_raw,start_raw,cgroup_sha,applied_raw,status_raw,module_path)=sys.argv[1:]
+round_number=int(round_raw);pid=int(pid_raw);start=int(start_raw)
+canonical=lambda value:json.dumps(value,sort_keys=True,separators=(",",":"))
+digest=lambda raw:hashlib.sha256((raw+"\n").encode()).hexdigest()
+hash_re=re.compile(r"[0-9a-f]{64}")
+def parse(raw,label):
+    try:value=json.loads(raw)
+    except (UnicodeDecodeError,json.JSONDecodeError):raise SystemExit(f"{label} is invalid JSON")
+    if not isinstance(value,dict) or raw!=canonical(value):raise SystemExit(f"{label} is noncanonical")
+    return value
+applied=parse(applied_raw,"active quarantine applied receipt")
+spec=importlib.util.spec_from_file_location("arc_active_quarantine_rounds",module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("active quarantine validator module cannot be loaded")
+rounds=importlib.util.module_from_spec(spec);sys.modules[spec.name]=rounds
+spec.loader.exec_module(rounds)
+try:rounds.validate_node_applied(applied,authorization_sha256=auth_sha,node=node)
+except Exception as error:
+    raise SystemExit(f"active quarantine applied receipt is invalid: {error}") from error
+applied_fields={"schema","capture_id","freeze_plan_sha256","round_authorization_sha256",
+ "round_readiness_sha256","round_number","node","host","boot_id","writer_pid",
+ "writer_start_ticks","writer_cgroup_sha256","nft_policy_source_sha256",
+ "owned_ruleset_stateless_sha256","nft_applied_at","nft_deadline_gate",
+ "network_quarantine_receipt","network_quarantine_receipt_sha256","stable_head",
+ "authorization_ancestry_proof","persistent_restart_fence_sha256"}
+applied_sha=digest(applied_raw)
+if (set(applied)!=applied_fields
+        or applied.get("schema")!="arc.recovery.quarantine-node-nft-applied.v1"
+        or (applied.get("capture_id"),applied.get("freeze_plan_sha256"),
+            applied.get("round_number"),applied.get("round_authorization_sha256"),
+            applied.get("round_readiness_sha256"),applied.get("node"),applied.get("host"),
+            applied.get("boot_id"),applied.get("writer_pid"),
+            applied.get("writer_start_ticks"),applied.get("writer_cgroup_sha256"))
+            !=(capture,freeze,round_number,auth_sha,readiness_sha,node,host,
+               boot,pid,start,cgroup_sha)
+        or (local_applied_sha!="-" and local_applied_sha!=applied_sha)):
+    raise SystemExit("active quarantine applied receipt identity differs")
+for label in ("writer_cgroup_sha256","nft_policy_source_sha256",
+              "owned_ruleset_stateless_sha256","network_quarantine_receipt_sha256",
+              "persistent_restart_fence_sha256"):
+    if hash_re.fullmatch(str(applied.get(label))) is None:
+        raise SystemExit(f"active quarantine applied {label} differs")
+def unwrap(wrapper,label):
+    if not isinstance(wrapper,dict) or set(wrapper)!={"sha256","value"} \
+            or not isinstance(wrapper.get("value"),dict):
+        raise SystemExit(f"active quarantine {label} wrapper differs")
+    root=hashlib.sha256((canonical(wrapper["value"])+"\n").encode()).hexdigest()
+    if wrapper.get("sha256")!=root:raise SystemExit(f"active quarantine {label} root differs")
+    return wrapper["value"],root
+unwrap(applied["nft_deadline_gate"],"nft gate")
+network,network_sha=unwrap(applied["network_quarantine_receipt"],"network receipt")
+unwrap(applied["authorization_ancestry_proof"],"ancestry")
+if (network_sha!=applied["network_quarantine_receipt_sha256"]
+        or (network.get("capture_id"),network.get("freeze_plan_sha256"),
+            network.get("round_number"),network.get("round_authorization_sha256"),
+            network.get("round_readiness_sha256"),network.get("node"),network.get("host"))
+            !=(capture,freeze,round_number,auth_sha,readiness_sha,node,host)
+        or network.get("owned_ruleset_stateless_sha256")
+            !=applied["owned_ruleset_stateless_sha256"]):
+    raise SystemExit("active quarantine network receipt binding differs")
+head=applied.get("stable_head")
+if (not isinstance(head,dict) or set(head)!={"height","block_hash","state_root"}
+        or isinstance(head.get("height"),bool) or not isinstance(head.get("height"),int)
+        or head["height"]<1 or hash_re.fullmatch(str(head.get("block_hash"))) is None
+        or hash_re.fullmatch(str(head.get("state_root"))) is None):
+    raise SystemExit("active quarantine applied head differs")
+status=parse(status_raw,"active quarantine round status")
+status_fields={"schema","capture_id","freeze_plan_sha256","node","host",
+ "node_applied_receipt_sha256","observed_at","writer_state","boot_id","writer_pid",
+ "writer_start_ticks","writer_cgroup_sha256","network_quarantine_receipt_sha256",
+ "owned_ruleset_stateless_sha256","stable_head","active","enabled",
+ "persistent_restart_fence_sha256"}
+if (set(status)!=status_fields
+        or status.get("schema")!="arc.recovery.quarantine-prior-fenced-status.v1"
+        or (status.get("capture_id"),status.get("freeze_plan_sha256"),status.get("node"),
+            status.get("host"),status.get("node_applied_receipt_sha256"),
+            status.get("writer_state"),status.get("boot_id"),status.get("writer_pid"),
+            status.get("writer_start_ticks"),status.get("writer_cgroup_sha256"),
+            status.get("network_quarantine_receipt_sha256"),
+            status.get("owned_ruleset_stateless_sha256"),status.get("stable_head"),
+            status.get("persistent_restart_fence_sha256"),status.get("active"),
+            status.get("enabled"))!=(capture,freeze,node,host,applied_sha,
+                "exact-live-fenced",boot,pid,start,cgroup_sha,
+                applied["network_quarantine_receipt_sha256"],
+                applied["owned_ruleset_stateless_sha256"],head,None,True,True)):
+    raise SystemExit("active quarantine round status identity differs")
+try:datetime.datetime.strptime(status.get("observed_at",""),"%Y-%m-%dT%H:%M:%SZ")
+except ValueError:raise SystemExit("active quarantine round status time differs")
+print(applied_sha)
+PY
+}
+
+compare_active_quarantine_round_statuses() {
+    [ "$#" -eq 2 ] || die "active quarantine round comparison requires before and after"
+    python3 - "$1" "$2" <<'PY'
+import json,sys
+before,after=map(json.loads,sys.argv[1:])
+if any(before.get(label)!=after.get(label) for label in set(before)-{"observed_at"}):
+    raise SystemExit("active quarantine round changed during readiness proof")
+PY
+}
+
+stdin_sha256() {
+    python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+}
+
+active_quarantine_applied_prestop_ready() {
+    [ "$#" -eq 5 ] || \
+        die "active quarantine readiness requires capture, freeze, plan, node, and round root"
+    local capture_id="$1" freeze_sha="$2" freeze_plan="$3" node="$4" round_root="$5"
+    local host pid start_ticks boot_id writer_cgroup_sha writer_supervision_mode unit
+    local executable_path exe_sha argv_sha data_dir model_path model_sha model_size
+    local candidates round authorization_sha readiness_sha local_applied_sha
+    local applied_raw applied_sha status_before status_after matches=0
+    local selected_applied selected_status selected_round selected_auth selected_readiness
+    host="$(host_for "$node")"
+    pid="$(freeze_node_field "$freeze_plan" "$node" writer_pid)"
+    start_ticks="$(freeze_node_field "$freeze_plan" "$node" writer_start_ticks)"
+    boot_id="$(freeze_node_field "$freeze_plan" "$node" boot_id)"
+    writer_cgroup_sha="$(freeze_node_field "$freeze_plan" "$node" writer_cgroup_sha256)"
+    writer_supervision_mode="$(freeze_node_field "$freeze_plan" "$node" writer_supervision_mode)"
+    unit="$(freeze_node_field "$freeze_plan" "$node" supervisor_unit)"
+    executable_path="$(freeze_node_field "$freeze_plan" "$node" executable_path)"
+    exe_sha="$(freeze_node_field "$freeze_plan" "$node" executable_sha256)"
+    argv_sha="$(freeze_node_field "$freeze_plan" "$node" argv_sha256)"
+    data_dir="$(freeze_node_field "$freeze_plan" "$node" data_dir)"
+    model_path="$(freeze_node_field "$freeze_plan" "$node" model_path)"
+    model_sha="$(freeze_node_field "$freeze_plan" "$node" model_sha256)"
+    model_size="$(freeze_node_field "$freeze_plan" "$node" model_size_bytes)"
+    if candidates="$(active_quarantine_round_candidates \
+            "$round_root" "$capture_id" "$freeze_sha" "$node")"; then
+        :
+    else
+        return 1
+    fi
+    [ -n "$candidates" ] || return 1
+    while read -r round authorization_sha readiness_sha local_applied_sha; do
+        [ -n "$round" ] || continue
+        applied_raw="$(run_remote "$node" quarantine-round-applied-status \
+            "$capture_id" "$node" "$freeze_sha" "$round" \
+            "$authorization_sha" "$readiness_sha" 2>/dev/null)" || continue
+        applied_sha="$(printf '%s\n' "$applied_raw" | stdin_sha256)" || continue
+        status_before="$(run_remote "$node" quarantine-round-status \
+            "$capture_id" "$node" "$freeze_sha" "$round" \
+            "$authorization_sha" "$readiness_sha" "$applied_sha" 2>/dev/null)" || continue
+        if ! validate_active_quarantine_round_status "$capture_id" "$freeze_sha" \
+                "$node" "$host" "$round" "$authorization_sha" "$readiness_sha" \
+                "$local_applied_sha" "$boot_id" "$pid" "$start_ticks" \
+                "$writer_cgroup_sha" "$applied_raw" "$status_before" \
+                "$QUARANTINE_ROUND_MODULE" >/dev/null 2>&1; then
+            continue
+        fi
+        matches=$((matches + 1))
+        [ "$matches" -eq 1 ] || return 1
+        selected_applied="$applied_raw"
+        selected_status="$status_before"
+        selected_round="$round"
+        selected_auth="$authorization_sha"
+        selected_readiness="$readiness_sha"
+    done <<< "$candidates"
+    [ "$matches" -eq 1 ] || return 1
+
+    ssh_remote_exact "$host" /bin/sh -c \
+        'set -eu; capture=$1 pid=$2 start=$3 boot=$4 writer_cgroup_sha=$5 writer_mode=$6 unit=$7 executable=$8 exe_sha=$9 argv_sha=${10} data=${11} model=${12} model_sha=${13} model_size=${14}; test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"; test -d "/proc/$pid"; test "$(awk '\''{print $22}'\'' "/proc/$pid/stat")" = "$start"; test "$(cat "/proc/$pid/comm")" = arc-node; test "$(pgrep -x arc-node)" = "$pid"; test "$(sha256sum "/proc/$pid/cgroup" | cut -d" " -f1)" = "$writer_cgroup_sha"; case "$writer_mode" in systemd-unit) grep -Fq "$unit" "/proc/$pid/cgroup";; detached-root-session) ! grep -Fq "$unit" "/proc/$pid/cgroup" && test "$(awk '\''{print $4}'\'' "/proc/$pid/stat")" = 1;; *) exit 1;; esac; test "$(readlink "/proc/$pid/exe")" = "$executable"; test "$(sha256sum "/proc/$pid/exe" | cut -d" " -f1)" = "$exe_sha"; test "$(sha256sum "/proc/$pid/cmdline" | cut -d" " -f1)" = "$argv_sha"; for source in arc-self-heal.service arc-node.service arc-node-update.service arc-node-update.timer; do active=$(systemctl show "$source" --property=ActiveState --value); job=$(systemctl show "$source" --property=Job --value); main=$(systemctl show "$source" --property=MainPID --value); main=${main:-0}; case "$active" in inactive|failed) :;; *) exit 1;; esac; case "$job" in ""|0) :;; *) exit 1;; esac; test "$main" = 0; done; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; command -v curl >/dev/null; command -v python3 >/dev/null; command -v sha256sum >/dev/null; command -v zstd >/dev/null; command -v tar >/dev/null; command -v systemctl >/dev/null; test ! -e /root/arc-recovery-captures || { test -d /root/arc-recovery-captures && test ! -L /root/arc-recovery-captures; }; { test ! -e "$capture" || { test -d "$capture" && test ! -L "$capture"; }; }; bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal_bytes=$(stat -c %s "$data/state.wal"); snapshot_bytes=0; for snapshot in "$data/state.snapshot.lz4" "$data.snapshot.lz4"; do if test -f "$snapshot" && test ! -L "$snapshot"; then snapshot_bytes=$((snapshot_bytes + $(stat -c %s "$snapshot"))); fi; done; binding_bytes=$((wal_bytes + snapshot_bytes)); test "$binding_bytes" -ge "$bytes" || binding_bytes=$bytes; binding_bytes=$((binding_bytes + 2147483648)); required_bytes=$((bytes + binding_bytes)); required_inodes=$((files + 10000)); free_bytes=$(df -PB1 /root | awk '\''NR==2 {print $4}'\''); free_inodes=$(df -Pi /root | awk '\''NR==2 {print $4}'\''); test "$free_bytes" -ge "$required_bytes"; test "$free_inodes" -ge "$required_inodes"' \
+        /bin/sh "/root/arc-recovery-captures/$capture_id/$node" \
+        "$pid" "$start_ticks" "$boot_id" "$writer_cgroup_sha" \
+        "$writer_supervision_mode" "$unit" "$executable_path" \
+        "$exe_sha" "$argv_sha" "$data_dir" "$model_path" \
+        "$model_sha" "$model_size" >/dev/null 2>&1 || return 1
+    applied_sha="$(printf '%s\n' "$selected_applied" | stdin_sha256)" || return 1
+    status_after="$(run_remote "$node" quarantine-round-status \
+        "$capture_id" "$node" "$freeze_sha" "$selected_round" \
+        "$selected_auth" "$selected_readiness" "$applied_sha" 2>/dev/null)" || return 1
+    validate_active_quarantine_round_status "$capture_id" "$freeze_sha" \
+        "$node" "$host" "$selected_round" "$selected_auth" "$selected_readiness" \
+        - "$boot_id" "$pid" "$start_ticks" "$writer_cgroup_sha" \
+        "$selected_applied" "$status_after" "$QUARANTINE_ROUND_MODULE" \
+        >/dev/null 2>&1 || return 1
+    compare_active_quarantine_round_statuses \
+        "$selected_status" "$status_after" >/dev/null 2>&1
+}
+
 remote_readiness_node() {
     local capture_id="$1" freeze_sha="$2" freeze_plan="$3" node="$4"
+    local quarantine_round_root="$5"
     local host pid start_ticks boot_id writer_cgroup_sha writer_supervision_mode
     local unit unit_main_pid supervisor_start_ticks
     local supervisor_executable_path supervisor_executable_sha supervisor_argv_sha
@@ -5344,8 +5732,19 @@ remote_readiness_node() {
         printf '  exact live writer/disk ready: %s %s pid=%s data=%s\n' "$node" "$host" "$pid" "$data_dir"
         return 0
     fi
+    # A crashed capture can resume after a round's durable commit but before
+    # its local transition receipt or the original writer stop. Resolve only
+    # exact local dispatch roots; recover/validate the hash-bound remote
+    # applied receipt; and bracket the slow writer/content check with the
+    # existing round-status proof.
+    if active_quarantine_applied_prestop_ready "$capture_id" "$freeze_sha" \
+            "$freeze_plan" "$node" "$quarantine_round_root"; then
+        printf '  exact active applied-prestop quarantine/disk ready: %s %s pid=%s data=%s\n' \
+            "$node" "$host" "$pid" "$data_dir"
+        return 0
+    fi
     run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null || \
-        die "$node is neither the exact sealed live writer nor an exact persistently fenced stop"
+        die "$node is neither the exact sealed live writer, an exact active applied-prestop quarantine, nor an exact persistently fenced stop"
     local readiness_state=stopped
     if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
         readiness_state=captured
@@ -5358,8 +5757,10 @@ remote_readiness_node() {
 }
 
 remote_readiness() {
-    [ "$#" -eq 4 ] || die "remote readiness requires capture, freeze, plan, and log root"
+    [ "$#" -eq 5 ] || \
+        die "remote readiness requires capture, freeze, plan, log root, and round root"
     local capture_id="$1" freeze_sha="$2" freeze_plan="$3" log_root="$4"
+    local quarantine_round_root="$5"
     local readiness_log_root failed=0 index node
     local pids=() names=()
     [ -d "$log_root" ] && [ ! -L "$log_root" ] || \
@@ -5374,7 +5775,8 @@ remote_readiness() {
     # and stop the guarded phase with SIGTTIN.
     for node in nyc lax ams lhr nrt sgp; do
         (
-            remote_readiness_node "$capture_id" "$freeze_sha" "$freeze_plan" "$node"
+            remote_readiness_node "$capture_id" "$freeze_sha" "$freeze_plan" \
+                "$node" "$quarantine_round_root"
         ) </dev/null > "$readiness_log_root/$node.log" 2>&1 &
         pids+=("$!")
         names+=("$node")
@@ -5392,7 +5794,8 @@ remote_readiness() {
             /bin/cat -- "$readiness_log_root/$node.log" >&2
         fi
     done
-    [ "$failed" -eq 0 ] || die "one or more exact live/stopped readiness probes failed"
+    [ "$failed" -eq 0 ] || \
+        die "one or more exact live/active-quarantine/stopped readiness probes failed"
 }
 
 stop_after_quarantine_round_exact() {
@@ -9132,7 +9535,8 @@ PY
     # first-quarantine selection and its dual operator clocks are created.
     # Otherwise cold caches can consume the bounded 300-second lease before
     # every node has durably accepted the shared readiness artifact.
-    remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan" "$log_root"
+    remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan" "$log_root" \
+        "$maintenance_input_root/quarantine-rounds"
     observation_selection_sha="$(seal_live_observation_selection "$observation_selection" \
         "$observation_generation_receipt" "$live_observation_statuses" \
         "$freeze_sha" "$capture_id")"
