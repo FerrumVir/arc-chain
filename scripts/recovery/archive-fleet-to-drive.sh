@@ -5344,6 +5344,7 @@ remote_readiness_node() {
         printf '  exact live writer/disk ready: %s %s pid=%s data=%s\n' "$node" "$host" "$pid" "$data_dir"
         return 0
     fi
+    if ! run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null; then
     # Post-quarantine resume compatibility. This capture's own round-1
     # persistent restart fence stops the sealed systemd supervisor by design
     # (fence dependency plus condition-only drop-in), so a crash after round 1
@@ -5395,8 +5396,8 @@ bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal
             "$node" "$host" "$pid" "$data_dir"
         return 0
     fi
-    run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null || \
         die "$node is neither the exact sealed live writer nor an exact persistently fenced stop"
+    fi
     local readiness_state=stopped
     if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
         readiness_state=captured
