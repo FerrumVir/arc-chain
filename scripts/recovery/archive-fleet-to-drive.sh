@@ -5344,8 +5344,60 @@ remote_readiness_node() {
         printf '  exact live writer/disk ready: %s %s pid=%s data=%s\n' "$node" "$host" "$pid" "$data_dir"
         return 0
     fi
-    run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null || \
+    if ! run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null; then
+    # Post-quarantine resume compatibility. This capture's own round-1
+    # persistent restart fence stops the sealed systemd supervisor by design
+    # (fence dependency plus condition-only drop-in), so a crash after round 1
+    # leaves a writer that is byte-exact with the seal but whose supervisor is
+    # inactive. Accept that state only when every writer, disk, and capacity
+    # assertion of the exact-live probe passes, the supervisor is inactive with
+    # no pending job behind the round fence drop-in and fence-unit dependency,
+    # the owned nft table is installed, and the active round's
+    # persistent-restart-fence receipt binds this exact capture, freeze plan,
+    # and sealed writer identity. Detached root-session writers keep the
+    # exact-live path above.
+    if [ "$writer_supervision_mode" = systemd-unit ] \
+        && ssh_remote_exact "$host" /bin/sh -c \
+            'set -eu; capture=$1 pid=$2 start=$3 boot=$4 writer_cgroup_sha=$5 unit=$6 executable=$7 exe_sha=$8 argv_sha=$9 data=${10} model=${11} model_sha=${12} model_size=${13} capture_id=${14} freeze_sha=${15}; test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"; test -d "/proc/$pid"; test "$(awk '\''{print $22}'\'' "/proc/$pid/stat")" = "$start"; test "$(cat "/proc/$pid/comm")" = arc-node; test "$(pgrep -x arc-node)" = "$pid"; test "$(sha256sum "/proc/$pid/cgroup" | cut -d" " -f1)" = "$writer_cgroup_sha"; grep -Fq "$unit" "/proc/$pid/cgroup"; test "$(readlink "/proc/$pid/exe")" = "$executable"; test "$(sha256sum "/proc/$pid/exe" | cut -d" " -f1)" = "$exe_sha"; test "$(sha256sum "/proc/$pid/cmdline" | cut -d" " -f1)" = "$argv_sha"; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; command -v curl >/dev/null; command -v python3 >/dev/null; command -v sha256sum >/dev/null; command -v zstd >/dev/null; command -v tar >/dev/null; command -v systemctl >/dev/null; command -v nft >/dev/null; test ! -e /root/arc-recovery-captures || { test -d /root/arc-recovery-captures && test ! -L /root/arc-recovery-captures; }; { test ! -e "$capture" || { test -d "$capture" && test ! -L "$capture"; }; }; case "$(systemctl show "$unit" --property=ActiveState --value)" in inactive|failed) ;; *) exit 1;; esac; test "$(systemctl show "$unit" --property=MainPID --value)" = 0; case "$(systemctl show "$unit" --property=Job --value)" in ""|0) ;; *) exit 1;; esac; case " $(systemctl show "$unit" --property=DropInPaths --value) " in *" /etc/systemd/system/$unit.d/zzzy-arc-recovery-network-fence.conf "*) ;; *) exit 1;; esac; case " $(systemctl show "$unit" --property=Requires --value) " in *" arc-legacy-maintenance-fence.service "*) ;; *) exit 1;; esac; case " $(systemctl show "$unit" --property=After --value) " in *" arc-legacy-maintenance-fence.service "*) ;; *) exit 1;; esac; test "$(systemctl show arc-legacy-maintenance-fence.service --property=ActiveState --value)" = active; nft list table inet arc_legacy_maintenance_v1 >/dev/null; active=/run/arc-recovery/active-network-fence; test "$(stat -c %u:%g:%a:%h "$active")" = 0:0:400:1; round="$(cat "$active")"; case "$round" in /etc/arc-recovery/network-fence-rounds/"$capture_id"/[0-9a-f]*) ;; *) exit 1;; esac; test -d "$round" && test ! -L "$round"; python3 - "$round" "$capture_id" "$freeze_sha" "$pid" "$start" "$boot" "$unit" <<'"'"'PY2'"'"'
+import hashlib, json, os, pathlib, re, stat, sys
+round_dir, capture_id, freeze_sha, pid, start, boot, unit = sys.argv[1:]
+if not re.fullmatch(r"[0-9a-f]{64}", round_dir.rsplit("/", 1)[1]):
+    raise SystemExit("round directory name is not an authorization digest")
+def load(name):
+    path = pathlib.Path(round_dir) / name
+    details = path.lstat()
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or stat.S_IMODE(details.st_mode) != 0o400:
+        raise SystemExit(f"{name} is not a root-owned mode-0400 regular file")
+    raw = path.read_bytes()
+    return raw, json.loads(raw)
+fence_raw, fence = load("persistent-restart-fence.json")
+_, applied = load("applied.commit.json")
+writer = fence.get("authorized_writer") or {}
+if (fence.get("capture_id") != capture_id or fence.get("freeze_plan_sha256") != freeze_sha
+        or applied.get("capture_id") != capture_id or applied.get("freeze_plan_sha256") != freeze_sha
+        or fence.get("automatic_unfence") is not False
+        or str(writer.get("pid")) != pid or str(writer.get("start_ticks")) != start
+        or writer.get("boot_id") != boot or fence.get("armed_boot_id") != boot):
+    raise SystemExit("persistent-restart-fence receipt does not bind this capture, freeze plan, and writer")
+if applied.get("persistent_restart_fence_sha256") not in (None, hashlib.sha256(fence_raw).hexdigest()):
+    raise SystemExit("applied commit does not bind the persistent-restart-fence receipt")
+dependencies = fence.get("dependency_sha256") or {}
+dropin = f"/etc/systemd/system/{unit}.d/zzzy-arc-recovery-network-fence.conf"
+expected = dependencies.get(dropin)
+if not isinstance(expected, str) or hashlib.sha256(pathlib.Path(dropin).read_bytes()).hexdigest() != expected:
+    raise SystemExit("supervisor round fence drop-in differs from the sealed receipt")
+PY2
+bytes=$(du -s -B1 "$data" | cut -f1); files=$(find "$data" -type f | wc -l); wal_bytes=$(stat -c %s "$data/state.wal"); snapshot_bytes=0; for snapshot in "$data/state.snapshot.lz4" "$data.snapshot.lz4"; do if test -f "$snapshot" && test ! -L "$snapshot"; then snapshot_bytes=$((snapshot_bytes + $(stat -c %s "$snapshot"))); fi; done; binding_bytes=$((wal_bytes + snapshot_bytes)); test "$binding_bytes" -ge "$bytes" || binding_bytes=$bytes; binding_bytes=$((binding_bytes + 2147483648)); required_bytes=$((bytes + binding_bytes)); required_inodes=$((files + 10000)); free_bytes=$(df -PB1 /root | awk '\''NR==2 {print $4}'\''); free_inodes=$(df -Pi /root | awk '\''NR==2 {print $4}'\''); test "$free_bytes" -ge "$required_bytes" || { printf "insufficient recovery bytes including v3 headroom: need=%s free=%s\n" "$required_bytes" "$free_bytes" >&2; exit 1; }; test "$free_inodes" -ge "$required_inodes" || { printf "insufficient recovery inodes including v3 headroom: need=%s free=%s\n" "$required_inodes" "$free_inodes" >&2; exit 1; }' \
+            /bin/sh "/root/arc-recovery-captures/$capture_id/$node" "$pid" "$start_ticks" \
+            "$boot_id" "$writer_cgroup_sha" "$unit" \
+            "$executable_path" "$exe_sha" "$argv_sha" "$data_dir" \
+            "$model_path" "$model_sha" "$model_size" "$capture_id" "$freeze_sha" >/dev/null 2>&1; then
+        printf '  exact live writer behind its own round fence (supervisor fence-stopped): %s %s pid=%s data=%s\n' \
+            "$node" "$host" "$pid" "$data_dir"
+        return 0
+    fi
         die "$node is neither the exact sealed live writer nor an exact persistently fenced stop"
+    fi
     local readiness_state=stopped
     if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
         readiness_state=captured
