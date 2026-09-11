@@ -1100,6 +1100,67 @@ capture_readiness_resumes_stopped_and_indexed_nodes() (
         grep -Fq 'lax stopped-status' "$f/actions" && grep -Fq 'lax status' "$f/actions"
 )
 
+capture_readiness_accepts_fence_stopped_supervisor() (
+    # Regression for the 2026-09-09 stall: after round 1 fences the fleet, the
+    # writer is byte-exact with the seal but its systemd supervisor is
+    # inactive behind the capture's own persistent restart fence. That is
+    # neither the pre-freeze exact-live shape nor a persistently stopped
+    # writer, so the readiness probe used to fail closed. The fence-stopped
+    # branch must accept it (systemd-unit writers only) without ever asking a
+    # stopped/captured status.
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local f; f="$(mktemp -d)"; trap 'rm -rf -- "$f"' EXIT
+    # shellcheck disable=SC2317,SC2329
+    host_for() { printf '%s\n' "$1"; }
+    # shellcheck disable=SC2317,SC2329
+    freeze_node_field() {
+        case "$3" in
+            writer_pid|writer_start_ticks|supervisor_main_pid|supervisor_start_ticks|stake) printf '1\n' ;;
+            boot_id) printf '00000000-0000-0000-0000-000000000000\n' ;;
+            writer_supervision_mode) printf 'systemd-unit\n' ;;
+            supervisor_unit) printf 'arc-node.service\n' ;;
+            executable_path|supervisor_executable_path|data_dir|model_path) printf '/safe/%s/%s\n' "$2" "$3" ;;
+            executable_sha256|argv_sha256|writer_cgroup_sha256|supervisor_executable_sha256|supervisor_argv_sha256|model_sha256|validator_address) printf 'a%.0s' {1..64}; printf '\n' ;;
+            model_size_bytes) printf '4081004224\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    # Exact-live probe (contains /root/arc-recovery-captures) fails: supervisor
+    # is not alive. The fence-stopped probe (contains arc_legacy_maintenance_v1)
+    # succeeds: the remote round receipts verify.
+    # shellcheck disable=SC2317,SC2329
+    ssh() {
+        local joined="$*"
+        case "$joined" in
+            *arc_legacy_maintenance_v1*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    # A fenced live writer is NOT persistently stopped: stopped-status fails,
+    # so the fence-stopped branch is the only acceptance path.
+    # shellcheck disable=SC2317,SC2329
+    run_remote() {
+        printf '%s %s\n' "$1" "$2" >> "$f/actions"
+        return 1
+    }
+    local out
+    out="$(remote_readiness "$(printf 'b%.0s' {1..64})" "$(printf 'a%.0s' {1..64})" \
+        /sealed/freeze.json "$f")" || return 1
+    # Every node accepted via the fence-stopped branch.
+    [ "$(printf '%s\n' "$out" | grep -c 'behind its own round fence')" -eq 6 ] || return 1
+    # The branch returns before any stopped/captured status is requested.
+    ! grep -Fq ' status' "$f/actions" || return 1
+    # A detached-root-session writer must NOT take this systemd-unit-only path.
+    freeze_node_field() { case "$3" in writer_supervision_mode) printf 'detached-root-session\n';; boot_id) printf '00000000-0000-0000-0000-000000000000\n';; writer_pid|writer_start_ticks|supervisor_main_pid|supervisor_start_ticks|stake) printf '1\n';; supervisor_unit) printf 'arc-node.service\n';; executable_path|supervisor_executable_path|data_dir|model_path) printf '/safe/%s/%s\n' "$2" "$3";; model_size_bytes) printf '4081004224\n';; *) printf 'a%.0s' {1..64}; printf '\n';; esac; }
+    local g; g="$(mktemp -d)"
+    run_remote() { printf '%s %s\n' "$1" "$2" >> "$g/actions"; return 1; }
+    if ( remote_readiness "$(printf 'b%.0s' {1..64})" "$(printf 'a%.0s' {1..64})" /sealed/freeze.json "$g" ) >/dev/null 2>&1; then
+        rm -rf -- "$g"; return 1
+    fi
+    rm -rf -- "$g"
+)
+
 capture_readiness_fans_out_all_slow_host_probes() (
     # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
@@ -4163,6 +4224,7 @@ run_test 'v5 freeze transaction is fault-closed' v5_freeze_transaction_is_fault_
 run_test 'v5 stop journal semantics are fault-closed' v5_stop_journal_semantics_are_fault_closed
 run_test 'classification requires each node once' classification_requires_each_node_once
 run_test 'capture readiness resumes exact stopped state' capture_readiness_resumes_stopped_and_indexed_nodes
+run_test 'capture readiness accepts fence-stopped supervisor' capture_readiness_accepts_fence_stopped_supervisor
 run_test 'capture readiness fans out all slow host probes' capture_readiness_fans_out_all_slow_host_probes
 run_test 'stale freeze capacity cannot cross current readiness gate' stale_freeze_capacity_cannot_cross_current_readiness_gate
 run_test 'fleet observation retry rejects any stopped writer' fleet_live_observation_retry_rejects_any_stopped_writer
