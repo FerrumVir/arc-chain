@@ -1544,7 +1544,7 @@ PY
         'status --porcelain=v1 --untracked-files=all' \
         '.github/workflows/validator-vault-rewrap.yml' \
         'bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9' \
-        '6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43' \
+        '7af66885356183b7c4ce4fc23f05c0c1f6a3f3a141c44db779b0678c848773d2' \
         '/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/arc-node-linux-x86_64' \
         '/secure/operator/pretag-materialized-v0.8.0/headless-linux-x86_64/genesis.toml' \
         'scripts/recovery/legacy-validator-set-40m.json.sha256' \

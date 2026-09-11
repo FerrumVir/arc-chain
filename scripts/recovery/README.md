@@ -327,7 +327,7 @@ not inner release archives. The PATH is intentional: the enclave's reviewed
 SHA with source-ciphertext SHA-256
 `bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9`,
 restore-certificate SHA-256
-`6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43`,
+`7af66885356183b7c4ce4fc23f05c0c1f6a3f3a141c44db779b0678c848773d2`,
 and confirmation `REWRAP ARC VALIDATOR VAULT <protected-main-sha>`. After the
 release-environment approval and successful completion, record its exact run
 ID and attempt. The procedure proves that workflow/run/commit tuple and the
@@ -575,7 +575,7 @@ test -f /secure/operator/restore.key.pem \
 test "$(/usr/bin/stat --format='%a:%h' /secure/operator/restore.cert.pem)" = 600:1
 test "$(/usr/bin/stat --format='%a:%h' /secure/operator/restore.key.pem)" = 600:1
 printf '%s  %s\n' \
-  6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43 \
+  7af66885356183b7c4ce4fc23f05c0c1f6a3f3a141c44db779b0678c848773d2 \
   /secure/operator/restore.cert.pem | /usr/bin/sha256sum --check --strict
 
 unset GH_TOKEN GITHUB_TOKEN
@@ -644,7 +644,7 @@ jq -e \
     "repos/FerrumVir/arc-chain/actions/runs/$vault_rewrap_run_id/artifacts?per_page=100" \
     --jq '.artifacts[]' | jq -s '{artifacts: .}' > "$rewrap_artifacts_json"
 )
-rewrap_artifact_prefix="arc-validator-vault-rewrap-$protected_main_sha-6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43-"
+rewrap_artifact_prefix="arc-validator-vault-rewrap-$protected_main_sha-7af66885356183b7c4ce4fc23f05c0c1f6a3f3a141c44db779b0678c848773d2-"
 rewrap_artifact_json="$(
   jq -cer \
     --arg prefix "$rewrap_artifact_prefix" \
@@ -710,7 +710,7 @@ expected_names = {
     "REWRAP-RECEIPT.json": 64 * 1024,
     "SHA256SUMS": 1024,
 }
-expected_cert = "6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43"
+expected_cert = "7af66885356183b7c4ce4fc23f05c0c1f6a3f3a141c44db779b0678c848773d2"
 expected_source = "bdb2dd477fe10e06e63123d6080f321fce4a251479a5af8a59ae2b47814ed7e9"
 expected_cms = artifact_name.rsplit("-", 1)[-1]
 if len(expected_cms) != 64 or any(c not in "0123456789abcdef" for c in expected_cms):
