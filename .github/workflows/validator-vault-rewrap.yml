@@ -71,7 +71,7 @@ jobs:
             echo "::error::Typed source ciphertext SHA-256 is not the retained validator vault."
             exit 1
           }
-          [ "$EXPECTED_RESTORE_CERT_SHA256" = 6707f8b1dbc1f2d37d9a873a7e3d2c870d2b46db36f15a6df5293547680bfd43 ] || {
+          [ "$EXPECTED_RESTORE_CERT_SHA256" = 7af66885356183b7c4ce4fc23f05c0c1f6a3f3a141c44db779b0678c848773d2 ] || {
             echo "::error::Typed restore-certificate SHA-256 is not the approved operator certificate."
             exit 1
           }
