@@ -6878,7 +6878,7 @@ Restart=always
 RestartPreventExitStatus=77
 RestartSec=1
 NoNewPrivileges=yes
-ProtectHome=read-only
+ProtectHome=yes
 PrivateTmp=yes
 ProtectControlGroups=no
 
@@ -11789,7 +11789,7 @@ unit_raw = (
     f"ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C TZ=UTC PYTHONHASHSEED=0 "
     f"{python_exec} -I {monitor_path}\n"
     "Restart=always\nRestartPreventExitStatus=77\nRestartSec=1\n"
-    "NoNewPrivileges=yes\nProtectHome=read-only\nPrivateTmp=yes\nProtectControlGroups=no\n\n"
+    "NoNewPrivileges=yes\nProtectHome=yes\nPrivateTmp=yes\nProtectControlGroups=no\n\n"
     "[Install]\nWantedBy=multi-user.target\n"
 ).encode()
 create_exact(unit_path, unit_raw, 0o400)
