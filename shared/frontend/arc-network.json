@@ -4,7 +4,7 @@
   "updatedAt": "2026-09-17T21:45:00Z",
   "network": {
     "name": "ARC Testnet",
-    "chainId": "arc-testnet"
+    "chainId": "0x415243"
   },
   "checkpoint": {
     "height": 138310,
@@ -30,7 +30,19 @@
     { "id": "v3-nrt", "name": "ARC v3 - NRT", "region": "nrt", "kind": "v3", "baseUrl": "https://202.182.107.41", "replicaGroup": "v3-main", "enabled": true },
     { "id": "v3-sgp", "name": "ARC v3 - SGP", "region": "sgp", "kind": "v3", "baseUrl": "https://149.28.153.31", "replicaGroup": "v3-main", "enabled": true }
   ],
-  "services": {},
+  "services": {
+    "maintenanceInterlock": {
+      "schema": "arc.frontend.maintenance-interlock.v1",
+      "path": "/maintenance/status",
+      "sourceSetSha256": "d599ee44ea67783ac429278bd45e93c73f846a08b0fb0457d8fc3c940aee6073",
+      "boundarySha256": "b2f89b72a69ad38107fe7c4a1246d8f9822218f7577d2cb92dfc61346dd91a0c",
+      "toolSha256": "f6d92c7f862d436dc84d342c452c3780f603b188115524ce50e2521cd60b60da",
+      "sourceMainCommit": "047e62581cbb33215637fd9a13fd05c2e432be9f",
+      "observedCutoffHeight": 141063,
+      "requiredHealthyReplicas": 6,
+      "maxStalenessSeconds": 90
+    }
+  },
   "notices": [
     "ARC protocol-v3 recovery is live. Canonical continuation from the quorum-signed checkpoint at height 138311."
   ]
