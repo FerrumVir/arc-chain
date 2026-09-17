@@ -1,15 +1,37 @@
 {
   "schema": "arc.frontend.network.v1",
-  "state": "maintenance",
-  "updatedAt": "2026-08-27T00:00:00Z",
+  "state": "recovered",
+  "updatedAt": "2026-09-17T21:45:00Z",
   "network": {
     "name": "ARC Testnet",
     "chainId": "arc-testnet"
   },
-  "checkpoint": null,
-  "sources": [],
+  "checkpoint": {
+    "height": 138310,
+    "recoveryHeight": 138311,
+    "legacyPublicMaxHeight": 141063,
+    "blockHash": "11fea52a3a39db994e588e85e83381134caccef7d05673a2c834e0d22049f551",
+    "stateRoot": "9ec6c114b24fac80c2a7e3645f36670cf89ba6bc075ef78782a99e1728b870ae",
+    "manifestHash": "9c6aa3ec659b101751bf58a8a24c655f0e4fba79596e9b44f87a30f98f08acc0",
+    "boundaryBlockHash": "d74321c2400fbb401b904b9e3c61cb751fd62fa7c9c7e0c23905d7c19159aae6",
+    "boundaryStateRoot": "d103671a855f22414f4c9546eb329d6e1d1c5c1676781583900fe28622061c33",
+    "recoveryDomain": "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+    "recoveryEpoch": 1,
+    "validatorSetId": 1,
+    "protocolVersion": "3.0.0",
+    "legacySourceId": "v3-nyc",
+    "v3SourceId": "v3-nyc"
+  },
+  "sources": [
+    { "id": "v3-nyc", "name": "ARC v3 - NYC", "region": "nyc", "kind": "v3", "baseUrl": "https://149.28.32.76", "replicaGroup": "v3-main", "enabled": true },
+    { "id": "v3-lax", "name": "ARC v3 - LAX", "region": "lax", "kind": "v3", "baseUrl": "https://140.82.16.112", "replicaGroup": "v3-main", "enabled": true },
+    { "id": "v3-ams", "name": "ARC v3 - AMS", "region": "ams", "kind": "v3", "baseUrl": "https://136.244.109.1", "replicaGroup": "v3-main", "enabled": true },
+    { "id": "v3-lhr", "name": "ARC v3 - LHR", "region": "lhr", "kind": "v3", "baseUrl": "https://104.238.171.11", "replicaGroup": "v3-main", "enabled": true },
+    { "id": "v3-nrt", "name": "ARC v3 - NRT", "region": "nrt", "kind": "v3", "baseUrl": "https://202.182.107.41", "replicaGroup": "v3-main", "enabled": true },
+    { "id": "v3-sgp", "name": "ARC v3 - SGP", "region": "sgp", "kind": "v3", "baseUrl": "https://149.28.153.31", "replicaGroup": "v3-main", "enabled": true }
+  ],
   "services": {},
   "notices": [
-    "Canonical recovery metadata has not been published. Explorer and dashboard claims are paused rather than inferred from legacy peers."
+    "ARC protocol-v3 recovery is live. Canonical continuation from the quorum-signed checkpoint at height 138311."
   ]
 }
