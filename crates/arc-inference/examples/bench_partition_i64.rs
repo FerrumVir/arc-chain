@@ -1,7 +1,7 @@
 //! Bounded local feasibility gate for useful integer model parallelism.
 //!
-//! This intentionally uses ARC's production `integer_engine::matmul_i64` kernel
-//! with a deterministic synthetic projection-shaped matrix. Workers own
+//! This intentionally uses ARC's existing reference `integer_engine::matmul_i64`
+//! kernel with a deterministic synthetic projection-shaped matrix. Workers own
 //! disjoint output rows; the merge is therefore concatenation, not duplicated
 //! verification work. Local threads demonstrate arithmetic and partition
 //! accounting only. They make no WAN, complete-model, or production-readiness
