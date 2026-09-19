@@ -436,6 +436,36 @@ await test("request helper performs only source-relative GET requests", async ()
   await assert.rejects(app.requestJson(mockFetch({}), sourceConfig, "https://evil.example/health"), /source-relative/);
 });
 
+await test("latest block helper falls back to v0.8 info height when alias is absent", async () => {
+  const calls = [];
+  const sourceConfig = resolver.source("v3");
+  const latest = { header: { height: 12, hash: hex("1"), state_root: hex("2") } };
+  const fetchImpl = mockFetch({
+    "https://v3.example.test/block/latest": { status: 404, body: {} },
+    "https://v3.example.test/info": { body: { block_height: 12 } },
+    "https://v3.example.test/block/12": { body: latest },
+  }, calls);
+  assert.deepEqual(await app.requestLatestBlock(fetchImpl, sourceConfig), latest);
+  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), ["/block/latest", "/info", "/stats", "/health", "/block/12"]);
+});
+
+await test("latest block fallback rejects non-404 errors, unsafe heights, and mismatched blocks", async () => {
+  const sourceConfig = resolver.source("v3");
+  await assert.rejects(app.requestLatestBlock(mockFetch({
+    "https://v3.example.test/block/latest": { status: 500, body: {} },
+  }), sourceConfig), /HTTP 500|RPC returned HTTP 500/);
+  await assert.rejects(app.requestLatestBlock(mockFetch({
+    "https://v3.example.test/block/latest": { status: 404, body: {} },
+    "https://v3.example.test/info": { body: { block_height: "9007199254740992" } },
+  }), sourceConfig), /RPC returned HTTP 404/);
+  await assert.rejects(app.requestLatestBlock(mockFetch({
+    "https://v3.example.test/block/latest": { status: 404, body: {} },
+    "https://v3.example.test/info": { body: { block_height: 12 } },
+    "https://v3.example.test/block/12": { body: { header: { height: 13 } } },
+  }), sourceConfig), /height did not match/);
+  await assert.rejects(app.requestLatestBlock(async () => { throw new Error("network down"); }, sourceConfig), /network down/);
+});
+
 await test("lookup failures use their own abort controller and render the intended error", () => {
   assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 3);
   assert.doesNotMatch(source, /signal: state\.lookupController\.signal/);

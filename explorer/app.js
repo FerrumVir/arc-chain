@@ -134,6 +134,25 @@
     }
   }
 
+  // Some deployed v0.8 gateways return 404 for the /block/latest alias even
+  // though the source RPC implements it. Resolve the current height through
+  // read-only status endpoints, then fetch the same canonical block shape.
+  async function requestLatestBlock(fetchImpl, source, options) {
+    const direct = await optionalRequest(fetchImpl, source, "/block/latest", options);
+    if (direct.ok) return direct.value;
+    if (direct.error?.status !== 404) throw direct.error;
+    const [info, stats, health] = await Promise.all([
+      optionalRequest(fetchImpl, source, "/info", options),
+      optionalRequest(fetchImpl, source, "/stats", options),
+      optionalRequest(fetchImpl, source, "/health", options),
+    ]);
+    const height = reportedHeight({ info: info.ok ? info.value : null, stats: stats.ok ? stats.value : null, health: health.ok ? health.value : null });
+    if (height === null) throw direct.error;
+    const block = await requestJson(fetchImpl, source, `/block/${height}`, options);
+    if (network.blockHeight(block) !== height) throw new RpcError("latest block height did not match the advertised height", 0, source.id);
+    return block;
+  }
+
   async function verifyRecoveryCheckpoint(options) {
     const { resolver, fetchImpl, signal } = options;
     const checkpoint = resolver.config.checkpoint;
@@ -520,7 +539,7 @@
         optionalRequest(window.fetch.bind(window), source, "/info", { signal }),
         optionalRequest(window.fetch.bind(window), source, "/stats", { signal }),
         optionalRequest(window.fetch.bind(window), source, "/validators", { signal }),
-        optionalRequest(window.fetch.bind(window), source, "/block/latest", { signal }),
+        requestLatestBlock(window.fetch.bind(window), source, { signal }).then((value) => ({ ok: true, value })).catch((error) => ({ ok: false, error })),
       ]);
       const [health, info, stats, validators, latest] = requests.map((result) => result.ok ? result.value : null);
       if (!requests.some((result) => result.ok)) throw requests[0].error;
@@ -854,6 +873,7 @@
     formatExactInteger,
     reportedHeight,
     requestJson,
+    requestLatestBlock,
     verifyRecoveryCheckpoint,
     queryBlock,
     queryTransaction,
