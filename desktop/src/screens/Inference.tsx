@@ -118,6 +118,13 @@ export function Inference() {
   const communityWorker = run.data?.routedVia?.startsWith("community:")
     ? run.data.routedVia.slice("community:".length)
     : null;
+  // A quorum flag without an exact execution-profile binding is incomplete
+  // evidence: it cannot establish that every vote covered the same model and
+  // protocol profile. Keep the result visible, but do not promote it to
+  // authenticated consensus in the product copy.
+  const authenticatedQuorum = Boolean(
+    run.data?.quorumVerified === true && run.data?.profileBound === true,
+  );
   const settlement = run.data?.settlement;
   const isCommunityRewardTx = Boolean(
     settlement?.submitted === true &&
@@ -626,15 +633,15 @@ export function Inference() {
                     </>
                   )}
                 </>
-              ) : run.data.quorumVerified && communityWorker ? (
-                <> · independently checked with authenticated 2-of-3 range quorums</>
+              ) : authenticatedQuorum && communityWorker ? (
+                <> · independently checked with authenticated replica agreement</>
               ) : (
                 <> · no independent replica-agreement evidence returned</>
               )}
               {run.data.profileBound
                 ? " · exact execution profile bound"
                 : " · execution profile not proven"}
-              {run.data.quorumVerified
+              {authenticatedQuorum
                 ? " · authenticated quorum verified"
                 : " · quorum not verified"}
             </span>
