@@ -1,0 +1,13 @@
+# Isolated payment contract: implementation boundary
+
+September 19, 2026. This supplements `protocol-contract-v1.md` for the next local implementation slice. It does not define an activated network transaction or replace the remaining protocol, persistence, or execution gates.
+
+The new contract module is a pure validation and settlement-planning library. It binds a signed request to a trusted chain/recovery domain, a committed fixed validator set, exact model/operator profile, input/generation/assignment commitments, limits, reserved funds, execution price and expiry. Request identity derives from a canonical, domain-separated commitment. Certificate signatures bind that request and the exact bounded output. Distinct authenticated signers must represent strictly more than two thirds of the frozen stake; membership cannot shrink with availability.
+
+For isolated tests, the caller reserves a maximum amount and signs a fixed execution price no larger than that reservation. A successful certificate allocates that price proportionally to the matching signers' stake, with a specified deterministic remainder rule, and returns unused funds to the caller. Timeout returns the reservation in full. Ordinary outer-transaction fees are separate. There is no treasury subsidy, community reward, or additional failure penalty. This conservative candidate compensates attestors who independently check the complete computation; it is not the final pricing scheme for heterogeneous compute partitions.
+
+Validation and arithmetic finish before a settlement plan is returned. The module does not mutate accounts, consume a persisted pending request, verify model execution, or write a WAL. Its caller must eventually apply the plan and terminal status atomically, coalesce overlapping recipient roles, enforce balances/nonces and registry eligibility, and make retries idempotent. Passing these unit tests alone cannot demonstrate payment, durable exactly-once behavior, or end-to-end inference.
+
+Integration remains gated on explicit wire decoding bounds, version/activation rules, current-state admission, atomic escrow/result/refund persistence, production-model execution and authenticated evidence, isolated multi-node tests, and finality verification. Existing paid RPC and transaction-family guards stay in place.
+
+Budget: the prior execution baseline was 66% account-wide weekly used. This batch began at 70%, against the original five-percentage-point target. Other tasks share the meter. Finish this bounded implementation and review; do not silently treat a continuation as a new five-point allowance.
