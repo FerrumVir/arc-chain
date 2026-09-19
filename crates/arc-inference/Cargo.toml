@@ -54,6 +54,9 @@ rand.workspace = true
 name = "bench_int8"
 required-features = ["candle"]
 [[example]]
+name = "validate_canonical_artifact"
+required-features = ["candle"]
+[[example]]
 name = "bench_gpu_forward"
 required-features = ["candle"]
 [[example]]
