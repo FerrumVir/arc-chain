@@ -132,6 +132,8 @@ pub enum InferenceContractError {
     RequestIdMismatch,
     #[error("output blob is empty, oversized, or has the wrong hash")]
     InvalidOutput,
+    #[error("certificate must contain 1..={MAX_COMMITTEE_MEMBERS} votes")]
+    InvalidCertificateBounds,
     #[error("certificate must contain a matching two-thirds-plus stake certificate")]
     InsufficientStake,
     #[error("duplicate or non-member validator vote")]
@@ -353,6 +355,9 @@ fn validate_certificate(
         || certificate.output.len() > pending.request.job.max_output_bytes as usize
     {
         return Err(InferenceContractError::InvalidOutput);
+    }
+    if certificate.votes.is_empty() || certificate.votes.len() > members.len() {
+        return Err(InferenceContractError::InvalidCertificateBounds);
     }
     let output_hash = hash_bytes(&certificate.output);
     let total_stake = validate_members(members)?;
@@ -700,6 +705,33 @@ mod tests {
         .unwrap();
         let pending = request.validate(&domain, &committee, 1).unwrap();
         let output = b"output";
+        let empty_certificate = InferenceCertificate {
+            output: output.to_vec(),
+            votes: Vec::new(),
+        };
+        assert_eq!(
+            plan_finalize(&pending, &empty_certificate, &committee, &domain, 1),
+            Err(InferenceContractError::InvalidCertificateBounds)
+        );
+        let oversized_certificate = InferenceCertificate {
+            output: output.to_vec(),
+            votes: (0..=committee.len())
+                .map(|_| sign_vote(pending.request_id, output, &keys[0]).unwrap())
+                .collect(),
+        };
+        assert_eq!(
+            plan_finalize(&pending, &oversized_certificate, &committee, &domain, 1),
+            Err(InferenceContractError::InvalidCertificateBounds)
+        );
+        let requester_vote = sign_vote(pending.request_id, output, &requester).unwrap();
+        let requester_certificate = InferenceCertificate {
+            output: output.to_vec(),
+            votes: vec![requester_vote],
+        };
+        assert_eq!(
+            plan_finalize(&pending, &requester_certificate, &committee, &domain, 1),
+            Err(InferenceContractError::InvalidVoteMember)
+        );
         let mut vote = sign_vote(pending.request_id, output, &keys[0]).unwrap();
         vote.signature = Signature::null();
         let forged = InferenceCertificate {
@@ -778,5 +810,82 @@ mod tests {
             plan_refund(&pending, &domain, &committee, 100),
             Ok(SettlementPlan::Refund { .. })
         ));
+    }
+
+    #[test]
+    fn stake_total_overflow_is_rejected_before_commitment() {
+        let first = KeyPair::generate_ed25519();
+        let second = KeyPair::generate_ed25519();
+        let mut members = members(&[&first, &second], &[u64::MAX, u64::MAX]);
+        assert_eq!(
+            validate_members(&members),
+            Err(InferenceContractError::InvalidStakeTotal)
+        );
+        members[0].stake = 1;
+        members[1].stake = 1;
+        assert!(validate_members(&members).is_ok());
+    }
+
+    #[test]
+    fn admitted_requester_vote_coalesces_refund_and_reward() {
+        let validator_a = KeyPair::generate_ed25519();
+        let validator_b = KeyPair::generate_ed25519();
+        let requester = KeyPair::generate_ed25519();
+        let committee = members(&[&validator_a, &validator_b, &requester], &[1, 1, 1]);
+        let domain = InferenceDomain {
+            chain_genesis: hash_bytes(b"genesis-admitted"),
+            recovery_epoch: 9,
+            validator_set_hash: validator_set_commitment(&committee).unwrap(),
+        };
+        let request = InferenceRequest::sign(
+            InferenceJob {
+                version: INFERENCE_CONTRACT_VERSION,
+                domain,
+                requester: requester.address(),
+                nonce: 0,
+                model_hash: hash_bytes(b"model"),
+                profile_hash: hash_bytes(b"profile"),
+                input_hash: hash_bytes(b"input"),
+                generation_hash: hash_bytes(b"generation"),
+                assignment_hash: hash_bytes(b"assignment"),
+                max_tokens: 32,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 101,
+                expires_at: 100,
+            },
+            &requester,
+        )
+        .unwrap();
+        let pending = request.validate(&domain, &committee, 1).unwrap();
+        let output = b"admitted";
+        let certificate = InferenceCertificate {
+            output: output.to_vec(),
+            votes: [&validator_a, &validator_b, &requester]
+                .into_iter()
+                .map(|key| sign_vote(pending.request_id(), output, key).unwrap())
+                .collect(),
+        };
+        let SettlementPlan::Finalize { credits, .. } =
+            plan_finalize(&pending, &certificate, &committee, &domain, 1).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(credits.iter().map(|credit| credit.amount).sum::<u64>(), 101);
+        assert_eq!(
+            credits
+                .iter()
+                .filter(|credit| credit.payee == requester.address())
+                .count(),
+            1
+        );
+        assert!(
+            credits
+                .iter()
+                .find(|credit| credit.payee == requester.address())
+                .unwrap()
+                .amount
+                > 91
+        );
     }
 }
