@@ -1,5 +1,6 @@
 pub mod block_stm;
 pub mod gpu_state;
+pub mod inference_contract_state;
 pub mod io_backend;
 pub mod jmt_store;
 pub mod light_client;
@@ -1342,6 +1343,18 @@ impl StateDB {
                 *self.recovery_context.write() = Some(context.clone());
                 self.community_rewards_v1_activation_height
                     .store(activation_height.unwrap_or(u64::MAX), Ordering::Release);
+            }
+            WalOp::InferenceTransition(record) => {
+                for (address, account) in &record.account_updates {
+                    self.accounts.insert(address.0, account.clone());
+                    self.dirty_accounts.insert(address.0);
+                }
+                for (address, key, value) in &record.storage_updates {
+                    self.storage
+                        .entry(address.0)
+                        .or_default()
+                        .insert(*key, value.clone());
+                }
             }
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational - no state change

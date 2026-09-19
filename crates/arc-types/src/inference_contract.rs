@@ -87,7 +87,7 @@ impl PendingInference {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementCredit {
     pub payee: Hash256,
     pub amount: u64,

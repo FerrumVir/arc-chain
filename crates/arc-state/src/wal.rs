@@ -6,6 +6,9 @@
 
 use crate::recovery::RecoveryContext;
 use arc_crypto::Hash256;
+use arc_types::inference_contract::{
+    InferenceCertificate, InferenceRequest, SettlementCredit, ValidatorMember,
+};
 use arc_types::{Account, Address, Block, EventLog, Identity, Transaction, TxReceipt};
 use crossbeam::channel::{self, Receiver, Sender};
 use parking_lot::Mutex;
@@ -544,6 +547,41 @@ pub enum WalOp {
     /// genesis-committed community-reward activation height. Kept at the end
     /// so every historical bincode enum discriminant remains stable.
     SetRecoveryContext(RecoveryContext, Option<u64>),
+    /// One bounded isolated-inference transition. Kept last so legacy
+    /// bincode enum discriminants remain unchanged. The state adapter writes
+    /// this record before publishing replacements to in-memory state.
+    InferenceTransition(InferenceTransitionRecord),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceTransitionRecord {
+    pub context_commitment: Hash256,
+    pub request_id: Hash256,
+    pub escrow: Address,
+    pub admission_height: u64,
+    pub members: Vec<ValidatorMember>,
+    pub metadata: InferenceMetadata,
+    pub account_updates: Vec<(Address, Account)>,
+    pub storage_updates: Vec<(Address, Hash256, Vec<u8>)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceMetadata {
+    pub context_commitment: Hash256,
+    pub request: InferenceRequest,
+    pub input_blob: Vec<u8>,
+    pub status: InferenceTransitionStatus,
+    pub output: Vec<u8>,
+    pub output_hash: Option<Hash256>,
+    pub certificate: Option<InferenceCertificate>,
+    pub credits: Vec<SettlementCredit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum InferenceTransitionStatus {
+    Pending,
+    Finalized,
+    Refunded,
 }
 
 /// An admitted append whose sequence is already linearized with every WAL
