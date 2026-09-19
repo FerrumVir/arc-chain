@@ -1017,6 +1017,9 @@ pub enum PipelineError {
     NoCompleteExecutionProfile { profiles: Vec<String> },
     /// Registry is empty (or every entry was a stub).
     NoShards,
+    /// A shard reached an authenticated/readiness path without the validator
+    /// identity bound by its signed announcement.
+    MissingValidatorIdentity { node: String, addr: String },
     /// Coverage stops before the model does.
     Gap {
         expected: usize,
@@ -1053,6 +1056,11 @@ impl std::fmt::Display for PipelineError {
                 f,
                 "No shards announced. Need shard registry to be populated."
             ),
+            PipelineError::MissingValidatorIdentity { node, addr } => write!(
+                f,
+                "Shard identity unavailable or malformed for node {} at {}",
+                node, addr
+            ),
             PipelineError::Gap {
                 expected,
                 got,
@@ -1070,6 +1078,21 @@ impl std::fmt::Display for PipelineError {
             ),
         }
     }
+}
+
+/// Signed shard announcements retain the authenticated validator identity in
+/// the registry's `node_name` field. That field is also serialized by the
+/// legacy `/shards` view, so live callers must treat it as the canonical ID;
+/// human-readable names remain valid only for the legacy/free compatibility
+/// helper and cannot enter readiness or reward verification.
+fn parse_canonical_shard_validator_identity(value: &str) -> Option<Hash256> {
+    let identity = parse_hash256_hex(value, "shard validator identity").ok()?;
+    (value == format!("0x{}", identity.to_hex())).then_some(identity)
+}
+
+fn bind_shard_registry_identity(mut shard: ShardInfo, validator: Hash256) -> ShardInfo {
+    shard.node_name = format!("0x{}", validator.to_hex());
+    shard
 }
 
 /// Turn a flat list of announced shards into a runnable pipeline: one entry
@@ -1095,9 +1118,10 @@ impl std::fmt::Display for PipelineError {
 ///
 /// Steps, in order:
 ///   1. bucket announcements by (start_layer, end_layer);
-///   2. dedupe per node_name inside each bucket, preferring a routable addr
-///      over a stub (a rebooted coordinator's self-announce and the gossiped
-///      copy land under different registry keys);
+///   2. dedupe per authenticated validator identity inside each bucket,
+///      preferring a routable addr over a stub (a rebooted coordinator's
+///      self-announce and the gossiped copy land under different registry
+///      keys);
 ///   3. drop stub addrs UNCONDITIONALLY, then drop buckets left empty. The old
 ///      run_consensus kept a stub "as a fallback" when no routable replica
 ///      existed — that is how a community worker announcing 127.0.0.1:9090
@@ -1118,37 +1142,76 @@ pub fn assemble_pipeline(
     announced: Vec<ShardInfo>,
     stats: &dashmap::DashMap<String, LatencyEWMA>,
 ) -> Result<Vec<PipelineHop>, PipelineError> {
-    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
+    assemble_pipeline_with_identity_policy(announced, stats, false)
+}
+
+/// Assemble a pipeline while optionally requiring the validator identity that
+/// was bound by `/shards/announce`. The public helper retains its historical
+/// display-name compatibility for local/free tests and observers; all live
+/// readiness and reward verification paths use the strict variant.
+fn assemble_pipeline_with_identity_policy(
+    announced: Vec<ShardInfo>,
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+    require_authenticated_identity: bool,
+) -> Result<Vec<PipelineHop>, PipelineError> {
+    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<(String, ShardInfo)>> =
         std::collections::BTreeMap::new();
     for s in announced {
+        let identity = parse_canonical_shard_validator_identity(&s.node_name)
+            .map(|id| format!("0x{}", id.to_hex()))
+            .or_else(|| {
+                (!require_authenticated_identity).then(|| format!("legacy:{}", s.node_name))
+            })
+            .ok_or_else(|| PipelineError::MissingValidatorIdentity {
+                node: s.node_name.clone(),
+                addr: s.socket_addr.clone(),
+            })?;
         let key = (s.start_layer, s.end_layer);
         let bucket = by_range.entry(key).or_default();
         match bucket
             .iter()
-            .position(|existing| existing.node_name == s.node_name)
+            .position(|(existing, _)| existing == &identity)
         {
-            None => bucket.push(s),
+            None => bucket.push((identity, s)),
             Some(i) => {
-                if is_stub_socket_addr(&bucket[i].socket_addr)
+                if is_stub_socket_addr(&bucket[i].1.socket_addr)
                     && !is_stub_socket_addr(&s.socket_addr)
                 {
-                    bucket[i] = s;
+                    bucket[i] = (identity, s);
                 }
             }
         }
     }
 
     by_range.retain(|_, bucket| {
-        bucket.retain(|s| !is_stub_socket_addr(&s.socket_addr));
+        bucket.retain(|(_, s)| !is_stub_socket_addr(&s.socket_addr));
         !bucket.is_empty()
     });
     for bucket in by_range.values_mut() {
-        sort_replicas_by_latency(bucket, stats);
+        let mut replicas: Vec<ShardInfo> = bucket.drain(..).map(|(_, s)| s).collect();
+        sort_replicas_by_latency(&mut replicas, stats);
+        *bucket = replicas
+            .into_iter()
+            .map(|s| {
+                let identity = parse_canonical_shard_validator_identity(&s.node_name)
+                    .map(|id| format!("0x{}", id.to_hex()))
+                    .unwrap_or_else(|| format!("legacy:{}", s.node_name));
+                (identity, s)
+            })
+            .collect();
     }
 
     // BTreeMap already iterates in (start, end) order, so the SHORTEST range
     // beginning at each layer is seen first.
-    let candidates: Vec<PipelineHop> = by_range.into_iter().collect();
+    let candidates: Vec<PipelineHop> = by_range
+        .into_iter()
+        .map(|(range, replicas)| {
+            (
+                range,
+                replicas.into_iter().map(|(_, shard)| shard).collect(),
+            )
+        })
+        .collect();
     if candidates.is_empty() {
         return Err(PipelineError::NoShards);
     }
@@ -1215,6 +1278,22 @@ pub fn assemble_profile_bound_pipeline_for_model(
     required_profile: Option<&str>,
     stats: &dashmap::DashMap<String, LatencyEWMA>,
 ) -> Result<ProfileBoundPipeline, PipelineError> {
+    assemble_profile_bound_pipeline_for_model_with_identity_policy(
+        announced,
+        expected_model_id,
+        required_profile,
+        stats,
+        false,
+    )
+}
+
+fn assemble_profile_bound_pipeline_for_model_with_identity_policy(
+    announced: Vec<ShardInfo>,
+    expected_model_id: Hash256,
+    required_profile: Option<&str>,
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+    require_authenticated_identity: bool,
+) -> Result<ProfileBoundPipeline, PipelineError> {
     let had_announcements = !announced.is_empty();
     let matching: Vec<_> = announced
         .into_iter()
@@ -1264,11 +1343,20 @@ pub fn assemble_profile_bound_pipeline_for_model(
         let shards = by_profile
             .remove(profile)
             .expect("profile key came from the same map");
-        if let Ok(hops) = assemble_pipeline(shards, stats) {
-            return Ok(ProfileBoundPipeline {
-                hops,
-                execution_profile: profile.clone(),
-            });
+        match assemble_pipeline_with_identity_policy(shards, stats, require_authenticated_identity)
+        {
+            Ok(hops) => {
+                return Ok(ProfileBoundPipeline {
+                    hops,
+                    execution_profile: profile.clone(),
+                });
+            }
+            Err(error @ PipelineError::MissingValidatorIdentity { .. })
+                if require_authenticated_identity =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
         }
     }
     Err(PipelineError::NoCompleteExecutionProfile { profiles })
@@ -1287,11 +1375,12 @@ pub fn assemble_profile_bound_pipeline_for(
     let model_id = node
         .model_artifact_id
         .ok_or(PipelineError::ModelIdentityUnavailable)?;
-    assemble_profile_bound_pipeline_for_model(
+    assemble_profile_bound_pipeline_for_model_with_identity_policy(
         fresh_shards(&node.shard_registry),
         model_id,
         required_profile,
         &node.latency_stats,
+        true,
     )
 }
 
@@ -1868,8 +1957,13 @@ pub async fn serve(
     // different ranges coexist.
     for si in &shard_infos {
         let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
-        node.shard_registry
-            .insert(key, (si.clone(), std::time::Instant::now()));
+        node.shard_registry.insert(
+            key,
+            (
+                bind_shard_registry_identity(si.clone(), node.validator_address),
+                std::time::Instant::now(),
+            ),
+        );
     }
     if !shard_infos.is_empty() {
         // Local configured shards are process-owned state, so refresh their
@@ -1878,6 +1972,7 @@ pub async fn serve(
         // Remote registries still accept only signed direct-holder announces.
         let refresh_registry = node.shard_registry.clone();
         let refresh_infos = shard_infos.clone();
+        let refresh_validator = node.validator_address;
         let mut refresh_shutdown = node.runtime_shutdown.clone();
         spawn_node_runtime_task(&node, async move {
             loop {
@@ -1892,7 +1987,13 @@ pub async fn serve(
                         "{}#{}-{}",
                         shard.socket_addr, shard.start_layer, shard.end_layer
                     );
-                    refresh_registry.insert(key, (shard.clone(), now));
+                    refresh_registry.insert(
+                        key,
+                        (
+                            bind_shard_registry_identity(shard.clone(), refresh_validator),
+                            now,
+                        ),
+                    );
                 }
             }
         });
@@ -6348,11 +6449,12 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
     let sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
         node.inference_model.is_some()
             && !local_model_ready
-            && assemble_profile_bound_pipeline_for_model(
+            && assemble_profile_bound_pipeline_for_model_with_identity_policy(
                 fresh_shards_snapshot(&node.shard_registry),
                 model_id,
                 Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
                 &node.latency_stats,
+                true,
             )
             .is_ok()
     });
@@ -11383,11 +11485,12 @@ async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }
     let fully_covered = contiguous && covered_to == total_layers && total_layers > 0;
     let profile_selection = node.model_artifact_id.and_then(|expected_model_id| {
-        assemble_profile_bound_pipeline_for_model(
+        assemble_profile_bound_pipeline_for_model_with_identity_policy(
             shards.clone(),
             expected_model_id,
             None,
             &node.latency_stats,
+            true,
         )
         .ok()
     });
@@ -11542,9 +11645,13 @@ async fn announce_shard(
                 .to_string(),
         ));
     }
+    // The signed payload's display name is untrusted metadata. Bind the
+    // authenticated validator identity after audience verification so aliases
+    // cannot inflate a replica set or conflate two validators sharing a name.
+    req.shard = bind_shard_registry_identity(req.shard, announcing_validator);
 
     // Dedupe: if an existing entry already covers the same (layer_range,
-    // node_name) with a routable socket_addr, drop this announcement when
+    // authenticated validator identity) with a routable socket_addr, drop this announcement when
     // the incoming addr is STILL a stub (self-announce from localhost). This
     // preserves existing behavior and prevents self-announces from clobbering
     // gossiped entries with real public IPs.
@@ -11576,7 +11683,7 @@ async fn announce_shard(
     );
     // Also register in multi-model ShardRegistry for multi-model routing
     let assignment = arc_inference::distributed::ShardAssignment {
-        node_address: model_id, // placeholder; real node addr comes from p2p
+        node_address: announcing_validator,
         start_layer: req.shard.start_layer as u32,
         end_layer: req.shard.end_layer as u32,
         expert_indices: Vec::new(),
@@ -15675,11 +15782,12 @@ async fn get_models(AxumState(node): AxumState<NodeState>) -> Json<Value> {
             let selection = parse_hash256_hex(&s.model_id, "model_id")
                 .ok()
                 .and_then(|model_id| {
-                    assemble_profile_bound_pipeline_for_model(
+                    assemble_profile_bound_pipeline_for_model_with_identity_policy(
                         shards_for_model.clone(),
                         model_id,
                         None,
                         &node.latency_stats,
+                        true,
                     )
                     .ok()
                 });
@@ -15746,11 +15854,12 @@ async fn get_model_shards(
         .first()
         .map(|shard| shard.total_layers)
         .unwrap_or(0);
-    match assemble_profile_bound_pipeline_for_model(
+    match assemble_profile_bound_pipeline_for_model_with_identity_policy(
         announced,
         model_hash,
         None,
         &node.latency_stats,
+        true,
     ) {
         Ok(selection) => {
             let pipeline: Vec<Value> = selection
@@ -23423,6 +23532,71 @@ mod tests {
         dashmap::DashMap::new()
     }
 
+    fn authenticated_shard(identity: &[u8], addr: &str, model_id: Hash256) -> ShardInfo {
+        let mut shard = shard("same-display-name", addr, 0, 32);
+        shard.model_id = format!("0x{}", model_id.to_hex());
+        shard.node_name = format!("0x{}", arc_crypto::hash_bytes(identity).to_hex());
+        shard
+    }
+
+    #[test]
+    fn strict_pipeline_dedupes_aliases_by_authenticated_validator_identity() {
+        let model_id = arc_crypto::hash_bytes(b"strict-alias-model");
+        let profile = canonical_profile();
+        let first = authenticated_shard(b"validator-a", "203.0.113.10:9090", model_id);
+        let mut alias = first.clone();
+        alias.socket_addr = "203.0.113.11:9090".to_string();
+        let selection = assemble_profile_bound_pipeline_for_model_with_identity_policy(
+            vec![first, alias],
+            model_id,
+            Some(&profile),
+            &no_stats(),
+            true,
+        )
+        .expect("authenticated alias set should remain a valid one-replica range");
+        assert_eq!(selection.hops[0].1.len(), 1);
+        assert_eq!(selection.hops[0].1[0].socket_addr, "203.0.113.10:9090");
+    }
+
+    #[test]
+    fn strict_pipeline_keeps_same_display_name_distinct_validator_identities() {
+        let model_id = arc_crypto::hash_bytes(b"strict-collision-model");
+        let profile = canonical_profile();
+        let first = authenticated_shard(b"validator-a", "203.0.113.20:9090", model_id);
+        let second = authenticated_shard(b"validator-b", "203.0.113.21:9090", model_id);
+        assert_ne!(first.node_name, second.node_name);
+        let selection = assemble_profile_bound_pipeline_for_model_with_identity_policy(
+            vec![first, second],
+            model_id,
+            Some(&profile),
+            &no_stats(),
+            true,
+        )
+        .expect("distinct authenticated validators should both remain eligible");
+        assert_eq!(selection.hops[0].1.len(), 2);
+    }
+
+    #[test]
+    fn strict_pipeline_rejects_missing_or_malformed_validator_identity() {
+        let model_id = arc_crypto::hash_bytes(b"strict-invalid-identity-model");
+        let invalid = shard("display-only", "203.0.113.30:9090", 0, 32);
+        let error = assemble_pipeline_with_identity_policy(vec![invalid], &no_stats(), true)
+            .expect_err("display-only shard metadata must not enter strict readiness");
+        assert!(matches!(
+            error,
+            PipelineError::MissingValidatorIdentity { .. }
+        ));
+        let malformed = authenticated_shard(b"validator-c", "203.0.113.31:9090", model_id);
+        let mut malformed = malformed;
+        malformed.node_name = "0xnot-a-validator".to_string();
+        let error = assemble_pipeline_with_identity_policy(vec![malformed], &no_stats(), true)
+            .expect_err("malformed validator identity must fail closed");
+        assert!(matches!(
+            error,
+            PipelineError::MissingValidatorIdentity { .. }
+        ));
+    }
+
     #[test]
     fn free_sharded_one_of_n_never_claims_quorum_or_determinism() {
         assert_eq!(
@@ -23866,7 +24040,7 @@ mod tests {
         let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
         assert!(matches!(
             assemble_profile_bound_pipeline_for(&node, Some(canonical)),
-            Err(PipelineError::NoCompleteExecutionProfile { .. })
+            Err(PipelineError::MissingValidatorIdentity { .. })
         ));
 
         let plan_request = || AutoShardPlanRequest {
@@ -23905,7 +24079,7 @@ mod tests {
         );
         assert!(matches!(
             assemble_profile_bound_pipeline_for(&node, Some(canonical)),
-            Err(PipelineError::NoCompleteExecutionProfile { .. })
+            Err(PipelineError::MissingValidatorIdentity { .. })
         ));
         let Json(models_view) = get_models(AxumState(node.clone())).await;
         assert_eq!(models_view["models"][0]["fully_covered"], false);
@@ -24155,6 +24329,20 @@ mod tests {
         assert_eq!(response["ok"], true);
         assert_eq!(coordinator.shard_registry.len(), 1);
         assert_eq!(coordinator.multi_model_registry.total_shard_nodes(), 1);
+        let registered = coordinator.shard_registry.iter().next().unwrap();
+        assert_eq!(
+            registered.value().0.node_name,
+            format!("0x{}", holder_key.address().to_hex()),
+            "registry identity must come from the authenticated signer"
+        );
+        assert_eq!(
+            coordinator
+                .multi_model_registry
+                .get_node_shards(&holder_key.address())
+                .len(),
+            1,
+            "multi-model registry must key the holder by validator identity"
+        );
         let selection = assemble_profile_bound_pipeline_for(
             &coordinator,
             Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
@@ -24169,6 +24357,96 @@ mod tests {
             models_view["models"][0]["execution_profile"],
             canonical_profile()
         );
+    }
+
+    #[tokio::test]
+    async fn signed_shard_aliases_dedupe_by_signer_and_same_labels_do_not_collide() {
+        let first_key = arc_crypto::KeyPair::generate_ed25519();
+        let second_key = arc_crypto::KeyPair::generate_ed25519();
+        let state = Arc::new(arc_state::StateDB::new());
+        state.seed_genesis_validators(&[
+            (first_key.address(), arc_state::StateDB::MIN_VALIDATOR_STAKE),
+            (
+                second_key.address(),
+                arc_state::StateDB::MIN_VALIDATOR_STAKE,
+            ),
+        ]);
+
+        let model_id = arc_crypto::hash_bytes(b"signed-alias-collision-artifact");
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = state;
+        coordinator.model_artifact_id = Some(model_id);
+        let origins = [
+            "https://203.0.113.15".to_string(),
+            "https://203.0.113.16".to_string(),
+            "https://203.0.113.17".to_string(),
+        ];
+        coordinator.community_rpc_bases = Arc::new(origins.to_vec());
+        for (origin, validator) in [
+            (&origins[0], first_key.address()),
+            (&origins[1], first_key.address()),
+            (&origins[2], second_key.address()),
+        ] {
+            coordinator.shard_rpc_audiences.insert(
+                shard_rpc_origin(origin).unwrap(),
+                ValidatorRpcAudience {
+                    validator,
+                    transaction_domain: None,
+                    observed_at: Instant::now(),
+                },
+            );
+        }
+
+        let announce = |origin: String, key: &arc_crypto::KeyPair| {
+            sign_validator_shard_announcement(
+                ShardInfo {
+                    start_layer: 0,
+                    end_layer: 1,
+                    total_layers: 1,
+                    model_id: format!("0x{}", model_id.to_hex()),
+                    model_name: "one-layer-test".to_string(),
+                    execution_profile: canonical_profile(),
+                    memory_mb: 1,
+                    full_model_mb: 1,
+                    socket_addr: origin,
+                    node_name: "shared-display-label".to_string(),
+                },
+                key,
+                coordinator.validator_address,
+                None,
+            )
+            .unwrap()
+        };
+
+        for (origin, key) in [
+            (origins[0].clone(), &first_key),
+            (origins[1].clone(), &first_key),
+            (origins[2].clone(), &second_key),
+        ] {
+            let Json(response) = announce_shard(
+                AxumState(coordinator.clone()),
+                ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
+                Json(announce(origin, key)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["ok"], true);
+        }
+
+        let selection = assemble_profile_bound_pipeline_for(
+            &coordinator,
+            Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
+        )
+        .expect("signed aliases should produce a complete two-replica range");
+        assert_eq!(selection.hops[0].1.len(), 2);
+        let identities = selection.hops[0]
+            .1
+            .iter()
+            .map(|shard| shard.node_name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), 2);
+        assert!(identities.contains(&format!("0x{}", first_key.address().to_hex())));
+        assert!(identities.contains(&format!("0x{}", second_key.address().to_hex())));
     }
 
     #[test]
