@@ -1874,13 +1874,22 @@ impl ConsensusManager {
                     && last_round_change.elapsed() >= HISTORY_STUCK_AFTER
                     && connected_validators.iter().any(|(_, g)| g.connected)
                 {
-                    // Ask from the OLDEST round this node still needs, not from
-                    // its current one. After a restart the commit cursor can be
-                    // far behind the round cursor, and history that starts at
-                    // the round cursor leaves the gap the commit rule is
-                    // actually waiting on.
-                    history_requests_broadcast =
-                        Some(self.engine.last_committed_round().min(now_round));
+                    // Ask from the oldest round this node can actually USE.
+                    //
+                    // Block validation is recursive: inserting a block at round
+                    // R needs its parents at R-1. A node whose DAG is empty -
+                    // which is every node just after a restart - can therefore
+                    // only be bootstrapped from round 0, where parents are
+                    // empty by definition. Asking from the commit cursor
+                    // produces a run whose very first round can never be
+                    // validated, which is why a restarted node sent 252
+                    // history requests and imported nothing.
+                    let from_round = if self.engine.dag_is_empty() {
+                        0
+                    } else {
+                        self.engine.last_committed_round().min(now_round)
+                    };
+                    history_requests_broadcast = Some(from_round);
                 }
             }
 

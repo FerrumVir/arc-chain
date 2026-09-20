@@ -7704,57 +7704,21 @@ async fn run_arc_node() -> Result<()> {
                     .engine
                     .restore_round_from_local_wal(recovered_round, recovered_committed);
 
-                // Restoring the cursors is not enough on its own: the engine's
-                // DAG starts EMPTY, so nothing this node later receives can be
-                // validated - every block needs its parents, and after a
-                // restart they exist only on disk. The 4-node fixture measured
-                // exactly that: cursors restored correctly, 273 history
-                // requests, zero usable responses, and a node that rejoined the
-                // mesh and never committed another block.
+                // Restoring the cursors is not enough on its own: the
+                // engine's DAG starts EMPTY, and block validation is recursive
+                // - inserting a block at round R needs its parents at R-1 - so
+                // nothing this node later receives can be validated until the
+                // DAG is bootstrapped.
                 //
-                // So replay the local DAG WAL back into the engine. Every block
-                // goes through the same validation as a live one, in ascending
-                // round order, via the same import path a peer's history uses.
-                // This trusts nobody: the blocks are ones this node already
-                // accepted and fsynced.
-                let mut replay_blocks: Vec<arc_consensus::DagBlock> = Vec::new();
-                let mut replay_transactions: Vec<arc_types::Transaction> = Vec::new();
-                for entry in arc_state::wal::read_wal_dir(&dag_wal_path) {
-                    match entry.op {
-                        arc_state::WalOp::SetDagBlock(_, ref bytes) => {
-                            match bincode::deserialize::<arc_consensus::DagBlock>(bytes) {
-                                Ok(block) => replay_blocks.push(block),
-                                Err(error) => tracing::warn!(
-                                    %error,
-                                    "Skipping an undecodable DAG block in the local WAL"
-                                ),
-                            }
-                        }
-                        arc_state::WalOp::SetFullTransaction(_, ref transaction) => {
-                            replay_transactions.push((**transaction).clone());
-                        }
-                        _ => {}
-                    }
-                }
-                if !replay_blocks.is_empty() {
-                    replay_blocks.sort_by_key(|block| (block.round, block.hash.0));
-                    replay_blocks.dedup_by_key(|block| block.hash.0);
-                    let blocks = replay_blocks.len();
-                    match consensus.engine.import_history(&replay_blocks, u64::MAX) {
-                        Ok(reached) => tracing::info!(
-                            blocks,
-                            transactions = replay_transactions.len(),
-                            reached,
-                            "Replayed the local DAG WAL into consensus"
-                        ),
-                        Err(error) => tracing::warn!(
-                            blocks,
-                            %error,
-                            "Local DAG WAL replay stopped early; this node will need peer history"
-                        ),
-                    }
-                    consensus.install_recovered_preimages(replay_transactions);
-                }
+                // Replaying the local DAG WAL was tried and does not work: the
+                // WAL is not a contiguous DAG. A restarted node found 31 blocks
+                // in it with a gap at round 1, against a chain at round 577.
+                // The parents it needs were never all persisted locally.
+                //
+                // So the bootstrap comes from peers, over the authenticated
+                // history path, starting at round 0 where parents are empty by
+                // definition. `ConsensusManager` requests it that way whenever
+                // its DAG is empty.
                 tracing::info!(
                     recovered_round,
                     recovered_committed,

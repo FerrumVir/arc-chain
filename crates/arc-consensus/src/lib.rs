@@ -2493,6 +2493,17 @@ impl ConsensusEngine {
         self.stake_tracker.lock().prune_votes(before_round);
     }
 
+    /// True when this node holds no DAG blocks at all.
+    ///
+    /// The case that matters is a restart: block validation is recursive -
+    /// inserting a block at round R requires its parents at R-1 - so a node
+    /// whose DAG is empty can only be bootstrapped from round 0, where parents
+    /// are empty by definition. Asking for history from anywhere else produces
+    /// a run whose first round can never be validated.
+    pub fn dag_is_empty(&self) -> bool {
+        self.dag.is_empty()
+    }
+
     /// How many rounds of DAG history this node retains below the commit
     /// cursor, and therefore how far behind a peer may fall and still rejoin by
     /// history transfer.
