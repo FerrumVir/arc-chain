@@ -1884,11 +1884,18 @@ impl ConsensusManager {
                     // produces a run whose very first round can never be
                     // validated, which is why a restarted node sent 252
                     // history requests and imported nothing.
-                    let from_round = if self.engine.dag_is_empty() {
-                        0
-                    } else {
-                        self.engine.last_committed_round().min(now_round)
-                    };
+                    // Ask from the first round this node is actually missing,
+                    // walking up from 0. Block validation is recursive -
+                    // inserting a block at round R needs its parents at R-1 -
+                    // so a DAG with a hole at round G cannot use anything above
+                    // G, whatever the cursors say. Asking from a cursor instead
+                    // either re-requests what is already held or skips the gap;
+                    // a restarted node did the former 267 times and imported
+                    // nothing.
+                    let from_round = self
+                        .engine
+                        .first_missing_round(0, self.engine.retained_rounds())
+                        .min(now_round);
                     history_requests_broadcast = Some(from_round);
                 }
             }

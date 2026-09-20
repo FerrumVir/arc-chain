@@ -2109,10 +2109,12 @@ impl ConsensusEngine {
         // validation as a live one, and `advance_round` still re-checks stake
         // and participation for each round.
         let mut reached = start;
+        let mut inserted = 0usize;
         'rounds: for (round, round_blocks) in by_round {
             for block in round_blocks {
                 match self.receive_block(block) {
-                    Ok(()) | Err(ConsensusError::DuplicateBlock) => {}
+                    Ok(()) => inserted += 1,
+                    Err(ConsensusError::DuplicateBlock) => {}
                     Err(error) => {
                         debug!(
                             round,
@@ -2131,15 +2133,22 @@ impl ConsensusEngine {
                 }
             }
         }
-        if reached == start {
+        // Progress is blocks INSERTED, not the round cursor moving. A node that
+        // restarted has a round cursor far ahead of its empty DAG, so the
+        // history it needs is all BELOW that cursor: it fills the DAG in from
+        // round 0 without the cursor moving at all. Judging that run a failure
+        // is what made a restarted node re-request the same range 267 times and
+        // import nothing.
+        if inserted == 0 && reached == start {
             return Err(ConsensusError::InvalidBlock(
-                "history did not advance this node".into(),
+                "history added nothing this node did not already have".into(),
             ));
         }
         info!(
             from = start,
             to = reached,
             blocks = blocks.len(),
+            inserted,
             "Imported authenticated history"
         );
         Ok(reached)
@@ -2491,6 +2500,24 @@ impl ConsensusEngine {
         };
         self.withholding_detector.lock().prune(before_round);
         self.stake_tracker.lock().prune_votes(before_round);
+    }
+
+    /// The first round at or above `from` for which this node holds no blocks,
+    /// scanning at most `limit` rounds.
+    ///
+    /// This is where a node filling its DAG in has to ask next. Asking from a
+    /// fixed point instead would either re-request what it already has or skip
+    /// the gap it still needs.
+    pub fn first_missing_round(&self, from: u64, limit: u64) -> u64 {
+        let end = from.saturating_add(limit);
+        let mut round = from;
+        while round < end {
+            if self.blocks_in_round(round).is_empty() {
+                return round;
+            }
+            round = round.saturating_add(1);
+        }
+        end
     }
 
     /// True when this node holds no DAG blocks at all.

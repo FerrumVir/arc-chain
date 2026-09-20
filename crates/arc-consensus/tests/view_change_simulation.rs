@@ -1110,3 +1110,58 @@ fn an_anchor_one_node_certifies_is_never_skipped_by_another() {
         );
     }
 }
+
+#[test]
+fn a_node_with_an_empty_dag_fills_it_in_from_the_first_missing_round() {
+    // Regression for the restart case, which took five fixture runs to pin
+    // down. A restarted node has a round cursor far ahead of an EMPTY DAG, so
+    // every block it needs is BELOW that cursor. Two things then went wrong:
+    // an import that inserted hundreds of blocks without moving the cursor was
+    // judged a failure, and the next request was computed from a cursor rather
+    // than from the gap - so the node re-requested the same range forever.
+    let mut sim = Sim::new(4);
+    sim.run(30, &Faults::default());
+    let source = &sim.nodes[0];
+    let top = source.engine.current_round();
+    assert!(top > 8, "the source chain must be long enough to matter");
+
+    let mut all = Vec::new();
+    for round in 0..=top {
+        for hash in source.engine.blocks_in_round(round) {
+            if let Some(block) = source.engine.get_block(&hash) {
+                all.push(block);
+            }
+        }
+    }
+
+    // A fresh engine standing in for the restarted node: empty DAG, but its
+    // round cursor already restored far ahead.
+    let fresh = Sim::new(4);
+    let engine = &fresh.nodes[0].engine;
+    engine.restore_round_from_local_wal(top, top.saturating_sub(3));
+    assert!(engine.dag_is_empty());
+    assert_eq!(engine.first_missing_round(0, 1_000), 0);
+
+    // Importing rounds entirely below the cursor must count as progress.
+    let lower: Vec<DagBlock> = all.iter().filter(|b| b.round <= 4).cloned().collect();
+    engine
+        .import_history(&lower, HISTORY_SPAN)
+        .expect("history below the round cursor is progress, not failure");
+    assert!(!engine.dag_is_empty());
+
+    // And the next request must start at the gap, not back at 0 or at a cursor.
+    let next = engine.first_missing_round(0, 1_000);
+    assert_eq!(
+        next, 5,
+        "after importing rounds 0..=4 the node must ask from 5, not from 0 or from its cursor"
+    );
+
+    // Feeding it the rest walks it all the way up.
+    engine
+        .import_history(&all, HISTORY_SPAN)
+        .expect("the remainder imports");
+    assert!(
+        engine.first_missing_round(0, 1_000) > next,
+        "the DAG did not fill in any further"
+    );
+}
