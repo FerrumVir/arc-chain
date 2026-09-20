@@ -277,6 +277,20 @@ fn native_request_is_executed_and_finalized_by_a_real_node_process() {
         validator_set_hash: Hash256::from_hex(ctx["validator_set_hash"].as_str().unwrap()).unwrap(),
     };
 
+    // Verify the premise before relying on it. A native request only becomes a
+    // pending job once it is COMMITTED, so a chain that never produces a block
+    // can never finalize anything. Without this check the test times out on a
+    // receipt and blames the worker for a block-production failure.
+    wait_for(
+        Duration::from_secs(90),
+        "the chain to commit its first block (a request cannot be executed until it is committed)",
+        || {
+            get_json(node.port, "/health")
+                .and_then(|h| h["height"].as_u64())
+                .is_some_and(|h| h > 0)
+        },
+    );
+
     let expires = u64::MAX / 2;
     let (tx, request_id) = fx.signed_request(domain, 0, expires, fx.allowed);
     let (code, body) = submit(node.port, &tx);
