@@ -27,6 +27,7 @@ pub mod beacon;
 pub mod data_availability;
 pub mod security;
 pub mod subnet;
+pub mod view_change;
 pub use data_availability::*;
 pub use security::*;
 
@@ -411,7 +412,7 @@ impl ValidatorSet {
 /// Exact protocol-v3 recovery domain for DAG proposals and votes. Keeping the
 /// fields explicit makes status/audit output meaningful while `domain_hash`
 /// binds chain ID, genesis, recovery epoch, validator set, and protocol.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusDomain {
     pub domain_hash: Hash256,
     pub recovery_epoch: u64,
@@ -744,6 +745,16 @@ pub struct ConsensusEngine {
     /// and only non-zero round allowed to start without legacy DAG parents.
     /// Ordinary parent rules apply to every later round; retaining this value
     /// also permits strict replay of late bootstrap-round blocks after restart.
+    /// Verified round-skip certificates, by round. A round with a certificate
+    /// may be passed by the commit cursor without committing its leader; see
+    /// `view_change` for why that is safe.
+    skip_certificates: DashMap<(u64, Address), view_change::SkipCertificate>,
+    /// `(round, leader)` pairs this node has permanently refused, either by
+    /// signing a skip itself or by adopting a peer's certificate. A refused
+    /// block is never used as a parent and never counted in commit support.
+    refused_leader_blocks: DashMap<(u64, Address), ()>,
+    /// Verified committed-block finality certificates, by height.
+    finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
     recovery_bootstrap_round: RwLock<Option<u64>>,
     /// First retained round in an independently pinned, content-addressed local
     /// recovery generation. Its missing parents are covered by that durable
@@ -797,6 +808,9 @@ impl ConsensusEngine {
             node_role: NodeRole::Full,
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
+            skip_certificates: DashMap::new(),
+            refused_leader_blocks: DashMap::new(),
+            finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
@@ -840,6 +854,9 @@ impl ConsensusEngine {
             node_role: NodeRole::Full,
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
+            skip_certificates: DashMap::new(),
+            refused_leader_blocks: DashMap::new(),
+            finality_certificates: DashMap::new(),
             recovery_bootstrap_round: RwLock::new(None),
             local_recovery_boundary_round: RwLock::new(None),
             local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
@@ -1440,6 +1457,12 @@ impl ConsensusEngine {
             for hash in &prev_hashes {
                 if let Some(block) = self.dag.get(hash)
                     && let Some(validator) = vs.get_validator(&block.author)
+                    // Having signed or adopted a skip for this block, this node
+                    // permanently refuses to reference it. That refusal is what
+                    // makes the skip certificate safe: it is why a quorum of
+                    // skip signers can never also supply the support a commit
+                    // of the same block would need.
+                    && !self.refuses_leader_block(block.round, &block.author)
                     && seen_parent_authors.insert(block.author)
                 {
                     selected_parents.push(*hash);
@@ -1450,15 +1473,14 @@ impl ConsensusEngine {
             }
 
             let full_recovery_participation = !self.requires_full_round_participation()
-                || vs
-                    .validators
-                    .iter()
-                    .filter(|validator| validator.stake > 0)
-                    .all(|validator| seen_parent_authors.contains(&validator.address));
-            // A local timeout or testnet flag is not a quorum certificate. In
-            // the recovery domain there is no certified leader-skip protocol,
-            // so a proposal missing even one fixed validator parent would be
-            // able to recreate a permanent deterministic-leader hole.
+                || vs.validators.iter().filter(|v| v.stake > 0).all(|validator| {
+                    seen_parent_authors.contains(&validator.address)
+                        || self.is_excused_for_round(prev_round, &validator.address)
+                });
+            // A local timeout or testnet flag is still not a quorum
+            // certificate. The only thing that excuses a missing fixed
+            // validator parent is an authenticated quorum skip certificate for
+            // that exact round, which proves its block can never be committed.
             if accumulated_stake < vs.quorum || !full_recovery_participation {
                 return Err(ConsensusError::InsufficientParents);
             }
@@ -1685,16 +1707,16 @@ impl ConsensusEngine {
                 )));
             }
 
+            let parent_round = block.round.saturating_sub(1);
             let full_recovery_participation = !self.requires_full_round_participation()
-                || vs
-                    .validators
-                    .iter()
-                    .filter(|validator| validator.stake > 0)
-                    .all(|validator| seen_parent_authors.contains(&validator.address));
-            // A local timeout or testnet flag is not a parent certificate.
-            // Recovery blocks must carry one known prior-round parent author
-            // for every fixed positive-stake validator until a separately
-            // certified skip/view-change protocol exists.
+                || vs.validators.iter().filter(|v| v.stake > 0).all(|validator| {
+                    seen_parent_authors.contains(&validator.address)
+                        || self.is_excused_for_round(parent_round, &validator.address)
+                });
+            // A local timeout or testnet flag is still not a parent
+            // certificate. Recovery blocks must carry one known prior-round
+            // parent author for every fixed positive-stake validator that an
+            // authenticated skip certificate has not excused for that round.
             if parent_stake < vs.quorum || !full_recovery_participation {
                 return Err(ConsensusError::InsufficientParents);
             }
@@ -1848,6 +1870,7 @@ impl ConsensusEngine {
                 if let Some(certifier) = self.dag.get(&certifier_hash)
                     && certifier.parents.contains(&child_hash)
                     && let Some(validator) = validator_set.get_validator(&certifier.author)
+                    && !self.refuses_leader_block(certifier.round, &certifier.author)
                     && seen_certifiers.insert(certifier.author)
                 {
                     supporting_stake = supporting_stake
@@ -1860,6 +1883,106 @@ impl ConsensusEngine {
             }
         }
         None
+    }
+
+    // ── Authenticated round skip and finality ───────────────────────────────
+
+    /// Verify and register an absence certificate.
+    ///
+    /// Two effects, both load-bearing (see `view_change`): the named member is
+    /// excused from that round's participation requirement, and this node
+    /// permanently refuses that member's block for that round. When the
+    /// absentee is also the round's deterministic leader, the commit cursor may
+    /// pass the round.
+    pub fn register_skip_certificate(
+        &self,
+        certificate: view_change::SkipCertificate,
+    ) -> Result<u64, view_change::CertificateError> {
+        let domain = self
+            .consensus_domain
+            .read()
+            .ok_or(view_change::CertificateError::WrongValidatorSet)?;
+        let signing = {
+            let vs = self.frozen_validator_set.read();
+            certificate.verify(&domain, &vs)?
+        };
+        let round = certificate.round;
+        let absentee = certificate.absentee;
+        self.refused_leader_blocks.insert((round, absentee), ());
+        self.skip_certificates.insert((round, absentee), certificate);
+        info!(
+            round,
+            %absentee,
+            signing_stake = signing,
+            "Registered authenticated absence certificate"
+        );
+        Ok(signing)
+    }
+
+    /// A validator is excused from the recovery domain's full-participation
+    /// requirement for exactly the round an authenticated skip certificate
+    /// covers it for. This is the replacement for the blanket all-validator
+    /// guard: participation is still required from everyone the committee has
+    /// not certified as absent, and the certificate is what makes "absent"
+    /// something a node proves rather than assumes.
+    fn is_excused_for_round(&self, round: u64, address: &Address) -> bool {
+        self.refused_leader_blocks.contains_key(&(round, *address))
+    }
+
+    /// True when a verified absence certificate covers this member in this
+    /// round.
+    pub fn has_skip_certificate(&self, round: u64, absentee: &Address) -> bool {
+        self.skip_certificates.contains_key(&(round, *absentee))
+    }
+
+    pub fn skip_certificate(
+        &self,
+        round: u64,
+        absentee: &Address,
+    ) -> Option<view_change::SkipCertificate> {
+        self.skip_certificates
+            .get(&(round, *absentee))
+            .map(|c| c.value().clone())
+    }
+
+    /// True when this node has permanently refused a specific leader block.
+    pub fn refuses_leader_block(&self, round: u64, author: &Address) -> bool {
+        self.refused_leader_blocks.contains_key(&(round, *author))
+    }
+
+    /// Record a refusal taken locally (this node signed the skip vote itself).
+    pub fn note_refused_leader_block(&self, round: u64, leader: Address) {
+        self.refused_leader_blocks.insert((round, leader), ());
+    }
+
+    /// Verify and store a committed-block finality certificate.
+    pub fn register_finality_certificate(
+        &self,
+        certificate: view_change::FinalityCertificate,
+    ) -> Result<u64, view_change::CertificateError> {
+        let domain = self
+            .consensus_domain
+            .read()
+            .ok_or(view_change::CertificateError::WrongValidatorSet)?;
+        let signing = {
+            let vs = self.frozen_validator_set.read();
+            certificate.verify(&domain, &vs)?
+        };
+        self.finality_certificates
+            .insert(certificate.height, certificate);
+        Ok(signing)
+    }
+
+    pub fn finality_certificate(&self, height: u64) -> Option<view_change::FinalityCertificate> {
+        self.finality_certificates
+            .get(&height)
+            .map(|c| c.value().clone())
+    }
+
+    /// The commitment over the exact frozen committee, which every certificate
+    /// carries so it cannot be replayed against a different membership.
+    pub fn frozen_validator_set_hash(&self) -> Hash256 {
+        view_change::validator_set_hash(&self.frozen_validator_set.read())
     }
 
     /// Try to commit blocks using the two-round commit rule.
@@ -1912,6 +2035,30 @@ impl ConsensusEngine {
         // rounds that are already finalized (was scanning from 0 every time).
         let scan_start = self.last_committed_round.load(Ordering::SeqCst);
         for r in scan_start..=(current.saturating_sub(2)) {
+            let round_leader = if frozen_vals.is_empty() {
+                None
+            } else {
+                Some(frozen_vals[r as usize % frozen_vals.len()])
+            };
+
+            // An authenticated quorum certificate naming this round's LEADER as
+            // absent is the one thing that may advance this cursor without a
+            // commit. It proves no honest node can ever certify that leader's
+            // block, so passing the round cannot diverge from a node that is
+            // still waiting. A certificate naming anyone else only excuses
+            // participation; it never moves the cursor.
+            if let Some(leader_addr) = round_leader
+                && self.has_skip_certificate(r, &leader_addr)
+            {
+                debug!(
+                    round = r,
+                    leader = %leader_addr,
+                    "Commit cursor passing a certified absent leader"
+                );
+                self.last_committed_round.store(r + 1, Ordering::SeqCst);
+                continue;
+            }
+
             let round_r_blocks = self.blocks_in_round(r);
             if round_r_blocks.is_empty() {
                 // A locally empty round may still contain a delayed leader
@@ -1920,11 +2067,7 @@ impl ConsensusEngine {
                 break;
             }
 
-            let leader = if frozen_vals.is_empty() {
-                None
-            } else {
-                Some(frozen_vals[r as usize % frozen_vals.len()])
-            };
+            let leader = round_leader;
 
             let mut certified_leader_blocks = Vec::<(DagBlock, u64)>::new();
             for block_b_hash in &round_r_blocks {
@@ -2219,11 +2362,10 @@ impl ConsensusEngine {
         }
 
         let full_recovery_participation = !self.requires_full_round_participation()
-            || vs
-                .validators
-                .iter()
-                .filter(|validator| validator.stake > 0)
-                .all(|validator| seen_authors.contains(&validator.address));
+            || vs.validators.iter().filter(|v| v.stake > 0).all(|validator| {
+                seen_authors.contains(&validator.address)
+                    || self.is_excused_for_round(current, &validator.address)
+            });
         if round_stake >= vs.quorum && full_recovery_participation {
             let Some(new_round) = current.checked_add(1) else {
                 warn!(round = current, "Cannot advance beyond u64::MAX round");

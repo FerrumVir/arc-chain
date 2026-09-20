@@ -374,6 +374,17 @@ impl KeyPair {
         KeyPair::Ed25519(signing_key)
     }
 
+    /// Rebuild an Ed25519 key pair from 32 secret bytes.
+    ///
+    /// The caller owns the secret's provenance entirely: this performs no key
+    /// derivation, stretching or entropy check. It exists so deterministic
+    /// simulations and fixtures can replay the same committee, and for callers
+    /// that already hold a securely generated secret. Never derive one of these
+    /// from a guessable value for anything that holds funds.
+    pub fn from_ed25519_secret_bytes(secret: &[u8; 32]) -> Self {
+        KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(secret))
+    }
+
     /// Generate a new random Secp256k1 key pair.
     pub fn generate_secp256k1() -> Self {
         let signing_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
