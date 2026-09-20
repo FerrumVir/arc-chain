@@ -256,6 +256,73 @@ else
   fail "no height was ever observed by two nodes, so agreement was never testable"
 fi
 
+# ── Phase 5b: live RPC-backed user journeys ─────────────────────────────────
+#
+# Gate 5 was being claimed on 214 Playwright tests that all run against
+# `mockInvoke` (desktop/src/lib/tauri.ts), with the four specs that touch a real
+# node unconditionally skipped. That is mock coverage and establishes no live
+# journey.
+#
+# The explorer's own live gate (explorer/test-live.mjs) cannot supply one here:
+# it requires an approved recovery checkpoint and all SIX production maintenance
+# interlocks, so it is bound to the production fleet, not to anything
+# reproducible locally. These journeys run against the REAL nodes above instead.
+echo ""
+echo "[5b/6] live RPC-backed user journeys against a real node"
+jget() { # path -> body; fails unless HTTP 200 AND valid JSON
+  local raw code body
+  raw=$(curl -s -w '\n%{http_code}' --max-time 6 "http://127.0.0.1:$BASE_RPC$1" 2>/dev/null) || return 1
+  code=${raw##*$'\n'}; body=${raw%$'\n'*}
+  [[ "$code" == "200" ]] || return 1
+  printf '%s' "$body" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null || return 1
+  printf '%s' "$body"
+}
+jfield() { printf '%s' "$1" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(sys.argv[1],""))' "$2" 2>/dev/null; }
+
+H=$(jget /health) && ok "health journey: /health is HTTP 200 and valid JSON" || fail "live /health failed"
+for f in status height validators peers dag_round; do
+  [[ -n "$(jfield "$H" "$f")" ]] || fail "/health is missing $f"
+done
+echo "    status=$(jfield "$H" status) height=$(jfield "$H" height) validators=$(jfield "$H" validators) peers=$(jfield "$H" peers)"
+
+JH=$(jfield "$H" height)
+if [[ "${JH:-0}" -gt 0 ]] && jget "/block/$JH" >/dev/null; then
+  ok "browsing journey: /block/{height} returns a real mined block"
+else
+  fail "live /block/{height} did not return a mined block at height ${JH:-0}"
+fi
+
+ACC=$(jget "/account/${ADDRS[0]}") && ok "account journey: /account/{address} is HTTP 200" \
+  || fail "live /account failed"
+echo "    validator balance=$(jfield "$ACC" balance) nonce=$(jfield "$ACC" nonce)"
+
+# The payment journey that gate 5 actually needs: claim -> mined -> readable.
+RECIP=$(python3 -c "import secrets;print(secrets.token_hex(32))")
+BEFORE=$(jfield "$(jget "/account/$RECIP" || echo '{}')" balance); BEFORE=${BEFORE:-0}
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -X POST \
+       -H 'Content-Type: application/json' -d "{\"address\":\"$RECIP\"}" \
+       "http://127.0.0.1:$BASE_RPC/faucet/claim")
+if [[ "$CODE" == "200" ]]; then
+  credited=0; AFTER=$BEFORE
+  for _ in $(seq 1 20); do
+    AFTER=$(jfield "$(jget "/account/$RECIP" || echo '{}')" balance); AFTER=${AFTER:-0}
+    [[ "${AFTER:-0}" -gt "${BEFORE:-0}" ]] && { credited=1; break; }
+    sleep 5
+  done
+  echo "    payment: claim HTTP 200, recipient balance $BEFORE -> $AFTER"
+  [[ $credited -eq 1 ]] && ok "payment journey: funds were MINED and read back over live RPC" \
+    || fail "payment journey: claim accepted but the balance never changed"
+else
+  fail "payment journey: faucet claim rejected (HTTP $CODE)"
+fi
+
+BAD=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://127.0.0.1:$BASE_RPC/account/not-a-valid-address")
+[[ "$BAD" != "200" ]] && ok "error journey: an invalid address is refused (HTTP $BAD), not answered with a fake account" \
+  || fail "error journey: an invalid address returned HTTP 200"
+MISSING=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://127.0.0.1:$BASE_RPC/block/99999999")
+[[ "$MISSING" != "200" ]] && ok "error journey: a nonexistent block is refused (HTTP $MISSING), not fabricated" \
+  || fail "error journey: a nonexistent block returned HTTP 200"
+
 # ── Phase 6: real process death and restart ─────────────────────────────────
 echo ""
 echo "[6/6] killing node $((NODES-1)) and restarting it as a NEW process"
